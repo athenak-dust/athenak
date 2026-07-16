@@ -138,6 +138,8 @@ class Mesh {
   int *nprtcl_eachrank;    // number of particles on each rank
 
   Real time, dt, dtold, dt_last_completed, cfl_no;
+  Real dtmax;                    // optional hard cap on dt (<time>/dtmax), for
+                                 // fixed-timestep convergence tests
   int ncycle;
   EventCounters ecounter;
 

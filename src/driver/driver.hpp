@@ -49,6 +49,9 @@ class Driver {
   Real wall_time;
 
   // functions
+  // (re)build the gamma-dependent imex2+ coefficients; also called by the dust module's
+  // gamma-switch (Krapp et al. 2024, Eq. 18) at the start of a cycle
+  void SetImEx2PlusCoefficients(Real gamma_new);
   void ExecuteTaskList(Mesh *pm, std::string tl, int stage);
   void Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool rflag);
   void Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout);

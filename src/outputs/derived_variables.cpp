@@ -1270,7 +1270,39 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
       if (three_d) {
         kp = (pr(IPZ,p) - size.d_view(m).x3min)/size.d_view(m).dx3 + ks;
       }
-      pdens(m,0,kp,jp,ip) += 1.0;
+      Kokkos::atomic_add(&pdens(m,0,kp,jp,ip), 1.0);
+    });
+  }
+
+  // Dust mass density binned to mesh (NGP, particle mass / cell volume). Unlike the
+  // raw prtcl_d counter this is a physical density: it uses the particle masses (IPM)
+  // and divides by the cell volume, and the accumulation is atomic (safe on threaded
+  // and GPU backends).
+  if (name.compare("dust_d") == 0) {
+    Kokkos::realloc(derived_var, nmb_alloc, 1, n3, n2, n1);
+    auto ddens = derived_var;
+    auto pr = pm->pmb_pack->ppart->prtcl_rdata;
+    auto pi = pm->pmb_pack->ppart->prtcl_idata;
+    int &npart = pm->nprtcl_thisrank;
+    int gids = pm->pmb_pack->gids;
+
+    par_for("ddens0", DevExeSpace(), 0, (nmb-1), ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      ddens(m,0,k,j,i) = 0.0;
+    });
+
+    par_for("ddens", DevExeSpace(), 0, (npart-1),
+    KOKKOS_LAMBDA(const int p) {
+      int m = pi(PGID,p) - gids;
+      int ip = (pr(IPX,p) - size.d_view(m).x1min)/size.d_view(m).dx1 + is;
+      int jp = (pr(IPY,p) - size.d_view(m).x2min)/size.d_view(m).dx2 + js;
+      int kp = ks;
+      Real vol = size.d_view(m).dx1*size.d_view(m).dx2;
+      if (three_d) {
+        kp = (pr(IPZ,p) - size.d_view(m).x3min)/size.d_view(m).dx3 + ks;
+        vol *= size.d_view(m).dx3;
+      }
+      Kokkos::atomic_add(&ddens(m,0,kp,jp,ip), pr(IPM,p)/vol);
     });
   }
   i_dv = i_dv % n_dv; // reset derived variable index

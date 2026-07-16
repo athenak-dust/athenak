@@ -1,0 +1,93 @@
+# AthenaK input file for the multi-species NSH drift equilibrium test in an
+# unstratified 2D r-z shearing box (Nakagawa et al. 1986; Krapp et al. 2024 Sec. 3.6).
+# Gas + N dust species are initialized at the exact steady drift solution; the unsplit
+# IMEX update must hold it to round-off over many orbits. Any Strang-like splitting
+# error appears as secular drift of the mean velocities (recorded in the user history).
+# Errors vs the equilibrium are written to dust_nsh-errs.dat at the end of the run.
+#
+# The radial pressure-gradient mimic a_x = 2*omega0*etavk acts on the GAS ONLY via the
+# standard const_accel source term; dust particles feel rotation + drag only.
+
+<comment>
+problem   = multi-species NSH drift equilibrium
+
+<job>
+basename  = dust_nsh      # problem ID: basename of output filenames
+
+<mesh>
+nghost    = 2         # Number of ghost cells
+nx1       = 32        # Number of zones in X1-direction (radial)
+x1min     = -0.5      # minimum value of X1
+x1max     = 0.5       # maximum value of X1
+ix1_bc    = periodic  # inner-X1 boundary flag (plain periodic: 2D r-z geometry)
+ox1_bc    = periodic  # outer-X1 boundary flag
+
+nx2       = 32        # Number of zones in X2-direction (vertical)
+x2min     = -0.5      # minimum value of X2
+x2max     = 0.5       # maximum value of X2
+ix2_bc    = periodic  # inner-X2 boundary flag
+ox2_bc    = periodic  # outer-X2 boundary flag
+
+nx3       = 1         # Number of zones in X3-direction
+x3min     = -0.5      # minimum value of X3
+x3max     = 0.5       # maximum value of X3
+ix3_bc    = periodic  # inner-X3 boundary flag
+ox3_bc    = periodic  # outer-X3 boundary flag
+
+<meshblock>
+nx1       = 16        # Number of cells in each MeshBlock, X1-dir
+nx2       = 16        # Number of cells in each MeshBlock, X2-dir
+nx3       = 1         # Number of cells in each MeshBlock, X3-dir
+
+<time>
+evolution  = dynamic  # dynamic/kinematic/static
+integrator = imex2+   # time integration algorithm (required for dust)
+cfl_number = 0.45     # imex2+ explicit stage requires C <~ 0.58
+nlim       = -1       # cycle limit
+tlim       = 62.831853071795864   # 10 orbits (10 * 2*pi/omega0)
+ndiag      = 1000     # cycles between diagnostic output
+
+<hydro>
+eos         = isothermal  # EOS type
+iso_sound_speed = 1.0     # isothermal sound speed
+reconstruct = plm         # spatial reconstruction method
+rsolver     = hlle        # Riemann-solver to be used
+
+<hydro_srcterms>
+const_accel     = true    # radial pressure-gradient mimic on the gas only
+const_accel_val = 0.1     # = 2*omega0*etavk
+const_accel_dir = 1       # radial
+
+<shearing_box>
+qshear    = 1.5           # shear parameter (Keplerian)
+omega0    = 1.0           # local orbital frequency
+
+<particles>
+particle_type = dust      # dust particles
+pusher        = imex_dust # pushed by the DustGasDrag module inside the IMEX stages
+ppc           = 3.0       # integer multiple of <dust>/nspecies
+
+<dust>
+nspecies      = 3         # number of dust species
+taus_1        = 0.01      # stopping times spanning tightly to marginally coupled
+taus_2        = 0.1
+taus_3        = 1.0
+dust_to_gas   = 1.0       # unused when eps_s are given below
+back_reaction = true      # dust drags gas (PMBR)
+deposit       = tsc       # particle-mesh deposit scheme
+gamma_switch  = false     # fixed gamma = 1+1/sqrt(2)
+dt_cfl        = 0.5       # particle transport CFL number
+
+<problem>
+pgen_name = dust_nsh      # problem generator name
+user_hist = true          # per-species drift-velocity history
+rho0      = 1.0           # uniform gas density
+etavk     = 0.05          # eta*v_K (radial forcing a_x = 2*omega0*etavk)
+eps_1     = 0.2           # per-species dust-to-gas ratios
+eps_2     = 0.5
+eps_3     = 0.3
+
+<output1>
+file_type  = hst          # History output
+dt         = 0.1          # time increment between outputs
+data_format = %.14e

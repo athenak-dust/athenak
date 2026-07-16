@@ -1,0 +1,72 @@
+# AthenaK input file for the damped dusty sound wave test (Laibe & Price 2011;
+# Krapp et al. 2024, Sec. 3.2). Exact eigenmode of the linearized gas-dust system,
+# one wavelength across the x1 domain. L1 field errors vs the analytic damped wave
+# are written to dusty_wave-errs.dat; expect second-order convergence in Nx1.
+
+<comment>
+problem   = damped dusty sound wave
+
+<job>
+basename  = dusty_wave    # problem ID: basename of output filenames
+
+<mesh>
+nghost    = 2         # Number of ghost cells
+nx1       = 64        # Number of zones in X1-direction
+x1min     = 0.0       # minimum value of X1
+x1max     = 1.0       # maximum value of X1
+ix1_bc    = periodic  # inner-X1 boundary flag
+ox1_bc    = periodic  # outer-X1 boundary flag
+
+nx2       = 8         # Number of zones in X2-direction
+x2min     = 0.0       # minimum value of X2
+x2max     = 0.125     # maximum value of X2
+ix2_bc    = periodic  # inner-X2 boundary flag
+ox2_bc    = periodic  # outer-X2 boundary flag
+
+nx3       = 1         # Number of zones in X3-direction
+x3min     = -0.5      # minimum value of X3
+x3max     = 0.5       # maximum value of X3
+ix3_bc    = periodic  # inner-X3 boundary flag
+ox3_bc    = periodic  # outer-X3 boundary flag
+
+<meshblock>
+nx1       = 32        # Number of cells in each MeshBlock, X1-dir
+nx2       = 8         # Number of cells in each MeshBlock, X2-dir
+nx3       = 1         # Number of cells in each MeshBlock, X3-dir
+
+<time>
+evolution  = dynamic  # dynamic/kinematic/static
+integrator = imex2+   # time integration algorithm (required for dust)
+cfl_number = 0.4      # The Courant, Friedrichs, & Lewy (CFL) Number
+nlim       = -1       # cycle limit
+tlim       = 2.0      # time limit
+ndiag      = 100      # cycles between diagnostic output
+
+<hydro>
+eos         = isothermal  # EOS type
+iso_sound_speed = 1.0     # isothermal sound speed
+reconstruct = plm         # spatial reconstruction method
+rsolver     = hlle        # Riemann-solver to be used
+
+<particles>
+particle_type = dust      # dust particles
+pusher        = imex_dust # pushed by the DustGasDrag module inside the IMEX stages
+ppc           = 1.0       # integer multiple of <dust>/nspecies
+
+<dust>
+nspecies      = 1         # number of dust species
+taus_1        = 0.1       # stopping time of species 1
+dust_to_gas   = 1.0       # total dust-to-gas mass ratio
+back_reaction = true      # dust drags gas (PMBR)
+deposit       = tsc       # particle-mesh deposit scheme
+gamma_switch  = false     # fixed gamma = 1+1/sqrt(2)
+dt_cfl        = 0.5       # particle transport CFL number
+
+<problem>
+pgen_name = dusty_wave    # problem generator name
+rho0      = 1.0           # background gas density
+amp       = 1.0e-6        # wave amplitude (delta_u = amp*cs)
+
+<output1>
+file_type  = hst          # History output
+dt         = 0.05         # time increment between outputs

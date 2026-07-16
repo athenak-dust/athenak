@@ -61,8 +61,15 @@ enum BFieldIndex {IBX=0, IBY=1, IBZ=2, NMAG=3};
 // array indices for metric matrices in GR
 enum MetricIndex {I00=0, I01=1, I02=2, I03=3, I11=4, I12=5, I13=6, I22=7, I23=8, I33=9,
                   NMETRIC=10};
-// array indices for particle arrays
-enum ParticlesIndex {PGID=0, PTAG=1, IPX=0, IPVX=1, IPY=2, IPVY=3, IPZ=4, IPVZ=5};
+// array indices for particle arrays. First group indexes integer data (prtcl_idata),
+// second group indexes real data (prtcl_rdata). Columns beyond IPVZ are only allocated
+// for dust particles: (IPX1...IPVZ1) store the stage-1 registers of the low-storage RK
+// integrator, (IPRX...IPRZ) the drag rate R_j recorded at each implicit stage, IPTS the
+// stopping time, and IPM the particle mass.
+enum ParticlesIndex {PGID=0, PTAG=1, PSP=2,
+                     IPX=0, IPVX=1, IPY=2, IPVY=3, IPZ=4, IPVZ=5,
+                     IPX1=6, IPVX1=7, IPY1=8, IPVY1=9, IPZ1=10, IPVZ1=11,
+                     IPRX=12, IPRY=13, IPRZ=14, IPTS=15, IPM=16};
 
 // integer constants to specify spatial reconstruction methods
 enum ReconstructionMethod {dc, plm, ppm4, ppmx, wenoz};

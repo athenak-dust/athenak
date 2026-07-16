@@ -704,6 +704,13 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     outvars.emplace_back("pdens",0,&(derived_var));
   }
 
+  // dust mass density binned to mesh (NGP, mass/volume)
+  if (out_params.variable.compare("dust_d") == 0) {
+    out_params.contains_derived = true;
+    out_params.n_derived += 1;
+    outvars.emplace_back("dustd",0,&(derived_var));
+  }
+
   // initialize vector containing number of output MBs per rank
   noutmbs.assign(global_variable::nranks, 0);
 }

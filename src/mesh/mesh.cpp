@@ -636,6 +636,9 @@ void Mesh::NewTimeStep(const Real tlim) {
   MPI_Allreduce(MPI_IN_PLACE, &dt, 1, MPI_ATHENA_REAL, MPI_MIN, MPI_COMM_WORLD);
 #endif
 
+  // optional hard cap (<time>/dtmax), e.g. for fixed-timestep convergence tests
+  dt = std::min(dt, dtmax);
+
   // limit last time step to stop at tlim *exactly*
   if ( (time < tlim) && ((time + dt) > tlim) ) {dt = tlim - time;}
 

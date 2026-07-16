@@ -45,6 +45,8 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
     std::string ptype = pin->GetString("particles","particle_type");
     if (ptype.compare("cosmic_ray") == 0) {
       particle_type = ParticleType::cosmic_ray;
+    } else if (ptype.compare("dust") == 0) {
+      particle_type = ParticleType::dust;
     } else {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Particle type = '" << ptype << "' not recognized"
@@ -58,6 +60,10 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
     std::string ppush = pin->GetString("particles","pusher");
     if (ppush.compare("drift") == 0) {
       pusher = ParticlesPusher::drift;
+    } else if (ppush.compare("imex_dust") == 0) {
+      // dust particles are pushed by the DustGasDrag module inside the IMEX stages;
+      // Particles::Push is never called for this pusher
+      pusher = ParticlesPusher::imex_dust;
     } else {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Particle pusher must be specified in <particles> block"
@@ -79,6 +85,15 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
         if (pmy_pack->pmesh->three_d) {ndim+=2;}
         nrdata = ndim;
         nidata = 2;
+        break;
+      }
+    case ParticleType::dust:
+      {
+        // dust always carries all three position/velocity components (in 2D r-z the
+        // azimuthal velocity lives in IPVZ, matching gas IM3), plus the RK registers
+        // (x1,v1), the recorded drag rate R_j, stopping time, and mass
+        nrdata = 17;
+        nidata = 3;   // PGID, PTAG, PSP (species index)
         break;
       }
     default:

@@ -193,40 +193,7 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
       nimp_stages = 4;
       nexp_stages = 3;
       cfl_limit = 1.0;
-      gamma = 1.707106781186547;   //1+1/sqrt(2)
-      gam0[0] = 1.0;
-      gam1[0] = 0.0;
-      beta[0] = gamma;
-
-      gam0[1] = (2.0*gamma-1.0)/(2.0*gamma*gamma);
-      gam1[1] = (1.0-(2.0*gamma-1.0)/(2.0*gamma*gamma));
-      beta[1] = 1.0/(2.0*gamma);
-
-      gam0[2] = 1.0;
-      gam1[2] = 0.0;
-      beta[2] = 0.0;
-
-      a_twid[0][0] = 0.0;
-      a_twid[0][1] = 0.0;
-      a_twid[0][2] = 0.0;
-      a_twid[0][3] = 0.0;
-
-      a_twid[1][0] = 0.0;
-      a_twid[1][1] = 0.0;
-      a_twid[1][2] = 0.0;
-      a_twid[1][3] = 0.0;
-
-      a_twid[2][0] = 0.0;
-      a_twid[2][1] = 0.0;
-      a_twid[2][2] = (1.0-2.0*gamma*gamma)/2.0/gamma;
-      a_twid[2][3] = 0.0;
-
-      a_twid[3][0] = 0.0;
-      a_twid[3][1] = 0.0;
-      a_twid[3][2] = 0.0;
-      a_twid[3][3] = 0.0;
-
-      a_impl = gamma;
+      SetImEx2PlusCoefficients(1.707106781186547);   //1+1/sqrt(2)
     } else if (integrator == "imex3") {
       // IMEX-SSP3(4,3,3): Pareschi & Russo (2005) Table VI.
       // three-stage explicit, four-stage implicit, third-order ImEx
@@ -273,10 +240,42 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
     } else {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
          << std::endl << "integrator=" << integrator << " not implemented. "
-         << "Valid choices are [rk1,rk2,rk3,rk4,imex2,imex3]." << std::endl;
+         << "Valid choices are [rk1,rk2,rk3,rk4,imex2,imex2+,imex3]." << std::endl;
       exit(EXIT_FAILURE);
     }
   }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::SetImEx2PlusCoefficients()
+//! \brief Sets all gamma-dependent coefficients of the imex2+ IMEX(4,3,2) integrator
+//! (Krapp et al. 2024, Eq.30). Called from the constructor with gamma = 1+1/sqrt(2), and
+//! by DustGasDrag::GammaSwitch once per cycle when the gamma-switch (their Eq. 18) is
+//! enabled. Only rows/entries that depend on gamma are recomputed; all other a_twid
+//! entries are zero for this tableau.
+
+void Driver::SetImEx2PlusCoefficients(Real gamma_new) {
+  gamma = gamma_new;
+  gam0[0] = 1.0;
+  gam1[0] = 0.0;
+  beta[0] = gamma;
+
+  gam0[1] = (2.0*gamma-1.0)/(2.0*gamma*gamma);
+  gam1[1] = (1.0-(2.0*gamma-1.0)/(2.0*gamma*gamma));
+  beta[1] = 1.0/(2.0*gamma);
+
+  gam0[2] = 1.0;
+  gam1[2] = 0.0;
+  beta[2] = 0.0;
+
+  for (int i=0; i<4; ++i) {
+    for (int s=0; s<4; ++s) {
+      a_twid[i][s] = 0.0;
+    }
+  }
+  a_twid[2][2] = (1.0-2.0*gamma*gamma)/2.0/gamma;
+
+  a_impl = gamma;
 }
 
 //----------------------------------------------------------------------------------------

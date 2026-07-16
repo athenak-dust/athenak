@@ -29,6 +29,7 @@
 #include "radiation/radiation.hpp"
 #include "srcterms/turb_driver.hpp"
 #include "particles/particles.hpp"
+#include "dust/dust.hpp"
 #include "units/units.hpp"
 #include "meshblock_pack.hpp"
 
@@ -52,6 +53,7 @@ MeshBlockPack::MeshBlockPack(Mesh *pm, int igids, int igide) :
 // MeshBlock destructor
 
 MeshBlockPack::~MeshBlockPack() {
+  if (pdust  != nullptr) {delete pdust;}
   if (ppart  != nullptr) {delete ppart;}
   if (pnr    != nullptr) {delete pnr;}
   if (pdyngr != nullptr) {delete pdyngr;}
@@ -116,8 +118,11 @@ void MeshBlockPack::AddPhysics(ParameterInput *pin) {
   if (pin->DoesBlockExist("hydro")) {
     phydro = new hydro::Hydro(this, pin);
     nphysics++;
+    // when dust drag is enabled, the combined hydro+dust task list is assembled by the
+    // DustGasDrag module in step (10) below
     if (!(pin->DoesBlockExist("mhd")) && !(pin->DoesBlockExist("radiation")) &&
-        !(pin->DoesBlockExist("adm")) && !(pin->DoesBlockExist("z4c")) ) {
+        !(pin->DoesBlockExist("adm")) && !(pin->DoesBlockExist("z4c")) &&
+        !(pin->DoesBlockExist("dust")) ) {
       phydro->AssembleHydroTasks(tl_map);
     }
   } else {
@@ -230,13 +235,34 @@ void MeshBlockPack::AddPhysics(ParameterInput *pin) {
   }
 
   // (9) PARTICLES
-  // Create particles module.  Create tasklist.
+  // Create particles module.  Create tasklist (unless the dust module owns the tasks:
+  // dust particles are pushed inside the RK stages, not in before_timeintegrator).
   if (pin->DoesBlockExist("particles")) {
     ppart = new particles::Particles(this, pin);
-    ppart->AssembleTasks(tl_map);
+    if (!(pin->DoesBlockExist("dust"))) {
+      ppart->AssembleTasks(tl_map);
+    }
     nphysics++;
   } else {
     ppart = nullptr;
+  }
+
+  // (10) DUST-GAS DRAG
+  // Create dust drag module coupling Particles to Hydro, and the combined task list.
+  // Error if <hydro> and <particles> are not both defined as well.
+  if (pin->DoesBlockExist("dust")) {
+    if (pin->DoesBlockExist("hydro") && pin->DoesBlockExist("particles")) {
+      pdust = new dust::DustGasDrag(this, pin);
+      pdust->AssembleDustGasDragTasks(tl_map);
+      nphysics++;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<dust> block detected in input file, but either"
+                << " <hydro> or <particles> block missing" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  } else {
+    pdust = nullptr;
   }
 
   // Check that at least ONE is requested and initialized.

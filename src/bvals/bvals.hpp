@@ -183,6 +183,27 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
 };
 
 //----------------------------------------------------------------------------------------
+//! \class MeshBoundaryValuesDep
+//  \brief Derived class implementing an ADDITIVE ghost-zone exchange for cell-centered
+//  fields built by particle deposition: ghost-cell deposits are packed and *added* into
+//  the overlapping active cells of the neighboring MeshBlock (the reverse data flow of
+//  the ordinary copy exchange). Uniform grids only.
+
+class MeshBoundaryValuesDep : public MeshBoundaryValues {
+ public:
+  MeshBoundaryValuesDep(MeshBlockPack *ppack, ParameterInput *pin);
+
+  //functions
+  void InitSendIndices(MeshBoundaryBuffer &b,int o1,int o2,int o3,int f1,int f2) override;
+  void InitRecvIndices(MeshBoundaryBuffer &b,int o1,int o2,int o3,int f1,int f2) override;
+  TaskStatus InitFluxRecv(const int nvar) override {return TaskStatus::complete;}
+
+  // pack ghost-region deposits and send; receive and sum into active cells
+  TaskStatus PackAndSendDeposit(DvceArray5D<Real> &a);
+  TaskStatus RecvAndSumDeposit(DvceArray5D<Real> &a);
+};
+
+//----------------------------------------------------------------------------------------
 //! \class BoundaryValuesFC
 //  \brief Derived class implementing boundary values for face-centered vector fields
 
@@ -252,6 +273,16 @@ class ParticlesBoundaryValues {
 
   int nprtcl_send, nprtcl_recv;
   DualArray1D<ParticleLocationData> sendlist;
+
+  // shear-periodic x1 boundary support (uniform grids only). Particles crossing the
+  // radial mesh boundaries are shifted azimuthally (positions only; velocities are
+  // shear-relative), so their destination MeshBlock is generally not the x1-neighbor:
+  // it is found from a (side, lx3, lx2) -> gid/rank map over the boundary MeshBlocks.
+  bool shear_periodic_x1=false;
+  Real qshear_sp=0.0, omega0_sp=0.0;   // copies of <shearing_box> parameters
+  int nmb_sp_x2=1, nmb_sp_x3=1;        // root-grid MeshBlock counts in x2/x3
+  DualArray3D<int> sgid_map;           // destination GID:  (side, lx3, lx2)
+  DualArray3D<int> srank_map;          // destination rank: (side, lx3, lx2)
 
   // Data needed to count number of messages and particles to send between ranks
   int nsends; // number of MPI sends to neighboring ranks on this rank

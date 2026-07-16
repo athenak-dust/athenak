@@ -1,0 +1,89 @@
+# AthenaK input file for the particle-gas deceleration test of Bai & Stone (2010),
+# ApJS 190, 297, Sec. 4.2. Uniform lattice of particles moving at +1 through uniform
+# gas moving at -1 (zero total momentum frame), particle-to-gas mass ratio eps = 1,
+# stopping time t_stop = 2. All particles travel S(t) = w0*ts/(1+eps)*[1-e^-(1+eps)t/ts].
+# Errors (velocity, displacement, momentum) are written to dust_decel-errs.dat.
+#
+# The box is deliberately huge (dx = 5) so that the <time>/dtmax cap is the binding
+# timestep limit and the run proceeds at exactly constant dt = dtmax, as in BS10:
+#   hydro:    cfl*dx/(cs+|v|) = 0.45*5/2   = 1.125
+#   particle: dt_cfl*dx/|v|   = 0.9*5/1    = 4.5
+# Accuracy scan:  override time/dtmax = h (h <= 1), tlim = 1.
+# Stiff test:     override time/dtmax = 1, time/tlim = 10, dust/taus_1 = 0.2 or 0.02.
+
+<comment>
+problem   = BS10 particle-gas deceleration test
+
+<job>
+basename  = dust_decel    # problem ID: basename of output filenames
+
+<mesh>
+nghost    = 2         # Number of ghost cells
+nx1       = 8         # Number of zones in X1-direction
+x1min     = -20.0     # minimum value of X1
+x1max     = 20.0      # maximum value of X1
+ix1_bc    = periodic  # inner-X1 boundary flag
+ox1_bc    = periodic  # outer-X1 boundary flag
+
+nx2       = 8         # Number of zones in X2-direction
+x2min     = -20.0     # minimum value of X2
+x2max     = 20.0      # maximum value of X2
+ix2_bc    = periodic  # inner-X2 boundary flag
+ox2_bc    = periodic  # outer-X2 boundary flag
+
+nx3       = 1         # Number of zones in X3-direction
+x3min     = -0.5      # minimum value of X3
+x3max     = 0.5       # maximum value of X3
+ix3_bc    = periodic  # inner-X3 boundary flag
+ox3_bc    = periodic  # outer-X3 boundary flag
+
+<meshblock>
+nx1       = 8         # Number of cells in each MeshBlock, X1-dir
+nx2       = 8         # Number of cells in each MeshBlock, X2-dir
+nx3       = 1         # Number of cells in each MeshBlock, X3-dir
+
+<time>
+evolution  = dynamic  # dynamic/kinematic/static
+integrator = imex2+   # time integration algorithm (required for dust)
+cfl_number = 0.45     # The Courant, Friedrichs, & Lewy (CFL) Number
+dtmax      = 0.5      # fixed timestep h (binding limit by construction; see header)
+nlim       = -1       # cycle limit
+tlim       = 1.0      # time limit
+ndiag      = 1000     # cycles between diagnostic output
+
+<hydro>
+eos         = isothermal  # EOS type
+iso_sound_speed = 1.0     # isothermal sound speed
+reconstruct = plm         # spatial reconstruction method
+rsolver     = roe         # irrelevant for uniform states (checked vs hlle/llf)
+
+<particles>
+particle_type = dust      # dust particles
+pusher        = imex_dust # pushed by the DustGasDrag module inside the IMEX stages
+ppc           = 1.0       # one particle per cell (lattice placement)
+
+<dust>
+nspecies      = 1         # number of dust species
+taus_1        = 2.0       # stopping time (0.2 / 0.02 for the stiff test)
+dust_to_gas   = 1.0       # overridden by <problem>/eps_1 below
+back_reaction = true      # dust drags gas (PMBR)
+deposit       = tsc       # particle-mesh deposit scheme
+gamma_switch  = false     # fixed gamma = 1+1/sqrt(2) (true tests the stiff switch)
+dt_cfl        = 0.9       # particle transport CFL number
+
+<problem>
+pgen_name = dust_damping  # problem generator name
+user_hist = true          # per-species dust velocity sums in the history file
+rho0      = 1.0           # uniform gas density
+vgas0     = -1.0          # gas initial velocity (zero total momentum frame)
+vd_1      = 1.0           # particle initial velocity w0
+eps_1     = 1.0           # particle-to-gas mass ratio
+lattice   = true          # particles at cell centers (exact ODE reference)
+lat_nx1   = 0             # >0 with lattice=false: uniform particle lattice per block
+lat_nx2   = 1             #   (lat_nx1 x lat_nx2 x lat_nx3 nodes; allows e.g. ppc=1.5
+lat_nx3   = 1             #    with uniform spacing via 12 x 8 on an 8x8 block)
+
+<output1>
+file_type   = hst         # History output
+dcycle      = 1           # every cycle (velocity evolution for the stiff test)
+data_format = %.14e

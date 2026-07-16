@@ -15,6 +15,7 @@ add_executable(
         bvals/buffs_cc.cpp
         bvals/buffs_fc.cpp
         bvals/bvals_cc.cpp
+        bvals/bvals_dep.cpp
         bvals/bvals_fc.cpp
         bvals/bvals_part.cpp
         bvals/bvals_tasks.cpp
@@ -37,6 +38,12 @@ add_executable(
         diffusion/viscosity.cpp
 
         driver/driver.cpp
+
+        dust/dust.cpp
+        dust/dust_newdt.cpp
+        dust/dust_pm.cpp
+        dust/dust_push.cpp
+        dust/dust_tasks.cpp
 
         dyn_grmhd/dyn_grmhd.cpp
         dyn_grmhd/dyn_grmhd_fluxes.cpp
@@ -115,6 +122,9 @@ add_executable(
         pgen/tests/cpaw.cpp
         pgen/tests/cshock.cpp
         pgen/tests/diffusion.cpp
+        pgen/tests/dust_damping.cpp
+        pgen/tests/dust_nsh.cpp
+        pgen/tests/dusty_wave.cpp
         pgen/tests/gr_bondi.cpp
         pgen/tests/gr_monopole.cpp
         pgen/tests/linear_wave.cpp
@@ -123,6 +133,7 @@ add_executable(
         pgen/tests/mri3d.cpp
         pgen/tests/shock_tube.cpp
         pgen/tests/shwave.cpp
+        pgen/tests/streaming_linear.cpp
         pgen/tests/rad_beam.cpp
         pgen/tests/rad_linear_wave.cpp
         pgen/tests/z4c_boosted_puncture.cpp

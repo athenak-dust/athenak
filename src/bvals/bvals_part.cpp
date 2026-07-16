@@ -64,8 +64,30 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
   int *pcounter = &counter;
   bool &multi_d = pmy_part->pmy_pack->pmesh->multi_d;
   bool &three_d = pmy_part->pmy_pack->pmesh->three_d;
+  // dust particles carry RK position registers (IPX1/IPY1/IPZ1) that must be shifted by
+  // the same box length as the positions when a particle wraps at a periodic boundary
+  const bool has_reg = (pmy_part->nrdata > IPX1);
 
-  Kokkos::realloc(sendlist, static_cast<int>(0.1*npart));
+  // shear-periodic x1 boundaries: particles crossing the radial mesh boundaries are
+  // shifted azimuthally by the (folded) shear offset (positions only; velocities are
+  // shear-relative), and routed to the boundary MeshBlock found from the shear maps
+  const bool shear_x1 = shear_periodic_x1;
+  Real ysh = 0.0;
+  if (shear_x1) {
+    Real lx = (meshsize.x1max - meshsize.x1min);
+    Real ly = (meshsize.x2max - meshsize.x2min);
+    ysh = fmod(qshear_sp*omega0_sp*lx*(pmy_part->pmy_pack->pmesh->time), ly);
+  }
+  const int nmbx2 = nmb_sp_x2, nmbx3 = nmb_sp_x3;
+  auto &sgid = sgid_map;
+  auto &srnk = srank_map;
+
+  // Size the send list for the worst case (every particle crossing a rank boundary in
+  // the same stage). The previous 10% heuristic overflowed silently: coherent particle
+  // sheets (e.g. drifting lattices in a shearing box) cross block faces simultaneously,
+  // and the unchecked atomic append in UpdateGID then corrupts the heap. The list is
+  // shrunk to the actual send count immediately after the kernel.
+  Kokkos::realloc(sendlist, std::max(npart, 1));
   par_for("part_update",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     int mylevel = mblev.d_view(m);
@@ -92,6 +114,48 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
 
     // only update particle GID if it has crossed MeshBlock boundary
     if ((abs(ix) + abs(iy) + abs(iz)) != 0) {
+      bool cross_in  = shear_x1 && (x1 < meshsize.x1min);
+      bool cross_out = shear_x1 && (x1 > meshsize.x1max);
+      if (cross_in || cross_out) {
+        // shear-periodic radial crossing: wrap x, shift y azimuthally by the (folded)
+        // shear offset with no velocity change (velocities are shear-relative), wrap
+        // y/z periodically, then route to the boundary MeshBlock at the new (y,z).
+        // The RK position registers are shifted identically.
+        Real lxm = (meshsize.x1max - meshsize.x1min);
+        pr(IPX,p) += cross_in ? lxm : -lxm;
+        if (has_reg) {pr(IPX1,p) += cross_in ? lxm : -lxm;}
+        Real lym = (meshsize.x2max - meshsize.x2min);
+        Real ynew = pr(IPY,p) + (cross_in ? -ysh : ysh);
+        if (ynew < meshsize.x2min) {ynew += lym;}
+        if (ynew >= meshsize.x2max) {ynew -= lym;}
+        Real dy = ynew - pr(IPY,p);
+        pr(IPY,p) = ynew;
+        if (has_reg) {pr(IPY1,p) += dy;}
+        Real lzm = (meshsize.x3max - meshsize.x3min);
+        if (x3 < meshsize.x3min) {
+          pr(IPZ,p) += lzm;
+          if (has_reg) {pr(IPZ1,p) += lzm;}
+        } else if (x3 > meshsize.x3max) {
+          pr(IPZ,p) -= lzm;
+          if (has_reg) {pr(IPZ1,p) -= lzm;}
+        }
+        // destination MeshBlock on the opposite radial side at the new (y,z)
+        int b2 = static_cast<int>(((pr(IPY,p) - meshsize.x2min)/lym)
+                                  *static_cast<Real>(nmbx2));
+        b2 = (b2 < 0) ? 0 : ((b2 > nmbx2-1) ? (nmbx2-1) : b2);
+        int b3 = 0;
+        if (three_d) {
+          b3 = static_cast<int>(((pr(IPZ,p) - meshsize.x3min)/lzm)
+                                *static_cast<Real>(nmbx3));
+          b3 = (b3 < 0) ? 0 : ((b3 > nmbx3-1) ? (nmbx3-1) : b3);
+        }
+        NeighborBlock nb;
+        nb.gid = sgid.d_view((cross_in ? 1 : 0), b3, b2);
+        nb.lev = mylevel;
+        nb.rank = srnk.d_view((cross_in ? 1 : 0), b3, b2);
+        nb.dest = 0;
+        UpdateGID(pi(PGID,p), nb, myrank, pcounter, psendl, p);
+      } else {
       if (iz == 0) {
         if (iy == 0) {
           // x1 face
@@ -153,21 +217,30 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
       }
 
       // reset x,y,z positions if particle crosses Mesh boundary using periodic BCs
+      // RK position registers must be shifted with the position so the low-storage
+      // combination (gam0*x + gam1*x1) stays in a single periodic image
       if (x1 < meshsize.x1min) {
         pr(IPX,p) += (meshsize.x1max - meshsize.x1min);
+        if (has_reg) {pr(IPX1,p) += (meshsize.x1max - meshsize.x1min);}
       } else if (x1 > meshsize.x1max) {
         pr(IPX,p) -= (meshsize.x1max - meshsize.x1min);
+        if (has_reg) {pr(IPX1,p) -= (meshsize.x1max - meshsize.x1min);}
       }
       if (x2 < meshsize.x2min) {
         pr(IPY,p) += (meshsize.x2max - meshsize.x2min);
+        if (has_reg) {pr(IPY1,p) += (meshsize.x2max - meshsize.x2min);}
       } else if (x2 > meshsize.x2max) {
         pr(IPY,p) -= (meshsize.x2max - meshsize.x2min);
+        if (has_reg) {pr(IPY1,p) -= (meshsize.x2max - meshsize.x2min);}
       }
       if (x3 < meshsize.x3min) {
         pr(IPZ,p) += (meshsize.x3max - meshsize.x3min);
+        if (has_reg) {pr(IPZ1,p) += (meshsize.x3max - meshsize.x3min);}
       } else if (x3 > meshsize.x3max) {
         pr(IPZ,p) -= (meshsize.x3max - meshsize.x3min);
+        if (has_reg) {pr(IPZ1,p) -= (meshsize.x3max - meshsize.x3min);}
       }
+      }  // end shear/standard crossing branch
     }
   });
   nprtcl_send = counter;
