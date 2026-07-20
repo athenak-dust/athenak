@@ -15,11 +15,14 @@
 //!     0 = -(2-q)*Omega*u_x     + sum_s eps_s*(v_phi,s - u_phi)/tau_s
 //!     0 =  2*Omega*v_phi,s - (v_x,s - u_x)/tau_s
 //!     0 = -(2-q)*Omega*v_x,s - (v_phi,s - u_phi)/tau_s
-//! (velocities relative to the background shear). The problem initializes this
-//! equilibrium exactly and the test verifies it is HELD TO ROUND-OFF: because the
+//! (velocities relative to the background shear). By default the problem uses a quiet
+//! particle lattice, initializes this equilibrium exactly, and verifies it is HELD TO
+//! ROUND-OFF: because the
 //! rotation/shear/forcing kicks and the implicit drag solve are composed unsplit inside
 //! the IMEX stages, the discrete update has the continuum equilibrium as an exact fixed
 //! point (any Strang-like splitting error would appear as secular drift).
+//! <problem>/particle_placement=random instead gives a reproducible warm start at the
+//! same NSH velocities for nonlinear streaming-instability calculations.
 //!
 //! Works in the 2D r-z shearing box (azimuthal components in IM3/IPVZ, plain periodic
 //! boundaries) and in 3D (azimuthal in IM2/IPVY, shear-periodic x1 boundaries).
@@ -31,6 +34,7 @@
 // C++ headers
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>     // fopen(), fprintf()
 #include <iostream>
 #include <limits>
@@ -54,6 +58,27 @@ void DustNSHErrors(ParameterInput *pin, Mesh *pm);
 void DustNSHHistory(HistoryData *pdata, Mesh *pm);
 
 namespace {
+
+//----------------------------------------------------------------------------------------
+//! \fn HashUniform01
+//! \brief Reproducible stateless pseudo-random number in [0,1), suitable for device code.
+
+KOKKOS_INLINE_FUNCTION
+Real HashUniform01(std::uint64_t key) {
+  // SplitMix64 finalizer. Using particle tags as keys makes the initial condition
+  // independent of Kokkos execution order and therefore reproducible on CPU and GPU.
+  key += UINT64_C(0x9e3779b97f4a7c15);
+  key = (key ^ (key >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+  key = (key ^ (key >> 27)) * UINT64_C(0x94d049bb133111eb);
+  key ^= key >> 31;
+#if SINGLE_PRECISION_ENABLED
+  // All integers through 2^24 are exactly representable as float.  Using 24 bits keeps
+  // the largest result at 1 - 2^-24; casting a 53-bit value to float could round to 1.
+  return static_cast<Real>(key >> 40) * static_cast<Real>(1.0/16777216.0);
+#else
+  return static_cast<Real>(key >> 11) * static_cast<Real>(1.0/9007199254740992.0);
+#endif
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn SolveNSH
@@ -153,7 +178,17 @@ void ReadNSHParams(ParameterInput *pin, MeshBlockPack *pmbp,
 //! \brief Problem Generator for the multi-species NSH drift equilibrium
 
 void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
-  pgen_final_func = DustNSHErrors;
+  std::string placement = pin->GetOrAddString("problem","particle_placement","lattice");
+  bool random_placement = (placement.compare("random") == 0);
+  if (!random_placement && placement.compare("lattice") != 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "<problem>/particle_placement must be lattice or random"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  bool check_equilibrium =
+      pin->GetOrAddBoolean("problem","check_equilibrium",!random_placement);
+  pgen_final_func = check_equilibrium ? DustNSHErrors : nullptr;
   user_hist_func = DustNSHHistory;   // used only when <problem>/user_hist = true
   if (restart) return;
 
@@ -221,7 +256,9 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     u0(m,IM3,k,j,i) = three_d ? 0.0 : rho0*ugp;
   });
 
-  // initialize particles on a lattice at the per-species equilibrium velocities
+  // Initialize particles at the per-species equilibrium velocities. The lattice is the
+  // quiet start used by the NSH regression test. Random placement is the warm start for
+  // nonlinear streaming-instability calculations (e.g. Johansen et al. 2007 Run BA).
   particles::Particles *ppar = pmbp->ppart;
   int npart = ppar->nprtcl_thispack;
   auto &pr = ppar->prtcl_rdata;
@@ -231,14 +268,20 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   int npart_permb = npart/nmb;
   int ncells = indcs.nx1*indcs.nx2*indcs.nx3;
   int ppc_int = npart_permb/ncells;
-  if ((npart_permb != ppc_int*ncells) || (ppc_int % nspec != 0)) {
+  if ((!random_placement &&
+       ((npart_permb != ppc_int*ncells) || (ppc_int % nspec != 0))) ||
+      (random_placement && (npart % nspec != 0))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "NSH test requires <particles>/ppc to be an integer multiple of "
-              << "<dust>/nspecies" << std::endl;
+              << "NSH lattice placement requires <particles>/ppc to be an integer "
+              << "multiple of <dust>/nspecies; random placement requires the total "
+              << "number of particles per rank to be divisible by <dust>/nspecies"
+              << std::endl;
     std::exit(EXIT_FAILURE);
   }
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2, lnx3 = indcs.nx3;
   Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
+  std::uint64_t random_seed = static_cast<std::uint64_t>(
+      pin->GetOrAddInteger("problem","random_seed",1));
   auto &taus_ = pmbp->pdust->taus;
   // per-species device table: [s][0]=v_x, [s][1]=v_phi, [s][2]=mass factor
   DualArray2D<Real> spdat("nsh_spdat",nspec,3);
@@ -251,19 +294,45 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   spdat.template sync<DevExeSpace>();
 
   par_for("nsh_part", DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
-    int m = p/npart_permb;
-    if (m > (nmb-1)) {m = nmb-1;}
+    int m, s;
+    if (random_placement) {
+      // Offset the tag stream before hashing so different seeds generate independent
+      // position sets.  XOR with the raw tag is not sufficient: for consecutive tags
+      // spanning complete power-of-two ranges it only permutes the same set of keys.
+      std::uint64_t key = static_cast<std::uint64_t>(pi(PTAG,p))
+                        + random_seed*UINT64_C(0x9e3779b97f4a7c15);
+      m = static_cast<int>(HashUniform01(key)*static_cast<Real>(nmb));
+      if (m > (nmb-1)) {m = nmb-1;}
+      Real ux = HashUniform01(key + UINT64_C(0x632be59bd9b4e019));
+      Real uy = HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7));
+      Real uz = HashUniform01(key + UINT64_C(0x58f38ded6f7c55b5));
+      pr(IPX,p) = mbsize.d_view(m).x1min
+                + ux*(mbsize.d_view(m).x1max - mbsize.d_view(m).x1min);
+      pr(IPY,p) = mbsize.d_view(m).x2min
+                + uy*(mbsize.d_view(m).x2max - mbsize.d_view(m).x2min);
+      pr(IPZ,p) = three_d ? mbsize.d_view(m).x3min
+                + uz*(mbsize.d_view(m).x3max - mbsize.d_view(m).x3min) : 0.0;
+      // Stripe species by the local particle index. Unlike PTAG % nspec, this remains
+      // balanced when <particles>/assign_tag=rank_order and nranks shares a factor with
+      // nspec. The divisibility check above guarantees equal counts in this pack.
+      s = p % nspec;
+    } else {
+      m = p/npart_permb;
+      if (m > (nmb-1)) {m = nmb-1;}
+      int q = p - m*npart_permb;
+      int c = q/ppc_int;
+      s = (q % ppc_int) % nspec;
+      int i = c % lnx1;
+      int j = (c/lnx1) % lnx2;
+      int k = c/(lnx1*lnx2);
+      pr(IPX,p) = CellCenterX(i, lnx1, mbsize.d_view(m).x1min,
+                             mbsize.d_view(m).x1max);
+      pr(IPY,p) = CellCenterX(j, lnx2, mbsize.d_view(m).x2min,
+                             mbsize.d_view(m).x2max);
+      pr(IPZ,p) = three_d ?
+          CellCenterX(k, lnx3, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max) : 0.0;
+    }
     pi(PGID,p) = gids + m;
-    int q = p - m*npart_permb;
-    int c = q/ppc_int;
-    int s = (q % ppc_int) % nspec;
-    int i = c % lnx1;
-    int j = (c/lnx1) % lnx2;
-    int k = c/(lnx1*lnx2);
-    pr(IPX,p) = CellCenterX(i, lnx1, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max);
-    pr(IPY,p) = CellCenterX(j, lnx2, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max);
-    pr(IPZ,p) = three_d ?
-        CellCenterX(k, lnx3, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max) : 0.0;
     pi(PSP,p) = s;
     pr(IPTS,p) = taus_.d_view(s);
     Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
