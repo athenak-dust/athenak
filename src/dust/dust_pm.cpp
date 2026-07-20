@@ -72,7 +72,7 @@ void PMWeights(const Real x, const Real xmin, const Real xmax, const int nx,
 //! \brief Zero the (Q,P) field and scatter the drag-weighted particle sums into it.
 
 TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
 
   Kokkos::deep_copy(DevExeSpace(), qdep, 0.0);
 

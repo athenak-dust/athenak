@@ -380,9 +380,16 @@ TaskStatus ParticlesBoundaryValues::InitPrtclRecv() {
     nprtcl_recv += recvs_thisrank[n].nprtcls;
   }
 
-  // Allocate receive buffer
-  Kokkos::realloc(prtcl_rrecvbuf, (pmy_part->nrdata)*nprtcl_recv);
-  Kokkos::realloc(prtcl_irecvbuf, (pmy_part->nidata)*nprtcl_recv);
+  // Retain high-water capacities across migration stages.  MPI uses only the valid
+  // prefixes described by nprtcl_recv, so no buffer contents need to be preserved.
+  std::size_t rrecv_required = static_cast<std::size_t>(pmy_part->nrdata)*nprtcl_recv;
+  std::size_t irecv_required = static_cast<std::size_t>(pmy_part->nidata)*nprtcl_recv;
+  if (prtcl_rrecvbuf.extent(0) < rrecv_required) {
+    Kokkos::realloc(prtcl_rrecvbuf, rrecv_required);
+  }
+  if (prtcl_irecvbuf.extent(0) < irecv_required) {
+    Kokkos::realloc(prtcl_irecvbuf, irecv_required);
+  }
 
   // Post non-blocking receives
   bool no_errors=true;
@@ -450,9 +457,16 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
 
   bool no_errors=true;
   if (nprtcl_send > 0) {
-    // Allocate send buffer
-    Kokkos::realloc(prtcl_rsendbuf, (pmy_part->nrdata)*nprtcl_send);
-    Kokkos::realloc(prtcl_isendbuf, (pmy_part->nidata)*nprtcl_send);
+    // Retain high-water capacities across migration stages.  Only the current valid
+    // prefixes are packed and passed to MPI.
+    std::size_t rsend_required = static_cast<std::size_t>(pmy_part->nrdata)*nprtcl_send;
+    std::size_t isend_required = static_cast<std::size_t>(pmy_part->nidata)*nprtcl_send;
+    if (prtcl_rsendbuf.extent(0) < rsend_required) {
+      Kokkos::realloc(prtcl_rsendbuf, rsend_required);
+    }
+    if (prtcl_isendbuf.extent(0) < isend_required) {
+      Kokkos::realloc(prtcl_isendbuf, isend_required);
+    }
 
     // sendlist on device is already sorted by destrank in CountSendAndRecvs()
     // Use sendlist on device to load particles into send buffer ordered by dest_rank

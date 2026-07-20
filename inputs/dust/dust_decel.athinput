@@ -69,6 +69,7 @@ dust_to_gas   = 1.0       # overridden by <problem>/eps_1 below
 back_reaction = true      # dust drags gas (PMBR)
 deposit       = tsc       # particle-mesh deposit scheme
 gamma_switch  = false     # fixed gamma = 1+1/sqrt(2) (true tests the stiff switch)
+stopping_time_mode = species_fixed # species_fixed, particle_static, or dynamic
 dt_cfl        = 0.9       # particle transport CFL number
 
 <problem>

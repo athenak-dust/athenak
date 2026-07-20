@@ -25,6 +25,66 @@
 namespace dust {
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::RefreshStoppingTimeMaximum
+//! \brief Validates the post-pgen particle stopping times and, for particle_static or
+//! dynamic mode, obtains their maximum across all ranks.  A maximum-finite-Real sentinel
+//! folds validation into the same MAX reduction, so dynamic mode needs only one MPI
+//! collective per cycle.  species_fixed and particle_static call this only once.
+
+void DustGasDrag::RefreshStoppingTimeMaximum() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  auto &taus_ = taus;
+  int npart = ppar->nprtcl_thispack;
+  int nspec = nspecies;
+  int mode = static_cast<int>(stopping_time_mode);
+  int fixed_mode = static_cast<int>(DustStoppingTimeMode::species_fixed);
+  Real bad_value = std::numeric_limits<Real>::max();
+  Real rel_tol = 64.0*std::numeric_limits<Real>::epsilon();
+
+  Real local_max = 0.0;
+  if (npart > 0) {
+    Kokkos::parallel_reduce("dust_validate_tstop",
+    Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, Real &max_tstop) {
+      int s = pi(PSP,p);
+      Real ts = pr(IPTS,p);
+      bool bad = (s < 0 || s >= nspec || !Kokkos::isfinite(ts) || !(ts > 0.0));
+      if (!bad && mode == fixed_mode) {
+        Real ts_ref = taus_.d_view(s);
+        bad = (fabs(ts - ts_ref) > rel_tol*fabs(ts_ref));
+      }
+      Real candidate = bad ? bad_value : ts;
+      max_tstop = fmax(max_tstop, candidate);
+    }, Kokkos::Max<Real>(local_max));
+  }
+
+#if MPI_PARALLEL_ENABLED
+  int ierr = MPI_Allreduce(MPI_IN_PLACE, &local_max, 1, MPI_ATHENA_REAL, MPI_MAX,
+                           MPI_COMM_WORLD);
+  if (ierr != MPI_SUCCESS) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "MPI error while reducing dust stopping times" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+#endif
+
+  if (local_max == bad_value) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Invalid dust particle stopping-time state: PSP must be in "
+              << "[0, nspecies), IPTS must be finite and positive, and species_fixed "
+              << "requires IPTS = taus_[PSP]" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
+  if (stopping_time_mode != DustStoppingTimeMode::species_fixed && local_max > 0.0) {
+    taus_max = local_max;
+  }
+  stopping_times_initialized = true;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::NewTimeStep
 //! \brief Computes the minimum particle transport timestep min(dx/|v_transport|) over
 //! all particles. In the 3D shearing box the azimuthal transport velocity includes the
@@ -79,6 +139,10 @@ TaskStatus DustGasDrag::NewTimeStep(Driver *pdrive, int stage) {
 //! recorded drag rates are consumed strictly within one cycle.
 
 TaskStatus DustGasDrag::GammaSwitch(Driver *pdrive, int stage) {
+  if (!stopping_times_initialized ||
+      stopping_time_mode == DustStoppingTimeMode::dynamic) {
+    RefreshStoppingTimeMaximum();
+  }
   if (!gamma_switch) {return TaskStatus::complete;}
 
   Real gnew = (pmy_pack->pmesh->dt > taus_max) ? 0.5 : 1.0 + 1.0/sqrt(2.0);

@@ -93,8 +93,26 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // (2) read parameters ----------------------------------------------------------------
   back_reaction = pin->GetOrAddBoolean("dust","back_reaction",true);
   gamma_switch  = pin->GetOrAddBoolean("dust","gamma_switch",false);
+  stopping_times_initialized = false;
   dt_cfl        = pin->GetOrAddReal("dust","dt_cfl",0.5);
   dust_to_gas   = pin->GetOrAddReal("dust","dust_to_gas",0.01);
+
+  {
+    std::string mode = pin->GetOrAddString("dust","stopping_time_mode","species_fixed");
+    if (mode.compare("species_fixed") == 0) {
+      stopping_time_mode = DustStoppingTimeMode::species_fixed;
+    } else if (mode.compare("particle_static") == 0) {
+      stopping_time_mode = DustStoppingTimeMode::particle_static;
+    } else if (mode.compare("dynamic") == 0) {
+      stopping_time_mode = DustStoppingTimeMode::dynamic;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<dust>/stopping_time_mode = '" << mode
+                << "' not recognized (must be species_fixed, particle_static, or "
+                << "dynamic)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
 
   // drag work is not deposited into the gas energy equation, so back-reaction requires
   // an isothermal EOS for a consistent energy budget

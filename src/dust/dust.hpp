@@ -34,6 +34,12 @@ class ShearingBoxCC;
 // constants that enumerate particle-mesh deposit schemes
 enum class DustDeposit {ngp=0, cic=1, tsc=2};
 
+// contract for per-particle stopping times.  The default species_fixed mode keeps the
+// configured species table authoritative; particle_static permits arbitrary positive
+// per-particle values that remain constant; dynamic refreshes their global maximum once
+// per cycle.
+enum class DustStoppingTimeMode {species_fixed=0, particle_static=1, dynamic=2};
+
 //----------------------------------------------------------------------------------------
 //! \struct DustGasDragTaskIDs
 //  \brief container to hold TaskIDs of all dust+hydro tasks
@@ -70,6 +76,7 @@ class DustGasDrag {
   int nspecies;              // number of dust species (per-species stopping times)
   bool back_reaction;        // dust exerts drag on gas (PMBR); false = test particles
   bool gamma_switch;         // switch gamma to 1/2 when dt > max stopping time (Krapp24)
+  bool stopping_times_initialized;  // post-pgen stopping-time contract has been checked
   bool is_shearing_box;      // <shearing_box> block present
   bool is_stratified;        // vertical gravity (3D shearing box only)
   Real qshear, omega0;       // shearing box parameters (0 if no shearing box)
@@ -78,6 +85,7 @@ class DustGasDrag {
   Real dust_to_gas;          // total dust/gas mass ratio for default mass normalization
   DualArray1D<Real> taus;    // per-species stopping times
   DustDeposit deposit;       // particle-mesh deposit scheme (tsc default)
+  DustStoppingTimeMode stopping_time_mode;
 
   // deposited fields, dimensioned (nmb, nvar, ncells3, ncells2, ncells1)
   DvceArray5D<Real> qdep;    // nvar=4: [0]=Q (drag-weighted density sum), [1-3]=P
@@ -103,6 +111,9 @@ class DustGasDrag {
 
   // ...in "before_timeintegrator" list
   TaskStatus GammaSwitch(Driver *pdrive, int stage);
+  // Must be public because NVCC extended host/device lambdas cannot be enclosed by a
+  // private or protected member function.
+  void RefreshStoppingTimeMaximum();  // validate IPTS; refresh taus_max when requested
   // ...in "before_stagen" list
   TaskStatus InitRecvDep(Driver *pdrive, int stage);
   // ...in "stagen" list

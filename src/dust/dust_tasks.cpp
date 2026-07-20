@@ -117,8 +117,11 @@ void DustGasDrag::AssembleDustGasDragTasks(
 TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
 
-  TaskStatus tstat = pbval_qp->InitRecv(4);
-  if (tstat != TaskStatus::complete) return tstat;
+  TaskStatus tstat = TaskStatus::complete;
+  if (back_reaction) {
+    tstat = pbval_qp->InitRecv(4);
+    if (tstat != TaskStatus::complete) return tstat;
+  }
   tstat = pbval_us->InitRecv(3);
   if (tstat != TaskStatus::complete) return tstat;
   if (back_reaction) {
@@ -137,12 +140,12 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
 // Send/receive wrappers for the three exchanges of the implicit drag solve
 
 TaskStatus DustGasDrag::SendDepQP(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
   return pbval_qp->PackAndSendDeposit(qdep);
 }
 
 TaskStatus DustGasDrag::RecvDepQP(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
   return pbval_qp->RecvAndSumDeposit(qdep);
 }
 
