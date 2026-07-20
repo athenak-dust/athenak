@@ -270,6 +270,7 @@ DustGasDrag::~DustGasDrag() {
     std::sort(iterations.begin(), iterations.end());
     auto quantile = [&](double fraction) {
       if (iterations.empty()) return 0;
+      if (fraction <= 0.0) return iterations.front();
       std::size_t index = static_cast<std::size_t>(
           std::ceil(fraction*static_cast<double>(iterations.size())) - 1.0);
       index = std::min(index, iterations.size() - 1);

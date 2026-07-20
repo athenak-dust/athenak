@@ -148,8 +148,11 @@ class DustGasDrag {
   unsigned long long solver_pcg_stage_count = 0;
   double solver_wall_seconds = 0.0;
   std::vector<int> solver_pcg_iterations;
-  Real solver_last_residual = 0.0;
-  Real solver_last_epsmax = 0.0;
+  Real solver_last_residual = -1.0;  // negative means a true residual was not sampled
+  Real solver_last_epsmax = -1.0;  // negative means this mode did not sample epsilon_c
+  Real solver_last_error_bound = -1.0;
+  Real solver_last_acceptance_target = -1.0;
+  Real solver_last_state_scale = -1.0;
   int solver_last_iterations = 0;
   bool solver_last_fast_accept = false;
 

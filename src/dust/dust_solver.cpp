@@ -544,7 +544,11 @@ TaskStatus DustGasDrag::SolveCoupledStage(Driver *pdrive, int stage) {
 
   solver_last_iterations=0;
   solver_last_fast_accept=false;
-  solver_last_residual=0.0;
+  solver_last_residual=-1.0;
+  solver_last_epsmax=-1.0;
+  solver_last_error_bound=-1.0;
+  solver_last_acceptance_target=-1.0;
+  solver_last_state_scale=-1.0;
   if (drag_solver == DustDragSolver::applya) {
     ApplyCoupledOperator(x,ap,a_dt);
   } else if (drag_solver == DustDragSolver::dc1 ||
@@ -572,6 +576,9 @@ TaskStatus DustGasDrag::SolveCoupledStage(Driver *pdrive, int stage) {
       solver_last_residual=residual_norm;
       Real state_scale,target;
       Real bound=AdaptiveErrorBound(a_dt,residual_norm,state_scale,target);
+      solver_last_error_bound=bound;
+      solver_last_acceptance_target=target;
+      solver_last_state_scale=state_scale;
       if (bound <= target) {
         solver_last_fast_accept=true;
         ++solver_fast_accept_count;
@@ -597,6 +604,9 @@ TaskStatus DustGasDrag::SolveCoupledStage(Driver *pdrive, int stage) {
     std::cout << "# DUST_SOLVER_DIAG cycle=" << pmy_pack->pmesh->ncycle
               << " eps_c_max=" << solver_last_epsmax
               << " true_residual=" << solver_last_residual
+              << " alg_error_bound=" << solver_last_error_bound
+              << " acceptance_target=" << solver_last_acceptance_target
+              << " state_scale=" << solver_last_state_scale
               << " pcg_iterations=" << solver_last_iterations
               << " fast_accept=" << (solver_last_fast_accept?1:0) << std::endl;
   }

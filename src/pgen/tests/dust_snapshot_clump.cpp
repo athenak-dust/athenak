@@ -385,32 +385,45 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 }
 
 //----------------------------------------------------------------------------------------
-//! \brief Global dust mass and momentum.  Together with the standard gas history this
-//! gives a direct round-off-level action--reaction check for every solver mode.
+//! \brief Global dust mass, momentum, and directional kinetic energy.  Together with
+//! the standard gas history these give action--reaction and temporal-convergence checks.
 
 void DustSnapshotClumpHistory(HistoryData *pdata, Mesh *pm) {
   particles::Particles *ppar = pm->pmb_pack->ppart;
-  pdata->nhist = 4;
+  pdata->nhist = 7;
   pdata->label[0] = "dust_mass";
   pdata->label[1] = "dust_mom1";
   pdata->label[2] = "dust_mom2";
   pdata->label[3] = "dust_mom3";
+  pdata->label[4] = "dust_ke1";
+  pdata->label[5] = "dust_ke2";
+  pdata->label[6] = "dust_ke3";
 
   auto &pr = ppar->prtcl_rdata;
   int npart = ppar->nprtcl_thispack;
   Real mass = 0.0, mom1 = 0.0, mom2 = 0.0, mom3 = 0.0;
+  Real ke1 = 0.0, ke2 = 0.0, ke3 = 0.0;
   Kokkos::parallel_reduce("snapshot_clump_history",
   Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
-  KOKKOS_LAMBDA(const int p, Real &mass_, Real &mom1_, Real &mom2_, Real &mom3_) {
+  KOKKOS_LAMBDA(const int p, Real &mass_, Real &mom1_, Real &mom2_, Real &mom3_,
+                Real &ke1_, Real &ke2_, Real &ke3_) {
     Real mp = pr(IPM,p);
+    Real vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
     mass_ += mp;
-    mom1_ += mp*pr(IPVX,p);
-    mom2_ += mp*pr(IPVY,p);
-    mom3_ += mp*pr(IPVZ,p);
+    mom1_ += mp*vx;
+    mom2_ += mp*vy;
+    mom3_ += mp*vz;
+    ke1_ += 0.5*mp*vx*vx;
+    ke2_ += 0.5*mp*vy*vy;
+    ke3_ += 0.5*mp*vz*vz;
   }, Kokkos::Sum<Real>(mass), Kokkos::Sum<Real>(mom1), Kokkos::Sum<Real>(mom2),
-     Kokkos::Sum<Real>(mom3));
+     Kokkos::Sum<Real>(mom3), Kokkos::Sum<Real>(ke1), Kokkos::Sum<Real>(ke2),
+     Kokkos::Sum<Real>(ke3));
   pdata->hdata[0] = mass;
   pdata->hdata[1] = mom1;
   pdata->hdata[2] = mom2;
   pdata->hdata[3] = mom3;
+  pdata->hdata[4] = ke1;
+  pdata->hdata[5] = ke2;
+  pdata->hdata[6] = ke3;
 }
