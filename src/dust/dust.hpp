@@ -20,8 +20,10 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "athena.hpp"
+#include "coordinates/cell_locations.hpp"
 #include "parameter_input.hpp"
 #include "tasklist/task_list.hpp"
 #include "bvals/bvals.hpp"
@@ -39,6 +41,10 @@ enum class DustDeposit {ngp=0, cic=1, tsc=2};
 // per-particle values that remain constant; dynamic refreshes their global maximum once
 // per cycle.
 enum class DustStoppingTimeMode {species_fixed=0, particle_static=1, dynamic=2};
+
+// `local` is the regression baseline. `applya` executes one non-mutating coupled
+// operator application and then retains the local answer, for marginal-cost timing.
+enum class DustDragSolver {local=0, applya=1, dc1=2, pcg=3, adaptive=4};
 
 //----------------------------------------------------------------------------------------
 //! \struct DustGasDragTaskIDs
@@ -64,6 +70,31 @@ struct DustGasDragTaskIDs {
 
 namespace dust {
 
+// Shared NGP/CIC/TSC stencil for deposits, matrix-free gathers, and the final kick.
+// One helper is used everywhere so the coupled operator and conservative commit cannot
+// silently acquire different particle-mesh weights.
+KOKKOS_INLINE_FUNCTION
+void PMWeights(const Real x, const Real xmin, const Real xmax, const int nx,
+               const int is, const int scheme, int &ip, Real w[3]) {
+  Real dx = (xmax - xmin)/static_cast<Real>(nx);
+  int ig = static_cast<int>((x - xmin)/dx + 1.0) - 1;
+  Real del = (x - CellCenterX(ig, nx, xmin, xmax))/dx;
+  ip = ig + is;
+  if (scheme == 0) {
+    w[0] = 0.0;
+    w[1] = 1.0;
+    w[2] = 0.0;
+  } else if (scheme == 1) {
+    w[0] = fmax(0.0, -del);
+    w[1] = 1.0 - fabs(del);
+    w[2] = fmax(0.0, del);
+  } else {
+    w[0] = 0.5*SQR(0.5 - del);
+    w[1] = 0.75 - SQR(del);
+    w[2] = 0.5*SQR(0.5 + del);
+  }
+}
+
 //----------------------------------------------------------------------------------------
 //! \class DustGasDrag
 
@@ -86,18 +117,41 @@ class DustGasDrag {
   DualArray1D<Real> taus;    // per-species stopping times
   DustDeposit deposit;       // particle-mesh deposit scheme (tsc default)
   DustStoppingTimeMode stopping_time_mode;
+  DustDragSolver drag_solver;
+  Real drag_rtol, drag_atol;
+  int drag_iter_max, drag_diagnostic_interval;
+  Real adaptive_order_c, adaptive_rtol_max, adaptive_tref, adaptive_state_floor;
 
   // deposited fields, dimensioned (nmb, nvar, ncells3, ncells2, ncells1)
   DvceArray5D<Real> qdep;    // nvar=4: [0]=Q (drag-weighted density sum), [1-3]=P
   DvceArray5D<Real> ustar;   // nvar=3: provisional drag-corrected gas velocity u*
   DvceArray5D<Real> dmom;    // nvar=3: PMBR momentum deposit; becomes R_g after apply
   DvceArray5D<Real> cdummy;  // 1-element dummy coarse array for ustar copy exchange
+  DvceArray5D<Real> solver_r;   // coupled-solver residual
+  DvceArray5D<Real> solver_p;   // PCG search direction
+  DvceArray5D<Real> solver_ap;  // matrix-free A*x / A*p work field
 
   // Boundary communication objects
   MeshBoundaryValuesDep *pbval_qp;  // additive exchange of (Q,P) ghost deposits
   MeshBoundaryValuesDep *pbval_dm;  // additive exchange of PMBR ghost deposits
   MeshBoundaryValuesCC  *pbval_us;  // copy exchange to fill u* ghost zones
   ShearingBoxCC *psbox_us = nullptr;  // shear-periodic remap of u* x1 ghost zones (3D)
+  MeshBoundaryValuesCC *pbval_solver_copy = nullptr;
+  MeshBoundaryValuesDep *pbval_solver_add = nullptr;
+
+  // Cumulative rank-local timing and globally consistent iteration diagnostics.
+  unsigned long long solver_stage_count = 0;
+  unsigned long long solver_applya_count = 0;
+  unsigned long long solver_halo_count = 0;
+  unsigned long long solver_reduction_count = 0;
+  unsigned long long solver_fast_accept_count = 0;
+  unsigned long long solver_pcg_stage_count = 0;
+  double solver_wall_seconds = 0.0;
+  std::vector<int> solver_pcg_iterations;
+  Real solver_last_residual = 0.0;
+  Real solver_last_epsmax = 0.0;
+  int solver_last_iterations = 0;
+  bool solver_last_fast_accept = false;
 
   // container to hold names of TaskIDs
   DustGasDragTaskIDs id;
@@ -124,6 +178,16 @@ class DustGasDrag {
   TaskStatus SendDepQP(Driver *pdrive, int stage);
   TaskStatus RecvDepQP(Driver *pdrive, int stage);
   TaskStatus GasImplicitSolve(Driver *pdrive, int stage);  // u* = (rho*u+P)/(rho+Q)
+  TaskStatus SolveCoupledStage(Driver *pdrive, int stage);
+  void ApplyCoupledOperator(DvceArray5D<Real> &field, DvceArray5D<Real> &result,
+                            Real a_dt);
+  void CompleteCopyExchange(DvceArray5D<Real> &field);
+  void CompleteAddExchange(DvceArray5D<Real> &field);
+  void GlobalDot(DvceArray5D<Real> &left, DvceArray5D<Real> &right, Real value[3]);
+  void GlobalPreconditionedNorm(DvceArray5D<Real> &residual, Real value[3]);
+  int StrictPCG(Real a_dt, bool residual_is_current);
+  Real AdaptiveErrorBound(Real a_dt, Real residual_norm, Real &state_scale,
+                          Real &acceptance_target);
   TaskStatus SendUstar(Driver *pdrive, int stage);
   TaskStatus RecvUstar(Driver *pdrive, int stage);
   TaskStatus SendUstarShr(Driver *pdrive, int stage);

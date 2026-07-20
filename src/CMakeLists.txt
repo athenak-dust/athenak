@@ -43,6 +43,7 @@ add_executable(
         dust/dust_newdt.cpp
         dust/dust_pm.cpp
         dust/dust_push.cpp
+        dust/dust_solver.cpp
         dust/dust_tasks.cpp
 
         dyn_grmhd/dyn_grmhd.cpp

@@ -7,6 +7,8 @@
 //! \brief implementation of DustGasDrag class constructor and support functions
 
 #include <algorithm>
+#include <cmath>
+#include <iomanip>
 #include <iostream>
 #include <string>
 
@@ -32,6 +34,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     ustar("ustar",1,1,1,1,1),
     dmom("dmom",1,1,1,1,1),
     cdummy("cdum",1,1,1,1,1),
+    solver_r("dust_solver_r",1,1,1,1,1),
+    solver_p("dust_solver_p",1,1,1,1,1),
+    solver_ap("dust_solver_ap",1,1,1,1,1),
     pmy_pack(ppack) {
   // (1) validate configuration ----------------------------------------------------------
   hydro::Hydro *phyd = pmy_pack->phydro;
@@ -96,6 +101,45 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   stopping_times_initialized = false;
   dt_cfl        = pin->GetOrAddReal("dust","dt_cfl",0.5);
   dust_to_gas   = pin->GetOrAddReal("dust","dust_to_gas",0.01);
+
+  {
+    std::string solver = pin->GetOrAddString("dust", "drag_solver", "local");
+    if (solver.compare("local") == 0) {
+      drag_solver = DustDragSolver::local;
+    } else if (solver.compare("applya") == 0) {
+      drag_solver = DustDragSolver::applya;
+    } else if (solver.compare("dc1") == 0) {
+      drag_solver = DustDragSolver::dc1;
+    } else if (solver.compare("pcg") == 0) {
+      drag_solver = DustDragSolver::pcg;
+    } else if (solver.compare("adaptive") == 0) {
+      drag_solver = DustDragSolver::adaptive;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<dust>/drag_solver = '" << solver
+                << "' not recognized (must be local, applya, dc1, pcg, or adaptive)"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+  drag_rtol = pin->GetOrAddReal("dust", "drag_rtol", 1.0e-11);
+  drag_atol = pin->GetOrAddReal("dust", "drag_atol", 1.0e-14);
+  drag_iter_max = pin->GetOrAddInteger("dust", "drag_iter_max", 200);
+  drag_diagnostic_interval = pin->GetOrAddInteger("dust", "drag_diagnostic_interval", 0);
+  adaptive_order_c = pin->GetOrAddReal("dust", "drag_adaptive_order_c", 0.25);
+  adaptive_rtol_max = pin->GetOrAddReal("dust", "drag_adaptive_rtol_max", 1.0e-3);
+  adaptive_tref = pin->GetOrAddReal("dust", "drag_adaptive_tref", 1.0);
+  adaptive_state_floor = pin->GetOrAddReal("dust", "drag_adaptive_state_floor", 1.0);
+  std::string fail_policy = pin->GetOrAddString("dust", "drag_fail_policy", "abort");
+  if (drag_rtol <= 0.0 || drag_atol < 0.0 || drag_iter_max < 1 ||
+      drag_diagnostic_interval < 0 || adaptive_order_c <= 0.0 ||
+      adaptive_rtol_max <= 0.0 || adaptive_tref <= 0.0 ||
+      adaptive_state_floor <= 0.0 || fail_policy.compare("abort") != 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Invalid coupled drag-solver tolerance/iteration policy; "
+              << "only drag_fail_policy=abort is supported" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 
   {
     std::string mode = pin->GetOrAddString("dust","stopping_time_mode","species_fixed");
@@ -173,6 +217,12 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     omega0 = 0.0;
     is_stratified = false;
   }
+  if (drag_solver != DustDragSolver::local && shear_x1) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Coupled drag solvers require ordinary periodic boundaries; "
+              << "the exact-transpose shear deposit is not implemented" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 
   // (3) allocate deposited fields (with ghost zones) ------------------------------------
   auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -184,6 +234,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::realloc(ustar, nmb, 3, ncells3, ncells2, ncells1);
   Kokkos::realloc(dmom,  nmb, 3, ncells3, ncells2, ncells1);
   Kokkos::deep_copy(dmom, 0.0);  // read as R_g=0 in stage 2 if back_reaction is off
+  if (drag_solver != DustDragSolver::local) {
+    Kokkos::realloc(solver_r,  nmb, 3, ncells3, ncells2, ncells1);
+    Kokkos::realloc(solver_p,  nmb, 3, ncells3, ncells2, ncells1);
+    Kokkos::realloc(solver_ap, nmb, 3, ncells3, ncells2, ncells1);
+  }
 
   // (4) allocate boundary communication objects -----------------------------------------
   pbval_qp = new MeshBoundaryValuesDep(pmy_pack, pin);
@@ -192,6 +247,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   pbval_dm->InitializeBuffers(3);
   pbval_us = new MeshBoundaryValuesCC(pmy_pack, pin, false);
   pbval_us->InitializeBuffers(3);
+  if (drag_solver != DustDragSolver::local) {
+    // These objects own distinct communicators/requests and are reinitialized for every
+    // matrix-free matvec; they must not alias the one-shot stage exchanges above.
+    pbval_solver_copy = new MeshBoundaryValuesCC(pmy_pack, pin, false);
+    pbval_solver_copy->InitializeBuffers(3);
+    pbval_solver_add = new MeshBoundaryValuesDep(pmy_pack, pin);
+    pbval_solver_add->InitializeBuffers(3);
+  }
   // shear-periodic remap of the u* radial ghost zones (3D shearing box only)
   if (shear_x1 && pmy_pack->pmesh->three_d) {
     psbox_us = new ShearingBoxCC(pmy_pack, pin, 3);
@@ -202,9 +265,39 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
 // destructor
 
 DustGasDrag::~DustGasDrag() {
+  if (global_variable::my_rank == 0 && solver_stage_count > 0) {
+    std::vector<int> iterations = solver_pcg_iterations;
+    std::sort(iterations.begin(), iterations.end());
+    auto quantile = [&](double fraction) {
+      if (iterations.empty()) return 0;
+      std::size_t index = static_cast<std::size_t>(
+          std::ceil(fraction*static_cast<double>(iterations.size())) - 1.0);
+      index = std::min(index, iterations.size() - 1);
+      return iterations[index];
+    };
+    const char *name = (drag_solver == DustDragSolver::applya) ? "applya" :
+                       (drag_solver == DustDragSolver::dc1) ? "dc1" :
+                       (drag_solver == DustDragSolver::pcg) ? "pcg" :
+                       (drag_solver == DustDragSolver::adaptive) ? "adaptive" : "local";
+    std::cout << std::setprecision(14)
+              << "# DUST_SOLVER_SUMMARY mode=" << name
+              << " stages=" << solver_stage_count
+              << " applya=" << solver_applya_count
+              << " halos=" << solver_halo_count
+              << " reductions=" << solver_reduction_count
+              << " fast_accept=" << solver_fast_accept_count
+              << " pcg_stages=" << solver_pcg_stage_count
+              << " pcg_iter_min=" << quantile(0.0)
+              << " pcg_iter_median=" << quantile(0.5)
+              << " pcg_iter_p95=" << quantile(0.95)
+              << " pcg_iter_max=" << quantile(1.0)
+              << " solve_seconds=" << solver_wall_seconds << std::endl;
+  }
   delete pbval_qp;
   delete pbval_dm;
   delete pbval_us;
+  if (pbval_solver_copy != nullptr) delete pbval_solver_copy;
+  if (pbval_solver_add != nullptr) delete pbval_solver_add;
   if (psbox_us != nullptr) {delete psbox_us;}
 }
 

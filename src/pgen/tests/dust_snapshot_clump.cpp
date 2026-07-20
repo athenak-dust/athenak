@@ -34,12 +34,15 @@
 #include "globals.hpp"
 #include "hydro/hydro.hpp"
 #include "mesh/mesh.hpp"
+#include "outputs/outputs.hpp"
 #include "parameter_input.hpp"
 #include "particles/particles.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
 #endif
+
+void DustSnapshotClumpHistory(HistoryData *pdata, Mesh *pm);
 
 namespace {
 
@@ -203,6 +206,7 @@ Real MapCoordinate(float source, Real source_min, Real source_max,
 //! \brief Initialize a controllable dust benchmark from a particle-snapshot template.
 
 void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
+  user_hist_func = DustSnapshotClumpHistory;
   if (restart) return;
 
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
@@ -378,4 +382,35 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     std::cout << "# snapshot-clump source selected mean pvel=" << source_mean[0] << " "
               << source_mean[1] << " " << source_mean[2] << std::endl;
   }
+}
+
+//----------------------------------------------------------------------------------------
+//! \brief Global dust mass and momentum.  Together with the standard gas history this
+//! gives a direct round-off-level action--reaction check for every solver mode.
+
+void DustSnapshotClumpHistory(HistoryData *pdata, Mesh *pm) {
+  particles::Particles *ppar = pm->pmb_pack->ppart;
+  pdata->nhist = 4;
+  pdata->label[0] = "dust_mass";
+  pdata->label[1] = "dust_mom1";
+  pdata->label[2] = "dust_mom2";
+  pdata->label[3] = "dust_mom3";
+
+  auto &pr = ppar->prtcl_rdata;
+  int npart = ppar->nprtcl_thispack;
+  Real mass = 0.0, mom1 = 0.0, mom2 = 0.0, mom3 = 0.0;
+  Kokkos::parallel_reduce("snapshot_clump_history",
+  Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
+  KOKKOS_LAMBDA(const int p, Real &mass_, Real &mom1_, Real &mom2_, Real &mom3_) {
+    Real mp = pr(IPM,p);
+    mass_ += mp;
+    mom1_ += mp*pr(IPVX,p);
+    mom2_ += mp*pr(IPVY,p);
+    mom3_ += mp*pr(IPVZ,p);
+  }, Kokkos::Sum<Real>(mass), Kokkos::Sum<Real>(mom1), Kokkos::Sum<Real>(mom2),
+     Kokkos::Sum<Real>(mom3));
+  pdata->hdata[0] = mass;
+  pdata->hdata[1] = mom1;
+  pdata->hdata[2] = mom2;
+  pdata->hdata[3] = mom3;
 }

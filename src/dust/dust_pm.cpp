@@ -32,40 +32,9 @@
 #include "driver/driver.hpp"
 #include "hydro/hydro.hpp"
 #include "particles/particles.hpp"
-#include "coordinates/cell_locations.hpp"
 #include "dust.hpp"
 
 namespace dust {
-
-//----------------------------------------------------------------------------------------
-//! \fn PMWeights
-//! \brief Computes the index of the cell containing position x and the three deposit
-//! weights over cells (ip-1, ip, ip+1) for the chosen scheme (0=NGP, 1=CIC, 2=TSC).
-//! Weights always sum to one. delta = (x - x_cellcenter)/dx is in [-0.5, 0.5] for any
-//! particle inside its MeshBlock.
-
-KOKKOS_INLINE_FUNCTION
-void PMWeights(const Real x, const Real xmin, const Real xmax, const int nx,
-               const int is, const int scheme, int &ip, Real w[3]) {
-  Real dx = (xmax - xmin)/static_cast<Real>(nx);
-  // true floor for arguments > -1 (cast truncates toward zero)
-  int ig = static_cast<int>((x - xmin)/dx + 1.0) - 1;
-  Real del = (x - CellCenterX(ig, nx, xmin, xmax))/dx;
-  ip = ig + is;
-  if (scheme == 0) {         // nearest grid point
-    w[0] = 0.0;
-    w[1] = 1.0;
-    w[2] = 0.0;
-  } else if (scheme == 1) {  // cloud-in-cell
-    w[0] = fmax(0.0, -del);
-    w[1] = 1.0 - fabs(del);
-    w[2] = fmax(0.0, del);
-  } else {                   // triangular-shaped cloud
-    w[0] = 0.5*SQR(0.5 - del);
-    w[1] = 0.75 - SQR(del);
-    w[2] = 0.5*SQR(0.5 + del);
-  }
-}
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::DepositDrag
@@ -158,6 +127,9 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
 
 TaskStatus DustGasDrag::GasImplicitSolve(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (back_reaction && drag_solver != DustDragSolver::local) {
+    return SolveCoupledStage(pdrive, stage);
+  }
 
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
