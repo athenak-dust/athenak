@@ -272,7 +272,10 @@ class ParticlesBoundaryValues {
   ~ParticlesBoundaryValues();
 
   int nprtcl_send, nprtcl_recv;
+  // sendlist allocation is persistent: nprtcl_send is the valid-prefix length, while
+  // sendlist.extent(0) is capacity.  Never shrink the allocation after a migration.
   DualArray1D<ParticleLocationData> sendlist;
+  DualArray1D<int> send_count;  // device-side append counter (length one)
 
   // shear-periodic x1 boundary support (uniform grids only). Particles crossing the
   // radial mesh boundaries are shifted azimuthally (positions only; velocities are

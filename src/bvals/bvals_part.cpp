@@ -12,7 +12,6 @@
 #include <vector>
 #include <algorithm>
 #include <Kokkos_Core.hpp>
-#include <Kokkos_StdAlgorithms.hpp>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -31,14 +30,14 @@ namespace particles {
 
 KOKKOS_INLINE_FUNCTION
 void UpdateGID(int &newgid, NeighborBlock nghbr, int myrank, int *pcounter,
-               DualArray1D<ParticleLocationData> slist, int p) {
+               DvceArray1D<ParticleLocationData> slist, int p) {
   newgid = nghbr.gid;
 #if MPI_PARALLEL_ENABLED
   if (nghbr.rank != myrank) {
     int index = Kokkos::atomic_fetch_add(pcounter,1);
-    slist.d_view(index).prtcl_indx = p;
-    slist.d_view(index).dest_gid   = nghbr.gid;
-    slist.d_view(index).dest_rank  = nghbr.rank;
+    slist(index).prtcl_indx = p;
+    slist(index).dest_gid   = nghbr.gid;
+    slist(index).dest_rank  = nghbr.rank;
   }
 #endif
   return;
@@ -59,14 +58,12 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
   auto &meshsize = pmy_part->pmy_pack->pmesh->mesh_size;
   auto myrank = global_variable::my_rank;
   auto &nghbr = pmy_part->pmy_pack->pmb->nghbr;
-  auto &psendl = sendlist;
-  int counter=0;
-  int *pcounter = &counter;
+  int *pcounter = nullptr;
   bool &multi_d = pmy_part->pmy_pack->pmesh->multi_d;
   bool &three_d = pmy_part->pmy_pack->pmesh->three_d;
   // dust particles carry RK position registers (IPX1/IPY1/IPZ1) that must be shifted by
   // the same box length as the positions when a particle wraps at a periodic boundary
-  const bool has_reg = (pmy_part->nrdata > IPX1);
+  const bool has_reg = (pmy_part->particle_type == ParticleType::dust);
 
   // shear-periodic x1 boundaries: particles crossing the radial mesh boundaries are
   // shifted azimuthally by the (folded) shear offset (positions only; velocities are
@@ -82,12 +79,21 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
   auto &sgid = sgid_map;
   auto &srnk = srank_map;
 
-  // Size the send list for the worst case (every particle crossing a rank boundary in
-  // the same stage). The previous 10% heuristic overflowed silently: coherent particle
-  // sheets (e.g. drifting lattices in a shearing box) cross block faces simultaneously,
-  // and the unchecked atomic append in UpdateGID then corrupts the heap. The list is
-  // shrunk to the actual send count immediately after the kernel.
-  Kokkos::realloc(sendlist, std::max(npart, 1));
+#if MPI_PARALLEL_ENABLED
+  // Keep a worst-case-capacity send list, but allocate only when the local particle
+  // high-water mark grows. nprtcl_send below is the logical valid-prefix length.  The
+  // persistent allocation avoids the previous grow-to-npart/shrink-to-nsend churn.
+  int required_capacity = std::max(npart, 1);
+  if (static_cast<int>(sendlist.extent(0)) < required_capacity) {
+    Kokkos::realloc(sendlist, required_capacity);
+  }
+  Kokkos::deep_copy(send_count.d_view, 0);
+  pcounter = send_count.d_view.data();
+#endif
+  // Capture only the CUDA-accessible view in the kernel. Capturing the DualView (or
+  // accessing the sendlist member through `this`) leaves a host pointer in a CUDA
+  // lambda and fails as soon as an inter-rank particle is appended or packed.
+  auto psendl = sendlist.d_view;
   par_for("part_update",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     int mylevel = mblev.d_view(m);
@@ -243,11 +249,39 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
       }  // end shear/standard crossing branch
     }
   });
-  nprtcl_send = counter;
-  Kokkos::resize(sendlist, nprtcl_send);
-  // sync sendlist device array with host
-  sendlist.template modify<DevExeSpace>();
-  sendlist.template sync<HostMemSpace>();
+#if MPI_PARALLEL_ENABLED
+  // This deep copy also synchronizes completion of the device append kernel.  Copy only
+  // the valid prefix to the host; DualView::sync() would copy the full capacity.
+  Kokkos::deep_copy(send_count.h_view, send_count.d_view);
+  nprtcl_send = send_count.h_view(0);
+  if (nprtcl_send < 0 || nprtcl_send > static_cast<int>(sendlist.extent(0))) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Invalid particle send count " << nprtcl_send
+              << " on rank " << global_variable::my_rank << " (capacity "
+              << sendlist.extent(0) << ")" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (nprtcl_send > 0) {
+    auto d_prefix = Kokkos::subview(sendlist.d_view,
+                                    std::make_pair(0, nprtcl_send));
+    auto h_prefix = Kokkos::subview(sendlist.h_view,
+                                    std::make_pair(0, nprtcl_send));
+    Kokkos::deep_copy(h_prefix, d_prefix);
+    for (int n=0; n<nprtcl_send; ++n) {
+      int p = sendlist.h_view(n).prtcl_indx;
+      int r = sendlist.h_view(n).dest_rank;
+      if (p < 0 || p >= npart || r < 0 || r >= global_variable::nranks) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "Invalid particle send-list entry " << n
+                  << " on rank " << global_variable::my_rank << ": particle=" << p
+                  << ", destination rank=" << r << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+    }
+  }
+#else
+  nprtcl_send = 0;
+#endif
 
   return TaskStatus::complete;
 }
@@ -259,11 +293,15 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
 TaskStatus ParticlesBoundaryValues::CountSendsAndRecvs() {
 #if MPI_PARALLEL_ENABLED
   // Sort sendlist on host by destrank.
-  namespace KE = Kokkos::Experimental;
-  std::sort(KE::begin(sendlist.h_view), KE::end(sendlist.h_view), SortByRank);
-  // sync sendlist host array with device.  This results in sorted array on device
-  sendlist.template modify<HostMemSpace>();
-  sendlist.template sync<DevExeSpace>();
+  std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByRank);
+  // Copy only the sorted valid prefix back to the device.
+  if (nprtcl_send > 0) {
+    auto h_prefix = Kokkos::subview(sendlist.h_view,
+                                    std::make_pair(0, nprtcl_send));
+    auto d_prefix = Kokkos::subview(sendlist.d_view,
+                                    std::make_pair(0, nprtcl_send));
+    Kokkos::deep_copy(d_prefix, h_prefix);
+  }
 
   // load STL::vector of ParticleMessageData with <sendrank, recvrank, nprtcls> for sends
   // from this rank. Length will be nsends; initially this length is unknown
@@ -360,7 +398,7 @@ TaskStatus ParticlesBoundaryValues::InitPrtclRecv() {
   for (int n=0; n<nrecvs; ++n) {
     // calculate amount of data to be passed, get pointer to variables
     int data_size = (pmy_part->nrdata)*(recvs_thisrank[n].nprtcls);
-    int data_end = data_start + (pmy_part->nrdata)*(recvs_thisrank[n].nprtcls - 1);
+    int data_end = data_start + data_size;
     auto recv_ptr = Kokkos::subview(prtcl_rrecvbuf, std::make_pair(data_start, data_end));
     int drank = recvs_thisrank[n].sendrank;
     int tag = 0; // 0 for Reals, 1 for ints
@@ -376,7 +414,7 @@ TaskStatus ParticlesBoundaryValues::InitPrtclRecv() {
   for (int n=0; n<nrecvs; ++n) {
     // calculate amount of data to be passed, get pointer to variables
     int data_size = (pmy_part->nidata)*(recvs_thisrank[n].nprtcls);
-    int data_end = data_start + (pmy_part->nidata)*(recvs_thisrank[n].nprtcls - 1);
+    int data_end = data_start + data_size;
     auto recv_ptr = Kokkos::subview(prtcl_irecvbuf, std::make_pair(data_start, data_end));
     int drank = recvs_thisrank[n].sendrank;
     int tag = 1; // 0 for Reals, 1 for ints
@@ -424,8 +462,9 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
     auto &pi = pmy_part->prtcl_idata;
     auto &rsendbuf = prtcl_rsendbuf;
     auto &isendbuf = prtcl_isendbuf;
+    auto sendlist_d = sendlist.d_view;
     par_for("ppack",DevExeSpace(),0,(nprtcl_send-1), KOKKOS_LAMBDA(const int n) {
-      int p = sendlist.d_view(n).prtcl_indx;
+      int p = sendlist_d(n).prtcl_indx;
       for (int i=0; i<nidata; ++i) {
         isendbuf(nidata*n + i) = pi(i,p);
       }
@@ -448,7 +487,7 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
     for (int n=0; n<nsends; ++n) {
       // calculate amount of data to be passed, get pointer to variables
       int data_size = nrdata*(sends_thisrank[n].nprtcls);
-      int data_end = data_start + nrdata*(sends_thisrank[n].nprtcls - 1);
+      int data_end = data_start + data_size;
       auto send_ptr = Kokkos::subview(prtcl_rsendbuf,std::make_pair(data_start,data_end));
       int drank = sends_thisrank[n].recvrank;
       int tag = 0; // 0 for Reals, 1 for ints
@@ -464,7 +503,7 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
     for (int n=0; n<nsends; ++n) {
       // calculate amount of data to be passed, get pointer to variables
       int data_size = nidata*(sends_thisrank[n].nprtcls);
-      int data_end = data_start + nidata*(sends_thisrank[n].nprtcls - 1);
+      int data_end = data_start + data_size;
       auto send_ptr = Kokkos::subview(prtcl_isendbuf,std::make_pair(data_start,data_end));
       int drank = sends_thisrank[n].recvrank;
       int tag = 1; // 0 for Reals, 1 for ints
@@ -494,11 +533,15 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
 TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
 #if MPI_PARALLEL_ENABLED
   // Sort sendlist on host by index in particle array
-  namespace KE = Kokkos::Experimental;
-  std::sort(KE::begin(sendlist.h_view), KE::end(sendlist.h_view), SortByIndex);
-  // sync sendlist host array with device.  This results in sorted array on device
-  sendlist.template modify<HostMemSpace>();
-  sendlist.template sync<DevExeSpace>();
+  std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByIndex);
+  // Copy only the sorted valid prefix back to the device.
+  if (nprtcl_send > 0) {
+    auto h_prefix = Kokkos::subview(sendlist.h_view,
+                                    std::make_pair(0, nprtcl_send));
+    auto d_prefix = Kokkos::subview(sendlist.d_view,
+                                    std::make_pair(0, nprtcl_send));
+    Kokkos::deep_copy(d_prefix, h_prefix);
+  }
 
   // increase size of particle arrays if needed
   int new_npart = pmy_part->nprtcl_thispack + (nprtcl_recv - nprtcl_send);
@@ -541,13 +584,15 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
     auto &pi = pmy_part->prtcl_idata;
     auto &rrecvbuf = prtcl_rrecvbuf;
     auto &irecvbuf = prtcl_irecvbuf;
+    auto sendlist_d = sendlist.d_view;
+    int nsend = nprtcl_send;
     int &npart = pmy_part->nprtcl_thispack;
     par_for("punpack",DevExeSpace(),0,(nprtcl_recv-1), KOKKOS_LAMBDA(const int n) {
       int p;
-      if (n < nprtcl_send) {
-        p = sendlist.d_view(n).prtcl_indx; // place particles in holes created by sends
+      if (n < nsend) {
+        p = sendlist_d(n).prtcl_indx; // place particles in holes created by sends
       } else {
-        p = npart + (n - nprtcl_send);     // place particle at end of arrays
+        p = npart + (n - nsend);           // place particle at end of arrays
       }
       for (int i=0; i<nidata; ++i) {
         pi(i,p) = irecvbuf(nidata*n + i);

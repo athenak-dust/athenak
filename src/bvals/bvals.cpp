@@ -237,6 +237,7 @@ void MeshBoundaryValues::InitializeBuffers(const int nvar) {
 particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
   particles::Particles *pp, ParameterInput *pin) :
     sendlist("sendlist",1),
+    send_count("send_count",1),
     sgid_map("sgid_map",1,1,1),
     srank_map("srank_map",1,1,1),
 #if MPI_PARALLEL_ENABLED
@@ -258,7 +259,11 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
   // the MeshBlocks adjacent to the two radial boundaries, used to route particles that
   // cross them (their azimuthal shear shift changes the destination MeshBlock).
   Mesh *pmesh = pp->pmy_pack->pmesh;
+  // Preserve the pre-dust behavior of every other particle type.  The transform below
+  // assumes the dust pusher's shear-relative velocity convention and RK registers; it
+  // is not a generic particle-boundary contract.
   shear_periodic_x1 =
+      (pp->particle_type == ParticleType::dust) &&
       (pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic);
   if (shear_periodic_x1) {
     if (pmesh->multilevel) {

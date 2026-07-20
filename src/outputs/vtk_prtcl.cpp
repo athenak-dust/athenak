@@ -245,8 +245,9 @@ void ParticleVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     header_offset += pm->nprtcl_total*datasize;
   }
 
-  // Write Part 7: particle velocity vectors
-  {
+  // Write Part 7 for dust only. Preserve the historical particle-VTK schema and I/O
+  // volume for every pre-existing particle type.
+  if (pm->pmb_pack->ppart->particle_type == ParticleType::dust) {
     std::stringstream msg;
     msg << std::endl << "VECTORS pvel float" << std::endl;
     if (global_variable::my_rank == 0) {
