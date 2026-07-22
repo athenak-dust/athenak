@@ -92,33 +92,26 @@ void DustGasDrag::ApplyCoupledOperator(DvceArray5D<Real> &field,
   Kokkos::deep_copy(DevExeSpace(), result, 0.0);
 
   particles::Particles *ppar = pmy_pack->ppart;
-  auto &pr = ppar->prtcl_rdata;
-  auto &pi = ppar->prtcl_idata;
   int npart = ppar->nprtcl_thispack;
+  RequireParticleCache(npart, a_dt, "DustGasDrag::ApplyCoupledOperator");
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, js = indcs.js, ks = indcs.ks;
-  int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
   bool three_d = pmy_pack->pmesh->three_d;
-  auto &mbsize = pmy_pack->pmb->mb_size;
-  auto gids = pmy_pack->gids;
-  int scheme = static_cast<int>(deposit);
+  auto &cache_i = particle_cache_i;
+  auto &cache_r = particle_cache_r;
   auto &field_ = field;
   auto &result_ = result;
 
   par_for("dust_applya_gtsg",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
-    int m = pi(PGID,p) - gids;
-    int ip, jp, kp;
+    int m = cache_i(pm_cache_m,p);
+    int ip = cache_i(pm_cache_ip,p);
+    int jp = cache_i(pm_cache_jp,p);
+    int kp = cache_i(pm_cache_kp,p);
     Real wx[3], wy[3], wz[3];
-    PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
-              scheme, ip, wx);
-    PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
-              scheme, jp, wy);
-    if (three_d) {
-      PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
-                scheme, kp, wz);
-    } else {
-      kp = ks;
-      wz[0] = 0.0; wz[1] = 1.0; wz[2] = 0.0;
+    for (int a=0; a<3; ++a) {
+      wx[a] = cache_r(pm_cache_wx+a,p);
+      wy[a] = cache_r(pm_cache_wy+a,p);
+      wz[a] = cache_r(pm_cache_wz+a,p);
     }
 
     Real gathered[3] = {0.0, 0.0, 0.0};
@@ -137,10 +130,7 @@ void DustGasDrag::ApplyCoupledOperator(DvceArray5D<Real> &field,
       }
     }
 
-    Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
-    if (three_d) vol *= mbsize.d_view(m).dx3;
-    Real cj = a_dt/(pr(IPTS,p) + a_dt);
-    Real fac = pr(IPM,p)*cj/vol;
+    Real fac = cache_r(pm_cache_muc,p);
     for (int c=clo; c<=chi; ++c) {
       for (int b=0; b<3; ++b) {
         Real wcb = wz[c]*wy[b]*fac;
@@ -186,19 +176,20 @@ void DustGasDrag::GlobalDot(DvceArray5D<Real> &left, DvceArray5D<Real> &right,
   auto left_ = left;
   auto right_ = right;
   Real local[3] = {0.0, 0.0, 0.0};
-  for (int d=0; d<3; ++d) {
-    Kokkos::parallel_reduce("dust_solver_dot",Kokkos::RangePolicy<>(DevExeSpace(),0,ncells),
-    KOKKOS_LAMBDA(const int idx, Real &sum) {
-      int q = idx;
-      int i = q % nx1; q /= nx1;
-      int j = q % nx2; q /= nx2;
-      int k = q % nx3; q /= nx3;
-      int m = q;
-      Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
-      if (three_d) vol *= mbsize.d_view(m).dx3;
-      sum += vol*left_(m,d,k+ks,j+js,i+is)*right_(m,d,k+ks,j+js,i+is);
-    }, local[d]);
-  }
+  Kokkos::parallel_reduce("dust_solver_dot",Kokkos::RangePolicy<>(DevExeSpace(),0,ncells),
+  KOKKOS_LAMBDA(const int idx, Real &sum0, Real &sum1, Real &sum2) {
+    int q = idx;
+    int i = q % nx1; q /= nx1;
+    int j = q % nx2; q /= nx2;
+    int k = q % nx3; q /= nx3;
+    int m = q;
+    Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+    if (three_d) vol *= mbsize.d_view(m).dx3;
+    sum0 += vol*left_(m,0,k+ks,j+js,i+is)*right_(m,0,k+ks,j+js,i+is);
+    sum1 += vol*left_(m,1,k+ks,j+js,i+is)*right_(m,1,k+ks,j+js,i+is);
+    sum2 += vol*left_(m,2,k+ks,j+js,i+is)*right_(m,2,k+ks,j+js,i+is);
+  }, Kokkos::Sum<Real>(local[0]), Kokkos::Sum<Real>(local[1]),
+     Kokkos::Sum<Real>(local[2]));
 #if MPI_PARALLEL_ENABLED
   int ierr = MPI_Allreduce(local, value, 3, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
   if (ierr != MPI_SUCCESS) SolverFatal("MPI_Allreduce failed in GlobalDot");
@@ -223,21 +214,25 @@ void DustGasDrag::GlobalPreconditionedNorm(DvceArray5D<Real> &residual, Real val
   auto &qdep_ = qdep;
   auto residual_ = residual;
   Real local[3] = {0.0, 0.0, 0.0};
-  for (int d=0; d<3; ++d) {
-    Kokkos::parallel_reduce("dust_solver_pnorm",Kokkos::RangePolicy<>(DevExeSpace(),0,ncells),
-    KOKKOS_LAMBDA(const int idx, Real &sum) {
-      int q = idx;
-      int i = q % nx1; q /= nx1;
-      int j = q % nx2; q /= nx2;
-      int k = q % nx3; q /= nx3;
-      int m = q;
-      int ii = i+is, jj = j+js, kk = k+ks;
-      Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
-      if (three_d) vol *= mbsize.d_view(m).dx3;
-      Real rv = residual_(m,d,kk,jj,ii);
-      sum += vol*rv*rv/(u0(m,IDN,kk,jj,ii) + qdep_(m,0,kk,jj,ii));
-    }, local[d]);
-  }
+  Kokkos::parallel_reduce("dust_solver_pnorm",Kokkos::RangePolicy<>(DevExeSpace(),0,ncells),
+  KOKKOS_LAMBDA(const int idx, Real &sum0, Real &sum1, Real &sum2) {
+    int q = idx;
+    int i = q % nx1; q /= nx1;
+    int j = q % nx2; q /= nx2;
+    int k = q % nx3; q /= nx3;
+    int m = q;
+    int ii = i+is, jj = j+js, kk = k+ks;
+    Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+    if (three_d) vol *= mbsize.d_view(m).dx3;
+    Real invp = vol/(u0(m,IDN,kk,jj,ii) + qdep_(m,0,kk,jj,ii));
+    Real rv0 = residual_(m,0,kk,jj,ii);
+    Real rv1 = residual_(m,1,kk,jj,ii);
+    Real rv2 = residual_(m,2,kk,jj,ii);
+    sum0 += invp*rv0*rv0;
+    sum1 += invp*rv1*rv1;
+    sum2 += invp*rv2*rv2;
+  }, Kokkos::Sum<Real>(local[0]), Kokkos::Sum<Real>(local[1]),
+     Kokkos::Sum<Real>(local[2]));
 #if MPI_PARALLEL_ENABLED
   int ierr = MPI_Allreduce(local, value, 3, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
   if (ierr != MPI_SUCCESS) SolverFatal("MPI_Allreduce failed in residual norm");
@@ -293,21 +288,25 @@ int DustGasDrag::StrictPCG(Real a_dt, bool residual_is_current) {
   bool three_d = pmy_pack->pmesh->three_d;
   auto &mbsize = pmy_pack->pmb->mb_size;
   Real bnorm_local[3] = {0.0, 0.0, 0.0};
-  for (int d=0; d<3; ++d) {
-    Kokkos::parallel_reduce("dust_pcg_bnorm",Kokkos::RangePolicy<>(DevExeSpace(),0,ncells),
-    KOKKOS_LAMBDA(const int idx, Real &sum) {
-      int q = idx;
-      int i = q % nx1; q /= nx1;
-      int j = q % nx2; q /= nx2;
-      int k = q % nx3; q /= nx3;
-      int m = q;
-      int ii=i+is, jj=j+js, kk=k+ks;
-      Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
-      if (three_d) vol *= mbsize.d_view(m).dx3;
-      Real bv = u0(m,IM1+d,kk,jj,ii) + qdep_(m,1+d,kk,jj,ii);
-      sum += vol*bv*bv/(u0(m,IDN,kk,jj,ii) + qdep_(m,0,kk,jj,ii));
-    }, bnorm_local[d]);
-  }
+  Kokkos::parallel_reduce("dust_pcg_bnorm",Kokkos::RangePolicy<>(DevExeSpace(),0,ncells),
+  KOKKOS_LAMBDA(const int idx, Real &sum0, Real &sum1, Real &sum2) {
+    int q = idx;
+    int i = q % nx1; q /= nx1;
+    int j = q % nx2; q /= nx2;
+    int k = q % nx3; q /= nx3;
+    int m = q;
+    int ii=i+is, jj=j+js, kk=k+ks;
+    Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+    if (three_d) vol *= mbsize.d_view(m).dx3;
+    Real invp = vol/(u0(m,IDN,kk,jj,ii) + qdep_(m,0,kk,jj,ii));
+    Real bv0 = u0(m,IM1,kk,jj,ii) + qdep_(m,1,kk,jj,ii);
+    Real bv1 = u0(m,IM2,kk,jj,ii) + qdep_(m,2,kk,jj,ii);
+    Real bv2 = u0(m,IM3,kk,jj,ii) + qdep_(m,3,kk,jj,ii);
+    sum0 += invp*bv0*bv0;
+    sum1 += invp*bv1*bv1;
+    sum2 += invp*bv2*bv2;
+  }, Kokkos::Sum<Real>(bnorm_local[0]), Kokkos::Sum<Real>(bnorm_local[1]),
+     Kokkos::Sum<Real>(bnorm_local[2]));
   Real bnorm2[3];
 #if MPI_PARALLEL_ENABLED
   int ierr = MPI_Allreduce(bnorm_local, bnorm2, 3, MPI_ATHENA_REAL, MPI_SUM,
@@ -433,12 +432,14 @@ Real DustGasDrag::AdaptiveErrorBound(Real a_dt, Real residual_norm, Real &state_
 
   particles::Particles *ppar=pmy_pack->ppart;
   auto &pr=ppar->prtcl_rdata;
-  auto &pi=ppar->prtcl_idata;
   int npart=ppar->nprtcl_thispack;
+  RequireParticleCache(npart,a_dt,"DustGasDrag::AdaptiveErrorBound");
+  auto &cache_i=particle_cache_i;
+  auto &cache_r=particle_cache_r;
   Real cmax_local=0.0;
   Kokkos::parallel_reduce("dust_adapt_cmax",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
   KOKKOS_LAMBDA(const int p, Real &maximum) {
-    maximum=fmax(maximum,a_dt/(pr(IPTS,p)+a_dt));
+    maximum=fmax(maximum,cache_r(pm_cache_cj,p));
   },Kokkos::Max<Real>(cmax_local));
   Real maxima_local[2]={eps_local,cmax_local}, maxima[2];
 #if MPI_PARALLEL_ENABLED
@@ -465,23 +466,18 @@ Real DustGasDrag::AdaptiveErrorBound(Real a_dt, Real residual_norm, Real &state_
     sum+=vol*u0(m,IDN,kk,jj,ii)*usq;
   },gas_state_local);
 
-  auto gids=pmy_pack->gids;
-  int scheme=static_cast<int>(deposit);
   Real particle_state_local=0.0;
   Kokkos::parallel_reduce("dust_adapt_particle_state",
   Kokkos::RangePolicy<>(DevExeSpace(),0,npart),KOKKOS_LAMBDA(const int p,Real &sum) {
-    int m=pi(PGID,p)-gids;
-    int ip,jp,kp;
+    int m=cache_i(pm_cache_m,p);
+    int ip=cache_i(pm_cache_ip,p);
+    int jp=cache_i(pm_cache_jp,p);
+    int kp=cache_i(pm_cache_kp,p);
     Real wx[3],wy[3],wz[3];
-    PMWeights(pr(IPX,p),mbsize.d_view(m).x1min,mbsize.d_view(m).x1max,nx1,is,
-              scheme,ip,wx);
-    PMWeights(pr(IPY,p),mbsize.d_view(m).x2min,mbsize.d_view(m).x2max,nx2,js,
-              scheme,jp,wy);
-    if (three_d) {
-      PMWeights(pr(IPZ,p),mbsize.d_view(m).x3min,mbsize.d_view(m).x3max,nx3,ks,
-                scheme,kp,wz);
-    } else {
-      kp=ks; wz[0]=0.0; wz[1]=1.0; wz[2]=0.0;
+    for (int a=0;a<3;++a) {
+      wx[a]=cache_r(pm_cache_wx+a,p);
+      wy[a]=cache_r(pm_cache_wy+a,p);
+      wz[a]=cache_r(pm_cache_wz+a,p);
     }
     Real gu[3]={0.0,0.0,0.0};
     int clo=three_d?0:1,chi=three_d?2:1;
@@ -492,7 +488,7 @@ Real DustGasDrag::AdaptiveErrorBound(Real a_dt, Real residual_norm, Real &state_
       gu[1]+=w*x(m,1,kk,jj,ii);
       gu[2]+=w*x(m,2,kk,jj,ii);
     }
-    Real cj=a_dt/(pr(IPTS,p)+a_dt);
+    Real cj=cache_r(pm_cache_cj,p);
     Real vx=pr(IPVX,p)+cj*(gu[0]-pr(IPVX,p));
     Real vy=pr(IPVY,p)+cj*(gu[1]-pr(IPVY,p));
     Real vz=pr(IPVZ,p)+cj*(gu[2]-pr(IPVZ,p));
