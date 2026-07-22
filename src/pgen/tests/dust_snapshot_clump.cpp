@@ -129,6 +129,7 @@ ParticleSnapshot ReadParticleVTK(const std::string &path) {
   snapshot.position = ReadFloatArray(stream, 3*static_cast<std::size_t>(count));
   snapshot.tag.resize(count);
   std::iota(snapshot.tag.begin(), snapshot.tag.end(), 0);
+  bool have_ptag = false;
 
   line = NextNonemptyLine(stream);
   std::istringstream point_data_header(line);
@@ -151,7 +152,19 @@ ParticleSnapshot ReadParticleVTK(const std::string &path) {
       }
       std::vector<float> values = ReadFloatArray(stream, count);
       if (name == "ptag") {
-        for (int p=0; p<count; ++p) snapshot.tag[p] = static_cast<int>(std::lround(values[p]));
+        // AthenaK's legacy particle VTK writer stores integer tags as float32.  Reject
+        // the ambiguous range rather than silently alias distinct tags above 2^24.
+        constexpr float first_ambiguous_tag = 16777216.0F;
+        for (int p=0; p<count; ++p) {
+          float value = values[p];
+          if (!std::isfinite(value) || value < 0.0F || value >= first_ambiguous_tag ||
+              value != std::trunc(value)) {
+            Fatal("Particle VTK ptag is not an exact nonnegative float32 integer below "
+                  "2^24 at source index " + std::to_string(p));
+          }
+          snapshot.tag[p] = static_cast<int>(std::lround(value));
+        }
+        have_ptag = true;
       }
     } else if (keyword == "VECTORS") {
       std::vector<float> values = ReadFloatArray(stream, 3*static_cast<std::size_t>(count));
@@ -162,6 +175,13 @@ ParticleSnapshot ReadParticleVTK(const std::string &path) {
   }
   if (snapshot.velocity.size() != snapshot.position.size()) {
     Fatal("Particle snapshot does not contain VECTORS pvel");
+  }
+  if (have_ptag) {
+    std::vector<int> sorted_tags = snapshot.tag;
+    std::sort(sorted_tags.begin(), sorted_tags.end());
+    if (std::adjacent_find(sorted_tags.begin(), sorted_tags.end()) != sorted_tags.end()) {
+      Fatal("Particle VTK contains duplicate decoded ptag values");
+    }
   }
   return snapshot;
 }

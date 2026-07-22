@@ -148,7 +148,8 @@ class DustGasDrag {
   unsigned long long solver_fast_accept_count = 0;
   unsigned long long solver_pcg_stage_count = 0;
   double solver_wall_seconds = 0.0;
-  std::vector<int> solver_pcg_iterations;
+  // Exact bounded histogram over [0, drag_iter_max], allocated only on rank 0.
+  std::vector<unsigned long long> solver_pcg_iteration_hist;
   Real solver_last_residual = -1.0;  // negative means a true residual was not sampled
   Real solver_last_epsmax = -1.0;  // negative means this mode did not sample epsilon_c
   Real solver_last_error_bound = -1.0;

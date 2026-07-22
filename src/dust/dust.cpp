@@ -142,6 +142,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
               << "only drag_fail_policy=abort is supported" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  if (global_variable::my_rank == 0 &&
+      (drag_solver == DustDragSolver::pcg || drag_solver == DustDragSolver::adaptive)) {
+    solver_pcg_iteration_hist.assign(static_cast<std::size_t>(drag_iter_max) + 1, 0);
+  }
 
   {
     std::string mode = pin->GetOrAddString("dust","stopping_time_mode","species_fixed");
@@ -268,15 +272,20 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
 
 DustGasDrag::~DustGasDrag() {
   if (global_variable::my_rank == 0 && solver_stage_count > 0) {
-    std::vector<int> iterations = solver_pcg_iterations;
-    std::sort(iterations.begin(), iterations.end());
     auto quantile = [&](double fraction) {
-      if (iterations.empty()) return 0;
-      if (fraction <= 0.0) return iterations.front();
-      std::size_t index = static_cast<std::size_t>(
-          std::ceil(fraction*static_cast<double>(iterations.size())) - 1.0);
-      index = std::min(index, iterations.size() - 1);
-      return iterations[index];
+      if (solver_pcg_stage_count == 0) return 0;
+      unsigned long long order = (fraction <= 0.0) ? 1 :
+          static_cast<unsigned long long>(
+              std::ceil(fraction*static_cast<double>(solver_pcg_stage_count)));
+      unsigned long long cumulative = 0;
+      for (std::size_t iteration=0; iteration<solver_pcg_iteration_hist.size();
+           ++iteration) {
+        cumulative += solver_pcg_iteration_hist[iteration];
+        if (cumulative >= order) return static_cast<int>(iteration);
+      }
+      // The histogram and stage count are updated together; reaching this return would
+      // indicate internal diagnostic corruption rather than a numerical solver failure.
+      return drag_iter_max;
     };
     const char *name = (drag_solver == DustDragSolver::applya) ? "applya" :
                        (drag_solver == DustDragSolver::dc1) ? "dc1" :

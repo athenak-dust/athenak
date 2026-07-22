@@ -14,6 +14,13 @@
 //! where c_p=a/(t_stop,p+a).  Matching PMWeights in G and G^T makes A SPD.  All trial
 //! operations below are non-mutating: particle velocities and gas momentum are changed
 //! only later by GatherKickPMBR and ApplyPMBR after one field has been accepted.
+//!
+//! The communication-bearing solves below deliberately block inside one task.  This is
+//! safe under AthenaK's current execution contract: one MeshBlockPack contains all local
+//! MeshBlocks on a rank, IMEX stages invoke this task sequentially, and every numerical
+//! continue/accept decision is computed from globally reduced scalars.  A future design
+//! with multiple packs, overlapping stages, or concurrent collective streams must move
+//! solver progress to a stage-wide controller rather than call these loops concurrently.
 
 #include <algorithm>
 #include <chrono>
@@ -37,8 +44,14 @@ namespace dust {
 namespace {
 
 [[noreturn]] void SolverFatal(const std::string &message) {
-  std::cout << "### FATAL ERROR in dust coupled solver on rank "
+  std::cerr << "### FATAL ERROR in dust coupled solver on rank "
             << global_variable::my_rank << std::endl << message << std::endl;
+#if MPI_PARALLEL_ENABLED
+  // This routine is called while the solver may have outstanding point-to-point
+  // operations or may be between collectives.  Terminate the whole MPI job rather than
+  // leave peer ranks spinning in a boundary exchange or blocked in the next collective.
+  MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+#endif
   std::exit(EXIT_FAILURE);
 }
 
@@ -334,7 +347,10 @@ int DustGasDrag::StrictPCG(Real a_dt, bool residual_is_current) {
     converged[d] = std::sqrt(std::max(rz[d], 0.0)) <= target[d];
   }
 
-  for (int iteration=1; iteration<=drag_iter_max; ++iteration) {
+  // `iteration` is the number of completed PCG updates.  Including drag_iter_max here
+  // gives an iterate that converged on the final allowed update one verification-only
+  // pass; it does not permit an additional PCG update beyond the configured budget.
+  for (int iteration=0; iteration<=drag_iter_max; ++iteration) {
     if (converged[0] && converged[1] && converged[2]) {
       ApplyCoupledOperator(x, ap, a_dt);
       par_for("dust_pcg_true_r",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
@@ -354,7 +370,7 @@ int DustGasDrag::StrictPCG(Real a_dt, bool residual_is_current) {
         true_converged = true_converged && converged[d];
         rz[d] = true_norm2[d];
       }
-      if (true_converged) return iteration - 1;
+      if (true_converged) return iteration;
 
       // Recursive convergence was optimistic: restart from the recomputed true residual.
       par_for("dust_pcg_true_restart",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
@@ -364,13 +380,15 @@ int DustGasDrag::StrictPCG(Real a_dt, bool residual_is_current) {
       });
     }
 
+    if (iteration == drag_iter_max) break;
+    int update_iteration = iteration + 1;
     ApplyCoupledOperator(p, ap, a_dt);
     Real pap[3];
     GlobalDot(p, ap, pap);
     for (int d=0; d<3; ++d) {
       if (!converged[d] && (!(pap[d] > 0.0) || !std::isfinite(pap[d]))) {
         SolverFatal("PCG lost positive definiteness at iteration " +
-                    std::to_string(iteration));
+                    std::to_string(update_iteration));
       }
     }
     Real alpha0 = converged[0] ? 0.0 : rz[0]/pap[0];
@@ -601,13 +619,17 @@ TaskStatus DustGasDrag::SolveCoupledStage(Driver *pdrive, int stage) {
       } else {
         solver_last_iterations=StrictPCG(a_dt,true);
         ++solver_pcg_stage_count;
-        solver_pcg_iterations.push_back(solver_last_iterations);
+        if (global_variable::my_rank == 0) {
+          ++solver_pcg_iteration_hist[static_cast<std::size_t>(solver_last_iterations)];
+        }
       }
     }
   } else if (drag_solver == DustDragSolver::pcg) {
     solver_last_iterations=StrictPCG(a_dt,false);
     ++solver_pcg_stage_count;
-    solver_pcg_iterations.push_back(solver_last_iterations);
+    if (global_variable::my_rank == 0) {
+      ++solver_pcg_iteration_hist[static_cast<std::size_t>(solver_last_iterations)];
+    }
   }
 
   Kokkos::fence();
