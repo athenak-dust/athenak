@@ -2,6 +2,9 @@
 
 Block-based AMR framework with fluid, particle and numerical relativity solvers in Kokkos.
 
+> **Dust development branch.** This branch adds a dust module to AthenaK by extending its existing particle infrastructure for our science applications, while preserving upstream behavior as closely as possible when the dust module is disabled.  
+> The companion repository [athenak-dust/athenak_dust_tests](https://github.com/athenak-dust/athenak_dust_tests) contains the development tests and benchmarks, including their input files, notebooks, and instructions.
+
 ## Overview
 
 AthenaK is a complete rewrite of the AMR framework and fluid solvers in the [Athena++](https://github.com/PrincetonUniversity/athena) astrophysical MHD code using the [Kokkos](https://kokkos.org/) programming model.  Note that Athena++ is itself an extension of the original C-version of
