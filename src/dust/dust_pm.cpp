@@ -25,10 +25,6 @@
 //!      a_twid history term of the next stage (AddDragHistoryGas). This works because
 //!      dmom = a*R_g identically.
 
-#include <algorithm>
-#include <cstdlib>
-#include <iostream>
-
 #include "athena.hpp"
 #include "globals.hpp"
 #include "parameter_input.hpp"
@@ -41,42 +37,8 @@
 namespace dust {
 
 //----------------------------------------------------------------------------------------
-//! Grow the stage-transfer cache geometrically. Reallocation is rare after startup and
-//! fenced explicitly because the preceding stage's final gather may still reference the
-//! old views on an asynchronous device execution space.
-
-void DustGasDrag::EnsureParticleCacheCapacity(int npart) {
-  int capacity = static_cast<int>(particle_cache_i.extent(1));
-  if (npart <= capacity) return;
-
-  particle_cache_valid = false;
-  Kokkos::fence();
-  int new_capacity = std::max(npart, capacity + capacity/2 + 1);
-  Kokkos::realloc(particle_cache_i, npm_cache_index, new_capacity);
-  Kokkos::realloc(particle_cache_r, npm_cache_real, new_capacity);
-}
-
-//----------------------------------------------------------------------------------------
-//! Fail closed if task ordering ever exposes stale transfer metadata. Exact comparison
-//! of a_dt is intentional: DepositDrag and all consumers evaluate the same stage scalar.
-
-void DustGasDrag::RequireParticleCache(int npart, Real a_dt,
-                                       const char *operation) const {
-  if (particle_cache_valid && particle_cache_npart == npart &&
-      particle_cache_adt == a_dt) return;
-
-  std::cout << "### FATAL ERROR in " << operation << " on rank "
-            << global_variable::my_rank << std::endl
-            << "Dust particle-mesh stage cache is stale or incomplete: valid="
-            << particle_cache_valid << " cached_npart=" << particle_cache_npart
-            << " current_npart=" << npart << " cached_a_dt=" << particle_cache_adt
-            << " current_a_dt=" << a_dt << std::endl;
-  std::exit(EXIT_FAILURE);
-}
-
-//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::DepositDrag
-//! \brief Build stage-frozen PM metadata, zero (Q,P), and scatter particle sums.
+//! \brief Zero the (Q,P) field and scatter the drag-weighted particle sums into it.
 
 TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
@@ -87,8 +49,6 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
   int npart = ppar->nprtcl_thispack;
-  EnsureParticleCacheCapacity(npart);
-  particle_cache_valid = false;
 
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, js = indcs.js, ks = indcs.ks;
@@ -99,8 +59,6 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   int scheme = static_cast<int>(deposit);
   Real a_dt = (pdrive->a_impl)*(pmy_pack->pmesh->dt);
   auto &qdep_ = qdep;
-  auto &cache_i = particle_cache_i;
-  auto &cache_r = particle_cache_r;
 
   par_for("dust_scatter",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
@@ -132,23 +90,9 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
 
     Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
     if (three_d) {vol *= mbsize.d_view(m).dx3;}
-    Real cj = a_dt/(pr(IPTS,p) + a_dt);
-    Real mu = pr(IPM,p)/vol;
-    Real muc = mu*cj;
+    Real cj  = a_dt/(pr(IPTS,p) + a_dt);
+    Real muc = pr(IPM,p)*cj/vol;
     Real vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
-
-    cache_i(pm_cache_m,p) = m;
-    cache_i(pm_cache_ip,p) = ip;
-    cache_i(pm_cache_jp,p) = jp;
-    cache_i(pm_cache_kp,p) = kp;
-    for (int a=0; a<3; ++a) {
-      cache_r(pm_cache_wx+a,p) = wx[a];
-      cache_r(pm_cache_wy+a,p) = wy[a];
-      cache_r(pm_cache_wz+a,p) = wz[a];
-    }
-    cache_r(pm_cache_cj,p) = cj;
-    cache_r(pm_cache_muc,p) = muc;
-    cache_r(pm_cache_mu,p) = mu;
 
     int clo = three_d ? 0 : 1, chi = three_d ? 2 : 1;
     for (int c=clo; c<=chi; ++c) {
@@ -166,10 +110,6 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       }
     }
   });
-
-  particle_cache_npart = npart;
-  particle_cache_adt = a_dt;
-  particle_cache_valid = true;
 
   return TaskStatus::complete;
 }
@@ -245,37 +185,21 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
   Real a_dt = (pdrive->a_impl)*(pmy_pack->pmesh->dt);
   auto &ustar_ = ustar;
   auto &dmom_ = dmom;
-  auto &cache_i = particle_cache_i;
-  auto &cache_r = particle_cache_r;
-  if (br) RequireParticleCache(npart, a_dt, "DustGasDrag::GatherKickPMBR");
 
   par_for("dust_gather",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
-    int m;
+    int m = pi(PGID,p) - gids;
     int ip, jp, kp;
     Real wx[3], wy[3], wz[3];
-    if (br) {
-      m = cache_i(pm_cache_m,p);
-      ip = cache_i(pm_cache_ip,p);
-      jp = cache_i(pm_cache_jp,p);
-      kp = cache_i(pm_cache_kp,p);
-      for (int a=0; a<3; ++a) {
-        wx[a] = cache_r(pm_cache_wx+a,p);
-        wy[a] = cache_r(pm_cache_wy+a,p);
-        wz[a] = cache_r(pm_cache_wz+a,p);
-      }
+    PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
+              scheme, ip, wx);
+    PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
+              scheme, jp, wy);
+    if (three_d) {
+      PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
+                scheme, kp, wz);
     } else {
-      m = pi(PGID,p) - gids;
-      PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
-                scheme, ip, wx);
-      PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
-                scheme, jp, wy);
-      if (three_d) {
-        PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
-                  scheme, kp, wz);
-      } else {
-        kp = ks;
-        wz[0] = 0.0; wz[1] = 1.0; wz[2] = 0.0;
-      }
+      kp = ks;
+      wz[0] = 0.0; wz[1] = 1.0; wz[2] = 0.0;
     }
 
     // gather provisional gas velocity at particle position
@@ -296,7 +220,7 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
     }
 
     // implicit drag kick and drag-rate record
-    Real cj = br ? cache_r(pm_cache_cj,p) : a_dt/(pr(IPTS,p) + a_dt);
+    Real cj  = a_dt/(pr(IPTS,p) + a_dt);
     Real dvx = cj*(ux - pr(IPVX,p));
     Real dvy = cj*(uy - pr(IPVY,p));
     Real dvz = cj*(uz - pr(IPVZ,p));
@@ -309,7 +233,9 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
 
     // momentum back-reaction deposit with the SAME weights and dv
     if (br) {
-      Real fac = -cache_r(pm_cache_mu,p);
+      Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+      if (three_d) {vol *= mbsize.d_view(m).dx3;}
+      Real fac = -pr(IPM,p)/vol;
       for (int c=clo; c<=chi; ++c) {
         for (int b=0; b<3; ++b) {
           Real wcb = wz[c]*wy[b]*fac;
@@ -325,8 +251,6 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
       }
     }
   });
-
-  if (br) particle_cache_valid = false;
 
   return TaskStatus::complete;
 }

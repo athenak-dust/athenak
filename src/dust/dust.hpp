@@ -47,14 +47,6 @@ enum class DustStoppingTimeMode {species_fixed=0, particle_static=1, dynamic=2};
 // `dc1` and `dc2` unconditionally accept one and two fixed defect corrections.
 enum class DustDragSolver {local=0, applya=1, dc1=2, dc2=3, pcg=4, adaptive=5};
 
-// Stage-frozen particle-mesh transfer cache. The arrays use a structure-of-arrays
-// layout, (quantity, particle), so adjacent particle threads read contiguous values.
-// Indices refer to the central PM cell; wx/wy/wz each occupy three consecutive slots.
-enum DustPMCacheIndex {pm_cache_m=0, pm_cache_ip=1, pm_cache_jp=2, pm_cache_kp=3,
-                       npm_cache_index=4};
-enum DustPMCacheReal {pm_cache_wx=0, pm_cache_wy=3, pm_cache_wz=6, pm_cache_cj=9,
-                      pm_cache_muc=10, pm_cache_mu=11, npm_cache_real=12};
-
 //----------------------------------------------------------------------------------------
 //! \struct DustGasDragTaskIDs
 //  \brief container to hold TaskIDs of all dust+hydro tasks
@@ -214,16 +206,6 @@ class DustGasDrag {
 
  private:
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this DustGasDrag
-  // Rebuilt after particle migration for every active implicit stage. `muc` is
-  // m_p*c_p/V and `mu` is m_p/V. No cached value is used as a warm start.
-  DvceArray2D<int> particle_cache_i;
-  DvceArray2D<Real> particle_cache_r;
-  int particle_cache_npart = -1;
-  Real particle_cache_adt = -1.0;
-  bool particle_cache_valid = false;
-
-  void EnsureParticleCacheCapacity(int npart);
-  void RequireParticleCache(int npart, Real a_dt, const char *operation) const;
 };
 
 } // namespace dust

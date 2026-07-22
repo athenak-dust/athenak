@@ -92,26 +92,33 @@ void DustGasDrag::ApplyCoupledOperator(DvceArray5D<Real> &field,
   Kokkos::deep_copy(DevExeSpace(), result, 0.0);
 
   particles::Particles *ppar = pmy_pack->ppart;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
   int npart = ppar->nprtcl_thispack;
-  RequireParticleCache(npart, a_dt, "DustGasDrag::ApplyCoupledOperator");
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, js = indcs.js, ks = indcs.ks;
+  int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
   bool three_d = pmy_pack->pmesh->three_d;
-  auto &cache_i = particle_cache_i;
-  auto &cache_r = particle_cache_r;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  auto gids = pmy_pack->gids;
+  int scheme = static_cast<int>(deposit);
   auto &field_ = field;
   auto &result_ = result;
 
   par_for("dust_applya_gtsg",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
-    int m = cache_i(pm_cache_m,p);
-    int ip = cache_i(pm_cache_ip,p);
-    int jp = cache_i(pm_cache_jp,p);
-    int kp = cache_i(pm_cache_kp,p);
+    int m = pi(PGID,p) - gids;
+    int ip, jp, kp;
     Real wx[3], wy[3], wz[3];
-    for (int a=0; a<3; ++a) {
-      wx[a] = cache_r(pm_cache_wx+a,p);
-      wy[a] = cache_r(pm_cache_wy+a,p);
-      wz[a] = cache_r(pm_cache_wz+a,p);
+    PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
+              scheme, ip, wx);
+    PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
+              scheme, jp, wy);
+    if (three_d) {
+      PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
+                scheme, kp, wz);
+    } else {
+      kp = ks;
+      wz[0] = 0.0; wz[1] = 1.0; wz[2] = 0.0;
     }
 
     Real gathered[3] = {0.0, 0.0, 0.0};
@@ -130,7 +137,10 @@ void DustGasDrag::ApplyCoupledOperator(DvceArray5D<Real> &field,
       }
     }
 
-    Real fac = cache_r(pm_cache_muc,p);
+    Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+    if (three_d) vol *= mbsize.d_view(m).dx3;
+    Real cj = a_dt/(pr(IPTS,p) + a_dt);
+    Real fac = pr(IPM,p)*cj/vol;
     for (int c=clo; c<=chi; ++c) {
       for (int b=0; b<3; ++b) {
         Real wcb = wz[c]*wy[b]*fac;
@@ -432,14 +442,12 @@ Real DustGasDrag::AdaptiveErrorBound(Real a_dt, Real residual_norm, Real &state_
 
   particles::Particles *ppar=pmy_pack->ppart;
   auto &pr=ppar->prtcl_rdata;
+  auto &pi=ppar->prtcl_idata;
   int npart=ppar->nprtcl_thispack;
-  RequireParticleCache(npart,a_dt,"DustGasDrag::AdaptiveErrorBound");
-  auto &cache_i=particle_cache_i;
-  auto &cache_r=particle_cache_r;
   Real cmax_local=0.0;
   Kokkos::parallel_reduce("dust_adapt_cmax",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
   KOKKOS_LAMBDA(const int p, Real &maximum) {
-    maximum=fmax(maximum,cache_r(pm_cache_cj,p));
+    maximum=fmax(maximum,a_dt/(pr(IPTS,p)+a_dt));
   },Kokkos::Max<Real>(cmax_local));
   Real maxima_local[2]={eps_local,cmax_local}, maxima[2];
 #if MPI_PARALLEL_ENABLED
@@ -466,18 +474,23 @@ Real DustGasDrag::AdaptiveErrorBound(Real a_dt, Real residual_norm, Real &state_
     sum+=vol*u0(m,IDN,kk,jj,ii)*usq;
   },gas_state_local);
 
+  auto gids=pmy_pack->gids;
+  int scheme=static_cast<int>(deposit);
   Real particle_state_local=0.0;
   Kokkos::parallel_reduce("dust_adapt_particle_state",
   Kokkos::RangePolicy<>(DevExeSpace(),0,npart),KOKKOS_LAMBDA(const int p,Real &sum) {
-    int m=cache_i(pm_cache_m,p);
-    int ip=cache_i(pm_cache_ip,p);
-    int jp=cache_i(pm_cache_jp,p);
-    int kp=cache_i(pm_cache_kp,p);
+    int m=pi(PGID,p)-gids;
+    int ip,jp,kp;
     Real wx[3],wy[3],wz[3];
-    for (int a=0;a<3;++a) {
-      wx[a]=cache_r(pm_cache_wx+a,p);
-      wy[a]=cache_r(pm_cache_wy+a,p);
-      wz[a]=cache_r(pm_cache_wz+a,p);
+    PMWeights(pr(IPX,p),mbsize.d_view(m).x1min,mbsize.d_view(m).x1max,nx1,is,
+              scheme,ip,wx);
+    PMWeights(pr(IPY,p),mbsize.d_view(m).x2min,mbsize.d_view(m).x2max,nx2,js,
+              scheme,jp,wy);
+    if (three_d) {
+      PMWeights(pr(IPZ,p),mbsize.d_view(m).x3min,mbsize.d_view(m).x3max,nx3,ks,
+                scheme,kp,wz);
+    } else {
+      kp=ks; wz[0]=0.0; wz[1]=1.0; wz[2]=0.0;
     }
     Real gu[3]={0.0,0.0,0.0};
     int clo=three_d?0:1,chi=three_d?2:1;
@@ -488,7 +501,7 @@ Real DustGasDrag::AdaptiveErrorBound(Real a_dt, Real residual_norm, Real &state_
       gu[1]+=w*x(m,1,kk,jj,ii);
       gu[2]+=w*x(m,2,kk,jj,ii);
     }
-    Real cj=cache_r(pm_cache_cj,p);
+    Real cj=a_dt/(pr(IPTS,p)+a_dt);
     Real vx=pr(IPVX,p)+cj*(gu[0]-pr(IPVX,p));
     Real vy=pr(IPVY,p)+cj*(gu[1]-pr(IPVY,p));
     Real vz=pr(IPVZ,p)+cj*(gu[2]-pr(IPVZ,p));
