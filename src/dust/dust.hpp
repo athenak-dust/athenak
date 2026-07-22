@@ -44,7 +44,8 @@ enum class DustStoppingTimeMode {species_fixed=0, particle_static=1, dynamic=2};
 
 // `local` is the regression baseline. `applya` executes one non-mutating coupled
 // operator application and then retains the local answer, for marginal-cost timing.
-enum class DustDragSolver {local=0, applya=1, dc1=2, pcg=3, adaptive=4};
+// `dc1` and `dc2` unconditionally accept one and two fixed defect corrections.
+enum class DustDragSolver {local=0, applya=1, dc1=2, dc2=3, pcg=4, adaptive=5};
 
 // Stage-frozen particle-mesh transfer cache. The arrays use a structure-of-arrays
 // layout, (quantity, particle), so adjacent particle threads read contiguous values.

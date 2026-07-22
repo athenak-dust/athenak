@@ -548,16 +548,23 @@ TaskStatus DustGasDrag::SolveCoupledStage(Driver *pdrive, int stage) {
   if (drag_solver == DustDragSolver::applya) {
     ApplyCoupledOperator(x,ap,a_dt);
   } else if (drag_solver == DustDragSolver::dc1 ||
+             drag_solver == DustDragSolver::dc2 ||
              drag_solver == DustDragSolver::adaptive) {
-    ApplyCoupledOperator(x,ap,a_dt);
-    par_for("dust_solver_dc1",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
-    KOKKOS_LAMBDA(const int m,const int k,const int j,const int i) {
-      Real pinv=1.0/(u0(m,IDN,k,j,i)+qdep_(m,0,k,j,i));
-      for (int d=0;d<3;++d) {
-        r(m,d,k,j,i)=u0(m,IM1+d,k,j,i)+qdep_(m,1+d,k,j,i)-ap(m,d,k,j,i);
-        x(m,d,k,j,i)+=pinv*r(m,d,k,j,i);
-      }
-    });
+    // Fixed defect correction: DC1/adaptive take one sweep and DC2 takes two. DC2 is
+    // deliberately accepted after its second sweep without a residual reduction or a
+    // PCG fallback, giving a deterministic two-ApplyA production cost.
+    int nsweeps=(drag_solver == DustDragSolver::dc2)?2:1;
+    for (int sweep=0;sweep<nsweeps;++sweep) {
+      ApplyCoupledOperator(x,ap,a_dt);
+      par_for("dust_solver_dc",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
+      KOKKOS_LAMBDA(const int m,const int k,const int j,const int i) {
+        Real pinv=1.0/(u0(m,IDN,k,j,i)+qdep_(m,0,k,j,i));
+        for (int d=0;d<3;++d) {
+          r(m,d,k,j,i)=u0(m,IM1+d,k,j,i)+qdep_(m,1+d,k,j,i)-ap(m,d,k,j,i);
+          x(m,d,k,j,i)+=pinv*r(m,d,k,j,i);
+        }
+      });
+    }
     if (drag_solver == DustDragSolver::adaptive) {
       ApplyCoupledOperator(x,ap,a_dt);
       par_for("dust_adaptive_true_r",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,

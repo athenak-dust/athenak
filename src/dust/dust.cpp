@@ -112,6 +112,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       drag_solver = DustDragSolver::applya;
     } else if (solver.compare("dc1") == 0) {
       drag_solver = DustDragSolver::dc1;
+    } else if (solver.compare("dc2") == 0) {
+      drag_solver = DustDragSolver::dc2;
     } else if (solver.compare("pcg") == 0) {
       drag_solver = DustDragSolver::pcg;
     } else if (solver.compare("adaptive") == 0) {
@@ -119,7 +121,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     } else {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<dust>/drag_solver = '" << solver
-                << "' not recognized (must be local, applya, dc1, pcg, or adaptive)"
+                << "' not recognized (must be local, applya, dc1, dc2, pcg, or adaptive)"
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
@@ -285,6 +287,7 @@ DustGasDrag::~DustGasDrag() {
     };
     const char *name = (drag_solver == DustDragSolver::applya) ? "applya" :
                        (drag_solver == DustDragSolver::dc1) ? "dc1" :
+                       (drag_solver == DustDragSolver::dc2) ? "dc2" :
                        (drag_solver == DustDragSolver::pcg) ? "pcg" :
                        (drag_solver == DustDragSolver::adaptive) ? "adaptive" : "local";
     std::cout << std::setprecision(14)
