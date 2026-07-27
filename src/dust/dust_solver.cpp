@@ -11,9 +11,9 @@
 //!   A = diag(rho_g) + G^T diag(m_p*c_p/V) G,
 //!   b = momentum_g + G^T diag(m_p*c_p/V) v_p,
 //!
-//! where c_p=a/(t_stop,p+a).  Matching PMWeights in G and G^T makes A SPD.  All trial
-//! operations below are non-mutating: particle velocities and gas momentum are changed
-//! only later by GatherKickPMBR and ApplyPMBR after one field has been accepted.
+//! where c_p=a/(t_stop,p+a).  Matching PMCompactWeights in G and G^T makes A SPD.  All
+//! trial operations below are non-mutating: particle velocities and gas momentum are
+//! changed only later by GatherKickPMBR and ApplyPMBR after one field has been accepted.
 //!
 //! The communication-bearing solves below deliberately block inside one task.  This is
 //! safe under AthenaK's current execution contract: one MeshBlockPack contains all local
@@ -61,6 +61,136 @@ void RequireComplete(TaskStatus status, const char *operation) {
   }
 }
 
+// Scheme- and dimension-specialized particle contribution to the matrix-free operator.
+// Compact supports are essential for NGP/CIC: the former runtime-width loop issued
+// reads and atomics for zero-weight cells.
+template<DustDeposit Scheme, bool ThreeD>
+void ApplyCoupledParticleTerm(DvceArray2D<Real> pr, DvceArray2D<int> pi,
+                              DvceArray1D<RegionSize> mbsize,
+                              DvceArray5D<Real> field, DvceArray5D<Real> result,
+                              const int npart, const int gids,
+                              const int is, const int js, const int ks,
+                              const int nx1, const int nx2, const int nx3,
+                              const Real a_dt) {
+  constexpr int nstencil = PMStencilWidth<Scheme>::value;
+  constexpr int nk = ThreeD ? nstencil : 1;
+  const char *label = (Scheme == DustDeposit::ngp) ? "dust_applya_gtsg_ngp" :
+                      (Scheme == DustDeposit::cic) ? "dust_applya_gtsg_cic" :
+                                                    "dust_applya_gtsg_tsc";
+
+  par_for(label,DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
+    int m = pi(PGID,p) - gids;
+    int ip, jp, kp, i0, j0, k0;
+    Real wx[nstencil], wy[nstencil], wz[nk];
+    // Capture z-dimension bounds outside if constexpr for CUDA extended lambdas.
+    const int nx3_ = nx3;
+    kp = ks;
+    k0 = ks;
+    wz[0] = 1.0;
+    PMCompactWeights<Scheme>(pr(IPX,p), mbsize(m).x1min, mbsize(m).x1max,
+                             nx1, is, ip, i0, wx);
+    PMCompactWeights<Scheme>(pr(IPY,p), mbsize(m).x2min, mbsize(m).x2max,
+                             nx2, js, jp, j0, wy);
+    if constexpr (ThreeD) {
+      PMCompactWeights<Scheme>(pr(IPZ,p), mbsize(m).x3min, mbsize(m).x3max,
+                               nx3_, ks, kp, k0, wz);
+    }
+
+    Real gathered[3] = {0.0, 0.0, 0.0};
+    for (int c=0; c<nk; ++c) {
+      for (int b=0; b<nstencil; ++b) {
+        Real wcb = wz[c]*wy[b];
+        if (wcb == 0.0) {continue;}
+        for (int a=0; a<nstencil; ++a) {
+          Real w = wcb*wx[a];
+          if (w == 0.0) {continue;}
+          int kk = k0+c, jj = j0+b, ii = i0+a;
+          gathered[0] += w*field(m,0,kk,jj,ii);
+          gathered[1] += w*field(m,1,kk,jj,ii);
+          gathered[2] += w*field(m,2,kk,jj,ii);
+        }
+      }
+    }
+
+    Real vol = mbsize(m).dx1*mbsize(m).dx2;
+    if constexpr (ThreeD) {vol *= mbsize(m).dx3;}
+    Real cj = a_dt/(pr(IPTS,p) + a_dt);
+    Real fac = pr(IPM,p)*cj/vol;
+    for (int c=0; c<nk; ++c) {
+      for (int b=0; b<nstencil; ++b) {
+        Real wcb = wz[c]*wy[b]*fac;
+        if (wcb == 0.0) {continue;}
+        for (int a=0; a<nstencil; ++a) {
+          Real w = wcb*wx[a];
+          if (w == 0.0) {continue;}
+          int kk = k0+c, jj = j0+b, ii = i0+a;
+          Kokkos::atomic_add(&result(m,0,kk,jj,ii), w*gathered[0]);
+          Kokkos::atomic_add(&result(m,1,kk,jj,ii), w*gathered[1]);
+          Kokkos::atomic_add(&result(m,2,kk,jj,ii), w*gathered[2]);
+        }
+      }
+    }
+  });
+}
+
+template<DustDeposit Scheme, bool ThreeD>
+Real AdaptiveParticleState(DvceArray2D<Real> pr, DvceArray2D<int> pi,
+                           DvceArray1D<RegionSize> mbsize,
+                           DvceArray5D<Real> field, const int npart,
+                           const int gids, const int is, const int js, const int ks,
+                           const int nx1, const int nx2, const int nx3,
+                           const Real a_dt) {
+  constexpr int nstencil = PMStencilWidth<Scheme>::value;
+  constexpr int nk = ThreeD ? nstencil : 1;
+  const char *label = (Scheme == DustDeposit::ngp) ? "dust_adapt_particle_state_ngp" :
+                      (Scheme == DustDeposit::cic) ? "dust_adapt_particle_state_cic" :
+                                                    "dust_adapt_particle_state_tsc";
+
+  Real state = 0.0;
+  Kokkos::parallel_reduce(label,Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
+  KOKKOS_LAMBDA(const int p, Real &sum) {
+    int m = pi(PGID,p) - gids;
+    int ip, jp, kp, i0, j0, k0;
+    Real wx[nstencil], wy[nstencil], wz[nk];
+    // Capture z-dimension bounds outside if constexpr for CUDA extended lambdas.
+    const int nx3_ = nx3;
+    kp = ks;
+    k0 = ks;
+    wz[0] = 1.0;
+    PMCompactWeights<Scheme>(pr(IPX,p), mbsize(m).x1min, mbsize(m).x1max,
+                             nx1, is, ip, i0, wx);
+    PMCompactWeights<Scheme>(pr(IPY,p), mbsize(m).x2min, mbsize(m).x2max,
+                             nx2, js, jp, j0, wy);
+    if constexpr (ThreeD) {
+      PMCompactWeights<Scheme>(pr(IPZ,p), mbsize(m).x3min, mbsize(m).x3max,
+                               nx3_, ks, kp, k0, wz);
+    }
+
+    Real gu[3] = {0.0, 0.0, 0.0};
+    for (int c=0; c<nk; ++c) {
+      for (int b=0; b<nstencil; ++b) {
+        Real wcb = wz[c]*wy[b];
+        if (wcb == 0.0) {continue;}
+        for (int a=0; a<nstencil; ++a) {
+          Real w = wcb*wx[a];
+          if (w == 0.0) {continue;}
+          int kk = k0+c, jj = j0+b, ii = i0+a;
+          gu[0] += w*field(m,0,kk,jj,ii);
+          gu[1] += w*field(m,1,kk,jj,ii);
+          gu[2] += w*field(m,2,kk,jj,ii);
+        }
+      }
+    }
+
+    Real cj = a_dt/(pr(IPTS,p)+a_dt);
+    Real vx = pr(IPVX,p)+cj*(gu[0]-pr(IPVX,p));
+    Real vy = pr(IPVY,p)+cj*(gu[1]-pr(IPVY,p));
+    Real vz = pr(IPVZ,p)+cj*(gu[2]-pr(IPVZ,p));
+    sum += pr(IPM,p)*(vx*vx+vy*vy+vz*vz);
+  },state);
+  return state;
+}
+
 } // namespace
 
 //----------------------------------------------------------------------------------------
@@ -102,85 +232,76 @@ void DustGasDrag::CompleteAddExchange(DvceArray5D<Real> &field) {
 void DustGasDrag::ApplyCoupledOperator(DvceArray5D<Real> &field,
                                        DvceArray5D<Real> &result, Real a_dt) {
   CompleteCopyExchange(field);
-  Kokkos::deep_copy(DevExeSpace(), result, 0.0);
+
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int is = indcs.is, ie = indcs.ie, js = indcs.js, je = indcs.je;
+  int ks = indcs.ks, ke = indcs.ke;
+  int nmb1 = pmy_pack->nmb_thispack - 1;
+  int ncells1 = result.extent_int(4);
+  int ncells2 = result.extent_int(3);
+  int ncells3 = result.extent_int(2);
+  auto &u0 = pmy_pack->phydro->u0;
+  auto &field_ = field;
+  auto &result_ = result;
+  // Initialize the particle-scatter target and gas diagonal in one pass.  Ghost cells
+  // must start at zero because the additive exchange transfers only particle deposits.
+  par_for("dust_applya_init",DevExeSpace(),0,nmb1,0,(ncells3-1),0,(ncells2-1),
+          0,(ncells1-1),
+  KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+    bool active = (i >= is && i <= ie && j >= js && j <= je &&
+                   k >= ks && k <= ke);
+    if (active) {
+      Real rho = u0(m,IDN,k,j,i);
+      result_(m,0,k,j,i) = rho*field_(m,0,k,j,i);
+      result_(m,1,k,j,i) = rho*field_(m,1,k,j,i);
+      result_(m,2,k,j,i) = rho*field_(m,2,k,j,i);
+    } else {
+      result_(m,0,k,j,i) = 0.0;
+      result_(m,1,k,j,i) = 0.0;
+      result_(m,2,k,j,i) = 0.0;
+    }
+  });
 
   particles::Particles *ppar = pmy_pack->ppart;
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
   int npart = ppar->nprtcl_thispack;
-  auto &indcs = pmy_pack->pmesh->mb_indcs;
-  int is = indcs.is, js = indcs.js, ks = indcs.ks;
   int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
   bool three_d = pmy_pack->pmesh->three_d;
-  auto &mbsize = pmy_pack->pmb->mb_size;
+  auto mbsize = pmy_pack->pmb->mb_size.d_view;
   auto gids = pmy_pack->gids;
-  int scheme = static_cast<int>(deposit);
-  auto &field_ = field;
-  auto &result_ = result;
 
-  par_for("dust_applya_gtsg",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
-    int m = pi(PGID,p) - gids;
-    int ip, jp, kp;
-    Real wx[3], wy[3], wz[3];
-    PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
-              scheme, ip, wx);
-    PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
-              scheme, jp, wy);
-    if (three_d) {
-      PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
-                scheme, kp, wz);
+  if (three_d) {
+    if (deposit == DustDeposit::ngp) {
+      ApplyCoupledParticleTerm<DustDeposit::ngp,true>(
+          pr, pi, mbsize, field, result, npart, gids,
+          is, js, ks, nx1, nx2, nx3, a_dt);
+    } else if (deposit == DustDeposit::cic) {
+      ApplyCoupledParticleTerm<DustDeposit::cic,true>(
+          pr, pi, mbsize, field, result, npart, gids,
+          is, js, ks, nx1, nx2, nx3, a_dt);
     } else {
-      kp = ks;
-      wz[0] = 0.0; wz[1] = 1.0; wz[2] = 0.0;
+      ApplyCoupledParticleTerm<DustDeposit::tsc,true>(
+          pr, pi, mbsize, field, result, npart, gids,
+          is, js, ks, nx1, nx2, nx3, a_dt);
     }
-
-    Real gathered[3] = {0.0, 0.0, 0.0};
-    int clo = three_d ? 0 : 1, chi = three_d ? 2 : 1;
-    for (int c=clo; c<=chi; ++c) {
-      for (int b=0; b<3; ++b) {
-        Real wcb = wz[c]*wy[b];
-        if (wcb == 0.0) continue;
-        for (int a=0; a<3; ++a) {
-          Real w = wcb*wx[a];
-          int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
-          gathered[0] += w*field_(m,0,kk,jj,ii);
-          gathered[1] += w*field_(m,1,kk,jj,ii);
-          gathered[2] += w*field_(m,2,kk,jj,ii);
-        }
-      }
+  } else {
+    if (deposit == DustDeposit::ngp) {
+      ApplyCoupledParticleTerm<DustDeposit::ngp,false>(
+          pr, pi, mbsize, field, result, npart, gids,
+          is, js, ks, nx1, nx2, nx3, a_dt);
+    } else if (deposit == DustDeposit::cic) {
+      ApplyCoupledParticleTerm<DustDeposit::cic,false>(
+          pr, pi, mbsize, field, result, npart, gids,
+          is, js, ks, nx1, nx2, nx3, a_dt);
+    } else {
+      ApplyCoupledParticleTerm<DustDeposit::tsc,false>(
+          pr, pi, mbsize, field, result, npart, gids,
+          is, js, ks, nx1, nx2, nx3, a_dt);
     }
-
-    Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
-    if (three_d) vol *= mbsize.d_view(m).dx3;
-    Real cj = a_dt/(pr(IPTS,p) + a_dt);
-    Real fac = pr(IPM,p)*cj/vol;
-    for (int c=clo; c<=chi; ++c) {
-      for (int b=0; b<3; ++b) {
-        Real wcb = wz[c]*wy[b]*fac;
-        if (wcb == 0.0) continue;
-        for (int a=0; a<3; ++a) {
-          Real w = wcb*wx[a];
-          int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
-          Kokkos::atomic_add(&result_(m,0,kk,jj,ii), w*gathered[0]);
-          Kokkos::atomic_add(&result_(m,1,kk,jj,ii), w*gathered[1]);
-          Kokkos::atomic_add(&result_(m,2,kk,jj,ii), w*gathered[2]);
-        }
-      }
-    }
-  });
+  }
 
   CompleteAddExchange(result);
-
-  int ie = indcs.ie, je = indcs.je, ke = indcs.ke;
-  int nmb1 = pmy_pack->nmb_thispack - 1;
-  auto &u0 = pmy_pack->phydro->u0;
-  par_for("dust_applya_rho",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
-  KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-    Real rho = u0(m,IDN,k,j,i);
-    result_(m,0,k,j,i) += rho*field_(m,0,k,j,i);
-    result_(m,1,k,j,i) += rho*field_(m,1,k,j,i);
-    result_(m,2,k,j,i) += rho*field_(m,2,k,j,i);
-  });
   ++solver_applya_count;
 }
 
@@ -493,38 +614,31 @@ Real DustGasDrag::AdaptiveErrorBound(Real a_dt, Real residual_norm, Real &state_
   },gas_state_local);
 
   auto gids=pmy_pack->gids;
-  int scheme=static_cast<int>(deposit);
   Real particle_state_local=0.0;
-  Kokkos::parallel_reduce("dust_adapt_particle_state",
-  Kokkos::RangePolicy<>(DevExeSpace(),0,npart),KOKKOS_LAMBDA(const int p,Real &sum) {
-    int m=pi(PGID,p)-gids;
-    int ip,jp,kp;
-    Real wx[3],wy[3],wz[3];
-    PMWeights(pr(IPX,p),mbsize.d_view(m).x1min,mbsize.d_view(m).x1max,nx1,is,
-              scheme,ip,wx);
-    PMWeights(pr(IPY,p),mbsize.d_view(m).x2min,mbsize.d_view(m).x2max,nx2,js,
-              scheme,jp,wy);
-    if (three_d) {
-      PMWeights(pr(IPZ,p),mbsize.d_view(m).x3min,mbsize.d_view(m).x3max,nx3,ks,
-                scheme,kp,wz);
+  auto mbsize_d=mbsize.d_view;
+  if (three_d) {
+    if (deposit == DustDeposit::ngp) {
+      particle_state_local=AdaptiveParticleState<DustDeposit::ngp,true>(
+          pr,pi,mbsize_d,x,npart,gids,is,js,ks,nx1,nx2,nx3,a_dt);
+    } else if (deposit == DustDeposit::cic) {
+      particle_state_local=AdaptiveParticleState<DustDeposit::cic,true>(
+          pr,pi,mbsize_d,x,npart,gids,is,js,ks,nx1,nx2,nx3,a_dt);
     } else {
-      kp=ks; wz[0]=0.0; wz[1]=1.0; wz[2]=0.0;
+      particle_state_local=AdaptiveParticleState<DustDeposit::tsc,true>(
+          pr,pi,mbsize_d,x,npart,gids,is,js,ks,nx1,nx2,nx3,a_dt);
     }
-    Real gu[3]={0.0,0.0,0.0};
-    int clo=three_d?0:1,chi=three_d?2:1;
-    for (int c=clo;c<=chi;++c) for (int b=0;b<3;++b) for (int a=0;a<3;++a) {
-      Real w=wz[c]*wy[b]*wx[a];
-      int kk=kp+c-1,jj=jp+b-1,ii=ip+a-1;
-      gu[0]+=w*x(m,0,kk,jj,ii);
-      gu[1]+=w*x(m,1,kk,jj,ii);
-      gu[2]+=w*x(m,2,kk,jj,ii);
+  } else {
+    if (deposit == DustDeposit::ngp) {
+      particle_state_local=AdaptiveParticleState<DustDeposit::ngp,false>(
+          pr,pi,mbsize_d,x,npart,gids,is,js,ks,nx1,nx2,nx3,a_dt);
+    } else if (deposit == DustDeposit::cic) {
+      particle_state_local=AdaptiveParticleState<DustDeposit::cic,false>(
+          pr,pi,mbsize_d,x,npart,gids,is,js,ks,nx1,nx2,nx3,a_dt);
+    } else {
+      particle_state_local=AdaptiveParticleState<DustDeposit::tsc,false>(
+          pr,pi,mbsize_d,x,npart,gids,is,js,ks,nx1,nx2,nx3,a_dt);
     }
-    Real cj=a_dt/(pr(IPTS,p)+a_dt);
-    Real vx=pr(IPVX,p)+cj*(gu[0]-pr(IPVX,p));
-    Real vy=pr(IPVY,p)+cj*(gu[1]-pr(IPVY,p));
-    Real vz=pr(IPVZ,p)+cj*(gu[2]-pr(IPVZ,p));
-    sum+=pr(IPM,p)*(vx*vx+vy*vy+vz*vz);
-  },particle_state_local);
+  }
 
   Real state_local=gas_state_local+particle_state_local,state_global;
 #if MPI_PARALLEL_ENABLED
@@ -591,8 +705,9 @@ TaskStatus DustGasDrag::SolveCoupledStage(Driver *pdrive, int stage) {
       KOKKOS_LAMBDA(const int m,const int k,const int j,const int i) {
         Real pinv=1.0/(u0(m,IDN,k,j,i)+qdep_(m,0,k,j,i));
         for (int d=0;d<3;++d) {
-          r(m,d,k,j,i)=u0(m,IM1+d,k,j,i)+qdep_(m,1+d,k,j,i)-ap(m,d,k,j,i);
-          x(m,d,k,j,i)+=pinv*r(m,d,k,j,i);
+          Real residual =
+              u0(m,IM1+d,k,j,i)+qdep_(m,1+d,k,j,i)-ap(m,d,k,j,i);
+          x(m,d,k,j,i)+=pinv*residual;
         }
       });
     }

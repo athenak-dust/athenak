@@ -236,10 +236,15 @@ void MeshBoundaryValues::InitializeBuffers(const int nvar) {
 
 particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
   particles::Particles *pp, ParameterInput *pin) :
+    nprtcl_send(0),
+    nprtcl_recv(0),
     sendlist("sendlist",1),
     send_count("send_count",1),
+    compactlist("compactlist",1),
     sgid_map("sgid_map",1,1,1),
     srank_map("srank_map",1,1,1),
+    nsends(0),
+    nrecvs(0),
 #if MPI_PARALLEL_ENABLED
     prtcl_rsendbuf("rsend",1),
     prtcl_rrecvbuf("rrecv",1),

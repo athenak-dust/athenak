@@ -235,8 +235,16 @@ class MeshBoundaryValuesFC : public MeshBoundaryValues {
 
 struct ParticleLocationData {
   int prtcl_indx;   // index in particle array
-  int dest_gid;     // GID of target MeshBlock
   int dest_rank;    // rank of target MeshBlock
+};
+
+//----------------------------------------------------------------------------------------
+//! \struct ParticleMoveData
+//! \brief source/destination indices for device-side particle-array compaction
+
+struct ParticleMoveData {
+  int src;
+  int dst;
 };
 
 // Custom operators to sort ParticleLocationData array by dest_rank or prtcl_indx
@@ -276,6 +284,8 @@ class ParticlesBoundaryValues {
   // sendlist.extent(0) is capacity.  Never shrink the allocation after a migration.
   DualArray1D<ParticleLocationData> sendlist;
   DualArray1D<int> send_count;  // device-side append counter (length one)
+  // compactlist is also persistent; only its valid prefix is copied/launched.
+  DualArray1D<ParticleMoveData> compactlist;
 
   // shear-periodic x1 boundary support (uniform grids only). Particles crossing the
   // radial mesh boundaries are shifted azimuthally (positions only; velocities are

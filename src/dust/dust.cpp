@@ -37,6 +37,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     solver_r("dust_solver_r",1,1,1,1,1),
     solver_p("dust_solver_p",1,1,1,1,1),
     solver_ap("dust_solver_ap",1,1,1,1,1),
+    pbval_qp(nullptr),
+    pbval_dm(nullptr),
+    pbval_us(nullptr),
     pmy_pack(ppack) {
   // (1) validate configuration ----------------------------------------------------------
   hydro::Hydro *phyd = pmy_pack->phydro;
@@ -236,24 +239,35 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   int ncells1 = indcs.nx1 + 2*(indcs.ng);
   int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
   int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
-  Kokkos::realloc(qdep,  nmb, 4, ncells3, ncells2, ncells1);
   Kokkos::realloc(ustar, nmb, 3, ncells3, ncells2, ncells1);
-  Kokkos::realloc(dmom,  nmb, 3, ncells3, ncells2, ncells1);
-  Kokkos::deep_copy(dmom, 0.0);  // read as R_g=0 in stage 2 if back_reaction is off
-  if (drag_solver != DustDragSolver::local) {
-    Kokkos::realloc(solver_r,  nmb, 3, ncells3, ncells2, ncells1);
-    Kokkos::realloc(solver_p,  nmb, 3, ncells3, ncells2, ncells1);
-    Kokkos::realloc(solver_ap, nmb, 3, ncells3, ncells2, ncells1);
+  if (back_reaction) {
+    Kokkos::realloc(qdep, nmb, 4, ncells3, ncells2, ncells1);
+    Kokkos::realloc(dmom, nmb, 3, ncells3, ncells2, ncells1);
+    Kokkos::deep_copy(dmom, 0.0);
+    if (drag_solver != DustDragSolver::local) {
+      // The stage-2 drag history consumes dmom before SolveCoupledStage.  solver_ap is
+      // dead when GatherKickPMBR subsequently clears dmom for the new feedback deposit,
+      // and the solver/feedback boundary objects own distinct communication buffers.
+      // Reuse the storage between those non-overlapping lifetimes.
+      solver_ap = dmom;
+    }
+    if (drag_solver == DustDragSolver::pcg ||
+        drag_solver == DustDragSolver::adaptive) {
+      Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
+      Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
+    }
   }
 
   // (4) allocate boundary communication objects -----------------------------------------
-  pbval_qp = new MeshBoundaryValuesDep(pmy_pack, pin);
-  pbval_qp->InitializeBuffers(4);
-  pbval_dm = new MeshBoundaryValuesDep(pmy_pack, pin);
-  pbval_dm->InitializeBuffers(3);
+  if (back_reaction) {
+    pbval_qp = new MeshBoundaryValuesDep(pmy_pack, pin);
+    pbval_qp->InitializeBuffers(4);
+    pbval_dm = new MeshBoundaryValuesDep(pmy_pack, pin);
+    pbval_dm->InitializeBuffers(3);
+  }
   pbval_us = new MeshBoundaryValuesCC(pmy_pack, pin, false);
   pbval_us->InitializeBuffers(3);
-  if (drag_solver != DustDragSolver::local) {
+  if (back_reaction && drag_solver != DustDragSolver::local) {
     // These objects own distinct communicators/requests and are reinitialized for every
     // matrix-free matvec; they must not alias the one-shot stage exchanges above.
     pbval_solver_copy = new MeshBoundaryValuesCC(pmy_pack, pin, false);
@@ -306,8 +320,8 @@ DustGasDrag::~DustGasDrag() {
               << " pcg_iter_max=" << quantile(1.0)
               << " solve_seconds=" << solver_wall_seconds << std::endl;
   }
-  delete pbval_qp;
-  delete pbval_dm;
+  if (pbval_qp != nullptr) delete pbval_qp;
+  if (pbval_dm != nullptr) delete pbval_dm;
   delete pbval_us;
   if (pbval_solver_copy != nullptr) delete pbval_solver_copy;
   if (pbval_solver_add != nullptr) delete pbval_solver_add;

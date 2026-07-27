@@ -18,6 +18,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <utility>
 
 #include "athena.hpp"
 #include "coordinates/cell_locations.hpp"
@@ -42,8 +43,21 @@ ParticleVTKOutput::ParticleVTKOutput(ParameterInput *pin, Mesh *pm, OutputParame
 
 void ParticleVTKOutput::LoadOutputData(Mesh *pm) {
   particles::Particles *pp = pm->pmb_pack->ppart;
-  npout_thisrank = pm->nprtcl_thisrank;
-  npout_total = pm->nprtcl_total;
+  npout_thisrank = pp->nprtcl_thispack;
+  pm->nprtcl_thisrank = npout_thisrank;
+  pm->nprtcl_eachrank[global_variable::my_rank] = npout_thisrank;
+#if MPI_PARALLEL_ENABLED
+  // Migration updates only the local logical count.  Refresh the distributed counts
+  // here, where the rank offsets are actually needed, rather than on every stage.
+  MPI_Allgather(&npout_thisrank, 1, MPI_INT, pm->nprtcl_eachrank, 1, MPI_INT,
+                MPI_COMM_WORLD);
+#endif
+  npout_total = 0;
+  for (int n=0; n<global_variable::nranks; ++n) {
+    npout_total += pm->nprtcl_eachrank[n];
+  }
+  pm->nprtcl_total = npout_total;
+
   Kokkos::realloc(outpart_rdata, pp->nrdata, npout_thisrank);
   Kokkos::realloc(outpart_idata, pp->nidata, npout_thisrank);
 
@@ -52,9 +66,14 @@ void ParticleVTKOutput::LoadOutputData(Mesh *pm) {
                                                     outpart_rdata);
   auto d_outpart_idata = Kokkos::create_mirror_view(Kokkos::DefaultHostExecutionSpace(),
                                                     outpart_idata);
-  // Copy particle positions into device mirrors
-  Kokkos::deep_copy(d_outpart_rdata, pp->prtcl_rdata);
-  Kokkos::deep_copy(d_outpart_idata, pp->prtcl_idata);
+  // Particle arrays retain geometric capacity between migrations.  Copy only the
+  // logical prefix into the exact-sized output views.
+  auto rprefix = Kokkos::subview(pp->prtcl_rdata, Kokkos::ALL,
+                                 std::make_pair(0, npout_thisrank));
+  auto iprefix = Kokkos::subview(pp->prtcl_idata, Kokkos::ALL,
+                                 std::make_pair(0, npout_thisrank));
+  Kokkos::deep_copy(d_outpart_rdata, rprefix);
+  Kokkos::deep_copy(d_outpart_idata, iprefix);
   // Copy particle positions from device mirror to host output array
   Kokkos::deep_copy(outpart_rdata, d_outpart_rdata);
   Kokkos::deep_copy(outpart_idata, d_outpart_idata);
@@ -127,7 +146,7 @@ void ParticleVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     header_offset += msg.str().size();
   }
   // allocate 1D vector of floats used to convert and output particle data
-  float *data = new float[3*npout_thisrank];
+  float *data = new float[std::max(3*npout_thisrank, 1)];
   // Loop over particles, load positions into data[]
   for (int p=0; p<npout_thisrank; ++p) {
     data[3*p] = static_cast<float>(outpart_rdata(IPX,p));

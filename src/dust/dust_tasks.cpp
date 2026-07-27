@@ -28,6 +28,20 @@
 #include "dust.hpp"
 
 namespace dust {
+namespace {
+
+// Coupled modes ending in a matrix-free operator application have already copy-filled
+// the accepted ustar ghost zones.  Local and fixed defect-correction modes either never
+// do that exchange or modify active ustar after their final application.
+bool NeedsPostSolveUstarExchange(const bool back_reaction,
+                                 const DustDragSolver solver) {
+  if (!back_reaction) {return true;}
+  return solver == DustDragSolver::local ||
+         solver == DustDragSolver::dc1 ||
+         solver == DustDragSolver::dc2;
+}
+
+} // namespace
 
 //----------------------------------------------------------------------------------------
 //! \fn void DustGasDrag::AssembleDustGasDragTasks
@@ -122,8 +136,10 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
     tstat = pbval_qp->InitRecv(4);
     if (tstat != TaskStatus::complete) return tstat;
   }
-  tstat = pbval_us->InitRecv(3);
-  if (tstat != TaskStatus::complete) return tstat;
+  if (NeedsPostSolveUstarExchange(back_reaction, drag_solver)) {
+    tstat = pbval_us->InitRecv(3);
+    if (tstat != TaskStatus::complete) return tstat;
+  }
   if (back_reaction) {
     tstat = pbval_dm->InitRecv(3);
     if (tstat != TaskStatus::complete) return tstat;
@@ -150,12 +166,18 @@ TaskStatus DustGasDrag::RecvDepQP(Driver *pdrive, int stage) {
 }
 
 TaskStatus DustGasDrag::SendUstar(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!ActiveStage(pdrive, stage) ||
+      !NeedsPostSolveUstarExchange(back_reaction, drag_solver)) {
+    return TaskStatus::complete;
+  }
   return pbval_us->PackAndSendCC(ustar, cdummy);
 }
 
 TaskStatus DustGasDrag::RecvUstar(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!ActiveStage(pdrive, stage) ||
+      !NeedsPostSolveUstarExchange(back_reaction, drag_solver)) {
+    return TaskStatus::complete;
+  }
   return pbval_us->RecvAndUnpackCC(ustar, cdummy);
 }
 
@@ -185,18 +207,23 @@ TaskStatus DustGasDrag::RecvPMBR(Driver *pdrive, int stage) {
 //! dormant stages since unposted requests are MPI_REQUEST_NULL.
 
 TaskStatus DustGasDrag::ClearDep(Driver *pdrive, int stage) {
-  TaskStatus tstat = pbval_qp->ClearSend();
-  if (tstat != TaskStatus::complete) return tstat;
-  tstat = pbval_qp->ClearRecv();
-  if (tstat != TaskStatus::complete) return tstat;
+  TaskStatus tstat = TaskStatus::complete;
+  if (pbval_qp != nullptr) {
+    tstat = pbval_qp->ClearSend();
+    if (tstat != TaskStatus::complete) return tstat;
+    tstat = pbval_qp->ClearRecv();
+    if (tstat != TaskStatus::complete) return tstat;
+  }
   tstat = pbval_us->ClearSend();
   if (tstat != TaskStatus::complete) return tstat;
   tstat = pbval_us->ClearRecv();
   if (tstat != TaskStatus::complete) return tstat;
-  tstat = pbval_dm->ClearSend();
-  if (tstat != TaskStatus::complete) return tstat;
-  tstat = pbval_dm->ClearRecv();
-  if (tstat != TaskStatus::complete) return tstat;
+  if (pbval_dm != nullptr) {
+    tstat = pbval_dm->ClearSend();
+    if (tstat != TaskStatus::complete) return tstat;
+    tstat = pbval_dm->ClearRecv();
+    if (tstat != TaskStatus::complete) return tstat;
+  }
   if (psbox_us != nullptr) {
     tstat = psbox_us->ClearSend();
     if (tstat != TaskStatus::complete) return tstat;

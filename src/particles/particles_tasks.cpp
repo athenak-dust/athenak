@@ -15,11 +15,27 @@
 #include "globals.hpp"
 #include "parameter_input.hpp"
 #include "tasklist/task_list.hpp"
+#include "driver/driver.hpp"
 #include "mesh/mesh.hpp"
 #include "bvals/bvals.hpp"
 #include "particles.hpp"
 
 namespace particles {
+namespace {
+
+// Dust uses imex2+, whose final explicit stage only assembles the low-storage RK
+// solution.  No particle position changes on that stage, so running the migration
+// chain would repeat a full particle scan and all MPI metadata collectives for
+// unchanged particles.
+bool ActiveMigrationStage(const ParticlesPusher pusher, const Driver *pdrive,
+                          const int stage) {
+  return !(pusher == ParticlesPusher::imex_dust &&
+           pdrive->integrator.compare("imex2+") == 0 &&
+           stage == pdrive->nexp_stages);
+}
+
+} // namespace
+
 //----------------------------------------------------------------------------------------
 //! \fn  void Particles::AssembleTasks
 //! \brief Adds hydro tasks to appropriate task lists used by time integrators.
@@ -47,6 +63,7 @@ void Particles::AssembleTasks(std::map<std::string, std::shared_ptr<TaskList>> t
 //! MeshBlocks.
 
 TaskStatus Particles::NewGID(Driver *pdrive, int stage) {
+  if (!ActiveMigrationStage(pusher, pdrive, stage)) {return TaskStatus::complete;}
   TaskStatus tstat = pbval_part->SetNewPrtclGID();
   return tstat;
 }
@@ -57,6 +74,7 @@ TaskStatus Particles::NewGID(Driver *pdrive, int stage) {
 //! MPI between all ranks
 
 TaskStatus Particles::SendCnt(Driver *pdrive, int stage) {
+  if (!ActiveMigrationStage(pusher, pdrive, stage)) {return TaskStatus::complete;}
   TaskStatus tstat = pbval_part->CountSendsAndRecvs();
   return tstat;
 }
@@ -66,6 +84,7 @@ TaskStatus Particles::SendCnt(Driver *pdrive, int stage) {
 //! \brief Wrapper task list function to post non-blocking receives (with MPI).
 
 TaskStatus Particles::InitRecv(Driver *pdrive, int stage) {
+  if (!ActiveMigrationStage(pusher, pdrive, stage)) {return TaskStatus::complete;}
   // post receives for particles
   TaskStatus tstat = pbval_part->InitPrtclRecv();
   return tstat;
@@ -76,6 +95,7 @@ TaskStatus Particles::InitRecv(Driver *pdrive, int stage) {
 //! \brief Wrapper task list function to pack/send particles
 
 TaskStatus Particles::SendP(Driver *pdrive, int stage) {
+  if (!ActiveMigrationStage(pusher, pdrive, stage)) {return TaskStatus::complete;}
   TaskStatus tstat = pbval_part->PackAndSendPrtcls();
   return tstat;
 }
@@ -85,6 +105,7 @@ TaskStatus Particles::SendP(Driver *pdrive, int stage) {
 //! \brief Wrapper task list function to receive/unpack particles
 
 TaskStatus Particles::RecvP(Driver *pdrive, int stage) {
+  if (!ActiveMigrationStage(pusher, pdrive, stage)) {return TaskStatus::complete;}
   TaskStatus tstat = pbval_part->RecvAndUnpackPrtcls();
   return tstat;
 }
@@ -95,6 +116,7 @@ TaskStatus Particles::RecvP(Driver *pdrive, int stage) {
 //! \brief Wrapper task list function that checks all MPI sends have completed.
 
 TaskStatus Particles::ClearSend(Driver *pdrive, int stage) {
+  if (!ActiveMigrationStage(pusher, pdrive, stage)) {return TaskStatus::complete;}
   // check sends of particles complete
   TaskStatus tstat = pbval_part->ClearPrtclSend();
   return tstat;
@@ -105,6 +127,7 @@ TaskStatus Particles::ClearSend(Driver *pdrive, int stage) {
 //! \brief Wrapper task list function that checks all MPI receives have completed.
 
 TaskStatus Particles::ClearRecv(Driver *pdrive, int stage) {
+  if (!ActiveMigrationStage(pusher, pdrive, stage)) {return TaskStatus::complete;}
   // check receives of particles complete
   TaskStatus tstat = pbval_part->ClearPrtclRecv();
   return tstat;

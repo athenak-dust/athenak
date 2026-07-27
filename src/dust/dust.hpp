@@ -71,28 +71,67 @@ struct DustGasDragTaskIDs {
 
 namespace dust {
 
-// Shared NGP/CIC/TSC stencil for deposits, matrix-free gathers, and the final kick.
-// One helper is used everywhere so the coupled operator and conservative commit cannot
-// silently acquire different particle-mesh weights.
+// Compute the cell containing a particle using the same arithmetic for every
+// particle-mesh operation.  Returning dx lets the weight helpers avoid recomputing it.
 KOKKOS_INLINE_FUNCTION
-void PMWeights(const Real x, const Real xmin, const Real xmax, const int nx,
-               const int is, const int scheme, int &ip, Real w[3]) {
-  Real dx = (xmax - xmin)/static_cast<Real>(nx);
-  int ig = static_cast<int>((x - xmin)/dx + 1.0) - 1;
-  Real del = (x - CellCenterX(ig, nx, xmin, xmax))/dx;
+void PMGridIndex(const Real x, const Real xmin, const Real xmax, const int nx,
+                 const int is, int &ig, int &ip, Real &dx) {
+  dx = (xmax - xmin)/static_cast<Real>(nx);
+  ig = static_cast<int>((x - xmin)/dx + 1.0) - 1;
   ip = ig + is;
-  if (scheme == 0) {
-    w[0] = 0.0;
-    w[1] = 1.0;
-    w[2] = 0.0;
-  } else if (scheme == 1) {
-    w[0] = fmax(0.0, -del);
-    w[1] = 1.0 - fabs(del);
-    w[2] = fmax(0.0, del);
+}
+
+template <DustDeposit Scheme>
+struct PMStencilWidth;
+
+template <>
+struct PMStencilWidth<DustDeposit::ngp> {
+  static constexpr int value = 1;
+};
+
+template <>
+struct PMStencilWidth<DustDeposit::cic> {
+  static constexpr int value = 2;
+};
+
+template <>
+struct PMStencilWidth<DustDeposit::tsc> {
+  static constexpr int value = 3;
+};
+
+// Return the compact, contiguous support of a compile-time-selected PM scheme.  ip is
+// the containing cell (for halo validation), while i0 is the first cell carrying a
+// weight.  Every matrix-free and conservative particle-mesh operation shares this
+// helper so the gather and transpose scatter cannot acquire different weights.
+template <DustDeposit Scheme>
+KOKKOS_INLINE_FUNCTION
+void PMCompactWeights(const Real x, const Real xmin, const Real xmax, const int nx,
+                      const int is, int &ip, int &i0, Real w[3]) {
+  Real dx;
+  int ig;
+  PMGridIndex(x, xmin, xmax, nx, is, ig, ip, dx);
+
+  if constexpr (Scheme == DustDeposit::ngp) {
+    i0 = ip;
+    w[0] = 1.0;
   } else {
-    w[0] = 0.5*SQR(0.5 - del);
-    w[1] = 0.75 - SQR(del);
-    w[2] = 0.5*SQR(0.5 + del);
+    Real del = (x - CellCenterX(ig, nx, xmin, xmax))/dx;
+    if constexpr (Scheme == DustDeposit::cic) {
+      if (del < 0.0) {
+        i0 = ip - 1;
+        w[0] = fmax(0.0, -del);
+        w[1] = 1.0 - fabs(del);
+      } else {
+        i0 = ip;
+        w[0] = 1.0 - fabs(del);
+        w[1] = fmax(0.0, del);
+      }
+    } else {
+      i0 = ip - 1;
+      w[0] = 0.5*SQR(0.5 - del);
+      w[1] = 0.75 - SQR(del);
+      w[2] = 0.5*SQR(0.5 + del);
+    }
   }
 }
 

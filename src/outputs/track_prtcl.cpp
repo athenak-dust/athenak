@@ -115,7 +115,7 @@ void TrackedParticleOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
 //  std::size_t header_offset = 0;
 
   // allocate 1D vector of floats used to convert and output particle data
-  float *data = new float[6*npout];
+  float *data = new float[std::max(6*npout, 1)];
   // Loop over particles, load positions into data[]
   for (int p=0; p<npout; ++p) {
     data[ 6*p   ] = static_cast<float>(outpart(p).x);
@@ -127,7 +127,7 @@ void TrackedParticleOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   }
   // calculate local data offset
   std::vector<int> rank_offset(global_variable::nranks, 0);
-  int npout_min = pm->nprtcl_eachrank[0];
+  int npout_min = npout_eachrank[0];
   for (int n=1; n<global_variable::nranks; ++n) {
     rank_offset[n] = rank_offset[n-1] + npout_eachrank[n-1];
     npout_min = std::min(npout_min, npout_eachrank[n]);

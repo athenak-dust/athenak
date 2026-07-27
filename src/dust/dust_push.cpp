@@ -27,28 +27,16 @@ namespace dust {
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::FirstTwoImpRK
 //! \brief On stage 1, copies the gas conserved variables into the RK register (u1 <- u0,
-//! replacing Hydro::CopyCons in the combined task list) and the particle phase-space
-//! coordinates into the particle registers ((x1,v1) <- (x,v)). Under imex2+ the two
-//! fully-implicit pre-stages of the tableau are dormant (their a_twid rows are zero), so
-//! unlike IonNeutral::FirstTwoImpRK no implicit solves are performed here.
+//! replacing Hydro::CopyCons in the combined task list). The particle register copy is
+//! fused into ExplicitPush, eliminating a separate full-particle pass. Under imex2+ the
+//! two fully-implicit pre-stages of the tableau are dormant (their a_twid rows are zero),
+//! so unlike IonNeutral::FirstTwoImpRK no implicit solves are performed here.
 
 TaskStatus DustGasDrag::FirstTwoImpRK(Driver *pdrive, int stage) {
   if (stage != 1) {return TaskStatus::complete;}  // only execute on first stage
 
   hydro::Hydro *phyd = pmy_pack->phydro;
   Kokkos::deep_copy(DevExeSpace(), phyd->u1, phyd->u0);
-
-  particles::Particles *ppar = pmy_pack->ppart;
-  auto &pr = ppar->prtcl_rdata;
-  par_for("dust_reg_copy",DevExeSpace(),0,(ppar->nprtcl_thispack-1),
-  KOKKOS_LAMBDA(const int p) {
-    pr(IPX1,p)  = pr(IPX,p);
-    pr(IPVX1,p) = pr(IPVX,p);
-    pr(IPY1,p)  = pr(IPY,p);
-    pr(IPVY1,p) = pr(IPVY,p);
-    pr(IPZ1,p)  = pr(IPZ,p);
-    pr(IPVZ1,p) = pr(IPVZ,p);
-  });
 
   return TaskStatus::complete;
 }
@@ -75,6 +63,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
   Real beta_dt = (pdrive->beta[stage-1])*dt;
   // history term: only a_twid[2][2] is nonzero for imex2+, consumed at explicit stage 2
   Real atw_dt = (stage == 2) ? (pdrive->a_twid[2][2])*dt : 0.0;
+  bool first_stage = (stage == 1);
 
   bool three_d = pmy_pack->pmesh->three_d;
   bool is_sbox = is_shearing_box;
@@ -89,6 +78,16 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
     Real vx_old = pr(IPVX,p);
     Real vy_old = pr(IPVY,p);
     Real vz_old = pr(IPVZ,p);
+
+    // Save the beginning-of-cycle state while it is already resident in registers.
+    if (first_stage) {
+      pr(IPX1,p) = x_old;
+      pr(IPY1,p) = y_old;
+      pr(IPZ1,p) = z_old;
+      pr(IPVX1,p) = vx_old;
+      pr(IPVY1,p) = vy_old;
+      pr(IPVZ1,p) = vz_old;
+    }
 
     // rotational/shear forces from pre-stage velocities (shear-relative frame)
     Real fx = 0.0, fy = 0.0, fz = 0.0;
@@ -105,17 +104,25 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
       }
     }
 
-    pr(IPVX,p) = gam0*vx_old + gam1*pr(IPVX1,p) + beta_dt*fx + atw_dt*pr(IPRX,p);
-    pr(IPVY,p) = gam0*vy_old + gam1*pr(IPVY1,p) + beta_dt*fy + atw_dt*pr(IPRY,p);
-    pr(IPVZ,p) = gam0*vz_old + gam1*pr(IPVZ1,p) + beta_dt*fz + atw_dt*pr(IPRZ,p);
+    // On stage 1, use the old values directly instead of reloading the just-written
+    // registers.  Stage 2 reads the persistent beginning-of-cycle state as before.
+    Real vx1 = first_stage ? vx_old : pr(IPVX1,p);
+    Real vy1 = first_stage ? vy_old : pr(IPVY1,p);
+    Real vz1 = first_stage ? vz_old : pr(IPVZ1,p);
+    pr(IPVX,p) = gam0*vx_old + gam1*vx1 + beta_dt*fx + atw_dt*pr(IPRX,p);
+    pr(IPVY,p) = gam0*vy_old + gam1*vy1 + beta_dt*fy + atw_dt*pr(IPRY,p);
+    pr(IPVZ,p) = gam0*vz_old + gam1*vz1 + beta_dt*fz + atw_dt*pr(IPRZ,p);
 
     // position drift: azimuthal transport includes the background shear -q*Omega*x
     Real ydot = vy_old;
     if (is_sbox && three_d) {ydot -= qshear_*omega0_*x_old;}
-    pr(IPX,p) = gam0*x_old + gam1*pr(IPX1,p) + beta_dt*vx_old;
-    pr(IPY,p) = gam0*y_old + gam1*pr(IPY1,p) + beta_dt*ydot;
+    Real x1 = first_stage ? x_old : pr(IPX1,p);
+    Real y1 = first_stage ? y_old : pr(IPY1,p);
+    pr(IPX,p) = gam0*x_old + gam1*x1 + beta_dt*vx_old;
+    pr(IPY,p) = gam0*y_old + gam1*y1 + beta_dt*ydot;
     if (three_d) {
-      pr(IPZ,p) = gam0*z_old + gam1*pr(IPZ1,p) + beta_dt*vz_old;
+      Real z1 = first_stage ? z_old : pr(IPZ1,p);
+      pr(IPZ,p) = gam0*z_old + gam1*z1 + beta_dt*vz_old;
     }
   });
 
