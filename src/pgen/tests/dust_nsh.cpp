@@ -23,6 +23,9 @@
 //! point (any Strang-like splitting error would appear as secular drift).
 //! <problem>/particle_placement=random instead gives a reproducible warm start at the
 //! same NSH velocities for nonlinear streaming-instability calculations.
+//! A physical dust-free equilibrium is obtained by omitting both <particles> and <dust>.
+//! In that mode there are no dust species or stopping times, so the solution reduces to
+//! u_x=0 and u_phi=-etavk.
 //!
 //! Works in the 2D r-z shearing box (azimuthal components in IM3/IPVZ, plain periodic
 //! boundaries) and in 3D (azimuthal in IM2/IPVY, shear-periodic x1 boundaries).
@@ -90,6 +93,13 @@ void SolveNSH(const Real omega0, const Real qshear, const Real ax,
               const std::vector<Real> &eps, const std::vector<Real> &taus,
               Real &ugx, Real &ugp, std::vector<Real> &vx, std::vector<Real> &vp) {
   int ns = static_cast<int>(eps.size());
+  if (ns == 0) {
+    ugx = 0.0;
+    ugp = -ax/(2.0*omega0);
+    vx.clear();
+    vp.clear();
+    return;
+  }
   int n = 2 + 2*ns;
   std::vector<std::vector<Real>> a(n, std::vector<Real>(n+1, 0.0));
 
@@ -148,13 +158,13 @@ void SolveNSH(const Real omega0, const Real qshear, const Real ax,
 
 //----------------------------------------------------------------------------------------
 //! \fn ReadNSHParams
-//! \brief Reads shearing box and dust parameters shared by pgen/errors/history.
+//! \brief Reads the shearing-box and active dust-mixture parameters.
 
 void ReadNSHParams(ParameterInput *pin, MeshBlockPack *pmbp,
                    Real &omega0, Real &qshear, Real &etavk,
                    std::vector<Real> &eps, std::vector<Real> &taus) {
   dust::DustGasDrag *pdust = pmbp->pdust;
-  int ns = pdust->nspecies;
+  int ns = (pdust != nullptr) ? pdust->nspecies : 0;
   omega0 = pin->GetReal("shearing_box","omega0");
   qshear = pin->GetReal("shearing_box","qshear");
   etavk  = pin->GetReal("problem","etavk");
@@ -178,24 +188,39 @@ void ReadNSHParams(ParameterInput *pin, MeshBlockPack *pmbp,
 //! \brief Problem Generator for the multi-species NSH drift equilibrium
 
 void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
-  std::string placement = pin->GetOrAddString("problem","particle_placement","lattice");
-  bool random_placement = (placement.compare("random") == 0);
-  if (!random_placement && placement.compare("lattice") != 0) {
+  MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
+  bool has_particles = (pmbp->ppart != nullptr);
+  bool has_dust = (pmbp->pdust != nullptr);
+  if (has_particles != has_dust) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "<problem>/particle_placement must be lattice or random"
-              << std::endl;
+              << std::endl << "NSH requires both <particles> and <dust>, or neither "
+              << "for the dust-free gas equilibrium" << std::endl;
     std::exit(EXIT_FAILURE);
+  }
+  bool dust_active = has_particles && has_dust;
+  bool random_placement = false;
+  if (dust_active) {
+    std::string placement =
+        pin->GetOrAddString("problem","particle_placement","lattice");
+    random_placement = (placement.compare("random") == 0);
+    if (!random_placement && placement.compare("lattice") != 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<problem>/particle_placement must be lattice or random"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
   }
   bool check_equilibrium =
       pin->GetOrAddBoolean("problem","check_equilibrium",!random_placement);
   pgen_final_func = check_equilibrium ? DustNSHErrors : nullptr;
-  user_hist_func = DustNSHHistory;   // used only when <problem>/user_hist = true
+  // Keep this enrolled in dust-free runs as well so an otherwise unchanged input
+  // with user_hist=true remains valid; the callback emits no dust columns in that mode.
+  user_hist_func = DustNSHHistory;
   if (restart) return;
 
-  MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
-  if (pmbp->phydro == nullptr || pmbp->ppart == nullptr || pmbp->pdust == nullptr) {
+  if (pmbp->phydro == nullptr) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "NSH test requires <hydro>, <particles>, and <dust> blocks" << std::endl;
+              << "NSH test requires a <hydro> block" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (!(pin->DoesBlockExist("shearing_box"))) {
@@ -207,7 +232,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   Real omega0, qshear, etavk;
   std::vector<Real> eps, taus;
   ReadNSHParams(pin, pmbp, omega0, qshear, etavk, eps, taus);
-  int nspec = pmbp->pdust->nspecies;
+  int nspec = static_cast<int>(eps.size());
   Real ax = 2.0*omega0*etavk;
 
   // the radial forcing must be applied to the gas by the standard const_accel source
@@ -230,10 +255,15 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   std::vector<Real> vx, vp;
   SolveNSH(omega0, qshear, ax, eps, taus, ugx, ugp, vx, vp);
   if (global_variable::my_rank == 0) {
-    std::cout << "# NSH equilibrium: u_gx=" << ugx << " u_gphi=" << ugp << std::endl;
-    for (int s=0; s<nspec; ++s) {
-      std::cout << "#   species " << s+1 << ": v_x=" << vx[s] << " v_phi=" << vp[s]
-                << std::endl;
+    if (dust_active) {
+      std::cout << "# NSH equilibrium: u_gx=" << ugx << " u_gphi=" << ugp << std::endl;
+      for (int s=0; s<nspec; ++s) {
+        std::cout << "#   species " << s+1 << ": v_x=" << vx[s]
+                  << " v_phi=" << vp[s] << std::endl;
+      }
+    } else {
+      std::cout << "# Dust-free NSH equilibrium: u_gx=" << ugx
+                << " u_gphi=" << ugp << std::endl;
     }
   }
 
@@ -255,6 +285,9 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     u0(m,IM2,k,j,i) = three_d ? rho0*ugp : 0.0;
     u0(m,IM3,k,j,i) = three_d ? 0.0 : rho0*ugp;
   });
+
+  // There are no particle or dust modules to initialize in the dust-free equilibrium.
+  if (!dust_active) return;
 
   // Initialize particles at the per-species equilibrium velocities. The lattice is the
   // quiet start used by the NSH regression test. Random placement is the warm start for
@@ -366,13 +399,13 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
 //! \fn void DustNSHErrors()
 //! \brief Measures the deviation of the mean gas and per-species dust drift velocities
 //! from the NSH equilibrium at the end of the run and appends the errors to
-//! "<basename>-errs.dat". Since the equilibrium is an exact fixed point of the unsplit
-//! IMEX update, all errors should be at round-off level.
+//! "<basename>-errs.dat". Both the coupled and dust-free equilibria are fixed points,
+//! so all errors should be at round-off level.
 
 void DustNSHErrors(ParameterInput *pin, Mesh *pm) {
   MeshBlockPack *pmbp = pm->pmb_pack;
   particles::Particles *ppar = pmbp->ppart;
-  int nspec = pmbp->pdust->nspecies;
+  int nspec = (pmbp->pdust != nullptr) ? pmbp->pdust->nspecies : 0;
   bool three_d = pm->three_d;
 
   Real omega0, qshear, etavk;
@@ -407,37 +440,41 @@ void DustNSHErrors(ParameterInput *pin, Mesh *pm) {
     mass += u0(m,IDN,k,j,i);
   }, Kokkos::Sum<Real>(gmx), Kokkos::Sum<Real>(gmp), Kokkos::Sum<Real>(gm));
 
-  // per-species mean dust velocities
-  auto &pr = ppar->prtcl_rdata;
-  auto &pi = ppar->prtcl_idata;
-  int npart = ppar->nprtcl_thispack;
-  int ivazim = three_d ? IPVY : IPVZ;
+  // per-species mean dust velocities (absent in the dust-free equilibrium)
   std::vector<Real> pvx(nspec), pvp(nspec), pn(nspec);
-  for (int s=0; s<nspec; ++s) {
-    Real sx = 0.0, sp = 0.0, sn = 0.0;
-    Kokkos::parallel_reduce("nsh_psum",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
-    KOKKOS_LAMBDA(const int &p, Real &x_, Real &p_, Real &n_) {
-      if (pi(PSP,p) == s) {
-        x_ += pr(IPVX,p);
-        p_ += pr(ivazim,p);
-        n_ += 1.0;
-      }
-    }, Kokkos::Sum<Real>(sx), Kokkos::Sum<Real>(sp), Kokkos::Sum<Real>(sn));
-    pvx[s] = sx;
-    pvp[s] = sp;
-    pn[s] = sn;
+  if (nspec > 0) {
+    auto &pr = ppar->prtcl_rdata;
+    auto &pi = ppar->prtcl_idata;
+    int npart = ppar->nprtcl_thispack;
+    int ivazim = three_d ? IPVY : IPVZ;
+    for (int s=0; s<nspec; ++s) {
+      Real sx = 0.0, sp = 0.0, sn = 0.0;
+      Kokkos::parallel_reduce("nsh_psum",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
+      KOKKOS_LAMBDA(const int &p, Real &x_, Real &p_, Real &n_) {
+        if (pi(PSP,p) == s) {
+          x_ += pr(IPVX,p);
+          p_ += pr(ivazim,p);
+          n_ += 1.0;
+        }
+      }, Kokkos::Sum<Real>(sx), Kokkos::Sum<Real>(sp), Kokkos::Sum<Real>(sn));
+      pvx[s] = sx;
+      pvp[s] = sp;
+      pn[s] = sn;
+    }
   }
 
 #if MPI_PARALLEL_ENABLED
   MPI_Allreduce(MPI_IN_PLACE, &gmx, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
   MPI_Allreduce(MPI_IN_PLACE, &gmp, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
   MPI_Allreduce(MPI_IN_PLACE, &gm,  1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, pvx.data(), nspec, MPI_ATHENA_REAL, MPI_SUM,
-                MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, pvp.data(), nspec, MPI_ATHENA_REAL, MPI_SUM,
-                MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, pn.data(), nspec, MPI_ATHENA_REAL, MPI_SUM,
-                MPI_COMM_WORLD);
+  if (nspec > 0) {
+    MPI_Allreduce(MPI_IN_PLACE, pvx.data(), nspec, MPI_ATHENA_REAL, MPI_SUM,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, pvp.data(), nspec, MPI_ATHENA_REAL, MPI_SUM,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, pn.data(), nspec, MPI_ATHENA_REAL, MPI_SUM,
+                  MPI_COMM_WORLD);
+  }
 #endif
 
   Real err_ugx = fabs(gmx/gm - ugx);
@@ -453,8 +490,9 @@ void DustNSHErrors(ParameterInput *pin, Mesh *pm) {
       pfile = std::fopen(fname.c_str(), "a");
     } else {
       pfile = std::fopen(fname.c_str(), "w");
-      std::fprintf(pfile, "# Nx1  Nx2  Nx3  Ncycle  err_ugx  err_ugphi  "
-                          "err_vx_s  err_vphi_s ...\n");
+      std::fprintf(pfile, "# Nx1  Nx2  Nx3  Ncycle  err_ugx  err_ugphi");
+      if (nspec > 0) {std::fprintf(pfile, "  err_vx_s  err_vphi_s ...");}
+      std::fprintf(pfile, "\n");
     }
     std::fprintf(pfile, "%04d  %04d  %04d  %05d  %e  %e", pm->mesh_indcs.nx1,
                  pm->mesh_indcs.nx2, pm->mesh_indcs.nx3, pm->ncycle, err_ugx, err_ugp);
@@ -475,6 +513,10 @@ void DustNSHErrors(ParameterInput *pin, Mesh *pm) {
 //! velocities and particle counts (summed over ranks; divide sums by counts for means).
 
 void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
+  if (pm->pmb_pack->ppart == nullptr || pm->pmb_pack->pdust == nullptr) {
+    pdata->nhist = 0;
+    return;
+  }
   particles::Particles *ppar = pm->pmb_pack->ppart;
   int nspec = pm->pmb_pack->pdust->nspecies;
   bool three_d = pm->three_d;
