@@ -102,10 +102,10 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         for (int a=0; a<3; ++a) {
           Real w = wcb*wx[a];
           int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
-          Kokkos::atomic_add(&qdep_(m,0,kk,jj,ii), w);
-          Kokkos::atomic_add(&qdep_(m,1,kk,jj,ii), w*vx);
-          Kokkos::atomic_add(&qdep_(m,2,kk,jj,ii), w*vy);
-          Kokkos::atomic_add(&qdep_(m,3,kk,jj,ii), w*vz);
+          DepositAdd(&qdep_(m,0,kk,jj,ii), w);
+          DepositAdd(&qdep_(m,1,kk,jj,ii), w*vx);
+          DepositAdd(&qdep_(m,2,kk,jj,ii), w*vy);
+          DepositAdd(&qdep_(m,3,kk,jj,ii), w*vz);
         }
       }
     }
@@ -243,9 +243,9 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
           for (int a=0; a<3; ++a) {
             Real w = wcb*wx[a];
             int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
-            Kokkos::atomic_add(&dmom_(m,0,kk,jj,ii), w*dvx);
-            Kokkos::atomic_add(&dmom_(m,1,kk,jj,ii), w*dvy);
-            Kokkos::atomic_add(&dmom_(m,2,kk,jj,ii), w*dvz);
+            DepositAdd(&dmom_(m,0,kk,jj,ii), w*dvx);
+            DepositAdd(&dmom_(m,1,kk,jj,ii), w*dvy);
+            DepositAdd(&dmom_(m,2,kk,jj,ii), w*dvz);
           }
         }
       }
