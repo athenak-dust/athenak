@@ -8,10 +8,10 @@
 //! Like IonNeutral, this module assembles the COMBINED gas+dust task graph: when a
 //! <dust> block is present, Hydro::AssembleHydroTasks and Particles::AssembleTasks are
 //! not called, and every Hydro/Particles task is inserted here instead. Particle
-//! migration runs INSIDE each stage (positions change every stage), and the implicit
-//! drag solve (deposit -> halo add -> cell solve -> u* ghost fill -> gather/kick/PMBR ->
-//! halo add -> apply) sits between the explicit gas update and the boundary
-//! communication tail, mirroring the placement of IonNeutral::ImpRKUpdate.
+//! IMEX particle migration runs inside each working stage.  Hybrid PC2 instead performs
+//! one midpoint update/migration per cycle, while split-BE performs one relaxed
+//! kick/drift/migration after the final hydro stage.  The common drag chain sits between
+//! the explicit gas update and the boundary communication tail.
 
 #include <map>
 #include <memory>
@@ -81,9 +81,19 @@ void DustGasDrag::AssembleDustGasDragTasks(
                                         id.sendus_shr);
   id.gkp       = tl["stagen"]->AddTask(&DustGasDrag::GatherKickPMBR, this,
                                        id.recvus_shr);
+  // Hybrid split-BE drifts only after the relaxed kick, so its sole migration belongs
+  // here.  These wrappers no-op for IMEX and PC2; the first chain above does the
+  // opposite.  Both branches therefore retain exactly one migration per active cycle.
+  id.p2_newgid = tl["stagen"]->AddTask(&DustGasDrag::UpdateParticleGIDs2, this, id.gkp);
+  id.p2_cnt    = tl["stagen"]->AddTask(&DustGasDrag::CountParticleSends2, this,
+                                       id.p2_newgid);
+  id.p2_irecv  = tl["stagen"]->AddTask(&DustGasDrag::InitParticleRecv2, this, id.p2_cnt);
+  id.p2_sendp  = tl["stagen"]->AddTask(&DustGasDrag::SendParticles2, this, id.p2_irecv);
+  id.p2_recvp  = tl["stagen"]->AddTask(&DustGasDrag::RecvParticles2, this, id.p2_sendp);
   id.sendbr    = tl["stagen"]->AddTask(&DustGasDrag::SendPMBR, this, id.gkp);
   id.recvbr    = tl["stagen"]->AddTask(&DustGasDrag::RecvPMBR, this, id.sendbr);
-  id.apply     = tl["stagen"]->AddTask(&DustGasDrag::ApplyPMBR, this, id.recvbr);
+  TaskID commit_ready = (id.recvbr | id.p2_recvp);
+  id.apply     = tl["stagen"]->AddTask(&DustGasDrag::ApplyPMBR, this, commit_ready);
   // standard hydro tail (boundary comms, BCs, cons-to-prim, timestep)
   id.h_sendu_oa  = tl["stagen"]->AddTask(&Hydro::SendU_OA, phyd, id.apply);
   id.h_recvu_oa  = tl["stagen"]->AddTask(&Hydro::RecvU_OA, phyd, id.h_sendu_oa);
@@ -97,6 +107,7 @@ void DustGasDrag::AssembleDustGasDragTasks(
   id.h_c2p       = tl["stagen"]->AddTask(&Hydro::ConToPrim, phyd, id.h_prol);
   id.h_newdt     = tl["stagen"]->AddTask(&Hydro::NewTimeStep, phyd, id.h_c2p);
   id.newdt       = tl["stagen"]->AddTask(&DustGasDrag::NewTimeStep, this, id.gkp);
+  id.newdt2      = tl["stagen"]->AddTask(&DustGasDrag::NewTimeStep2, this, id.apply);
 
   // assemble "after_stagen" task list
   id.h_csend = tl["after_stagen"]->AddTask(&Hydro::ClearSend, phyd, none);
@@ -115,27 +126,52 @@ void DustGasDrag::AssembleDustGasDragTasks(
 //! third full GID scan and its MPI bookkeeping have no matching work to perform.
 
 TaskStatus DustGasDrag::UpdateParticleGIDs(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
   return pmy_pack->ppart->NewGID(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::CountParticleSends(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
   return pmy_pack->ppart->SendCnt(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::InitParticleRecv(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
   return pmy_pack->ppart->InitRecv(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::SendParticles(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
   return pmy_pack->ppart->SendP(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::RecvParticles(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->RecvP(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::UpdateParticleGIDs2(Driver *pdrive, int stage) {
+  if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->NewGID(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::CountParticleSends2(Driver *pdrive, int stage) {
+  if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->SendCnt(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::InitParticleRecv2(Driver *pdrive, int stage) {
+  if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->InitRecv(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::SendParticles2(Driver *pdrive, int stage) {
+  if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->SendP(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::RecvParticles2(Driver *pdrive, int stage) {
+  if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
   return pmy_pack->ppart->RecvP(pdrive, stage);
 }
 
@@ -158,17 +194,28 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
 
   TaskStatus tstat = TaskStatus::complete;
-  if (back_reaction) {
-    tstat = pbval_qp->InitRecv(4);
+  bool use_qp = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid &&
+       ((hybrid_mode == HybridMode::pc2 && stage == 1) ||
+        (hybrid_mode == HybridMode::split_be && stage == 2)));
+  bool use_ustar = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid &&
+       hybrid_mode == HybridMode::split_be && stage == 2);
+  bool use_dmom = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid && stage == 2);
+  if (back_reaction && use_qp) {
+    tstat = pbval_qp->InitRecv(5);
     if (tstat != TaskStatus::complete) return tstat;
   }
-  tstat = pbval_us->InitRecv(3);
-  if (tstat != TaskStatus::complete) return tstat;
-  if (back_reaction) {
+  if (use_ustar) {
+    tstat = pbval_us->InitRecv(3);
+    if (tstat != TaskStatus::complete) return tstat;
+  }
+  if (back_reaction && use_dmom) {
     tstat = pbval_dm->InitRecv(3);
     if (tstat != TaskStatus::complete) return tstat;
   }
-  if (psbox_us != nullptr) {
+  if (psbox_us != nullptr && use_ustar) {
     // also computes the shear offset used by the u* remap this stage; the O(dt)
     // offset between stages is second-order consistent
     tstat = psbox_us->InitRecv(pmy_pack->pmesh->time);
@@ -180,42 +227,78 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
 // Send/receive wrappers for the three exchanges of the implicit drag solve
 
 TaskStatus DustGasDrag::SendDepQP(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
+  bool use = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid &&
+       ((hybrid_mode == HybridMode::pc2 && stage == 1) ||
+        (hybrid_mode == HybridMode::split_be && stage == 2)));
+  if (!ActiveStage(pdrive, stage) || !back_reaction || !use) {
+    return TaskStatus::complete;
+  }
   return pbval_qp->PackAndSendDeposit(qdep);
 }
 
 TaskStatus DustGasDrag::RecvDepQP(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
+  bool use = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid &&
+       ((hybrid_mode == HybridMode::pc2 && stage == 1) ||
+        (hybrid_mode == HybridMode::split_be && stage == 2)));
+  if (!ActiveStage(pdrive, stage) || !back_reaction || !use) {
+    return TaskStatus::complete;
+  }
   return pbval_qp->RecvAndSumDeposit(qdep);
 }
 
 TaskStatus DustGasDrag::SendUstar(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  bool use = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid &&
+       hybrid_mode == HybridMode::split_be && stage == 2);
+  if (!ActiveStage(pdrive, stage) || !use) {return TaskStatus::complete;}
   return pbval_us->PackAndSendCC(ustar, cdummy);
 }
 
 TaskStatus DustGasDrag::RecvUstar(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  bool use = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid &&
+       hybrid_mode == HybridMode::split_be && stage == 2);
+  if (!ActiveStage(pdrive, stage) || !use) {return TaskStatus::complete;}
   return pbval_us->RecvAndUnpackCC(ustar, cdummy);
 }
 
 TaskStatus DustGasDrag::SendUstarShr(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage) || psbox_us == nullptr) {return TaskStatus::complete;}
+  bool use = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid &&
+       hybrid_mode == HybridMode::split_be && stage == 2);
+  if (!ActiveStage(pdrive, stage) || !use || psbox_us == nullptr) {
+    return TaskStatus::complete;
+  }
   return psbox_us->PackAndSendCC(ustar, ReconstructionMethod::plm);
 }
 
 TaskStatus DustGasDrag::RecvUstarShr(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage) || psbox_us == nullptr) {return TaskStatus::complete;}
+  bool use = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid &&
+       hybrid_mode == HybridMode::split_be && stage == 2);
+  if (!ActiveStage(pdrive, stage) || !use || psbox_us == nullptr) {
+    return TaskStatus::complete;
+  }
   return psbox_us->RecvAndUnpackCC(ustar);
 }
 
 TaskStatus DustGasDrag::SendPMBR(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
+  bool use = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid && stage == 2);
+  if (!ActiveStage(pdrive, stage) || !back_reaction || !use) {
+    return TaskStatus::complete;
+  }
   return pbval_dm->PackAndSendDeposit(dmom);
 }
 
 TaskStatus DustGasDrag::RecvPMBR(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
+  bool use = (coupling == DustCoupling::imex) ||
+      (coupling == DustCoupling::hybrid && stage == 2);
+  if (!ActiveStage(pdrive, stage) || !back_reaction || !use) {
+    return TaskStatus::complete;
+  }
   return pbval_dm->RecvAndSumDeposit(dmom);
 }
 

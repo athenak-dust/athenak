@@ -10,6 +10,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <string>
 
 #include "athena.hpp"
@@ -57,12 +58,30 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
               << "<dust> block requires <particles>/particle_type = dust" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // Driver is constructed after physics modules, so read the integrator from the input
+  // Driver is constructed after physics modules, so read the coupling and integrator
+  // directly from the input while validating the module configuration.
+  {
+    std::string method = pin->GetOrAddString("dust", "coupling", "imex");
+    if (method.compare("imex") == 0) {
+      coupling = DustCoupling::imex;
+    } else if (method.compare("hybrid") == 0) {
+      coupling = DustCoupling::hybrid;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<dust>/coupling = '" << method
+                << "' not recognized (must be imex or hybrid)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
   std::string integrator = pin->GetOrAddString("time", "integrator", "rk2");
-  if (integrator.compare("imex2+") != 0) {
+  bool bad_integrator = ((coupling == DustCoupling::imex &&
+                          integrator.compare("imex2+") != 0) ||
+                         (coupling == DustCoupling::hybrid &&
+                          integrator.compare("rk2") != 0));
+  if (bad_integrator) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Dust drag requires <time>/integrator = imex2+ (imex2/imex3 would need "
-              << "implicit pre-stages that are not implemented)" << std::endl;
+              << "Dust coupling=imex requires integrator=imex2+, while coupling=hybrid "
+              << "requires integrator=rk2" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (pmy_pack->pmesh->multilevel) {
@@ -98,9 +117,44 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // (2) read parameters ----------------------------------------------------------------
   back_reaction = pin->GetOrAddBoolean("dust","back_reaction",true);
   gamma_switch  = pin->GetOrAddBoolean("dust","gamma_switch",false);
+  if (coupling == DustCoupling::hybrid && gamma_switch) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<dust>/gamma_switch is only defined for coupling=imex" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   stopping_times_initialized = false;
   dt_cfl        = pin->GetOrAddReal("dust","dt_cfl",0.5);
   dust_to_gas   = pin->GetOrAddReal("dust","dust_to_gas",0.01);
+
+  hybrid_enter_zeta = pin->GetOrAddReal("dust", "hybrid_enter_zeta", 0.5);
+  hybrid_enter_chi  = pin->GetOrAddReal("dust", "hybrid_enter_chi", 0.5);
+  hybrid_exit_zeta  = pin->GetOrAddReal("dust", "hybrid_exit_zeta", 0.25);
+  hybrid_exit_chi   = pin->GetOrAddReal("dust", "hybrid_exit_chi", 0.25);
+  if (!(hybrid_enter_zeta > hybrid_exit_zeta && hybrid_exit_zeta >= 0.0 &&
+        hybrid_enter_chi > hybrid_exit_chi && hybrid_exit_chi >= 0.0)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "Hybrid enter thresholds must be positive and exceed exit thresholds"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  {
+    std::string forced = pin->GetOrAddString("dust", "hybrid_force_mode", "auto");
+    if (forced.compare("auto") == 0) {
+      hybrid_force_mode = HybridForceMode::automatic;
+      hybrid_mode = HybridMode::pc2;
+    } else if (forced.compare("pc2") == 0) {
+      hybrid_force_mode = HybridForceMode::pc2;
+      hybrid_mode = HybridMode::pc2;
+    } else if (forced.compare("split_be") == 0) {
+      hybrid_force_mode = HybridForceMode::split_be;
+      hybrid_mode = HybridMode::split_be;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<dust>/hybrid_force_mode = '" << forced
+                << "' not recognized (must be auto, pc2, or split_be)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
 
   {
     std::string solver = pin->GetOrAddString("dust", "drag_solver", "local");
@@ -123,6 +177,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
+  }
+  if (coupling == DustCoupling::hybrid &&
+      drag_solver != DustDragSolver::local && drag_solver != DustDragSolver::dc1 &&
+      drag_solver != DustDragSolver::pcg) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "The first hybrid split-BE implementation supports only "
+              << "drag_solver=local, dc1, or pcg" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
   drag_rtol = pin->GetOrAddReal("dust", "drag_rtol", 1.0e-11);
   drag_atol = pin->GetOrAddReal("dust", "drag_atol", 1.0e-14);
@@ -182,6 +244,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   taus = DualArray1D<Real>("dust_taus", nspecies);
   taus_max = 0.0;
+  taus_min = std::numeric_limits<Real>::max();
   for (int s=0; s<nspecies; ++s) {
     Real ts = pin->GetReal("dust", "taus_" + std::to_string(s+1));
     if (ts <= 0.0) {
@@ -191,6 +254,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     }
     taus.h_view(s) = ts;
     taus_max = std::max(taus_max, ts);
+    taus_min = std::min(taus_min, ts);
   }
   taus.template modify<HostMemSpace>();
   taus.template sync<DevExeSpace>();
@@ -236,7 +300,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   int ncells1 = indcs.nx1 + 2*(indcs.ng);
   int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
   int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
-  Kokkos::realloc(qdep,  nmb, 4, ncells3, ncells2, ncells1);
+  Kokkos::realloc(qdep,  nmb, 5, ncells3, ncells2, ncells1);
   Kokkos::realloc(ustar, nmb, 3, ncells3, ncells2, ncells1);
   Kokkos::realloc(dmom,  nmb, 3, ncells3, ncells2, ncells1);
   Kokkos::deep_copy(dmom, 0.0);  // read as R_g=0 in stage 2 if back_reaction is off
@@ -250,7 +314,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
 
   // (4) allocate boundary communication objects -----------------------------------------
   pbval_qp = new MeshBoundaryValuesDep(pmy_pack, pin);
-  pbval_qp->InitializeBuffers(4);
+  pbval_qp->InitializeBuffers(5);
   pbval_dm = new MeshBoundaryValuesDep(pmy_pack, pin);
   pbval_dm->InitializeBuffers(3);
   pbval_us = new MeshBoundaryValuesCC(pmy_pack, pin, false);
@@ -273,6 +337,17 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
 // destructor
 
 DustGasDrag::~DustGasDrag() {
+  if (global_variable::my_rank == 0 && coupling == DustCoupling::hybrid) {
+    unsigned long long total = hybrid_pc2_cycles + hybrid_split_be_cycles;
+    double pc2_fraction = (total > 0) ?
+        static_cast<double>(hybrid_pc2_cycles)/static_cast<double>(total) : 0.0;
+    std::cout << std::setprecision(14)
+              << "# DUST_HYBRID_SUMMARY pc2_cycles=" << hybrid_pc2_cycles
+              << " split_be_cycles=" << hybrid_split_be_cycles
+              << " pc2_fraction=" << pc2_fraction
+              << " last_zeta=" << hybrid_last_zeta
+              << " last_chi=" << hybrid_last_chi << std::endl;
+  }
   if (global_variable::my_rank == 0 && solver_stage_count > 0) {
     auto quantile = [&](double fraction) {
       if (solver_pcg_stage_count == 0) return 0;
@@ -323,7 +398,23 @@ DustGasDrag::~DustGasDrag() {
 //! solve is skipped since estage == nexp_stages), so every dust task no-ops there.
 
 bool DustGasDrag::ActiveStage(Driver *pdrive, int stage) const {
+  if (coupling == DustCoupling::hybrid) return true;
   return !((pdrive->integrator.compare("imex2+") == 0) && (stage == pdrive->nexp_stages));
+}
+
+bool DustGasDrag::FirstMigrationActive(Driver *pdrive, int stage) const {
+  if (coupling == DustCoupling::imex) return ActiveStage(pdrive, stage);
+  return (hybrid_mode == HybridMode::pc2 && stage == 2);
+}
+
+bool DustGasDrag::SecondMigrationActive(Driver *pdrive, int stage) const {
+  return (coupling == DustCoupling::hybrid &&
+          hybrid_mode == HybridMode::split_be && stage == 2);
+}
+
+Real DustGasDrag::DragStep(Driver *pdrive) const {
+  if (coupling == DustCoupling::hybrid) return pmy_pack->pmesh->dt;
+  return (pdrive->a_impl)*(pmy_pack->pmesh->dt);
 }
 
 //----------------------------------------------------------------------------------------
