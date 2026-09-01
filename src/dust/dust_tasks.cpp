@@ -38,9 +38,7 @@ void DustGasDrag::AssembleDustGasDragTasks(
     std::map<std::string, std::shared_ptr<TaskList>> tl) {
   TaskID none(0);
   using hydro::Hydro;
-  using particles::Particles;
   Hydro *phyd = pmy_pack->phydro;
-  Particles *ppar = pmy_pack->ppart;
 
   // assemble "before_timeintegrator" task list
   id.gswitch = tl["before_timeintegrator"]->AddTask(&DustGasDrag::GammaSwitch,this,none);
@@ -62,11 +60,12 @@ void DustGasDrag::AssembleDustGasDragTasks(
                                        id.h_srctrms);
   // explicit particle push + per-stage migration; overlaps with the gas chain
   id.push      = tl["stagen"]->AddTask(&DustGasDrag::ExplicitPush, this, id.first2);
-  id.p_newgid  = tl["stagen"]->AddTask(&Particles::NewGID, ppar, id.push);
-  id.p_cnt     = tl["stagen"]->AddTask(&Particles::SendCnt, ppar, id.p_newgid);
-  id.p_irecv   = tl["stagen"]->AddTask(&Particles::InitRecv, ppar, id.p_cnt);
-  id.p_sendp   = tl["stagen"]->AddTask(&Particles::SendP, ppar, id.p_irecv);
-  id.p_recvp   = tl["stagen"]->AddTask(&Particles::RecvP, ppar, id.p_sendp);
+  id.p_newgid  = tl["stagen"]->AddTask(&DustGasDrag::UpdateParticleGIDs, this, id.push);
+  id.p_cnt     = tl["stagen"]->AddTask(&DustGasDrag::CountParticleSends, this,
+                                        id.p_newgid);
+  id.p_irecv   = tl["stagen"]->AddTask(&DustGasDrag::InitParticleRecv, this, id.p_cnt);
+  id.p_sendp   = tl["stagen"]->AddTask(&DustGasDrag::SendParticles, this, id.p_irecv);
+  id.p_recvp   = tl["stagen"]->AddTask(&DustGasDrag::RecvParticles, this, id.p_sendp);
   // implicit drag solve
   id.scat      = tl["stagen"]->AddTask(&DustGasDrag::DepositDrag, this, id.p_recvp);
   id.sendd     = tl["stagen"]->AddTask(&DustGasDrag::SendDepQP, this, id.scat);
@@ -102,11 +101,52 @@ void DustGasDrag::AssembleDustGasDragTasks(
   // assemble "after_stagen" task list
   id.h_csend = tl["after_stagen"]->AddTask(&Hydro::ClearSend, phyd, none);
   id.h_crecv = tl["after_stagen"]->AddTask(&Hydro::ClearRecv, phyd, id.h_csend);
-  id.p_csend = tl["after_stagen"]->AddTask(&Particles::ClearSend, ppar, none);
-  id.p_crecv = tl["after_stagen"]->AddTask(&Particles::ClearRecv, ppar, id.p_csend);
+  id.p_csend = tl["after_stagen"]->AddTask(&DustGasDrag::ClearParticleSend, this, none);
+  id.p_crecv = tl["after_stagen"]->AddTask(&DustGasDrag::ClearParticleRecv, this,
+                                            id.p_csend);
   id.cleard  = tl["after_stagen"]->AddTask(&DustGasDrag::ClearDep, this, none);
 
   return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \brief Particle migration wrappers for the combined dust task graph.  The final
+//! imex2+ stage only assembles the explicit solution and does not move particles, so a
+//! third full GID scan and its MPI bookkeeping have no matching work to perform.
+
+TaskStatus DustGasDrag::UpdateParticleGIDs(Driver *pdrive, int stage) {
+  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->NewGID(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::CountParticleSends(Driver *pdrive, int stage) {
+  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->SendCnt(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::InitParticleRecv(Driver *pdrive, int stage) {
+  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->InitRecv(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::SendParticles(Driver *pdrive, int stage) {
+  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->SendP(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::RecvParticles(Driver *pdrive, int stage) {
+  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->RecvP(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::ClearParticleSend(Driver *pdrive, int stage) {
+  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->ClearSend(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::ClearParticleRecv(Driver *pdrive, int stage) {
+  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  return pmy_pack->ppart->ClearRecv(pdrive, stage);
 }
 
 //----------------------------------------------------------------------------------------
@@ -181,10 +221,12 @@ TaskStatus DustGasDrag::RecvPMBR(Driver *pdrive, int stage) {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ClearDep
-//! \brief Waits for all sends/receives of the dust exchanges to complete. Safe on
-//! dormant stages since unposted requests are MPI_REQUEST_NULL.
+//! \brief Waits for all sends/receives of the dust exchanges to complete.  The dormant
+//! assembly stage returns early: the preceding active stage drained its requests and
+//! the dormant stage posts no new dust exchanges.
 
 TaskStatus DustGasDrag::ClearDep(Driver *pdrive, int stage) {
+  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
   TaskStatus tstat = pbval_qp->ClearSend();
   if (tstat != TaskStatus::complete) return tstat;
   tstat = pbval_qp->ClearRecv();

@@ -11,9 +11,10 @@
 //!   A = diag(rho_g) + G^T diag(m_p*c_p/V) G,
 //!   b = momentum_g + G^T diag(m_p*c_p/V) v_p,
 //!
-//! where c_p=a/(t_stop,p+a).  Matching PMWeights in G and G^T makes A SPD.  All trial
-//! operations below are non-mutating: particle velocities and gas momentum are changed
-//! only later by GatherKickPMBR and ApplyPMBR after one field has been accepted.
+//! where c_p=a/(t_stop,p+a).  Matching PMWeights in G and G^T makes A SPD.  Ordinary
+//! operator applications are non-mutating.  Fixed defect-correction sweeps explicitly
+//! update the provisional gas-velocity field; particle velocities and gas momentum are
+//! changed only later by GatherKickPMBR and ApplyPMBR after that field has been accepted.
 //!
 //! The communication-bearing solves below deliberately block inside one task.  This is
 //! safe under AthenaK's current execution contract: one MeshBlockPack contains all local
@@ -97,10 +98,29 @@ void DustGasDrag::CompleteAddExchange(DvceArray5D<Real> &field) {
 }
 
 //----------------------------------------------------------------------------------------
-//! Apply A to all three velocity components using one fused particle gather/scatter.
+//! Apply A to all three velocity components.  `field` is unchanged and the complete
+//! operator result is returned in `result`.
 
 void DustGasDrag::ApplyCoupledOperator(DvceArray5D<Real> &field,
                                        DvceArray5D<Real> &result, Real a_dt) {
+  ApplyCoupledOperatorImpl(field, result, a_dt, false);
+}
+
+//----------------------------------------------------------------------------------------
+//! Apply one preconditioned defect-correction sweep in place.  `work` holds only the
+//! particle scatter term on return; it is scratch storage, not the complete A(field).
+
+void DustGasDrag::ApplyDefectCorrection(DvceArray5D<Real> &field,
+                                        DvceArray5D<Real> &work, Real a_dt) {
+  ApplyCoupledOperatorImpl(field, work, a_dt, true);
+}
+
+//----------------------------------------------------------------------------------------
+//! Shared particle gather/scatter implementation for the two explicit contracts above.
+
+void DustGasDrag::ApplyCoupledOperatorImpl(DvceArray5D<Real> &field,
+                                           DvceArray5D<Real> &result, Real a_dt,
+                                           bool correct_field) {
   CompleteCopyExchange(field);
   Kokkos::deep_copy(DevExeSpace(), result, 0.0);
 
@@ -161,9 +181,9 @@ void DustGasDrag::ApplyCoupledOperator(DvceArray5D<Real> &field,
         for (int a=0; a<3; ++a) {
           Real w = wcb*wx[a];
           int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
-          Kokkos::atomic_add(&result_(m,0,kk,jj,ii), w*gathered[0]);
-          Kokkos::atomic_add(&result_(m,1,kk,jj,ii), w*gathered[1]);
-          Kokkos::atomic_add(&result_(m,2,kk,jj,ii), w*gathered[2]);
+          DepositAdd(&result_(m,0,kk,jj,ii), w*gathered[0]);
+          DepositAdd(&result_(m,1,kk,jj,ii), w*gathered[1]);
+          DepositAdd(&result_(m,2,kk,jj,ii), w*gathered[2]);
         }
       }
     }
@@ -174,13 +194,27 @@ void DustGasDrag::ApplyCoupledOperator(DvceArray5D<Real> &field,
   int ie = indcs.ie, je = indcs.je, ke = indcs.ke;
   int nmb1 = pmy_pack->nmb_thispack - 1;
   auto &u0 = pmy_pack->phydro->u0;
-  par_for("dust_applya_rho",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
-  KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-    Real rho = u0(m,IDN,k,j,i);
-    result_(m,0,k,j,i) += rho*field_(m,0,k,j,i);
-    result_(m,1,k,j,i) += rho*field_(m,1,k,j,i);
-    result_(m,2,k,j,i) += rho*field_(m,2,k,j,i);
-  });
+  if (correct_field) {
+    auto &qdep_ = qdep;
+    par_for("dust_applya_dc",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+      Real rho = u0(m,IDN,k,j,i);
+      Real pinv = 1.0/(rho + qdep_(m,0,k,j,i));
+      for (int d=0; d<3; ++d) {
+        Real av = result_(m,d,k,j,i) + rho*field_(m,d,k,j,i);
+        Real rv = u0(m,IM1+d,k,j,i) + qdep_(m,1+d,k,j,i) - av;
+        field_(m,d,k,j,i) += pinv*rv;
+      }
+    });
+  } else {
+    par_for("dust_applya_rho",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+      Real rho = u0(m,IDN,k,j,i);
+      result_(m,0,k,j,i) += rho*field_(m,0,k,j,i);
+      result_(m,1,k,j,i) += rho*field_(m,1,k,j,i);
+      result_(m,2,k,j,i) += rho*field_(m,2,k,j,i);
+    });
+  }
   ++solver_applya_count;
 }
 
@@ -586,15 +620,7 @@ TaskStatus DustGasDrag::SolveCoupledStage(Driver *pdrive, int stage) {
     // PCG fallback, giving a deterministic two-ApplyA production cost.
     int nsweeps=(drag_solver == DustDragSolver::dc2)?2:1;
     for (int sweep=0;sweep<nsweeps;++sweep) {
-      ApplyCoupledOperator(x,ap,a_dt);
-      par_for("dust_solver_dc",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
-      KOKKOS_LAMBDA(const int m,const int k,const int j,const int i) {
-        Real pinv=1.0/(u0(m,IDN,k,j,i)+qdep_(m,0,k,j,i));
-        for (int d=0;d<3;++d) {
-          r(m,d,k,j,i)=u0(m,IM1+d,k,j,i)+qdep_(m,1+d,k,j,i)-ap(m,d,k,j,i);
-          x(m,d,k,j,i)+=pinv*r(m,d,k,j,i);
-        }
-      });
+      ApplyDefectCorrection(x,ap,a_dt);
     }
     if (drag_solver == DustDragSolver::adaptive) {
       ApplyCoupledOperator(x,ap,a_dt);

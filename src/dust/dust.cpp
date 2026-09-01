@@ -240,9 +240,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::realloc(ustar, nmb, 3, ncells3, ncells2, ncells1);
   Kokkos::realloc(dmom,  nmb, 3, ncells3, ncells2, ncells1);
   Kokkos::deep_copy(dmom, 0.0);  // read as R_g=0 in stage 2 if back_reaction is off
+  if (drag_solver == DustDragSolver::pcg || drag_solver == DustDragSolver::adaptive) {
+    Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
+    Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
+  }
   if (drag_solver != DustDragSolver::local) {
-    Kokkos::realloc(solver_r,  nmb, 3, ncells3, ncells2, ncells1);
-    Kokkos::realloc(solver_p,  nmb, 3, ncells3, ncells2, ncells1);
     Kokkos::realloc(solver_ap, nmb, 3, ncells3, ncells2, ncells1);
   }
 

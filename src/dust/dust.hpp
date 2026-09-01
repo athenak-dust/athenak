@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "athena.hpp"
@@ -71,15 +72,37 @@ struct DustGasDragTaskIDs {
 
 namespace dust {
 
+// Particle deposits need atomic updates on parallel execution spaces because stencil
+// footprints overlap.  Kokkos::Serial has only one worker, however, so its generic
+// compare-and-swap atomic adds synchronization overhead without providing protection.
+// Keep the operation order unchanged while compiling that overhead out of serial CPU
+// builds; all genuinely parallel backends retain Kokkos atomics.
+KOKKOS_INLINE_FUNCTION
+void DepositAdd(Real *destination, const Real value) {
+#if defined(KOKKOS_ENABLE_SERIAL)
+  constexpr bool serial_exec = std::is_same_v<DevExeSpace, Kokkos::Serial>;
+#else
+  constexpr bool serial_exec = false;
+#endif
+  if constexpr (serial_exec) {
+    *destination += value;
+  } else {
+    Kokkos::atomic_add(destination, value);
+  }
+}
+
 // Shared NGP/CIC/TSC stencil for deposits, matrix-free gathers, and the final kick.
 // One helper is used everywhere so the coupled operator and conservative commit cannot
 // silently acquire different particle-mesh weights.
 KOKKOS_INLINE_FUNCTION
 void PMWeights(const Real x, const Real xmin, const Real xmax, const int nx,
                const int is, const int scheme, int &ip, Real w[3]) {
-  Real dx = (xmax - xmin)/static_cast<Real>(nx);
-  int ig = static_cast<int>((x - xmin)/dx + 1.0) - 1;
-  Real del = (x - CellCenterX(ig, nx, xmin, xmax))/dx;
+  // Express the particle position directly in cell coordinates.  Besides being the
+  // same uniform-grid geometry as CellCenterX, this uses one division rather than
+  // forming dx and then dividing by it twice.
+  Real cell = (x - xmin)*(static_cast<Real>(nx)/(xmax - xmin));
+  int ig = static_cast<int>(cell + 1.0) - 1;
+  Real del = cell - (static_cast<Real>(ig) + 0.5);
   ip = ig + is;
   if (scheme == 0) {
     w[0] = 0.0;
@@ -178,6 +201,11 @@ class DustGasDrag {
   // ...in "stagen" list
   TaskStatus FirstTwoImpRK(Driver *pdrive, int stage);     // stage 1 register copies
   TaskStatus ExplicitPush(Driver *pdrive, int stage);      // rotation kick + drift
+  TaskStatus UpdateParticleGIDs(Driver *pdrive, int stage);
+  TaskStatus CountParticleSends(Driver *pdrive, int stage);
+  TaskStatus InitParticleRecv(Driver *pdrive, int stage);
+  TaskStatus SendParticles(Driver *pdrive, int stage);
+  TaskStatus RecvParticles(Driver *pdrive, int stage);
   TaskStatus AddDragHistoryGas(Driver *pdrive, int stage); // u0 += a_twid*dt*R_g
   TaskStatus DepositDrag(Driver *pdrive, int stage);       // scatter Q,P
   TaskStatus SendDepQP(Driver *pdrive, int stage);
@@ -186,6 +214,12 @@ class DustGasDrag {
   TaskStatus SolveCoupledStage(Driver *pdrive, int stage);
   void ApplyCoupledOperator(DvceArray5D<Real> &field, DvceArray5D<Real> &result,
                             Real a_dt);
+  void ApplyDefectCorrection(DvceArray5D<Real> &field, DvceArray5D<Real> &work,
+                             Real a_dt);
+  // Internal shared implementation.  This must remain public because it encloses NVCC
+  // extended host/device lambdas; callers should use one of the explicit methods above.
+  void ApplyCoupledOperatorImpl(DvceArray5D<Real> &field, DvceArray5D<Real> &result,
+                                Real a_dt, bool correct_field);
   void CompleteCopyExchange(DvceArray5D<Real> &field);
   void CompleteAddExchange(DvceArray5D<Real> &field);
   void GlobalDot(DvceArray5D<Real> &left, DvceArray5D<Real> &right, Real value[3]);
@@ -203,6 +237,8 @@ class DustGasDrag {
   TaskStatus ApplyPMBR(Driver *pdrive, int stage);         // u0 += dmom; dmom -> R_g
   TaskStatus NewTimeStep(Driver *pdrive, int stage);
   // ...in "after_stagen" list
+  TaskStatus ClearParticleSend(Driver *pdrive, int stage);
+  TaskStatus ClearParticleRecv(Driver *pdrive, int stage);
   TaskStatus ClearDep(Driver *pdrive, int stage);
 
  private:
