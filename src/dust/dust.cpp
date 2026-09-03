@@ -60,16 +60,22 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   // Driver is constructed after physics modules, so read the coupling and integrator
   // directly from the input while validating the module configuration.
+  bool pc2_only = false;
   {
     std::string method = pin->GetOrAddString("dust", "coupling", "imex");
     if (method.compare("imex") == 0) {
       coupling = DustCoupling::imex;
     } else if (method.compare("hybrid") == 0) {
       coupling = DustCoupling::hybrid;
+    } else if (method.compare("pc2") == 0) {
+      // PC2 uses the hybrid task path, but this direct spelling disables the
+      // automatic split-BE fallback and selects PC2 for every cycle.
+      coupling = DustCoupling::hybrid;
+      pc2_only = true;
     } else {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<dust>/coupling = '" << method
-                << "' not recognized (must be imex or hybrid)" << std::endl;
+                << "' not recognized (must be imex, pc2, or hybrid)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
@@ -80,8 +86,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                           integrator.compare("rk2") != 0));
   if (bad_integrator) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Dust coupling=imex requires integrator=imex2+, while coupling=hybrid "
-              << "requires integrator=rk2" << std::endl;
+              << "Dust coupling=imex requires integrator=imex2+, while coupling=pc2 "
+              << "or hybrid requires integrator=rk2" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (pmy_pack->pmesh->multilevel) {
@@ -118,9 +124,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   back_reaction = pin->GetOrAddBoolean("dust","back_reaction",true);
   gamma_switch  = pin->GetOrAddBoolean("dust","gamma_switch",false);
   if (coupling == DustCoupling::hybrid && gamma_switch) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<dust>/gamma_switch is only defined for coupling=imex" << std::endl;
-    std::exit(EXIT_FAILURE);
+    if (global_variable::my_rank == 0) {
+      std::cout << "# WARNING (dust): <dust>/gamma_switch=true has no effect for "
+                << "coupling=" << (pc2_only ? "pc2" : "hybrid")
+                << "; gamma_switch only modifies the imex2+ tableau and will be ignored."
+                << std::endl;
+    }
+    gamma_switch = false;
   }
   stopping_times_initialized = false;
   dt_cfl        = pin->GetOrAddReal("dust","dt_cfl",0.5);
@@ -137,7 +147,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  {
+  if (pc2_only) {
+    hybrid_force_mode = HybridForceMode::pc2;
+    hybrid_mode = HybridMode::pc2;
+  } else {
     std::string forced = pin->GetOrAddString("dust", "hybrid_force_mode", "auto");
     if (forced.compare("auto") == 0) {
       hybrid_force_mode = HybridForceMode::automatic;

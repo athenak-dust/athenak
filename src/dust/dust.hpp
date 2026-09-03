@@ -49,9 +49,9 @@ enum class DustStoppingTimeMode {species_fixed=0, particle_static=1, dynamic=2};
 // `dc1` and `dc2` unconditionally accept one and two fixed defect corrections.
 enum class DustDragSolver {local=0, applya=1, dc1=2, dc2=3, pcg=4, adaptive=5};
 
-// Time coupling between the hydro RK update and particle drag.  The hybrid path uses
-// PC2 while drag and feedback are resolved, and a full-step split backward-Euler
-// fallback otherwise.
+// Time coupling between the hydro RK update and particle drag. Input coupling=pc2 maps
+// to the hybrid task path with PC2 forced for every cycle. Input coupling=hybrid can use
+// PC2 while drag and feedback are resolved and split backward-Euler otherwise.
 enum class DustCoupling {imex=0, hybrid=1};
 enum class HybridMode {pc2=0, split_be=1};
 enum class HybridForceMode {automatic=0, pc2=1, split_be=2};
