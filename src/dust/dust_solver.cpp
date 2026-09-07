@@ -585,7 +585,7 @@ Real DustGasDrag::AdaptiveErrorBound(Real a_dt, Real residual_norm, Real &state_
 
 TaskStatus DustGasDrag::SolveCoupledStage(Driver *pdrive, int stage) {
   auto started=std::chrono::steady_clock::now();
-  Real a_dt=(pdrive->a_impl)*(pmy_pack->pmesh->dt);
+  Real a_dt=DragStep(pdrive);
   auto &indcs=pmy_pack->pmesh->mb_indcs;
   int is=indcs.is,ie=indcs.ie,js=indcs.js,je=indcs.je,ks=indcs.ks,ke=indcs.ke;
   int nmb1=pmy_pack->nmb_thispack-1;

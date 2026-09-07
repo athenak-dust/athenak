@@ -80,6 +80,19 @@ void DustGasDrag::RefreshStoppingTimeMaximum() {
 
   if (stopping_time_mode != DustStoppingTimeMode::species_fixed && local_max > 0.0) {
     taus_max = local_max;
+    Real local_min = std::numeric_limits<Real>::max();
+    if (npart > 0) {
+      Kokkos::parallel_reduce("dust_min_tstop",
+      Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p, Real &minimum) {
+        minimum = fmin(minimum, pr(IPTS,p));
+      }, Kokkos::Min<Real>(local_min));
+    }
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &local_min, 1, MPI_ATHENA_REAL, MPI_MIN,
+                  MPI_COMM_WORLD);
+#endif
+    if (local_min < std::numeric_limits<Real>::max()) taus_min = local_min;
   }
   stopping_times_initialized = true;
 }
@@ -93,6 +106,13 @@ void DustGasDrag::RefreshStoppingTimeMaximum() {
 //! CFL factor to ppart->dtnew.
 
 TaskStatus DustGasDrag::NewTimeStep(Driver *pdrive, int stage) {
+  if (coupling == DustCoupling::hybrid && hybrid_mode == HybridMode::split_be) {
+    return TaskStatus::complete;
+  }
+  return ComputeNewTimeStep(pdrive, stage);
+}
+
+TaskStatus DustGasDrag::ComputeNewTimeStep(Driver *pdrive, int stage) {
   if (stage != (pdrive->nexp_stages)) {
     return TaskStatus::complete;  // only execute on last stage
   }
@@ -130,6 +150,19 @@ TaskStatus DustGasDrag::NewTimeStep(Driver *pdrive, int stage) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::NewTimeStep2
+//! \brief Split-BE migrates after its relaxed kick, later than PC2/IMEX.  Keep a second
+//! conditional task after that migration so the legacy paths retain their original
+//! overlap between particle timestep reduction and the PMBR commit.
+
+TaskStatus DustGasDrag::NewTimeStep2(Driver *pdrive, int stage) {
+  if (coupling != DustCoupling::hybrid || hybrid_mode != HybridMode::split_be) {
+    return TaskStatus::complete;
+  }
+  return ComputeNewTimeStep(pdrive, stage);
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::GammaSwitch
 //! \brief Once per cycle (before the time integrator), switches the imex2+ singly-
 //! diagonal coefficient between gamma = 1+1/sqrt(2) (monotone, most accurate for
@@ -142,6 +175,26 @@ TaskStatus DustGasDrag::GammaSwitch(Driver *pdrive, int stage) {
   if (!stopping_times_initialized ||
       stopping_time_mode == DustStoppingTimeMode::dynamic) {
     RefreshStoppingTimeMaximum();
+  }
+  if (coupling == DustCoupling::hybrid) {
+    if (hybrid_force_mode == HybridForceMode::pc2) {
+      hybrid_mode = HybridMode::pc2;
+    } else if (hybrid_force_mode == HybridForceMode::split_be) {
+      hybrid_mode = HybridMode::split_be;
+    } else if (hybrid_have_metric) {
+      Real zeta = pmy_pack->pmesh->dt/taus_min;
+      Real chi = pmy_pack->pmesh->dt*hybrid_feedback_rate_max;
+      if (hybrid_mode == HybridMode::pc2) {
+        if (zeta > hybrid_enter_zeta || chi > hybrid_enter_chi) {
+          hybrid_mode = HybridMode::split_be;
+        }
+      } else if (zeta < hybrid_exit_zeta && chi < hybrid_exit_chi) {
+        hybrid_mode = HybridMode::pc2;
+      }
+      hybrid_last_zeta = zeta;
+      hybrid_last_chi = chi;
+    }
+    return TaskStatus::complete;
   }
   if (!gamma_switch) {return TaskStatus::complete;}
 

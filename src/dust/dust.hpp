@@ -7,11 +7,12 @@
 //========================================================================================
 //! \file dust.hpp
 //! \brief definitions for DustGasDrag class: Lagrangian dust particles coupled to a
-//! Hydro gas by stiff mutual drag, integrated with the imex2+ IMEX(4,3,2) integrator
-//! (Krapp et al. 2024) using the particle-mesh scatter/gather method of Yang & Johansen
-//! (2016) with exact momentum-conserving back-reaction (PMBR), and the O(N) closed-form
-//! per-cell drag solve of Benitez-Llambay, Krapp & Pessah (2019) generalized to
-//! per-particle stopping times.
+//! Hydro gas by stiff mutual drag.  The module supports the imex2+ IMEX(4,3,2) method
+//! (Krapp et al. 2024), plus an RK2 hybrid of resolved PC2 midpoint coupling and a stiff
+//! full-step split-BE fallback.  Both use the particle-mesh scatter/gather method of
+//! Yang & Johansen (2016) with exact momentum-conserving back-reaction (PMBR), and the
+//! O(N) closed-form per-cell drag solve of Benitez-Llambay, Krapp & Pessah (2019)
+//! generalized to per-particle stopping times.
 //!
 //! This module couples the Particles and Hydro modules the same way IonNeutral couples
 //! Hydro and MHD: it owns the combined task graph, the deposited fields, and the drag
@@ -48,6 +49,13 @@ enum class DustStoppingTimeMode {species_fixed=0, particle_static=1, dynamic=2};
 // `dc1` and `dc2` unconditionally accept one and two fixed defect corrections.
 enum class DustDragSolver {local=0, applya=1, dc1=2, dc2=3, pcg=4, adaptive=5};
 
+// Time coupling between the hydro RK update and particle drag. Input coupling=pc2 maps
+// to the hybrid task path with PC2 forced for every cycle. Input coupling=hybrid can use
+// PC2 while drag and feedback are resolved and split backward-Euler otherwise.
+enum class DustCoupling {imex=0, hybrid=1};
+enum class HybridMode {pc2=0, split_be=1};
+enum class HybridForceMode {automatic=0, pc2=1, split_be=2};
+
 //----------------------------------------------------------------------------------------
 //! \struct DustGasDragTaskIDs
 //  \brief container to hold TaskIDs of all dust+hydro tasks
@@ -64,8 +72,9 @@ struct DustGasDragTaskIDs {
   TaskID p_newgid, p_cnt, p_irecv, p_sendp, p_recvp;
   TaskID scat, sendd, recvd, solve, sendus, recvus, sendus_shr, recvus_shr;
   TaskID gkp, sendbr, recvbr, apply;
+  TaskID p2_newgid, p2_cnt, p2_irecv, p2_sendp, p2_recvp;
   TaskID h_sendu_oa, h_recvu_oa, h_restu, h_sendu, h_recvu, h_sendu_shr, h_recvu_shr;
-  TaskID h_bcs, h_prol, h_c2p, h_newdt, newdt;
+  TaskID h_bcs, h_prol, h_c2p, h_newdt, newdt, newdt2;
   // "after_stagen" tasks
   TaskID h_csend, h_crecv, p_csend, p_crecv, cleard;
 };
@@ -137,17 +146,29 @@ class DustGasDrag {
   Real qshear, omega0;       // shearing box parameters (0 if no shearing box)
   Real dt_cfl;               // particle CFL number for transport timestep
   Real taus_max;             // largest stopping time over all species
+  Real taus_min;             // smallest stopping time over all species
   Real dust_to_gas;          // total dust/gas mass ratio for default mass normalization
   DualArray1D<Real> taus;    // per-species stopping times
   DustDeposit deposit;       // particle-mesh deposit scheme (tsc default)
   DustStoppingTimeMode stopping_time_mode;
   DustDragSolver drag_solver;
+  DustCoupling coupling;
+  HybridMode hybrid_mode;
+  HybridForceMode hybrid_force_mode;
+  Real hybrid_enter_zeta, hybrid_enter_chi;
+  Real hybrid_exit_zeta, hybrid_exit_chi;
+  Real hybrid_last_zeta = 0.0;
+  Real hybrid_last_chi = 0.0;
+  Real hybrid_feedback_rate_max = 0.0;
+  bool hybrid_have_metric = false;
+  unsigned long long hybrid_pc2_cycles = 0;
+  unsigned long long hybrid_split_be_cycles = 0;
   Real drag_rtol, drag_atol;
   int drag_iter_max, drag_diagnostic_interval;
   Real adaptive_order_c, adaptive_rtol_max, adaptive_tref, adaptive_state_floor;
 
   // deposited fields, dimensioned (nmb, nvar, ncells3, ncells2, ncells1)
-  DvceArray5D<Real> qdep;    // nvar=4: [0]=Q (drag-weighted density sum), [1-3]=P
+  DvceArray5D<Real> qdep;    // [0]=Q, [1-3]=P/predictor impulse, [4]=feedback rate
   DvceArray5D<Real> ustar;   // nvar=3: provisional drag-corrected gas velocity u*
   DvceArray5D<Real> dmom;    // nvar=3: PMBR momentum deposit; becomes R_g after apply
   DvceArray5D<Real> cdummy;  // 1-element dummy coarse array for ustar copy exchange
@@ -188,6 +209,9 @@ class DustGasDrag {
   void AssembleDustGasDragTasks(std::map<std::string, std::shared_ptr<TaskList>> tl);
   // dust tasks are dormant on the trivial assembly stage of imex2+ (beta=0, gam0=1)
   bool ActiveStage(Driver *pdrive, int stage) const;
+  bool FirstMigrationActive(Driver *pdrive, int stage) const;
+  bool SecondMigrationActive(Driver *pdrive, int stage) const;
+  Real DragStep(Driver *pdrive) const;
   // default particle mass/species/stopping-time initialization (pgen may override)
   void SetDefaultMasses(ParameterInput *pin);
 
@@ -206,11 +230,17 @@ class DustGasDrag {
   TaskStatus InitParticleRecv(Driver *pdrive, int stage);
   TaskStatus SendParticles(Driver *pdrive, int stage);
   TaskStatus RecvParticles(Driver *pdrive, int stage);
+  TaskStatus UpdateParticleGIDs2(Driver *pdrive, int stage);
+  TaskStatus CountParticleSends2(Driver *pdrive, int stage);
+  TaskStatus InitParticleRecv2(Driver *pdrive, int stage);
+  TaskStatus SendParticles2(Driver *pdrive, int stage);
+  TaskStatus RecvParticles2(Driver *pdrive, int stage);
   TaskStatus AddDragHistoryGas(Driver *pdrive, int stage); // u0 += a_twid*dt*R_g
   TaskStatus DepositDrag(Driver *pdrive, int stage);       // scatter Q,P
   TaskStatus SendDepQP(Driver *pdrive, int stage);
   TaskStatus RecvDepQP(Driver *pdrive, int stage);
   TaskStatus GasImplicitSolve(Driver *pdrive, int stage);  // u* = (rho*u+P)/(rho+Q)
+  void UpdateHybridMetric(Driver *pdrive, int stage);
   TaskStatus SolveCoupledStage(Driver *pdrive, int stage);
   void ApplyCoupledOperator(DvceArray5D<Real> &field, DvceArray5D<Real> &result,
                             Real a_dt);
@@ -236,6 +266,8 @@ class DustGasDrag {
   TaskStatus RecvPMBR(Driver *pdrive, int stage);
   TaskStatus ApplyPMBR(Driver *pdrive, int stage);         // u0 += dmom; dmom -> R_g
   TaskStatus NewTimeStep(Driver *pdrive, int stage);
+  TaskStatus NewTimeStep2(Driver *pdrive, int stage);
+  TaskStatus ComputeNewTimeStep(Driver *pdrive, int stage);
   // ...in "after_stagen" list
   TaskStatus ClearParticleSend(Driver *pdrive, int stage);
   TaskStatus ClearParticleRecv(Driver *pdrive, int stage);

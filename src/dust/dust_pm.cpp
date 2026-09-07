@@ -4,8 +4,9 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_pm.cpp
-//! \brief Particle-mesh kernels for the implicit gas-dust drag solve, executed once per
-//! working IMEX stage with implicit coefficient a = a_impl*dt:
+//! \brief Particle-mesh kernels for IMEX drag stages and for the PC2/split-BE hybrid.
+//! The implicit chain is executed with a=a_impl*dt in each working IMEX stage, or once
+//! with a=dt in the split-BE branch:
 //!
 //!  (1) DepositDrag (scatter): with c_j = a/(t_s,j + a) and mu_j = m_j*W_jk/V, atomically
 //!      accumulate Q_k = sum_j mu_j*c_j and P_k = sum_j mu_j*c_j*v_j.
@@ -34,6 +35,10 @@
 #include "particles/particles.hpp"
 #include "dust.hpp"
 
+#if MPI_PARALLEL_ENABLED
+#include <mpi.h>
+#endif
+
 namespace dust {
 
 //----------------------------------------------------------------------------------------
@@ -42,6 +47,83 @@ namespace dust {
 
 TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
+
+  if (coupling == DustCoupling::hybrid) {
+    // Split-BE deposits Q/P in its fused preparation traversal.  PC2 needs only the
+    // fresh old-state feedback predictor during stage 1.
+    if (hybrid_mode != HybridMode::pc2 || stage != 1) return TaskStatus::complete;
+    Kokkos::deep_copy(DevExeSpace(), qdep, 0.0);
+
+    particles::Particles *ppar = pmy_pack->ppart;
+    auto &pr = ppar->prtcl_rdata;
+    auto &pi = ppar->prtcl_idata;
+    int npart = ppar->nprtcl_thispack;
+    auto &indcs = pmy_pack->pmesh->mb_indcs;
+    int is = indcs.is, js = indcs.js, ks = indcs.ks;
+    int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
+    bool three_d = pmy_pack->pmesh->three_d;
+    auto &mbsize = pmy_pack->pmb->mb_size;
+    auto gids = pmy_pack->gids;
+    int scheme = static_cast<int>(deposit);
+    Real dt = pmy_pack->pmesh->dt;
+    auto &uold = pmy_pack->phydro->u1;
+    auto &qdep_ = qdep;
+
+    par_for("dust_pc2_predictor",DevExeSpace(),0,(npart-1),
+    KOKKOS_LAMBDA(const int p) {
+      int m = pi(PGID,p) - gids;
+      int ip, jp, kp;
+      Real wx[3], wy[3], wz[3];
+      PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
+                scheme, ip, wx);
+      PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
+                scheme, jp, wy);
+      if (three_d) {
+        PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
+                  scheme, kp, wz);
+      } else {
+        kp = ks;
+        wz[0] = 0.0; wz[1] = 1.0; wz[2] = 0.0;
+      }
+      Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
+      int clo = three_d ? 0 : 1, chi = three_d ? 2 : 1;
+      for (int c=clo; c<=chi; ++c) {
+        for (int b=0; b<3; ++b) {
+          Real wcb = wz[c]*wy[b];
+          if (wcb == 0.0) continue;
+          for (int a=0; a<3; ++a) {
+            Real w = wcb*wx[a];
+            int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
+            Real invrho = 1.0/uold(m,IDN,kk,jj,ii);
+            ugx += w*uold(m,IM1,kk,jj,ii)*invrho;
+            ugy += w*uold(m,IM2,kk,jj,ii)*invrho;
+            ugz += w*uold(m,IM3,kk,jj,ii)*invrho;
+          }
+        }
+      }
+      Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+      if (three_d) vol *= mbsize.d_view(m).dx3;
+      Real rate = pr(IPM,p)/(pr(IPTS,p)*vol);
+      Real gx = -dt*rate*(ugx-pr(IPVX,p));
+      Real gy = -dt*rate*(ugy-pr(IPVY,p));
+      Real gz = -dt*rate*(ugz-pr(IPVZ,p));
+      for (int c=clo; c<=chi; ++c) {
+        for (int b=0; b<3; ++b) {
+          Real wcb = wz[c]*wy[b];
+          if (wcb == 0.0) continue;
+          for (int a=0; a<3; ++a) {
+            Real w = wcb*wx[a];
+            int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
+            DepositAdd(&qdep_(m,1,kk,jj,ii), w*gx);
+            DepositAdd(&qdep_(m,2,kk,jj,ii), w*gy);
+            DepositAdd(&qdep_(m,3,kk,jj,ii), w*gz);
+            DepositAdd(&qdep_(m,4,kk,jj,ii), w*rate);
+          }
+        }
+      }
+    });
+    return TaskStatus::complete;
+  }
 
   Kokkos::deep_copy(DevExeSpace(), qdep, 0.0);
 
@@ -57,7 +139,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   auto &mbsize = pmy_pack->pmb->mb_size;
   auto gids = pmy_pack->gids;
   int scheme = static_cast<int>(deposit);
-  Real a_dt = (pdrive->a_impl)*(pmy_pack->pmesh->dt);
+  Real a_dt = DragStep(pdrive);
   auto &qdep_ = qdep;
 
   par_for("dust_scatter",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
@@ -115,6 +197,57 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::UpdateHybridMetric
+//! \brief Reduce the cell feedback stiffness deposited in qdep[4].  A PC2 cycle may
+//! still fall back before committing its predictor; a split-BE cycle records the metric
+//! for the next cycle's hysteretic choice.
+
+void DustGasDrag::UpdateHybridMetric(Driver *pdrive, int stage) {
+  if (coupling != DustCoupling::hybrid) return;
+  hybrid_last_zeta = pmy_pack->pmesh->dt/taus_min;
+  hybrid_last_chi = 0.0;
+  if (back_reaction) {
+    auto &indcs = pmy_pack->pmesh->mb_indcs;
+    int is = indcs.is, ie = indcs.ie;
+    int js = indcs.js, je = indcs.je;
+    int ks = indcs.ks, ke = indcs.ke;
+    int nx1 = ie-is+1, nx2 = je-js+1, nx3 = ke-ks+1;
+    int nmb = pmy_pack->nmb_thispack;
+    int ncells = nmb*nx3*nx2*nx1;
+    auto &rho_state = (hybrid_mode == HybridMode::pc2 && stage == 1) ?
+                      pmy_pack->phydro->u1 : pmy_pack->phydro->u0;
+    auto &qdep_ = qdep;
+    Real dt = pmy_pack->pmesh->dt;
+    Real local_chi = 0.0;
+    Kokkos::parallel_reduce("dust_hybrid_chi",
+    Kokkos::RangePolicy<>(DevExeSpace(), 0, ncells),
+    KOKKOS_LAMBDA(const int idx, Real &maximum) {
+      int q = idx;
+      int i = is + q % nx1; q /= nx1;
+      int j = js + q % nx2; q /= nx2;
+      int k = ks + q % nx3; q /= nx3;
+      int m = q;
+      Real value = dt*qdep_(m,4,k,j,i)/rho_state(m,IDN,k,j,i);
+      maximum = fmax(maximum, value);
+    }, Kokkos::Max<Real>(local_chi));
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &local_chi, 1, MPI_ATHENA_REAL, MPI_MAX,
+                  MPI_COMM_WORLD);
+#endif
+    hybrid_last_chi = local_chi;
+    hybrid_feedback_rate_max = local_chi/dt;
+  } else {
+    hybrid_feedback_rate_max = 0.0;
+  }
+  hybrid_have_metric = true;
+  if (hybrid_force_mode == HybridForceMode::automatic &&
+      hybrid_mode == HybridMode::pc2 && stage == 1 &&
+      (hybrid_last_zeta > hybrid_enter_zeta || hybrid_last_chi > hybrid_enter_chi)) {
+    hybrid_mode = HybridMode::split_be;
+  }
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::GasImplicitSolve
 //! \brief Closed-form per-cell drag solve for the provisional gas velocity u*. Uses
 //! conserved variables (primitives are stale mid-stage). Active cells only; ghost values
@@ -127,6 +260,32 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
 
 TaskStatus DustGasDrag::GasImplicitSolve(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (coupling == DustCoupling::hybrid) {
+    if (hybrid_mode == HybridMode::pc2 && stage == 1) {
+      UpdateHybridMetric(pdrive, stage);
+      if (hybrid_mode == HybridMode::pc2 && back_reaction) {
+        auto &indcs = pmy_pack->pmesh->mb_indcs;
+        int is = indcs.is, ie = indcs.ie;
+        int js = indcs.js, je = indcs.je;
+        int ks = indcs.ks, ke = indcs.ke;
+        int nmb1 = pmy_pack->nmb_thispack - 1;
+        auto &u0 = pmy_pack->phydro->u0;
+        auto &qdep_ = qdep;
+        par_for("dust_pc2_apply_predictor",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
+        KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+          u0(m,IM1,k,j,i) += qdep_(m,1,k,j,i);
+          u0(m,IM2,k,j,i) += qdep_(m,2,k,j,i);
+          u0(m,IM3,k,j,i) += qdep_(m,3,k,j,i);
+        });
+      }
+      return TaskStatus::complete;
+    }
+    if (hybrid_mode == HybridMode::split_be && stage == 2) {
+      UpdateHybridMetric(pdrive, stage);
+    } else {
+      return TaskStatus::complete;
+    }
+  }
   if (back_reaction && drag_solver != DustDragSolver::local) {
     return SolveCoupledStage(pdrive, stage);
   }
@@ -164,6 +323,10 @@ TaskStatus DustGasDrag::GasImplicitSolve(Driver *pdrive, int stage) {
 
 TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (coupling == DustCoupling::hybrid &&
+      !(hybrid_mode == HybridMode::split_be && stage == 2)) {
+    return TaskStatus::complete;
+  }
 
   bool br = back_reaction;
   if (br) {
@@ -182,7 +345,11 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
   auto &mbsize = pmy_pack->pmb->mb_size;
   auto gids = pmy_pack->gids;
   int scheme = static_cast<int>(deposit);
-  Real a_dt = (pdrive->a_impl)*(pmy_pack->pmesh->dt);
+  Real a_dt = DragStep(pdrive);
+  Real dt = pmy_pack->pmesh->dt;
+  bool split_be = (coupling == DustCoupling::hybrid);
+  bool shear3d = is_shearing_box && three_d;
+  Real qo = qshear*omega0;
   auto &ustar_ = ustar;
   auto &dmom_ = dmom;
 
@@ -231,6 +398,15 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
     pr(IPRY,p) = dvy/a_dt;
     pr(IPRZ,p) = dvz/a_dt;
 
+    // The split fallback holds positions fixed during the coupled solve, then uses the
+    // relaxed velocity for its deliberately first-order drift.
+    if (split_be) {
+      Real x0 = pr(IPX,p);
+      pr(IPX,p) += dt*pr(IPVX,p);
+      pr(IPY,p) += dt*(pr(IPVY,p) - (shear3d ? qo*x0 : 0.0));
+      if (three_d) pr(IPZ,p) += dt*pr(IPVZ,p);
+    }
+
     // momentum back-reaction deposit with the SAME weights and dv
     if (br) {
       Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
@@ -264,6 +440,27 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
 TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
 
+  if (coupling == DustCoupling::hybrid) {
+    if (stage != 2) return TaskStatus::complete;
+    auto &indcs = pmy_pack->pmesh->mb_indcs;
+    int is = indcs.is, ie = indcs.ie;
+    int js = indcs.js, je = indcs.je;
+    int ks = indcs.ks, ke = indcs.ke;
+    int nmb1 = pmy_pack->nmb_thispack - 1;
+    auto &u0 = pmy_pack->phydro->u0;
+    auto &dmom_ = dmom;
+    auto &qdep_ = qdep;
+    bool pc2 = (hybrid_mode == HybridMode::pc2);
+    Real wpred = pdrive->gam1[pdrive->nexp_stages-1];
+    par_for("dust_hybrid_commit",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+      u0(m,IM1,k,j,i) += dmom_(m,0,k,j,i) - (pc2 ? wpred*qdep_(m,1,k,j,i) : 0.0);
+      u0(m,IM2,k,j,i) += dmom_(m,1,k,j,i) - (pc2 ? wpred*qdep_(m,2,k,j,i) : 0.0);
+      u0(m,IM3,k,j,i) += dmom_(m,2,k,j,i) - (pc2 ? wpred*qdep_(m,3,k,j,i) : 0.0);
+    });
+    return TaskStatus::complete;
+  }
+
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
@@ -295,6 +492,7 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
 //! consumed at explicit stage 2.
 
 TaskStatus DustGasDrag::AddDragHistoryGas(Driver *pdrive, int stage) {
+  if (coupling != DustCoupling::imex) {return TaskStatus::complete;}
   if (stage != 2 || !back_reaction) {return TaskStatus::complete;}
 
   auto &indcs = pmy_pack->pmesh->mb_indcs;
