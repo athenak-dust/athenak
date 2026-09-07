@@ -1,0 +1,74 @@
+<job>
+basename = uniform_dust
+
+<mesh>
+nghost = 2
+nx1 = 32
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+
+nx2 = 32
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 1
+
+<time>
+evolution = dynamic
+integrator = imex2+
+cfl_number = 0.4
+tlim = 1.0
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = plm
+rsolver = hlle
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+ppc = 1.0
+
+<dust>
+nspecies = 1
+taus_1 = 1e20
+back_reaction = false
+drag_solver = local
+
+<shearing_box>
+qshear = 1.5
+omega0 = 1.0
+stratified = false
+
+<problem>
+rho0 = 1.0
+vx0 = 0.01
+vd0 = 0.01
+
+<output1>
+file_type = hst
+dt = 0.05
+
+<output2>
+file_type = bin
+variable = hydro_u
+dt = 0.1
+
+<output3>
+file_type = pvtk
+variable = prtcl_all
+dt = 0.1
