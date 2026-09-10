@@ -1,5 +1,5 @@
 <job>
-basename = uniform_dust
+basename = epicyclic_test
 
 <mesh>
 nghost = 2
@@ -30,7 +30,7 @@ nx3 = 1
 evolution = dynamic
 integrator = imex2+
 cfl_number = 0.4
-tlim = 1.0
+tlim = 62.8318530718
 
 <hydro>
 eos = isothermal

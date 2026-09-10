@@ -14,7 +14,7 @@
 #include "dust/dust.hpp"
 #include "pgen/pgen.hpp"
 
-void ProblemGenerator::UniformDeceleration(ParameterInput *pin, const bool restart) {
+void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   // Register callbacks above this test, if the problem has any. See section 8.
   if (restart) return;
 
@@ -28,6 +28,7 @@ void ProblemGenerator::UniformDeceleration(ParameterInput *pin, const bool resta
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  /*
   if (pmbp->pdust->nspecies != 1) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "uniform_dust requires <dust>/nspecies = 1"
@@ -42,6 +43,7 @@ void ProblemGenerator::UniformDeceleration(ParameterInput *pin, const bool resta
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  */
 
   Real rho0 = pin->GetOrAddReal("problem", "rho0", 1.0);
   Real vx0  = pin->GetOrAddReal("problem", "vx0", 0.0);
