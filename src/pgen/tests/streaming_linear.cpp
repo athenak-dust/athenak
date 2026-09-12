@@ -323,8 +323,15 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
 //! of Athena (C)'s OutputModeAmplitude (streaming2d_single.c, the "amp" .dat file):
 //!   dg_max, dp_max      max |rho_g - rho0|, max |rho_p - eps*rho0|
 //!   dugx_max, dvpx_max  max |u_gx - u_NSH,x|, max |v_px - v_NSH,x|   (radial)
-//!   dugp_max, dvpp_max  max |u_gphi - u_NSH,phi|, max |v_pphi - v_NSH,phi| (azimuthal)
+//!   dugy_max, dvpy_max  max |u_gy - u_NSH,y|, max |v_py - v_NSH,y|   (AZIMUTHAL)
 //!   ugz_max, vpz_max    max |u_gz|, max |v_pz|                       (vertical, NSH = 0)
+//! The x/y/z of these labels is the shearing-box convention of Athena's .dat file --
+//! x radial, y AZIMUTHAL, z vertical -- so the columns compare letter-for-letter with it.
+//! Note that this is not the array convention of the 2D r-z geometry, where the azimuthal
+//! velocity is the third component (IM3/IPVZ) and x2/IM2/IPVY is the vertical one; nor is
+//! it the naming of this generator's own eigenvector inputs, where the azimuthal
+//! amplitudes are dugp_* and dvpp_* and the vertical ones dugz_* and dvpz_*.  The
+//! correspondence is: dugy_max <-> dugp_re/im, ugz_max <-> dugz_re/im.
 //! For the even/odd eigenfunctions each maximum is |f~| of that field at t = 0, so the
 //! columns can be compared directly with the eigenvector, and their growth is a second,
 //! mode-agnostic estimate of s.  Unlike the projections these are NOT mode-selective:
@@ -353,8 +360,8 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
   pdata->label[7] = "dp_max";
   pdata->label[8] = "dugx_max";
   pdata->label[9] = "dvpx_max";
-  pdata->label[10] = "dugp_max";
-  pdata->label[11] = "dvpp_max";
+  pdata->label[10] = "dugy_max";
+  pdata->label[11] = "dvpy_max";
   pdata->label[12] = "ugz_max";
   pdata->label[13] = "vpz_max";
 
