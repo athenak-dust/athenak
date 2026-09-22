@@ -52,7 +52,7 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
     }
     std::string transfer = pin->GetOrAddString(
         "dust", "experimental_smr_transfer", "smooth_p2");
-    if (transfer.compare("smooth_p2") == 0) {
+    if (transfer.compare("smooth_p2") == 0 || transfer.compare("refinable_cloud") == 0) {
       // The composite dust kernels deposit directly into active leaf cells.
       local_smr_direct_ = true;
     } else if (transfer.compare("owner_overlap") == 0) {

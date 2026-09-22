@@ -310,17 +310,21 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       smr_transfer_mode = DustSMRTransfer::owner_overlap;
     } else if (transfer.compare("smooth_p2") == 0) {
       smr_transfer_mode = DustSMRTransfer::smooth_p2;
+    } else if (transfer.compare("refinable_cloud") == 0) {
+      smr_transfer_mode = DustSMRTransfer::refinable_cloud;
+      cloud_split_slack = pin->GetOrAddReal("dust", "cloud_split_slack", 0.02);
+      cloud_merge_tolerance = pin->GetOrAddReal("dust", "cloud_merge_tolerance", 0.05);
     } else {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<dust>/experimental_smr_transfer = '" << transfer
-                << "' not recognized (must be owner_overlap or smooth_p2)" << std::endl;
+                << "' not recognized (must be owner_overlap, smooth_p2, or "
+                << "refinable_cloud)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    if (smr_transfer_mode == DustSMRTransfer::smooth_p2 &&
-        deposit != DustDeposit::tsc) {
+    if (UsesCompositeTransfer() && deposit != DustDeposit::tsc) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "experimental_smr_transfer=smooth_p2 currently "
-                << "requires <dust>/deposit=tsc" << std::endl;
+                << std::endl << "experimental_smr_transfer=" << transfer
+                << " currently requires <dust>/deposit=tsc" << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
@@ -367,6 +371,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         std::cout << "# WARNING (dust): experimental static-SMR owner_overlap transfer "
                   << "is enabled only as a negative control; it is not a certified "
                   << "gather/deposit adjoint" << std::endl;
+      }
+    } else if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
+      BuildRefinableCloudTransfer(pin);
+      if (global_variable::my_rank == 0) {
+        std::cout << "# WARNING (dust): experimental static-SMR refinable_cloud transfer "
+                  << "is enabled (hat clouds, exact leaf integrals, two-scale split; "
+                  << "single rank, 2-D, static mesh). SI convergence is not certified"
+                  << std::endl;
       }
     } else {
       BuildSMRCompositeTransfer(pin);
@@ -422,6 +434,12 @@ DustGasDrag::~DustGasDrag() {
               << " pc2_fraction=" << pc2_fraction
               << " last_zeta=" << hybrid_last_zeta
               << " last_chi=" << hybrid_last_chi << std::endl;
+  }
+  if (global_variable::my_rank == 0 &&
+      smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
+    std::cout << "# DUST_CLOUD_SUMMARY splits=" << cloud_split_count
+              << " merges=" << cloud_merge_count
+              << " particles=" << pmy_pack->ppart->nprtcl_thispack << std::endl;
   }
   if (global_variable::my_rank == 0 && solver_stage_count > 0) {
     auto quantile = [&](double fraction) {

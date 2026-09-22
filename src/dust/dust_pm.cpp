@@ -69,14 +69,14 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
     auto &uold = pmy_pack->phydro->u1;
     auto &qdep_ = qdep;
 
-    if (smr_transfer_mode == DustSMRTransfer::smooth_p2) {
+    if (UsesCompositeTransfer()) {
       auto transfer = smr_transfer;
       int ncells1 = qdep.extent_int(4);
       int ncells2 = qdep.extent_int(3);
       par_for("dust_pc2_composite_predictor",DevExeSpace(),0,(npart-1),
       KOKKOS_LAMBDA(const int p) {
         Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p),
+        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p),
         [&](const int target, const Real particle_weight) {
           int ti = target % ncells1;
           int remainder = target/ncells1;
@@ -92,7 +92,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         Real gx = -dt*mass_rate*(ugx-pr(IPVX,p));
         Real gy = -dt*mass_rate*(ugy-pr(IPVY,p));
         Real gz = -dt*mass_rate*(ugz-pr(IPVZ,p));
-        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p),
+        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p),
         [&](const int target, const Real particle_weight) {
           int ti = target % ncells1;
           int remainder = target/ncells1;
@@ -182,7 +182,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   Real a_dt = DragStep(pdrive);
   auto &qdep_ = qdep;
 
-  if (smr_transfer_mode == DustSMRTransfer::smooth_p2) {
+  if (UsesCompositeTransfer()) {
     auto transfer = smr_transfer;
     int ncells1 = qdep.extent_int(4);
     int ncells2 = qdep.extent_int(3);
@@ -191,7 +191,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       Real cj = a_dt/(pr(IPTS,p) + a_dt);
       Real mass_c = pr(IPM,p)*cj;
       Real vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
-      transfer.ForEachWeight(pr(IPX,p), pr(IPY,p),
+      transfer.ForEachWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p),
       [&](const int target, const Real particle_weight) {
         int ti = target % ncells1;
         int remainder = target/ncells1;
@@ -419,7 +419,7 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
   auto &ustar_ = ustar;
   auto &dmom_ = dmom;
 
-  if (smr_transfer_mode == DustSMRTransfer::smooth_p2) {
+  if (UsesCompositeTransfer()) {
     auto transfer = smr_transfer;
     int ncells1 = ustar.extent_int(4);
     int ncells2 = ustar.extent_int(3);
@@ -427,7 +427,7 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
     KOKKOS_LAMBDA(const int p) {
       Real x0 = pr(IPX,p), y0 = pr(IPY,p);
       Real ux = 0.0, uy = 0.0, uz = 0.0;
-      transfer.ForEachWeight(x0, y0,
+      transfer.ForEachWeight(x0, y0, pi(PLEV,p),
       [&](const int target, const Real particle_weight) {
         int ti = target % ncells1;
         int remainder = target/ncells1;
@@ -451,7 +451,7 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
 
       if (br) {
         Real mass = -pr(IPM,p);
-        transfer.ForEachWeight(x0, y0,
+        transfer.ForEachWeight(x0, y0, pi(PLEV,p),
         [&](const int target, const Real particle_weight) {
           int ti = target % ncells1;
           int remainder = target/ncells1;

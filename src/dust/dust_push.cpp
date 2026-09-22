@@ -115,7 +115,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
     auto &mbsize = pmy_pack->pmb->mb_size;
     auto gids = pmy_pack->gids;
     int scheme = static_cast<int>(deposit);
-    bool composite_smr = (smr_transfer_mode == DustSMRTransfer::smooth_p2);
+    bool composite_smr = UsesCompositeTransfer();
     auto transfer = smr_transfer;
     int ncells1 = dmom.extent_int(4);
     int ncells2 = dmom.extent_int(3);
@@ -155,7 +155,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
         int clo = three_d ? 0 : 1, chi = three_d ? 2 : 1;
         if (composite_smr) {
-          transfer.ForEachWeight(xh, yh,
+          transfer.ForEachWeight(xh, yh, pi(PLEV,p),
           [&](const int target, const Real particle_weight) {
             int ti = target % ncells1;
             int remainder = target/ncells1;
@@ -232,7 +232,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         if (br) {
           if (composite_smr) {
             Real mass = -pr(IPM,p);
-            transfer.ForEachWeight(xh, yh,
+            transfer.ForEachWeight(xh, yh, pi(PLEV,p),
             [&](const int target, const Real particle_weight) {
               int ti = target % ncells1;
               int remainder = target/ncells1;
@@ -292,7 +292,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
           Real cj = dt/(pr(IPTS,p) + dt);
           Real mass_c = pr(IPM,p)*cj;
           Real mass_rate = pr(IPM,p)/pr(IPTS,p);
-          transfer.ForEachWeight(x0, y0,
+          transfer.ForEachWeight(x0, y0, pi(PLEV,p),
           [&](const int target, const Real particle_weight) {
             int ti = target % ncells1;
             int remainder = target/ncells1;

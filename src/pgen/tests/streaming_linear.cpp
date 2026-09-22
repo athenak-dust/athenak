@@ -56,12 +56,17 @@ namespace {
 Real kx_ = 0.0, kz_ = 0.0, rho0_ = 1.0;
 bool snapshots_ = false;
 int snapshot_number_ = 0;
+// refinable clouds: the particle projection is weighted by the cloud's Fourier
+// transform sinc^2(k ell/2) per direction, which is invariant under the two-scale split
+bool cloud_mode_ = false;
+Real cloud_root_dx1_ = 0.0, cloud_root_dx2_ = 0.0;
 std::string snapshot_basename_;
 
 // Opt-in, single-rank diagnostic output at the history cadence. Native binary and
 // particle-VTK output round to float, which erases the small LinA perturbations.
 // Header: ASCII magic, then time/cycle/ncell/nparticle. Payload: native-endian f64
-// cell rows [x,z,dx,dz,rho,mx,mz,mphi], then particle rows [x,z,m,vx,vz,vphi,tag].
+// cell rows [x,z,dx,dz,rho,mx,mz,mphi], then particle rows
+// [x,z,m,vx,vz,vphi,tag,level] (v2; v1 had no level column).
 void WriteStreamingSnapshot(Mesh *pm) {
   auto *pack = pm->pmb_pack;
   auto &ind = pm->mb_indcs;
@@ -75,7 +80,7 @@ void WriteStreamingSnapshot(Mesh *pm) {
   std::vector<double> cells;
   std::vector<double> particles;
   cells.reserve(8*ncell);
-  particles.reserve(7*npart);
+  particles.reserve(8*npart);
   for (int m=0; m<pack->nmb_thispack; ++m) {
     const auto &size = pack->pmb->mb_size.h_view(m);
     for (int j=ind.js; j<=ind.je; ++j) {
@@ -89,7 +94,8 @@ void WriteStreamingSnapshot(Mesh *pm) {
   }
   for (int p=0; p<npart; ++p) {
     particles.insert(particles.end(), {pr(IPX,p), pr(IPY,p), pr(IPM,p),
-        pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p), static_cast<double>(pi(PTAG,p))});
+        pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p), static_cast<double>(pi(PTAG,p)),
+        static_cast<double>(pi(PLEV,p))});
   }
   char number[32];
   std::snprintf(number, sizeof(number), ".%05d.lina", snapshot_number_++);
@@ -99,7 +105,7 @@ void WriteStreamingSnapshot(Mesh *pm) {
     std::cerr << "Cannot open LinA snapshot " << filename << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  bool ok = std::fprintf(file, "AthenaK LinA snapshot v1 f64-native\n"
+  bool ok = std::fprintf(file, "AthenaK LinA snapshot v2 f64-native\n"
       "%.17g %d %d %d\n", pm->time, pm->ncycle, ncell, npart) > 0;
   ok = (std::fwrite(cells.data(), sizeof(double), cells.size(), file)
         == cells.size()) && ok;
@@ -278,6 +284,87 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   Real rhop0 = eps*rho0;
   Real taus0 = taus;
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2;
+
+  // Refinable clouds: the quiet-start lattice is the ROOT lattice everywhere (one
+  // root-level cloud per root cell, ppc sub-lattice inside it), independent of the
+  // local refinement.  Clouds lying inside the fine region are then split by the exact
+  // two-scale rule, exactly as they will be at run time, so the refined lattice is
+  // built by the same rule as the dynamics.  Every particle keeps its analytic seed
+  // (displacement and velocity) from its parent's lattice site.
+  cloud_mode_ = (pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud);
+  if (cloud_mode_) {
+    auto &transfer = pmbp->pdust->smr_transfer;
+    cloud_root_dx1_ = transfer.root_dx1;
+    cloud_root_dx2_ = transfer.root_dx2;
+    Real hx = transfer.root_dx1, hz = transfer.root_dx2;
+    auto &mblev = pmbp->pmb->mb_lev;
+    std::vector<int> first(nmb + 1, 0);
+    std::vector<int> nroot1(nmb, 0), nroot2(nmb, 0);
+    for (int m=0; m<nmb; ++m) {
+      int ratio = 1 << (mblev.h_view(m) - pmy_mesh_->root_level);
+      if ((lnx1 % ratio) != 0 || (lnx2 % ratio) != 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "refinable_cloud lattice requires MeshBlocks that "
+                  << "contain whole root cells" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      nroot1[m] = lnx1/ratio;
+      nroot2[m] = lnx2/ratio;
+      first[m+1] = first[m] + ppc_int*nroot1[m]*nroot2[m];
+    }
+    int nlattice = first[nmb];
+    Kokkos::realloc(pr, ppar->nrdata, nlattice);
+    Kokkos::realloc(pi, ppar->nidata, nlattice);
+    auto hr = Kokkos::create_mirror_view(pr);
+    auto hi = Kokkos::create_mirror_view(pi);
+    for (int m=0; m<nmb; ++m) {
+      const auto &size = mbsize.h_view(m);
+      for (int q=0; q<first[m+1]-first[m]; ++q) {
+        int p = first[m] + q;
+        int c = q/ppc_int;
+        int sub = q - c*ppc_int;
+        int ip = sub % npar1d;
+        int jp = sub / npar1d;
+        int i = c % nroot1[m];
+        int j = c / nroot1[m];
+        Real x0 = size.x1min + (static_cast<Real>(i)
+                  + (static_cast<Real>(ip) + 0.5)/static_cast<Real>(npar1d))*hx;
+        Real z0 = size.x2min + (static_cast<Real>(j)
+                  + (static_cast<Real>(jp) + 0.5)/static_cast<Real>(npar1d))*hz;
+        Real ce = std::cos(kx*x0), se = std::sin(kx*x0);
+        Real cz = std::cos(kz*z0), sz = std::sin(kz*z0);
+        hi(PGID,p) = gids + m;
+        hi(PTAG,p) = p;
+        hi(PSP,p) = 0;
+        hi(PLEV,p) = 0;
+        for (int col=0; col<ppar->nrdata; ++col) hr(col,p) = 0.0;
+        hr(IPX,p) = x0 - (Apr/(kx*rhop0))*se*cz;
+        hr(IPY,p) = z0;
+        hr(IPX1,p) = hr(IPX,p);
+        hr(IPY1,p) = z0;
+        hr(IPTS,p) = taus0;
+        hr(IPM,p) = eps*rho0*hx*hz/ppc;
+        hr(IPVX,p) = vnx + (Vxr*ce - Vxi*se)*cz;
+        hr(IPVY,p) =     - (Vzr*se + Vzi*ce)*sz;
+        hr(IPVZ,p) = vnp + (Vpr*ce - Vpi*se)*cz;
+        hr(IPVX1,p) = hr(IPVX,p);
+        hr(IPVY1,p) = hr(IPVY,p);
+        hr(IPVZ1,p) = hr(IPVZ,p);
+      }
+    }
+    Kokkos::deep_copy(pr, hr);
+    Kokkos::deep_copy(pi, hi);
+    ppar->nprtcl_thispack = nlattice;
+    pmy_mesh_->nprtcl_thisrank = nlattice;
+    pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = nlattice;
+    pmy_mesh_->nprtcl_total = nlattice;
+    pmbp->pdust->SplitAndMergeClouds();
+    if (global_variable::my_rank == 0) {
+      std::cout << "# refinable_cloud lattice: " << nlattice << " root clouds -> "
+                << ppar->nprtcl_thispack << " particles after the initial split"
+                << std::endl;
+    }
+  } else {
   par_for("stream_part", DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = p/npart_permb;
     if (m > (nmb-1)) {m = nmb-1;}
@@ -303,6 +390,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     pr(IPY,p) = z0;
     pr(IPZ,p) = 0.0;
     pi(PSP,p) = 0;
+    pi(PLEV,p) = 0;
     pr(IPTS,p) = taus0;
     Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
     pr(IPM,p) = eps*rho0*vol/ppc;
@@ -313,6 +401,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     pr(IPRY,p) = 0.0;
     pr(IPRZ,p) = 0.0;
   });
+  }
 
   // particle timestep from drift speeds (perturbations are negligible)
   Real vmax = std::max({fabs(vnx), fabs(vnp), 1.0e-30});
@@ -347,11 +436,22 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
 
   // particle projection
   auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
   int npart = ppar->nprtcl_thispack;
+  bool cloud = cloud_mode_;
+  Real hx = cloud_root_dx1_, hz = cloud_root_dx2_;
   Real pre = 0.0, pim = 0.0;
   Kokkos::parallel_reduce("stream_hp",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
   KOKKOS_LAMBDA(const int &p, Real &re_, Real &im_) {
     Real w = pr(IPM,p)*cos(kz*pr(IPY,p));
+    if (cloud) {
+      // hat cloud of half-width ell: Fourier transform sinc^2(k ell/2) per direction
+      Real scale = 1.0/static_cast<Real>(1 << pi(PLEV,p));
+      Real ax = 0.5*kx*hx*scale, az = 0.5*kz*hz*scale;
+      Real sx = (ax == 0.0) ? 1.0 : sin(ax)/ax;
+      Real sz = (az == 0.0) ? 1.0 : sin(az)/az;
+      w *= SQR(sx)*SQR(sz);
+    }
     re_ += w*cos(kx*pr(IPX,p));
     im_ -= w*sin(kx*pr(IPX,p));
   }, Kokkos::Sum<Real>(pre), Kokkos::Sum<Real>(pim));

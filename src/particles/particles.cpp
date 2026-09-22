@@ -93,7 +93,7 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
         // azimuthal velocity lives in IPVZ, matching gas IM3), plus the RK registers
         // (x1,v1), the recorded drag rate R_j, stopping time, and mass
         nrdata = 17;
-        nidata = 3;   // PGID, PTAG, PSP (species index)
+        nidata = 4;   // PGID, PTAG, PSP (species index), PLEV (cloud level)
         break;
       }
     default:

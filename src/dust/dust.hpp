@@ -57,14 +57,29 @@ enum class HybridMode {pc2=0, split_be=1};
 enum class HybridForceMode {automatic=0, pc2=1, split_be=2};
 
 // Experimental transfer choices on the narrowly supported static-SMR path. The
-// owner_overlap choice is retained only as a negative control.
-enum class DustSMRTransfer {none=0, owner_overlap=1, smooth_p2=2};
+// owner_overlap choice is retained only as a negative control. refinable_cloud gives
+// every particle its own hat cloud: weights are exact integrals of
+// the cloud over active leaf cells, and clouds change size only by the exact B-spline
+// two-scale split (see DustGasDrag::SplitAndMergeClouds).
+enum class DustSMRTransfer {none=0, owner_overlap=1, smooth_p2=2, refinable_cloud=3};
 
 // Device-copyable description of the smooth composite transfer. Each virtual coarse
 // or fine cell stores a short linear map to active leaf-cell degrees of freedom. The
 // same ForEachWeight() traversal is consumed by every gather and deposit operation.
+// In cloud_mode the struct instead holds the finest-level virtual grid of the
+// refinable-cloud transfer, and ForEachWeight(x1,x2,lev,f) dispatches to it.
 struct SMRCompositeTransfer {
+  // Largest 1-D cloud stencil on the finest virtual grid: 2*2^(nlev-lev)+1 cells, so
+  // nine cells allow a root cloud to sit on leaves up to two levels finer.
+  static constexpr int kMaxCloudStencil = 9;
+
   bool enabled = false;
+  bool cloud_mode = false;
+  int cloud_nlev = 0;                 // max_level - root_level
+  Real root_dx1 = 0.0, root_dx2 = 0.0;
+  Real fine_dx1 = 0.0, fine_dx2 = 0.0;
+  DvceArray2D<int> cloud_target;      // finest virtual cell -> encoded active leaf
+  DvceArray2D<int> cloud_level;       // finest virtual cell -> owner level - root_level
   bool measure_correction = true;
   int ncoarse1 = 0, ncoarse2 = 0;
   int nfine1 = 0, nfine2 = 0;
@@ -114,6 +129,112 @@ struct SMRCompositeTransfer {
     weight[0] = 0.5*SQR(0.5 - offset);
     weight[1] = 0.75 - SQR(offset);
     weight[2] = 0.5*SQR(0.5 + offset);
+  }
+
+  // Cumulative distribution of the unit hat cloud S(s) = max(0, 1-|s|).
+  KOKKOS_INLINE_FUNCTION
+  static Real HatCDF(const Real s) {
+    if (s <= -1.0) return 0.0;
+    if (s >= 1.0) return 1.0;
+    return (s <= 0.0) ? 0.5*SQR(1.0 + s) : 1.0 - 0.5*SQR(1.0 - s);
+  }
+
+  // Exact 1-D integrals of a hat cloud of half-width ell centred at x over the
+  // consecutive virtual cells [i0, i0+count) of spacing dx.  Consecutive CDF
+  // differences telescope, so the weights sum to one for any cell partition.
+  KOKKOS_INLINE_FUNCTION
+  static int CloudWeights1D(const Real x, const Real ell, const Real xmin, const Real dx,
+                            int &i0, Real w[kMaxCloudStencil]) {
+    Real inv_ell = 1.0/ell;
+    i0 = static_cast<int>(floor((x - ell - xmin)/dx));
+    int i1 = static_cast<int>(ceil((x + ell - xmin)/dx));
+    int count = i1 - i0;
+    if (count > kMaxCloudStencil) count = kMaxCloudStencil;
+    Real prev = HatCDF((xmin + i0*dx - x)*inv_ell);
+    for (int a=0; a<count; ++a) {
+      Real next = HatCDF((xmin + (i0 + a + 1)*dx - x)*inv_ell);
+      w[a] = next - prev;
+      prev = next;
+    }
+    return count;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real CloudHalfWidth1(const int lev) const {
+    return root_dx1/static_cast<Real>(1 << lev);
+  }
+  KOKKOS_INLINE_FUNCTION
+  Real CloudHalfWidth2(const int lev) const {
+    return root_dx2/static_cast<Real>(1 << lev);
+  }
+
+  // Cloud-integrated weights on active leaves: the virtual finest cells overlapped by
+  // the support are integrated exactly and forwarded to their owning leaf, so a
+  // coarse leaf receives the sum of its sub-cell integrals (its own exact integral).
+  template <typename Function>
+  KOKKOS_INLINE_FUNCTION
+  void ForEachCloudWeight(const Real particle_x1, const Real particle_x2, const int lev,
+                          const Function &function) const {
+    Real x1 = WrapPosition(particle_x1, x1min, x1max);
+    Real x2 = WrapPosition(particle_x2, x2min, x2max);
+    int i0, j0;
+    Real w1[kMaxCloudStencil], w2[kMaxCloudStencil];
+    int n1 = CloudWeights1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1);
+    int n2 = CloudWeights1D(x2, CloudHalfWidth2(lev), x2min, fine_dx2, j0, w2);
+    for (int b=0; b<n2; ++b) {
+      if (w2[b] == 0.0) continue;
+      int fj = WrapIndex(j0 + b, nfine2);
+      for (int a=0; a<n1; ++a) {
+        Real w = w2[b]*w1[a];
+        if (w == 0.0) continue;
+        function(cloud_target(fj, WrapIndex(i0 + a, nfine1)), w);
+      }
+    }
+  }
+
+  // True when the support of a level-lev cloud, shrunk by slack*ell on each side, lies
+  // entirely on leaves finer than lev, i.e. the particle may be split.
+  KOKKOS_INLINE_FUNCTION
+  bool CloudInsideFiner(const Real particle_x1, const Real particle_x2, const int lev,
+                        const Real slack) const {
+    if (lev >= cloud_nlev) return false;
+    Real x1 = WrapPosition(particle_x1, x1min, x1max);
+    Real x2 = WrapPosition(particle_x2, x2min, x2max);
+    Real r1 = (1.0 - slack)*CloudHalfWidth1(lev);
+    Real r2 = (1.0 - slack)*CloudHalfWidth2(lev);
+    int ia = static_cast<int>(floor((x1 - r1 - x1min)/fine_dx1));
+    int ib = static_cast<int>(ceil((x1 + r1 - x1min)/fine_dx1)) - 1;
+    int ja = static_cast<int>(floor((x2 - r2 - x2min)/fine_dx2));
+    int jb = static_cast<int>(ceil((x2 + r2 - x2min)/fine_dx2)) - 1;
+    for (int fj=ja; fj<=jb; ++fj) {
+      int wj = WrapIndex(fj, nfine2);
+      for (int fi=ia; fi<=ib; ++fi) {
+        if (cloud_level(wj, WrapIndex(fi, nfine1)) <= lev) return false;
+      }
+    }
+    return true;
+  }
+
+  // Encoded active leaf that owns a (wrapped) position; used to assign PGID to
+  // particles created by a split or a merge.
+  KOKKOS_INLINE_FUNCTION
+  int LeafOwner(const Real particle_x1, const Real particle_x2) const {
+    Real x1 = WrapPosition(particle_x1, x1min, x1max);
+    Real x2 = WrapPosition(particle_x2, x2min, x2max);
+    int fi = WrapIndex(static_cast<int>(floor((x1 - x1min)/fine_dx1)), nfine1);
+    int fj = WrapIndex(static_cast<int>(floor((x2 - x2min)/fine_dx2)), nfine2);
+    return cloud_target(fj, fi);
+  }
+
+  template <typename Function>
+  KOKKOS_INLINE_FUNCTION
+  void ForEachWeight(const Real particle_x1, const Real particle_x2, const int lev,
+                     const Function &function) const {
+    if (cloud_mode) {
+      ForEachCloudWeight(particle_x1, particle_x2, lev, function);
+    } else {
+      ForEachWeight(particle_x1, particle_x2, function);
+    }
   }
 
   KOKKOS_INLINE_FUNCTION
@@ -220,7 +341,7 @@ struct SMRCompositeTransfer {
 
 struct DustGasDragTaskIDs {
   // "before_timeintegrator" tasks
-  TaskID gswitch;
+  TaskID gswitch, cloud;
   // "before_stagen" tasks
   TaskID h_irecv, irecvd;
   // "stagen" tasks
@@ -323,6 +444,15 @@ class DustGasDrag {
   unsigned long long hybrid_split_be_cycles = 0;
   DustSMRTransfer smr_transfer_mode = DustSMRTransfer::none;
   SMRCompositeTransfer smr_transfer;
+  // refinable-cloud controls and counters (SplitAndMergeClouds)
+  Real cloud_split_slack = 0.02;      // support test shrinks the cloud by this fraction
+  Real cloud_merge_tolerance = 0.05;  // coincidence radius in finest-cell units
+  int cloud_next_tag = -1;            // next PTAG for created particles (-1 = unset)
+  unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
+  bool UsesCompositeTransfer() const {
+    return (smr_transfer_mode == DustSMRTransfer::smooth_p2 ||
+            smr_transfer_mode == DustSMRTransfer::refinable_cloud);
+  }
   Real drag_rtol, drag_atol;
   int drag_iter_max, drag_diagnostic_interval;
   Real adaptive_order_c, adaptive_rtol_max, adaptive_tref, adaptive_state_floor;
@@ -375,6 +505,9 @@ class DustGasDrag {
   // default particle mass/species/stopping-time initialization (pgen may override)
   void SetDefaultMasses(ParameterInput *pin);
   void BuildSMRCompositeTransfer(ParameterInput *pin);
+  void BuildRefinableCloudTransfer(ParameterInput *pin);
+  void SplitAndMergeClouds();
+  TaskStatus RefineClouds(Driver *pdrive, int stage);
 
   // ...in "before_timeintegrator" list
   TaskStatus GammaSwitch(Driver *pdrive, int stage);

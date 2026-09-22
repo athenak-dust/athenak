@@ -42,6 +42,9 @@ void DustGasDrag::AssembleDustGasDragTasks(
 
   // assemble "before_timeintegrator" task list
   id.gswitch = tl["before_timeintegrator"]->AddTask(&DustGasDrag::GammaSwitch,this,none);
+  // refinable clouds: split particles whose cloud lies on finer leaves before the cycle
+  id.cloud   = tl["before_timeintegrator"]->AddTask(&DustGasDrag::RefineClouds, this,
+                                                    id.gswitch);
 
   // assemble "before_stagen" task list
   id.h_irecv = tl["before_stagen"]->AddTask(&Hydro::InitRecv, phyd, none);
@@ -260,7 +263,7 @@ TaskStatus DustGasDrag::SendUstar(Driver *pdrive, int stage) {
       (coupling == DustCoupling::hybrid &&
        hybrid_mode == HybridMode::split_be && stage == 2);
   if (!ActiveStage(pdrive, stage) || !use) {return TaskStatus::complete;}
-  if (smr_transfer_mode == DustSMRTransfer::smooth_p2) {
+  if (UsesCompositeTransfer()) {
     return TaskStatus::complete;
   }
   if (pmy_pack->pmesh->multilevel) {
@@ -274,7 +277,7 @@ TaskStatus DustGasDrag::RecvUstar(Driver *pdrive, int stage) {
       (coupling == DustCoupling::hybrid &&
        hybrid_mode == HybridMode::split_be && stage == 2);
   if (!ActiveStage(pdrive, stage) || !use) {return TaskStatus::complete;}
-  if (smr_transfer_mode == DustSMRTransfer::smooth_p2) {
+  if (UsesCompositeTransfer()) {
     return TaskStatus::complete;
   }
   TaskStatus status = pbval_us->RecvAndUnpackCC(ustar, cdummy);
