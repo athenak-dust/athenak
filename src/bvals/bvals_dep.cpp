@@ -16,11 +16,17 @@
 //! buffers with a scalar loop over neighbors, exactly as in
 //! MeshBoundaryValuesFC::SumBoundaryFluxes().
 //!
-//! Only same-level (uniform grid) exchanges are supported.
+//! The production exchange remains same-level only. An explicitly enabled,
+//! single-rank, static-2-D-SMR test path maps every deposited ghost-cell density to the
+//! active leaf cells that geometrically overlap it. It preserves the integrated
+//! deposited quantity by applying overlap_volume/receiving_volume. This path is a
+//! diagnostic owner-level transfer, not the exact transpose of AthenaK prolongation.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <utility>
 
 #include "athena.hpp"
@@ -35,11 +41,170 @@
 MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *pin) :
   MeshBoundaryValues(pp, pin, false) {
   if (pp->pmesh->multilevel) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "Additive deposit exchange does not support SMR/AMR"
-              << std::endl;
-    std::exit(EXIT_FAILURE);
+    bool experimental_smr = pin->GetOrAddBoolean(
+        "dust", "experimental_static_smr", false);
+    if (!(experimental_smr && !(pp->pmesh->adaptive) && pp->pmesh->two_d &&
+          pp->pmesh->strictly_periodic && global_variable::nranks == 1)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Additive deposit exchange does not support this "
+                << "SMR/AMR configuration" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    std::string transfer = pin->GetOrAddString(
+        "dust", "experimental_smr_transfer", "smooth_p2");
+    if (transfer.compare("smooth_p2") == 0) {
+      // The composite dust kernels deposit directly into active leaf cells.
+      local_smr_direct_ = true;
+    } else if (transfer.compare("owner_overlap") == 0) {
+      local_smr_remap_ = true;
+      BuildLocalSMRMap();
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Unknown experimental static-SMR deposit transfer"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
   }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void MeshBoundaryValuesDep::BuildLocalSMRMap()
+//! \brief Precompute the active-leaf destinations of every local ghost cell.
+
+void MeshBoundaryValuesDep::BuildLocalSMRMap() {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int nmb = pmy_pack->nmb_thispack;
+  int ncells1 = indcs.nx1 + 2*indcs.ng;
+  int ncells2 = indcs.nx2 + 2*indcs.ng;
+  int ncells3 = 1;
+  smr_target_count_ = DualArray4D<int>("dep_smr_count", nmb, ncells3,
+                                       ncells2, ncells1);
+  smr_target_index_ = DualArray5D<int>("dep_smr_index", nmb, ncells3,
+                                       ncells2, ncells1, max_smr_targets_);
+  smr_target_weight_ = DualArray5D<Real>("dep_smr_weight", nmb, ncells3,
+                                         ncells2, ncells1, max_smr_targets_);
+  Kokkos::deep_copy(smr_target_count_.h_view, 0);
+  Kokkos::deep_copy(smr_target_index_.h_view, -1);
+  Kokkos::deep_copy(smr_target_weight_.h_view, 0.0);
+
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  auto &meshsize = pmy_pack->pmesh->mesh_size;
+  Real lxmesh = meshsize.x1max - meshsize.x1min;
+  Real lymesh = meshsize.x2max - meshsize.x2min;
+
+  for (int m=0; m<nmb; ++m) {
+    const auto &src = mbsize.h_view(m);
+    for (int j=0; j<ncells2; ++j) {
+      for (int i=0; i<ncells1; ++i) {
+        bool active = (i >= indcs.is && i <= indcs.ie &&
+                       j >= indcs.js && j <= indcs.je);
+        if (active) continue;
+
+        Real xlo = src.x1min + static_cast<Real>(i - indcs.is)*src.dx1;
+        Real xhi = xlo + src.dx1;
+        Real ylo = src.x2min + static_cast<Real>(j - indcs.js)*src.dx2;
+        Real yhi = ylo + src.dx2;
+        while (0.5*(xlo + xhi) < meshsize.x1min) {xlo += lxmesh; xhi += lxmesh;}
+        while (0.5*(xlo + xhi) >= meshsize.x1max) {xlo -= lxmesh; xhi -= lxmesh;}
+        while (0.5*(ylo + yhi) < meshsize.x2min) {ylo += lymesh; yhi += lymesh;}
+        while (0.5*(ylo + yhi) >= meshsize.x2max) {ylo -= lymesh; yhi -= lymesh;}
+
+        int ntarget = 0;
+        Real overlap_sum = 0.0;
+        for (int tm=0; tm<nmb; ++tm) {
+          const auto &dst = mbsize.h_view(tm);
+          if (xhi <= dst.x1min || xlo >= dst.x1max ||
+              yhi <= dst.x2min || ylo >= dst.x2max) continue;
+          for (int tj=0; tj<indcs.nx2; ++tj) {
+            Real tylo = dst.x2min + static_cast<Real>(tj)*dst.dx2;
+            Real tyhi = tylo + dst.dx2;
+            Real oy = std::max(0.0, std::min(yhi, tyhi) - std::max(ylo, tylo));
+            if (oy == 0.0) continue;
+            for (int ti=0; ti<indcs.nx1; ++ti) {
+              Real txlo = dst.x1min + static_cast<Real>(ti)*dst.dx1;
+              Real txhi = txlo + dst.dx1;
+              Real ox = std::max(0.0, std::min(xhi, txhi) - std::max(xlo, txlo));
+              Real overlap = ox*oy;
+              Real overlap_tol = 1.0e-12*std::min(src.dx1*src.dx2,
+                                                  dst.dx1*dst.dx2);
+              if (overlap <= overlap_tol) continue;
+              if (ntarget >= max_smr_targets_) {
+                std::cout << "### FATAL ERROR in " << __FILE__ << " at line "
+                          << __LINE__ << std::endl
+                          << "Static-SMR deposit cell overlaps too many leaves" << std::endl;
+                std::exit(EXIT_FAILURE);
+              }
+              int tk = indcs.ks;
+              int tj_full = tj + indcs.js;
+              int ti_full = ti + indcs.is;
+              int encoded = (((tm*ncells3 + tk)*ncells2 + tj_full)*ncells1 + ti_full);
+              smr_target_index_.h_view(m,0,j,i,ntarget) = encoded;
+              smr_target_weight_.h_view(m,0,j,i,ntarget) =
+                  overlap/(dst.dx1*dst.dx2);
+              overlap_sum += overlap;
+              ++ntarget;
+            }
+          }
+        }
+        Real source_volume = src.dx1*src.dx2;
+        if (std::abs(overlap_sum - source_volume) > 1.0e-10*source_volume) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "Static-SMR deposit map does not cover ghost cell: "
+                    << "overlap/source=" << overlap_sum/source_volume << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        smr_target_count_.h_view(m,0,j,i) = ntarget;
+      }
+    }
+  }
+
+  smr_target_count_.template modify<HostMemSpace>();
+  smr_target_count_.template sync<DevExeSpace>();
+  smr_target_index_.template modify<HostMemSpace>();
+  smr_target_index_.template sync<DevExeSpace>();
+  smr_target_weight_.template modify<HostMemSpace>();
+  smr_target_weight_.template sync<DevExeSpace>();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MeshBoundaryValuesDep::RemapLocalSMRDeposit()
+//! \brief Add integrated ghost deposits to overlapping active leaf cells.
+
+TaskStatus MeshBoundaryValuesDep::RemapLocalSMRDeposit(DvceArray5D<Real> &a) {
+  int nmb = pmy_pack->nmb_thispack;
+  int nvar = a.extent_int(1);
+  int ncells3 = a.extent_int(2);
+  int ncells2 = a.extent_int(3);
+  int ncells1 = a.extent_int(4);
+  int ncell = nmb*ncells3*ncells2*ncells1;
+  auto &counts = smr_target_count_;
+  auto &targets = smr_target_index_;
+  auto &weights = smr_target_weight_;
+
+  Kokkos::parallel_for("DepSMRRemap", Kokkos::RangePolicy<>(DevExeSpace(),0,ncell),
+  KOKKOS_LAMBDA(const int idx) {
+    int m = idx/(ncells3*ncells2*ncells1);
+    int remainder = idx - m*(ncells3*ncells2*ncells1);
+    int k = remainder/(ncells2*ncells1);
+    remainder -= k*(ncells2*ncells1);
+    int j = remainder/ncells1;
+    int i = remainder - j*ncells1;
+    int count = counts.d_view(m,k,j,i);
+    for (int t=0; t<count; ++t) {
+      int encoded = targets.d_view(m,k,j,i,t);
+      int ti = encoded % ncells1;
+      encoded /= ncells1;
+      int tj = encoded % ncells2;
+      encoded /= ncells2;
+      int tk = encoded % ncells3;
+      int tm = encoded/ncells3;
+      Real weight = weights.d_view(m,k,j,i,t);
+      for (int v=0; v<nvar; ++v) {
+        Kokkos::atomic_add(&a(tm,v,tk,tj,ti), weight*a(m,v,k,j,i));
+      }
+    }
+  });
+  return TaskStatus::complete;
 }
 
 //----------------------------------------------------------------------------------------
@@ -120,6 +285,9 @@ void MeshBoundaryValuesDep::InitRecvIndices(MeshBoundaryBuffer &buf,
 //! Input array must be a 5D Kokkos View dimensioned (nmb, nvar, nx3, nx2, nx1)
 
 TaskStatus MeshBoundaryValuesDep::PackAndSendDeposit(DvceArray5D<Real> &a) {
+  if (local_smr_direct_) return TaskStatus::complete;
+  if (local_smr_remap_) return RemapLocalSMRDeposit(a);
+
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
@@ -230,6 +398,9 @@ TaskStatus MeshBoundaryValuesDep::PackAndSendDeposit(DvceArray5D<Real> &a) {
 //! concurrent accumulation over buffers would race (cf. SumBoundaryFluxes).
 
 TaskStatus MeshBoundaryValuesDep::RecvAndSumDeposit(DvceArray5D<Real> &a) {
+  if (local_smr_direct_) return TaskStatus::complete;
+  if (local_smr_remap_) return TaskStatus::complete;
+
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;

@@ -176,12 +176,19 @@ TaskStatus DustGasDrag::RecvParticles2(Driver *pdrive, int stage) {
 }
 
 TaskStatus DustGasDrag::ClearParticleSend(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  // PC2 and split-BE deliberately skip particle migration in stage 1.  In an MPI
+  // build their request arrays therefore do not contain requests that may be waited
+  // on during that stage.
+  if (!FirstMigrationActive(pdrive, stage) && !SecondMigrationActive(pdrive, stage)) {
+    return TaskStatus::complete;
+  }
   return pmy_pack->ppart->ClearSend(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::ClearParticleRecv(Driver *pdrive, int stage) {
-  if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
+  if (!FirstMigrationActive(pdrive, stage) && !SecondMigrationActive(pdrive, stage)) {
+    return TaskStatus::complete;
+  }
   return pmy_pack->ppart->ClearRecv(pdrive, stage);
 }
 
@@ -253,6 +260,12 @@ TaskStatus DustGasDrag::SendUstar(Driver *pdrive, int stage) {
       (coupling == DustCoupling::hybrid &&
        hybrid_mode == HybridMode::split_be && stage == 2);
   if (!ActiveStage(pdrive, stage) || !use) {return TaskStatus::complete;}
+  if (smr_transfer_mode == DustSMRTransfer::smooth_p2) {
+    return TaskStatus::complete;
+  }
+  if (pmy_pack->pmesh->multilevel) {
+    pmy_pack->pmesh->pmr->RestrictCC(ustar, cdummy);
+  }
   return pbval_us->PackAndSendCC(ustar, cdummy);
 }
 
@@ -261,7 +274,15 @@ TaskStatus DustGasDrag::RecvUstar(Driver *pdrive, int stage) {
       (coupling == DustCoupling::hybrid &&
        hybrid_mode == HybridMode::split_be && stage == 2);
   if (!ActiveStage(pdrive, stage) || !use) {return TaskStatus::complete;}
-  return pbval_us->RecvAndUnpackCC(ustar, cdummy);
+  if (smr_transfer_mode == DustSMRTransfer::smooth_p2) {
+    return TaskStatus::complete;
+  }
+  TaskStatus status = pbval_us->RecvAndUnpackCC(ustar, cdummy);
+  if (status == TaskStatus::complete && pmy_pack->pmesh->multilevel) {
+    pbval_us->FillCoarseInBndryCC(ustar, cdummy);
+    pbval_us->ProlongateCC(ustar, cdummy);
+  }
+  return status;
 }
 
 TaskStatus DustGasDrag::SendUstarShr(Driver *pdrive, int stage) {

@@ -54,6 +54,63 @@ namespace {
 
 // mode parameters cached for the history function
 Real kx_ = 0.0, kz_ = 0.0, rho0_ = 1.0;
+bool snapshots_ = false;
+int snapshot_number_ = 0;
+std::string snapshot_basename_;
+
+// Opt-in, single-rank diagnostic output at the history cadence. Native binary and
+// particle-VTK output round to float, which erases the small LinA perturbations.
+// Header: ASCII magic, then time/cycle/ncell/nparticle. Payload: native-endian f64
+// cell rows [x,z,dx,dz,rho,mx,mz,mphi], then particle rows [x,z,m,vx,vz,vphi,tag].
+void WriteStreamingSnapshot(Mesh *pm) {
+  auto *pack = pm->pmb_pack;
+  auto &ind = pm->mb_indcs;
+  auto gas = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pack->phydro->u0);
+  auto pr = Kokkos::create_mirror_view_and_copy(HostMemSpace(),
+                                               pack->ppart->prtcl_rdata);
+  auto pi = Kokkos::create_mirror_view_and_copy(HostMemSpace(),
+                                               pack->ppart->prtcl_idata);
+  int ncell = pack->nmb_thispack*ind.nx1*ind.nx2;
+  int npart = pack->ppart->nprtcl_thispack;
+  std::vector<double> cells;
+  std::vector<double> particles;
+  cells.reserve(8*ncell);
+  particles.reserve(7*npart);
+  for (int m=0; m<pack->nmb_thispack; ++m) {
+    const auto &size = pack->pmb->mb_size.h_view(m);
+    for (int j=ind.js; j<=ind.je; ++j) {
+      for (int i=ind.is; i<=ind.ie; ++i) {
+        cells.insert(cells.end(), {size.x1min + (i-ind.is+0.5)*size.dx1,
+            size.x2min + (j-ind.js+0.5)*size.dx2, size.dx1, size.dx2,
+            gas(m,IDN,ind.ks,j,i), gas(m,IM1,ind.ks,j,i),
+            gas(m,IM2,ind.ks,j,i), gas(m,IM3,ind.ks,j,i)});
+      }
+    }
+  }
+  for (int p=0; p<npart; ++p) {
+    particles.insert(particles.end(), {pr(IPX,p), pr(IPY,p), pr(IPM,p),
+        pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p), static_cast<double>(pi(PTAG,p))});
+  }
+  char number[32];
+  std::snprintf(number, sizeof(number), ".%05d.lina", snapshot_number_++);
+  std::string filename = snapshot_basename_ + number;
+  FILE *file = std::fopen(filename.c_str(), "wb");
+  if (file == nullptr) {
+    std::cerr << "Cannot open LinA snapshot " << filename << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  bool ok = std::fprintf(file, "AthenaK LinA snapshot v1 f64-native\n"
+      "%.17g %d %d %d\n", pm->time, pm->ncycle, ncell, npart) > 0;
+  ok = (std::fwrite(cells.data(), sizeof(double), cells.size(), file)
+        == cells.size()) && ok;
+  ok = (std::fwrite(particles.data(), sizeof(double), particles.size(), file)
+        == particles.size()) && ok;
+  ok = (std::fclose(file) == 0) && ok;
+  if (!ok) {
+    std::cerr << "Failed writing LinA snapshot " << filename << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn SolveNSH2
@@ -105,6 +162,17 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   kx_ = pin->GetReal("problem","kx");
   kz_ = pin->GetReal("problem","kz");
   rho0_ = pin->GetOrAddReal("problem","rho0",1.0);
+  snapshots_ = pin->GetOrAddBoolean("problem", "double_precision_snapshots", false);
+  if (snapshots_) {
+    if (restart || global_variable::nranks != 1 ||
+        !pin->GetOrAddBoolean("problem", "user_hist", false)) {
+      std::cerr << "LinA snapshots require a fresh, single-rank run with user_hist=true"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    snapshot_basename_ = pin->GetString("job", "basename");
+    snapshot_number_ = 0;
+  }
   if (restart) return;
 
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
@@ -325,5 +393,6 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
   pdata->hdata[3] = gim;
   pdata->hdata[4] = mre;
   pdata->hdata[5] = mim;
+  if (snapshots_) WriteStreamingSnapshot(pm);
   return;
 }

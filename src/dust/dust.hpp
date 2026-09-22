@@ -56,6 +56,164 @@ enum class DustCoupling {imex=0, hybrid=1};
 enum class HybridMode {pc2=0, split_be=1};
 enum class HybridForceMode {automatic=0, pc2=1, split_be=2};
 
+// Experimental transfer choices on the narrowly supported static-SMR path. The
+// owner_overlap choice is retained only as a negative control.
+enum class DustSMRTransfer {none=0, owner_overlap=1, smooth_p2=2};
+
+// Device-copyable description of the smooth composite transfer. Each virtual coarse
+// or fine cell stores a short linear map to active leaf-cell degrees of freedom. The
+// same ForEachWeight() traversal is consumed by every gather and deposit operation.
+struct SMRCompositeTransfer {
+  bool enabled = false;
+  bool measure_correction = true;
+  int ncoarse1 = 0, ncoarse2 = 0;
+  int nfine1 = 0, nfine2 = 0;
+  int nfine_blocks = 0;
+  int correction_tiles = 0;
+  Real x1min = 0.0, x1max = 0.0;
+  Real x2min = 0.0, x2max = 0.0;
+  Real transition_width = 0.0;
+  Real interface_x1[2] = {0.0, 0.0};
+  Real interface_coarse_sign[2] = {0.0, 0.0};
+  DvceArray2D<int> coarse_count;
+  DvceArray3D<int> coarse_target;
+  DvceArray3D<Real> coarse_weight;
+  DvceArray2D<int> fine_count;
+  DvceArray3D<int> fine_target;
+  DvceArray3D<Real> fine_weight;
+  DvceArray2D<Real> fine_block_bounds;
+  DvceArray1D<int> correction_count;
+  DvceArray2D<int> correction_target;
+  DvceArray2D<Real> correction_weight;
+
+  KOKKOS_INLINE_FUNCTION
+  static int WrapIndex(const int index, const int extent) {
+    int wrapped = index % extent;
+    return (wrapped < 0) ? wrapped + extent : wrapped;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  static Real WrapPosition(const Real x, const Real xmin, const Real xmax) {
+    Real length = xmax - xmin;
+    Real wrapped = x;
+    while (wrapped < xmin) wrapped += length;
+    while (wrapped >= xmax) wrapped -= length;
+    return wrapped;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  static void VirtualTSC(const Real x, const Real xmin, const Real xmax, const int ncells,
+                         int index[3], Real weight[3]) {
+    Real dx = (xmax - xmin)/static_cast<Real>(ncells);
+    Real coordinate = (x - xmin)/dx - 0.5;
+    int nearest = static_cast<int>(floor(coordinate + 0.5));
+    Real offset = coordinate - static_cast<Real>(nearest);
+    index[0] = WrapIndex(nearest - 1, ncells);
+    index[1] = WrapIndex(nearest,     ncells);
+    index[2] = WrapIndex(nearest + 1, ncells);
+    weight[0] = 0.5*SQR(0.5 - offset);
+    weight[1] = 0.75 - SQR(offset);
+    weight[2] = 0.5*SQR(0.5 + offset);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  Real FineFraction(const Real particle_x1, const Real particle_x2) const {
+    Real x1 = WrapPosition(particle_x1, x1min, x1max);
+    Real x2 = WrapPosition(particle_x2, x2min, x2max);
+    Real length1 = x1max - x1min;
+    Real length2 = x2max - x2min;
+    Real minimum_distance = 1.0e30;
+    for (int block=0; block<nfine_blocks; ++block) {
+      for (int shift2=-1; shift2<=1; ++shift2) {
+        Real lower2 = fine_block_bounds(block,2) + shift2*length2;
+        Real upper2 = fine_block_bounds(block,3) + shift2*length2;
+        Real distance2 = (x2 < lower2) ? lower2 - x2
+                       : ((x2 > upper2) ? x2 - upper2 : 0.0);
+        for (int shift1=-1; shift1<=1; ++shift1) {
+          Real lower1 = fine_block_bounds(block,0) + shift1*length1;
+          Real upper1 = fine_block_bounds(block,1) + shift1*length1;
+          Real distance1 = (x1 < lower1) ? lower1 - x1
+                         : ((x1 > upper1) ? x1 - upper1 : 0.0);
+          Real distance = sqrt(SQR(distance1) + SQR(distance2));
+          minimum_distance = fmin(minimum_distance, distance);
+        }
+      }
+    }
+    if (minimum_distance <= 0.0) return 1.0;
+    Real s = fmax(0.0, 1.0 - minimum_distance/transition_width);
+    // Quintic smoothstep: alpha, alpha', and alpha'' match at both band edges.
+    return s*s*s*(10.0 + s*(-15.0 + 6.0*s));
+  }
+
+  template <typename Function>
+  KOKKOS_INLINE_FUNCTION
+  void ForEachWeight(const Real particle_x1, const Real particle_x2,
+                     const Function &function) const {
+    Real x1 = WrapPosition(particle_x1, x1min, x1max);
+    Real x2 = WrapPosition(particle_x2, x2min, x2max);
+    Real alpha = FineFraction(x1, x2);
+    int index1[3], index2[3];
+    Real weight1[3], weight2[3];
+
+    VirtualTSC(x1, x1min, x1max, ncoarse1, index1, weight1);
+    VirtualTSC(x2, x2min, x2max, ncoarse2, index2, weight2);
+    Real coarse_fraction = 1.0 - alpha;
+    for (int b=0; b<3; ++b) {
+      for (int a=0; a<3; ++a) {
+        Real virtual_weight = coarse_fraction*weight2[b]*weight1[a];
+        int count = coarse_count(index2[b], index1[a]);
+        for (int entry=0; entry<count; ++entry) {
+          function(coarse_target(index2[b],index1[a],entry),
+                   virtual_weight*coarse_weight(index2[b],index1[a],entry));
+        }
+      }
+    }
+
+    VirtualTSC(x1, x1min, x1max, nfine1, index1, weight1);
+    VirtualTSC(x2, x2min, x2max, nfine2, index2, weight2);
+    for (int b=0; b<3; ++b) {
+      for (int a=0; a<3; ++a) {
+        Real virtual_weight = alpha*weight2[b]*weight1[a];
+        int count = fine_count(index2[b], index1[a]);
+        for (int entry=0; entry<count; ++entry) {
+          function(fine_target(index2[b],index1[a],entry),
+                   virtual_weight*fine_weight(index2[b],index1[a],entry));
+        }
+      }
+    }
+
+    if (!measure_correction) return;
+
+    // Measure-preserving correction. Each interface/y-tile defect is the integral of
+    // the raw blended row relative to G_H. The normalized compact profiles integrate
+    // to one, so subtracting them restores every active-leaf column integral while
+    // retaining the tile defect's zero zeroth and first moments.
+    Real domain_length1 = x1max - x1min;
+    Real coarse_dx2 = (x2max - x2min)/static_cast<Real>(ncoarse2);
+    int yindex[3];
+    Real yweight[3];
+    VirtualTSC(x2, x2min, x2max, ncoarse2, yindex, yweight);
+    for (int interface=0; interface<2; ++interface) {
+      Real offset = x1 - interface_x1[interface];
+      if (offset < -0.5*domain_length1) offset += domain_length1;
+      if (offset >= 0.5*domain_length1) offset -= domain_length1;
+      Real distance = interface_coarse_sign[interface]*offset;
+      if (!(distance > 0.0 && distance < transition_width)) continue;
+      Real s = distance/transition_width;
+      Real profile1 = 140.0*s*s*s*SQR(1.0-s)*(1.0-s)/transition_width;
+      for (int b=0; b<3; ++b) {
+        int tile = interface*ncoarse2 + yindex[b];
+        Real profile = profile1*yweight[b]/coarse_dx2;
+        int count = correction_count(tile);
+        for (int entry=0; entry<count; ++entry) {
+          function(correction_target(tile,entry),
+                   -profile*correction_weight(tile,entry));
+        }
+      }
+    }
+  }
+};
+
 //----------------------------------------------------------------------------------------
 //! \struct DustGasDragTaskIDs
 //  \brief container to hold TaskIDs of all dust+hydro tasks
@@ -163,6 +321,8 @@ class DustGasDrag {
   bool hybrid_have_metric = false;
   unsigned long long hybrid_pc2_cycles = 0;
   unsigned long long hybrid_split_be_cycles = 0;
+  DustSMRTransfer smr_transfer_mode = DustSMRTransfer::none;
+  SMRCompositeTransfer smr_transfer;
   Real drag_rtol, drag_atol;
   int drag_iter_max, drag_diagnostic_interval;
   Real adaptive_order_c, adaptive_rtol_max, adaptive_tref, adaptive_state_floor;
@@ -214,6 +374,7 @@ class DustGasDrag {
   Real DragStep(Driver *pdrive) const;
   // default particle mass/species/stopping-time initialization (pgen may override)
   void SetDefaultMasses(ParameterInput *pin);
+  void BuildSMRCompositeTransfer(ParameterInput *pin);
 
   // ...in "before_timeintegrator" list
   TaskStatus GammaSwitch(Driver *pdrive, int stage);

@@ -69,6 +69,46 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
     auto &uold = pmy_pack->phydro->u1;
     auto &qdep_ = qdep;
 
+    if (smr_transfer_mode == DustSMRTransfer::smooth_p2) {
+      auto transfer = smr_transfer;
+      int ncells1 = qdep.extent_int(4);
+      int ncells2 = qdep.extent_int(3);
+      par_for("dust_pc2_composite_predictor",DevExeSpace(),0,(npart-1),
+      KOKKOS_LAMBDA(const int p) {
+        Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
+        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p),
+        [&](const int target, const Real particle_weight) {
+          int ti = target % ncells1;
+          int remainder = target/ncells1;
+          int tj = remainder % ncells2;
+          int tm = remainder/ncells2;
+          Real invrho = 1.0/uold(tm,IDN,ks,tj,ti);
+          ugx += particle_weight*uold(tm,IM1,ks,tj,ti)*invrho;
+          ugy += particle_weight*uold(tm,IM2,ks,tj,ti)*invrho;
+          ugz += particle_weight*uold(tm,IM3,ks,tj,ti)*invrho;
+        });
+
+        Real mass_rate = pr(IPM,p)/pr(IPTS,p);
+        Real gx = -dt*mass_rate*(ugx-pr(IPVX,p));
+        Real gy = -dt*mass_rate*(ugy-pr(IPVY,p));
+        Real gz = -dt*mass_rate*(ugz-pr(IPVZ,p));
+        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p),
+        [&](const int target, const Real particle_weight) {
+          int ti = target % ncells1;
+          int remainder = target/ncells1;
+          int tj = remainder % ncells2;
+          int tm = remainder/ncells2;
+          Real volume = mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2;
+          Real density_weight = particle_weight/volume;
+          DepositAdd(&qdep_(tm,1,ks,tj,ti), density_weight*gx);
+          DepositAdd(&qdep_(tm,2,ks,tj,ti), density_weight*gy);
+          DepositAdd(&qdep_(tm,3,ks,tj,ti), density_weight*gz);
+          DepositAdd(&qdep_(tm,4,ks,tj,ti), density_weight*mass_rate);
+        });
+      });
+      return TaskStatus::complete;
+    }
+
     par_for("dust_pc2_predictor",DevExeSpace(),0,(npart-1),
     KOKKOS_LAMBDA(const int p) {
       int m = pi(PGID,p) - gids;
@@ -141,6 +181,32 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   int scheme = static_cast<int>(deposit);
   Real a_dt = DragStep(pdrive);
   auto &qdep_ = qdep;
+
+  if (smr_transfer_mode == DustSMRTransfer::smooth_p2) {
+    auto transfer = smr_transfer;
+    int ncells1 = qdep.extent_int(4);
+    int ncells2 = qdep.extent_int(3);
+    par_for("dust_composite_scatter",DevExeSpace(),0,(npart-1),
+    KOKKOS_LAMBDA(const int p) {
+      Real cj = a_dt/(pr(IPTS,p) + a_dt);
+      Real mass_c = pr(IPM,p)*cj;
+      Real vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
+      transfer.ForEachWeight(pr(IPX,p), pr(IPY,p),
+      [&](const int target, const Real particle_weight) {
+        int ti = target % ncells1;
+        int remainder = target/ncells1;
+        int tj = remainder % ncells2;
+        int tm = remainder/ncells2;
+        Real receiving_volume = mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2;
+        Real density_weight = mass_c*particle_weight/receiving_volume;
+        DepositAdd(&qdep_(tm,0,ks,tj,ti), density_weight);
+        DepositAdd(&qdep_(tm,1,ks,tj,ti), density_weight*vx);
+        DepositAdd(&qdep_(tm,2,ks,tj,ti), density_weight*vy);
+        DepositAdd(&qdep_(tm,3,ks,tj,ti), density_weight*vz);
+      });
+    });
+    return TaskStatus::complete;
+  }
 
   par_for("dust_scatter",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
@@ -352,6 +418,60 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
   Real qo = qshear*omega0;
   auto &ustar_ = ustar;
   auto &dmom_ = dmom;
+
+  if (smr_transfer_mode == DustSMRTransfer::smooth_p2) {
+    auto transfer = smr_transfer;
+    int ncells1 = ustar.extent_int(4);
+    int ncells2 = ustar.extent_int(3);
+    par_for("dust_composite_gather",DevExeSpace(),0,(npart-1),
+    KOKKOS_LAMBDA(const int p) {
+      Real x0 = pr(IPX,p), y0 = pr(IPY,p);
+      Real ux = 0.0, uy = 0.0, uz = 0.0;
+      transfer.ForEachWeight(x0, y0,
+      [&](const int target, const Real particle_weight) {
+        int ti = target % ncells1;
+        int remainder = target/ncells1;
+        int tj = remainder % ncells2;
+        int tm = remainder/ncells2;
+        ux += particle_weight*ustar_(tm,0,ks,tj,ti);
+        uy += particle_weight*ustar_(tm,1,ks,tj,ti);
+        uz += particle_weight*ustar_(tm,2,ks,tj,ti);
+      });
+
+      Real cj = a_dt/(pr(IPTS,p) + a_dt);
+      Real dvx = cj*(ux - pr(IPVX,p));
+      Real dvy = cj*(uy - pr(IPVY,p));
+      Real dvz = cj*(uz - pr(IPVZ,p));
+      pr(IPVX,p) += dvx;
+      pr(IPVY,p) += dvy;
+      pr(IPVZ,p) += dvz;
+      pr(IPRX,p) = dvx/a_dt;
+      pr(IPRY,p) = dvy/a_dt;
+      pr(IPRZ,p) = dvz/a_dt;
+
+      if (br) {
+        Real mass = -pr(IPM,p);
+        transfer.ForEachWeight(x0, y0,
+        [&](const int target, const Real particle_weight) {
+          int ti = target % ncells1;
+          int remainder = target/ncells1;
+          int tj = remainder % ncells2;
+          int tm = remainder/ncells2;
+          Real receiving_volume = mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2;
+          Real density_weight = mass*particle_weight/receiving_volume;
+          DepositAdd(&dmom_(tm,0,ks,tj,ti), density_weight*dvx);
+          DepositAdd(&dmom_(tm,1,ks,tj,ti), density_weight*dvy);
+          DepositAdd(&dmom_(tm,2,ks,tj,ti), density_weight*dvz);
+        });
+      }
+      if (split_be) {
+        pr(IPX,p) += dt*pr(IPVX,p);
+        pr(IPY,p) += dt*(pr(IPVY,p) - (shear3d ? qo*x0 : 0.0));
+        if (three_d) pr(IPZ,p) += dt*pr(IPVZ,p);
+      }
+    });
+    return TaskStatus::complete;
+  }
 
   par_for("dust_gather",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;

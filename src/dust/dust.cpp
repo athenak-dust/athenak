@@ -91,9 +91,17 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     std::exit(EXIT_FAILURE);
   }
   if (pmy_pack->pmesh->multilevel) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Dust drag does not support SMR/AMR" << std::endl;
-    std::exit(EXIT_FAILURE);
+    bool experimental_smr = pin->GetOrAddBoolean(
+        "dust", "experimental_static_smr", false);
+    if (!(experimental_smr && !(pmy_pack->pmesh->adaptive) &&
+          pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic &&
+          global_variable::nranks == 1)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Dust drag does not support SMR/AMR. The current "
+                << "experimental exception requires explicit opt-in, static 2-D SMR, "
+                << "ordinary periodic boundaries, and one MPI rank" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
   }
   bool shear_x1 = (pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] ==
                    BoundaryFlag::shear_periodic);
@@ -199,6 +207,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
               << "drag_solver=local, dc1, or pcg" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  if (pmy_pack->pmesh->multilevel && drag_solver != DustDragSolver::local) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Experimental static-SMR dust currently supports only "
+              << "drag_solver=local; coupled solvers require a certified adjoint "
+              << "composite transfer" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   drag_rtol = pin->GetOrAddReal("dust", "drag_rtol", 1.0e-11);
   drag_atol = pin->GetOrAddReal("dust", "drag_atol", 1.0e-14);
   drag_iter_max = pin->GetOrAddInteger("dust", "drag_iter_max", 200);
@@ -288,6 +303,27 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       std::exit(EXIT_FAILURE);
     }
   }
+  if (pmy_pack->pmesh->multilevel) {
+    std::string transfer = pin->GetOrAddString(
+        "dust", "experimental_smr_transfer", "smooth_p2");
+    if (transfer.compare("owner_overlap") == 0) {
+      smr_transfer_mode = DustSMRTransfer::owner_overlap;
+    } else if (transfer.compare("smooth_p2") == 0) {
+      smr_transfer_mode = DustSMRTransfer::smooth_p2;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<dust>/experimental_smr_transfer = '" << transfer
+                << "' not recognized (must be owner_overlap or smooth_p2)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (smr_transfer_mode == DustSMRTransfer::smooth_p2 &&
+        deposit != DustDeposit::tsc) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "experimental_smr_transfer=smooth_p2 currently "
+                << "requires <dust>/deposit=tsc" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
 
   // shearing box parameters (must match those read by the ShearingBox constructor)
   is_shearing_box = pin->DoesBlockExist("shearing_box");
@@ -320,6 +356,32 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   if (drag_solver == DustDragSolver::pcg || drag_solver == DustDragSolver::adaptive) {
     Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
     Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
+  }
+  if (pmy_pack->pmesh->multilevel) {
+    if (smr_transfer_mode == DustSMRTransfer::owner_overlap) {
+      int nccells1 = indcs.cnx1 + 2*(indcs.ng);
+      int nccells2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*(indcs.ng)) : 1;
+      int nccells3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*(indcs.ng)) : 1;
+      Kokkos::realloc(cdummy, nmb, 3, nccells3, nccells2, nccells1);
+      if (global_variable::my_rank == 0) {
+        std::cout << "# WARNING (dust): experimental static-SMR owner_overlap transfer "
+                  << "is enabled only as a negative control; it is not a certified "
+                  << "gather/deposit adjoint" << std::endl;
+      }
+    } else {
+      BuildSMRCompositeTransfer(pin);
+      if (global_variable::my_rank == 0) {
+        std::cout << "# WARNING (dust): experimental static-SMR smooth_p2 transfer is "
+                  << "enabled. Gather and deposition share one composite leaf stencil. ";
+        if (smr_transfer.measure_correction) {
+          std::cout << "The construction-time uniform-loading audit passed, but SI "
+                    << "convergence is not certified" << std::endl;
+        } else {
+          std::cout << "The raw blend has a known uniform-loading defect and is for "
+                    << "diagnostics only" << std::endl;
+        }
+      }
+    }
   }
   if (drag_solver != DustDragSolver::local) {
     Kokkos::realloc(solver_ap, nmb, 3, ncells3, ncells2, ncells1);

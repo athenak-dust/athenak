@@ -237,7 +237,8 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
 //  \brief Derived class implementing an ADDITIVE ghost-zone exchange for cell-centered
 //  fields built by particle deposition: ghost-cell deposits are packed and *added* into
 //  the overlapping active cells of the neighboring MeshBlock (the reverse data flow of
-//  the ordinary copy exchange). Uniform grids only.
+//  the ordinary copy exchange). The experimental single-rank static-SMR path remaps
+//  ghost-cell densities by geometric overlap and receiving-cell volume.
 
 class MeshBoundaryValuesDep : public MeshBoundaryValues {
  public:
@@ -251,6 +252,18 @@ class MeshBoundaryValuesDep : public MeshBoundaryValues {
   // pack ghost-region deposits and send; receive and sum into active cells
   TaskStatus PackAndSendDeposit(DvceArray5D<Real> &a);
   TaskStatus RecvAndSumDeposit(DvceArray5D<Real> &a);
+  // Public because CUDA extended lambdas cannot be enclosed by a private member.
+  TaskStatus RemapLocalSMRDeposit(DvceArray5D<Real> &a);
+
+ private:
+  static constexpr int max_smr_targets_ = 8;
+  bool local_smr_remap_ = false;
+  bool local_smr_direct_ = false;
+  DualArray4D<int> smr_target_count_;
+  DualArray5D<int> smr_target_index_;
+  DualArray5D<Real> smr_target_weight_;
+
+  void BuildLocalSMRMap();
 };
 
 //----------------------------------------------------------------------------------------

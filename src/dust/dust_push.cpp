@@ -115,6 +115,10 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
     auto &mbsize = pmy_pack->pmb->mb_size;
     auto gids = pmy_pack->gids;
     int scheme = static_cast<int>(deposit);
+    bool composite_smr = (smr_transfer_mode == DustSMRTransfer::smooth_p2);
+    auto transfer = smr_transfer;
+    int ncells1 = dmom.extent_int(4);
+    int ncells2 = dmom.extent_int(3);
 
     if (hybrid_mode == HybridMode::pc2) {
       if (br) Kokkos::deep_copy(DevExeSpace(), dmom, 0.0);
@@ -134,30 +138,45 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
 
         int ip, jp, kp;
         Real wx[3], wy[3], wz[3];
-        PMWeights(xh, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
-                  scheme, ip, wx);
-        PMWeights(yh, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
-                  scheme, jp, wy);
-        if (three_d) {
-          PMWeights(zh, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
-                    scheme, kp, wz);
-        } else {
-          kp = ks;
-          wz[0] = 0.0; wz[1] = 1.0; wz[2] = 0.0;
+        if (!composite_smr) {
+          PMWeights(xh, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
+                    scheme, ip, wx);
+          PMWeights(yh, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
+                    scheme, jp, wy);
+          if (three_d) {
+            PMWeights(zh, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
+                      scheme, kp, wz);
+          } else {
+            kp = ks;
+            wz[0] = 0.0; wz[1] = 1.0; wz[2] = 0.0;
+          }
         }
 
         Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
         int clo = three_d ? 0 : 1, chi = three_d ? 2 : 1;
-        for (int c=clo; c<=chi; ++c) {
-          for (int b=0; b<3; ++b) {
-            Real wcb = wz[c]*wy[b];
-            if (wcb == 0.0) continue;
-            for (int a=0; a<3; ++a) {
-              Real w = wcb*wx[a];
-              int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
-              ugx += w*ustar_(m,0,kk,jj,ii);
-              ugy += w*ustar_(m,1,kk,jj,ii);
-              ugz += w*ustar_(m,2,kk,jj,ii);
+        if (composite_smr) {
+          transfer.ForEachWeight(xh, yh,
+          [&](const int target, const Real particle_weight) {
+            int ti = target % ncells1;
+            int remainder = target/ncells1;
+            int tj = remainder % ncells2;
+            int tm = remainder/ncells2;
+            ugx += particle_weight*ustar_(tm,0,ks,tj,ti);
+            ugy += particle_weight*ustar_(tm,1,ks,tj,ti);
+            ugz += particle_weight*ustar_(tm,2,ks,tj,ti);
+          });
+        } else {
+          for (int c=clo; c<=chi; ++c) {
+            for (int b=0; b<3; ++b) {
+              Real wcb = wz[c]*wy[b];
+              if (wcb == 0.0) continue;
+              for (int a=0; a<3; ++a) {
+                Real w = wcb*wx[a];
+                int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
+                ugx += w*ustar_(m,0,kk,jj,ii);
+                ugy += w*ustar_(m,1,kk,jj,ii);
+                ugz += w*ustar_(m,2,kk,jj,ii);
+              }
             }
           }
         }
@@ -211,19 +230,35 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         pr(IPRZ,p) = dvz_drag;
 
         if (br) {
-          Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
-          if (three_d) vol *= mbsize.d_view(m).dx3;
-          Real fac = -pr(IPM,p)/vol;
-          for (int c=clo; c<=chi; ++c) {
-            for (int b=0; b<3; ++b) {
-              Real wcb = wz[c]*wy[b]*fac;
-              if (wcb == 0.0) continue;
-              for (int a=0; a<3; ++a) {
-                Real w = wcb*wx[a];
-                int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
-                DepositAdd(&dmom_(m,0,kk,jj,ii), w*dvx_drag);
-                DepositAdd(&dmom_(m,1,kk,jj,ii), w*dvy_drag);
-                DepositAdd(&dmom_(m,2,kk,jj,ii), w*dvz_drag);
+          if (composite_smr) {
+            Real mass = -pr(IPM,p);
+            transfer.ForEachWeight(xh, yh,
+            [&](const int target, const Real particle_weight) {
+              int ti = target % ncells1;
+              int remainder = target/ncells1;
+              int tj = remainder % ncells2;
+              int tm = remainder/ncells2;
+              Real volume = mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2;
+              Real density_weight = mass*particle_weight/volume;
+              DepositAdd(&dmom_(tm,0,ks,tj,ti), density_weight*dvx_drag);
+              DepositAdd(&dmom_(tm,1,ks,tj,ti), density_weight*dvy_drag);
+              DepositAdd(&dmom_(tm,2,ks,tj,ti), density_weight*dvz_drag);
+            });
+          } else {
+            Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+            if (three_d) vol *= mbsize.d_view(m).dx3;
+            Real fac = -pr(IPM,p)/vol;
+            for (int c=clo; c<=chi; ++c) {
+              for (int b=0; b<3; ++b) {
+                Real wcb = wz[c]*wy[b]*fac;
+                if (wcb == 0.0) continue;
+                for (int a=0; a<3; ++a) {
+                  Real w = wcb*wx[a];
+                  int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
+                  DepositAdd(&dmom_(m,0,kk,jj,ii), w*dvx_drag);
+                  DepositAdd(&dmom_(m,1,kk,jj,ii), w*dvy_drag);
+                  DepositAdd(&dmom_(m,2,kk,jj,ii), w*dvz_drag);
+                }
               }
             }
           }
@@ -253,6 +288,26 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         pr(IPX,p) = x0; pr(IPY,p) = y0; pr(IPZ,p) = z0;
 
         if (!br) return;
+        if (composite_smr) {
+          Real cj = dt/(pr(IPTS,p) + dt);
+          Real mass_c = pr(IPM,p)*cj;
+          Real mass_rate = pr(IPM,p)/pr(IPTS,p);
+          transfer.ForEachWeight(x0, y0,
+          [&](const int target, const Real particle_weight) {
+            int ti = target % ncells1;
+            int remainder = target/ncells1;
+            int tj = remainder % ncells2;
+            int tm = remainder/ncells2;
+            Real volume = mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2;
+            Real density_weight = particle_weight/volume;
+            DepositAdd(&qdep_(tm,0,ks,tj,ti), density_weight*mass_c);
+            DepositAdd(&qdep_(tm,1,ks,tj,ti), density_weight*mass_c*pr(IPVX,p));
+            DepositAdd(&qdep_(tm,2,ks,tj,ti), density_weight*mass_c*pr(IPVY,p));
+            DepositAdd(&qdep_(tm,3,ks,tj,ti), density_weight*mass_c*pr(IPVZ,p));
+            DepositAdd(&qdep_(tm,4,ks,tj,ti), density_weight*mass_rate);
+          });
+          return;
+        }
         int m = pi(PGID,p) - gids;
         int ip, jp, kp;
         Real wx[3], wy[3], wz[3];

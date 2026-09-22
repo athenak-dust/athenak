@@ -177,12 +177,26 @@ Mesh::Mesh(ParameterInput *pin) :
   multilevel = (adaptive || pin->GetString("mesh_refinement","refinement") == "static")
     ?  true : false;
 
-  // FIXME: The shearing box is not currently compatible with SMR/AMR
+  // The 2-D r-z shearing-box equations use only local source terms when all mesh
+  // boundaries are ordinary periodic boundaries. Permit that narrow configuration
+  // only as part of the explicitly enabled experimental static-SMR dust test. In
+  // particular, a non-dust input retains the original fail-closed behavior.
   if (multilevel && pin->DoesBlockExist("shearing_box")) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-        << "Shearing box is not currently compatible with mesh refinement"
-        << std::endl;
-    std::exit(EXIT_FAILURE);
+    bool experimental_dust_smr = pin->DoesBlockExist("dust") &&
+        pin->GetOrAddBoolean("dust", "experimental_static_smr", false);
+    if (!(experimental_dust_smr && !adaptive && two_d && strictly_periodic &&
+          global_variable::nranks == 1)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Shearing box is not currently compatible with mesh "
+                << "refinement, except the explicitly enabled experimental dust "
+                << "configuration with static 2-D SMR, ordinary periodic boundaries, "
+                << "and one MPI rank" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (global_variable::my_rank == 0) {
+      std::cout << "# WARNING (mesh): experimental static SMR with the 2-D r-z "
+                << "shearing-box source terms is enabled" << std::endl;
+    }
   }
 
   // error check physical size of mesh (root level) from input file.
