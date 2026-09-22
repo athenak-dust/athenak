@@ -358,7 +358,9 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     pmy_mesh_->nprtcl_thisrank = nlattice;
     pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = nlattice;
     pmy_mesh_->nprtcl_total = nlattice;
-    pmbp->pdust->SplitAndMergeClouds();
+    // one pass per refinement level: children of the first pass may lie inside a
+    // still finer region
+    while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
     if (global_variable::my_rank == 0) {
       std::cout << "# refinable_cloud lattice: " << nlattice << " root clouds -> "
                 << ppar->nprtcl_thispack << " particles after the initial split"

@@ -76,6 +76,8 @@ struct SMRCompositeTransfer {
   bool enabled = false;
   bool cloud_mode = false;
   int cloud_nlev = 0;                 // max_level - root_level
+  int cloud_max_level = 0;            // clouds are never split beyond this level
+  bool cloud_split_everywhere = false; // control: split regardless of the local mesh
   Real root_dx1 = 0.0, root_dx2 = 0.0;
   Real fine_dx1 = 0.0, fine_dx2 = 0.0;
   DvceArray2D<int> cloud_target;      // finest virtual cell -> encoded active leaf
@@ -197,7 +199,8 @@ struct SMRCompositeTransfer {
   KOKKOS_INLINE_FUNCTION
   bool CloudInsideFiner(const Real particle_x1, const Real particle_x2, const int lev,
                         const Real slack) const {
-    if (lev >= cloud_nlev) return false;
+    if (lev >= cloud_nlev || lev >= cloud_max_level) return false;
+    if (cloud_split_everywhere) return true;
     Real x1 = WrapPosition(particle_x1, x1min, x1max);
     Real x2 = WrapPosition(particle_x2, x2min, x2max);
     Real r1 = (1.0 - slack)*CloudHalfWidth1(lev);
@@ -506,7 +509,7 @@ class DustGasDrag {
   void SetDefaultMasses(ParameterInput *pin);
   void BuildSMRCompositeTransfer(ParameterInput *pin);
   void BuildRefinableCloudTransfer(ParameterInput *pin);
-  void SplitAndMergeClouds();
+  int SplitAndMergeClouds();   // returns the number of clouds split
   TaskStatus RefineClouds(Driver *pdrive, int stage);
 
   // ...in "before_timeintegrator" list

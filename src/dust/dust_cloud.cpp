@@ -83,6 +83,10 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   t.root_dx2 = (t.x2max - t.x2min)/static_cast<Real>(t.ncoarse2);
   t.fine_dx1 = t.root_dx1/static_cast<Real>(1 << nlev);
   t.fine_dx2 = t.root_dx2/static_cast<Real>(1 << nlev);
+  // controls: cloud_max_level=0 keeps every cloud at root size (translation-invariant
+  // dust on the mixed gas mesh); cloud_split_everywhere refines the whole lattice
+  t.cloud_max_level = pin->GetOrAddInteger("dust", "cloud_max_level", nlev);
+  t.cloud_split_everywhere = pin->GetOrAddBoolean("dust", "cloud_split_everywhere", false);
 
   t.cloud_target = DvceArray2D<int>("dust_cloud_target", t.nfine2, t.nfine1);
   t.cloud_level = DvceArray2D<int>("dust_cloud_level", t.nfine2, t.nfine1);
@@ -145,7 +149,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     std::cout << "# refinable_cloud map: levels=" << nlev << ", virtual finest grid "
               << t.nfine1 << "x" << t.nfine2 << ", split slack=" << cloud_split_slack
               << ", merge tolerance=" << cloud_merge_tolerance << " finest cells"
-              << std::endl;
+              << ", max cloud level=" << t.cloud_max_level
+              << (t.cloud_split_everywhere ? ", split everywhere" : "") << std::endl;
   }
 }
 
@@ -166,11 +171,11 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
 //! coincide with same-level particles.  Runs on the host: splits are rare (a lattice
 //! column entering the fine region) and the mesh is single-rank by construction.
 
-void DustGasDrag::SplitAndMergeClouds() {
+int DustGasDrag::SplitAndMergeClouds() {
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   int npart = ppar->nprtcl_thispack;
-  if (npart == 0) return;
+  if (npart == 0) return 0;
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
@@ -185,7 +190,7 @@ void DustGasDrag::SplitAndMergeClouds() {
     flag(p) = f;
     sum += f;
   }, Kokkos::Sum<int>(nsplit));
-  if (nsplit == 0) return;
+  if (nsplit == 0) return 0;
 
   auto pr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
   auto pi_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pi);
@@ -337,6 +342,7 @@ void DustGasDrag::SplitAndMergeClouds() {
   pmesh->nprtcl_thisrank = nnew;
   pmesh->nprtcl_eachrank[global_variable::my_rank] = nnew;
   pmesh->nprtcl_total = nnew;
+  return nsplit;
 }
 
 } // namespace dust
