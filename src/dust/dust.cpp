@@ -316,6 +316,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_tolerance = pin->GetOrAddReal("dust", "cloud_merge_tolerance", 0.05);
       cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order", 1);
       cloud_force_local = pin->GetOrAddBoolean("dust", "cloud_force_local", false);
+      cloud_force_children = pin->GetOrAddBoolean("dust", "cloud_force_children", false);
       if (cloud_gather_order != 1 && cloud_gather_order != 2) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<dust>/cloud_gather_order must be 1 or 2" << std::endl;

@@ -75,7 +75,8 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       int ncells2 = qdep.extent_int(3);
       bool linear = (cloud_gather_order == 2) && transfer.cloud_mode;
       bool flocal = cloud_force_local && transfer.cloud_mode;
-      if (linear || flocal) {
+      bool fchild = cloud_force_children && transfer.cloud_mode;
+      if (linear || flocal || fchild) {
         // Refinable-cloud variants: (linear) the gather integrates a linear
         // reconstruction of the old gas velocity over the cloud (central slopes over
         // the block's own cells, ghosts included, moments about the leaf centre);
@@ -86,7 +87,8 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         KOKKOS_LAMBDA(const int p) {
           Real xp = pr(IPX,p), yp = pr(IPY,p);
           int lev = pi(PLEV,p);
-          auto leaf_value = [&](const int tm, const int tj, const int ti, const Real w,
+          auto leaf_value = [&](const Real px, const Real py,
+                                const int tm, const int tj, const int ti, const Real w,
                                 const Real m1x, const Real m1y,
                                 Real &ux, Real &uy, Real &uz) {
             Real invrho = 1.0/uold(tm,IDN,ks,tj,ti);
@@ -97,8 +99,8 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             Real dx1 = mbsize.d_view(tm).dx1, dx2 = mbsize.d_view(tm).dx2;
             Real xc = mbsize.d_view(tm).x1min + (ti - is + 0.5)*dx1;
             Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
-            Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
-            Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
+            Real cx = 0.5*(m1x + transfer.MinImage1(px - xc)*w)/dx1;
+            Real cy = 0.5*(m1y + transfer.MinImage2(py - yc)*w)/dx2;
             Real rip = 1.0/uold(tm,IDN,ks,tj,ti+1), rim = 1.0/uold(tm,IDN,ks,tj,ti-1);
             Real rjp = 1.0/uold(tm,IDN,ks,tj+1,ti), rjm = 1.0/uold(tm,IDN,ks,tj-1,ti);
             ux += cx*(uold(tm,IM1,ks,tj,ti+1)*rip - uold(tm,IM1,ks,tj,ti-1)*rim)
@@ -116,11 +118,43 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             int tj = remainder % ncells2;
             int tm = remainder/ncells2;
             Real ux, uy, uz;
-            leaf_value(tm, tj, ti, w, m1x, m1y, ux, uy, uz);
+            leaf_value(xp, yp, tm, tj, ti, w, m1x, m1y, ux, uy, uz);
             ugx += ux; ugy += uy; ugz += uz;
           });
           Real mass_rate = pr(IPM,p)/pr(IPTS,p);
           Real vpx = pr(IPVX,p), vpy = pr(IPVY,p), vpz = pr(IPVZ,p);
+          if (fchild && transfer.CloudOverlapsFiner(xp, yp, lev)) {
+            // deposit as the 3^2 two-scale children: each child gathers its own mean
+            // gas velocity and spreads (mean - v) with its own weights; the children's
+            // gathers average exactly to the parent's, so the total is unchanged
+            transfer.ForEachChild(xp, yp, lev,
+            [&](const Real cx, const Real cy, const Real fraction) {
+              Real cgx = 0.0, cgy = 0.0, cgz = 0.0;
+              transfer.ForEachCloudMoment(cx, cy, lev+1,
+              [&](const int target, const Real w, const Real m1x, const Real m1y) {
+                int ti = target % ncells1;
+                int remainder = target/ncells1;
+                int tj = remainder % ncells2;
+                int tm = remainder/ncells2;
+                Real ux, uy, uz;
+                leaf_value(cx, cy, tm, tj, ti, w, m1x, m1y, ux, uy, uz);
+                cgx += ux; cgy += uy; cgz += uz;
+              });
+              transfer.ForEachCloudMoment(cx, cy, lev+1,
+              [&](const int target, const Real w, const Real m1x, const Real m1y) {
+                int ti = target % ncells1;
+                int remainder = target/ncells1;
+                int tj = remainder % ncells2;
+                int tm = remainder/ncells2;
+                Real inv_volume = fraction/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
+                DepositAdd(&qdep_(tm,1,ks,tj,ti), -dt*mass_rate*inv_volume*w*(cgx - vpx));
+                DepositAdd(&qdep_(tm,2,ks,tj,ti), -dt*mass_rate*inv_volume*w*(cgy - vpy));
+                DepositAdd(&qdep_(tm,3,ks,tj,ti), -dt*mass_rate*inv_volume*w*(cgz - vpz));
+                DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
+              });
+            });
+            return;
+          }
           transfer.ForEachCloudMoment(xp, yp, lev,
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
             int ti = target % ncells1;
@@ -128,7 +162,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             int tj = remainder % ncells2;
             int tm = remainder/ncells2;
             Real fx = w*ugx, fy = w*ugy, fz = w*ugz;
-            if (flocal) leaf_value(tm, tj, ti, w, m1x, m1y, fx, fy, fz);
+            if (flocal) leaf_value(xp, yp, tm, tj, ti, w, m1x, m1y, fx, fy, fz);
             Real inv_volume = 1.0/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
             DepositAdd(&qdep_(tm,1,ks,tj,ti), -dt*mass_rate*inv_volume*(fx - w*vpx));
             DepositAdd(&qdep_(tm,2,ks,tj,ti), -dt*mass_rate*inv_volume*(fy - w*vpy));

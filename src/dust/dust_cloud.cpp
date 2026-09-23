@@ -152,6 +152,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << ", max cloud level=" << t.cloud_max_level
               << ", gather order=" << cloud_gather_order
               << (cloud_force_local ? ", local gas-side drag" : "")
+              << (cloud_force_children ? ", drag deposited as children over finer leaves" : "")
               << (t.cloud_split_everywhere ? ", split everywhere" : "") << std::endl;
   }
 }

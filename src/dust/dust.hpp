@@ -289,6 +289,46 @@ struct SMRCompositeTransfer {
     }
   }
 
+  // True if any finest virtual cell under the support of a level-lev cloud belongs to
+  // a leaf finer than lev (the cloud overlaps a finer region, split or not).
+  KOKKOS_INLINE_FUNCTION
+  bool CloudOverlapsFiner(const Real particle_x1, const Real particle_x2,
+                          const int lev) const {
+    if (lev >= cloud_nlev) return false;
+    Real x1 = WrapPosition(particle_x1, x1min, x1max);
+    Real x2 = WrapPosition(particle_x2, x2min, x2max);
+    Real r1 = CloudHalfWidth1(lev), r2 = CloudHalfWidth2(lev);
+    int ia = static_cast<int>(floor((x1 - r1 - x1min)/fine_dx1));
+    int ib = static_cast<int>(ceil((x1 + r1 - x1min)/fine_dx1)) - 1;
+    int ja = static_cast<int>(floor((x2 - r2 - x2min)/fine_dx2));
+    int jb = static_cast<int>(ceil((x2 + r2 - x2min)/fine_dx2)) - 1;
+    for (int fj=ja; fj<=jb; ++fj) {
+      int wj = WrapIndex(fj, nfine2);
+      for (int fi=ia; fi<=ib; ++fi) {
+        if (cloud_level(wj, WrapIndex(fi, nfine1)) > lev) return true;
+      }
+    }
+    return false;
+  }
+
+  // The 3^2 children of a level-lev cloud in the exact two-scale identity: level lev+1
+  // clouds at offsets (-1/2, 0, +1/2) of the parent half-width per direction with mass
+  // fractions (1/4, 1/2, 1/4); function(child_x1, child_x2, fraction).
+  template <typename Function>
+  KOKKOS_INLINE_FUNCTION
+  void ForEachChild(const Real particle_x1, const Real particle_x2, const int lev,
+                    const Function &function) const {
+    const Real offset[3] = {-0.5, 0.0, 0.5};
+    const Real fraction[3] = {0.25, 0.5, 0.25};
+    Real h1 = CloudHalfWidth1(lev), h2 = CloudHalfWidth2(lev);
+    for (int b=0; b<3; ++b) {
+      for (int a=0; a<3; ++a) {
+        function(particle_x1 + offset[a]*h1, particle_x2 + offset[b]*h2,
+                 fraction[a]*fraction[b]);
+      }
+    }
+  }
+
   // Encoded active leaf that owns a (wrapped) position; used to assign PGID to
   // particles created by a split or a merge.
   KOKKOS_INLINE_FUNCTION
@@ -523,6 +563,8 @@ class DustGasDrag {
   Real cloud_merge_tolerance = 0.05;  // coincidence radius in finest-cell units
   int cloud_gather_order = 1;         // 2: gather a linear reconstruction of the leaves
   bool cloud_force_local = false;     // gas-side drag uses the leaf's own velocity
+  bool cloud_force_children = false;  // clouds overlapping finer leaves deposit the drag
+                                      // as their 3^d two-scale children (kick unchanged)
   int cloud_next_tag = -1;            // next PTAG for created particles (-1 = unset)
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   bool UsesCompositeTransfer() const {
