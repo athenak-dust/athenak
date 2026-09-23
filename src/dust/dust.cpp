@@ -314,6 +314,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       smr_transfer_mode = DustSMRTransfer::refinable_cloud;
       cloud_split_slack = pin->GetOrAddReal("dust", "cloud_split_slack", 0.02);
       cloud_merge_tolerance = pin->GetOrAddReal("dust", "cloud_merge_tolerance", 0.05);
+      cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order", 1);
+      cloud_force_local = pin->GetOrAddBoolean("dust", "cloud_force_local", false);
+      if (cloud_gather_order != 1 && cloud_gather_order != 2) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<dust>/cloud_gather_order must be 1 or 2" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
     } else {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<dust>/experimental_smr_transfer = '" << transfer

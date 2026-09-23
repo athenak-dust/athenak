@@ -73,6 +73,71 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       auto transfer = smr_transfer;
       int ncells1 = qdep.extent_int(4);
       int ncells2 = qdep.extent_int(3);
+      bool linear = (cloud_gather_order == 2) && transfer.cloud_mode;
+      bool flocal = cloud_force_local && transfer.cloud_mode;
+      if (linear || flocal) {
+        // Refinable-cloud variants: (linear) the gather integrates a linear
+        // reconstruction of the old gas velocity over the cloud (central slopes over
+        // the block's own cells, ghosts included, moments about the leaf centre);
+        // (flocal) the gas-side drag deposited into a leaf uses the velocity the cloud
+        // sees in that leaf instead of the cloud average, which keeps the total
+        // impulse identical and the exchange antisymmetric per particle.
+        par_for("dust_pc2_cloud_predictor",DevExeSpace(),0,(npart-1),
+        KOKKOS_LAMBDA(const int p) {
+          Real xp = pr(IPX,p), yp = pr(IPY,p);
+          int lev = pi(PLEV,p);
+          auto leaf_value = [&](const int tm, const int tj, const int ti, const Real w,
+                                const Real m1x, const Real m1y,
+                                Real &ux, Real &uy, Real &uz) {
+            Real invrho = 1.0/uold(tm,IDN,ks,tj,ti);
+            ux = w*uold(tm,IM1,ks,tj,ti)*invrho;
+            uy = w*uold(tm,IM2,ks,tj,ti)*invrho;
+            uz = w*uold(tm,IM3,ks,tj,ti)*invrho;
+            if (!linear) return;
+            Real dx1 = mbsize.d_view(tm).dx1, dx2 = mbsize.d_view(tm).dx2;
+            Real xc = mbsize.d_view(tm).x1min + (ti - is + 0.5)*dx1;
+            Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
+            Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
+            Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
+            Real rip = 1.0/uold(tm,IDN,ks,tj,ti+1), rim = 1.0/uold(tm,IDN,ks,tj,ti-1);
+            Real rjp = 1.0/uold(tm,IDN,ks,tj+1,ti), rjm = 1.0/uold(tm,IDN,ks,tj-1,ti);
+            ux += cx*(uold(tm,IM1,ks,tj,ti+1)*rip - uold(tm,IM1,ks,tj,ti-1)*rim)
+                + cy*(uold(tm,IM1,ks,tj+1,ti)*rjp - uold(tm,IM1,ks,tj-1,ti)*rjm);
+            uy += cx*(uold(tm,IM2,ks,tj,ti+1)*rip - uold(tm,IM2,ks,tj,ti-1)*rim)
+                + cy*(uold(tm,IM2,ks,tj+1,ti)*rjp - uold(tm,IM2,ks,tj-1,ti)*rjm);
+            uz += cx*(uold(tm,IM3,ks,tj,ti+1)*rip - uold(tm,IM3,ks,tj,ti-1)*rim)
+                + cy*(uold(tm,IM3,ks,tj+1,ti)*rjp - uold(tm,IM3,ks,tj-1,ti)*rjm);
+          };
+          Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
+          transfer.ForEachCloudMoment(xp, yp, lev,
+          [&](const int target, const Real w, const Real m1x, const Real m1y) {
+            int ti = target % ncells1;
+            int remainder = target/ncells1;
+            int tj = remainder % ncells2;
+            int tm = remainder/ncells2;
+            Real ux, uy, uz;
+            leaf_value(tm, tj, ti, w, m1x, m1y, ux, uy, uz);
+            ugx += ux; ugy += uy; ugz += uz;
+          });
+          Real mass_rate = pr(IPM,p)/pr(IPTS,p);
+          Real vpx = pr(IPVX,p), vpy = pr(IPVY,p), vpz = pr(IPVZ,p);
+          transfer.ForEachCloudMoment(xp, yp, lev,
+          [&](const int target, const Real w, const Real m1x, const Real m1y) {
+            int ti = target % ncells1;
+            int remainder = target/ncells1;
+            int tj = remainder % ncells2;
+            int tm = remainder/ncells2;
+            Real fx = w*ugx, fy = w*ugy, fz = w*ugz;
+            if (flocal) leaf_value(tm, tj, ti, w, m1x, m1y, fx, fy, fz);
+            Real inv_volume = 1.0/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
+            DepositAdd(&qdep_(tm,1,ks,tj,ti), -dt*mass_rate*inv_volume*(fx - w*vpx));
+            DepositAdd(&qdep_(tm,2,ks,tj,ti), -dt*mass_rate*inv_volume*(fy - w*vpy));
+            DepositAdd(&qdep_(tm,3,ks,tj,ti), -dt*mass_rate*inv_volume*(fz - w*vpz));
+            DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
+          });
+        });
+        return TaskStatus::complete;
+      }
       par_for("dust_pc2_composite_predictor",DevExeSpace(),0,(npart-1),
       KOKKOS_LAMBDA(const int p) {
         Real ugx = 0.0, ugy = 0.0, ugz = 0.0;

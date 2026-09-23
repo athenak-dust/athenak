@@ -161,6 +161,48 @@ struct SMRCompositeTransfer {
     return count;
   }
 
+  // Antiderivative of s*(1-|s|), the first moment of the unit hat, clamped outside
+  // [-1,1] so that differences give the moment of the hat over any interval.
+  KOKKOS_INLINE_FUNCTION
+  static Real HatMoment(const Real s) {
+    if (s <= -1.0 || s >= 1.0) return 1.0/6.0;
+    return (s <= 0.0) ? 0.5*SQR(s) + SQR(s)*s/3.0 : 0.5*SQR(s) - SQR(s)*s/3.0;
+  }
+
+  // CloudWeights1D plus the first moment g[a] = int_cell S(x) (x - x_particle) dx of the
+  // unit-mass hat over each virtual cell (about the particle position, length units).
+  KOKKOS_INLINE_FUNCTION
+  static int CloudWeightsMoments1D(const Real x, const Real ell, const Real xmin,
+                                   const Real dx, int &i0, Real w[kMaxCloudStencil],
+                                   Real g[kMaxCloudStencil]) {
+    Real inv_ell = 1.0/ell;
+    i0 = static_cast<int>(floor((x - ell - xmin)/dx));
+    int i1 = static_cast<int>(ceil((x + ell - xmin)/dx));
+    int count = i1 - i0;
+    if (count > kMaxCloudStencil) count = kMaxCloudStencil;
+    Real s = (xmin + i0*dx - x)*inv_ell;
+    Real prev = HatCDF(s), gprev = HatMoment(s);
+    for (int a=0; a<count; ++a) {
+      s = (xmin + (i0 + a + 1)*dx - x)*inv_ell;
+      Real next = HatCDF(s), gnext = HatMoment(s);
+      w[a] = next - prev;
+      g[a] = ell*(gnext - gprev);
+      prev = next;
+      gprev = gnext;
+    }
+    return count;
+  }
+
+  // Minimum-image displacement in a periodic direction.
+  KOKKOS_INLINE_FUNCTION
+  static Real MinImage(const Real d, const Real length) {
+    return d - length*round(d/length);
+  }
+  KOKKOS_INLINE_FUNCTION
+  Real MinImage1(const Real d) const {return MinImage(d, x1max - x1min);}
+  KOKKOS_INLINE_FUNCTION
+  Real MinImage2(const Real d) const {return MinImage(d, x2max - x2min);}
+
   KOKKOS_INLINE_FUNCTION
   Real CloudHalfWidth1(const int lev) const {
     return root_dx1/static_cast<Real>(1 << lev);
@@ -216,6 +258,35 @@ struct SMRCompositeTransfer {
       }
     }
     return true;
+  }
+
+  // Cloud traversal that also hands the callback the first moments of the cloud over
+  // the virtual cell about the particle position: function(target, w, m1x, m1y).  A
+  // gather of a linearly reconstructed leaf field u_c + s.(x - x_c) is then
+  // sum(w*u_c + (m1x + (x_p - x_c)*w)*s_x + (m1y + (y_p - y_c)*w)*s_y), exact for a
+  // linear field and second-order accurate for any cloud/leaf size combination.
+  template <typename Function>
+  KOKKOS_INLINE_FUNCTION
+  void ForEachCloudMoment(const Real particle_x1, const Real particle_x2, const int lev,
+                          const Function &function) const {
+    Real x1 = WrapPosition(particle_x1, x1min, x1max);
+    Real x2 = WrapPosition(particle_x2, x2min, x2max);
+    int i0, j0;
+    Real w1[kMaxCloudStencil], w2[kMaxCloudStencil];
+    Real g1[kMaxCloudStencil], g2[kMaxCloudStencil];
+    int n1 = CloudWeightsMoments1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1, g1);
+    int n2 = CloudWeightsMoments1D(x2, CloudHalfWidth2(lev), x2min, fine_dx2, j0, w2, g2);
+    for (int b=0; b<n2; ++b) {
+      if (w2[b] == 0.0 && g2[b] == 0.0) continue;
+      int fj = WrapIndex(j0 + b, nfine2);
+      for (int a=0; a<n1; ++a) {
+        Real w = w2[b]*w1[a];
+        Real m1x = w2[b]*g1[a];
+        Real m1y = w1[a]*g2[b];
+        if (w == 0.0 && m1x == 0.0 && m1y == 0.0) continue;
+        function(cloud_target(fj, WrapIndex(i0 + a, nfine1)), w, m1x, m1y);
+      }
+    }
   }
 
   // Encoded active leaf that owns a (wrapped) position; used to assign PGID to
@@ -450,6 +521,8 @@ class DustGasDrag {
   // refinable-cloud controls and counters (SplitAndMergeClouds)
   Real cloud_split_slack = 0.02;      // support test shrinks the cloud by this fraction
   Real cloud_merge_tolerance = 0.05;  // coincidence radius in finest-cell units
+  int cloud_gather_order = 1;         // 2: gather a linear reconstruction of the leaves
+  bool cloud_force_local = false;     // gas-side drag uses the leaf's own velocity
   int cloud_next_tag = -1;            // next PTAG for created particles (-1 = unset)
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   bool UsesCompositeTransfer() const {
