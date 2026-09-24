@@ -77,6 +77,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       bool flocal = cloud_force_local && transfer.cloud_mode;
       bool fchild = cloud_force_children && transfer.cloud_mode;
       bool deform = cloud_deform && transfer.cloud_mode;
+      int gather_level = cloud_gather_level;
       if (linear || flocal || fchild || deform) {
         // Refinable-cloud variants: (linear) the gather integrates a linear
         // reconstruction of the old gas velocity over the cloud (central slopes over
@@ -115,7 +116,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
                 + cy*(uold(tm,IM3,ks,tj+1,ti)*rjp - uold(tm,IM3,ks,tj-1,ti)*rjm);
           };
           Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-          transfer.ForEachCloudMoment(xp, yp, lev,
+          transfer.ForEachCloudMoment(xp, yp, (gather_level >= 0) ? gather_level : lev,
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
             int ti = target % ncells1;
             int remainder = target/ncells1;
@@ -190,7 +191,8 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       par_for("dust_pc2_composite_predictor",DevExeSpace(),0,(npart-1),
       KOKKOS_LAMBDA(const int p) {
         Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p),
+        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p),
+                               (gather_level >= 0) ? gather_level : pi(PLEV,p),
         [&](const int target, const Real particle_weight) {
           int ti = target % ncells1;
           int remainder = target/ncells1;

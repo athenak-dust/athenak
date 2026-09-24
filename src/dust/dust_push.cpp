@@ -128,6 +128,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
       bool flocal = composite_smr && cloud_force_local && transfer.cloud_mode;
       bool fchild = composite_smr && cloud_force_children && transfer.cloud_mode;
       bool deform = composite_smr && cloud_deform && transfer.cloud_mode;
+      int gather_level = cloud_gather_level;
       par_for("dust_pc2_advance",DevExeSpace(),0,(npart-1),
       KOKKOS_LAMBDA(const int p) {
         int m = pi(PGID,p) - gids;
@@ -193,8 +194,9 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
             agrad[2*n+1] += cy*(ustar_(tm,n,ks,tj+1,ti) - ustar_(tm,n,ks,tj-1,ti));
           }
         };
+        int glev = (gather_level >= 0) ? gather_level : pi(PLEV,p);
         if (linear || flocal || fchild || deform) {
-          transfer.ForEachCloudMoment(xh, yh, pi(PLEV,p),
+          transfer.ForEachCloudMoment(xh, yh, glev,
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
             int ti = target % ncells1;
             int remainder = target/ncells1;
@@ -206,7 +208,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
             if (deform) leaf_slope(tm, tj, ti, w);
           });
         } else if (composite_smr) {
-          transfer.ForEachWeight(xh, yh, pi(PLEV,p),
+          transfer.ForEachWeight(xh, yh, glev,
           [&](const int target, const Real particle_weight) {
             int ti = target % ncells1;
             int remainder = target/ncells1;

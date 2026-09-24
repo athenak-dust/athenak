@@ -154,6 +154,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << (cloud_force_local ? ", local gas-side drag" : "")
               << (cloud_force_children ? ", drag deposited as children over finer leaves" : "")
               << (cloud_deform ? ", deformable clouds (dv/dx carried)" : "")
+              << (cloud_gather_level >= 0 ? ", gather footprint fixed at level " : "")
+              << (cloud_gather_level >= 0 ? std::to_string(cloud_gather_level) : "")
               << (t.cloud_split_everywhere ? ", split everywhere" : "") << std::endl;
   }
 }
