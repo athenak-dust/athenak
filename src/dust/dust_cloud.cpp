@@ -60,10 +60,10 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   int ncells2 = indcs.nx2 + 2*indcs.ng;
   int nlev = pmesh->max_level - pmesh->root_level;
 
-  if (nlev < 1 || nlev > 2) {
+  if (nlev < 0 || nlev > 2) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "refinable_cloud currently requires one or two levels "
-              << "of 2:1 static refinement" << std::endl;
+              << std::endl << "refinable_cloud currently requires a uniform mesh or one "
+              << "or two levels of 2:1 static refinement" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
@@ -153,6 +153,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << ", gather order=" << cloud_gather_order
               << (cloud_force_local ? ", local gas-side drag" : "")
               << (cloud_force_children ? ", drag deposited as children over finer leaves" : "")
+              << (cloud_deform ? ", deformable clouds (dv/dx carried)" : "")
               << (t.cloud_split_everywhere ? ", split everywhere" : "") << std::endl;
   }
 }
@@ -267,6 +268,8 @@ int DustGasDrag::SplitAndMergeClouds() {
 
   const Real offset[3] = {-0.5, 0.0, 0.5};
   const Real fraction[3] = {0.25, 0.5, 0.25};
+  const bool deform = cloud_deform;
+  std::vector<Real> child(nrdata, 0.0);
   unsigned long long merged_here = 0;
   for (int p=0; p<npart; ++p) {
     if (!flag_h(p)) continue;
@@ -275,9 +278,21 @@ int DustGasDrag::SplitAndMergeClouds() {
     Real ell2 = transfer.CloudHalfWidth2(lev);
     for (int b=0; b<3; ++b) {
       for (int a=0; a<3; ++a) {
-        Real x = wrap1(pr_h(IPX,p) + offset[a]*ell1);
-        Real y = wrap2(pr_h(IPY,p) + offset[b]*ell2);
+        Real d1 = offset[a]*ell1, d2 = offset[b]*ell2;
+        Real x = wrap1(pr_h(IPX,p) + d1);
+        Real y = wrap2(pr_h(IPY,p) + d2);
         Real mass = pr_h(IPM,p)*fraction[a]*fraction[b];
+        // child attributes: the parent's, except that a deformable cloud's children
+        // take the parent's linear velocity field v + G.d at their own centres
+        for (int c=0; c<nrdata; ++c) child[c] = pr_h(c,p);
+        if (deform) {
+          child[IPVX] += pr_h(IPGXX,p)*d1 + pr_h(IPGXY,p)*d2;
+          child[IPVY] += pr_h(IPGYX,p)*d1 + pr_h(IPGYY,p)*d2;
+          child[IPVZ] += pr_h(IPGZX,p)*d1 + pr_h(IPGZY,p)*d2;
+          child[IPVX1] = child[IPVX];
+          child[IPVY1] = child[IPVY];
+          child[IPVZ1] = child[IPVZ];
+        }
         // look for a coincident same-level, same-species particle in the 3x3 bins
         int found = -1;
         int bi = bin1(x), bj = bin2(y);
@@ -302,7 +317,7 @@ int DustGasDrag::SplitAndMergeClouds() {
           Real ms = rr(IPM,s), mt = ms + mass, wc = mass/mt;
           for (int c=0; c<nrdata; ++c) {
             if (c == IPM || c == IPX || c == IPY || c == IPX1 || c == IPY1) continue;
-            rr(c,s) = rr(c,s) + wc*(pr_h(c,p) - rr(c,s));
+            rr(c,s) = rr(c,s) + wc*(child[c] - rr(c,s));
           }
           Real xs = wrap1(rr(IPX,s) + wc*image1(x - rr(IPX,s)));
           Real ys = wrap2(rr(IPY,s) + wc*image2(y - rr(IPY,s)));
@@ -313,7 +328,7 @@ int DustGasDrag::SplitAndMergeClouds() {
           ++merged_here;
         } else {
           int s = nslot++;
-          for (int c=0; c<nrdata; ++c) rr(c,s) = pr_h(c,p);
+          for (int c=0; c<nrdata; ++c) rr(c,s) = child[c];
           for (int c=0; c<nidata; ++c) ii(c,s) = pi_h(c,p);
           rr(IPX,s) = x; rr(IPX1,s) = x;
           rr(IPY,s) = y; rr(IPY1,s) = y;

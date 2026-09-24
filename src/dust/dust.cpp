@@ -303,18 +303,35 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       std::exit(EXIT_FAILURE);
     }
   }
-  if (pmy_pack->pmesh->multilevel) {
+  {
+    // The refinable-cloud path may also be selected on a uniform mesh: its clouds are
+    // then exact TSC and the gather/deposit options apply unchanged, which gives uniform
+    // reference runs with the same coupling as the mixed-resolution runs.
+    bool multilevel = pmy_pack->pmesh->multilevel;
     std::string transfer = pin->GetOrAddString(
-        "dust", "experimental_smr_transfer", "smooth_p2");
-    if (transfer.compare("owner_overlap") == 0) {
+        "dust", "experimental_smr_transfer", multilevel ? "smooth_p2" : "none");
+    if (transfer.compare("none") == 0 && !multilevel) {
+      smr_transfer_mode = DustSMRTransfer::none;
+    } else if (transfer.compare("owner_overlap") == 0 && multilevel) {
       smr_transfer_mode = DustSMRTransfer::owner_overlap;
-    } else if (transfer.compare("smooth_p2") == 0) {
+    } else if (transfer.compare("smooth_p2") == 0 && multilevel) {
       smr_transfer_mode = DustSMRTransfer::smooth_p2;
     } else if (transfer.compare("refinable_cloud") == 0) {
       smr_transfer_mode = DustSMRTransfer::refinable_cloud;
+      if (!multilevel && !(pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic &&
+                           global_variable::nranks == 1 &&
+                           drag_solver == DustDragSolver::local)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "refinable_cloud on a uniform mesh requires a 2-D, "
+                  << "strictly periodic, single-rank mesh and drag_solver=local"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       cloud_split_slack = pin->GetOrAddReal("dust", "cloud_split_slack", 0.02);
       cloud_merge_tolerance = pin->GetOrAddReal("dust", "cloud_merge_tolerance", 0.05);
-      cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order", 1);
+      cloud_deform = pin->GetOrAddBoolean("dust", "cloud_deform", false);
+      cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order",
+                                                cloud_deform ? 2 : 1);
       cloud_force_local = pin->GetOrAddBoolean("dust", "cloud_force_local", false);
       cloud_force_children = pin->GetOrAddBoolean("dust", "cloud_force_children", false);
       if (cloud_gather_order != 1 && cloud_gather_order != 2) {
@@ -322,11 +339,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << std::endl << "<dust>/cloud_gather_order must be 1 or 2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
+      if (cloud_deform && (cloud_gather_order != 2 || cloud_force_local ||
+                           cloud_force_children)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<dust>/cloud_deform requires cloud_gather_order=2 and "
+                  << "excludes cloud_force_local and cloud_force_children" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
     } else {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<dust>/experimental_smr_transfer = '" << transfer
                 << "' not recognized (must be owner_overlap, smooth_p2, or "
-                << "refinable_cloud)" << std::endl;
+                << "refinable_cloud on a refined mesh; none or refinable_cloud on a "
+                << "uniform mesh)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     if (UsesCompositeTransfer() && deposit != DustDeposit::tsc) {
@@ -369,7 +394,15 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
     Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
   }
-  if (pmy_pack->pmesh->multilevel) {
+  if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
+    BuildRefinableCloudTransfer(pin);
+    if (global_variable::my_rank == 0) {
+      std::cout << "# WARNING (dust): experimental static-SMR refinable_cloud transfer "
+                << "is enabled (hat clouds, exact leaf integrals, two-scale split; "
+                << "single rank, 2-D, static mesh). SI convergence is not certified"
+                << std::endl;
+    }
+  } else if (pmy_pack->pmesh->multilevel) {
     if (smr_transfer_mode == DustSMRTransfer::owner_overlap) {
       int nccells1 = indcs.cnx1 + 2*(indcs.ng);
       int nccells2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*(indcs.ng)) : 1;
@@ -379,14 +412,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         std::cout << "# WARNING (dust): experimental static-SMR owner_overlap transfer "
                   << "is enabled only as a negative control; it is not a certified "
                   << "gather/deposit adjoint" << std::endl;
-      }
-    } else if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
-      BuildRefinableCloudTransfer(pin);
-      if (global_variable::my_rank == 0) {
-        std::cout << "# WARNING (dust): experimental static-SMR refinable_cloud transfer "
-                  << "is enabled (hat clouds, exact leaf integrals, two-scale split; "
-                  << "single rank, 2-D, static mesh). SI convergence is not certified"
-                  << std::endl;
       }
     } else {
       BuildSMRCompositeTransfer(pin);

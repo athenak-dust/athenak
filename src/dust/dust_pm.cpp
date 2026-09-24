@@ -76,13 +76,17 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       bool linear = (cloud_gather_order == 2) && transfer.cloud_mode;
       bool flocal = cloud_force_local && transfer.cloud_mode;
       bool fchild = cloud_force_children && transfer.cloud_mode;
-      if (linear || flocal || fchild) {
+      bool deform = cloud_deform && transfer.cloud_mode;
+      if (linear || flocal || fchild || deform) {
         // Refinable-cloud variants: (linear) the gather integrates a linear
         // reconstruction of the old gas velocity over the cloud (central slopes over
         // the block's own cells, ghosts included, moments about the leaf centre);
         // (flocal) the gas-side drag deposited into a leaf uses the velocity the cloud
         // sees in that leaf instead of the cloud average, which keeps the total
-        // impulse identical and the exchange antisymmetric per particle.
+        // impulse identical and the exchange antisymmetric per particle; (deform) as
+        // flocal on the gas side, while the dust side is the cloud's linear velocity
+        // field v + G.(x - x_p), whose integral over a leaf is w*v + G.m1 (the first
+        // moments m1 sum to zero over the cloud, so the total impulse is unchanged).
         par_for("dust_pc2_cloud_predictor",DevExeSpace(),0,(npart-1),
         KOKKOS_LAMBDA(const int p) {
           Real xp = pr(IPX,p), yp = pr(IPY,p);
@@ -123,6 +127,12 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
           });
           Real mass_rate = pr(IPM,p)/pr(IPTS,p);
           Real vpx = pr(IPVX,p), vpy = pr(IPVY,p), vpz = pr(IPVZ,p);
+          Real gxx = 0.0, gxy = 0.0, gyx = 0.0, gyy = 0.0, gzx = 0.0, gzy = 0.0;
+          if (deform) {
+            gxx = pr(IPGXX,p); gxy = pr(IPGXY,p);
+            gyx = pr(IPGYX,p); gyy = pr(IPGYY,p);
+            gzx = pr(IPGZX,p); gzy = pr(IPGZY,p);
+          }
           if (fchild && transfer.CloudOverlapsFiner(xp, yp, lev)) {
             // deposit as the 3^2 two-scale children: each child gathers its own mean
             // gas velocity and spreads (mean - v) with its own weights; the children's
@@ -162,7 +172,12 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             int tj = remainder % ncells2;
             int tm = remainder/ncells2;
             Real fx = w*ugx, fy = w*ugy, fz = w*ugz;
-            if (flocal) leaf_value(xp, yp, tm, tj, ti, w, m1x, m1y, fx, fy, fz);
+            if (flocal || deform) leaf_value(xp, yp, tm, tj, ti, w, m1x, m1y, fx, fy, fz);
+            if (deform) {
+              fx -= gxx*m1x + gxy*m1y;
+              fy -= gyx*m1x + gyy*m1y;
+              fz -= gzx*m1x + gzy*m1y;
+            }
             Real inv_volume = 1.0/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
             DepositAdd(&qdep_(tm,1,ks,tj,ti), -dt*mass_rate*inv_volume*(fx - w*vpx));
             DepositAdd(&qdep_(tm,2,ks,tj,ti), -dt*mass_rate*inv_volume*(fy - w*vpy));

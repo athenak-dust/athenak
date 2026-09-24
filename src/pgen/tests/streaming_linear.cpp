@@ -350,6 +350,14 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
         hr(IPVX1,p) = hr(IPVX,p);
         hr(IPVY1,p) = hr(IPVY,p);
         hr(IPVZ1,p) = hr(IPVZ,p);
+        if (ppar->nrdata > IPGZY) {   // deformable clouds: analytic velocity gradient
+          hr(IPGXX,p) = -kx*(Vxr*se + Vxi*ce)*cz;
+          hr(IPGXY,p) = -kz*(Vxr*ce - Vxi*se)*sz;
+          hr(IPGYX,p) = -kx*(Vzr*ce - Vzi*se)*sz;
+          hr(IPGYY,p) = -kz*(Vzr*se + Vzi*ce)*cz;
+          hr(IPGZX,p) = -kx*(Vpr*se + Vpi*ce)*cz;
+          hr(IPGZY,p) = -kz*(Vpr*ce - Vpi*se)*sz;
+        }
       }
     }
     Kokkos::deep_copy(pr, hr);
@@ -367,6 +375,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
                 << std::endl;
     }
   } else {
+  int nrdata = ppar->nrdata;
   par_for("stream_part", DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = p/npart_permb;
     if (m > (nmb-1)) {m = nmb-1;}
@@ -402,6 +411,14 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     pr(IPRX,p) = 0.0;
     pr(IPRY,p) = 0.0;
     pr(IPRZ,p) = 0.0;
+    if (nrdata > IPGZY) {   // deformable clouds: analytic velocity gradient
+      pr(IPGXX,p) = -kx*(Vxr*se + Vxi*ce)*cz;
+      pr(IPGXY,p) = -kz*(Vxr*ce - Vxi*se)*sz;
+      pr(IPGYX,p) = -kx*(Vzr*ce - Vzi*se)*sz;
+      pr(IPGYY,p) = -kz*(Vzr*se + Vzi*ce)*cz;
+      pr(IPGZX,p) = -kx*(Vpr*se + Vpi*ce)*cz;
+      pr(IPGZY,p) = -kz*(Vpr*ce - Vpi*se)*sz;
+    }
   });
   }
 

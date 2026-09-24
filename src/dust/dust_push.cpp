@@ -127,6 +127,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
       bool linear = composite_smr && (cloud_gather_order == 2) && transfer.cloud_mode;
       bool flocal = composite_smr && cloud_force_local && transfer.cloud_mode;
       bool fchild = composite_smr && cloud_force_children && transfer.cloud_mode;
+      bool deform = composite_smr && cloud_deform && transfer.cloud_mode;
       par_for("dust_pc2_advance",DevExeSpace(),0,(npart-1),
       KOKKOS_LAMBDA(const int p) {
         int m = pi(PGID,p) - gids;
@@ -180,7 +181,19 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
           uz += cx*(ustar_(tm,2,ks,tj,ti+1) - ustar_(tm,2,ks,tj,ti-1))
               + cy*(ustar_(tm,2,ks,tj+1,ti) - ustar_(tm,2,ks,tj-1,ti));
         };
-        if (linear || flocal || fchild) {
+        // Deformable cloud: the gas velocity gradient A_ij seen by the cloud is the
+        // cloud integral of the reconstruction slopes (first-order accurate; it only
+        // multiplies O(H) moments).  Layout of the six entries: 2*row + column with
+        // rows (x,y,z velocity components) and columns (x1,x2), as IPGXX...IPGZY.
+        Real agrad[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        auto leaf_slope = [&](const int tm, const int tj, const int ti, const Real w) {
+          Real cx = 0.5*w/mbsize.d_view(tm).dx1, cy = 0.5*w/mbsize.d_view(tm).dx2;
+          for (int n=0; n<3; ++n) {
+            agrad[2*n]   += cx*(ustar_(tm,n,ks,tj,ti+1) - ustar_(tm,n,ks,tj,ti-1));
+            agrad[2*n+1] += cy*(ustar_(tm,n,ks,tj+1,ti) - ustar_(tm,n,ks,tj-1,ti));
+          }
+        };
+        if (linear || flocal || fchild || deform) {
           transfer.ForEachCloudMoment(xh, yh, pi(PLEV,p),
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
             int ti = target % ncells1;
@@ -190,6 +203,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
             Real ux, uy, uz;
             leaf_value(xh, yh, tm, tj, ti, w, m1x, m1y, ux, uy, uz);
             ugx += ux; ugy += uy; ugz += uz;
+            if (deform) leaf_slope(tm, tj, ti, w);
           });
         } else if (composite_smr) {
           transfer.ForEachWeight(xh, yh, pi(PLEV,p),
@@ -251,6 +265,54 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         pr(IPVX,p) = 2.0*vxh - vx0;
         pr(IPVY,p) = 2.0*vyh - vy0;
         pr(IPVZ,p) = 2.0*vzh - vz0;
+
+        // Deformable cloud: advance the carried velocity gradient G_ij = dv_i/dx_j with
+        // the gradient of the particle equation along the path,
+        //   DG/Dt = C.G - G.G + (A - G)/t_s,
+        // (C = rotation matrix, A = gas velocity gradient seen by the cloud; 2-D, no
+        // vertical gravity).  Same implicit-midpoint solve as the velocity, column by
+        // column; the quadratic term is iterated once so that it too sits at the
+        // midpoint.  G_h is used by the drag deposit below.
+        Real gh[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        if (deform) {
+          Real g0[6];
+          for (int c=0; c<6; ++c) {g0[c] = pr(IPGXX+c,p); gh[c] = g0[c];}
+          for (int pass=0; pass<2; ++pass) {
+            Real gn[6];
+            for (int c=0; c<6; ++c) gn[c] = gh[c];
+            for (int j=0; j<2; ++j) {
+              // (G.G)_ij = G_i,x1 G_x,j + G_i,x2 G_y,j: the contraction runs over the
+              // two coordinate directions, whose velocity components are rows x and y
+              Real nrow[3];
+              for (int i=0; i<3; ++i) nrow[i] = gn[2*i]*gn[j] + gn[2*i+1]*gn[2+j];
+              Real rx = g0[j]   + lambda*agrad[j]   - h*nrow[0];
+              Real ry = g0[2+j] + lambda*agrad[2+j] - h*nrow[1];
+              Real rz = g0[4+j] + lambda*agrad[4+j] - h*nrow[2];
+              Real gxh, gyh, gzh;
+              if (is_sbox && three_d) {
+                Real cxy = 2.0*h*omega0_;
+                Real cyx = h*(2.0-qshear_)*omega0_;
+                Real det = aa*aa + cxy*cyx;
+                gxh = (aa*rx + cxy*ry)/det;
+                gyh = (aa*ry - cyx*rx)/det;
+                gzh = rz/aa;
+              } else if (is_sbox) {
+                Real cxz = 2.0*h*omega0_;
+                Real czx = h*(2.0-qshear_)*omega0_;
+                Real det = aa*aa + cxz*czx;
+                gxh = (aa*rx + cxz*rz)/det;
+                gzh = (aa*rz - czx*rx)/det;
+                gyh = ry/aa;
+              } else {
+                gxh = rx/aa;
+                gyh = ry/aa;
+                gzh = rz/aa;
+              }
+              gh[j] = gxh; gh[2+j] = gyh; gh[4+j] = gzh;
+            }
+          }
+          for (int c=0; c<6; ++c) pr(IPGXX+c,p) = 2.0*gh[c] - g0[c];
+        }
         pr(IPX,p) = x0 + dt*vxh;
         pr(IPY,p) = y0 + dt*(vyh - ((is_sbox && three_d) ?
                                     qshear_*omega0_*xh : 0.0));
@@ -297,9 +359,11 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
                 DepositAdd(&dmom_(tm,2,ks,tj,ti), density*dt*inv_ts*w*(cgz - vzh));
               });
             });
-          } else if (flocal) {
+          } else if (flocal || deform) {
             // per-leaf impulse dt*(u_leaf - v_h)/t_s with the velocity the cloud sees
-            // in that leaf; the leaf impulses sum to the particle's dv_drag exactly
+            // in that leaf; the leaf impulses sum to the particle's dv_drag exactly.
+            // A deformable cloud subtracts its own linear velocity field instead of
+            // the single v_h: its leaf integral is w*v_h + G_h.m1.
             Real mass = -pr(IPM,p);
             Real inv_ts = 1.0/pr(IPTS,p);
             transfer.ForEachCloudMoment(xh, yh, pi(PLEV,p),
@@ -310,6 +374,11 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
               int tm = remainder/ncells2;
               Real fx, fy, fz;
               leaf_value(xh, yh, tm, tj, ti, w, m1x, m1y, fx, fy, fz);
+              if (deform) {
+                fx -= gh[0]*m1x + gh[1]*m1y;
+                fy -= gh[2]*m1x + gh[3]*m1y;
+                fz -= gh[4]*m1x + gh[5]*m1y;
+              }
               Real density = mass/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
               DepositAdd(&dmom_(tm,0,ks,tj,ti), density*dt*inv_ts*(fx - w*vxh));
               DepositAdd(&dmom_(tm,1,ks,tj,ti), density*dt*inv_ts*(fy - w*vyh));

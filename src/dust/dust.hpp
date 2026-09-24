@@ -565,6 +565,9 @@ class DustGasDrag {
   bool cloud_force_local = false;     // gas-side drag uses the leaf's own velocity
   bool cloud_force_children = false;  // clouds overlapping finer leaves deposit the drag
                                       // as their 3^d two-scale children (kick unchanged)
+  bool cloud_deform = false;          // deformable clouds: each particle carries dv_i/dx_j,
+                                      // split children take v + G.d, and the drag is
+                                      // deposited with the linear dust velocity field
   int cloud_next_tag = -1;            // next PTAG for created particles (-1 = unset)
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   bool UsesCompositeTransfer() const {
