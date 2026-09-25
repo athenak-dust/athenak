@@ -369,9 +369,11 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     // one pass per refinement level: children of the first pass may lie inside a
     // still finer region
     while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
+    int ntrans = pmbp->pdust->MakeTransitionClouds();
     if (global_variable::my_rank == 0) {
       std::cout << "# refinable_cloud lattice: " << nlattice << " root clouds -> "
                 << ppar->nprtcl_thispack << " particles after the initial split"
+                << " (" << ntrans << " edge children merged into transition clouds)"
                 << std::endl;
     }
   } else {
@@ -463,16 +465,37 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
   Kokkos::parallel_reduce("stream_hp",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
   KOKKOS_LAMBDA(const int &p, Real &re_, Real &im_) {
     Real w = pr(IPM,p)*cos(kz*pr(IPY,p));
+    int lobe1 = 0;
+    Real cxr = 0.0, cxi = 0.0;
     if (cloud) {
-      // hat cloud of half-width ell: Fourier transform sinc^2(k ell/2) per direction
-      Real scale = 1.0/static_cast<Real>(1 << pi(PLEV,p));
+      // hat cloud of half-width ell: Fourier transform sinc^2(k ell/2) per direction;
+      // a transition cloud adds 1/3 of its hat displaced by -/+ ell
+      int code = pi(PLEV,p);
+      Real scale = 1.0/static_cast<Real>(1 << SMRCompositeTransfer::CloudLevel(code));
       Real ax = 0.5*kx*hx*scale, az = 0.5*kz*hz*scale;
       Real sx = (ax == 0.0) ? 1.0 : sin(ax)/ax;
       Real sz = (az == 0.0) ? 1.0 : sin(az)/az;
+      int l1 = SMRCompositeTransfer::CloudLobe1(code);
+      int l2 = SMRCompositeTransfer::CloudLobe2(code);
+      if (l2) {
+        Real d = ((l2 == 1) ? -hz : hz)*scale;
+        w = pr(IPM,p)*((2.0/3.0)*cos(kz*pr(IPY,p)) + (1.0/3.0)*cos(kz*(pr(IPY,p) + d)));
+      }
+      if (l1) {
+        Real d = ((l1 == 1) ? -hx : hx)*scale;
+        cxr = (2.0/3.0)*cos(kx*pr(IPX,p)) + (1.0/3.0)*cos(kx*(pr(IPX,p) + d));
+        cxi = (2.0/3.0)*sin(kx*pr(IPX,p)) + (1.0/3.0)*sin(kx*(pr(IPX,p) + d));
+        lobe1 = l1;
+      }
       w *= SQR(sx)*SQR(sz);
     }
-    re_ += w*cos(kx*pr(IPX,p));
-    im_ -= w*sin(kx*pr(IPX,p));
+    if (lobe1) {
+      re_ += w*cxr;
+      im_ -= w*cxi;
+    } else {
+      re_ += w*cos(kx*pr(IPX,p));
+      im_ -= w*sin(kx*pr(IPX,p));
+    }
   }, Kokkos::Sum<Real>(pre), Kokkos::Sum<Real>(pim));
   pdata->hdata[0] = pre;
   pdata->hdata[1] = pim;

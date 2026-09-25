@@ -51,6 +51,13 @@ void WENOZ(const Real &q_im2, const Real &q_im1, const Real &q_i, const Real &q_
   indicator[0] = SQR(tau_5 / (beta[0] + epsL));
   indicator[1] = SQR(tau_5 / (beta[1] + epsL));
   indicator[2] = SQR(tau_5 / (beta[2] + epsL));
+#ifdef ATHENAK_WENOZ_LINEAR
+  // diagnostic build: frozen ideal weights (0.1, 0.6, 0.3), i.e. the
+  // linear fifth-order upwind reconstruction
+  indicator[0] = 0.0;
+  indicator[1] = 0.0;
+  indicator[2] = 0.0;
+#endif
 
   // compute qL_ip1
   // Factor of 1/6 in coefficients of f[] array applied to alpha_sum to reduce divisions

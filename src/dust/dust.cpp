@@ -335,6 +335,17 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_force_local = pin->GetOrAddBoolean("dust", "cloud_force_local", false);
       cloud_force_children = pin->GetOrAddBoolean("dust", "cloud_force_children", false);
       cloud_gather_level = pin->GetOrAddInteger("dust", "cloud_gather_level", -1);
+      cloud_transition = pin->GetOrAddInteger("dust", "cloud_transition", 0);
+      if (cloud_transition < 0 || cloud_transition > 2 ||
+          (cloud_transition > 0 && (cloud_deform || cloud_force_local ||
+                                    cloud_force_children || cloud_gather_level >= 0)) ||
+          (cloud_transition == 2 && cloud_gather_order != 2)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<dust>/cloud_transition must be 0, 1 or 2; it excludes "
+                  << "deform/force_local/force_children/gather_level, and 2 requires "
+                  << "cloud_gather_order=2" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       if (cloud_gather_level >= 0 && (cloud_deform || cloud_force_local ||
                                       cloud_force_children)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__

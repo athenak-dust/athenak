@@ -156,6 +156,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << (cloud_deform ? ", deformable clouds (dv/dx carried)" : "")
               << (cloud_gather_level >= 0 ? ", gather footprint fixed at level " : "")
               << (cloud_gather_level >= 0 ? std::to_string(cloud_gather_level) : "")
+              << (cloud_transition > 0 ? ", P1 transition clouds (mode " +
+                  std::to_string(cloud_transition) + ")" : "")
               << (t.cloud_split_everywhere ? ", split everywhere" : "") << std::endl;
   }
 }
@@ -363,6 +365,139 @@ int DustGasDrag::SplitAndMergeClouds() {
   pmesh->nprtcl_eachrank[global_variable::my_rank] = nnew;
   pmesh->nprtcl_total = nnew;
   return nsplit;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::MakeTransitionClouds
+//! \brief P1 transition clouds.  After the split, the particle basis
+//! reproduces constants exactly but not linear fields: at every split edge the child
+//! that has a same-level neighbour on one side only (its partner would have been the
+//! child of the unsplit neighbouring parent) carries an uncancelled first moment
+//! m H/8.  Each such edge child is merged into that neighbour, which keeps its own
+//! position and takes the lobed shape (2/3) S_ell(x - x_p) + (1/3) S_ell(x - x_p -/+ ell)
+//! along that direction: the deposited density is unchanged, and the union of coarse
+//! hats, transition hats and fine hats is the P1 (FEM) basis of the graded particle
+//! lattice.  Applied once to the initial lattice; clouds split later are not processed.
+
+int DustGasDrag::MakeTransitionClouds() {
+  if (cloud_transition <= 0) return 0;
+  particles::Particles *ppar = pmy_pack->ppart;
+  Mesh *pmesh = pmy_pack->pmesh;
+  int npart = ppar->nprtcl_thispack;
+  if (npart == 0) return 0;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  const int nrdata = ppar->nrdata, nidata = ppar->nidata;
+  auto transfer = smr_transfer;
+  auto pr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
+  auto pi_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pi);
+
+  const Real x1min = transfer.x1min, x2min = transfer.x2min;
+  const Real len1 = transfer.x1max - transfer.x1min;
+  const Real len2 = transfer.x2max - transfer.x2min;
+  const int nfine1 = transfer.nfine1, nfine2 = transfer.nfine2;
+  const Real fdx1 = transfer.fine_dx1, fdx2 = transfer.fine_dx2;
+  const Real tol = cloud_merge_tolerance*std::min(fdx1, fdx2);
+  auto wrap = [](Real x, Real xmin, Real len) {
+    while (x < xmin) x += len;
+    while (x >= xmin + len) x -= len;
+    return x;
+  };
+  auto image = [](Real d, Real len) {
+    if (d < -0.5*len) d += len;
+    if (d >= 0.5*len) d -= len;
+    return d;
+  };
+  auto key = [&](Real x, Real y) {
+    int i = SMRCompositeTransfer::WrapIndex(
+        static_cast<int>(std::floor((x - x1min)/fdx1)), nfine1);
+    int j = SMRCompositeTransfer::WrapIndex(
+        static_cast<int>(std::floor((y - x2min)/fdx2)), nfine2);
+    return std::make_pair(i, j);
+  };
+  std::unordered_map<int, std::vector<int>> bins;
+  for (int p=0; p<npart; ++p) {
+    if (pi_h(PLEV,p) == 0) continue;
+    auto k = key(pr_h(IPX,p), pr_h(IPY,p));
+    bins[k.second*nfine1 + k.first].push_back(p);
+  }
+  std::vector<char> removed(npart, 0);
+  auto find_at = [&](Real x, Real y, int lev, int sp) {
+    auto k = key(x, y);
+    for (int dj=-1; dj<=1; ++dj) {
+      int wj = SMRCompositeTransfer::WrapIndex(k.second + dj, nfine2);
+      for (int di=-1; di<=1; ++di) {
+        int wi = SMRCompositeTransfer::WrapIndex(k.first + di, nfine1);
+        auto it = bins.find(wj*nfine1 + wi);
+        if (it == bins.end()) continue;
+        for (int s : it->second) {
+          if (removed[s] || SMRCompositeTransfer::CloudLevel(pi_h(PLEV,s)) != lev ||
+              pi_h(PSP,s) != sp) continue;
+          Real d1 = image(x - pr_h(IPX,s), len1), d2 = image(y - pr_h(IPY,s), len2);
+          if (d1*d1 + d2*d2 <= tol*tol) return s;
+        }
+      }
+    }
+    return -1;
+  };
+
+  int ntrans = 0;
+  for (int dir=2; dir>=1; --dir) {
+    const int shift = (dir == 2) ? SMRCompositeTransfer::kCloudLobeShift2
+                                 : SMRCompositeTransfer::kCloudLobeShift1;
+    for (int s=0; s<npart; ++s) {
+      int code = pi_h(PLEV,s);
+      int lev = SMRCompositeTransfer::CloudLevel(code);
+      if (removed[s] || lev == 0 || code != lev) continue;   // plain refined clouds only
+      Real x = pr_h(IPX,s), y = pr_h(IPY,s);
+      int sp = pi_h(PSP,s);
+      int lo, hi;
+      if (dir == 2) {
+        Real ell = transfer.CloudHalfWidth2(lev);
+        lo = find_at(x, wrap(y - ell, x2min, len2), lev, sp);
+        hi = find_at(x, wrap(y + ell, x2min, len2), lev, sp);
+      } else {
+        Real ell = transfer.CloudHalfWidth1(lev);
+        lo = find_at(wrap(x - ell, x1min, len1), y, lev, sp);
+        hi = find_at(wrap(x + ell, x1min, len1), y, lev, sp);
+      }
+      if ((lo >= 0) == (hi >= 0)) continue;
+      int c = (lo >= 0) ? lo : hi;
+      if (pi_h(PLEV,c) != lev) continue;          // neighbour is already a transition
+      // merge s into c: c keeps its position, other attributes are mass-averaged
+      Real mt = pr_h(IPM,c) + pr_h(IPM,s), wc = pr_h(IPM,s)/mt;
+      for (int col=0; col<nrdata; ++col) {
+        if (col == IPM || col == IPX || col == IPY || col == IPX1 || col == IPY1) continue;
+        pr_h(col,c) = pr_h(col,c) + wc*(pr_h(col,s) - pr_h(col,c));
+      }
+      pr_h(IPM,c) = mt;
+      pi_h(PLEV,c) = lev | (((lo >= 0) ? 2 : 1) << shift);
+      removed[s] = 1;
+      ++ntrans;
+    }
+  }
+  if (ntrans == 0) return 0;
+
+  int nnew = 0;
+  for (int p=0; p<npart; ++p) if (!removed[p]) ++nnew;
+  Kokkos::realloc(pr, nrdata, nnew);
+  Kokkos::realloc(pi, nidata, nnew);
+  auto pr_new = Kokkos::create_mirror_view(pr);
+  auto pi_new = Kokkos::create_mirror_view(pi);
+  int s = 0;
+  for (int p=0; p<npart; ++p) {
+    if (removed[p]) continue;
+    for (int c=0; c<nrdata; ++c) pr_new(c,s) = pr_h(c,p);
+    for (int c=0; c<nidata; ++c) pi_new(c,s) = pi_h(c,p);
+    ++s;
+  }
+  Kokkos::deep_copy(pr, pr_new);
+  Kokkos::deep_copy(pi, pi_new);
+  ppar->nprtcl_thispack = nnew;
+  pmesh->nprtcl_thisrank = nnew;
+  pmesh->nprtcl_eachrank[global_variable::my_rank] = nnew;
+  pmesh->nprtcl_total = nnew;
+  return ntrans;
 }
 
 } // namespace dust

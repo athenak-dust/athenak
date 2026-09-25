@@ -73,6 +73,32 @@ struct SMRCompositeTransfer {
   // nine cells allow a root cloud to sit on leaves up to two levels finer.
   static constexpr int kMaxCloudStencil = 9;
 
+  // Cloud code stored in PLEV: bits 0-3 the cloud level, bits 4-5 (x2) and 6-7 (x1) a
+  // transition lobe (0 none, 1 lower, 2 upper); bit 8 is set only on gather calls and
+  // evaluates the leaf reconstructions at the particle along lobed directions.  A
+  // transition cloud (<dust>/cloud_transition) is the rigid union of a
+  // level-lev child and the unpaired edge child next to it: along a lobed direction
+  // its shape is (2/3) S_ell(x - x_p) + (1/3) S_ell(x - x_p -/+ ell), the P1 (FEM)
+  // transition hat with half-widths ell and 2 ell, peaked at the particle.
+  static constexpr int kCloudLevelMask = 15;
+  static constexpr int kCloudLobeShift2 = 4;
+  static constexpr int kCloudLobeShift1 = 6;
+  static constexpr int kCloudGatherPoint = 256;
+  KOKKOS_INLINE_FUNCTION
+  static int CloudLevel(const int code) {return code & kCloudLevelMask;}
+  KOKKOS_INLINE_FUNCTION
+  static int CloudLobe1(const int code) {return (code >> kCloudLobeShift1) & 3;}
+  KOKKOS_INLINE_FUNCTION
+  static int CloudLobe2(const int code) {return (code >> kCloudLobeShift2) & 3;}
+  // Code handed to gathers: transition=1 gathers with the plain child hat, transition=2
+  // with the lobed weights and the point value of each leaf's linear reconstruction.
+  KOKKOS_INLINE_FUNCTION
+  static int GatherCode(const int code, const int transition) {
+    if (transition == 1) return code & kCloudLevelMask;
+    if (transition == 2) return code | kCloudGatherPoint;
+    return code;
+  }
+
   bool enabled = false;
   bool cloud_mode = false;
   int cloud_nlev = 0;                 // max_level - root_level
@@ -144,19 +170,30 @@ struct SMRCompositeTransfer {
   // Exact 1-D integrals of a hat cloud of half-width ell centred at x over the
   // consecutive virtual cells [i0, i0+count) of spacing dx.  Consecutive CDF
   // differences telescope, so the weights sum to one for any cell partition.
+  // A nonzero lobe (1 lower, 2 upper) gives the transition shape
+  // (2/3) S_ell(x - x_p) + (1/3) S_ell(x - x_p -/+ ell) instead.
   KOKKOS_INLINE_FUNCTION
   static int CloudWeights1D(const Real x, const Real ell, const Real xmin, const Real dx,
-                            int &i0, Real w[kMaxCloudStencil]) {
+                            int &i0, Real w[kMaxCloudStencil], const int lobe = 0) {
     Real inv_ell = 1.0/ell;
-    i0 = static_cast<int>(floor((x - ell - xmin)/dx));
-    int i1 = static_cast<int>(ceil((x + ell - xmin)/dx));
+    Real sl = (lobe == 1) ? -ell : ell;
+    Real lo = (lobe == 1) ? x - 2.0*ell : x - ell;
+    Real hi = (lobe == 2) ? x + 2.0*ell : x + ell;
+    i0 = static_cast<int>(floor((lo - xmin)/dx));
+    int i1 = static_cast<int>(ceil((hi - xmin)/dx));
     int count = i1 - i0;
     if (count > kMaxCloudStencil) count = kMaxCloudStencil;
     Real prev = HatCDF((xmin + i0*dx - x)*inv_ell);
+    Real prevl = lobe ? HatCDF((xmin + i0*dx - x - sl)*inv_ell) : 0.0;
     for (int a=0; a<count; ++a) {
       Real next = HatCDF((xmin + (i0 + a + 1)*dx - x)*inv_ell);
       w[a] = next - prev;
       prev = next;
+      if (lobe) {
+        Real nextl = HatCDF((xmin + (i0 + a + 1)*dx - x - sl)*inv_ell);
+        w[a] = (2.0/3.0)*w[a] + (1.0/3.0)*(nextl - prevl);
+        prevl = nextl;
+      }
     }
     return count;
   }
@@ -171,17 +208,26 @@ struct SMRCompositeTransfer {
 
   // CloudWeights1D plus the first moment g[a] = int_cell S(x) (x - x_particle) dx of the
   // unit-mass hat over each virtual cell (about the particle position, length units).
+  // With a lobe the moments are those of the transition shape about x_p; point=true
+  // (lobed directions of a cloud_transition=2 gather) returns zero moments, so that
+  // the gather takes the value of each leaf's reconstruction at the particle.
   KOKKOS_INLINE_FUNCTION
   static int CloudWeightsMoments1D(const Real x, const Real ell, const Real xmin,
                                    const Real dx, int &i0, Real w[kMaxCloudStencil],
-                                   Real g[kMaxCloudStencil]) {
+                                   Real g[kMaxCloudStencil], const int lobe = 0,
+                                   const bool point = false) {
     Real inv_ell = 1.0/ell;
-    i0 = static_cast<int>(floor((x - ell - xmin)/dx));
-    int i1 = static_cast<int>(ceil((x + ell - xmin)/dx));
+    Real sl = (lobe == 1) ? -ell : ell;
+    Real lo = (lobe == 1) ? x - 2.0*ell : x - ell;
+    Real hi = (lobe == 2) ? x + 2.0*ell : x + ell;
+    i0 = static_cast<int>(floor((lo - xmin)/dx));
+    int i1 = static_cast<int>(ceil((hi - xmin)/dx));
     int count = i1 - i0;
     if (count > kMaxCloudStencil) count = kMaxCloudStencil;
     Real s = (xmin + i0*dx - x)*inv_ell;
     Real prev = HatCDF(s), gprev = HatMoment(s);
+    Real t = lobe ? (xmin + i0*dx - x - sl)*inv_ell : 0.0;
+    Real prevl = HatCDF(t), gprevl = HatMoment(t);
     for (int a=0; a<count; ++a) {
       s = (xmin + (i0 + a + 1)*dx - x)*inv_ell;
       Real next = HatCDF(s), gnext = HatMoment(s);
@@ -189,6 +235,15 @@ struct SMRCompositeTransfer {
       g[a] = ell*(gnext - gprev);
       prev = next;
       gprev = gnext;
+      if (lobe) {
+        t = (xmin + (i0 + a + 1)*dx - x - sl)*inv_ell;
+        Real nextl = HatCDF(t), gnextl = HatMoment(t);
+        Real wl = nextl - prevl;
+        w[a] = (2.0/3.0)*w[a] + (1.0/3.0)*wl;
+        g[a] = point ? 0.0 : (2.0/3.0)*g[a] + (1.0/3.0)*(ell*(gnextl - gprevl) + sl*wl);
+        prevl = nextl;
+        gprevl = gnextl;
+      }
     }
     return count;
   }
@@ -205,11 +260,11 @@ struct SMRCompositeTransfer {
 
   KOKKOS_INLINE_FUNCTION
   Real CloudHalfWidth1(const int lev) const {
-    return root_dx1/static_cast<Real>(1 << lev);
+    return root_dx1/static_cast<Real>(1 << (lev & kCloudLevelMask));
   }
   KOKKOS_INLINE_FUNCTION
   Real CloudHalfWidth2(const int lev) const {
-    return root_dx2/static_cast<Real>(1 << lev);
+    return root_dx2/static_cast<Real>(1 << (lev & kCloudLevelMask));
   }
 
   // Cloud-integrated weights on active leaves: the virtual finest cells overlapped by
@@ -223,8 +278,10 @@ struct SMRCompositeTransfer {
     Real x2 = WrapPosition(particle_x2, x2min, x2max);
     int i0, j0;
     Real w1[kMaxCloudStencil], w2[kMaxCloudStencil];
-    int n1 = CloudWeights1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1);
-    int n2 = CloudWeights1D(x2, CloudHalfWidth2(lev), x2min, fine_dx2, j0, w2);
+    int n1 = CloudWeights1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1,
+                            CloudLobe1(lev));
+    int n2 = CloudWeights1D(x2, CloudHalfWidth2(lev), x2min, fine_dx2, j0, w2,
+                            CloudLobe2(lev));
     for (int b=0; b<n2; ++b) {
       if (w2[b] == 0.0) continue;
       int fj = WrapIndex(j0 + b, nfine2);
@@ -241,6 +298,7 @@ struct SMRCompositeTransfer {
   KOKKOS_INLINE_FUNCTION
   bool CloudInsideFiner(const Real particle_x1, const Real particle_x2, const int lev,
                         const Real slack) const {
+    if (CloudLobe1(lev) || CloudLobe2(lev)) return false;   // transition clouds stay
     if (lev >= cloud_nlev || lev >= cloud_max_level) return false;
     if (cloud_split_everywhere) return true;
     Real x1 = WrapPosition(particle_x1, x1min, x1max);
@@ -274,8 +332,11 @@ struct SMRCompositeTransfer {
     int i0, j0;
     Real w1[kMaxCloudStencil], w2[kMaxCloudStencil];
     Real g1[kMaxCloudStencil], g2[kMaxCloudStencil];
-    int n1 = CloudWeightsMoments1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1, g1);
-    int n2 = CloudWeightsMoments1D(x2, CloudHalfWidth2(lev), x2min, fine_dx2, j0, w2, g2);
+    bool point = (lev & kCloudGatherPoint) != 0;
+    int n1 = CloudWeightsMoments1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1, g1,
+                                   CloudLobe1(lev), point);
+    int n2 = CloudWeightsMoments1D(x2, CloudHalfWidth2(lev), x2min, fine_dx2, j0, w2, g2,
+                                   CloudLobe2(lev), point);
     for (int b=0; b<n2; ++b) {
       if (w2[b] == 0.0 && g2[b] == 0.0) continue;
       int fj = WrapIndex(j0 + b, nfine2);
@@ -293,7 +354,8 @@ struct SMRCompositeTransfer {
   // a leaf finer than lev (the cloud overlaps a finer region, split or not).
   KOKKOS_INLINE_FUNCTION
   bool CloudOverlapsFiner(const Real particle_x1, const Real particle_x2,
-                          const int lev) const {
+                          const int code) const {
+    const int lev = CloudLevel(code);
     if (lev >= cloud_nlev) return false;
     Real x1 = WrapPosition(particle_x1, x1min, x1max);
     Real x2 = WrapPosition(particle_x2, x2min, x2max);
@@ -567,6 +629,9 @@ class DustGasDrag {
                                       // as their 3^d two-scale children (kick unchanged)
   int cloud_gather_level = -1;        // diagnostic: >= 0 gathers every cloud with the
                                       // footprint of that level (deposit keeps the cloud)
+  int cloud_transition = 0;           // P1 transition clouds at split edges:
+                                      // 1 gathers with the child hat, 2 with the lobed
+                                      // weights and point-valued reconstructions
   bool cloud_deform = false;          // deformable clouds: each particle carries dv_i/dx_j,
                                       // split children take v + G.d, and the drag is
                                       // deposited with the linear dust velocity field
@@ -630,6 +695,7 @@ class DustGasDrag {
   void BuildSMRCompositeTransfer(ParameterInput *pin);
   void BuildRefinableCloudTransfer(ParameterInput *pin);
   int SplitAndMergeClouds();   // returns the number of clouds split
+  int MakeTransitionClouds();  // P1 transition clouds at split edges
   TaskStatus RefineClouds(Driver *pdrive, int stage);
 
   // ...in "before_timeintegrator" list
