@@ -74,7 +74,7 @@ struct SMRCompositeTransfer {
   static constexpr int kMaxCloudStencil = 9;
 
   // Cloud code stored in PLEV: bits 0-3 the cloud level, bits 4-5 (x2) and 6-7 (x1) a
-  // transition lobe (0 none, 1 lower, 2 upper); bit 8 is set only on gather calls and
+  // transition lobe (0 none, 1 lower, 2 upper, 3 both); bit 8 is set only on gather calls and
   // evaluates the leaf reconstructions at the particle along lobed directions.  A
   // transition cloud (<dust>/cloud_transition) is the rigid union of a
   // level-lev child and the unpaired edge child next to it: along a lobed direction
@@ -172,9 +172,13 @@ struct SMRCompositeTransfer {
   // differences telescope, so the weights sum to one for any cell partition.
   // A nonzero lobe (1 lower, 2 upper) gives the transition shape
   // (2/3) S_ell(x - x_p) + (1/3) S_ell(x - x_p -/+ ell) instead.
+  // Lobe 3 (both edge children attached, a parent left unsplit along this direction by
+  // the moving P1 split) is the hat of half-width 2 ell by the two-scale identity.
   KOKKOS_INLINE_FUNCTION
-  static int CloudWeights1D(const Real x, const Real ell, const Real xmin, const Real dx,
-                            int &i0, Real w[kMaxCloudStencil], const int lobe = 0) {
+  static int CloudWeights1D(const Real x, const Real ell_in, const Real xmin, const Real dx,
+                            int &i0, Real w[kMaxCloudStencil], const int lobe_in = 0) {
+    const Real ell = (lobe_in == 3) ? 2.0*ell_in : ell_in;
+    const int lobe = (lobe_in == 3) ? 0 : lobe_in;
     Real inv_ell = 1.0/ell;
     Real sl = (lobe == 1) ? -ell : ell;
     Real lo = (lobe == 1) ? x - 2.0*ell : x - ell;
@@ -212,10 +216,13 @@ struct SMRCompositeTransfer {
   // (lobed directions of a cloud_transition=2 gather) returns zero moments, so that
   // the gather takes the value of each leaf's reconstruction at the particle.
   KOKKOS_INLINE_FUNCTION
-  static int CloudWeightsMoments1D(const Real x, const Real ell, const Real xmin,
+  static int CloudWeightsMoments1D(const Real x, const Real ell_in, const Real xmin,
                                    const Real dx, int &i0, Real w[kMaxCloudStencil],
-                                   Real g[kMaxCloudStencil], const int lobe = 0,
+                                   Real g[kMaxCloudStencil], const int lobe_in = 0,
                                    const bool point = false) {
+    const bool both = (lobe_in == 3);
+    const Real ell = both ? 2.0*ell_in : ell_in;
+    const int lobe = both ? 0 : lobe_in;
     Real inv_ell = 1.0/ell;
     Real sl = (lobe == 1) ? -ell : ell;
     Real lo = (lobe == 1) ? x - 2.0*ell : x - ell;
@@ -232,7 +239,7 @@ struct SMRCompositeTransfer {
       s = (xmin + (i0 + a + 1)*dx - x)*inv_ell;
       Real next = HatCDF(s), gnext = HatMoment(s);
       w[a] = next - prev;
-      g[a] = ell*(gnext - gprev);
+      g[a] = (both && point) ? 0.0 : ell*(gnext - gprev);
       prev = next;
       gprev = gnext;
       if (lobe) {
@@ -636,7 +643,11 @@ class DustGasDrag {
                                       // split children take v + G.d, and the drag is
                                       // deposited with the linear dust velocity field
   int cloud_next_tag = -1;            // next PTAG for created particles (-1 = unset)
+  bool cloud_p1_split = false;        // moving-particle P1 split: edge children
+                                      // separate only where the neighbour parent splits,
+                                      // no merging (requires cloud_transition > 0)
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
+  unsigned long long cloud_lobe_split_count = 0;
   bool UsesCompositeTransfer() const {
     return (smr_transfer_mode == DustSMRTransfer::smooth_p2 ||
             smr_transfer_mode == DustSMRTransfer::refinable_cloud);
@@ -696,6 +707,7 @@ class DustGasDrag {
   void BuildRefinableCloudTransfer(ParameterInput *pin);
   int SplitAndMergeClouds();   // returns the number of clouds split
   int MakeTransitionClouds();  // P1 transition clouds at split edges
+  int SplitCloudsP1();         // moving-particle P1 split
   TaskStatus RefineClouds(Driver *pdrive, int stage);
 
   // ...in "before_timeintegrator" list

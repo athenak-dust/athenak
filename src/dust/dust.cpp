@@ -346,6 +346,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << "cloud_gather_order=2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
+      cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", false);
+      if (cloud_p1_split && cloud_transition == 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<dust>/cloud_p1_split requires cloud_transition=1 or 2 "
+                  << "(the gather used for transition clouds)" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       if (cloud_gather_level >= 0 && (cloud_deform || cloud_force_local ||
                                       cloud_force_children)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -492,6 +499,8 @@ DustGasDrag::~DustGasDrag() {
       smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
     std::cout << "# DUST_CLOUD_SUMMARY splits=" << cloud_split_count
               << " merges=" << cloud_merge_count
+              << (cloud_p1_split ? " lobe_splits=" + std::to_string(cloud_lobe_split_count)
+                                 : std::string())
               << " particles=" << pmy_pack->ppart->nprtcl_thispack << std::endl;
   }
   if (global_variable::my_rank == 0 && solver_stage_count > 0) {

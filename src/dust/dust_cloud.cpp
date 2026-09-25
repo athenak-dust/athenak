@@ -158,6 +158,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << (cloud_gather_level >= 0 ? std::to_string(cloud_gather_level) : "")
               << (cloud_transition > 0 ? ", P1 transition clouds (mode " +
                   std::to_string(cloud_transition) + ")" : "")
+              << (cloud_p1_split ? ", moving P1 split without merging" : "")
               << (t.cloud_split_everywhere ? ", split everywhere" : "") << std::endl;
   }
 }
@@ -180,6 +181,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
 //! column entering the fine region) and the mesh is single-rank by construction.
 
 int DustGasDrag::SplitAndMergeClouds() {
+  if (cloud_p1_split) return SplitCloudsP1();
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   int npart = ppar->nprtcl_thispack;
@@ -380,7 +382,7 @@ int DustGasDrag::SplitAndMergeClouds() {
 //! lattice.  Applied once to the initial lattice; clouds split later are not processed.
 
 int DustGasDrag::MakeTransitionClouds() {
-  if (cloud_transition <= 0) return 0;
+  if (cloud_transition <= 0 || cloud_p1_split) return 0;
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   int npart = ppar->nprtcl_thispack;
@@ -498,6 +500,207 @@ int DustGasDrag::MakeTransitionClouds() {
   pmesh->nprtcl_eachrank[global_variable::my_rank] = nnew;
   pmesh->nprtcl_total = nnew;
   return ntrans;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::SplitCloudsP1
+//! \brief Moving-particle P1 split (<dust>/cloud_p1_split), used in place
+//! of SplitAndMergeClouds.  A plain level-l cloud whose support lies on finer leaves is
+//! split, but along each direction an edge child is separated only if the lattice
+//! neighbour on that side (the virtual level-l cloud one parent spacing H away) would
+//! be split too; otherwise the edge child stays attached to the centre child as a
+//! transition lobe.  A lobed cloud separates a lobe once that neighbour becomes
+//! eligible.  Along a direction, the transition band of eligible parents with an
+//! ineligible neighbour is exactly H wide, so every lattice row holds one transition
+//! cloud whatever its phase and the particle basis stays P1 while the lattice drifts
+//! through the split surface.  Nothing is ever merged: every particle keeps its own
+//! attributes, so independent streams and stopping times are preserved.
+
+int DustGasDrag::SplitCloudsP1() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  Mesh *pmesh = pmy_pack->pmesh;
+  int npart = ppar->nprtcl_thispack;
+  if (npart == 0) return 0;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  const int nrdata = ppar->nrdata, nidata = ppar->nidata;
+  auto transfer = smr_transfer;
+  Real slack = cloud_split_slack;
+  const int sh1 = SMRCompositeTransfer::kCloudLobeShift1;
+  const int sh2 = SMRCompositeTransfer::kCloudLobeShift2;
+
+  // eligible(x, y, l): a plain level-l cloud at (x, y) would be split
+  DvceArray1D<int> flag("dust_cloud_flag", npart);
+  int nflag = 0;
+  Kokkos::parallel_reduce("dust_cloud_p1_flag",
+  Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
+  KOKKOS_LAMBDA(const int p, int &sum) {
+    const int code = pi(PLEV,p);
+    const int lev = SMRCompositeTransfer::CloudLevel(code);
+    const int l1 = SMRCompositeTransfer::CloudLobe1(code);
+    const int l2 = SMRCompositeTransfer::CloudLobe2(code);
+    const Real x = pr(IPX,p), y = pr(IPY,p);
+    int f = 0;
+    if (l1 == 0 && l2 == 0) {
+      f = transfer.CloudInsideFiner(x, y, lev, slack) ? 1 : 0;
+    } else if (lev > 0 && transfer.CloudInsideFiner(x, y, lev - 1, slack)) {
+      const Real h1 = transfer.CloudHalfWidth1(lev - 1);
+      const Real h2 = transfer.CloudHalfWidth2(lev - 1);
+      if (((l1 & 1) && transfer.CloudInsideFiner(x - h1, y, lev - 1, slack)) ||
+          ((l1 & 2) && transfer.CloudInsideFiner(x + h1, y, lev - 1, slack)) ||
+          ((l2 & 1) && transfer.CloudInsideFiner(x, y - h2, lev - 1, slack)) ||
+          ((l2 & 2) && transfer.CloudInsideFiner(x, y + h2, lev - 1, slack))) f = 1;
+    }
+    flag(p) = f;
+    sum += f;
+  }, Kokkos::Sum<int>(nflag));
+  if (nflag == 0) return 0;
+
+  auto pr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
+  auto pi_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pi);
+  auto flag_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), flag);
+  auto target_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(),
+                                                      transfer.cloud_target);
+  // host copy of the transfer for the eligibility tests (views point to host mirrors)
+  auto level_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), transfer.cloud_level);
+  if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
+
+  const Real x1min = transfer.x1min, x2min = transfer.x2min;
+  const Real len1 = transfer.x1max - transfer.x1min;
+  const Real len2 = transfer.x2max - transfer.x2min;
+  const int nfine1 = transfer.nfine1, nfine2 = transfer.nfine2;
+  const Real fdx1 = transfer.fine_dx1, fdx2 = transfer.fine_dx2;
+  const int gids = pmy_pack->gids;
+  const int ncells1 = qdep.extent_int(4);
+  const int ncells2 = qdep.extent_int(3);
+  auto wrap = [](Real x, Real xmin, Real len) {
+    while (x < xmin) x += len;
+    while (x >= xmin + len) x -= len;
+    return x;
+  };
+  auto owner_gid = [&](Real x, Real y) {
+    int fi = SMRCompositeTransfer::WrapIndex(
+        static_cast<int>(std::floor((x - x1min)/fdx1)), nfine1);
+    int fj = SMRCompositeTransfer::WrapIndex(
+        static_cast<int>(std::floor((y - x2min)/fdx2)), nfine2);
+    return gids + target_h(fj, fi)/(ncells1*ncells2);
+  };
+  // host version of SMRCompositeTransfer::CloudInsideFiner for a plain level-l cloud
+  auto eligible = [&](Real x, Real y, int lev) {
+    if (lev >= transfer.cloud_nlev || lev >= transfer.cloud_max_level) return false;
+    if (transfer.cloud_split_everywhere) return true;
+    x = wrap(x, x1min, len1);
+    y = wrap(y, x2min, len2);
+    Real r1 = (1.0 - slack)*transfer.CloudHalfWidth1(lev);
+    Real r2 = (1.0 - slack)*transfer.CloudHalfWidth2(lev);
+    int ia = static_cast<int>(std::floor((x - r1 - x1min)/fdx1));
+    int ib = static_cast<int>(std::ceil((x + r1 - x1min)/fdx1)) - 1;
+    int ja = static_cast<int>(std::floor((y - r2 - x2min)/fdx2));
+    int jb = static_cast<int>(std::ceil((y + r2 - x2min)/fdx2)) - 1;
+    for (int fj=ja; fj<=jb; ++fj) {
+      int wj = SMRCompositeTransfer::WrapIndex(fj, nfine2);
+      for (int fi=ia; fi<=ib; ++fi) {
+        if (level_h(wj, SMRCompositeTransfer::WrapIndex(fi, nfine1)) <= lev) return false;
+      }
+    }
+    return true;
+  };
+
+  // pieces of a cloud along one direction: offset (in child half-widths), fraction of
+  // the cloud's mass, lobe code.  lobe_old is the cloud's lobe set along the direction
+  // (3 for a plain parent, whose shape is the centre child with both edge children
+  // attached), sep_lo/sep_hi say which attached edge children are separated now.
+  struct Piece {Real off; Real frac; int lobe;};
+  auto pieces = [](int lobe_old, bool sep_lo, bool sep_hi, Piece out[3]) {
+    int n = 0;
+    Real total = 0.5 + 0.25*((lobe_old & 1) ? 1 : 0) + 0.25*((lobe_old & 2) ? 1 : 0);
+    bool lo = (lobe_old & 1) && sep_lo, hi = (lobe_old & 2) && sep_hi;
+    int lobe_new = lobe_old & ~((lo ? 1 : 0) | (hi ? 2 : 0));
+    Real keep = 0.5 + 0.25*((lobe_new & 1) ? 1 : 0) + 0.25*((lobe_new & 2) ? 1 : 0);
+    out[n++] = {0.0, keep/total, lobe_new};
+    if (lo) out[n++] = {-1.0, 0.25/total, 0};
+    if (hi) out[n++] = {1.0, 0.25/total, 0};
+    return n;
+  };
+
+  const int capacity = npart - nflag + 9*nflag;
+  std::vector<Real> R(static_cast<std::size_t>(nrdata)*capacity, 0.0);
+  std::vector<int> I(static_cast<std::size_t>(nidata)*capacity, 0);
+  auto rr = [&](int c, int s) -> Real& { return R[static_cast<std::size_t>(s)*nrdata + c]; };
+  auto ii = [&](int c, int s) -> int& { return I[static_cast<std::size_t>(s)*nidata + c]; };
+  int nslot = 0;
+  for (int p=0; p<npart; ++p) {
+    if (flag_h(p)) continue;
+    for (int c=0; c<nrdata; ++c) rr(c,nslot) = pr_h(c,p);
+    for (int c=0; c<nidata; ++c) ii(c,nslot) = pi_h(c,p);
+    ++nslot;
+  }
+
+  unsigned long long nparent = 0, nlobe = 0;
+  for (int p=0; p<npart; ++p) {
+    if (!flag_h(p)) continue;
+    const int code = pi_h(PLEV,p);
+    const int lev = SMRCompositeTransfer::CloudLevel(code);
+    const Real x = pr_h(IPX,p), y = pr_h(IPY,p);
+    Piece p1[3], p2[3];
+    int n1, n2, clev;
+    if (SMRCompositeTransfer::CloudLobe1(code) == 0 &&
+        SMRCompositeTransfer::CloudLobe2(code) == 0) {
+      // plain parent: children at level lev+1, edges separated where the neighbour
+      // parent is eligible as well
+      const Real h1 = transfer.CloudHalfWidth1(lev), h2 = transfer.CloudHalfWidth2(lev);
+      n1 = pieces(3, eligible(x - h1, y, lev), eligible(x + h1, y, lev), p1);
+      n2 = pieces(3, eligible(x, y - h2, lev), eligible(x, y + h2, lev), p2);
+      clev = lev + 1;
+      ++nparent;
+    } else {
+      // lobed cloud of level lev (parent level lev-1): separate the lobes whose
+      // neighbour parent has become eligible
+      const Real h1 = transfer.CloudHalfWidth1(lev - 1);
+      const Real h2 = transfer.CloudHalfWidth2(lev - 1);
+      n1 = pieces(SMRCompositeTransfer::CloudLobe1(code), eligible(x - h1, y, lev - 1),
+                  eligible(x + h1, y, lev - 1), p1);
+      n2 = pieces(SMRCompositeTransfer::CloudLobe2(code), eligible(x, y - h2, lev - 1),
+                  eligible(x, y + h2, lev - 1), p2);
+      clev = lev;
+      ++nlobe;
+    }
+    const Real e1 = transfer.CloudHalfWidth1(clev), e2 = transfer.CloudHalfWidth2(clev);
+    for (int b=0; b<n2; ++b) {
+      for (int a=0; a<n1; ++a) {
+        int s = nslot++;
+        Real cx = wrap(x + p1[a].off*e1, x1min, len1);
+        Real cy = wrap(y + p2[b].off*e2, x2min, len2);
+        for (int c=0; c<nrdata; ++c) rr(c,s) = pr_h(c,p);
+        for (int c=0; c<nidata; ++c) ii(c,s) = pi_h(c,p);
+        rr(IPX,s) = cx; rr(IPX1,s) = cx;
+        rr(IPY,s) = cy; rr(IPY1,s) = cy;
+        rr(IPM,s) = pr_h(IPM,p)*p1[a].frac*p2[b].frac;
+        ii(PLEV,s) = clev | (p1[a].lobe << sh1) | (p2[b].lobe << sh2);
+        ii(PGID,s) = owner_gid(cx, cy);
+        if (a > 0 || b > 0) ii(PTAG,s) = cloud_next_tag++;   // the centre keeps the tag
+      }
+    }
+  }
+  cloud_split_count += nparent;
+  cloud_lobe_split_count += nlobe;
+
+  int nnew = nslot;
+  Kokkos::realloc(pr, nrdata, nnew);
+  Kokkos::realloc(pi, nidata, nnew);
+  auto pr_new = Kokkos::create_mirror_view(pr);
+  auto pi_new = Kokkos::create_mirror_view(pi);
+  for (int s=0; s<nnew; ++s) {
+    for (int c=0; c<nrdata; ++c) pr_new(c,s) = rr(c,s);
+    for (int c=0; c<nidata; ++c) pi_new(c,s) = ii(c,s);
+  }
+  Kokkos::deep_copy(pr, pr_new);
+  Kokkos::deep_copy(pi, pi_new);
+  ppar->nprtcl_thispack = nnew;
+  pmesh->nprtcl_thisrank = nnew;
+  pmesh->nprtcl_eachrank[global_variable::my_rank] = nnew;
+  pmesh->nprtcl_total = nnew;
+  return nflag;
 }
 
 } // namespace dust

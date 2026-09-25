@@ -477,11 +477,20 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
       Real sz = (az == 0.0) ? 1.0 : sin(az)/az;
       int l1 = SMRCompositeTransfer::CloudLobe1(code);
       int l2 = SMRCompositeTransfer::CloudLobe2(code);
-      if (l2) {
+      // (lobe 3, both edge children attached: 1/2 at the particle, 1/4 at -/+ ell)
+      if (l2 == 3) {
+        Real d = hz*scale, z = pr(IPY,p);
+        w = pr(IPM,p)*(0.5*cos(kz*z) + 0.25*cos(kz*(z - d)) + 0.25*cos(kz*(z + d)));
+      } else if (l2) {
         Real d = ((l2 == 1) ? -hz : hz)*scale;
         w = pr(IPM,p)*((2.0/3.0)*cos(kz*pr(IPY,p)) + (1.0/3.0)*cos(kz*(pr(IPY,p) + d)));
       }
-      if (l1) {
+      if (l1 == 3) {
+        Real d = hx*scale, x = pr(IPX,p);
+        cxr = 0.5*cos(kx*x) + 0.25*cos(kx*(x - d)) + 0.25*cos(kx*(x + d));
+        cxi = 0.5*sin(kx*x) + 0.25*sin(kx*(x - d)) + 0.25*sin(kx*(x + d));
+        lobe1 = l1;
+      } else if (l1) {
         Real d = ((l1 == 1) ? -hx : hx)*scale;
         cxr = (2.0/3.0)*cos(kx*pr(IPX,p)) + (1.0/3.0)*cos(kx*(pr(IPX,p) + d));
         cxi = (2.0/3.0)*sin(kx*pr(IPX,p)) + (1.0/3.0)*sin(kx*(pr(IPX,p) + d));
