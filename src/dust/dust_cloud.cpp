@@ -526,6 +526,7 @@ int DustGasDrag::SplitCloudsP1() {
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
   auto transfer = smr_transfer;
   Real slack = cloud_split_slack;
+  const bool release = cloud_p1_release_exit;
   const int sh1 = SMRCompositeTransfer::kCloudLobeShift1;
   const int sh2 = SMRCompositeTransfer::kCloudLobeShift2;
 
@@ -543,6 +544,8 @@ int DustGasDrag::SplitCloudsP1() {
     int f = 0;
     if (l1 == 0 && l2 == 0) {
       f = transfer.CloudInsideFiner(x, y, lev, slack) ? 1 : 0;
+    } else if (lev > 0 && release && !transfer.CloudInsideFiner(x, y, lev - 1, slack)) {
+      f = 1;   // diagnostic: a lobed cloud that has left the split region releases its lobes
     } else if (lev > 0 && transfer.CloudInsideFiner(x, y, lev - 1, slack)) {
       const Real h1 = transfer.CloudHalfWidth1(lev - 1);
       const Real h2 = transfer.CloudHalfWidth2(lev - 1);
@@ -658,10 +661,11 @@ int DustGasDrag::SplitCloudsP1() {
       // neighbour parent has become eligible
       const Real h1 = transfer.CloudHalfWidth1(lev - 1);
       const Real h2 = transfer.CloudHalfWidth2(lev - 1);
-      n1 = pieces(SMRCompositeTransfer::CloudLobe1(code), eligible(x - h1, y, lev - 1),
-                  eligible(x + h1, y, lev - 1), p1);
-      n2 = pieces(SMRCompositeTransfer::CloudLobe2(code), eligible(x, y - h2, lev - 1),
-                  eligible(x, y + h2, lev - 1), p2);
+      const bool out = release && !eligible(x, y, lev - 1);
+      n1 = pieces(SMRCompositeTransfer::CloudLobe1(code), out || eligible(x - h1, y, lev - 1),
+                  out || eligible(x + h1, y, lev - 1), p1);
+      n2 = pieces(SMRCompositeTransfer::CloudLobe2(code), out || eligible(x, y - h2, lev - 1),
+                  out || eligible(x, y + h2, lev - 1), p2);
       clev = lev;
       ++nlobe;
     }

@@ -347,6 +347,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         std::exit(EXIT_FAILURE);
       }
       cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", false);
+      cloud_p1_release_exit = pin->GetOrAddBoolean("dust", "cloud_p1_release_exit", false);
       if (cloud_p1_split && cloud_transition == 0) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<dust>/cloud_p1_split requires cloud_transition=1 or 2 "

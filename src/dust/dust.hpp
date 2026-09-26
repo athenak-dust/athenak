@@ -646,6 +646,8 @@ class DustGasDrag {
   bool cloud_p1_split = false;        // moving-particle P1 split: edge children
                                       // separate only where the neighbour parent splits,
                                       // no merging (requires cloud_transition > 0)
+  bool cloud_p1_release_exit = false; // diagnostic: lobed clouds that leave the split
+                                      // region release their lobes (old-rule exit edge)
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   unsigned long long cloud_lobe_split_count = 0;
   bool UsesCompositeTransfer() const {
