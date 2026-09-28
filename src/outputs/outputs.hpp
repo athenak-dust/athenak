@@ -238,6 +238,10 @@ class BaseTypeOutput {
     tmp = dat[0];  dat[0] = dat[3];  dat[3] = tmp;
     tmp = dat[1];  dat[1] = dat[2];  dat[2] = tmp;
   }
+  inline void Swap8Bytes(void *vdat) {
+    char tmp, *dat = static_cast<char *>(vdat);
+    for (int b=0; b<4; ++b) { tmp = dat[b];  dat[b] = dat[7-b];  dat[7-b] = tmp; }
+  }
 
  protected:
   // CC output data on host with dims (n,m,k,j,i) except
@@ -349,6 +353,8 @@ class MeshVTKOutput : public BaseTypeOutput {
  public:
   MeshVTKOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
   void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+ private:
+  bool vtk_dbl;   // <outputN>/vtk_dbl: write float64 instead of the default float32
 };
 
 //----------------------------------------------------------------------------------------

@@ -5,7 +5,8 @@
 //========================================================================================
 //! \file vtk_mesh.cpp
 //! \brief writes mesh data in (legacy) vtk format.
-//! Data is written in STRUCTURED_POINTS geometry, in BINARY format, and in FLOAT type
+//! Data is written in STRUCTURED_POINTS geometry, in BINARY format, and in FLOAT type,
+//! or in DOUBLE type with <outputN>/vtk_dbl = true.
 //! Data over multiple MeshBlocks and MPI ranks is written to a single file using MPI-IO.
 
 // TODO(@user): create new communicator for MPI-IO for slicing, including only those ranks
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <cstdio>      // fwrite(), fclose(), fopen(), fnprintf(), snprintf()
 #include <cstdlib>
+#include <cstring>     // memcpy()
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -38,6 +40,9 @@ MeshVTKOutput::MeshVTKOutput(ParameterInput *pin, Mesh *pm, OutputParameters op)
   BaseTypeOutput(pin, pm, op) {
   // create new directory for this output. Comments in binary.cpp constructor explain why
   mkdir("vtk",0775);
+  // float64 data instead of the default float32: needed whenever the signal sits below
+  // float32 resolution, e.g. a linear-test perturbation of 1e-7 on an O(1) background
+  vtk_dbl = pin->GetOrAddBoolean(op.block_name, "vtk_dbl", false);
 }
 
 //----------------------------------------------------------------------------------------
@@ -54,6 +59,21 @@ MeshVTKOutput::MeshVTKOutput(ParameterInput *pin, Mesh *pm, OutputParameters op)
 
 void MeshVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   int big_end = IsBigEndian(); // =1 on big endian machine
+  // element type of the data section: float32 (default) or float64 (vtk_dbl)
+  const size_t esz = vtk_dbl ? sizeof(double) : sizeof(float);
+  const char *vtk_type = vtk_dbl ? " double" : " float";
+  // store value v as element indx of the byte buffer buf, converted and big-endian
+  auto put = [&](char *buf, int indx, Real v) {
+    if (vtk_dbl) {
+      double d = static_cast<double>(v);
+      if (!big_end) Swap8Bytes(&d);
+      std::memcpy(buf + indx*esz, &d, esz);
+    } else {
+      float f = static_cast<float>(v);
+      if (!big_end) Swap4Bytes(&f);
+      std::memcpy(buf + indx*esz, &f, esz);
+    }
+  };
   const int time_precision = std::numeric_limits<Real>::max_digits10 - 1;
   // create filename: "vtk/file_basename"."file_id"."gid"."XXXXX".vtk
   // where XXXXX = 5-digit file_number, and gid only added if specified
@@ -158,17 +178,18 @@ void MeshVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     }
     size_t header_size = msg.str().size();
 
-    // allocate 1D vector of floats used to convert and output entire 3D data
+    // allocate 1D buffer used to convert and output entire 3D data
     int nx1 = outmbs[0].oie - outmbs[0].ois + 1;
     int nx2 = outmbs[0].oje - outmbs[0].ojs + 1;
     int nx3 = outmbs[0].oke - outmbs[0].oks + 1;
-    float *data = new float[nx1*nx2*nx3];
+    char *data = new char[static_cast<size_t>(nx1)*nx2*nx3*esz];
+    MPI_Datatype mpi_etype = vtk_dbl ? MPI_DOUBLE : MPI_FLOAT;
 
     // create new datatype representing array of cells in MeshBlocks
     MPI_Datatype block;
     int bsize[3] = {nx3, nx2, nx1};      // total number of cells in MB
     int bstrt[3] = {0, 0, 0};            // i/j/k starting index of this block
-    MPI_Type_create_subarray(3,bsize,bsize,bstrt,MPI_ORDER_C,MPI_FLOAT,&block);
+    MPI_Type_create_subarray(3,bsize,bsize,bstrt,MPI_ORDER_C,mpi_etype,&block);
     MPI_Type_commit(&block);
 
     // create new datatype representing grid of MeshBlocks
@@ -176,7 +197,7 @@ void MeshVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     int gridsize[3] = {nout3, nout2, nout1};   // total number of cells over all MBs
     int mbstrt[3] = {0, 0, 0};                 // i/j/k starting index of blocks
     int mbsize[3] = {nx3, nx2, nx1};           // number of cells in blocks
-    MPI_Type_create_subarray(3,gridsize,mbsize,mbstrt,MPI_ORDER_C,MPI_FLOAT,&grid);
+    MPI_Type_create_subarray(3,gridsize,mbsize,mbstrt,MPI_ORDER_C,mpi_etype,&grid);
     MPI_Type_commit(&grid);
 
     // Loop over variables
@@ -185,7 +206,7 @@ void MeshVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       // write header this variable (SCALARS or VECTORS, name, type, color table)
       std::stringstream data_msg;
       data_msg << std::endl << "SCALARS " << outvars[n].label.c_str()
-               << " float" << std::endl
+               << vtk_type << std::endl
                << "LOOKUP_TABLE default" << std::endl;
       if (global_variable::my_rank == 0) {
         MPI_File_write(fh, data_msg.str().c_str(), data_msg.str().size(),
@@ -205,29 +226,24 @@ void MeshVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
           int jmb = (out_params.slice2 || (out_params.gid >= 0))? 0 : lloc.lx2;
           int kmb = (out_params.slice3 || (out_params.gid >= 0))? 0 : lloc.lx3;
 
-          // convert data to float and byte swap into big endian order
+          // convert data to float (or double) and byte swap into big endian order
           for (int k=0; k<nx3; ++k) {
             for (int j=0; j<nx2; ++j) {
               for (int i=0; i<nx1; ++i) {
                 int indx = i + j*indcs.nx1 + k*indcs.nx1*indcs.nx2;
-                data[indx] = static_cast<float>(outarray(n,m,k,j,i));
+                put(data, indx, outarray(n,m,k,j,i));
               }
-            }
-          }
-          if (!big_end) {
-            for (int i=0; i<(nx1*nx2*nx3); ++i) {
-              Swap4Bytes(&data[i]);
             }
           }
           // create new datatype representing this block in grid of MBs, and set file view
           int strt[3] = {kmb*nx3, jmb*nx2, imb*nx1};   // starting indices of this block
-          MPI_Type_create_subarray(3,gridsize,mbsize,strt,MPI_ORDER_C,MPI_FLOAT,&mygrid);
+          MPI_Type_create_subarray(3,gridsize,mbsize,strt,MPI_ORDER_C,mpi_etype,&mygrid);
           MPI_Type_commit(&mygrid);
-          MPI_File_set_view(fh, header_size, MPI_FLOAT, mygrid, "native", MPI_INFO_NULL);
+          MPI_File_set_view(fh, header_size, mpi_etype, mygrid, "native", MPI_INFO_NULL);
         } else {
           // if no data to be written, set file view to default
           // file view function is a collective operation, so must be called by all ranks
-          MPI_File_set_view(fh, header_size, MPI_FLOAT, grid, "native", MPI_INFO_NULL);
+          MPI_File_set_view(fh, header_size, mpi_etype, grid, "native", MPI_INFO_NULL);
         }
 
         // every rank has a MB to write, so write collectively
@@ -241,7 +257,7 @@ void MeshVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       MPI_Type_free(&mygrid);
 
       // reset view to stream of bytes in preparation for adding next data header
-      header_size += nout1*nout2*nout3*sizeof(float);
+      header_size += static_cast<size_t>(nout1)*nout2*nout3*esz;
       MPI_File_set_view(fh, header_size, MPI_BYTE, MPI_BYTE, "native", MPI_INFO_NULL);
     }  // end loop over variables
 
@@ -266,15 +282,15 @@ void MeshVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     }
     std::fprintf(pfile,"%s",msg.str().c_str());
 
-    // allocate 1D vector of floats used to convert and output entire 3D data
-    float *data = new float[nout1*nout2*nout3];
+    // allocate 1D buffer used to convert and output entire 3D data
+    char *data = new char[static_cast<size_t>(nout1)*nout2*nout3*esz];
     // Loop over variables
     int nout_vars = outvars.size();
     for (int n=0; n<nout_vars; ++n) {
       // write data type (SCALARS or VECTORS) and name
       std::stringstream data_msg;
       data_msg << std::endl << "SCALARS " << outvars[n].label.c_str()
-               << " float" << std::endl
+               << vtk_type << std::endl
                << "LOOKUP_TABLE default" << std::endl;
       std::fprintf(pfile,"%s",data_msg.str().c_str());
 
@@ -298,18 +314,15 @@ void MeshVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
               int indx = imb*indcs.nx1 + (i-ois) +
                         (jmb*indcs.nx2 + (j-ojs))*nout1 +
                         (kmb*indcs.nx3 + (k-oks))*nout1*nout2;
-              data[indx] = static_cast<float>(outarray(n,m,k-oks,j-ojs,i-ois));
+              // converted to float (or double) and swapped into big endian order
+              put(data, indx, outarray(n,m,k-oks,j-ojs,i-ois));
             }
           }
         }
       }  // end loop over MeshBlocks
 
-      // swap data for this variable into big endian order
-      if (!big_end) {
-        for (int i=0; i<(nout1*nout2*nout3); ++i) { Swap4Bytes(&data[i]); }
-      }
       // now write the data as unformatted binary
-      std::fwrite(&(data[0]), sizeof(float), nout1*nout2*nout3, pfile);
+      std::fwrite(&(data[0]), esz, nout1*nout2*nout3, pfile);
     }
     // close the output file and clean up
     std::fclose(pfile);
