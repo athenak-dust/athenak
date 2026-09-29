@@ -104,6 +104,8 @@ struct SMRCompositeTransfer {
   int cloud_nlev = 0;                 // max_level - root_level
   int cloud_max_level = 0;            // clouds are never split beyond this level
   bool cloud_split_everywhere = false; // control: split regardless of the local mesh
+  bool cloud_split_overlap = false;    // split once the (shrunk) support touches finer leaves
+                                       // instead of once it lies entirely on them
   Real root_dx1 = 0.0, root_dx2 = 0.0;
   Real fine_dx1 = 0.0, fine_dx2 = 0.0;
   DvceArray2D<int> cloud_target;      // finest virtual cell -> encoded active leaf
@@ -301,7 +303,9 @@ struct SMRCompositeTransfer {
   }
 
   // True when the support of a level-lev cloud, shrunk by slack*ell on each side, lies
-  // entirely on leaves finer than lev, i.e. the particle may be split.
+  // entirely on leaves finer than lev, i.e. the particle may be split.  With
+  // cloud_split_overlap it suffices that the shrunk support touches a finer leaf, so the
+  // finer leaves only ever see split clouds and the size transition sits on coarser cells.
   KOKKOS_INLINE_FUNCTION
   bool CloudInsideFiner(const Real particle_x1, const Real particle_x2, const int lev,
                         const Real slack) const {
@@ -316,6 +320,15 @@ struct SMRCompositeTransfer {
     int ib = static_cast<int>(ceil((x1 + r1 - x1min)/fine_dx1)) - 1;
     int ja = static_cast<int>(floor((x2 - r2 - x2min)/fine_dx2));
     int jb = static_cast<int>(ceil((x2 + r2 - x2min)/fine_dx2)) - 1;
+    if (cloud_split_overlap) {
+      for (int fj=ja; fj<=jb; ++fj) {
+        int wj = WrapIndex(fj, nfine2);
+        for (int fi=ia; fi<=ib; ++fi) {
+          if (cloud_level(wj, WrapIndex(fi, nfine1)) > lev) return true;
+        }
+      }
+      return false;
+    }
     for (int fj=ja; fj<=jb; ++fj) {
       int wj = WrapIndex(fj, nfine2);
       for (int fi=ia; fi<=ib; ++fi) {

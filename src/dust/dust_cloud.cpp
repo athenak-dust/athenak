@@ -87,6 +87,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // dust on the mixed gas mesh); cloud_split_everywhere refines the whole lattice
   t.cloud_max_level = pin->GetOrAddInteger("dust", "cloud_max_level", nlev);
   t.cloud_split_everywhere = pin->GetOrAddBoolean("dust", "cloud_split_everywhere", false);
+  t.cloud_split_overlap = pin->GetOrAddBoolean("dust", "cloud_split_overlap", false);
 
   t.cloud_target = DvceArray2D<int>("dust_cloud_target", t.nfine2, t.nfine1);
   t.cloud_level = DvceArray2D<int>("dust_cloud_level", t.nfine2, t.nfine1);
@@ -159,7 +160,9 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << (cloud_transition > 0 ? ", P1 transition clouds (mode " +
                   std::to_string(cloud_transition) + ")" : "")
               << (cloud_p1_split ? ", moving P1 split without merging" : "")
-              << (t.cloud_split_everywhere ? ", split everywhere" : "") << std::endl;
+              << (t.cloud_split_everywhere ? ", split everywhere" : "")
+              << (t.cloud_split_overlap ? ", split on first overlap with finer leaves" : "")
+              << std::endl;
   }
 }
 
@@ -600,6 +603,15 @@ int DustGasDrag::SplitCloudsP1() {
     int ib = static_cast<int>(std::ceil((x + r1 - x1min)/fdx1)) - 1;
     int ja = static_cast<int>(std::floor((y - r2 - x2min)/fdx2));
     int jb = static_cast<int>(std::ceil((y + r2 - x2min)/fdx2)) - 1;
+    if (transfer.cloud_split_overlap) {
+      for (int fj=ja; fj<=jb; ++fj) {
+        int wj = SMRCompositeTransfer::WrapIndex(fj, nfine2);
+        for (int fi=ia; fi<=ib; ++fi) {
+          if (level_h(wj, SMRCompositeTransfer::WrapIndex(fi, nfine1)) > lev) return true;
+        }
+      }
+      return false;
+    }
     for (int fj=ja; fj<=jb; ++fj) {
       int wj = SMRCompositeTransfer::WrapIndex(fj, nfine2);
       for (int fi=ia; fi<=ib; ++fi) {
