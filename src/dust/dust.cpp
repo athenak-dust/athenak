@@ -401,6 +401,16 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     omega0 = 0.0;
     is_stratified = false;
   }
+  // constant azimuthal acceleration on the particles (with the gas's const_accel2 it keeps
+  // a radially boosted 2-D r-z shearing-box equilibrium, see the streaming_linear pgen)
+  const_accel_phi = pin->GetOrAddReal("dust", "const_accel_phi", 0.0);
+  if (const_accel_phi != 0.0 &&
+      !(is_shearing_box && !pmy_pack->pmesh->three_d && pc2_only)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "<dust>/const_accel_phi requires a 2-D r-z shearing box and "
+              << "coupling=pc2" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (drag_solver != DustDragSolver::local && shear_x1) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "Coupled drag solvers require ordinary periodic boundaries; "

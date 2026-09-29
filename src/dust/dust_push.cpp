@@ -109,6 +109,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
     bool is_strat = is_stratified;
     Real qshear_ = qshear;
     Real omega0_ = omega0;
+    Real aphi = const_accel_phi;
     auto &indcs = pmy_pack->pmesh->mb_indcs;
     int is = indcs.is, js = indcs.js, ks = indcs.ks;
     int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
@@ -257,6 +258,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
           Real cxz = 2.0*h*omega0_;
           Real czx = h*(2.0-qshear_)*omega0_;
           Real det = aa*aa + cxz*czx;
+          if (aphi != 0.0) rz += h*aphi;   // constant azimuthal force (boosted frame)
           vxh = (aa*rx + cxz*rz)/det;
           vzh = (aa*rz - czx*rx)/det;
           vyh = ry/aa;

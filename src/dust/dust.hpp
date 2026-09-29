@@ -606,6 +606,7 @@ class DustGasDrag {
   bool is_shearing_box;      // <shearing_box> block present
   bool is_stratified;        // vertical gravity (3D shearing box only)
   Real qshear, omega0;       // shearing box parameters (0 if no shearing box)
+  Real const_accel_phi = 0.0; // constant azimuthal particle acceleration (2-D r-z, PC2)
   Real dt_cfl;               // particle CFL number for transport timestep
   Real taus_max;             // largest stopping time over all species
   Real taus_min;             // smallest stopping time over all species

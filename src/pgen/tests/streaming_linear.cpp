@@ -235,6 +235,36 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   Real ugx, ugp, vnx, vnp;
   SolveNSH2(omega0, qshear, ax, eps, taus, ugx, ugp, vnx, vnp);
 
+  // Optional radial Galilean boost W of the whole equilibrium (gas and dust).  In the
+  // axisymmetric shearing box a uniform radial velocity changes only the azimuthal
+  // Coriolis balance, by -(2-q) Omega W, which a constant azimuthal acceleration
+  // (2-q) Omega W on both species restores exactly; the perturbation equations are then
+  // those of the unboosted problem seen from a frame moving with -W, so the growth rate
+  // is unchanged and the frequency is Doppler shifted by kx W.  Used to hold the dust,
+  // or the eigenmode pattern, at rest relative to the mesh.
+  Real boost = pin->GetOrAddReal("problem", "boost_vx", 0.0);
+  if (boost != 0.0) {
+    Real aphi = (2.0 - qshear)*omega0*boost;
+    bool ok = pin->GetOrAddBoolean("hydro_srcterms", "const_accel2", false);
+    Real gval = ok ? pin->GetReal("hydro_srcterms", "const_accel2_val") : 0.0;
+    int gdir = ok ? pin->GetInteger("hydro_srcterms", "const_accel2_dir") : 0;
+    Real dval = pmbp->pdust->const_accel_phi;
+    if (!ok || gdir != 3 || fabs(gval - aphi) > 1.0e-12*fabs(aphi) ||
+        fabs(dval - aphi) > 1.0e-12*fabs(aphi)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "boost_vx = " << boost << " requires <hydro_srcterms> "
+                << "const_accel2 with const_accel2_dir = 3 and <dust>/const_accel_phi, both "
+                << "equal to (2-q)*omega0*boost_vx = " << aphi << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    ugx += boost;
+    vnx += boost;
+    if (global_variable::my_rank == 0) {
+      std::cout << "# streaming_linear: radial boost W = " << boost << ", gas vx = " << ugx
+                << ", dust vx = " << vnx << ", azimuthal accel = " << aphi << std::endl;
+    }
+  }
+
   // initialize gas: NSH background + eigenmode at t=0
   auto &indcs = pmy_mesh_->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
@@ -281,6 +311,9 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     std::exit(EXIT_FAILURE);
   }
   Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
+  // optional radial shift of the quiet-start lattice, in units of the (root) cell: keeps
+  // a lattice held at rest by the boost off the cell faces
+  Real lshift = pin->GetOrAddReal("problem", "lattice_shift", 0.0);
   Real rhop0 = eps*rho0;
   Real taus0 = taus;
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2;
@@ -327,7 +360,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
         int jp = sub / npar1d;
         int i = c % nroot1[m];
         int j = c / nroot1[m];
-        Real x0 = size.x1min + (static_cast<Real>(i)
+        Real x0 = size.x1min + (static_cast<Real>(i) + lshift
                   + (static_cast<Real>(ip) + 0.5)/static_cast<Real>(npar1d))*hx;
         Real z0 = size.x2min + (static_cast<Real>(j)
                   + (static_cast<Real>(jp) + 0.5)/static_cast<Real>(npar1d))*hz;
@@ -392,7 +425,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     Real dx1 = mbsize.d_view(m).dx1;
     Real dx2 = mbsize.d_view(m).dx2;
     // subcell quiet-start position: cell left edge + (ip+1/2) dx/Npar
-    Real x0 = mbsize.d_view(m).x1min + (static_cast<Real>(i)
+    Real x0 = mbsize.d_view(m).x1min + (static_cast<Real>(i) + lshift
               + (static_cast<Real>(ip) + 0.5)/static_cast<Real>(npar1d))*dx1;
     Real z0 = mbsize.d_view(m).x2min + (static_cast<Real>(j)
               + (static_cast<Real>(jp) + 0.5)/static_cast<Real>(npar1d))*dx2;
