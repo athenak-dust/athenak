@@ -311,9 +311,10 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     std::exit(EXIT_FAILURE);
   }
   Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
-  // optional radial shift of the quiet-start lattice, in units of the (root) cell: keeps
-  // a lattice held at rest by the boost off the cell faces
+  // optional radial (and vertical) shift of the quiet-start lattice, in units of the
+  // (root) cell: keeps a lattice held at rest by the boost off the cell faces
   Real lshift = pin->GetOrAddReal("problem", "lattice_shift", 0.0);
+  Real lshiftz = pin->GetOrAddReal("problem", "lattice_shift_z", 0.0);
   Real rhop0 = eps*rho0;
   Real taus0 = taus;
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2;
@@ -362,7 +363,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
         int j = c / nroot1[m];
         Real x0 = size.x1min + (static_cast<Real>(i) + lshift
                   + (static_cast<Real>(ip) + 0.5)/static_cast<Real>(npar1d))*hx;
-        Real z0 = size.x2min + (static_cast<Real>(j)
+        Real z0 = size.x2min + (static_cast<Real>(j) + lshiftz
                   + (static_cast<Real>(jp) + 0.5)/static_cast<Real>(npar1d))*hz;
         Real ce = std::cos(kx*x0), se = std::sin(kx*x0);
         Real cz = std::cos(kz*z0), sz = std::sin(kz*z0);
@@ -427,7 +428,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     // subcell quiet-start position: cell left edge + (ip+1/2) dx/Npar
     Real x0 = mbsize.d_view(m).x1min + (static_cast<Real>(i) + lshift
               + (static_cast<Real>(ip) + 0.5)/static_cast<Real>(npar1d))*dx1;
-    Real z0 = mbsize.d_view(m).x2min + (static_cast<Real>(j)
+    Real z0 = mbsize.d_view(m).x2min + (static_cast<Real>(j) + lshiftz
               + (static_cast<Real>(jp) + 0.5)/static_cast<Real>(npar1d))*dx2;
     Real ce = cos(kx*x0), se = sin(kx*x0);
     Real cz = cos(kz*z0), sz = sin(kz*z0);
