@@ -76,7 +76,9 @@ void ParticleHistoryOutput::LoadOutputData(Mesh *pm) {
   }, Kokkos::Sum<Real>(gs[0]), Kokkos::Sum<Real>(gs[1]), Kokkos::Sum<Real>(gs[2]),
      Kokkos::Sum<Real>(gs[3]), Kokkos::Sum<Real>(gs[4]), Kokkos::Sum<Real>(gs[5]),
      Kokkos::Sum<Real>(gs[6]), Kokkos::Sum<Real>(gs[7]));
-  Real escaped = (pdust != nullptr) ? pdust->escaped_mass : 0.0;
+  // the m_escaped column is kept for a file layout identical to the dust-multigrid
+  // branch (jhlim0918/athenak); this code has no outflow removal, so it is always 0
+  Real escaped = 0.0;
   Real dmax = 0.0;
   if (pdust != nullptr) {
     pdust->AssembleDustDensityNow();
