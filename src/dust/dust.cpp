@@ -38,6 +38,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     solver_r("dust_solver_r",1,1,1,1,1),
     solver_p("dust_solver_p",1,1,1,1,1),
     solver_ap("dust_solver_ap",1,1,1,1,1),
+    rho_dust("rho_dust",1,1,1,1,1),
     pmy_pack(ppack) {
   // (1) validate configuration ----------------------------------------------------------
   hydro::Hydro *phyd = pmy_pack->phydro;
@@ -324,6 +325,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   if (drag_solver != DustDragSolver::local) {
     Kokkos::realloc(solver_ap, nmb, 3, ncells3, ncells2, ncells1);
   }
+  // the deposited dust density (diagnostics/outputs, AssembleDustDensityNow)
+  Kokkos::realloc(rho_dust, nmb, 1, ncells3, ncells2, ncells1);
+  Kokkos::deep_copy(rho_dust, 0.0);
 
   // (4) allocate boundary communication objects -----------------------------------------
   pbval_qp = new MeshBoundaryValuesDep(pmy_pack, pin);
@@ -343,6 +347,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // shear-periodic remap of the u* radial ghost zones (3D shearing box only)
   if (shear_x1 && pmy_pack->pmesh->three_d) {
     psbox_us = new ShearingBoxCC(pmy_pack, pin, 3);
+  }
+  // exchanges of the deposited dust density (AssembleDustDensityNow)
+  pbval_rd = new MeshBoundaryValuesDep(pmy_pack, pin);
+  pbval_rd->InitializeBuffers(1);
+  pbval_rc = new MeshBoundaryValuesCC(pmy_pack, pin, false);
+  pbval_rc->InitializeBuffers(1);
+  if (shear_x1 && pmy_pack->pmesh->three_d) {
+    psbox_rc = new ShearingBoxCC(pmy_pack, pin, 1);
   }
 }
 
@@ -402,6 +414,9 @@ DustGasDrag::~DustGasDrag() {
   if (pbval_solver_copy != nullptr) delete pbval_solver_copy;
   if (pbval_solver_add != nullptr) delete pbval_solver_add;
   if (psbox_us != nullptr) {delete psbox_us;}
+  if (pbval_rd != nullptr) {delete pbval_rd;}
+  if (pbval_rc != nullptr) {delete pbval_rc;}
+  if (psbox_rc != nullptr) {delete psbox_rc;}
 }
 
 //----------------------------------------------------------------------------------------

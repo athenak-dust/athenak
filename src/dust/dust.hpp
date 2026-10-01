@@ -175,6 +175,7 @@ class DustGasDrag {
   DvceArray5D<Real> solver_r;   // coupled-solver residual
   DvceArray5D<Real> solver_p;   // PCG search direction
   DvceArray5D<Real> solver_ap;  // matrix-free A*x / A*p work field
+  DvceArray5D<Real> rho_dust;   // nvar=1: PM dust mass density (deposit kernel + exchanges)
 
   // Boundary communication objects
   MeshBoundaryValuesDep *pbval_qp;  // additive exchange of (Q,P) ghost deposits
@@ -183,6 +184,9 @@ class DustGasDrag {
   ShearingBoxCC *psbox_us = nullptr;  // shear-periodic remap of u* x1 ghost zones (3D)
   MeshBoundaryValuesCC *pbval_solver_copy = nullptr;
   MeshBoundaryValuesDep *pbval_solver_add = nullptr;
+  MeshBoundaryValuesDep *pbval_rd = nullptr;  // additive exchange of rho_dust deposits
+  MeshBoundaryValuesCC  *pbval_rc = nullptr;  // copy exchange filling rho_dust ghosts
+  ShearingBoxCC *psbox_rc = nullptr;          // shear remap of the rho_dust x1 ghosts
 
   // Cumulative rank-local timing and globally consistent iteration diagnostics.
   unsigned long long solver_stage_count = 0;
@@ -220,6 +224,10 @@ class DustGasDrag {
   // Must be public because NVCC extended host/device lambdas cannot be enclosed by a
   // private or protected member function.
   void RefreshStoppingTimeMaximum();  // validate IPTS; refresh taus_max when requested
+  // the dust density as the module deposits it (dust_density.cpp): for diagnostics and
+  // outputs (dust_dpm, phst, user histories), outside the stage task lists
+  void DepositMass();                // rho_dust = sum m W / V on active cells + halo
+  void AssembleDustDensityNow();     // synchronous deposit + exchanges
   // ...in "before_stagen" list
   TaskStatus InitRecvDep(Driver *pdrive, int stage);
   // ...in "stagen" list

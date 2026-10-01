@@ -40,6 +40,7 @@ add_executable(
         driver/driver.cpp
 
         dust/dust.cpp
+        dust/dust_density.cpp
         dust/dust_newdt.cpp
         dust/dust_pm.cpp
         dust/dust_push.cpp
