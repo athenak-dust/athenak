@@ -11,6 +11,14 @@
 
 #include "z4c/z4c.hpp"
 
+// Diagnostic build option: -DATHENAK_PROLONG_UNLIMITED replaces the min-mod limited slope
+// of ProlongCC by the unlimited central slope (used to attribute SMR interface errors).
+#ifdef ATHENAK_PROLONG_UNLIMITED
+#define PROLONG_CC_SLOPE(dl, dr) (0.125*((dl) + (dr)))
+#else
+#define PROLONG_CC_SLOPE(dl, dr) (0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr)))
+#endif
+
 //----------------------------------------------------------------------------------------
 //! \fn ProlongCC()
 //! \brief 2nd-order (piecewise-linear) prolongation operator for cell-centered variables
@@ -23,14 +31,14 @@ void ProlongCC(const int m, const int v, const int k, const int j, const int i,
   // calculate x1-gradient using the min-mod limiter
   Real dl = ca(m,v,k,j,i  ) - ca(m,v,k,j,i-1);
   Real dr = ca(m,v,k,j,i+1) - ca(m,v,k,j,i  );
-  Real dvar1 = 0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr));
+  Real dvar1 = PROLONG_CC_SLOPE(dl, dr);
 
   // calculate x2-gradient using the min-mod limiter
   Real dvar2 = 0.0;
   if (multi_d) {
     dl = ca(m,v,k,j  ,i) - ca(m,v,k,j-1,i);
     dr = ca(m,v,k,j+1,i) - ca(m,v,k,j  ,i);
-    dvar2 = 0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr));
+    dvar2 = PROLONG_CC_SLOPE(dl, dr);
   }
 
   // calculate x1-gradient using the min-mod limiter
@@ -38,7 +46,7 @@ void ProlongCC(const int m, const int v, const int k, const int j, const int i,
   if (three_d) {
     dl = ca(m,v,k  ,j,i) - ca(m,v,k-1,j,i);
     dr = ca(m,v,k+1,j,i) - ca(m,v,k  ,j,i);
-    dvar3 = 0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr));
+    dvar3 = PROLONG_CC_SLOPE(dl, dr);
   }
 
   // interpolate to the finer grid
