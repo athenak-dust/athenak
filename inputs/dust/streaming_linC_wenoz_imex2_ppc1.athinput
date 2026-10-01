@@ -1,0 +1,148 @@
+# AthenaK input: the "linC" linear streaming-instability test of Bai & Stone (2010, ApJS 190,
+# 297; Table 2 / Appendix).  Code: github.com/athenak-dust/athenak, branch si-linmode (the
+# problem generator src/pgen/tests/streaming_linear.cpp; needs the phst, dust_dpm and vtk_dbl
+# outputs of that branch).  Reproduces the 2026-09-29 run on the jhlim0918/athenak fork
+# (branch dust-multigrid, commit eb5c7129): the dust side (particles, deposits, dust_dpm
+# dumps, phst, the dust history columns) to every digit, the gas to machine round-off
+# (|drho| <= 3e-16 after 20 steps; that branch's hydro carries later upstream commits).
+#
+# Mode: tau_s = 0.01, eps = 2, K_x = K_z = 1500 (K = k eta r), eta v_K / c_s = 0.05.
+# Linear growth rate s = 0.5980690 Omega, omega_R = 0.1049236 Omega (e-folding 1.67/Omega).
+# Units: Omega = c_s = rho_g0 = 1, eta v_K = 0.05 (eta r = 0.05), so k_x = k_z = 30000 and the
+# box is ONE wavelength square, L = 2 pi / 30000.  Cells per wavelength = mesh nx1 = nx2 = 256.
+# The seeded eigenvector (below, code units) is the full-precision solution of the 8x8
+# two-fluid linear problem (YG05/YJ07), matching Bai & Stone Table 2 to all printed digits,
+# scaled to drho_p/rho_p = 1e-6.
+#
+# Scheme: WENO-Z reconstruction, HLLE Riemann solver, IMEX2+ integrator with IMEX dust
+# coupling, CFL 0.25, 1 particle per cell, TSC deposit.  (WENO-Z with an rk2-type step was
+# unstable at CFL 0.4 in our linB tests; 0.25-0.3 is safe.)
+#
+# Diagnostics: <problem>/user_hist = true writes the complex Fourier projection of the dust
+# density (cols 3-4), gas density (5-6) and gas radial momentum (7-8) onto the seeded mode to
+# <basename>.user.hst, plus max amplitudes of all perturbed quantities (cols 9-16); the growth
+# rate is a fit of ln|projection|.  vtk_dbl = true writes float64 dumps (needed: the gas
+# density perturbation is only ~5e-13).
+#
+# Result (256 ranks, 16^2 MeshBlocks, ~8.7 h on AMD EPYC 9825): dust, gas density and gas
+# momentum all grow at 99.7-99.9% of s over t = 0.2-8.  Beyond t ~ 8.5-9 the mode's own
+# nonlinearity (k*xi ~ 0.05-0.1) ends the linear phase; at 1 ppc thin ring-like moire fringes
+# in the dust deposit also appear from t ~ 7.5 (weaker at 4 ppc).  Fit growth rates over t <= 8.
+#
+# Run:  mpirun -np 256 athena -i streaming_linC_wenoz_imex2_ppc1.athinput
+# (any rank count dividing the 256 MeshBlocks works; dt = 2.04e-7, 4.9e7 steps to t = 10)
+
+<comment>
+problem   = Bai & Stone (2010) linC streaming-instability test, K_x = K_z = 1500, tau_s = 0.01, eps = 2
+
+<job>
+basename  = si_linC
+
+<mesh>
+nghost    = 3
+nx1       = 256           # = cells per wavelength
+x1min     = -0.00010471975511965977
+x1max     = 0.00010471975511965977
+ix1_bc    = periodic
+ox1_bc    = periodic
+nx2       = 256
+x2min     = -0.00010471975511965977
+x2max     = 0.00010471975511965977
+ix2_bc    = periodic
+ox2_bc    = periodic
+nx3       = 1
+x3min     = -0.5
+x3max     = 0.5
+ix3_bc    = periodic
+ox3_bc    = periodic
+
+<meshblock>
+nx1       = 16            # 256 MeshBlocks; the run used 256 MPI ranks
+nx2       = 16
+nx3       = 1
+
+<time>
+evolution  = dynamic
+integrator = imex2+       # rk2 with dust/coupling = pc2
+cfl_number = 0.25
+nlim       = -1
+tlim       = 10.0         # 1/Omega
+ndiag      = 100000
+
+<hydro>
+eos         = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver     = hlle
+
+<hydro_srcterms>
+const_accel     = true
+const_accel_val = 0.1     # = 2*omega0*etavk
+const_accel_dir = 1
+
+<shearing_box>
+qshear    = 1.5
+omega0    = 1.0
+
+<particles>
+particle_type = dust
+pusher        = imex_dust
+ppc           = 1.0       # 1 particle per cell (as Bai & Stone 2010)
+
+<dust>
+coupling      = imex      # pc2 + time/integrator = rk2 gives identical results here, 1.6x faster
+nspecies      = 1
+taus_1        = 0.01
+dust_to_gas   = 2.0
+back_reaction = true
+deposit       = tsc
+gamma_switch  = false
+dt_cfl        = 0.5
+drag_solver   = local
+
+<problem>
+pgen_name  = streaming_linear
+user_hist  = true
+rho0       = 1.0
+etavk      = 0.05
+eps        = 2.0
+kx         = 30000.0
+kz         = 30000.0
+omega_re   = 0.10492362062982848  # reference only (unused at t = 0)
+# eigenvector, drho_p/rho_p = 1e-6, in code units
+drhog_re   = 8.684871615830304e-14
+drhog_im   = 5.350037142681756e-13
+dugx_re    = -7.993753113121934e-09
+dugx_im    = 3.983454888259487e-10
+dugp_re    = 5.822115884455827e-09
+dugp_im    = 6.118866087619584e-10
+dugz_re    = 7.993753083460543e-09
+dugz_im    = -3.9834560411180504e-10
+drhop_re   = 2e-06
+dvpx_re    = -7.835868333850584e-09
+dvpx_im    = 1.4418331164018565e-10
+dvpp_re    = 5.798911099509231e-09
+dvpp_im    = 8.057262102120806e-10
+dvpz_re    = 7.950475664428487e-09
+dvpz_im    = -1.2424767948398947e-10
+
+<output1>
+file_type  = hst
+dt         = 0.02
+data_format = %.14e
+
+<output2>
+file_type  = phst
+dt         = 0.02
+
+<output3>
+file_type  = vtk          # particle-mesh dust density
+variable   = dust_dpm
+dt         = 0.1
+vtk_dbl    = true
+
+<output4>
+file_type  = vtk          # gas primitives
+variable   = hydro_w
+dt         = 0.1
+vtk_dbl    = true
