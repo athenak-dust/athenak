@@ -21,7 +21,7 @@
     #error NHISTORY > NREDUCTION in outputs.hpp
 #endif
 
-#define NOUTPUT_CHOICES 154
+#define NOUTPUT_CHOICES 155
 // choices for output variables used in <ouput> blocks in input file
 // TO ADD MORE CHOICES:
 //   - add more strings to array below, change NOUTPUT_CHOICES above appropriately
@@ -98,7 +98,9 @@ static const char *var_choice[NOUTPUT_CHOICES] = {
   "tmunu",
 
   // Particles (151-153)
-  "prtcl_all", "prtcl_d", "dust_d"
+  "prtcl_all", "prtcl_d", "dust_d",
+  // Dust particle-mesh density with the module's deposit kernel and ghost exchange (154)
+  "dust_dpm"
 };
 
 

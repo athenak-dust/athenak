@@ -176,6 +176,13 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl << "Input file is likely missing a <dust> block" << std::endl;
     exit(EXIT_FAILURE);
   }
+  if ((ivar==154) && (pm->pmb_pack->pdust == nullptr)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+       << "Output variable 'dust_dpm' requested in <output> block '"
+       << out_params.block_name << "' but no dust object has been constructed."
+       << std::endl << "Input file is likely missing a <dust> block" << std::endl;
+    exit(EXIT_FAILURE);
+  }
 
   // Now load STL vector of output variables
   outvars.clear();
@@ -717,6 +724,13 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     out_params.contains_derived = true;
     out_params.n_derived += 1;
     outvars.emplace_back("dustd",0,&(derived_var));
+  }
+  // dust mass density as the module deposits it (its kernel, ghost deposits exchanged):
+  // the density the drag coupling actually sees
+  if (out_params.variable.compare("dust_dpm") == 0) {
+    out_params.contains_derived = true;
+    out_params.n_derived += 1;
+    outvars.emplace_back("dustdpm",0,&(derived_var));
   }
 
   // initialize vector containing number of output MBs per rank

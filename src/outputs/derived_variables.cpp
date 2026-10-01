@@ -29,6 +29,7 @@
 #include "radiation/radiation.hpp"
 #include "radiation/radiation_tetrad.hpp"
 #include "particles/particles.hpp"
+#include "dust/dust.hpp"
 #include "outputs.hpp"
 #include "utils/current.hpp"
 
@@ -1271,6 +1272,20 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
         kp = (pr(IPZ,p) - size.d_view(m).x3min)/size.d_view(m).dx3 + ks;
       }
       Kokkos::atomic_add(&pdens(m,0,kp,jp,ip), 1.0);
+    });
+  }
+
+  // particle-mesh dust density with the module's own kernel and ghost exchange: the
+  // density the drag coupling sees (collective: AssembleDustDensityNow)
+  if (name.compare("dust_dpm") == 0) {
+    Kokkos::realloc(derived_var, nmb_alloc, 1, n3, n2, n1);
+    auto ddens = derived_var;
+    dust::DustGasDrag *pdust = pm->pmb_pack->pdust;
+    pdust->AssembleDustDensityNow();
+    auto &rhod = pdust->rho_dust;
+    par_for("ddens_pm", DevExeSpace(), 0, (nmb-1), ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      ddens(m,0,k,j,i) = rhod(m,0,k,j,i);
     });
   }
 
