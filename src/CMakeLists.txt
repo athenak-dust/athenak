@@ -107,6 +107,7 @@ add_executable(
         outputs/eventlog.cpp
         outputs/formatted_table.cpp
         outputs/history.cpp
+        outputs/particle_history.cpp
         outputs/restart.cpp
         outputs/spherical_surface.cpp
         outputs/coarsened_binary.cpp

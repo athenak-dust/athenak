@@ -90,6 +90,7 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       // set output variable and optional file id (default is output variable name)
       // but only for those output types that use them
       if (opar.file_type.compare("hst") != 0 &&
+          opar.file_type.compare("phst") != 0 &&
           opar.file_type.compare("rst") != 0 &&
           opar.file_type.compare("log") != 0 &&
           opar.file_type.compare("trk") != 0) {
@@ -181,6 +182,7 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
 
       // set output variable and optional file id (default is output variable name)
       if (opar.file_type.compare("hst") != 0 &&
+          opar.file_type.compare("phst") != 0 &&
           opar.file_type.compare("rst") != 0 &&
           opar.file_type.compare("log") != 0) {
         opar.variable = pin->GetString(opar.block_name, "variable");
@@ -237,6 +239,9 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
         pout_list.insert(pout_list.begin(),pnode);
       } else if (opar.file_type.compare("pvtk") == 0) {
         pnode = new ParticleVTKOutput(pin,pm,opar);
+        pout_list.insert(pout_list.begin(),pnode);
+      } else if (opar.file_type.compare("phst") == 0) {
+        pnode = new ParticleHistoryOutput(pin,pm,opar);
         pout_list.insert(pout_list.begin(),pnode);
       } else if (opar.file_type.compare("trk") == 0) {
         pnode = new TrackedParticleOutput(pin,pm,opar);

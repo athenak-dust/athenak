@@ -292,6 +292,23 @@ class HistoryOutput : public BaseTypeOutput {
 };
 
 //----------------------------------------------------------------------------------------
+//! \class ParticleHistoryOutput
+//  \brief particle history (file_type = phst): global sums and per-species means and
+//  dispersions of positions and velocities (dust track; Athena-C dump_particle_history)
+
+class ParticleHistoryOutput : public BaseTypeOutput {
+ public:
+  ParticleHistoryOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
+  void LoadOutputData(Mesh *pm) override;
+  void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+ private:
+  void AdvanceTime(Mesh *pm, ParameterInput *pin);
+  int nspecies_;
+  bool header_written_;
+  std::vector<Real> global_, sums1_, means_, sums2_;
+};
+
+//----------------------------------------------------------------------------------------
 //! \class CoarsenedBinaryOutput
 //  \brief derived BaseTypeOutput class for coarsened binary grid data
 
