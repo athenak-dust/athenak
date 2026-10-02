@@ -179,6 +179,11 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     snapshot_basename_ = pin->GetString("job", "basename");
     snapshot_number_ = 0;
   }
+  if (restart && pin->GetOrAddBoolean("problem", "prescribed_gas", false)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<problem>/prescribed_gas (diagnostic) requires a fresh run" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (restart) return;
 
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
@@ -289,6 +294,55 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     u0(m,IM2,k,j,i) = rho*uz;   // vertical (x2) component
     u0(m,IM3,k,j,i) = rho*up;   // azimuthal component
   });
+
+  // Diagnostic prescribed gas: the gas is the analytic
+  // eigenmode at all times, as cell averages over every cell (ghosts included),
+  //   f(x,z,t) = [Re f~ cos(kx x - wR t) - Im f~ sin(kx x - wR t)] e^{st} cos(kz z)
+  // (odd fields with sin(kz z)); products rho*u are formed from the cell averages (the
+  // neglected sub-cell covariance is second order in the perturbation).  The dust is
+  // advanced by the usual PC2 gather and kick against this field and does not act on
+  // the gas (back_reaction = false).  Requires coupling = pc2 and no boost.
+  if (pin->GetOrAddBoolean("problem", "prescribed_gas", false)) {
+    auto *pdust = pmbp->pdust;
+    if (pdust->back_reaction || pdust->coupling != DustCoupling::hybrid ||
+        pdust->hybrid_force_mode != HybridForceMode::pc2 || boost != 0.0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<problem>/prescribed_gas requires <dust>/back_reaction = "
+                << "false, <dust>/coupling = pc2 and boost_vx = 0" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    Real srate = pin->GetReal("problem", "growth_rate");
+    Real wrate = pin->GetReal("problem", "omega_re");
+    int nmb_ = nmb;
+    int is_ = is, js_ = js;
+    auto mbsize_ = mbsize;
+    pdust->prescribed_gas = [=](Real t, DvceArray5D<Real> &u) {
+      Real amp = std::exp(srate*t), phase = wrate*t;
+      int n2 = u.extent_int(2), n3 = u.extent_int(3), n4 = u.extent_int(4);
+      par_for("prescribed_gas", DevExeSpace(), 0, nmb_-1, 0, n2-1, 0, n3-1, 0, n4-1,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        Real dx = mbsize_.d_view(m).dx1, dz = mbsize_.d_view(m).dx2;
+        Real xc = mbsize_.d_view(m).x1min + (i - is_ + 0.5)*dx;
+        Real zc = mbsize_.d_view(m).x2min + (j - js_ + 0.5)*dz;
+        // cell average of cos/sin(k x + c) = cos/sin(k x_c + c) sin(k dx/2)/(k dx/2)
+        Real fx = sin(0.5*kx*dx)/(0.5*kx*dx), fz = sin(0.5*kz*dz)/(0.5*kz*dz);
+        Real ce = amp*fx*cos(kx*xc - phase), se = amp*fx*sin(kx*xc - phase);
+        Real cz = fz*cos(kz*zc), sz = fz*sin(kz*zc);
+        Real rho = rho0 + (Agr*ce - Agi*se)*cz;
+        Real ux  = ugx  + (Uxr*ce - Uxi*se)*cz;
+        Real up  = ugp  + (Upr*ce - Upi*se)*cz;
+        Real uz  =      - (Uzr*se + Uzi*ce)*sz;
+        u(m,IDN,k,j,i) = rho;
+        u(m,IM1,k,j,i) = rho*ux;
+        u(m,IM2,k,j,i) = rho*uz;
+        u(m,IM3,k,j,i) = rho*up;
+      });
+    };
+    if (global_variable::my_rank == 0) {
+      std::cout << "# streaming_linear: prescribed analytic gas (s = " << srate
+                << ", wR = " << wrate << "), dust back-reaction off" << std::endl;
+    }
+  }
 
   // initialize particles: quiet-start lattice displaced radially to imprint the dust
   // density wave, with velocities = NSH + eigenmode evaluated at the unperturbed

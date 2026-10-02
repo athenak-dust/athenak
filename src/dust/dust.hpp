@@ -18,6 +18,7 @@
 //! Hydro and MHD: it owns the combined task graph, the deposited fields, and the drag
 //! kernels, while particle storage/migration stays in Particles and fluxes/BCs in Hydro.
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -664,6 +665,12 @@ class DustGasDrag {
                                       // region release their lobes (old-rule exit edge)
   bool cloud_split_log = false;       // diagnostic: log every P1 split event (parent,
                                       // children, leaf deposit audit) to a text file
+  // Diagnostic prescribed gas (set by a problem generator, e.g. <problem>/prescribed_gas
+  // of streaming_linear): fills the gas conserved variables of every cell, ghosts
+  // included, with a prescribed state at time t.  With PC2 and back_reaction=false the
+  // stage-2 midpoint gas velocity seen by the dust is formed from the prescribed states
+  // at t and t+dt, and the gas is reset to the prescribed state at the end of each step.
+  std::function<void(Real, DvceArray5D<Real>&)> prescribed_gas;
   unsigned long long cloud_split_event = 0;
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   unsigned long long cloud_lobe_split_count = 0;

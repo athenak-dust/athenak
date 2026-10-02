@@ -39,6 +39,11 @@ TaskStatus DustGasDrag::FirstTwoImpRK(Driver *pdrive, int stage) {
     // velocity before RKUpdate(2) overwrites u0.  Include ghosts so PC2 needs no second
     // mesh exchange for its midpoint gather.
     if (hybrid_mode == HybridMode::pc2) {
+      if (prescribed_gas) {
+        // diagnostic prescribed gas: the step-start state and the end-of-step state
+        prescribed_gas(pmy_pack->pmesh->time, phyd->u1);
+        prescribed_gas(pmy_pack->pmesh->time + pmy_pack->pmesh->dt, phyd->u0);
+      }
       int nmb1 = pmy_pack->nmb_thispack - 1;
       int ni = phyd->u0.extent_int(4);
       int nj = phyd->u0.extent_int(3);

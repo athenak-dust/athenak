@@ -678,6 +678,12 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
 //! R_g = dmom/(a_impl*dt) consumed by AddDragHistoryGas at the next stage.
 
 TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
+  if (prescribed_gas && coupling == DustCoupling::hybrid && stage == 2 &&
+      ActiveStage(pdrive, stage)) {
+    // diagnostic prescribed gas (back_reaction=false): reset the gas to the prescribed
+    // end-of-step state before the boundary tail
+    prescribed_gas(pmy_pack->pmesh->time + pmy_pack->pmesh->dt, pmy_pack->phydro->u0);
+  }
   if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
 
   if (coupling == DustCoupling::hybrid) {
