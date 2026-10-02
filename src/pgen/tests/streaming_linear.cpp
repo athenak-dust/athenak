@@ -323,11 +323,38 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   // root-level cloud per root cell, ppc sub-lattice inside it), independent of the
   // local refinement.  Clouds lying inside the fine region are then split by the exact
   // two-scale rule, exactly as they will be at run time, so the refined lattice is
-  // built by the same rule as the dynamics.  Every particle keeps its analytic seed
-  // (displacement and velocity) from its parent's lattice site.
+  // built by the same rule as the dynamics.  By default every particle keeps its
+  // analytic seed (displacement and velocity) from its parent's lattice site, so a finer
+  // region starts with the seed sampled at the root spacing.  With
+  // <problem>/seed_after_split = true the unperturbed root lattice is split first and
+  // every particle then receives the seed at its own lattice site (diagnostic).
   cloud_mode_ = (pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud);
   if (cloud_mode_) {
     auto &transfer = pmbp->pdust->smr_transfer;
+    const bool seed_after = pin->GetOrAddBoolean("problem", "seed_after_split", false);
+    // analytic LinA seed of the particle at lattice site (x0, z0)
+    auto imprint = [&](auto &h, int p, Real x0, Real z0) {
+      Real ce = std::cos(kx*x0), se = std::sin(kx*x0);
+      Real cz = std::cos(kz*z0), sz = std::sin(kz*z0);
+      h(IPX,p) = x0 - (Apr/(kx*rhop0))*se*cz;
+      h(IPY,p) = z0;
+      h(IPX1,p) = h(IPX,p);
+      h(IPY1,p) = z0;
+      h(IPVX,p) = vnx + (Vxr*ce - Vxi*se)*cz;
+      h(IPVY,p) =     - (Vzr*se + Vzi*ce)*sz;
+      h(IPVZ,p) = vnp + (Vpr*ce - Vpi*se)*cz;
+      h(IPVX1,p) = h(IPVX,p);
+      h(IPVY1,p) = h(IPVY,p);
+      h(IPVZ1,p) = h(IPVZ,p);
+      if (ppar->nrdata > IPGZY) {   // deformable clouds: analytic velocity gradient
+        h(IPGXX,p) = -kx*(Vxr*se + Vxi*ce)*cz;
+        h(IPGXY,p) = -kz*(Vxr*ce - Vxi*se)*sz;
+        h(IPGYX,p) = -kx*(Vzr*ce - Vzi*se)*sz;
+        h(IPGYY,p) = -kz*(Vzr*se + Vzi*ce)*cz;
+        h(IPGZX,p) = -kx*(Vpr*se + Vpi*ce)*cz;
+        h(IPGZY,p) = -kz*(Vpr*ce - Vpi*se)*sz;
+      }
+    };
     cloud_root_dx1_ = transfer.root_dx1;
     cloud_root_dx2_ = transfer.root_dx2;
     Real hx = transfer.root_dx1, hz = transfer.root_dx2;
@@ -365,32 +392,24 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
                   + (static_cast<Real>(ip) + 0.5)/static_cast<Real>(npar1d))*hx;
         Real z0 = size.x2min + (static_cast<Real>(j) + lshiftz
                   + (static_cast<Real>(jp) + 0.5)/static_cast<Real>(npar1d))*hz;
-        Real ce = std::cos(kx*x0), se = std::sin(kx*x0);
-        Real cz = std::cos(kz*z0), sz = std::sin(kz*z0);
         hi(PGID,p) = gids + m;
         hi(PTAG,p) = p;
         hi(PSP,p) = 0;
         hi(PLEV,p) = 0;
         for (int col=0; col<ppar->nrdata; ++col) hr(col,p) = 0.0;
-        hr(IPX,p) = x0 - (Apr/(kx*rhop0))*se*cz;
-        hr(IPY,p) = z0;
-        hr(IPX1,p) = hr(IPX,p);
-        hr(IPY1,p) = z0;
         hr(IPTS,p) = taus0;
         hr(IPM,p) = eps*rho0*hx*hz/ppc;
-        hr(IPVX,p) = vnx + (Vxr*ce - Vxi*se)*cz;
-        hr(IPVY,p) =     - (Vzr*se + Vzi*ce)*sz;
-        hr(IPVZ,p) = vnp + (Vpr*ce - Vpi*se)*cz;
-        hr(IPVX1,p) = hr(IPVX,p);
-        hr(IPVY1,p) = hr(IPVY,p);
-        hr(IPVZ1,p) = hr(IPVZ,p);
-        if (ppar->nrdata > IPGZY) {   // deformable clouds: analytic velocity gradient
-          hr(IPGXX,p) = -kx*(Vxr*se + Vxi*ce)*cz;
-          hr(IPGXY,p) = -kz*(Vxr*ce - Vxi*se)*sz;
-          hr(IPGYX,p) = -kx*(Vzr*ce - Vzi*se)*sz;
-          hr(IPGYY,p) = -kz*(Vzr*se + Vzi*ce)*cz;
-          hr(IPGZX,p) = -kx*(Vpr*se + Vpi*ce)*cz;
-          hr(IPGZY,p) = -kz*(Vpr*ce - Vpi*se)*sz;
+        if (seed_after) {   // unperturbed lattice; the seed is imprinted after the split
+          hr(IPX,p) = x0;
+          hr(IPY,p) = z0;
+          hr(IPX1,p) = x0;
+          hr(IPY1,p) = z0;
+          hr(IPVX,p) = vnx;
+          hr(IPVZ,p) = vnp;
+          hr(IPVX1,p) = vnx;
+          hr(IPVZ1,p) = vnp;
+        } else {
+          imprint(hr, p, x0, z0);
         }
       }
     }
@@ -404,11 +423,41 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     // still finer region
     while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
     int ntrans = pmbp->pdust->MakeTransitionClouds();
+    if (seed_after) {
+      auto h2 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
+      auto i2 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pi);
+      const auto &msz = pmy_mesh_->mesh_size;
+      const Real len1 = msz.x1max - msz.x1min, len2 = msz.x2max - msz.x2min;
+      for (int p=0; p<ppar->nprtcl_thispack; ++p) {
+        imprint(h2, p, h2(IPX,p), h2(IPY,p));
+        Real x = h2(IPX,p), z = h2(IPY,p);
+        if (x < msz.x1min) x += len1;
+        if (x >= msz.x1max) x -= len1;
+        h2(IPX,p) = x;
+        h2(IPX1,p) = x;
+        int owner = -1;
+        for (int m=0; m<nmb && owner<0; ++m) {
+          const auto &size = mbsize.h_view(m);
+          if (x >= size.x1min && x < size.x1max && z >= size.x2min && z < size.x2max) {
+            owner = m;
+          }
+        }
+        if (owner < 0) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "seed_after_split: particle outside every MeshBlock"
+                    << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        i2(PGID,p) = gids + owner;
+      }
+      Kokkos::deep_copy(pr, h2);
+      Kokkos::deep_copy(pi, i2);
+    }
     if (global_variable::my_rank == 0) {
       std::cout << "# refinable_cloud lattice: " << nlattice << " root clouds -> "
                 << ppar->nprtcl_thispack << " particles after the initial split"
                 << " (" << ntrans << " edge children merged into transition clouds)"
-                << std::endl;
+                << (seed_after ? ", seed imprinted after the split" : "") << std::endl;
     }
   } else {
   int nrdata = ppar->nrdata;
