@@ -592,6 +592,7 @@ int DustGasDrag::SplitCloudsP1() {
                    " npieces max|drho| max(rho_parent) max|djx| max|djy| max|djz| nleaf"
                    " fam_dm fam_dpx fam_dpy fam_dpz\n# C ev k tag code x y m\n"
                    "# W ev leaf_x1 leaf_x2 leaf_vol m_before m_after\n"
+                   "# O ev k shift_x shift_y (split_oracle; C lines then give pre-shift positions)\n"
                    "# G ncycle time nflag npart_before npart_after M_before M_after"
                    " PX_b PX_a PY_b PY_a PZ_b PZ_a\n");
     }
@@ -724,6 +725,37 @@ int DustGasDrag::SplitCloudsP1() {
         if (a > 0 || b > 0) ii(PTAG,s) = cloud_next_tag++;   // the centre keeps the tag
       }
     }
+    // diagnostic position oracle (<problem>/split_oracle): give the pieces of an in-run
+    // event the prescribed family-relative displacement, evaluated at their mass
+    // centroids (lobe: -/+ ell/3), minus its mass-weighted mean, so that the event's
+    // mass centroid is unchanged; velocities are not touched.  pre_x/pre_y keep the
+    // pre-shift positions for the split log (lineage needs the lattice offsets).
+    std::vector<Real> pre_x, pre_y, shift_x, shift_y;
+    if (split_oracle && pmesh->time > 0.0) {
+      const int np = nslot - slot0;
+      pre_x.resize(np); pre_y.resize(np); shift_x.resize(np); shift_y.resize(np);
+      Real mt = 0.0, mx = 0.0, my = 0.0;
+      for (int q=0; q<np; ++q) {
+        const int s = slot0 + q, pc = ii(PLEV,s);
+        const Real e1c = transfer.CloudHalfWidth1(pc), e2c = transfer.CloudHalfWidth2(pc);
+        const int l1 = SMRCompositeTransfer::CloudLobe1(pc);
+        const int l2 = SMRCompositeTransfer::CloudLobe2(pc);
+        const Real cx = rr(IPX,s) + ((l1 == 1) ? -e1c/3.0 : ((l1 == 2) ? e1c/3.0 : 0.0));
+        const Real cy = rr(IPY,s) + ((l2 == 1) ? -e2c/3.0 : ((l2 == 2) ? e2c/3.0 : 0.0));
+        split_oracle(pmesh->time, cx, cy, shift_x[q], shift_y[q]);
+        mt += rr(IPM,s); mx += rr(IPM,s)*shift_x[q]; my += rr(IPM,s)*shift_y[q];
+      }
+      for (int q=0; q<np; ++q) {
+        const int s = slot0 + q;
+        pre_x[q] = rr(IPX,s); pre_y[q] = rr(IPY,s);
+        shift_x[q] -= mx/mt; shift_y[q] -= my/mt;
+        Real nx = wrap(rr(IPX,s) + shift_x[q], x1min, len1);
+        Real ny = wrap(rr(IPY,s) + shift_y[q], x2min, len2);
+        rr(IPX,s) = nx; rr(IPX1,s) = nx;
+        rr(IPY,s) = ny; rr(IPY1,s) = ny;
+        ii(PGID,s) = owner_gid(nx, ny);
+      }
+    }
     if (logsplit) {
       // audit of this event: leaf deposit of mass and momentum by the cloud before and
       // by its pieces after the split, at the same instant, with the deposit's weights
@@ -788,8 +820,14 @@ int DustGasDrag::SplitCloudsP1() {
                    nslot - slot0, dmax[0], mmax, dmax[1], dmax[2], dmax[3],
                    static_cast<double>(acc.size()), fam[0], fam[1], fam[2], fam[3]);
       for (int s=slot0; s<nslot; ++s) {
-        std::fprintf(fp, "C %llu %d %d %d %.17g %.17g %.17g\n", ev, s - slot0, ii(PTAG,s),
-                     ii(PLEV,s), rr(IPX,s), rr(IPY,s), rr(IPM,s));
+        const int q = s - slot0;
+        const bool shifted = !pre_x.empty();
+        std::fprintf(fp, "C %llu %d %d %d %.17g %.17g %.17g\n", ev, q, ii(PTAG,s),
+                     ii(PLEV,s), shifted ? pre_x[q] : rr(IPX,s),
+                     shifted ? pre_y[q] : rr(IPY,s), rr(IPM,s));
+        if (shifted) {
+          std::fprintf(fp, "O %llu %d %.17g %.17g\n", ev, q, shift_x[q], shift_y[q]);
+        }
       }
     }
   }

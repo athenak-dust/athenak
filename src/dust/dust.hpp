@@ -671,6 +671,10 @@ class DustGasDrag {
   // stage-2 midpoint gas velocity seen by the dust is formed from the prescribed states
   // at t and t+dt, and the gas is reset to the prescribed state at the end of each step.
   std::function<void(Real, DvceArray5D<Real>&)> prescribed_gas;
+  // Diagnostic position oracle (set by a problem generator, <problem>/split_oracle of
+  // streaming_linear): the exact dust displacement (dx, dz) at position (x, z) and time t,
+  // used to place the pieces of in-run P1 splits and lobe releases (SplitCloudsP1).
+  std::function<void(Real, Real, Real, Real&, Real&)> split_oracle;
   unsigned long long cloud_split_event = 0;
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   unsigned long long cloud_lobe_split_count = 0;

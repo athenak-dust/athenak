@@ -344,6 +344,46 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     }
   }
 
+  // Diagnostic position oracle: with the prescribed gas the linear
+  // dust velocity is the eigenmode's at all times, so the exact dust displacement of a
+  // particle whose unperturbed position is X (X0 = X - vnx t at t = 0) is
+  //   xi(X,t) = xi_eig(X,t) + [xi_seed(X0) - xi_eig(X0,0)],
+  //   xi_eig = Re[v~/(s - i Omega) e^{i(kx X - wR t)}] e^{st} (cos kz z; odd field with
+  //   i v~ and sin kz z), Omega = wR - kx vnx,  xi_seed = -(Apr/(kx rho_p0)) sin(kx X0) cos(kz z)
+  // (the seed imprints a radial displacement only).  The dust code uses it to place the
+  // pieces of in-run splits (DustGasDrag::SplitCloudsP1).
+  if (pin->GetOrAddBoolean("problem", "split_oracle", false)) {
+    if (!pin->GetOrAddBoolean("problem", "prescribed_gas", false) ||
+        !pin->GetOrAddBoolean("problem", "seed_after_split", false)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<problem>/split_oracle requires prescribed_gas and "
+                << "seed_after_split" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const Real srate = pin->GetReal("problem", "growth_rate");
+    const Real wrate = pin->GetReal("problem", "omega_re");
+    const Real om = wrate - kx*vnx;
+    const Real rp0 = eps*rho0;
+    // c = v~/(s - i Omega) for x and i v~/(s - i Omega) for z
+    const Real den = srate*srate + om*om;
+    const Real cxr = (Vxr*srate - Vxi*om)/den, cxi = (Vxi*srate + Vxr*om)/den;
+    const Real vzr = (Vzr*srate - Vzi*om)/den, vzi = (Vzi*srate + Vzr*om)/den;
+    const Real czr = -vzi, czi = vzr;
+    const Real kxx = kx, kzz = kz, vd = vnx, ap = Apr;
+    pmbp->pdust->split_oracle = [=](Real t, Real x, Real z, Real &dx, Real &dz) {
+      const Real x0 = x - vd*t;
+      const Real g = std::exp(srate*t), ph = kxx*x - wrate*t;
+      const Real c1 = std::cos(ph), s1 = std::sin(ph), c0 = std::cos(kxx*x0), s0 = std::sin(kxx*x0);
+      const Real cz = std::cos(kzz*z), sz = std::sin(kzz*z);
+      dx = (g*(cxr*c1 - cxi*s1) - (cxr*c0 - cxi*s0) - (ap/(kxx*rp0))*s0)*cz;
+      dz = (g*(czr*c1 - czi*s1) - (czr*c0 - czi*s0))*sz;
+    };
+    if (global_variable::my_rank == 0) {
+      std::cout << "# streaming_linear: split position oracle on (Omega = " << om << ")"
+                << std::endl;
+    }
+  }
+
   // initialize particles: quiet-start lattice displaced radially to imprint the dust
   // density wave, with velocities = NSH + eigenmode evaluated at the unperturbed
   // positions. For ppc > 1, the ppc = Npar^2 particles of each cell are placed on an
