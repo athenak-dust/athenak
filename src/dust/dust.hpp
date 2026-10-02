@@ -675,6 +675,10 @@ class DustGasDrag {
   // streaming_linear): the exact dust displacement (dx, dz) at position (x, z) and time t,
   // used to place the pieces of in-run P1 splits and lobe releases (SplitCloudsP1).
   std::function<void(Real, Real, Real, Real&, Real&)> split_oracle;
+  // Optional velocity part of the oracle (<problem>/split_oracle_velocity): the exact dust
+  // velocity perturbation (dvx, dvz, dvphi) at (x, z, t); the pieces get its family-relative
+  // part (mass-weighted mean removed, so the event momentum is unchanged).
+  std::function<void(Real, Real, Real, Real&, Real&, Real&)> split_oracle_velocity;
   unsigned long long cloud_split_event = 0;
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   unsigned long long cloud_lobe_split_count = 0;

@@ -352,6 +352,12 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   //   i v~ and sin kz z), Omega = wR - kx vnx,  xi_seed = -(Apr/(kx rho_p0)) sin(kx X0) cos(kz z)
   // (the seed imprints a radial displacement only).  The dust code uses it to place the
   // pieces of in-run splits (DustGasDrag::SplitCloudsP1).
+  if (pin->GetOrAddBoolean("problem", "split_oracle_velocity", false) &&
+      !pin->GetOrAddBoolean("problem", "split_oracle", false)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<problem>/split_oracle_velocity requires split_oracle" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (pin->GetOrAddBoolean("problem", "split_oracle", false)) {
     if (!pin->GetOrAddBoolean("problem", "prescribed_gas", false) ||
         !pin->GetOrAddBoolean("problem", "seed_after_split", false)) {
@@ -378,8 +384,23 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       dx = (g*(cxr*c1 - cxi*s1) - (cxr*c0 - cxi*s0) - (ap/(kxx*rp0))*s0)*cz;
       dz = (g*(czr*c1 - czi*s1) - (czr*c0 - czi*s0))*sz;
     };
+    // optional velocity part: the exact dust velocity perturbation of the eigenmode,
+    //   dv = Re[v~ e^{i(kx X - wR t)}] e^{st} cos kz z (x, phi), Re[i v~ ...] sin kz z (z)
+    if (pin->GetOrAddBoolean("problem", "split_oracle_velocity", false)) {
+      const Real vxr = Vxr, vxi = Vxi, vzr2 = Vzr, vzi2 = Vzi, vpr = Vpr, vpi = Vpi;
+      pmbp->pdust->split_oracle_velocity = [=](Real t, Real x, Real z, Real &dvx, Real &dvz,
+                                               Real &dvp) {
+        const Real g = std::exp(srate*t), ph = kxx*x - wrate*t;
+        const Real c1 = std::cos(ph), s1 = std::sin(ph);
+        const Real cz = std::cos(kzz*z), sz = std::sin(kzz*z);
+        dvx = g*(vxr*c1 - vxi*s1)*cz;
+        dvz = -g*(vzr2*s1 + vzi2*c1)*sz;
+        dvp = g*(vpr*c1 - vpi*s1)*cz;
+      };
+    }
     if (global_variable::my_rank == 0) {
       std::cout << "# streaming_linear: split position oracle on (Omega = " << om << ")"
+                << (pmbp->pdust->split_oracle_velocity ? ", with velocities" : "")
                 << std::endl;
     }
   }

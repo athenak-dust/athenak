@@ -745,6 +745,27 @@ int DustGasDrag::SplitCloudsP1() {
         split_oracle(pmesh->time, cx, cy, shift_x[q], shift_y[q]);
         mt += rr(IPM,s); mx += rr(IPM,s)*shift_x[q]; my += rr(IPM,s)*shift_y[q];
       }
+      if (split_oracle_velocity) {
+        // family-relative velocity at the same centroids, mass-weighted mean removed
+        std::vector<Real> dv1(np), dv2(np), dv3(np);
+        Real m1 = 0.0, m2 = 0.0, m3 = 0.0;
+        for (int q=0; q<np; ++q) {
+          const int s = slot0 + q, pc = ii(PLEV,s);
+          const Real e1c = transfer.CloudHalfWidth1(pc), e2c = transfer.CloudHalfWidth2(pc);
+          const int l1 = SMRCompositeTransfer::CloudLobe1(pc);
+          const int l2 = SMRCompositeTransfer::CloudLobe2(pc);
+          const Real cx = rr(IPX,s) + ((l1 == 1) ? -e1c/3.0 : ((l1 == 2) ? e1c/3.0 : 0.0));
+          const Real cy = rr(IPY,s) + ((l2 == 1) ? -e2c/3.0 : ((l2 == 2) ? e2c/3.0 : 0.0));
+          split_oracle_velocity(pmesh->time, cx, cy, dv1[q], dv2[q], dv3[q]);
+          m1 += rr(IPM,s)*dv1[q]; m2 += rr(IPM,s)*dv2[q]; m3 += rr(IPM,s)*dv3[q];
+        }
+        for (int q=0; q<np; ++q) {
+          const int s = slot0 + q;
+          rr(IPVX,s) += dv1[q] - m1/mt; rr(IPVX1,s) = rr(IPVX,s);
+          rr(IPVY,s) += dv2[q] - m2/mt; rr(IPVY1,s) = rr(IPVY,s);
+          rr(IPVZ,s) += dv3[q] - m3/mt; rr(IPVZ1,s) = rr(IPVZ,s);
+        }
+      }
       for (int q=0; q<np; ++q) {
         const int s = slot0 + q;
         pre_x[q] = rr(IPX,s); pre_y[q] = rr(IPY,s);
