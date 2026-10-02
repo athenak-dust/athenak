@@ -244,14 +244,9 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
         rsolver_method = Hydro_RSolver::hlle;
       // HLLC solver
       } else if (rsolver.compare("hllc") == 0) {
-        if (peos->eos_data.is_ideal) {
-          rsolver_method = Hydro_RSolver::hllc;
-        } else {
-          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                    << std::endl << "<hydro>/rsolver = hllc cannot be used with "
-                    << "isothermal EOS" << std::endl;
-          std::exit(EXIT_FAILURE);
-        }
+        // ideal gas: HLLC of Toro et al.; isothermal: HLLC_Isothermal (B = 0 limit of
+        // the isothermal HLLD of Mignone 2007), see rsolvers/hllc_hyd.hpp
+        rsolver_method = Hydro_RSolver::hllc;
       // Roe solver
       } else if (rsolver.compare("roe") == 0) {
         rsolver_method = Hydro_RSolver::roe;
