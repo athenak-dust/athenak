@@ -21,7 +21,9 @@
 //! 2^d equal children per parent.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <unordered_map>
@@ -570,6 +572,30 @@ int DustGasDrag::SplitCloudsP1() {
   // host copy of the transfer for the eligibility tests (views point to host mirrors)
   auto level_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), transfer.cloud_level);
   if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
+  // diagnostic split log (<dust>/cloud_split_log): one S line per event (parent state
+  // and the largest leaf change of deposited density and momentum density), C lines for
+  // its pieces, W lines (leaf centre, volume, mass before/after) for the first events,
+  // and one G line per call with the global mass and momentum before and after
+  const bool logsplit = cloud_split_log;
+  constexpr unsigned long long kLogWeightEvents = 200;
+  std::FILE *fp = nullptr;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  auto &indcs = pmesh->mb_indcs;
+  if (logsplit) {
+    fp = std::fopen("cloud_split_events.txt", "a");
+    if (fp == nullptr) {
+      std::cout << "### FATAL ERROR: cannot open cloud_split_events.txt" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (cloud_split_event == 0) {
+      std::fprintf(fp, "# S ev ncycle time lobe_release ptag pcode px py pm pvx pvy pvz"
+                   " npieces max|drho| max(rho_parent) max|djx| max|djy| max|djz| nleaf"
+                   " fam_dm fam_dpx fam_dpy fam_dpz\n# C ev k tag code x y m\n"
+                   "# W ev leaf_x1 leaf_x2 leaf_vol m_before m_after\n"
+                   "# G ncycle time nflag npart_before npart_after M_before M_after"
+                   " PX_b PX_a PY_b PY_a PZ_b PZ_a\n");
+    }
+  }
 
   const Real x1min = transfer.x1min, x2min = transfer.x2min;
   const Real len1 = transfer.x1max - transfer.x1min;
@@ -682,6 +708,7 @@ int DustGasDrag::SplitCloudsP1() {
       ++nlobe;
     }
     const Real e1 = transfer.CloudHalfWidth1(clev), e2 = transfer.CloudHalfWidth2(clev);
+    const int slot0 = nslot;
     for (int b=0; b<n2; ++b) {
       for (int a=0; a<n1; ++a) {
         int s = nslot++;
@@ -697,6 +724,94 @@ int DustGasDrag::SplitCloudsP1() {
         if (a > 0 || b > 0) ii(PTAG,s) = cloud_next_tag++;   // the centre keeps the tag
       }
     }
+    if (logsplit) {
+      // audit of this event: leaf deposit of mass and momentum by the cloud before and
+      // by its pieces after the split, at the same instant, with the deposit's weights
+      // and active-leaf map (side 0 = before, 1 = after)
+      std::unordered_map<int, std::array<Real,8>> acc;
+      auto add = [&](Real px, Real py, int pcode, Real m, Real vx, Real vy, Real vz,
+                     int side) {
+        int i0, j0;
+        Real w1[SMRCompositeTransfer::kMaxCloudStencil];
+        Real w2[SMRCompositeTransfer::kMaxCloudStencil];
+        int m1 = SMRCompositeTransfer::CloudWeights1D(wrap(px, x1min, len1),
+                     transfer.CloudHalfWidth1(pcode), x1min, fdx1, i0, w1,
+                     SMRCompositeTransfer::CloudLobe1(pcode));
+        int m2 = SMRCompositeTransfer::CloudWeights1D(wrap(py, x2min, len2),
+                     transfer.CloudHalfWidth2(pcode), x2min, fdx2, j0, w2,
+                     SMRCompositeTransfer::CloudLobe2(pcode));
+        for (int b=0; b<m2; ++b) {
+          int fj = SMRCompositeTransfer::WrapIndex(j0 + b, nfine2);
+          for (int a=0; a<m1; ++a) {
+            Real w = w2[b]*w1[a];
+            if (w == 0.0) continue;
+            auto &q = acc[target_h(fj, SMRCompositeTransfer::WrapIndex(i0 + a, nfine1))];
+            q[4*side] += m*w;
+            q[4*side+1] += m*w*vx;
+            q[4*side+2] += m*w*vy;
+            q[4*side+3] += m*w*vz;
+          }
+        }
+      };
+      const unsigned long long ev = cloud_split_event++;
+      add(x, y, code, pr_h(IPM,p), pr_h(IPVX,p), pr_h(IPVY,p), pr_h(IPVZ,p), 0);
+      Real fam[4] = {-pr_h(IPM,p), -pr_h(IPM,p)*pr_h(IPVX,p), -pr_h(IPM,p)*pr_h(IPVY,p),
+                     -pr_h(IPM,p)*pr_h(IPVZ,p)};
+      for (int s=slot0; s<nslot; ++s) {
+        add(rr(IPX,s), rr(IPY,s), ii(PLEV,s), rr(IPM,s), rr(IPVX,s), rr(IPVY,s),
+            rr(IPVZ,s), 1);
+        fam[0] += rr(IPM,s);
+        fam[1] += rr(IPM,s)*rr(IPVX,s);
+        fam[2] += rr(IPM,s)*rr(IPVY,s);
+        fam[3] += rr(IPM,s)*rr(IPVZ,s);
+      }
+      Real dmax[4] = {0.0, 0.0, 0.0, 0.0}, mmax = 0.0;
+      for (auto &kv : acc) {
+        int tm = kv.first/(ncells1*ncells2);
+        Real vol = mbsize.h_view(tm).dx1*mbsize.h_view(tm).dx2;
+        for (int c=0; c<4; ++c) {
+          dmax[c] = std::max(dmax[c], std::fabs(kv.second[4+c] - kv.second[c])/vol);
+        }
+        mmax = std::max(mmax, kv.second[0]/vol);
+        if (ev < kLogWeightEvents) {
+          int ti = kv.first % ncells1, tj = (kv.first/ncells1) % ncells2;
+          std::fprintf(fp, "W %llu %.17g %.17g %.17g %.17g %.17g\n", ev,
+                       mbsize.h_view(tm).x1min + (ti - indcs.is + 0.5)*mbsize.h_view(tm).dx1,
+                       mbsize.h_view(tm).x2min + (tj - indcs.js + 0.5)*mbsize.h_view(tm).dx2,
+                       vol, kv.second[0], kv.second[4]);
+        }
+      }
+      std::fprintf(fp, "S %llu %d %.17g %d %d %d %.17g %.17g %.17g %.17g %.17g %.17g %d"
+                   " %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e\n", ev,
+                   pmesh->ncycle, pmesh->time, (clev == lev) ? 1 : 0, pi_h(PTAG,p), code,
+                   x, y, pr_h(IPM,p), pr_h(IPVX,p), pr_h(IPVY,p), pr_h(IPVZ,p),
+                   nslot - slot0, dmax[0], mmax, dmax[1], dmax[2], dmax[3],
+                   static_cast<double>(acc.size()), fam[0], fam[1], fam[2], fam[3]);
+      for (int s=slot0; s<nslot; ++s) {
+        std::fprintf(fp, "C %llu %d %d %d %.17g %.17g %.17g\n", ev, s - slot0, ii(PTAG,s),
+                     ii(PLEV,s), rr(IPX,s), rr(IPY,s), rr(IPM,s));
+      }
+    }
+  }
+  if (logsplit) {
+    // global totals of mass and momentum before and after this call
+    Real tot[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    for (int p=0; p<npart; ++p) {
+      tot[0] += pr_h(IPM,p);
+      tot[2] += pr_h(IPM,p)*pr_h(IPVX,p);
+      tot[4] += pr_h(IPM,p)*pr_h(IPVY,p);
+      tot[6] += pr_h(IPM,p)*pr_h(IPVZ,p);
+    }
+    for (int s=0; s<nslot; ++s) {
+      tot[1] += rr(IPM,s);
+      tot[3] += rr(IPM,s)*rr(IPVX,s);
+      tot[5] += rr(IPM,s)*rr(IPVY,s);
+      tot[7] += rr(IPM,s)*rr(IPVZ,s);
+    }
+    std::fprintf(fp, "G %d %.17g %d %d %d %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
+                 pmesh->ncycle, pmesh->time, nflag, npart, nslot, tot[0], tot[1], tot[2],
+                 tot[3], tot[4], tot[5], tot[6], tot[7]);
+    std::fclose(fp);
   }
   cloud_split_count += nparent;
   cloud_lobe_split_count += nlobe;

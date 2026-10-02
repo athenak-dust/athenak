@@ -348,6 +348,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", false);
       cloud_p1_release_exit = pin->GetOrAddBoolean("dust", "cloud_p1_release_exit", false);
+      cloud_split_log = pin->GetOrAddBoolean("dust", "cloud_split_log", false);
+      if (cloud_split_log && (!cloud_p1_split || global_variable::nranks > 1)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<dust>/cloud_split_log (diagnostic) requires "
+                  << "cloud_p1_split and a single rank" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       if (cloud_p1_split && cloud_transition == 0) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<dust>/cloud_p1_split requires cloud_transition=1 or 2 "

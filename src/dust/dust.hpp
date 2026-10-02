@@ -662,6 +662,9 @@ class DustGasDrag {
                                       // no merging (requires cloud_transition > 0)
   bool cloud_p1_release_exit = false; // diagnostic: lobed clouds that leave the split
                                       // region release their lobes (old-rule exit edge)
+  bool cloud_split_log = false;       // diagnostic: log every P1 split event (parent,
+                                      // children, leaf deposit audit) to a text file
+  unsigned long long cloud_split_event = 0;
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   unsigned long long cloud_lobe_split_count = 0;
   bool UsesCompositeTransfer() const {
