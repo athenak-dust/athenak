@@ -255,11 +255,11 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
           // leaf gather by the analytic field with the same cloud response
           Real tm = time0 + 0.5*dt;
           Real fac = 1.0;
-          if (SMRCompositeTransfer::CloudLobe1(glev) == 0) {
+          if (!ag.point_all && SMRCompositeTransfer::CloudLobe1(glev) == 0) {
             Real a = 0.5*ag.kx*transfer.CloudHalfWidth1(glev);
             fac *= SQR(sin(a)/a);
           }
-          if (SMRCompositeTransfer::CloudLobe2(glev) == 0) {
+          if (!ag.point_all && SMRCompositeTransfer::CloudLobe2(glev) == 0) {
             Real a = 0.5*ag.kz*transfer.CloudHalfWidth2(glev);
             fac *= SQR(sin(a)/a);
           }

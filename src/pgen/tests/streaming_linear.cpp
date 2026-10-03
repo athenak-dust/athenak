@@ -418,13 +418,15 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     }
     auto &ag = pmbp->pdust->analytic_gather;
     ag.on = true;
+    ag.point_all = pin->GetOrAddBoolean("problem", "analytic_gather_point", false);
     ag.kx = kx; ag.kz = kz;
     ag.srate = pin->GetReal("problem", "growth_rate");
     ag.wrate = pin->GetReal("problem", "omega_re");
     ag.ux0 = ugx; ag.up0 = ugp;
     ag.uxr = Uxr; ag.uxi = Uxi; ag.uzr = Uzr; ag.uzi = Uzi; ag.upr = Upr; ag.upi = Upi;
     if (global_variable::my_rank == 0) {
-      std::cout << "# streaming_linear: analytic gather on" << std::endl;
+      std::cout << "# streaming_linear: analytic gather on"
+                << (ag.point_all ? " (point value for every cloud)" : "") << std::endl;
     }
   }
 
