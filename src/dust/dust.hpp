@@ -663,6 +663,11 @@ class DustGasDrag {
                                       // no merging (requires cloud_transition > 0)
   bool cloud_p1_release_exit = false; // diagnostic: lobed clouds that leave the split
                                       // region release their lobes (old-rule exit edge)
+  bool cloud_split_interp = false;    // P1 split/release: pieces take the node-convention
+                                      // (linear, P1) prolongation of displacement and velocity
+                                      // from the neighbouring nodes of the particle lattice,
+                                      // positions relative to the centre piece, velocity
+                                      // increments mass-mean-free (single-stream prototype)
   bool cloud_split_log = false;       // diagnostic: log every P1 split event (parent,
                                       // children, leaf deposit audit) to a text file
   // Diagnostic prescribed gas (set by a problem generator, e.g. <problem>/prescribed_gas

@@ -35,6 +35,7 @@
 #include "mesh/mesh.hpp"
 #include "mesh/meshblock.hpp"
 #include "particles/particles.hpp"
+#include "hydro/hydro.hpp"
 #include "dust.hpp"
 
 namespace dust {
@@ -593,6 +594,10 @@ int DustGasDrag::SplitCloudsP1() {
                    " fam_dm fam_dpx fam_dpy fam_dpz\n# C ev k tag code x y m\n"
                    "# W ev leaf_x1 leaf_x2 leaf_vol m_before m_after\n"
                    "# O ev k shift_x shift_y (split_oracle; C lines then give pre-shift positions)\n"
+                   "# P ncycle time nevent nleaf max|drho| rms|drho| max|dFx| max|dFy|"
+                   " max|dFz| rms|dF| net_dM (whole call: deposit of all flagged clouds before"
+                   " vs all pieces after, leaf densities; dF = (dj - u_gas drho)/t_s, the change"
+                   " of the drag source density on the gas)\n"
                    "# G ncycle time nflag npart_before npart_after M_before M_after"
                    " PX_b PX_a PY_b PY_a PZ_b PZ_a\n");
     }
@@ -678,9 +683,38 @@ int DustGasDrag::SplitCloudsP1() {
     ++nslot;
   }
 
+  // <dust>/cloud_split_interp: node lookup on the particle lattice.  All particles
+  // derive from the root lattice by two-scale splits and drift with a common background
+  // velocity, so their nodes are multiples of the finest half-width from any particle
+  // (the anchor); displacements are ~1e-5 of a cell, so rounding is unambiguous.
+  const bool interp = cloud_split_interp;
+  if (interp && split_oracle) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<dust>/cloud_split_interp excludes <problem>/split_oracle" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const Real ef1 = transfer.CloudHalfWidth1(transfer.cloud_nlev);
+  const Real ef2 = transfer.CloudHalfWidth2(transfer.cloud_nlev);
+  const long long nn1 = std::llround(len1/ef1), nn2 = std::llround(len2/ef2);
+  const Real ax = pr_h(IPX,0), ay = pr_h(IPY,0);
+  auto node_key = [&](Real px, Real py) {
+    long long i = std::llround(wrap(px - ax, 0.0, len1)/ef1) % nn1;
+    long long j = std::llround(wrap(py - ay, 0.0, len2)/ef2) % nn2;
+    return j*nn1 + i;
+  };
+  std::unordered_map<long long, int> node_of;
+  if (interp) {
+    for (int p=0; p<npart; ++p) node_of[node_key(pr_h(IPX,p), pr_h(IPY,p))] = p;
+  }
+  unsigned long long interp_missing = 0;
+  // call-level leaf deposit of all flagged clouds (side 0) and all their pieces (side 1)
+  std::unordered_map<int, std::array<Real,8>> pass_acc;
+  int nevent_call = 0;
+
   unsigned long long nparent = 0, nlobe = 0;
   for (int p=0; p<npart; ++p) {
     if (!flag_h(p)) continue;
+    ++nevent_call;
     const int code = pi_h(PLEV,p);
     const int lev = SMRCompositeTransfer::CloudLevel(code);
     const Real x = pr_h(IPX,p), y = pr_h(IPY,p);
@@ -731,6 +765,107 @@ int DustGasDrag::SplitCloudsP1() {
     // mass centroid is unchanged; velocities are not touched.  pre_x/pre_y keep the
     // pre-shift positions for the split log (lineage needs the lattice offsets).
     std::vector<Real> pre_x, pre_y, shift_x, shift_y;
+    if (interp) {
+      // node-convention (P1) prolongation: along direction d a piece at offset s e_d
+      // (s = -1, +1) takes the quadratic interpolant of displacement and velocity through
+      // the nodes at -2 s e_d, 0 and +2 s e_d (this cloud's node and the neighbouring ones:
+      // a neighbouring parent, its centre piece, or a virtual node inside a coarse cloud,
+      // whose P1 value is the mean of the two (or four) nodes next to it), relative to this
+      // cloud: (3 (f_+ - f_0) - (f_- - f_0))/8, or (f_+ - f_0)/2 without the far node.  Corner
+      // pieces add both directions.  Displacements are taken on the lattice reference
+      // (xi_q = x_q - its node).  Positions stay relative to the centre piece; velocity
+      // increments have their mass-weighted mean removed.
+      const int np = nslot - slot0;
+      pre_x.resize(np); pre_y.resize(np); shift_x.assign(np, 0.0); shift_y.assign(np, 0.0);
+      const Real ed[2] = {transfer.CloudHalfWidth1(clev), transfer.CloudHalfWidth2(clev)};
+      // state (displacement relative to the node, velocity) at node (tx, ty)
+      auto node_state = [&](Real tx, Real ty, Real f[5]) {
+        auto exact = [&](Real px, Real py, Real g[5]) {
+          auto it = node_of.find(node_key(px, py));
+          if (it == node_of.end()) return false;
+          const int q = it->second;
+          const Real ddx = transfer.MinImage1(pr_h(IPX,q) - px);
+          const Real ddy = transfer.MinImage2(pr_h(IPY,q) - py);
+          if (std::fabs(ddx) > 0.25*ef1 || std::fabs(ddy) > 0.25*ef2) return false;
+          g[0] = ddx; g[1] = ddy;
+          g[2] = pr_h(IPVX,q); g[3] = pr_h(IPVY,q); g[4] = pr_h(IPVZ,q);
+          return true;
+        };
+        if (exact(tx, ty, f)) return true;
+        Real g[4][5];
+        const Real o1[4] = {-ed[0], ed[0], 0.0, 0.0}, o2[4] = {0.0, 0.0, -ed[1], ed[1]};
+        for (int pair=0; pair<2; ++pair) {   // midpoint of two nodes along x, then along y
+          const int i0 = 2*pair, i1 = 2*pair + 1;
+          if (exact(tx + o1[i0], ty + o2[i0], g[0]) && exact(tx + o1[i1], ty + o2[i1], g[1])) {
+            for (int c=0; c<5; ++c) f[c] = 0.5*(g[0][c] + g[1][c]);
+            return true;
+          }
+        }
+        int n = 0;
+        for (int a2=-1; a2<=1; a2+=2) {
+          for (int a1=-1; a1<=1; a1+=2) {
+            if (!exact(tx + a1*ed[0], ty + a2*ed[1], g[n])) return false;
+            ++n;
+          }
+        }
+        for (int c=0; c<5; ++c) f[c] = 0.25*(g[0][c] + g[1][c] + g[2][c] + g[3][c]);
+        return true;
+      };
+      Real f0[5] = {0.0, 0.0, pr_h(IPVX,p), pr_h(IPVY,p), pr_h(IPVZ,p)};
+      Real inc[2][3][5];   // [direction][s+1][dx, dy, dvx, dvy, dvz]
+      bool ok[2][3] = {{false, false, false}, {false, false, false}};
+      for (int d=0; d<2; ++d) {
+        Real fs[2][5];
+        bool have[2];
+        for (int k=0; k<2; ++k) {
+          const int s = 2*k - 1;
+          have[k] = node_state(x + ((d == 0) ? 2.0*s*ed[0] : 0.0),
+                               y + ((d == 1) ? 2.0*s*ed[1] : 0.0), fs[k]);
+        }
+        for (int k=0; k<2; ++k) {
+          if (!have[k]) continue;
+          const int s = 2*k - 1;
+          ok[d][s+1] = true;
+          for (int c=0; c<5; ++c) {
+            const Real dp = fs[k][c] - f0[c];
+            inc[d][s+1][c] = have[1-k] ? (3.0*dp - (fs[1-k][c] - f0[c]))/8.0 : 0.5*dp;
+          }
+        }
+      }
+      std::vector<std::array<Real,3>> dv(np);
+      Real mt = 0.0, mv[3] = {0.0, 0.0, 0.0};
+      int q = 0;
+      for (int b=0; b<n2; ++b) {
+        for (int a=0; a<n1; ++a, ++q) {
+          const int s1 = static_cast<int>(std::lround(p1[a].off));
+          const int s2 = static_cast<int>(std::lround(p2[b].off));
+          dv[q] = {0.0, 0.0, 0.0};
+          const int sd[2] = {s1, s2};
+          for (int d=0; d<2; ++d) {
+            if (sd[d] == 0) continue;
+            if (!ok[d][sd[d]+1]) {++interp_missing; continue;}
+            shift_x[q] += inc[d][sd[d]+1][0];
+            shift_y[q] += inc[d][sd[d]+1][1];
+            for (int c=0; c<3; ++c) dv[q][c] += inc[d][sd[d]+1][2+c];
+          }
+          const Real mq = rr(IPM, slot0 + q);
+          mt += mq;
+          for (int c=0; c<3; ++c) mv[c] += mq*dv[q][c];
+        }
+      }
+      for (int k=0; k<np; ++k) {
+        const int s = slot0 + k;
+        rr(IPVX,s) += dv[k][0] - mv[0]/mt; rr(IPVX1,s) = rr(IPVX,s);
+        rr(IPVY,s) += dv[k][1] - mv[1]/mt; rr(IPVY1,s) = rr(IPVY,s);
+        rr(IPVZ,s) += dv[k][2] - mv[2]/mt; rr(IPVZ1,s) = rr(IPVZ,s);
+        pre_x[k] = rr(IPX,s); pre_y[k] = rr(IPY,s);
+        Real nx = wrap(rr(IPX,s) + shift_x[k], x1min, len1);
+        Real ny = wrap(rr(IPY,s) + shift_y[k], x2min, len2);
+        rr(IPX,s) = nx; rr(IPX1,s) = nx;
+        rr(IPY,s) = ny; rr(IPY1,s) = ny;
+        ii(PGID,s) = owner_gid(nx, ny);
+      }
+    }
     if (split_oracle && pmesh->time > 0.0) {
       const int np = nslot - slot0;
       pre_x.resize(np); pre_y.resize(np); shift_x.resize(np); shift_y.resize(np);
@@ -812,6 +947,11 @@ int DustGasDrag::SplitCloudsP1() {
             q[4*side+1] += m*w*vx;
             q[4*side+2] += m*w*vy;
             q[4*side+3] += m*w*vz;
+            auto &qq = pass_acc[target_h(fj, SMRCompositeTransfer::WrapIndex(i0 + a, nfine1))];
+            qq[4*side] += m*w;
+            qq[4*side+1] += m*w*vx;
+            qq[4*side+2] += m*w*vy;
+            qq[4*side+3] += m*w*vz;
           }
         }
       };
@@ -862,6 +1002,39 @@ int DustGasDrag::SplitCloudsP1() {
     }
   }
   if (logsplit) {
+    // whole call: net leaf change of the deposited dust density and of the drag source
+    // density on the gas, dF = (dj - u drho)/t_s (single species), u the gas velocity of
+    // the leaf
+    {
+      auto u0_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pmy_pack->phydro->u0);
+      const Real ts0 = taus.h_view(0);
+      const int ks = indcs.ks;
+      Real drmax = 0.0, dr2 = 0.0, dfmax[3] = {0.0, 0.0, 0.0}, df2 = 0.0, dmnet = 0.0;
+      for (auto &kv : pass_acc) {
+        const int tm = kv.first/(ncells1*ncells2);
+        const int ti = kv.first % ncells1, tj = (kv.first/ncells1) % ncells2;
+        const Real vol = mbsize.h_view(tm).dx1*mbsize.h_view(tm).dx2;
+        const Real drho = (kv.second[4] - kv.second[0])/vol;
+        const Real rg = u0_h(tm,IDN,ks,tj,ti);
+        const Real ug[3] = {u0_h(tm,IM1,ks,tj,ti)/rg, u0_h(tm,IM2,ks,tj,ti)/rg,
+                            u0_h(tm,IM3,ks,tj,ti)/rg};
+        drmax = std::max(drmax, std::fabs(drho)); dr2 += drho*drho;
+        dmnet += kv.second[4] - kv.second[0];
+        for (int c=0; c<3; ++c) {
+          const Real df = ((kv.second[5+c] - kv.second[1+c])/vol - ug[c]*drho)/ts0;
+          dfmax[c] = std::max(dfmax[c], std::fabs(df)); df2 += df*df;
+        }
+      }
+      const Real nl = std::max<Real>(1.0, static_cast<Real>(pass_acc.size()));
+      std::fprintf(fp, "P %d %.17g %d %d %.6e %.6e %.6e %.6e %.6e %.6e %.6e\n",
+                   pmesh->ncycle, pmesh->time, nevent_call,
+                   static_cast<int>(pass_acc.size()), drmax, std::sqrt(dr2/nl), dfmax[0],
+                   dfmax[1], dfmax[2], std::sqrt(df2/nl), dmnet);
+      if (interp && interp_missing > 0) {
+        std::fprintf(fp, "# interp: %llu piece directions without a neighbouring node\n",
+                     interp_missing);
+      }
+    }
     // global totals of mass and momentum before and after this call
     Real tot[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     for (int p=0; p<npart; ++p) {
