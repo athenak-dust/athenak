@@ -679,6 +679,19 @@ class DustGasDrag {
   // velocity perturbation (dvx, dvz, dvphi) at (x, z, t); the pieces get its family-relative
   // part (mass-weighted mean removed, so the event momentum is unchanged).
   std::function<void(Real, Real, Real, Real&, Real&, Real&)> split_oracle_velocity;
+  // Diagnostic analytic gather (<problem>/analytic_gather of streaming_linear): the PC2
+  // midpoint gas velocity seen by each particle is replaced by the analytic eigenmode at
+  // t+dt/2 and the predicted midpoint position, with the response of the
+  // cloud_transition = 2 gather: the hat transform sinc^2(k ell/2) along plain
+  // directions (cloud integral), the point value along lobed ones.  Plain data so that
+  // the advance kernel can capture it.
+  struct AnalyticGather {
+    bool on = false;
+    Real kx = 0.0, kz = 0.0, srate = 0.0, wrate = 0.0;
+    Real ux0 = 0.0, up0 = 0.0;          // background velocity (x1 radial, x3 azimuthal)
+    Real uxr = 0.0, uxi = 0.0, uzr = 0.0, uzi = 0.0, upr = 0.0, upi = 0.0;
+  };
+  AnalyticGather analytic_gather;
   unsigned long long cloud_split_event = 0;
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   unsigned long long cloud_lobe_split_count = 0;

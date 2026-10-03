@@ -136,6 +136,15 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
       bool deform = composite_smr && cloud_deform && transfer.cloud_mode;
       int gather_level = cloud_gather_level;
       int tmode = cloud_transition;
+      auto ag = analytic_gather;
+      Real time0 = pmy_pack->pmesh->time;
+      if (ag.on && !(linear && tmode == 2 && gather_level < 0)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<problem>/analytic_gather requires refinable clouds with "
+                  << "cloud_gather_order = 2, cloud_transition = 2 and no cloud_gather_level"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       par_for("dust_pc2_advance",DevExeSpace(),0,(npart-1),
       KOKKOS_LAMBDA(const int p) {
         int m = pi(PGID,p) - gids;
@@ -240,6 +249,26 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
               }
             }
           }
+        }
+        if (ag.on) {
+          // diagnostic analytic gather (see DustGasDrag::AnalyticGather): replaces the
+          // leaf gather by the analytic field with the same cloud response
+          Real tm = time0 + 0.5*dt;
+          Real fac = 1.0;
+          if (SMRCompositeTransfer::CloudLobe1(glev) == 0) {
+            Real a = 0.5*ag.kx*transfer.CloudHalfWidth1(glev);
+            fac *= SQR(sin(a)/a);
+          }
+          if (SMRCompositeTransfer::CloudLobe2(glev) == 0) {
+            Real a = 0.5*ag.kz*transfer.CloudHalfWidth2(glev);
+            fac *= SQR(sin(a)/a);
+          }
+          Real amp = fac*exp(ag.srate*tm), ph = ag.kx*xh - ag.wrate*tm;
+          Real c1 = cos(ph), s1 = sin(ph);
+          Real cz = cos(ag.kz*yh), sz = sin(ag.kz*yh);
+          ugx = ag.ux0 + amp*(ag.uxr*c1 - ag.uxi*s1)*cz;
+          ugy =        - amp*(ag.uzr*s1 + ag.uzi*c1)*sz;   // x2 = vertical
+          ugz = ag.up0 + amp*(ag.upr*c1 - ag.upi*s1)*cz;   // x3 = azimuthal
         }
 
         // Solve the implicit-midpoint velocity equations.  The shearing-box Coriolis

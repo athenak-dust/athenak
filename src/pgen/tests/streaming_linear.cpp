@@ -405,6 +405,29 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     }
   }
 
+  // Diagnostic analytic gather: the dust sees the analytic gas
+  // velocity at t+dt/2 and the predicted midpoint position with the cloud response of
+  // the cloud_transition = 2 gather, instead of the gather from the gas cells
+  // (DustGasDrag::AnalyticGather).  The prescribed gas is kept for everything else.
+  if (pin->GetOrAddBoolean("problem", "analytic_gather", false)) {
+    if (!pin->GetOrAddBoolean("problem", "prescribed_gas", false)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<problem>/analytic_gather requires prescribed_gas"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    auto &ag = pmbp->pdust->analytic_gather;
+    ag.on = true;
+    ag.kx = kx; ag.kz = kz;
+    ag.srate = pin->GetReal("problem", "growth_rate");
+    ag.wrate = pin->GetReal("problem", "omega_re");
+    ag.ux0 = ugx; ag.up0 = ugp;
+    ag.uxr = Uxr; ag.uxi = Uxi; ag.uzr = Uzr; ag.uzi = Uzi; ag.upr = Upr; ag.upi = Upi;
+    if (global_variable::my_rank == 0) {
+      std::cout << "# streaming_linear: analytic gather on" << std::endl;
+    }
+  }
+
   // initialize particles: quiet-start lattice displaced radially to imprint the dust
   // density wave, with velocities = NSH + eigenmode evaluated at the unperturbed
   // positions. For ppc > 1, the ppc = Npar^2 particles of each cell are placed on an
