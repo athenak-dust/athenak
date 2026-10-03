@@ -670,6 +670,9 @@ class DustGasDrag {
                                       // increments mass-mean-free (single-stream prototype)
   bool cloud_split_log = false;       // diagnostic: log every P1 split event (parent,
                                       // children, leaf deposit audit) to a text file
+  bool cloud_split_log_leaves = false; // diagnostic (with cloud_split_log): per split call,
+                                      // a V line (volume-weighted norms of the net leaf
+                                      // change) and a D line per touched leaf
   // Diagnostic prescribed gas (set by a problem generator, e.g. <problem>/prescribed_gas
   // of streaming_linear): fills the gas conserved variables of every cell, ghosts
   // included, with a prescribed state at time t.  With PC2 and back_reaction=false the

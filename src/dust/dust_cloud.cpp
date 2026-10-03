@@ -609,6 +609,14 @@ int DustGasDrag::SplitCloudsP1() {
                    " of the drag source density on the gas)\n"
                    "# G ncycle time nflag npart_before npart_after M_before M_after"
                    " PX_b PX_a PY_b PY_a PZ_b PZ_a\n");
+      if (cloud_split_log_leaves) {
+        std::fprintf(fp, "# V ncycle time nleaf vol_touched vol_domain"
+                     " sqrt(sum V drho^2/vol_domain) sqrt(sum V |dm|^2/vol_domain)"
+                     " (cloud_split_log_leaves; dm = t_s dF = dj - u_gas drho, the momentum"
+                     " the changed deposit holds relative to the gas)\n"
+                     "# D ncycle leaf_x1 leaf_x2 leaf_vol drho dm_x dm_y dm_z (one per"
+                     " leaf touched by the call, before the P line)\n");
+      }
     }
   }
 
@@ -1019,6 +1027,8 @@ int DustGasDrag::SplitCloudsP1() {
       const Real ts0 = taus.h_view(0);
       const int ks = indcs.ks;
       Real drmax = 0.0, dr2 = 0.0, dfmax[3] = {0.0, 0.0, 0.0}, df2 = 0.0, dmnet = 0.0;
+      // volume-weighted sums for the V line (cloud_split_log_leaves)
+      Real vtouch = 0.0, vdr2 = 0.0, vdm2 = 0.0;
       for (auto &kv : pass_acc) {
         const int tm = kv.first/(ncells1*ncells2);
         const int ti = kv.first % ncells1, tj = (kv.first/ncells1) % ncells2;
@@ -1029,10 +1039,26 @@ int DustGasDrag::SplitCloudsP1() {
                             u0_h(tm,IM3,ks,tj,ti)/rg};
         drmax = std::max(drmax, std::fabs(drho)); dr2 += drho*drho;
         dmnet += kv.second[4] - kv.second[0];
+        Real dm[3];
         for (int c=0; c<3; ++c) {
-          const Real df = ((kv.second[5+c] - kv.second[1+c])/vol - ug[c]*drho)/ts0;
+          dm[c] = (kv.second[5+c] - kv.second[1+c])/vol - ug[c]*drho;
+          const Real df = dm[c]/ts0;
           dfmax[c] = std::max(dfmax[c], std::fabs(df)); df2 += df*df;
         }
+        if (cloud_split_log_leaves) {
+          vtouch += vol; vdr2 += vol*drho*drho;
+          vdm2 += vol*(dm[0]*dm[0] + dm[1]*dm[1] + dm[2]*dm[2]);
+          std::fprintf(fp, "D %d %.17g %.17g %.17g %.9e %.9e %.9e %.9e\n", pmesh->ncycle,
+                       mbsize.h_view(tm).x1min + (ti - indcs.is + 0.5)*mbsize.h_view(tm).dx1,
+                       mbsize.h_view(tm).x2min + (tj - indcs.js + 0.5)*mbsize.h_view(tm).dx2,
+                       vol, drho, dm[0], dm[1], dm[2]);
+        }
+      }
+      if (cloud_split_log_leaves) {
+        const Real vdom = len1*len2;
+        std::fprintf(fp, "V %d %.17g %d %.9e %.9e %.9e %.9e\n", pmesh->ncycle, pmesh->time,
+                     static_cast<int>(pass_acc.size()), vtouch, vdom, std::sqrt(vdr2/vdom),
+                     std::sqrt(vdm2/vdom));
       }
       const Real nl = std::max<Real>(1.0, static_cast<Real>(pass_acc.size()));
       std::fprintf(fp, "P %d %.17g %d %d %.6e %.6e %.6e %.6e %.6e %.6e %.6e\n",
