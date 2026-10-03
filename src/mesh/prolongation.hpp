@@ -11,10 +11,14 @@
 
 #include "z4c/z4c.hpp"
 
-// Diagnostic build option: -DATHENAK_PROLONG_UNLIMITED replaces the min-mod limited slope
-// of ProlongCC by the unlimited central slope (used to attribute SMR interface errors).
+// Diagnostic build options: -DATHENAK_PROLONG_UNLIMITED replaces the min-mod limited slope
+// of ProlongCC by the unlimited central slope (used to attribute SMR interface errors);
+// -DATHENAK_PROLONG_MC uses the monotonized-central slope minmod(2dl, 2dr, (dl+dr)/2).
 #ifdef ATHENAK_PROLONG_UNLIMITED
 #define PROLONG_CC_SLOPE(dl, dr) (0.125*((dl) + (dr)))
+#elif defined(ATHENAK_PROLONG_MC)
+#define PROLONG_CC_SLOPE(dl, dr) (0.125*(SIGN(dl) + SIGN(dr)) \
+                                  *fmin(0.5*fabs((dl) + (dr)), 2.0*fmin(fabs(dl), fabs(dr))))
 #else
 #define PROLONG_CC_SLOPE(dl, dr) (0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr)))
 #endif
