@@ -263,9 +263,17 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
             Real a = 0.5*ag.kz*transfer.CloudHalfWidth2(glev);
             fac *= SQR(sin(a)/a);
           }
-          Real amp = fac*exp(ag.srate*tm), ph = ag.kx*xh - ag.wrate*tm;
+          Real xs = xh, ys = yh;
+          if (ag.centroid_lobes) {
+            // lobe 1 (lower) / 2 (upper): centroid of (2/3) S(x - x_p) + (1/3) S(x - x_p -/+ ell)
+            int l1 = SMRCompositeTransfer::CloudLobe1(glev);
+            int l2 = SMRCompositeTransfer::CloudLobe2(glev);
+            if (l1 == 1 || l1 == 2) xs += ((l1 == 1) ? -1.0 : 1.0)*transfer.CloudHalfWidth1(glev)/3.0;
+            if (l2 == 1 || l2 == 2) ys += ((l2 == 1) ? -1.0 : 1.0)*transfer.CloudHalfWidth2(glev)/3.0;
+          }
+          Real amp = fac*exp(ag.srate*tm), ph = ag.kx*xs - ag.wrate*tm;
           Real c1 = cos(ph), s1 = sin(ph);
-          Real cz = cos(ag.kz*yh), sz = sin(ag.kz*yh);
+          Real cz = cos(ag.kz*ys), sz = sin(ag.kz*ys);
           ugx = ag.ux0 + amp*(ag.uxr*c1 - ag.uxi*s1)*cz;
           ugy =        - amp*(ag.uzr*s1 + ag.uzi*c1)*sz;   // x2 = vertical
           ugz = ag.up0 + amp*(ag.upr*c1 - ag.upi*s1)*cz;   // x3 = azimuthal

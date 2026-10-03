@@ -685,11 +685,14 @@ class DustGasDrag {
   // cloud_transition = 2 gather: the hat transform sinc^2(k ell/2) along plain
   // directions (cloud integral), the point value along lobed ones; point_all
   // (<problem>/analytic_gather_point) takes the point value for every cloud instead, so
-  // that all cloud shapes see the same field.  Plain data so that the advance kernel can
-  // capture it.
+  // that all cloud shapes see the same field; centroid_lobes
+  // (<problem>/analytic_gather_centroid) samples a lobed direction at the mass centroid
+  // of the lobed shape (node -/+ ell/3) instead of the node.  Plain data so that the
+  // advance kernel can capture it.
   struct AnalyticGather {
     bool on = false;
     bool point_all = false;
+    bool centroid_lobes = false;
     Real kx = 0.0, kz = 0.0, srate = 0.0, wrate = 0.0;
     Real ux0 = 0.0, up0 = 0.0;          // background velocity (x1 radial, x3 azimuthal)
     Real uxr = 0.0, uxi = 0.0, uzr = 0.0, uzi = 0.0, upr = 0.0, upi = 0.0;
