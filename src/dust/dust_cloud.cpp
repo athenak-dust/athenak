@@ -761,7 +761,7 @@ int DustGasDrag::SplitCloudsP1() {
           split_oracle_velocity(pmesh->time, cx, cy, dv1[q], dv2[q], dv3[q]);
           m1 += rr(IPM,s)*dv1[q]; m2 += rr(IPM,s)*dv2[q]; m3 += rr(IPM,s)*dv3[q];
         }
-        if (split_oracle_node) {
+        if (split_oracle_node && split_oracle_node_meanfree < 1) {
           // relative to the centre piece (slot0, at the parent's node)
           m1 = mt*dv1[0]; m2 = mt*dv2[0]; m3 = mt*dv3[0];
         }
@@ -772,7 +772,9 @@ int DustGasDrag::SplitCloudsP1() {
           rr(IPVZ,s) += dv3[q] - m3/mt; rr(IPVZ1,s) = rr(IPVZ,s);
         }
       }
-      if (split_oracle_node) {mx = mt*shift_x[0]; my = mt*shift_y[0];}
+      if (split_oracle_node && split_oracle_node_meanfree < 2) {
+        mx = mt*shift_x[0]; my = mt*shift_y[0];
+      }
       for (int q=0; q<np; ++q) {
         const int s = slot0 + q;
         pre_x[q] = rr(IPX,s); pre_y[q] = rr(IPY,s);

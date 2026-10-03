@@ -684,6 +684,11 @@ class DustGasDrag {
   // which keeps the parent's state; the event's mass centroid then moves by the P1
   // difference at a lobe release instead of being preserved.
   bool split_oracle_node = false;
+  // Conservation variants of the node convention (<problem>/split_oracle_node_meanfree):
+  // 1 removes the mass-weighted mean of the nodal velocity increments (event momentum
+  // conserved), 2 also that of the nodal displacement increments (event mass first
+  // moment conserved); 0 keeps both relative to the centre piece.
+  int split_oracle_node_meanfree = 0;
   // Diagnostic analytic gather (<problem>/analytic_gather of streaming_linear): the PC2
   // midpoint gas velocity seen by each particle is replaced by the analytic eigenmode at
   // t+dt/2 and the predicted midpoint position, with the response of the

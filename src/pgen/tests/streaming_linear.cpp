@@ -384,6 +384,16 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     const Real kxx = kx, kzz = kz, vd = vnx, ap = Apr;
     pmbp->pdust->split_oracle_node =
         pin->GetOrAddBoolean("problem", "split_oracle_node", false);
+    pmbp->pdust->split_oracle_node_meanfree =
+        pin->GetOrAddInteger("problem", "split_oracle_node_meanfree", 0);
+    if (pmbp->pdust->split_oracle_node_meanfree != 0 &&
+        (!pmbp->pdust->split_oracle_node || pmbp->pdust->split_oracle_node_meanfree < 0 ||
+         pmbp->pdust->split_oracle_node_meanfree > 2)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<problem>/split_oracle_node_meanfree must be 0, 1 or 2 and requires "
+                << "split_oracle_node" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
     pmbp->pdust->split_oracle = [=](Real t, Real x, Real z, Real &dx, Real &dz) {
       const Real x0 = x - vd*t;
       const Real g = std::exp(srate*t), ph = kxx*x - wrate*t;
@@ -410,6 +420,9 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       std::cout << "# streaming_linear: split position oracle on (Omega = " << om << ")"
                 << (pmbp->pdust->split_oracle_velocity ? ", with velocities" : "")
                 << (pmbp->pdust->split_oracle_node ? ", node convention" : "")
+                << (pmbp->pdust->split_oracle_node_meanfree == 1 ? ", mean-free velocity" :
+                    (pmbp->pdust->split_oracle_node_meanfree == 2 ?
+                     ", mean-free velocity and position" : ""))
                 << std::endl;
     }
   }
