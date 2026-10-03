@@ -740,8 +740,9 @@ int DustGasDrag::SplitCloudsP1() {
         const Real e1c = transfer.CloudHalfWidth1(pc), e2c = transfer.CloudHalfWidth2(pc);
         const int l1 = SMRCompositeTransfer::CloudLobe1(pc);
         const int l2 = SMRCompositeTransfer::CloudLobe2(pc);
-        const Real cx = rr(IPX,s) + ((l1 == 1) ? -e1c/3.0 : ((l1 == 2) ? e1c/3.0 : 0.0));
-        const Real cy = rr(IPY,s) + ((l2 == 1) ? -e2c/3.0 : ((l2 == 2) ? e2c/3.0 : 0.0));
+        const Real cn = split_oracle_node ? 0.0 : 1.0;   // node convention: no centroid shift
+        const Real cx = rr(IPX,s) + cn*((l1 == 1) ? -e1c/3.0 : ((l1 == 2) ? e1c/3.0 : 0.0));
+        const Real cy = rr(IPY,s) + cn*((l2 == 1) ? -e2c/3.0 : ((l2 == 2) ? e2c/3.0 : 0.0));
         split_oracle(pmesh->time, cx, cy, shift_x[q], shift_y[q]);
         mt += rr(IPM,s); mx += rr(IPM,s)*shift_x[q]; my += rr(IPM,s)*shift_y[q];
       }
@@ -754,10 +755,15 @@ int DustGasDrag::SplitCloudsP1() {
           const Real e1c = transfer.CloudHalfWidth1(pc), e2c = transfer.CloudHalfWidth2(pc);
           const int l1 = SMRCompositeTransfer::CloudLobe1(pc);
           const int l2 = SMRCompositeTransfer::CloudLobe2(pc);
-          const Real cx = rr(IPX,s) + ((l1 == 1) ? -e1c/3.0 : ((l1 == 2) ? e1c/3.0 : 0.0));
-          const Real cy = rr(IPY,s) + ((l2 == 1) ? -e2c/3.0 : ((l2 == 2) ? e2c/3.0 : 0.0));
+          const Real cn = split_oracle_node ? 0.0 : 1.0;
+          const Real cx = rr(IPX,s) + cn*((l1 == 1) ? -e1c/3.0 : ((l1 == 2) ? e1c/3.0 : 0.0));
+          const Real cy = rr(IPY,s) + cn*((l2 == 1) ? -e2c/3.0 : ((l2 == 2) ? e2c/3.0 : 0.0));
           split_oracle_velocity(pmesh->time, cx, cy, dv1[q], dv2[q], dv3[q]);
           m1 += rr(IPM,s)*dv1[q]; m2 += rr(IPM,s)*dv2[q]; m3 += rr(IPM,s)*dv3[q];
+        }
+        if (split_oracle_node) {
+          // relative to the centre piece (slot0, at the parent's node)
+          m1 = mt*dv1[0]; m2 = mt*dv2[0]; m3 = mt*dv3[0];
         }
         for (int q=0; q<np; ++q) {
           const int s = slot0 + q;
@@ -766,6 +772,7 @@ int DustGasDrag::SplitCloudsP1() {
           rr(IPVZ,s) += dv3[q] - m3/mt; rr(IPVZ1,s) = rr(IPVZ,s);
         }
       }
+      if (split_oracle_node) {mx = mt*shift_x[0]; my = mt*shift_y[0];}
       for (int q=0; q<np; ++q) {
         const int s = slot0 + q;
         pre_x[q] = rr(IPX,s); pre_y[q] = rr(IPY,s);

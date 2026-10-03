@@ -679,6 +679,11 @@ class DustGasDrag {
   // velocity perturbation (dvx, dvz, dvphi) at (x, z, t); the pieces get its family-relative
   // part (mass-weighted mean removed, so the event momentum is unchanged).
   std::function<void(Real, Real, Real, Real&, Real&, Real&)> split_oracle_velocity;
+  // Node convention of the oracle (<problem>/split_oracle_node): the pieces take the
+  // prescribed displacement (and velocity) at their nodes relative to the centre piece,
+  // which keeps the parent's state; the event's mass centroid then moves by the P1
+  // difference at a lobe release instead of being preserved.
+  bool split_oracle_node = false;
   // Diagnostic analytic gather (<problem>/analytic_gather of streaming_linear): the PC2
   // midpoint gas velocity seen by each particle is replaced by the analytic eigenmode at
   // t+dt/2 and the predicted midpoint position, with the response of the
