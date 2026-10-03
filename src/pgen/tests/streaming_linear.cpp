@@ -364,12 +364,16 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
               << "<problem>/split_oracle_node requires split_oracle" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  // The same displacement is exact for the two-way linear problem as well (2026-10-03):
+  // the eigenmode with dust velocity v~ solves the coupled linear equations, and the seed
+  // offset xi_seed - xi_eig(X0,0) is solenoidal (same dust density), so it changes neither
+  // the dust density nor the drag at linear order; the oracle then gives the exact linear
+  // state, not the numerical two-way solution.  No boost (Omega uses the unboosted drift).
   if (pin->GetOrAddBoolean("problem", "split_oracle", false)) {
-    if (!pin->GetOrAddBoolean("problem", "prescribed_gas", false) ||
-        !pin->GetOrAddBoolean("problem", "seed_after_split", false)) {
+    if (!pin->GetOrAddBoolean("problem", "seed_after_split", false) || boost != 0.0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "<problem>/split_oracle requires prescribed_gas and "
-                << "seed_after_split" << std::endl;
+                << std::endl << "<problem>/split_oracle requires seed_after_split and "
+                << "boost_vx = 0" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     const Real srate = pin->GetReal("problem", "growth_rate");
