@@ -61,12 +61,20 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   int nmb = pmy_pack->nmb_thispack;
   int ncells1 = indcs.nx1 + 2*indcs.ng;
   int ncells2 = indcs.nx2 + 2*indcs.ng;
-  int nlev = pmesh->max_level - pmesh->root_level;
+  // <dust>/cloud_virtual_levels (diagnostic control, default 0): extra levels of the
+  // virtual grid below the finest mesh level, so clouds can be finer than every gas leaf
+  // (e.g. a uniform gas mesh with the fine clouds and sampling of a refined region; the
+  // fine virtual cells map to their coarse leaf exactly as in the coarse part of a mixed
+  // mesh)
+  const int nlev_mesh = pmesh->max_level - pmesh->root_level;
+  const int nvirt = pin->GetOrAddInteger("dust", "cloud_virtual_levels", 0);
+  int nlev = nlev_mesh + nvirt;
 
-  if (nlev < 0 || nlev > 2) {
+  if (nlev_mesh < 0 || nvirt < 0 || nlev > 2) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "refinable_cloud currently requires a uniform mesh or one "
-              << "or two levels of 2:1 static refinement" << std::endl;
+              << "or two levels of 2:1 static refinement (virtual levels included)"
+              << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
@@ -150,7 +158,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   Kokkos::deep_copy(t.cloud_level, level);
 
   if (global_variable::my_rank == 0) {
-    std::cout << "# refinable_cloud map: levels=" << nlev << ", virtual finest grid "
+    std::cout << "# refinable_cloud map: levels=" << nlev
+              << (nvirt > 0 ? " (" + std::to_string(nvirt) + " virtual)" : "") << ", virtual finest grid "
               << t.nfine1 << "x" << t.nfine2 << ", split slack=" << cloud_split_slack
               << ", merge tolerance=" << cloud_merge_tolerance << " finest cells"
               << ", max cloud level=" << t.cloud_max_level
