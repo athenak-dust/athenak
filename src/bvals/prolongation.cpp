@@ -132,7 +132,7 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
 //! Code here is based on MeshRefinement::ProlongateCellCenteredValues() in C++ version
 
 void MeshBoundaryValuesCC::ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
-    bool is_z4c) {
+    bool is_z4c, Real amp_eps, Real amp_cs) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
@@ -152,6 +152,9 @@ void MeshBoundaryValuesCC::ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> 
   auto &nx2 = indcs.nx2;
   auto &nx3 = indcs.nx3;
   auto& prolong_2nd = pmy_pack->pmesh->pmr->weights.prolong_2nd;
+  // amplitude-aware hydro prolongation; amp_eps > 0 only from Hydro::Prolongate
+  DvceArray1D<int64_t> amp_cnt;
+  if (amp_eps > 0.0) amp_cnt = pmy_pack->pmesh->pmr->prolong_amp_count;
   auto& prolong_4th = pmy_pack->pmesh->pmr->weights.prolong_4th;
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
@@ -190,7 +193,10 @@ void MeshBoundaryValuesCC::ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> 
         int fj = (j - indcs.cjs)*2 + indcs.js;
         int fk = (k - indcs.cks)*2 + indcs.ks;
         // call inlined prolongation operator for CC variables
-        if (!is_z4c) {
+        if (amp_eps > 0.0) {
+          ProlongCCAmplitudeAware(m,v,k,j,i,fk,fj,fi,multi_d,three_d,ca,a,amp_eps,amp_cs,
+                                  amp_cnt);
+        } else if (!is_z4c) {
           ProlongCC(m,v,k,j,i,fk,fj,fi,multi_d,three_d,ca,a);
         } else {
           switch (indcs.ng) {

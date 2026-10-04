@@ -223,7 +223,8 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
   // functions to prolongate conserved and primitive CC variables
   void FillCoarseInBndryCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
        bool is_z4c=false);
-  void ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca, bool is_z4c=false);
+  void ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca, bool is_z4c=false,
+                    Real amp_eps=0.0, Real amp_cs=0.0);
   void ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons, DvceArray5D<Real> &prim);
   void PrimToConsFineBndry(const DvceArray5D<Real> &prim, DvceArray5D<Real> &cons);
   void ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,

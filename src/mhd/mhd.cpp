@@ -93,6 +93,13 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
     std::exit(EXIT_FAILURE);
   }
 
+  // the amplitude-aware prolongation candidate is hydro-only
+  if (ppack->pmesh->pmr != nullptr && ppack->pmesh->pmr->prolong_amp_eps > 0.0) {
+    std::cout << "### FATAL ERROR in "<< __FILE__ <<" at line " << __LINE__ << std::endl
+              << "<mesh_refinement>/prolong_amplitude_eps is not wired into MHD" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
   // (2) Initialize scalars, diffusion, source terms
   nscalars = pin->GetOrAddInteger("mhd","nscalars",0);
 

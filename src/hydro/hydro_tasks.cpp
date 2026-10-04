@@ -380,6 +380,10 @@ TaskStatus Hydro::Prolongate(Driver *pdrive, int stage) {
       pbval_u->ConsToPrimCoarseBndry(coarse_u0, coarse_w0);
       pbval_u->ProlongateCC(w0, coarse_w0);
       pbval_u->PrimToConsFineBndry(w0, u0);
+    } else if (pmy_pack->pmesh->pmr->prolong_amp_eps > 0.0) {
+      // amplitude-aware prolongation candidate
+      pbval_u->ProlongateCC(u0, coarse_u0, false, pmy_pack->pmesh->pmr->prolong_amp_eps,
+                            peos->eos_data.iso_cs);
     } else {
       pbval_u->ProlongateCC(u0, coarse_u0);
     }

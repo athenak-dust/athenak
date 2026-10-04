@@ -53,6 +53,11 @@ class MeshRefinement {
   int ncyc_check_amr;        // # of cycles between checking mesh for ref/derefinement
   int refinement_interval;   // # of cycles between allowing successive ref/derefinement
   bool prolong_prims;        // flag to enable prolongation of primitive vars
+  // <mesh_refinement>/prolong_amplitude_eps (diagnostic; default 0 = off):
+  // amplitude-aware central/MC blend for the hydro ghost-zone prolongation (static,
+  // isothermal); switch counters, see ProlongCCAmplitudeAware
+  Real prolong_amp_eps = 0.0;
+  DvceArray1D<int64_t> prolong_amp_count;
   RefinementCriteria* pmrc=nullptr;   // object to control various refinement criteria
 
   // following 2x Views are dimensioned [nmb_total]

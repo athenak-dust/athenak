@@ -478,6 +478,29 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
                     MPI_COMM_WORLD);
     }
 #endif
+    // switch summary of the amplitude-aware prolongation candidate
+    if (pmesh->pmr != nullptr && pmesh->pmr->prolong_amp_eps > 0.0 &&
+        global_variable::my_rank == 0) {
+      auto c = Kokkos::create_mirror_view_and_copy(HostMemSpace(),
+                                                   pmesh->pmr->prolong_amp_count);
+      const char *dn[3] = {"x1", "x2", "x3"};
+      for (int d=0; d<3; ++d) {
+        if (c(10*d) == 0) continue;
+        const double n = static_cast<double>(c(10*d));
+        auto frac = [](int64_t a, int64_t b) {
+          return (b > 0) ? static_cast<double>(a)/static_cast<double>(b) : 0.0;};
+        std::cout << "# PROLONG_AMP_SUMMARY eps=" << pmesh->pmr->prolong_amp_eps
+                  << " dir=" << dn[d] << " cell_dirs=" << c(10*d)
+                  << " center=" << c(10*d+1)/n << " mixed=" << c(10*d+2)/n
+                  << " mc=" << c(10*d+3)/n
+                  << " var_stencils_mixed=" << c(10*d+4)
+                  << " (MC!=central " << frac(c(10*d+5), c(10*d+4)) << ")"
+                  << " var_stencils_mc=" << c(10*d+6)
+                  << " (MC!=central " << frac(c(10*d+7), c(10*d+6)) << ")";
+        if (d == 0) std::cout << " positivity_scaled_cells=" << c(8);
+        std::cout << std::endl;
+      }
+    }
     if (global_variable::my_rank == 0) {
       // Print diagnostic messages related to the end of the simulation
       OutputCycleDiagnostics(pmesh);

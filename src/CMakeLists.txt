@@ -136,6 +136,7 @@ add_executable(
         pgen/tests/mri3d.cpp
         pgen/tests/shock_tube.cpp
         pgen/tests/shwave.cpp
+        pgen/tests/simple_wave.cpp
         pgen/tests/streaming_linear.cpp
         pgen/tests/rad_beam.cpp
         pgen/tests/rad_linear_wave.cpp

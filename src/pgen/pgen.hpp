@@ -70,6 +70,7 @@ class ProblemGenerator {
   void MRI3d(ParameterInput *pin, const bool restart);
   void OrszagTang(ParameterInput *pin, const bool restart);
   void ShockTube(ParameterInput *pin, const bool restart);
+  void SimpleWave(ParameterInput *pin, const bool restart);
   void Shwave(ParameterInput *pin, const bool restart);
   void StreamingLinear(ParameterInput *pin, const bool restart);
   void RadiationLinearWave(ParameterInput *pin, const bool restart);

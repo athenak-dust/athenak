@@ -66,6 +66,18 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
     if (pin->DoesParameterExist("mesh_refinement", "prolong_primitives")) {
       prolong_prims = pin->GetBoolean("mesh_refinement", "prolong_primitives");
     }
+    prolong_amp_eps = pin->GetOrAddReal("mesh_refinement", "prolong_amplitude_eps", 0.0);
+    if (prolong_amp_eps > 0.0) {
+      if (pm->adaptive || prolong_prims) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<mesh_refinement>/prolong_amplitude_eps (diagnostic) is "
+                  << "wired only into the static-mesh ghost prolongation of conserved "
+                  << "hydro variables (no AMR, no prolong_primitives)" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      prolong_amp_count = DvceArray1D<int64_t>("prolong_amp_count", 30);
+      Kokkos::deep_copy(prolong_amp_count, 0);
+    }
   }
 
   // allocate arrays for AMR, add RefinementCriteria object

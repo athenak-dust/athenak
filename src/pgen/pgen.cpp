@@ -924,6 +924,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     RadiationBeam(pin, is_restart);
   } else if (pgen_fun_name.compare("shock_tube") == 0) {
     ShockTube(pin, is_restart);
+  } else if (pgen_fun_name.compare("simple_wave") == 0) {
+    SimpleWave(pin, is_restart);
   } else if (pgen_fun_name.compare("shwave") == 0) {
     Shwave(pin, is_restart);
   } else if (pgen_fun_name.compare("streaming_linear") == 0) {
