@@ -9,13 +9,17 @@
 //! with n = (cos theta, sin theta); shock speed vs = mach*cs; downstream rho2 = mach^2 rho1
 //! moving with u2 = vs (1 - 1/mach^2) along n.  Cell averages of rho and M by 4x4
 //! sub-sampling of the step.  With ix1/ox1/ix2/ox2_bc = user the ghost cells are set to the
-//! exact moving planar shock (front at x0 + vs t_bc, t_bc = time + dt/2, the mid-point of
-//! the step, since the boundary function does not know the RK stage), sub-sampled 4x4, so
-//! each boundary cell is upstream or downstream according to the analytic solution.
+//! exact moving planar shock (front at x0 + vs t_bc), sub-sampled 4x4, so each boundary
+//! cell is upstream or downstream according to the analytic solution.  The boundaries are
+//! filled after each stage update, and with rk1 / rk2 (Heun) the updated state of every
+//! stage approximates t_n + dt, so t_bc = time + dt (time is advanced only after the last
+//! stage); the initial fill (dt not yet set) uses t_bc = time.  Other integrators have
+//! different stage times and are rejected.
 
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <string>
 
 #include "athena.hpp"
 #include "parameter_input.hpp"
@@ -50,6 +54,12 @@ void ProblemGenerator::ObliqueShock(ParameterInput *pin, const bool restart) {
   os_th = pin->GetReal("problem", "theta_deg")*M_PI/180.0;
   os_x0 = pin->GetReal("problem", "front0");
   os_rho1 = pin->GetOrAddReal("problem", "rho1", 1.0);
+  const std::string integ = pin->GetString("time", "integrator");
+  if (integ != "rk1" && integ != "rk2") {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "oblique_shock boundaries assume rk1 or rk2 stage times" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (pmy_mesh_->pmb_pack->phydro != nullptr) {
     os_cs = pmy_mesh_->pmb_pack->phydro->peos->eos_data.iso_cs;
   }
@@ -107,9 +117,9 @@ void ObliqueShockBCs(Mesh *pm) {
   const Real vs = os_mach*os_cs, u2 = vs*(1.0 - 1.0/(os_mach*os_mach));
   const Real nx = std::cos(os_th), ny = std::sin(os_th);
   // pm->dt is std::numeric_limits<float>::max() until the first time step is computed
-  // (the boundary fill at initialization): use the mid-step time only for a valid dt
+  // (the boundary fill at initialization): then the state is at pm->time itself
   const Real dt = (pm->dt < 0.5*std::numeric_limits<float>::max()) ? pm->dt : 0.0;
-  const Real front = os_x0 + vs*(pm->time + 0.5*dt);
+  const Real front = os_x0 + vs*(pm->time + dt);
   auto fill = [=] KOKKOS_FUNCTION (int m, int j, int i) {
     const Real dx = size.d_view(m).dx1, dy = size.d_view(m).dx2;
     const Real xc = CellCenterX(i-is, nx1, size.d_view(m).x1min, size.d_view(m).x1max);
