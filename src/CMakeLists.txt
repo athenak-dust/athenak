@@ -134,6 +134,7 @@ add_executable(
         pgen/tests/lw_implode.cpp
         pgen/tests/orszag_tang.cpp
         pgen/tests/mri3d.cpp
+        pgen/tests/oblique_shock.cpp
         pgen/tests/shock_tube.cpp
         pgen/tests/shwave.cpp
         pgen/tests/simple_wave.cpp
@@ -145,6 +146,7 @@ add_executable(
 
         pgen/unit_tests/eos_compose.cpp
         pgen/unit_tests/gauss_legendre.cpp
+        pgen/unit_tests/prolong_amp_unit.cpp
 
         radiation/radiation.cpp
         radiation/radiation_fluxes.cpp

@@ -922,6 +922,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     RadiationLinearWave(pin, is_restart);
   } else if (pgen_fun_name.compare("rad_beam") == 0) {
     RadiationBeam(pin, is_restart);
+  } else if (pgen_fun_name.compare("oblique_shock") == 0) {
+    ObliqueShock(pin, is_restart);
   } else if (pgen_fun_name.compare("shock_tube") == 0) {
     ShockTube(pin, is_restart);
   } else if (pgen_fun_name.compare("simple_wave") == 0) {
@@ -940,6 +942,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     EOSCompose(pin, is_restart);
   } else if (pgen_fun_name.compare("gauss_legendre") == 0) {
     GaussLegendre(pin, is_restart);
+  } else if (pgen_fun_name.compare("prolong_amp_unit") == 0) {
+    ProlongAmpUnit(pin, is_restart);
 
   } else {
     // name not set on command line or input file, print warning and quit
