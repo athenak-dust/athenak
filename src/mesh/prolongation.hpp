@@ -14,11 +14,21 @@
 // Diagnostic build options: -DATHENAK_PROLONG_UNLIMITED replaces the min-mod limited slope
 // of ProlongCC by the unlimited central slope (used to attribute SMR interface errors);
 // -DATHENAK_PROLONG_MC uses the monotonized-central slope minmod(2dl, 2dr, (dl+dr)/2).
+// Two diagnostic splits of MC's correction relative to the central slope:
+// -DATHENAK_PROLONG_MC_EXTCENTRAL: central slope where dl*dr <= 0 (extremum stencils),
+//   MC elsewhere; -DATHENAK_PROLONG_MC_MONOCENTRAL: central slope where dl*dr > 0
+//   (monotone stencils), zero slope elsewhere.
+#define PROLONG_CC_MC(dl, dr) (0.125*(SIGN(dl) + SIGN(dr)) \
+                               *fmin(0.5*fabs((dl) + (dr)), 2.0*fmin(fabs(dl), fabs(dr))))
 #ifdef ATHENAK_PROLONG_UNLIMITED
 #define PROLONG_CC_SLOPE(dl, dr) (0.125*((dl) + (dr)))
 #elif defined(ATHENAK_PROLONG_MC)
-#define PROLONG_CC_SLOPE(dl, dr) (0.125*(SIGN(dl) + SIGN(dr)) \
-                                  *fmin(0.5*fabs((dl) + (dr)), 2.0*fmin(fabs(dl), fabs(dr))))
+#define PROLONG_CC_SLOPE(dl, dr) PROLONG_CC_MC(dl, dr)
+#elif defined(ATHENAK_PROLONG_MC_EXTCENTRAL)
+#define PROLONG_CC_SLOPE(dl, dr) (((dl)*(dr) <= 0.0) ? 0.125*((dl) + (dr)) \
+                                                     : PROLONG_CC_MC(dl, dr))
+#elif defined(ATHENAK_PROLONG_MC_MONOCENTRAL)
+#define PROLONG_CC_SLOPE(dl, dr) (((dl)*(dr) > 0.0) ? 0.125*((dl) + (dr)) : 0.0)
 #else
 #define PROLONG_CC_SLOPE(dl, dr) (0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr)))
 #endif
