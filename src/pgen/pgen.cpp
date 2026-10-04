@@ -924,6 +924,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     RadiationBeam(pin, is_restart);
   } else if (pgen_fun_name.compare("oblique_shock") == 0) {
     ObliqueShock(pin, is_restart);
+  } else if (pgen_fun_name.compare("iso_collision") == 0) {
+    IsoCollision(pin, is_restart);
   } else if (pgen_fun_name.compare("shock_tube") == 0) {
     ShockTube(pin, is_restart);
   } else if (pgen_fun_name.compare("simple_wave") == 0) {

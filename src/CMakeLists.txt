@@ -135,6 +135,7 @@ add_executable(
         pgen/tests/orszag_tang.cpp
         pgen/tests/mri3d.cpp
         pgen/tests/oblique_shock.cpp
+        pgen/tests/iso_collision.cpp
         pgen/tests/shock_tube.cpp
         pgen/tests/shwave.cpp
         pgen/tests/simple_wave.cpp
