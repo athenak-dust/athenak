@@ -6,9 +6,11 @@
 //! \file hydro_fluxes.cpp
 //! \brief Calculate 3D fluxes for hydro
 
+#include <cstdio>
 #include <iostream>
 
 #include "athena.hpp"
+#include "globals.hpp"
 #include "mesh/mesh.hpp"
 #include "coordinates/coordinates.hpp"
 #include "hydro.hpp"
@@ -62,6 +64,9 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
   size_t scr_size = ScrArray2D<Real>::shmem_size(nvars, ncells1) * 2;
   int scr_level = 0;
   auto &flx1_ = uflx.x1f;
+#ifdef ATHENAK_HYDRO_FLUX_PROBE
+  auto probe_ = probe;
+#endif
 
   // set the loop limits for 1D/2D/3D problems
   int il = is, iu = ie+1, jl = js, ju = je, kl = ks, ku = ke;
@@ -129,6 +134,15 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
       HLLE_GR(member, eos, indcs, size, coord, m, k, j, il, iu, IVX, wl, wr, flx1);
     }
     member.team_barrier();
+#ifdef ATHENAK_HYDRO_FLUX_PROBE
+    if (m == 0 && k == ks && j == js) {
+      par_for_inner(member, il, iu, [&](const int i) {
+        probe_(0,i) = wl(IDN,i); probe_(1,i) = wl(IVX,i);
+        probe_(2,i) = wr(IDN,i); probe_(3,i) = wr(IVX,i);
+        probe_(4,i) = flx1_(m,IDN,k,j,i); probe_(5,i) = flx1_(m,IM1,k,j,i);
+      });
+    }
+#endif
 
     // calculate fluxes of scalars (if any)
     if (nvars > nhyd_) {
@@ -143,6 +157,30 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
       }
     }
   });
+
+#ifdef ATHENAK_HYDRO_FLUX_PROBE
+  // F lines: face i (0 = x1min of MeshBlock 0) with x_face, reconstructed left/right
+  // (rho, vx) and the mass / x1-momentum fluxes; C lines: cell i (including two ghost
+  // cells on each side) with x_center and the primitives (rho, vx) used for this stage
+  if (pmy_pack->pmesh->ncycle < probe_ncycle && global_variable::my_rank == 0) {
+    auto hp = Kokkos::create_mirror_view_and_copy(HostMemSpace(), probe);
+    auto hw = Kokkos::create_mirror_view_and_copy(HostMemSpace(), w0);
+    auto &sz = pmy_pack->pmb->mb_size.h_view(0);
+    const int nc = pmy_pack->pmesh->ncycle;
+    const Real tm = pmy_pack->pmesh->time, dtm = pmy_pack->pmesh->dt;
+    FILE *fp = std::fopen("flux_probe.txt", "a");
+    for (int i=is; i<=ie+1; ++i) {
+      std::fprintf(fp, "F %d %d %.17e %.17e %d %.17e %.17e %.17e %.17e %.17e %.17e %.17e\n",
+                   nc, stage, tm, dtm, i-is, sz.x1min + (i-is)*sz.dx1, hp(0,i), hp(1,i),
+                   hp(2,i), hp(3,i), hp(4,i), hp(5,i));
+    }
+    for (int i=is-2; i<=ie+2; ++i) {
+      std::fprintf(fp, "C %d %d %.17e %.17e %d %.17e %.17e %.17e\n", nc, stage, tm, dtm,
+                   i-is, sz.x1min + (i-is+0.5)*sz.dx1, hw(0,IDN,ks,js,i), hw(0,IVX,ks,js,i));
+    }
+    std::fclose(fp);
+  }
+#endif
 
   //--------------------------------------------------------------------------------------
   // j-direction

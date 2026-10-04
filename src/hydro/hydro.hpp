@@ -102,6 +102,12 @@ class Hydro {
   // following used for FOFC
   DvceArray4D<bool> fofc;  // flag for each cell to indicate if FOFC is needed
   bool use_fofc = false;   // flag to enable FOFC
+#ifdef ATHENAK_HYDRO_FLUX_PROBE
+  // diagnostic probe: x1 face states and fluxes of MeshBlock 0, row (ks,js),
+  // written to flux_probe.txt for every stage of the first probe_ncycle cycles
+  int probe_ncycle = 0;
+  DvceArray2D<Real> probe;  // (6, ncells1): wl_d, wl_vx, wr_d, wr_vx, F_mass, F_mom1
+#endif
   DvceArray5D<Real> utest;  // scratch array for FOFC
 
   // container to hold names of TaskIDs

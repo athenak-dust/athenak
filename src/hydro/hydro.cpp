@@ -291,6 +291,10 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
       Kokkos::realloc(uflx.x1f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
       Kokkos::realloc(uflx.x2f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
       Kokkos::realloc(uflx.x3f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
+#ifdef ATHENAK_HYDRO_FLUX_PROBE
+      probe_ncycle = pin->GetOrAddInteger("hydro", "probe_ncycle", 0);
+      Kokkos::realloc(probe, 6, ncells1);
+#endif
 
       // allocate array of flags used with FOFC
       if (use_fofc) {
