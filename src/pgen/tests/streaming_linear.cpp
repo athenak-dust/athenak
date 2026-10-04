@@ -61,6 +61,7 @@ int snapshot_number_ = 0;
 bool cloud_mode_ = false;
 Real cloud_root_dx1_ = 0.0, cloud_root_dx2_ = 0.0;
 std::string snapshot_basename_;
+int snapshot_every_ = 1, snapshot_calls_ = 0;   // write every N-th history call
 
 // Opt-in, single-rank diagnostic output at the history cadence. Native binary and
 // particle-VTK output round to float, which erases the small LinA perturbations.
@@ -178,6 +179,8 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     }
     snapshot_basename_ = pin->GetString("job", "basename");
     snapshot_number_ = 0;
+    snapshot_every_ = std::max(1, pin->GetOrAddInteger("problem", "snapshot_every", 1));
+    snapshot_calls_ = 0;
   }
   if (restart && pin->GetOrAddBoolean("problem", "prescribed_gas", false)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -796,6 +799,6 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
   pdata->hdata[3] = gim;
   pdata->hdata[4] = mre;
   pdata->hdata[5] = mim;
-  if (snapshots_) WriteStreamingSnapshot(pm);
+  if (snapshots_ && (snapshot_calls_++ % snapshot_every_) == 0) WriteStreamingSnapshot(pm);
   return;
 }
