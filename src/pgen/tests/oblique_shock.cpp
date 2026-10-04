@@ -15,6 +15,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <limits>
 
 #include "athena.hpp"
 #include "parameter_input.hpp"
@@ -105,7 +106,10 @@ void ObliqueShockBCs(Mesh *pm) {
   const Real rho1 = os_rho1, rho2 = os_rho1*os_mach*os_mach;
   const Real vs = os_mach*os_cs, u2 = vs*(1.0 - 1.0/(os_mach*os_mach));
   const Real nx = std::cos(os_th), ny = std::sin(os_th);
-  const Real front = os_x0 + vs*(pm->time + 0.5*pm->dt);
+  // pm->dt is std::numeric_limits<float>::max() until the first time step is computed
+  // (the boundary fill at initialization): use the mid-step time only for a valid dt
+  const Real dt = (pm->dt < 0.5*std::numeric_limits<float>::max()) ? pm->dt : 0.0;
+  const Real front = os_x0 + vs*(pm->time + 0.5*dt);
   auto fill = [=] KOKKOS_FUNCTION (int m, int j, int i) {
     const Real dx = size.d_view(m).dx1, dy = size.d_view(m).dx2;
     const Real xc = CellCenterX(i-is, nx1, size.d_view(m).x1min, size.d_view(m).x1max);
