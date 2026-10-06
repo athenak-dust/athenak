@@ -99,6 +99,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   t.cloud_max_level = pin->GetOrAddInteger("dust", "cloud_max_level", nlev);
   t.cloud_split_everywhere = pin->GetOrAddBoolean("dust", "cloud_split_everywhere", false);
   t.cloud_split_overlap = pin->GetOrAddBoolean("dust", "cloud_split_overlap", false);
+  t.lobe3_integral = cloud_presplit_x1;
 
   t.cloud_target = DvceArray2D<int>("dust_cloud_target", t.nfine2, t.nfine1);
   t.cloud_level = DvceArray2D<int>("dust_cloud_level", t.nfine2, t.nfine1);
@@ -544,6 +545,7 @@ int DustGasDrag::SplitCloudsP1() {
   const bool release = cloud_p1_release_exit;
   const int sh1 = SMRCompositeTransfer::kCloudLobeShift1;
   const int sh2 = SMRCompositeTransfer::kCloudLobeShift2;
+  const bool presplit = cloud_presplit_x1;
 
   // eligible(x, y, l): a plain level-l cloud at (x, y) would be split
   DvceArray1D<int> flag("dust_cloud_flag", npart);
@@ -559,6 +561,7 @@ int DustGasDrag::SplitCloudsP1() {
     int f = 0;
     if (l1 == 0 && l2 == 0) {
       f = transfer.CloudInsideFiner(x, y, lev, slack) ? 1 : 0;
+      if (presplit && lev == 0 && lev < transfer.cloud_nlev) f = 1;
     } else if (lev > 0 && release && !transfer.CloudInsideFiner(x, y, lev - 1, slack)) {
       f = 1;   // diagnostic: a lobed cloud that has left the split region releases its lobes
     } else if (lev > 0 && transfer.CloudInsideFiner(x, y, lev - 1, slack)) {
@@ -742,7 +745,8 @@ int DustGasDrag::SplitCloudsP1() {
       // plain parent: children at level lev+1, edges separated where the neighbour
       // parent is eligible as well
       const Real h1 = transfer.CloudHalfWidth1(lev), h2 = transfer.CloudHalfWidth2(lev);
-      n1 = pieces(3, eligible(x - h1, y, lev), eligible(x + h1, y, lev), p1);
+      const bool px = presplit && lev == 0;
+      n1 = pieces(3, px || eligible(x - h1, y, lev), px || eligible(x + h1, y, lev), p1);
       n2 = pieces(3, eligible(x, y - h2, lev), eligible(x, y + h2, lev), p2);
       clev = lev + 1;
       ++nparent;

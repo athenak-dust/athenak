@@ -107,6 +107,9 @@ struct SMRCompositeTransfer {
   bool cloud_split_everywhere = false; // control: split regardless of the local mesh
   bool cloud_split_overlap = false;    // split once the (shrunk) support touches finer leaves
                                        // instead of once it lies entirely on them
+  bool lobe3_integral = false;         // diagnostic (<dust>/cloud_presplit_x1): a lobe-3
+                                       // direction (parent width) of a transition-2 gather
+                                       // takes the cloud integral like a plain cloud
   Real root_dx1 = 0.0, root_dx2 = 0.0;
   Real fine_dx1 = 0.0, fine_dx2 = 0.0;
   DvceArray2D<int> cloud_target;      // finest virtual cell -> encoded active leaf
@@ -354,10 +357,12 @@ struct SMRCompositeTransfer {
     Real w1[kMaxCloudStencil], w2[kMaxCloudStencil];
     Real g1[kMaxCloudStencil], g2[kMaxCloudStencil];
     bool point = (lev & kCloudGatherPoint) != 0;
+    bool point1 = point && !(lobe3_integral && CloudLobe1(lev) == 3);
+    bool point2 = point && !(lobe3_integral && CloudLobe2(lev) == 3);
     int n1 = CloudWeightsMoments1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1, g1,
-                                   CloudLobe1(lev), point);
+                                   CloudLobe1(lev), point1);
     int n2 = CloudWeightsMoments1D(x2, CloudHalfWidth2(lev), x2min, fine_dx2, j0, w2, g2,
-                                   CloudLobe2(lev), point);
+                                   CloudLobe2(lev), point2);
     for (int b=0; b<n2; ++b) {
       if (w2[b] == 0.0 && g2[b] == 0.0) continue;
       int fj = WrapIndex(j0 + b, nfine2);
@@ -663,6 +668,10 @@ class DustGasDrag {
                                       // no merging (requires cloud_transition > 0)
   bool cloud_p1_release_exit = false; // diagnostic: lobed clouds that leave the split
                                       // region release their lobes (old-rule exit edge)
+  bool cloud_presplit_x1 = false;     // diagnostic: every root cloud is
+                                      // split along x1 only (x2 keeps the parent width as
+                                      // lobe 3, gathered as a cloud integral), so a z-normal
+                                      // refinement edge has no along-edge width jump
   bool cloud_split_interp = false;    // P1 split/release: pieces take the node-convention
                                       // (linear, P1) prolongation of displacement and velocity
                                       // from the neighbouring nodes of the particle lattice,
