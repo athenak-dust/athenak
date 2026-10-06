@@ -1359,6 +1359,35 @@ int DustGasDrag::MergeClouds() {
         return (R[a][IPX] < R[b][IPX]) || (R[a][IPX] == R[b][IPX] && R[a][IPY] < R[b][IPY]);
       });
       std::vector<int> centres, tmp;
+      // level-L clouds committed in this pass (x, y, m), by cell, for the implicit node mass
+      std::vector<std::array<Real,3>> newc;
+      std::unordered_map<int, std::vector<int>> hn;
+      const Real ell1 = transfer.CloudHalfWidth1(lev), ell2 = transfer.CloudHalfWidth2(lev);
+      // implicit mass of the fine node at (xn, yn): the share 1/4 prod(1 - |d|/H) that the
+      // level-L clouds within H hold of that node in their two-scale decomposition
+      auto implicit = [&](Real xn, Real yn) {
+        Real sum = 0.0;
+        const int ci = SMRCompositeTransfer::WrapIndex(static_cast<int>(
+            std::floor((wrap(xn, x1min, len1) - x1min)/H1)), n1);
+        const int cj = SMRCompositeTransfer::WrapIndex(static_cast<int>(
+            std::floor((wrap(yn, x2min, len2) - x2min)/H2)), n2);
+        for (int dj=-1; dj<=1; ++dj) {
+          for (int di=-1; di<=1; ++di) {
+            const int key = SMRCompositeTransfer::WrapIndex(cj + dj, n2)*n1 +
+                            SMRCompositeTransfer::WrapIndex(ci + di, n1);
+            auto add = [&](Real cx, Real cy, Real cm) {
+              const Real ax = std::fabs(transfer.MinImage1(cx - xn))/H1;
+              const Real ay = std::fabs(transfer.MinImage2(cy - yn))/H2;
+              if (ax < 1.0 - 1.0e-12 && ay < 1.0 - 1.0e-12) sum += 0.25*cm*(1.0 - ax)*(1.0 - ay);
+            };
+            auto it = hc.find(key);
+            if (it != hc.end()) for (int t : it->second) add(R[t][IPX], R[t][IPY], R[t][IPM]);
+            auto jt = hn.find(key);
+            if (jt != hn.end()) for (int k : jt->second) add(newc[k][0], newc[k][1], newc[k][2]);
+          }
+        }
+        return sum;
+      };
       for (int s : zone) {
         near(s, hc, tmp);
         if (!tmp.empty()) continue;
@@ -1376,14 +1405,31 @@ int DustGasDrag::MergeClouds() {
         for (int t : nb) if (!in_zone(t)) {ready = false; break;}
         if (!ready) {++npending; continue;}
         // contributions (index, mass taken)
+        // contributions (index, mass taken), node by node: coincident pieces form a node, and
+        // a node gives min(rem, w*(rem + implicit)), shared over its pieces by mass, so that
+        // on a uniform lattice every node is used up exactly by the centres around it
         std::vector<std::pair<int, Real>> con;
         con.emplace_back(c, R[c][IPM]);
+        std::map<std::pair<long long, long long>, std::vector<int>> nodes;
         for (int t : nb) {
-          const Real w = (1.0 - std::fabs(transfer.MinImage1(R[t][IPX] - R[c][IPX]))/H1)*
-                         (1.0 - std::fabs(transfer.MinImage2(R[t][IPY] - R[c][IPY]))/H2);
-          Real share = std::min(w*mnode, R[t][IPM]);
-          if (R[t][IPM] - share < 1.0e-10*mnode) share = R[t][IPM];   // no dust crumbs
-          if (share > 0.0) con.emplace_back(t, share);
+          const Real dx = transfer.MinImage1(R[t][IPX] - R[c][IPX]);
+          const Real dy = transfer.MinImage2(R[t][IPY] - R[c][IPY]);
+          nodes[{std::llround(dx/ell1*1.0e6), std::llround(dy/ell2*1.0e6)}].push_back(t);
+        }
+        for (auto &nd : nodes) {
+          const int t0 = nd.second[0];
+          const Real dx = transfer.MinImage1(R[t0][IPX] - R[c][IPX]);
+          const Real dy = transfer.MinImage2(R[t0][IPY] - R[c][IPY]);
+          const Real w = (1.0 - std::fabs(dx)/H1)*(1.0 - std::fabs(dy)/H2);
+          Real rem = 0.0;
+          for (int t : nd.second) rem += R[t][IPM];
+          if (rem <= 0.0) continue;
+          Real share = std::min(rem, w*(rem + implicit(R[t0][IPX], R[t0][IPY])));
+          if (rem - share < 1.0e-10*mnode) share = rem;   // no dust crumbs
+          for (int t : nd.second) {
+            const Real s = share*R[t][IPM]/rem;
+            if (s > 0.0) con.emplace_back(t, s);
+          }
         }
         // velocity tolerance: drop the worst contribution until all residuals fit
         Real M = 0.0, xc = 0.0, yc = 0.0, vm[3] = {0.0, 0.0, 0.0}, G[3][2];
@@ -1465,6 +1511,14 @@ int DustGasDrag::MergeClouds() {
         i[PLEV] = L;
         i[PGID] = owner_gid(px, py);
         Rm.push_back(r); Im.push_back(i);
+        {
+          const int ci = SMRCompositeTransfer::WrapIndex(static_cast<int>(
+              std::floor((px - x1min)/H1)), n1);
+          const int cj = SMRCompositeTransfer::WrapIndex(static_cast<int>(
+              std::floor((py - x2min)/H2)), n2);
+          hn[cj*n1 + ci].push_back(static_cast<int>(newc.size()));
+          newc.push_back({px, py, M});
+        }
         for (auto &e : con) {
           const int s = e.first;
           R[s][IPM] -= e.second;
