@@ -156,6 +156,38 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
       }
     }
   }
+  // <dust>/cloud_split_buffer (default 0): the refined dust region
+  // reaches this many cells of the next-coarser level beyond the refined gas leaves
+  // (periodic Chebyshev dilation of each level's region), so the dust size transition
+  // sits on uniform coarse gas.  Only the level map of split/merge eligibility changes;
+  // deposit and gather keep the leaf owners.
+  cloud_split_buffer = pin->GetOrAddInteger("dust", "cloud_split_buffer", 0);
+  if (cloud_split_buffer < 0 || (cloud_split_buffer > 0 &&
+      (!cloud_p1_split || cloud_force_children))) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<dust>/cloud_split_buffer must be >= 0; a positive buffer requires "
+              << "cloud_p1_split and excludes cloud_force_children" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (cloud_split_buffer > 0) {
+    auto mesh_level = Kokkos::create_mirror_view(t.cloud_level);
+    Kokkos::deep_copy(mesh_level, level);
+    for (int lev=1; lev<=nlev; ++lev) {
+      const int r = cloud_split_buffer << (nlev - lev + 1);   // finest cells per buffer
+      for (int fj=0; fj<t.nfine2; ++fj) {
+        for (int fi=0; fi<t.nfine1; ++fi) {
+          if (mesh_level(fj,fi) < lev) continue;
+          for (int dj=-r; dj<=r; ++dj) {
+            const int wj = SMRCompositeTransfer::WrapIndex(fj + dj, t.nfine2);
+            for (int di=-r; di<=r; ++di) {
+              int &l = level(wj, SMRCompositeTransfer::WrapIndex(fi + di, t.nfine1));
+              l = std::max(l, lev);
+            }
+          }
+        }
+      }
+    }
+  }
   Kokkos::deep_copy(t.cloud_target, target);
   Kokkos::deep_copy(t.cloud_level, level);
 
@@ -174,6 +206,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << (cloud_transition > 0 ? ", P1 transition clouds (mode " +
                   std::to_string(cloud_transition) + ")" : "")
               << (cloud_p1_split ? ", moving P1 split without merging" : "")
+              << (cloud_split_buffer > 0 ? ", dust split buffer " +
+                  std::to_string(cloud_split_buffer) + " coarse cells" : "")
               << (t.cloud_split_everywhere ? ", split everywhere" : "")
               << (t.cloud_split_overlap ? ", split on first overlap with finer leaves" : "")
               << std::endl;

@@ -682,6 +682,8 @@ class DustGasDrag {
   unsigned long long cloud_coarsen_events = 0, cloud_coarsen_in = 0;
   unsigned long long cloud_coarsen_reject = 0, cloud_far_release = 0;
   Real cloud_coarsen_dk_grad = 0.0, cloud_coarsen_dk_res = 0.0;
+  int cloud_split_buffer = 0;         // refined dust region reaches this many next-coarser
+                                      // cells beyond the refined gas
   bool cloud_presplit_x1 = false;     // diagnostic: every root cloud is
                                       // split along x1 only (x2 keeps the parent width as
                                       // lobe 3, gathered as a cloud integral), so a z-normal
