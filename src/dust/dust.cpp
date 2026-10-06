@@ -356,6 +356,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha", 0.2);
       cloud_merge_interval = pin->GetOrAddInteger("dust", "cloud_merge_interval", 10);
       cloud_merge_min_mass = pin->GetOrAddReal("dust", "cloud_merge_min_mass", 0.5);
+      cloud_merge_nc = pin->GetOrAddBoolean("dust", "cloud_merge_nc", true);
       if (cloud_merge && (!cloud_p1_split || cloud_split_interp || cloud_deform ||
                           cloud_merge_buffer < 2 ||
                           cloud_merge_alpha <= 0.0 || cloud_merge_interval < 1)) {

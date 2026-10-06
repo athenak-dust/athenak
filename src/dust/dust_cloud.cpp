@@ -1300,6 +1300,7 @@ int DustGasDrag::MergeClouds() {
   std::vector<std::vector<Real>> Rm;   // merged clouds
   std::vector<std::vector<int>> Im;
   unsigned long long nevents = 0, nin = 0, nreject = 0, npending = 0;
+  unsigned long long nc_shift = 0, nc_skip = 0;
   Real dk_grad = 0.0, dk_res = 0.0;
   const Real omega = is_shearing_box ? omega0 : 0.0;
   for (int lev=1; lev<=nlev; ++lev) {
@@ -1382,10 +1383,12 @@ int DustGasDrag::MergeClouds() {
       // level-L clouds committed in this pass (x, y, m), by cell, for the implicit node mass
       std::vector<std::array<Real,3>> newc;
       std::unordered_map<int, std::vector<int>> hn;
-      // implicit mass of the fine node at (xn, yn): the share 1/4 prod(1 - |d|/H) that the
-      // level-L clouds within H hold of that node in their two-scale decomposition
+      // implicit content of the fine node at (xn, yn): the mass 1/4 m tent(d) that each level-L
+      // cloud within H holds of that node in its two-scale decomposition, and its first moment
+      // relative to the node (the child sits at the cloud position plus the snapped offset)
+      struct Imp {Real m, mx, my;};
       auto implicit = [&](Real xn, Real yn) {
-        Real sum = 0.0;
+        Imp sum = {0.0, 0.0, 0.0};
         const int ci = SMRCompositeTransfer::WrapIndex(static_cast<int>(
             std::floor((wrap(xn, x1min, len1) - x1min)/H1)), n1);
         const int cj = SMRCompositeTransfer::WrapIndex(static_cast<int>(
@@ -1395,7 +1398,10 @@ int DustGasDrag::MergeClouds() {
             const int key = SMRCompositeTransfer::WrapIndex(cj + dj, n2)*n1 +
                             SMRCompositeTransfer::WrapIndex(ci + di, n1);
             auto add = [&](Real cx, Real cy, Real cm) {
-              sum += 0.25*cm*tent(transfer.MinImage1(cx - xn), transfer.MinImage2(cy - yn));
+              const Real dx = transfer.MinImage1(xn - cx), dy = transfer.MinImage2(yn - cy);
+              const Real w = 0.25*cm*tent(dx, dy);
+              if (w <= 0.0) return;
+              sum.m += w; sum.mx += w*(snap(dx, ell1) - dx); sum.my += w*(snap(dy, ell2) - dy);
             };
             auto it = hc.find(key);
             if (it != hc.end()) for (int t : it->second) add(R[t][IPX], R[t][IPY], R[t][IPM]);
@@ -1428,14 +1434,12 @@ int DustGasDrag::MergeClouds() {
         bool ready = true;
         for (int t : nb) if (!in_zone(t)) {ready = false; break;}
         if (!ready) {++npending; continue;}
-        // contributions (index, mass taken)
-        // contributions (index, mass taken), node by node: coincident pieces form a node, and
-        // a node gives min(rem, w*(rem + implicit)), shared over its pieces by mass, so that
-        // on a uniform lattice every node is used up exactly by the centres around it
-        std::vector<std::pair<int, Real>> con;
-        con.emplace_back(c, R[c][IPM]);
+        // nodes: coincident pieces (offsets within 0.1 ell of a multiple of ell); the centre's
+        // own node includes the centre.  A node gives min(E, w*(E + I)), shared over its pieces
+        // by mass, so that on a uniform lattice every node is used up by the centres around it.
         std::map<std::pair<long long, long long>, std::vector<int>> nodes;
-        for (int t : nb) {   // lattice nodes: offsets within 0.1 ell of a multiple of ell
+        nodes[{0, 0}].push_back(c);
+        for (int t : nb) {
           const Real dx = transfer.MinImage1(R[t][IPX] - R[c][IPX]);
           const Real dy = transfer.MinImage2(R[t][IPY] - R[c][IPY]);
           const long long r1 = std::llround(dx/ell1), r2 = std::llround(dy/ell2);
@@ -1445,20 +1449,43 @@ int DustGasDrag::MergeClouds() {
             nodes[{(1LL << 40) + t, 0}].push_back(t);   // irregular piece: its own node
           }
         }
-        for (auto &nd : nodes) {
-          const int t0 = nd.second[0];
-          const Real dx = transfer.MinImage1(R[t0][IPX] - R[c][IPX]);
-          const Real dy = transfer.MinImage2(R[t0][IPY] - R[c][IPY]);
-          const Real w = tent(dx, dy);
-          Real rem = 0.0;
-          for (int t : nd.second) rem += R[t][IPM];
-          if (rem <= 0.0) continue;
-          Real share = std::min(rem, w*(rem + implicit(R[t0][IPX], R[t0][IPY])));
-          if (rem - share < 1.0e-6*mnode) share = rem;   // no dust crumbs
-          for (int t : nd.second) {
-            const Real s = share*R[t][IPM]/rem;
-            if (s > 0.0) con.emplace_back(t, s);
+        // node convention (cloud_merge_nc): a share enters the centroid at the node's effective
+        // position, (implicit + explicit first moment)/(implicit + explicit mass), and after the
+        // commit the node's remaining pieces are shifted so that this effective position is
+        // unchanged; a partly used node at the merge front then still carries its own
+        // displacement, and the next centre takes the rest at the same effective position
+        struct Node {std::vector<int> p; int q0; Real E, Ex, Ey, I, Ix, Iy, ex, ey, share;};
+        std::vector<Node> nd;
+        struct Con {int s; Real m, ox, oy; int node;};   // ox, oy: offset from the centre
+        std::vector<Con> con;
+        for (auto &kv2 : nodes) {
+          Node n;
+          n.p = kv2.second; n.q0 = n.p[0];
+          const Real ox0 = transfer.MinImage1(R[n.q0][IPX] - R[c][IPX]);
+          const Real oy0 = transfer.MinImage2(R[n.q0][IPY] - R[c][IPY]);
+          const Real w = tent(ox0, oy0);
+          n.E = n.Ex = n.Ey = 0.0;
+          for (int t : n.p) {
+            n.E += R[t][IPM];
+            n.Ex += R[t][IPM]*transfer.MinImage1(R[t][IPX] - R[n.q0][IPX]);
+            n.Ey += R[t][IPM]*transfer.MinImage2(R[t][IPY] - R[n.q0][IPY]);
           }
+          if (n.E <= 0.0) continue;
+          Imp im = implicit(R[n.q0][IPX], R[n.q0][IPY]);
+          n.I = im.m; n.Ix = im.mx; n.Iy = im.my;
+          n.share = std::min(n.E, w*(n.E + n.I));
+          if (n.E - n.share < 1.0e-6*mnode) n.share = n.E;   // no dust crumbs
+          if (cloud_merge_nc) {
+            n.ex = (n.Ix + n.Ex)/(n.I + n.E); n.ey = (n.Iy + n.Ey)/(n.I + n.E);
+          } else {
+            n.ex = n.Ex/n.E; n.ey = n.Ey/n.E;
+          }
+          const int k = static_cast<int>(nd.size());
+          for (int t : n.p) {
+            const Real s = n.share*R[t][IPM]/n.E;
+            if (s > 0.0) con.push_back({t, s, ox0 + n.ex, oy0 + n.ey, k});
+          }
+          nd.push_back(n);
         }
         // velocity tolerance: drop the worst contribution until all residuals fit
         Real M = 0.0, xc = 0.0, yc = 0.0, vm[3] = {0.0, 0.0, 0.0}, G[3][2];
@@ -1467,14 +1494,12 @@ int DustGasDrag::MergeClouds() {
           M = 0.0; Real mx = 0.0, my = 0.0, mts = 0.0;
           for (int k=0; k<3; ++k) vm[k] = 0.0;
           for (auto &e : con) {
-            const int s = e.first; const Real m = e.second;
-            M += m;
-            mx += m*transfer.MinImage1(R[s][IPX] - R[c][IPX]);
-            my += m*transfer.MinImage2(R[s][IPY] - R[c][IPY]);
+            const int s = e.s; const Real m = e.m;
+            M += m; mx += m*e.ox; my += m*e.oy;
             vm[0] += m*R[s][IPVX]; vm[1] += m*R[s][IPVY]; vm[2] += m*R[s][IPVZ];
             mts += m*R[s][IPTS];
           }
-          xc = R[c][IPX] + mx/M; yc = R[c][IPY] + my/M;
+          xc = mx/M; yc = my/M;   // relative to the centre
           for (int k=0; k<3; ++k) vm[k] /= M;
           const Real ts = mts/M;
           const Real tau = (omega > 0.0) ? std::min(ts, 1.0/omega) : ts;
@@ -1483,9 +1508,8 @@ int DustGasDrag::MergeClouds() {
           if (con.size() >= 5) {
             Real cxx = 0.0, cxy = 0.0, cyy = 0.0, bx[3] = {0.0, 0.0, 0.0}, by[3] = {0.0, 0.0, 0.0};
             for (auto &e : con) {
-              const int s = e.first; const Real m = e.second;
-              const Real dx = transfer.MinImage1(R[s][IPX] - xc);
-              const Real dy = transfer.MinImage2(R[s][IPY] - yc);
+              const int s = e.s; const Real m = e.m;
+              const Real dx = e.ox - xc, dy = e.oy - yc;
               const Real v[3] = {R[s][IPVX] - vm[0], R[s][IPVY] - vm[1], R[s][IPVZ] - vm[2]};
               cxx += m*dx*dx; cxy += m*dx*dy; cyy += m*dy*dy;
               for (int k=0; k<3; ++k) {bx[k] += m*dx*v[k]; by[k] += m*dy*v[k];}
@@ -1501,9 +1525,8 @@ int DustGasDrag::MergeClouds() {
           int worst = -1;
           Real rmax = 0.0;
           for (int k=0; k<static_cast<int>(con.size()); ++k) {
-            const int s = con[k].first;
-            const Real dx = transfer.MinImage1(R[s][IPX] - xc);
-            const Real dy = transfer.MinImage2(R[s][IPY] - yc);
+            const int s = con[k].s;
+            const Real dx = con[k].ox - xc, dy = con[k].oy - yc;
             const Real v[3] = {R[s][IPVX], R[s][IPVY], R[s][IPVZ]};
             Real r2 = 0.0;
             for (int q=0; q<3; ++q) {
@@ -1513,17 +1536,16 @@ int DustGasDrag::MergeClouds() {
             if (r2 > rmax) {rmax = r2; worst = k;}
           }
           if (rmax <= tol*tol) {ok = true; break;}
-          if (worst == 0) break;   // the centre itself does not fit: no commit
+          if (con[worst].s == c) break;   // the centre itself does not fit: no commit
           con.erase(con.begin() + worst);
         }
         if (!ok || M < cloud_merge_min_mass*mref) {++nreject; continue;}
         // commit: one plain level-L cloud with the mass-weighted mean of every attribute
         std::vector<Real> r(nrdata, 0.0);
         for (auto &e : con) {
-          const int s = e.first; const Real m = e.second;
+          const int s = e.s; const Real m = e.m;
           for (int k=0; k<nrdata; ++k) r[k] += m*R[s][k];
-          const Real dx = transfer.MinImage1(R[s][IPX] - xc);
-          const Real dy = transfer.MinImage2(R[s][IPY] - yc);
+          const Real dx = e.ox - xc, dy = e.oy - yc;
           const Real v[3] = {R[s][IPVX] - vm[0], R[s][IPVY] - vm[1], R[s][IPVZ] - vm[2]};
           for (int q=0; q<3; ++q) {
             const Real g = G[q][0]*dx + G[q][1]*dy;
@@ -1532,7 +1554,7 @@ int DustGasDrag::MergeClouds() {
           }
         }
         for (int k=0; k<nrdata; ++k) r[k] /= M;
-        const Real px = wrap(xc, x1min, len1), py = wrap(yc, x2min, len2);
+        const Real px = wrap(R[c][IPX] + xc, x1min, len1), py = wrap(R[c][IPY] + yc, x2min, len2);
         r[IPM] = M;
         r[IPX] = px; r[IPX1] = px; r[IPY] = py; r[IPY1] = py;
         r[IPVX] = vm[0]; r[IPVY] = vm[1]; r[IPVZ] = vm[2];
@@ -1548,10 +1570,33 @@ int DustGasDrag::MergeClouds() {
           hn[cj*n1 + ci].push_back(static_cast<int>(newc.size()));
           newc.push_back({px, py, M});
         }
+        std::vector<Real> taken(nd.size(), 0.0);
         for (auto &e : con) {
-          const int s = e.first;
-          R[s][IPM] -= e.second;
-          if (s == c || R[s][IPM] <= 0.0) {R[s][IPM] = 0.0; removed[s] = 1;}
+          taken[e.node] += e.m;
+          R[e.s][IPM] -= e.m;
+          if (e.s == c || R[e.s][IPM] <= 0.0) {R[e.s][IPM] = 0.0; removed[e.s] = 1;}
+        }
+        if (cloud_merge_nc) {
+          for (std::size_t k=0; k<nd.size(); ++k) {
+            const Node &n = nd[k];
+            const Real rem = n.E - taken[k];
+            if (rem <= 1.0e-6*mnode || taken[k] <= 0.0) continue;
+            const Real dx = transfer.MinImage1(R[n.q0][IPX] - px);
+            const Real dy = transfer.MinImage2(R[n.q0][IPY] - py);
+            const Real In = 0.25*M*tent(dx, dy);
+            const Real xr = (n.ex*(n.I + In + rem) - n.Ix - In*(snap(dx, ell1) - dx))/rem;
+            const Real yr = (n.ey*(n.I + In + rem) - n.Iy - In*(snap(dy, ell2) - dy))/rem;
+            const Real sx = xr - n.Ex/n.E, sy = yr - n.Ey/n.E;
+            if (std::fabs(sx) >= 0.1*ell1 || std::fabs(sy) >= 0.1*ell2) {++nc_skip; continue;}
+            for (int t : n.p) {
+              if (removed[t]) continue;
+              const Real nx = wrap(R[t][IPX] + sx, x1min, len1);
+              const Real ny = wrap(R[t][IPY] + sy, x2min, len2);
+              R[t][IPX] = nx; R[t][IPX1] = nx; R[t][IPY] = ny; R[t][IPY1] = ny;
+              I[t][PGID] = owner_gid(nx, ny);
+            }
+            ++nc_shift;
+          }
         }
         ++nevents;
         nin += con.size();
@@ -1607,14 +1652,15 @@ int DustGasDrag::MergeClouds() {
     if (std::ftell(fp) == 0) {
       std::fprintf(fp, "# ncycle time npart_before npart_after far_releases commits"
                    " contributions rejected(tolerance/min mass) pending dK_grad dK_res M_b M_a"
-                   " PX_b PX_a PY_b PY_a PZ_b PZ_a m_level0 m_level1 m_level2 m_lobed\n");
+                   " PX_b PX_a PY_b PY_a PZ_b PZ_a m_level0 m_level1 m_level2 m_lobed"
+                   " nc_shifts nc_skipped\n");
     }
     std::fprintf(fp, "%d %.17g %d %d %llu %llu %llu %llu %llu %.9e %.9e %.17g %.17g %.17g"
-                 " %.17g %.17g %.17g %.17g %.17g %.9e %.9e %.9e %.9e\n", pmesh->ncycle,
+                 " %.17g %.17g %.17g %.17g %.17g %.9e %.9e %.9e %.9e %llu %llu\n", pmesh->ncycle,
                  pmesh->time, npart, nnew, nrelease, nevents, nin, nreject, npending, dk_grad,
                  dk_res,
                  tb[0], ta[0], tb[1], ta[1], tb[2], ta[2], tb[3], ta[3], mlev[0], mlev[1],
-                 mlev[2], mlobe);
+                 mlev[2], mlobe, nc_shift, nc_skip);
     std::fclose(fp);
   }
   return static_cast<int>(nevents);
