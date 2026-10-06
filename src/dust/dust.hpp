@@ -668,6 +668,17 @@ class DustGasDrag {
                                       // no merging (requires cloud_transition > 0)
   bool cloud_p1_release_exit = false; // diagnostic: lobed clouds that leave the split
                                       // region release their lobes (old-rule exit edge)
+  bool cloud_merge = false;           // coarsening: far from finer
+                                      // leaves, release lobes and merge fine clouds that are
+                                      // indistinguishable at the coarser level
+  int cloud_merge_buffer = 2;         // merge cells lie at least this many cells (of the
+                                      // target level) from any finer leaf
+  Real cloud_merge_alpha = 0.2;       // residual velocity tolerance alpha*H/tau_c,
+                                      // tau_c = min(t_s, 1/Omega)
+  int cloud_merge_interval = 10;      // cycles between coarsening passes
+  unsigned long long cloud_coarsen_events = 0, cloud_coarsen_in = 0;
+  unsigned long long cloud_coarsen_reject = 0, cloud_far_release = 0;
+  Real cloud_coarsen_dk_grad = 0.0, cloud_coarsen_dk_res = 0.0;
   bool cloud_presplit_x1 = false;     // diagnostic: every root cloud is
                                       // split along x1 only (x2 keeps the parent width as
                                       // lobe 3, gathered as a cloud integral), so a z-normal
@@ -789,6 +800,7 @@ class DustGasDrag {
   int MakeTransitionClouds();  // P1 transition clouds at split edges
   int SplitCloudsP1();         // moving-particle P1 split
   TaskStatus RefineClouds(Driver *pdrive, int stage);
+  int MergeClouds();
 
   // ...in "before_timeintegrator" list
   TaskStatus GammaSwitch(Driver *pdrive, int stage);

@@ -351,6 +351,20 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_split_log = pin->GetOrAddBoolean("dust", "cloud_split_log", false);
       cloud_split_log_leaves = pin->GetOrAddBoolean("dust", "cloud_split_log_leaves", false);
       cloud_split_interp = pin->GetOrAddBoolean("dust", "cloud_split_interp", false);
+      cloud_merge = pin->GetOrAddBoolean("dust", "cloud_merge", false);
+      cloud_merge_buffer = pin->GetOrAddInteger("dust", "cloud_merge_buffer", 2);
+      cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha", 0.2);
+      cloud_merge_interval = pin->GetOrAddInteger("dust", "cloud_merge_interval", 10);
+      if (cloud_merge && (cloud_split_interp || cloud_deform || cloud_merge_buffer < 2 ||
+                          cloud_merge_alpha <= 0.0 || cloud_merge_interval < 1)) {
+        // lattice-Ai looks nodes up on the root lattice, which merged centroids leave;
+        // deformable clouds carry gradients that a merge would have to combine
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<dust>/cloud_merge excludes cloud_split_interp and "
+                  << "cloud_deform, and needs cloud_merge_buffer >= 2, cloud_merge_alpha > 0"
+                  << " and cloud_merge_interval >= 1" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       cloud_presplit_x1 = pin->GetOrAddBoolean("dust", "cloud_presplit_x1", false);
       if (cloud_presplit_x1 && !cloud_p1_split) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -540,6 +554,12 @@ DustGasDrag::~DustGasDrag() {
               << " merges=" << cloud_merge_count
               << (cloud_p1_split ? " lobe_splits=" + std::to_string(cloud_lobe_split_count)
                                  : std::string())
+              << (cloud_merge ? " coarsen_events=" + std::to_string(cloud_coarsen_events) +
+                  " coarsen_in=" + std::to_string(cloud_coarsen_in) +
+                  " coarsen_reject=" + std::to_string(cloud_coarsen_reject) +
+                  " far_releases=" + std::to_string(cloud_far_release) +
+                  " dK_grad=" + std::to_string(cloud_coarsen_dk_grad) +
+                  " dK_res=" + std::to_string(cloud_coarsen_dk_res) : std::string())
               << " particles=" << pmy_pack->ppart->nprtcl_thispack << std::endl;
   }
   if (global_variable::my_rank == 0 && solver_stage_count > 0) {
