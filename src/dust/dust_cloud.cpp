@@ -1337,6 +1337,24 @@ int DustGasDrag::MergeClouds() {
         return std::fabs(transfer.MinImage1(R[a][IPX] - R[b][IPX])) < H1*(1.0 - 1.0e-12) &&
                std::fabs(transfer.MinImage2(R[a][IPY] - R[b][IPY])) < H2*(1.0 - 1.0e-12);
       };
+      const Real ell1 = transfer.CloudHalfWidth1(lev), ell2 = transfer.CloudHalfWidth2(lev);
+      // an offset within 0.1 ell of a multiple of ell is taken as that lattice offset, so that
+      // tent weights of a (displaced) lattice are the exact P1 values; irregular offsets keep
+      // the continuous tent weight
+      auto snap = [](Real d, Real ell) {
+        const Real r = std::round(d/ell);
+        return (std::fabs(d - r*ell) < 0.1*ell) ? r*ell : d;
+      };
+      auto tent = [&](Real dx, Real dy) {
+        return std::max<Real>(0.0, 1.0 - std::fabs(snap(dx, ell1))/H1)*
+               std::max<Real>(0.0, 1.0 - std::fabs(snap(dy, ell2))/H2);
+      };
+      // a centre or level-L cloud blocks a candidate only within H - ell/2, so that the next
+      // centre of a displaced lattice (about H away) is not blocked
+      auto blocks = [&](int a, int b) {
+        return std::fabs(transfer.MinImage1(R[a][IPX] - R[b][IPX])) < H1 - 0.5*ell1 &&
+               std::fabs(transfer.MinImage2(R[a][IPY] - R[b][IPY])) < H2 - 0.5*ell2;
+      };
       // members of hash h within the tent support of s
       auto near = [&](int s, std::unordered_map<int, std::vector<int>> &h,
                       std::vector<int> &out) {
@@ -1352,17 +1370,18 @@ int DustGasDrag::MergeClouds() {
         }
       };
       auto in_zone = [&](int s) {return merge_index(R[s][IPX], R[s][IPY], L) >= 0;};
-      // designate centres in a fixed order (by position)
+      // designate centres heaviest first (P1 centre pieces carry 1/4 of their parent and sit
+      // on the root lattice), then by position
       std::vector<int> zone;
       for (int s : kv.second) if (in_zone(s)) zone.push_back(s);
       std::sort(zone.begin(), zone.end(), [&](int a, int b) {
+        if (R[a][IPM] != R[b][IPM]) return R[a][IPM] > R[b][IPM];
         return (R[a][IPX] < R[b][IPX]) || (R[a][IPX] == R[b][IPX] && R[a][IPY] < R[b][IPY]);
       });
       std::vector<int> centres, tmp;
       // level-L clouds committed in this pass (x, y, m), by cell, for the implicit node mass
       std::vector<std::array<Real,3>> newc;
       std::unordered_map<int, std::vector<int>> hn;
-      const Real ell1 = transfer.CloudHalfWidth1(lev), ell2 = transfer.CloudHalfWidth2(lev);
       // implicit mass of the fine node at (xn, yn): the share 1/4 prod(1 - |d|/H) that the
       // level-L clouds within H hold of that node in their two-scale decomposition
       auto implicit = [&](Real xn, Real yn) {
@@ -1376,9 +1395,7 @@ int DustGasDrag::MergeClouds() {
             const int key = SMRCompositeTransfer::WrapIndex(cj + dj, n2)*n1 +
                             SMRCompositeTransfer::WrapIndex(ci + di, n1);
             auto add = [&](Real cx, Real cy, Real cm) {
-              const Real ax = std::fabs(transfer.MinImage1(cx - xn))/H1;
-              const Real ay = std::fabs(transfer.MinImage2(cy - yn))/H2;
-              if (ax < 1.0 - 1.0e-12 && ay < 1.0 - 1.0e-12) sum += 0.25*cm*(1.0 - ax)*(1.0 - ay);
+              sum += 0.25*cm*tent(transfer.MinImage1(cx - xn), transfer.MinImage2(cy - yn));
             };
             auto it = hc.find(key);
             if (it != hc.end()) for (int t : it->second) add(R[t][IPX], R[t][IPY], R[t][IPM]);
@@ -1389,18 +1406,25 @@ int DustGasDrag::MergeClouds() {
         return sum;
       };
       for (int s : zone) {
+        bool blocked = false;
         near(s, hc, tmp);
-        if (!tmp.empty()) continue;
+        for (int t : tmp) if (blocks(s, t)) {blocked = true; break;}
+        if (blocked) continue;
         near(s, hz, tmp);
-        if (!tmp.empty()) continue;
+        for (int t : tmp) if (blocks(s, t)) {blocked = true; break;}
+        if (blocked) continue;
         centres.push_back(s);
         auto c = cell(s);
         hz[c.second*n1 + c.first].push_back(s);
       }
       for (int c : centres) {
         if (removed[c] || R[c][IPM] <= 0.0) continue;
-        std::vector<int> nb;
-        near(c, hp, nb);
+        std::vector<int> nb, nb0;
+        near(c, hp, nb0);
+        for (int t : nb0) {   // pieces with a positive tent weight only
+          if (tent(transfer.MinImage1(R[t][IPX] - R[c][IPX]),
+                   transfer.MinImage2(R[t][IPY] - R[c][IPY])) > 0.0) nb.push_back(t);
+        }
         bool ready = true;
         for (int t : nb) if (!in_zone(t)) {ready = false; break;}
         if (!ready) {++npending; continue;}
@@ -1411,21 +1435,26 @@ int DustGasDrag::MergeClouds() {
         std::vector<std::pair<int, Real>> con;
         con.emplace_back(c, R[c][IPM]);
         std::map<std::pair<long long, long long>, std::vector<int>> nodes;
-        for (int t : nb) {
+        for (int t : nb) {   // lattice nodes: offsets within 0.1 ell of a multiple of ell
           const Real dx = transfer.MinImage1(R[t][IPX] - R[c][IPX]);
           const Real dy = transfer.MinImage2(R[t][IPY] - R[c][IPY]);
-          nodes[{std::llround(dx/ell1*1.0e6), std::llround(dy/ell2*1.0e6)}].push_back(t);
+          const long long r1 = std::llround(dx/ell1), r2 = std::llround(dy/ell2);
+          if (std::fabs(dx - r1*ell1) < 0.1*ell1 && std::fabs(dy - r2*ell2) < 0.1*ell2) {
+            nodes[{r1, r2}].push_back(t);
+          } else {
+            nodes[{(1LL << 40) + t, 0}].push_back(t);   // irregular piece: its own node
+          }
         }
         for (auto &nd : nodes) {
           const int t0 = nd.second[0];
           const Real dx = transfer.MinImage1(R[t0][IPX] - R[c][IPX]);
           const Real dy = transfer.MinImage2(R[t0][IPY] - R[c][IPY]);
-          const Real w = (1.0 - std::fabs(dx)/H1)*(1.0 - std::fabs(dy)/H2);
+          const Real w = tent(dx, dy);
           Real rem = 0.0;
           for (int t : nd.second) rem += R[t][IPM];
           if (rem <= 0.0) continue;
           Real share = std::min(rem, w*(rem + implicit(R[t0][IPX], R[t0][IPY])));
-          if (rem - share < 1.0e-10*mnode) share = rem;   // no dust crumbs
+          if (rem - share < 1.0e-6*mnode) share = rem;   // no dust crumbs
           for (int t : nd.second) {
             const Real s = share*R[t][IPM]/rem;
             if (s > 0.0) con.emplace_back(t, s);
