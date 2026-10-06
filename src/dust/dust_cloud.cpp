@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -1117,23 +1118,19 @@ int DustGasDrag::SplitCloudsP1() {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::MergeClouds
-//! \brief Coarsening of refinable clouds (<dust>/cloud_merge, variant A1).  A cell
-//! of the level-L grid is a merge cell when no leaf finer than L lies within
-//! cloud_merge_buffer level-L cells of it (periodic, Chebyshev distance).  In a merge cell
-//!  (1) every lobed level-(L+1) cloud releases its lobes into plain pieces (exact: the
-//!      deposit, mass and momentum are unchanged; the transition-2 point gather of the
-//!      lobed directions becomes the plain cloud integral);
-//!  (2) the plain level-(L+1) clouds of one species are fitted with a mass-weighted linear
-//!      velocity field v + G.(x - x_c) (mean only for fewer than five clouds), and clouds
-//!      whose residual exceeds alpha*H_L/tau_c, tau_c = min(t_s, 1/Omega), are excluded
-//!      one at a time (worst first, refitting each time); the remaining group (at least
-//!      two) becomes one plain level-L cloud at its mass centroid with the mass-weighted
-//!      mean of every other attribute, so mass and momentum are conserved exactly.  The
-//!      excluded clouds are treated as a new group (another stream), and so on.
-//! The kinetic energy removed, 1/2 sum m |v - v_mean|^2, splits exactly into the part of
-//! the fitted gradient and the residual part; both are accumulated.  Host prototype for a
-//! single rank, like SplitCloudsP1; the algorithm is local to a merge cell.
-
+//! \brief Coarsening of refinable clouds (<dust>/cloud_merge).  A
+//! cell of the level-L grid is a merge cell when no leaf finer than L lies within
+//! cloud_merge_buffer level-L cells of it (periodic, Chebyshev distance).  In merge cells
+//!  (1) lobed level-(L+1) clouds release all lobes into plain pieces (deposit, mass and
+//!      momentum unchanged; the transition-2 point gather becomes the cloud integral);
+//!  (2) plain level-(L+1) pieces are merged by the P1 tent merge described in the body:
+//!      the exact inverse of the two-scale split on a uniform lattice and at a P1 split
+//!      edge, and a second-order coarse graining of perturbations; for irregular particles
+//!      the tent shares are approximate and what is left of a piece waits for a later
+//!      centre.
+//! Mass and momentum are conserved exactly; the kinetic energy removed is split into the
+//! part of the fitted velocity gradient and the residual part.  Host prototype for a
+//! single rank, like SplitCloudsP1; the algorithm only looks at a centre's tent support.
 int DustGasDrag::MergeClouds() {
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
@@ -1266,135 +1263,217 @@ int DustGasDrag::MergeClouds() {
     ++nrelease;
   }
 
-  // groups: plain clouds of level l >= 1 in a merge cell of level l-1, per species
-  std::unordered_map<long long, std::vector<int>> groups;
+  // P1 tent merge, per fine level l >= 1 (target L = l-1) and species.
+  // m_ref(L) = m_root(s)/4^L is the mass of a level-L cloud in the initial sampling and
+  // m_node = m_ref/4 the expected mass of one level-l node of a uniform fine lattice.  A
+  // centre is a zone piece with no level-L cloud and no other centre within its tent support
+  // (|dx| < H_L, |dy| < H_L).  It commits only when every level-l piece within that support
+  // is in the merge zone; it then takes its own mass and, from each neighbour, the share
+  // w*m_node (w the tent weight, at most what the neighbour has left), and becomes one plain
+  // level-L cloud at the centroid of what it took.  The deposit is then unchanged exactly on
+  // a uniform lattice and at a P1 split edge; neighbours keep the rest for the next centre.
+  // Contributions whose velocity residual about the mass-weighted fit exceeds
+  // alpha*H_L/tau_c are left out; a commit lighter than cloud_merge_min_mass*m_ref waits.
   const int nw = static_cast<int>(R.size());
-  for (int s=0; s<nw; ++s) {
-    const int code = I[s][PLEV];
-    const int lev = SMRCompositeTransfer::CloudLevel(code);
-    if (lev == 0 || SMRCompositeTransfer::CloudLobe1(code) != 0 ||
-        SMRCompositeTransfer::CloudLobe2(code) != 0) continue;
-    const int c = merge_index(R[s][IPX], R[s][IPY], lev - 1);
-    if (c < 0) continue;
-    const long long key = (static_cast<long long>(lev)*(1LL << 40) +
-                           static_cast<long long>(c))*1024LL + I[s][PSP];
-    groups[key].push_back(s);
+  if (cloud_merge_mroot.empty()) {
+    int nsp = 1;
+    for (int s=0; s<nw; ++s) nsp = std::max(nsp, I[s][PSP] + 1);
+    cloud_merge_mroot.assign(nsp, 0.0);
+    std::vector<Real> m1(nsp, 0.0);
+    for (int s=0; s<nw; ++s) {
+      const int code = I[s][PLEV], sp = I[s][PSP];
+      if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) {
+        continue;
+      }
+      if (SMRCompositeTransfer::CloudLevel(code) == 0) {
+        cloud_merge_mroot[sp] = std::max(cloud_merge_mroot[sp], R[s][IPM]);
+      } else if (SMRCompositeTransfer::CloudLevel(code) == 1) {
+        m1[sp] = std::max(m1[sp], R[s][IPM]);
+      }
+    }
+    // without root-level clouds, a level-1 centre piece carries 1/4 of its parent
+    for (int sp=0; sp<nsp; ++sp) {
+      if (cloud_merge_mroot[sp] <= 0.0) cloud_merge_mroot[sp] = 4.0*m1[sp];
+    }
   }
-
   std::vector<char> removed(nw, 0);
   std::vector<std::vector<Real>> Rm;   // merged clouds
   std::vector<std::vector<int>> Im;
-  unsigned long long nevents = 0, nin = 0, nreject = 0;
+  unsigned long long nevents = 0, nin = 0, nreject = 0, npending = 0;
   Real dk_grad = 0.0, dk_res = 0.0;
   const Real omega = is_shearing_box ? omega0 : 0.0;
-  for (auto &kv : groups) {
-    const int lev = static_cast<int>(kv.first/1024LL/(1LL << 40));
+  for (int lev=1; lev<=nlev; ++lev) {
     const int L = lev - 1;
-    const Real H = std::min(transfer.root_dx1, transfer.root_dx2)/static_cast<Real>(1 << L);
-    std::vector<int> pool = kv.second;
-    int streams = 0;
-    while (pool.size() >= 2 && streams < 8) {
-      ++streams;
-      std::vector<int> mem = pool, out;
-      Real M = 0.0, xc = 0.0, yc = 0.0, vm[3] = {0.0, 0.0, 0.0}, G[3][2];
-      Real tol = 0.0;
-      bool accepted = false;
-      while (mem.size() >= 2) {
-        // centroid (minimum image about the first member), mean velocity, stopping time
-        const int s0 = mem[0];
-        M = 0.0; Real mx = 0.0, my = 0.0, mts = 0.0;
-        for (int c=0; c<3; ++c) vm[c] = 0.0;
-        for (int s : mem) {
-          const Real m = R[s][IPM];
-          M += m;
-          mx += m*transfer.MinImage1(R[s][IPX] - R[s0][IPX]);
-          my += m*transfer.MinImage2(R[s][IPY] - R[s0][IPY]);
-          vm[0] += m*R[s][IPVX]; vm[1] += m*R[s][IPVY]; vm[2] += m*R[s][IPVZ];
-          mts += m*R[s][IPTS];
-        }
-        xc = R[s0][IPX] + mx/M; yc = R[s0][IPY] + my/M;
-        for (int c=0; c<3; ++c) vm[c] /= M;
-        const Real ts = mts/M;
-        const Real tau = (omega > 0.0) ? std::min(ts, 1.0/omega) : ts;
-        tol = cloud_merge_alpha*H/tau;
-        // mass-weighted linear fit of each velocity component (five or more clouds)
-        for (int c=0; c<3; ++c) {G[c][0] = 0.0; G[c][1] = 0.0;}
-        if (mem.size() >= 5) {
-          Real cxx = 0.0, cxy = 0.0, cyy = 0.0, bx[3] = {0.0, 0.0, 0.0}, by[3] = {0.0, 0.0, 0.0};
-          for (int s : mem) {
-            const Real m = R[s][IPM];
-            const Real dx = transfer.MinImage1(R[s][IPX] - xc);
-            const Real dy = transfer.MinImage2(R[s][IPY] - yc);
-            const Real v[3] = {R[s][IPVX] - vm[0], R[s][IPVY] - vm[1], R[s][IPVZ] - vm[2]};
-            cxx += m*dx*dx; cxy += m*dx*dy; cyy += m*dy*dy;
-            for (int c=0; c<3; ++c) {bx[c] += m*dx*v[c]; by[c] += m*dy*v[c];}
-          }
-          const Real det = cxx*cyy - cxy*cxy;
-          if (det > 1.0e-6*M*M*H*H*H*H) {
-            for (int c=0; c<3; ++c) {
-              G[c][0] = (cyy*bx[c] - cxy*by[c])/det;
-              G[c][1] = (cxx*by[c] - cxy*bx[c])/det;
-            }
-          }
-        }
-        // largest residual
-        int worst = -1;
-        Real rmax = 0.0;
-        for (int k=0; k<static_cast<int>(mem.size()); ++k) {
-          const int s = mem[k];
-          const Real dx = transfer.MinImage1(R[s][IPX] - xc);
-          const Real dy = transfer.MinImage2(R[s][IPY] - yc);
-          const Real v[3] = {R[s][IPVX], R[s][IPVY], R[s][IPVZ]};
-          Real r2 = 0.0;
-          for (int c=0; c<3; ++c) {
-            const Real d = v[c] - vm[c] - G[c][0]*dx - G[c][1]*dy;
-            r2 += d*d;
-          }
-          if (r2 > rmax) {rmax = r2; worst = k;}
-        }
-        if (rmax <= tol*tol) {accepted = true; break;}
-        out.push_back(mem[worst]);
-        mem.erase(mem.begin() + worst);
-      }
-      if (!accepted || mem.size() < 2) {
-        // nothing mergeable left in this pool: one cloud less to try next time
-        if (!mem.empty()) out.insert(out.end(), mem.begin(), mem.end());
-        if (out.size() >= pool.size()) {out.erase(out.begin()); ++nreject;}
-        pool = out;
+    const Real H1 = transfer.root_dx1/static_cast<Real>(1 << L);
+    const Real H2 = transfer.root_dx2/static_cast<Real>(1 << L);
+    const Real H = std::min(H1, H2);
+    const int n1 = ng1[L], n2 = ng2[L];
+    auto cell = [&](int s) {
+      const int ci = SMRCompositeTransfer::WrapIndex(static_cast<int>(
+          std::floor((wrap(R[s][IPX], x1min, len1) - x1min)/H1)), n1);
+      const int cj = SMRCompositeTransfer::WrapIndex(static_cast<int>(
+          std::floor((wrap(R[s][IPY], x2min, len2) - x2min)/H2)), n2);
+      return std::make_pair(ci, cj);
+    };
+    std::map<int, std::vector<int>> pieces_sp, coarse_sp;
+    for (int s=0; s<nw; ++s) {
+      const int code = I[s][PLEV];
+      if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) {
         continue;
       }
-      // merge the accepted group into one plain level-L cloud
-      std::vector<Real> r(nrdata, 0.0);
-      std::vector<int> i = I[mem[0]];
-      int heavy = mem[0];
-      for (int s : mem) {
-        const Real m = R[s][IPM];
-        if (m > R[heavy][IPM]) heavy = s;
-        for (int c=0; c<nrdata; ++c) r[c] += m*R[s][c];
-        const Real dx = transfer.MinImage1(R[s][IPX] - xc);
-        const Real dy = transfer.MinImage2(R[s][IPY] - yc);
-        const Real v[3] = {R[s][IPVX] - vm[0], R[s][IPVY] - vm[1], R[s][IPVZ] - vm[2]};
-        for (int c=0; c<3; ++c) {
-          const Real g = G[c][0]*dx + G[c][1]*dy;
-          dk_grad += 0.5*m*g*g;
-          dk_res += 0.5*m*(v[c] - g)*(v[c] - g);
-        }
-        removed[s] = 1;
-      }
-      for (int c=0; c<nrdata; ++c) r[c] /= M;
-      const Real px = wrap(xc, x1min, len1), py = wrap(yc, x2min, len2);
-      r[IPM] = M;
-      r[IPX] = px; r[IPX1] = px; r[IPY] = py; r[IPY1] = py;
-      r[IPVX] = vm[0]; r[IPVY] = vm[1]; r[IPVZ] = vm[2];
-      i[PLEV] = L;
-      i[PTAG] = I[heavy][PTAG];
-      i[PGID] = owner_gid(px, py);
-      Rm.push_back(r); Im.push_back(i);
-      ++nevents;
-      nin += mem.size();
-      pool = out;
+      const int cl = SMRCompositeTransfer::CloudLevel(code);
+      if (cl == lev) pieces_sp[I[s][PSP]].push_back(s);
+      if (cl == L) coarse_sp[I[s][PSP]].push_back(s);
     }
-    for (int s : pool) if (!removed[s]) ++nreject;
+    for (auto &kv : pieces_sp) {
+      const int sp = kv.first;
+      const Real mref = cloud_merge_mroot[std::min<int>(sp, cloud_merge_mroot.size() - 1)]/
+                        static_cast<Real>(1 << (2*L));
+      const Real mnode = 0.25*mref;
+      std::unordered_map<int, std::vector<int>> hp, hc, hz;
+      for (int s : kv.second) {auto c = cell(s); hp[c.second*n1 + c.first].push_back(s);}
+      for (int s : coarse_sp[sp]) {auto c = cell(s); hc[c.second*n1 + c.first].push_back(s);}
+      auto within = [&](int a, int b) {
+        return std::fabs(transfer.MinImage1(R[a][IPX] - R[b][IPX])) < H1*(1.0 - 1.0e-12) &&
+               std::fabs(transfer.MinImage2(R[a][IPY] - R[b][IPY])) < H2*(1.0 - 1.0e-12);
+      };
+      // members of hash h within the tent support of s
+      auto near = [&](int s, std::unordered_map<int, std::vector<int>> &h,
+                      std::vector<int> &out) {
+        out.clear();
+        auto c = cell(s);
+        for (int dj=-1; dj<=1; ++dj) {
+          for (int di=-1; di<=1; ++di) {
+            auto it = h.find(SMRCompositeTransfer::WrapIndex(c.second + dj, n2)*n1 +
+                             SMRCompositeTransfer::WrapIndex(c.first + di, n1));
+            if (it == h.end()) continue;
+            for (int t : it->second) if (t != s && !removed[t] && within(s, t)) out.push_back(t);
+          }
+        }
+      };
+      auto in_zone = [&](int s) {return merge_index(R[s][IPX], R[s][IPY], L) >= 0;};
+      // designate centres in a fixed order (by position)
+      std::vector<int> zone;
+      for (int s : kv.second) if (in_zone(s)) zone.push_back(s);
+      std::sort(zone.begin(), zone.end(), [&](int a, int b) {
+        return (R[a][IPX] < R[b][IPX]) || (R[a][IPX] == R[b][IPX] && R[a][IPY] < R[b][IPY]);
+      });
+      std::vector<int> centres, tmp;
+      for (int s : zone) {
+        near(s, hc, tmp);
+        if (!tmp.empty()) continue;
+        near(s, hz, tmp);
+        if (!tmp.empty()) continue;
+        centres.push_back(s);
+        auto c = cell(s);
+        hz[c.second*n1 + c.first].push_back(s);
+      }
+      for (int c : centres) {
+        if (removed[c] || R[c][IPM] <= 0.0) continue;
+        std::vector<int> nb;
+        near(c, hp, nb);
+        bool ready = true;
+        for (int t : nb) if (!in_zone(t)) {ready = false; break;}
+        if (!ready) {++npending; continue;}
+        // contributions (index, mass taken)
+        std::vector<std::pair<int, Real>> con;
+        con.emplace_back(c, R[c][IPM]);
+        for (int t : nb) {
+          const Real w = (1.0 - std::fabs(transfer.MinImage1(R[t][IPX] - R[c][IPX]))/H1)*
+                         (1.0 - std::fabs(transfer.MinImage2(R[t][IPY] - R[c][IPY]))/H2);
+          Real share = std::min(w*mnode, R[t][IPM]);
+          if (R[t][IPM] - share < 1.0e-10*mnode) share = R[t][IPM];   // no dust crumbs
+          if (share > 0.0) con.emplace_back(t, share);
+        }
+        // velocity tolerance: drop the worst contribution until all residuals fit
+        Real M = 0.0, xc = 0.0, yc = 0.0, vm[3] = {0.0, 0.0, 0.0}, G[3][2];
+        bool ok = false;
+        while (!con.empty()) {
+          M = 0.0; Real mx = 0.0, my = 0.0, mts = 0.0;
+          for (int k=0; k<3; ++k) vm[k] = 0.0;
+          for (auto &e : con) {
+            const int s = e.first; const Real m = e.second;
+            M += m;
+            mx += m*transfer.MinImage1(R[s][IPX] - R[c][IPX]);
+            my += m*transfer.MinImage2(R[s][IPY] - R[c][IPY]);
+            vm[0] += m*R[s][IPVX]; vm[1] += m*R[s][IPVY]; vm[2] += m*R[s][IPVZ];
+            mts += m*R[s][IPTS];
+          }
+          xc = R[c][IPX] + mx/M; yc = R[c][IPY] + my/M;
+          for (int k=0; k<3; ++k) vm[k] /= M;
+          const Real ts = mts/M;
+          const Real tau = (omega > 0.0) ? std::min(ts, 1.0/omega) : ts;
+          const Real tol = cloud_merge_alpha*H/tau;
+          for (int k=0; k<3; ++k) {G[k][0] = 0.0; G[k][1] = 0.0;}
+          if (con.size() >= 5) {
+            Real cxx = 0.0, cxy = 0.0, cyy = 0.0, bx[3] = {0.0, 0.0, 0.0}, by[3] = {0.0, 0.0, 0.0};
+            for (auto &e : con) {
+              const int s = e.first; const Real m = e.second;
+              const Real dx = transfer.MinImage1(R[s][IPX] - xc);
+              const Real dy = transfer.MinImage2(R[s][IPY] - yc);
+              const Real v[3] = {R[s][IPVX] - vm[0], R[s][IPVY] - vm[1], R[s][IPVZ] - vm[2]};
+              cxx += m*dx*dx; cxy += m*dx*dy; cyy += m*dy*dy;
+              for (int k=0; k<3; ++k) {bx[k] += m*dx*v[k]; by[k] += m*dy*v[k];}
+            }
+            const Real det = cxx*cyy - cxy*cxy;
+            if (det > 1.0e-6*M*M*H*H*H*H) {
+              for (int k=0; k<3; ++k) {
+                G[k][0] = (cyy*bx[k] - cxy*by[k])/det;
+                G[k][1] = (cxx*by[k] - cxy*bx[k])/det;
+              }
+            }
+          }
+          int worst = -1;
+          Real rmax = 0.0;
+          for (int k=0; k<static_cast<int>(con.size()); ++k) {
+            const int s = con[k].first;
+            const Real dx = transfer.MinImage1(R[s][IPX] - xc);
+            const Real dy = transfer.MinImage2(R[s][IPY] - yc);
+            const Real v[3] = {R[s][IPVX], R[s][IPVY], R[s][IPVZ]};
+            Real r2 = 0.0;
+            for (int q=0; q<3; ++q) {
+              const Real d = v[q] - vm[q] - G[q][0]*dx - G[q][1]*dy;
+              r2 += d*d;
+            }
+            if (r2 > rmax) {rmax = r2; worst = k;}
+          }
+          if (rmax <= tol*tol) {ok = true; break;}
+          if (worst == 0) break;   // the centre itself does not fit: no commit
+          con.erase(con.begin() + worst);
+        }
+        if (!ok || M < cloud_merge_min_mass*mref) {++nreject; continue;}
+        // commit: one plain level-L cloud with the mass-weighted mean of every attribute
+        std::vector<Real> r(nrdata, 0.0);
+        for (auto &e : con) {
+          const int s = e.first; const Real m = e.second;
+          for (int k=0; k<nrdata; ++k) r[k] += m*R[s][k];
+          const Real dx = transfer.MinImage1(R[s][IPX] - xc);
+          const Real dy = transfer.MinImage2(R[s][IPY] - yc);
+          const Real v[3] = {R[s][IPVX] - vm[0], R[s][IPVY] - vm[1], R[s][IPVZ] - vm[2]};
+          for (int q=0; q<3; ++q) {
+            const Real g = G[q][0]*dx + G[q][1]*dy;
+            dk_grad += 0.5*m*g*g;
+            dk_res += 0.5*m*(v[q] - g)*(v[q] - g);
+          }
+        }
+        for (int k=0; k<nrdata; ++k) r[k] /= M;
+        const Real px = wrap(xc, x1min, len1), py = wrap(yc, x2min, len2);
+        r[IPM] = M;
+        r[IPX] = px; r[IPX1] = px; r[IPY] = py; r[IPY1] = py;
+        r[IPVX] = vm[0]; r[IPVY] = vm[1]; r[IPVZ] = vm[2];
+        std::vector<int> i = I[c];
+        i[PLEV] = L;
+        i[PGID] = owner_gid(px, py);
+        Rm.push_back(r); Im.push_back(i);
+        for (auto &e : con) {
+          const int s = e.first;
+          R[s][IPM] -= e.second;
+          if (s == c || R[s][IPM] <= 0.0) {R[s][IPM] = 0.0; removed[s] = 1;}
+        }
+        ++nevents;
+        nin += con.size();
+      }
+    }
   }
 
   // totals before (original particles) and after (kept + merged), for the log
@@ -1443,13 +1522,14 @@ int DustGasDrag::MergeClouds() {
   if (fp != nullptr) {
     std::fseek(fp, 0, SEEK_END);
     if (std::ftell(fp) == 0) {
-      std::fprintf(fp, "# ncycle time npart_before npart_after far_releases events merged_in"
-                   " rejected dK_grad dK_res M_b M_a PX_b PX_a PY_b PY_a PZ_b PZ_a"
-                   " m_level0 m_level1 m_level2 m_lobed\n");
+      std::fprintf(fp, "# ncycle time npart_before npart_after far_releases commits"
+                   " contributions rejected(tolerance/min mass) pending dK_grad dK_res M_b M_a"
+                   " PX_b PX_a PY_b PY_a PZ_b PZ_a m_level0 m_level1 m_level2 m_lobed\n");
     }
-    std::fprintf(fp, "%d %.17g %d %d %llu %llu %llu %llu %.9e %.9e %.17g %.17g %.17g %.17g"
-                 " %.17g %.17g %.17g %.17g %.9e %.9e %.9e %.9e\n", pmesh->ncycle,
-                 pmesh->time, npart, nnew, nrelease, nevents, nin, nreject, dk_grad, dk_res,
+    std::fprintf(fp, "%d %.17g %d %d %llu %llu %llu %llu %llu %.9e %.9e %.17g %.17g %.17g"
+                 " %.17g %.17g %.17g %.17g %.17g %.9e %.9e %.9e %.9e\n", pmesh->ncycle,
+                 pmesh->time, npart, nnew, nrelease, nevents, nin, nreject, npending, dk_grad,
+                 dk_res,
                  tb[0], ta[0], tb[1], ta[1], tb[2], ta[2], tb[3], ta[3], mlev[0], mlev[1],
                  mlev[2], mlobe);
     std::fclose(fp);

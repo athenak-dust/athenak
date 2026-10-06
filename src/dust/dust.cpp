@@ -355,13 +355,16 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_buffer = pin->GetOrAddInteger("dust", "cloud_merge_buffer", 2);
       cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha", 0.2);
       cloud_merge_interval = pin->GetOrAddInteger("dust", "cloud_merge_interval", 10);
-      if (cloud_merge && (cloud_split_interp || cloud_deform || cloud_merge_buffer < 2 ||
+      cloud_merge_min_mass = pin->GetOrAddReal("dust", "cloud_merge_min_mass", 0.5);
+      if (cloud_merge && (!cloud_p1_split || cloud_split_interp || cloud_deform ||
+                          cloud_merge_buffer < 2 ||
                           cloud_merge_alpha <= 0.0 || cloud_merge_interval < 1)) {
         // lattice-Ai looks nodes up on the root lattice, which merged centroids leave;
         // deformable clouds carry gradients that a merge would have to combine
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_merge excludes cloud_split_interp and "
-                  << "cloud_deform, and needs cloud_merge_buffer >= 2, cloud_merge_alpha > 0"
+                  << std::endl << "<dust>/cloud_merge needs cloud_p1_split, excludes "
+                  << "cloud_split_interp and cloud_deform, and needs cloud_merge_buffer >= 2, "
+                  << "cloud_merge_alpha > 0"
                   << " and cloud_merge_interval >= 1" << std::endl;
         std::exit(EXIT_FAILURE);
       }
