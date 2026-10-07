@@ -226,7 +226,10 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
 TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) return TaskStatus::complete;
   SplitAndMergeClouds();
-  if (cloud_merge && pmy_pack->pmesh->ncycle % cloud_merge_interval == 0) MergeClouds();
+  if (cloud_merge && pmy_pack->pmesh->ncycle % cloud_merge_interval == 0 &&
+      (cloud_merge_tstop < 0.0 || pmy_pack->pmesh->time < cloud_merge_tstop)) {
+    MergeClouds();
+  }
   return TaskStatus::complete;
 }
 
