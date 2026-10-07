@@ -653,8 +653,9 @@ int DustGasDrag::MergeCloudsDevice() {
         // centre's tent makes the centre wait: reach H + ell in both directions
         // (cloud_merge_lobe_wait = 1), or H plus ell only along the cloud's lobes (= 2)
         if (ready && lobe_wait) {
-          for (int dj=-1; dj<=1 && ready; ++dj) {
-            for (int di=-1; di<=1 && ready; ++di) {
+          // the reach (up to H + ell) can span two level-L cells: search +-2 cells
+          for (int dj=-2; dj<=2 && ready; ++dj) {
+            for (int di=-2; di<=2 && ready; ++di) {
               const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                               SMRCompositeTransfer::WrapIndex(I + di, n1);
               for (int k=sl_start(key); k<sl_start(key+1); ++k) {
