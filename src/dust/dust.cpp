@@ -359,6 +359,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_min_mass = pin->GetOrAddReal("dust", "cloud_merge_min_mass", 0.5);
       cloud_merge_nc = pin->GetOrAddBoolean("dust", "cloud_merge_nc", true);
       cloud_merge_lobe_wait = pin->GetOrAddInteger("dust", "cloud_merge_lobe_wait", 0);
+      cloud_merge_d3 = pin->GetOrAddBoolean("dust", "cloud_merge_d3", false);
+      cloud_merge_d3_iter = pin->GetOrAddInteger("dust", "cloud_merge_d3_iter", 30);
       cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", false);
       cloud_merge_tstop = pin->GetOrAddReal("dust", "cloud_merge_tstop", -1.0);
       if (cloud_merge && (!cloud_p1_split || cloud_split_interp || cloud_deform ||

@@ -245,6 +245,17 @@ struct MergeMask {
   }
 };
 
+// fraction of a unit-mass hat (centre c, half-width w) in [a, b] (D3 diagnostic)
+KOKKOS_INLINE_FUNCTION
+Real HatFrac(const Real c, const Real w, const Real a, const Real b) {
+  auto cdf = [](const Real u) -> Real {
+    if (u <= -1.0) return 0.0;
+    if (u >= 1.0) return 1.0;
+    return (u <= 0.0) ? 0.5*(u + 1.0)*(u + 1.0) : 1.0 - 0.5*(1.0 - u)*(1.0 - u);
+  };
+  return cdf((b - c)/w) - cdf((a - c)/w);
+}
+
 // pieces of a released lobed cloud along one direction (port of the host 'release')
 KOKKOS_INLINE_FUNCTION
 int ReleasePieces(const int lobe_old, DPiece out[3]) {
@@ -506,6 +517,9 @@ int DustGasDrag::MergeCloudsDevice() {
   const Real alpha = cloud_merge_alpha, fmin = cloud_merge_min_mass;
   const bool nc = cloud_merge_nc;
   const bool lobe_wait = cloud_merge_lobe_wait > 0, lobe_wait_dir = cloud_merge_lobe_wait == 2;
+  const bool d3 = cloud_merge_d3;
+  const int d3_iter = cloud_merge_d3_iter;
+  double d3s[2] = {0.0, 0.0};   // D3 diagnostic: row first-moment mismatch^2 before / after
 
   for (int lev=1; lev<=nlev; ++lev) {
     const int L = lev - 1;
@@ -620,6 +634,11 @@ int DustGasDrag::MergeCloudsDevice() {
     DvceArray1D<int> nhead("merge_nhead", nkey), nnext("merge_nnext", ncentre);
     DvceArray1D<int> nnew("merge_nnew", 1);
     Kokkos::deep_copy(nhead, -1);
+    // D3 diagnostic: per new cloud, the x first-moment mismatch of its contributions in the
+    // five coarse cell rows around it (relative to its own position), and its row index
+    const Real hcz = transfer.CloudHalfWidth2(L);
+    DvceArray2D<Real> dprof("d3_prof", 5, d3 ? ncentre : 1);
+    DvceArray1D<int> drow("d3_row", d3 ? ncentre : 1);
     for (int round=0; round<16*(maxrank + 1); ++round) {
       const int col = round % 16, sub = round/16;
       Kokkos::parallel_for("merge_commit", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -820,6 +839,21 @@ int DustGasDrag::MergeCloudsDevice() {
         nr(IPM,knew) = M;
         nr(IPX,knew) = px; nr(IPX1,knew) = px; nr(IPY,knew) = py; nr(IPY1,knew) = py;
         nr(IPVX,knew) = vm[0]; nr(IPVY,knew) = vm[1]; nr(IPVZ,knew) = vm[2];
+        if (d3) {
+          const int mz = static_cast<int>(Kokkos::floor((py - transfer.x2min)/H2));
+          drow(knew) = mz;
+          for (int j=0; j<5; ++j) dprof(j,knew) = 0.0;
+          for (int k=0; k<npc; ++k) {
+            if (!act[k]) continue;
+            const int t = pidx[k];
+            const Real dxp = transfer.MinImage1(pr(IPX,t) - px);
+            const Real zt = py + transfer.MinImage2(pr(IPY,t) - py);
+            for (int j=0; j<5; ++j) {
+              const Real a = transfer.x2min + (mz - 2 + j)*H2;
+              dprof(j,knew) -= cm[k]*dxp*HatFrac(zt, ell2, a, a + H2);
+            }
+          }
+        }
         for (int q=0; q<nidata; ++q) ni(q,knew) = pi(q,c);
         ni(PLEV,knew) = L;
         {
@@ -880,6 +914,77 @@ int DustGasDrag::MergeCloudsDevice() {
     // compaction: drop the used-up pieces, append the new level-L clouds
     int ncommit = 0;
     Kokkos::deep_copy(ncommit, Kokkos::subview(nnew, 0));
+    if (d3 && ncommit > 0) {
+      // Jacobi least squares for x shifts dX of this pass's new clouds: in each coarse cell row
+      // of a column (new clouds within H1/2 in x), the deposit x first moment of the new clouds
+      // matches that of the shares they took.  Previously committed clouds stay fixed.
+      DvceArray1D<Real> dx0("d3_dx0", ncommit), dxa("d3_dxa", ncommit), dxb("d3_dxb", ncommit);
+      DvceArray1D<double> ssum("d3_ssum", 2);
+      auto rowres = [=] KOKKOS_FUNCTION (const int k, const int m, const DvceArray1D<Real> &dX) -> Real {
+        const Real xk = nr(IPX,k), zk = nr(IPY,k);
+        const int sp = ni(PSP,k), cell = mm.Cell(xk, zk, L), I = cell % n1, J = cell/n1;
+        Real r = 0.0;
+        for (int dj=-3; dj<=3; ++dj) {
+          for (int di=-1; di<=1; ++di) {
+            const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+                            SMRCompositeTransfer::WrapIndex(I + di, n1);
+            for (int q=nhead(key); q>=0; q=nnext(q)) {
+              if (Kokkos::fabs(transfer.MinImage1(nr(IPX,q) - xk)) >= 0.5*H1) continue;
+              const Real zq = zk + transfer.MinImage2(nr(IPY,q) - zk);
+              const int mzq = static_cast<int>(Kokkos::floor((zq - transfer.x2min)/H2));
+              const int j = m - mzq + 2;
+              if (j < 0 || j > 4) continue;
+              const Real a = transfer.x2min + m*H2;
+              r += dprof(j,q) + nr(IPM,q)*HatFrac(zq, hcz, a, a + H2)*dX(q);
+            }
+          }
+        }
+        return r;
+      };
+      auto rows_of = [=] KOKKOS_FUNCTION (const int k) -> int {
+        return static_cast<int>(Kokkos::floor((nr(IPY,k) - transfer.x2min)/H2));
+      };
+      Kokkos::parallel_for("d3_s0", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncommit),
+      KOKKOS_LAMBDA(const int k) {
+        dxa(k) = 0.0;
+        const int mz = rows_of(k);
+        double s0 = 0.0;
+        for (int m=mz-2; m<=mz+2; ++m) {const Real r = rowres(k, m, dx0); s0 += r*r;}
+        Kokkos::atomic_add(&ssum(0), s0);
+      });
+      for (int it=0; it<d3_iter; ++it) {
+        auto &src = (it % 2 == 0) ? dxa : dxb;
+        auto &dst = (it % 2 == 0) ? dxb : dxa;
+        Kokkos::parallel_for("d3_jacobi", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncommit),
+        KOKKOS_LAMBDA(const int k) {
+          const Real zk = nr(IPY,k), Mk = nr(IPM,k);
+          const int mz = rows_of(k);
+          Real num = 0.0, den = 0.0;
+          for (int m=mz-1; m<=mz+1; ++m) {
+            const Real a = transfer.x2min + m*H2;
+            const Real w = Mk*HatFrac(zk, hcz, a, a + H2);
+            if (w <= 0.0) continue;
+            num += w*rowres(k, m, src); den += w*w;
+          }
+          dst(k) = (den > 0.0) ? src(k) - 0.7*num/den : src(k);
+        });
+      }
+      auto &fin = (d3_iter % 2 == 0) ? dxa : dxb;
+      Kokkos::parallel_for("d3_s1", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncommit),
+      KOKKOS_LAMBDA(const int k) {
+        const int mz = rows_of(k);
+        double s1 = 0.0;
+        for (int m=mz-2; m<=mz+2; ++m) {const Real r = rowres(k, m, fin); s1 += r*r;}
+        Kokkos::atomic_add(&ssum(1), s1);
+      });
+      Kokkos::parallel_for("d3_apply", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncommit),
+      KOKKOS_LAMBDA(const int k) {
+        const Real nx = SMRCompositeTransfer::WrapPosition(nr(IPX,k) + fin(k), transfer.x1min, transfer.x1max);
+        nr(IPX,k) = nx; nr(IPX1,k) = nx;
+      });
+      auto sh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ssum);
+      d3s[0] += sh(0); d3s[1] += sh(1);
+    }
     DvceArray1D<int> koff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_koff"), npart);
     int nkeep = 0;
     Kokkos::parallel_scan("merge_kscan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -947,10 +1052,13 @@ int DustGasDrag::MergeCloudsDevice() {
                    " nc_shifts nc_skipped (device)\n");
     }
     std::fprintf(fp, "%d %.17g %d %d %d %llu %llu %llu %llu %.9e %.9e %.17g %.17g %.17g"
-                 " %.17g %.17g %.17g %.17g %.17g %.9e %.9e %.9e %.9e %llu %llu\n", pmesh->ncycle,
+                 " %.17g %.17g %.17g %.17g %.17g %.9e %.9e %.9e %.9e %llu %llu", pmesh->ncycle,
                  pmesh->time, npart0, nfinal, nrelease, nevents, nin, nreject, npending, dkh(0),
                  dkh(1), tb[0], ta[0], tb[1], ta[1], tb[2], ta[2], tb[3], ta[3], ml[0], ml[1],
                  ml[2], ml[3], nc_shift, nc_skip);
+    // D3 diagnostic columns appended to the line: row first-moment mismatch^2 before / after
+    if (d3) std::fprintf(fp, " %.9e %.9e", d3s[0], d3s[1]);
+    std::fprintf(fp, "\n");
     std::fclose(fp);
   }
   (void) sh1; (void) sh2;
