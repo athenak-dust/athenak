@@ -678,6 +678,9 @@ class DustGasDrag {
   int cloud_merge_interval = 10;      // cycles between coarsening passes
   Real cloud_merge_min_mass = 0.5;    // a merge commits only with >= this fraction of m_ref
   bool cloud_merge_device = false;  // run MergeClouds on the device
+  DvceArray1D<char> merge_mask_d;     // device merge-cell masks of the level-L grids (built once,
+  int merge_mask_geom[12] = {0};       // static SMR): per level n1, n2, offset
+  bool merge_mask_built = false;
   bool cloud_merge_nc = true;         // merge-side node convention
   std::vector<Real> cloud_merge_mroot; // per species: root-level cloud mass (set on first pass)
   unsigned long long cloud_coarsen_events = 0, cloud_coarsen_in = 0;

@@ -123,7 +123,7 @@ int DustGasDrag::SplitCloudsP1Device() {
   const int ncell12 = qdep.extent_int(4)*qdep.extent_int(3);
 
   // pieces per particle (0 = not flagged), and the numbers of parents / lobed events
-  DvceArray1D<int> np("dust_split_np", npart);
+  DvceArray1D<int> np(Kokkos::view_alloc(Kokkos::WithoutInitializing, "dust_split_np"), npart);
   int nflag = 0, nparent = 0;
   Kokkos::parallel_reduce("dust_split_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, int &sf, int &sp) {
@@ -140,9 +140,9 @@ int DustGasDrag::SplitCloudsP1Device() {
   if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
 
   // slots of the kept particles, first slots of the pieces, first new tags
-  DvceArray1D<int> keepoff("dust_split_keepoff", npart);
-  DvceArray1D<int> pieceoff("dust_split_pieceoff", npart);
-  DvceArray1D<int> tagoff("dust_split_tagoff", npart);
+  DvceArray1D<int> keepoff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "dust_split_keepoff"), npart);
+  DvceArray1D<int> pieceoff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "dust_split_pieceoff"), npart);
+  DvceArray1D<int> tagoff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "dust_split_tagoff"), npart);
   int nkeep = 0, npieces = 0, ntags = 0;
   Kokkos::parallel_scan("dust_split_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
@@ -161,8 +161,8 @@ int DustGasDrag::SplitCloudsP1Device() {
   }, ntags);
 
   const int nnew = nkeep + npieces;
-  DvceArray2D<Real> prn("prtcl_rdata", nrdata, nnew);
-  DvceArray2D<int> pin("prtcl_idata", nidata, nnew);
+  DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata, nnew);
+  DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata, nnew);
   const int tag0 = cloud_next_tag;
   Kokkos::parallel_for("dust_split_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
@@ -319,11 +319,21 @@ int DustGasDrag::MergeCloudsDevice() {
   const int B = cloud_merge_buffer;
   if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
 
-  // merge-cell masks (host, as MergeClouds; static for SMR)
+  // merge-cell masks (host, as MergeClouds), built once: the refinement is static
   MergeMask mm;
   mm.x1min = transfer.x1min; mm.x2min = transfer.x2min;
   mm.x1max = transfer.x1max; mm.x2max = transfer.x2max;
-  {
+  for (int L=0; L<nlev; ++L) {
+    mm.dx1[L] = transfer.root_dx1/static_cast<Real>(1 << L);
+    mm.dx2[L] = transfer.root_dx2/static_cast<Real>(1 << L);
+  }
+  if (merge_mask_built) {
+    mm.mask = merge_mask_d;
+    for (int L=0; L<nlev; ++L) {
+      mm.n1[L] = merge_mask_geom[3*L]; mm.n2[L] = merge_mask_geom[3*L+1];
+      mm.off[L] = merge_mask_geom[3*L+2];
+    }
+  } else {
     auto level_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), transfer.cloud_level);
     const int nfine1 = transfer.nfine1, nfine2 = transfer.nfine2;
     std::vector<char> all;
@@ -358,6 +368,12 @@ int DustGasDrag::MergeCloudsDevice() {
     auto mh = Kokkos::create_mirror_view(mm.mask);
     for (std::size_t k=0; k<all.size(); ++k) mh(k) = all[k];
     Kokkos::deep_copy(mm.mask, mh);
+    merge_mask_d = mm.mask;
+    for (int L=0; L<nlev; ++L) {
+      merge_mask_geom[3*L] = mm.n1[L]; merge_mask_geom[3*L+1] = mm.n2[L];
+      merge_mask_geom[3*L+2] = mm.off[L];
+    }
+    merge_mask_built = true;
   }
 
   // totals before
@@ -377,7 +393,7 @@ int DustGasDrag::MergeCloudsDevice() {
     auto pr = ppar->prtcl_rdata;
     auto pi = ppar->prtcl_idata;
     const int npart = ppar->nprtcl_thispack;
-    DvceArray1D<int> np("rel_np", npart);
+    DvceArray1D<int> np(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rel_np"), npart);
     Kokkos::parallel_reduce("rel_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, int &sum) {
       const int code = pi(PLEV,p);
@@ -392,7 +408,7 @@ int DustGasDrag::MergeCloudsDevice() {
       sum += 1;
     }, Kokkos::Sum<int>(nrelease));
     if (nrelease > 0) {
-      DvceArray1D<int> off("rel_off", npart), toff("rel_toff", npart);
+      DvceArray1D<int> off(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rel_off"), npart), toff("rel_toff", npart);
       int nnew = 0, ntags = 0;
       Kokkos::parallel_scan("rel_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
       KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
@@ -404,8 +420,8 @@ int DustGasDrag::MergeCloudsDevice() {
         if (final) toff(p) = upd;
         upd += (np(p) > 0) ? np(p) - 1 : 0;
       }, ntags);
-      DvceArray2D<Real> prn("prtcl_rdata", nrdata, nnew);
-      DvceArray2D<int> pin("prtcl_idata", nidata, nnew);
+      DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata, nnew);
+      DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata, nnew);
       const int tag0 = cloud_next_tag;
       Kokkos::parallel_for("rel_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
       KOKKOS_LAMBDA(const int p) {
@@ -499,7 +515,7 @@ int DustGasDrag::MergeCloudsDevice() {
     const Real ell1 = transfer.CloudHalfWidth1(lev), ell2 = transfer.CloudHalfWidth2(lev);
     const int n1 = mm.n1[L], n2 = mm.n2[L], ncl = n1*n2, nkey = nsp*ncl;
     // cell keys: plain level-lev pieces (m > 0) and plain level-L clouds, by species
-    DvceArray1D<int> kp("merge_kp", npart), kc("merge_kc", npart);
+    DvceArray1D<int> kp(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_kp"), npart), kc("merge_kc", npart);
     Kokkos::parallel_for("merge_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
       const int code = pi(PLEV,p);
@@ -518,7 +534,7 @@ int DustGasDrag::MergeCloudsDevice() {
              Kokkos::fmax(0.0, 1.0 - Kokkos::fabs(Snap(dy, ell2))/H2);
     };
     // centres: two rounds of local maxima among unblocked zone pieces
-    DvceArray1D<int> state("merge_state", npart);   // 0 none, 1 candidate, 2 centre, 3 blocked
+    DvceArray1D<int> state(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_state"), npart);   // 0 none, 1 candidate, 2 centre, 3 blocked
     const Real b1 = H1 - 0.5*ell1, b2 = H2 - 0.5*ell2;
     Kokkos::parallel_for("merge_cand", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
@@ -539,7 +555,7 @@ int DustGasDrag::MergeCloudsDevice() {
       state(p) = 1;
     });
     for (int round=0; round<2; ++round) {
-      DvceArray1D<int> win("merge_win", npart);
+      DvceArray1D<int> win(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_win"), npart);
       Kokkos::parallel_for("merge_mis", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
       KOKKOS_LAMBDA(const int p) {
         win(p) = 0;
@@ -573,7 +589,7 @@ int DustGasDrag::MergeCloudsDevice() {
     if (ncentre == 0) continue;
     // rank of a centre among the centres of its own cell (two centres may share a cell when
     // they are more than the blocking radius apart in one direction): sub-rounds by rank
-    DvceArray1D<int> rank("merge_rank", npart);
+    DvceArray1D<int> rank(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_rank"), npart);
     int maxrank = 0;
     Kokkos::parallel_reduce("merge_rank", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, int &mx) {
@@ -591,8 +607,8 @@ int DustGasDrag::MergeCloudsDevice() {
       if (r > mx) mx = r;
     }, Kokkos::Max<int>(maxrank));
     // new level-L clouds of this pass, and their per-cell linked lists
-    DvceArray2D<Real> nr("merge_nr", nrdata, ncentre);
-    DvceArray2D<int> ni("merge_ni", nidata, ncentre);
+    DvceArray2D<Real> nr(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_nr"), nrdata, ncentre);
+    DvceArray2D<int> ni(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_ni"), nidata, ncentre);
     DvceArray1D<int> nhead("merge_nhead", nkey), nnext("merge_nnext", ncentre);
     DvceArray1D<int> nnew("merge_nnew", 1);
     Kokkos::deep_copy(nhead, -1);
@@ -836,7 +852,7 @@ int DustGasDrag::MergeCloudsDevice() {
     // compaction: drop the used-up pieces, append the new level-L clouds
     int ncommit = 0;
     Kokkos::deep_copy(ncommit, Kokkos::subview(nnew, 0));
-    DvceArray1D<int> koff("merge_koff", npart);
+    DvceArray1D<int> koff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_koff"), npart);
     int nkeep = 0;
     Kokkos::parallel_scan("merge_kscan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
@@ -844,8 +860,8 @@ int DustGasDrag::MergeCloudsDevice() {
       upd += (pr(IPM,p) > 0.0) ? 1 : 0;
     }, nkeep);
     const int ntot = nkeep + ncommit;
-    DvceArray2D<Real> prn("prtcl_rdata", nrdata, ntot);
-    DvceArray2D<int> pin("prtcl_idata", nidata, ntot);
+    DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata, ntot);
+    DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata, ntot);
     Kokkos::parallel_for("merge_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
       if (pr(IPM,p) <= 0.0) return;
