@@ -52,6 +52,7 @@
 // user history: Fourier projections onto the seeded mode
 void StreamingLinearHistory(HistoryData *pdata, Mesh *pm);
 void StreamingKx0Filter(Mesh *pm, const Real bdt);
+bool kx0_filter_phi = false;  // also filter the azimuthal momentum (IM3 in the 2-D r-z box)
 
 namespace {
 
@@ -171,6 +172,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   // <problem>/kx0_filter (diagnostic): with <problem>/user_srcs = true,
   // remove the z-dependent k_x = 0 part of the gas radial momentum every stage
   if (pin->GetOrAddBoolean("problem", "kx0_filter", false)) user_srcs_func = StreamingKx0Filter;
+  kx0_filter_phi = pin->GetOrAddBoolean("problem", "kx0_filter_phi", false);
   // cache mode parameters for the history function (also needed on restart)
   kx_ = pin->GetReal("problem","kx");
   kz_ = pin->GetReal("problem","kz");
@@ -956,7 +958,8 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
 //! \fn void StreamingKx0Filter()
 //! \brief Diagnostic user source: remove the z-dependent k_x = 0 component of
 //! the gas radial momentum, i.e. per row of the finest virtual grid the x-average of m_x
-//! minus its domain mean (the NSH background, uniform, and every k_x != 0 mode are kept).
+//! minus its domain mean (the NSH background, uniform, and every k_x != 0 mode are kept);
+//! with <problem>/kx0_filter_phi the same for the azimuthal momentum.
 //! A coarse cell covering several finest rows takes the mean of their corrections.
 void StreamingKx0Filter(Mesh *pm, const Real bdt) {
   (void) bdt;
@@ -970,28 +973,31 @@ void StreamingKx0Filter(Mesh *pm, const Real bdt) {
   const int nf2 = t.nfine2;
   const Real fd2 = t.fine_dx2, x2min = t.x2min;
   const Real len1 = pm->mesh_size.x1max - pm->mesh_size.x1min;
-  DvceArray1D<Real> row("kx0_row", nf2);
-  Kokkos::parallel_for("kx0_sum", Kokkos::MDRangePolicy<Kokkos::Rank<3>>(DevExeSpace(),
-      {0, js, is}, {nmb, je + 1, ie + 1}), KOKKOS_LAMBDA(const int m, const int j, const int i) {
-    const Real dx = size.d_view(m).dx1, dz = size.d_view(m).dx2;
-    const Real z0 = size.d_view(m).x2min + (j - js)*dz;
-    const int r = static_cast<int>(Kokkos::round(dz/fd2));
-    const int j0 = static_cast<int>(Kokkos::round((z0 - x2min)/fd2));
-    for (int q=0; q<r; ++q) Kokkos::atomic_add(&row(j0 + q), u0(m,IM1,0,j,i)*dx/len1);
-  });
-  Real mean = 0.0;
-  Kokkos::parallel_reduce("kx0_mean", Kokkos::RangePolicy<>(DevExeSpace(), 0, nf2),
-  KOKKOS_LAMBDA(const int k, Real &sum) {sum += row(k);}, mean);
-  mean /= static_cast<Real>(nf2);
-  Kokkos::parallel_for("kx0_apply", Kokkos::MDRangePolicy<Kokkos::Rank<3>>(DevExeSpace(),
-      {0, js, is}, {nmb, je + 1, ie + 1}), KOKKOS_LAMBDA(const int m, const int j, const int i) {
-    const Real dz = size.d_view(m).dx2;
-    const Real z0 = size.d_view(m).x2min + (j - js)*dz;
-    const int r = static_cast<int>(Kokkos::round(dz/fd2));
-    const int j0 = static_cast<int>(Kokkos::round((z0 - x2min)/fd2));
-    Real c = 0.0;
-    for (int q=0; q<r; ++q) c += row(j0 + q) - mean;
-    u0(m,IM1,0,j,i) -= c/static_cast<Real>(r);
-  });
+  for (int n : {static_cast<int>(IM1), static_cast<int>(IM3)}) {
+    if (n == IM3 && !kx0_filter_phi) continue;
+    DvceArray1D<Real> row("kx0_row", nf2);
+    Kokkos::parallel_for("kx0_sum", Kokkos::MDRangePolicy<Kokkos::Rank<3>>(DevExeSpace(),
+        {0, js, is}, {nmb, je + 1, ie + 1}), KOKKOS_LAMBDA(const int m, const int j, const int i) {
+      const Real dx = size.d_view(m).dx1, dz = size.d_view(m).dx2;
+      const Real z0 = size.d_view(m).x2min + (j - js)*dz;
+      const int r = static_cast<int>(Kokkos::round(dz/fd2));
+      const int j0 = static_cast<int>(Kokkos::round((z0 - x2min)/fd2));
+      for (int q=0; q<r; ++q) Kokkos::atomic_add(&row(j0 + q), u0(m,n,0,j,i)*dx/len1);
+    });
+    Real mean = 0.0;
+    Kokkos::parallel_reduce("kx0_mean", Kokkos::RangePolicy<>(DevExeSpace(), 0, nf2),
+    KOKKOS_LAMBDA(const int k, Real &sum) {sum += row(k);}, mean);
+    mean /= static_cast<Real>(nf2);
+    Kokkos::parallel_for("kx0_apply", Kokkos::MDRangePolicy<Kokkos::Rank<3>>(DevExeSpace(),
+        {0, js, is}, {nmb, je + 1, ie + 1}), KOKKOS_LAMBDA(const int m, const int j, const int i) {
+      const Real dz = size.d_view(m).dx2;
+      const Real z0 = size.d_view(m).x2min + (j - js)*dz;
+      const int r = static_cast<int>(Kokkos::round(dz/fd2));
+      const int j0 = static_cast<int>(Kokkos::round((z0 - x2min)/fd2));
+      Real c = 0.0;
+      for (int q=0; q<r; ++q) c += row(j0 + q) - mean;
+      u0(m,n,0,j,i) -= c/static_cast<Real>(r);
+    });
+  }
 }
 
