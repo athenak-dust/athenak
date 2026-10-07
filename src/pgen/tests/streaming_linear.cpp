@@ -33,6 +33,8 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <numeric>
+#include <random>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -52,6 +54,7 @@
 // user history: Fourier projections onto the seeded mode
 void StreamingLinearHistory(HistoryData *pdata, Mesh *pm);
 void StreamingKx0Filter(Mesh *pm, const Real bdt);
+void RunMergeReplay(ParameterInput *pin, Mesh *pm, const Real taus0);
 bool kx0_filter_phi = false;  // also filter the azimuthal momentum (IM3 in the 2-D r-z box)
 Real kx0_filter_tstart = 0.0;  // the filter acts from this time on
 
@@ -784,6 +787,11 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
                 << " (" << ntrans << " edge children merged into transition clouds)"
                 << (seed_after ? ", seed imprinted after the split" : "") << std::endl;
     }
+    // <problem>/merge_replay = snapshot (diagnostic): replace the
+    // particles by a LinA snapshot and replay split and merge with frozen velocities
+    if (!pin->GetOrAddString("problem", "merge_replay", "").empty()) {
+      RunMergeReplay(pin, pmy_mesh_, taus0);
+    }
   } else {
   int nrdata = ppar->nrdata;
   par_for("stream_part", DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
@@ -1003,5 +1011,142 @@ void StreamingKx0Filter(Mesh *pm, const Real bdt) {
       u0(m,n,0,j,i) -= c/static_cast<Real>(r);
     });
   }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void RunMergeReplay()
+//! \brief Diagnostic: local replay of the refinable-cloud split and
+//! merge without hydro.  The particles of a LinA snapshot (positions, velocities, masses,
+//! tags, codes) replace the lattice; then, per cycle as RefineClouds does it, the split
+//! check, a merge pass every cloud_merge_interval cycles (shifted by
+//! merge_replay_pass_offset), and a drift with the frozen velocities.  Variants: a random x
+//! offset (merge_replay_jitter, in root cells, for fine pieces with x in
+//! [merge_replay_jx0, merge_replay_jx1) root cells), a permuted storage order
+//! (merge_replay_shuffle = seed > 0).  Snapshots <basename>.replay.NNNNN.lina every
+//! merge_replay_snap_every cycles; the merge log goes to cloud_merge_log.txt.  Exits.
+void RunMergeReplay(ParameterInput *pin, Mesh *pm, const Real taus0) {
+  MeshBlockPack *pmbp = pm->pmb_pack;
+  particles::Particles *ppar = pmbp->ppart;
+  auto *pdust = pmbp->pdust;
+  const std::string fname = pin->GetString("problem", "merge_replay");
+  const int ncyc = pin->GetOrAddInteger("problem", "merge_replay_ncycles", 21300);
+  const Real dt = pin->GetOrAddReal("problem", "merge_replay_dt", 9.18667e-06);
+  const int snap_every = pin->GetOrAddInteger("problem", "merge_replay_snap_every", 1775);
+  const Real jit = pin->GetOrAddReal("problem", "merge_replay_jitter", 0.0);
+  const Real jx0 = pin->GetOrAddReal("problem", "merge_replay_jx0", -1.0e30);
+  const Real jx1 = pin->GetOrAddReal("problem", "merge_replay_jx1", 1.0e30);
+  const int seed = pin->GetOrAddInteger("problem", "merge_replay_seed", 1);
+  const int shuffle = pin->GetOrAddInteger("problem", "merge_replay_shuffle", 0);
+  const int offset = pin->GetOrAddInteger("problem", "merge_replay_pass_offset", 0);
+  const auto &msz = pm->mesh_size;
+  const Real len1 = msz.x1max - msz.x1min, len2 = msz.x2max - msz.x2min;
+  const Real hroot = len1/static_cast<Real>(pin->GetInteger("mesh", "nx1"));
+  // read the snapshot
+  FILE *f = std::fopen(fname.c_str(), "rb");
+  char line[256];
+  double t0 = 0.0; int cyc0 = 0, nc = 0, np = 0;
+  if (f == nullptr || std::fgets(line, sizeof(line), f) == nullptr ||
+      std::string(line) != "AthenaK LinA snapshot v2 f64-native\n" ||
+      std::fgets(line, sizeof(line), f) == nullptr ||
+      std::sscanf(line, "%lf %d %d %d", &t0, &cyc0, &nc, &np) != 4) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "merge_replay: cannot read snapshot " << fname << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  std::vector<double> raw(8*static_cast<size_t>(np));
+  if (std::fseek(f, 8L*8L*static_cast<long>(nc), SEEK_CUR) != 0 ||
+      std::fread(raw.data(), sizeof(double), raw.size(), f) != raw.size()) {
+    std::cout << "### FATAL ERROR: merge_replay: truncated snapshot " << fname << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  std::fclose(f);
+  std::vector<int> order(np);
+  std::iota(order.begin(), order.end(), 0);
+  std::mt19937_64 rng(seed);
+  if (shuffle > 0) {
+    std::mt19937_64 rs(shuffle);
+    std::shuffle(order.begin(), order.end(), rs);
+  }
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  Kokkos::realloc(pr, ppar->nrdata, np);
+  Kokkos::realloc(pi, ppar->nidata, np);
+  auto hr = Kokkos::create_mirror_view(pr);
+  auto hi = Kokkos::create_mirror_view(pi);
+  auto &mbsize = pmbp->pmb->mb_size;
+  const int nmb = pmbp->nmb_thispack, gids = pmbp->gids;
+  int maxtag = -1, njit = 0;
+  for (int s=0; s<np; ++s) {
+    const double *q = &raw[8*static_cast<size_t>(order[s])];
+    for (int col=0; col<ppar->nrdata; ++col) hr(col,s) = 0.0;
+    Real x = q[0], y = q[1];
+    const int code = static_cast<int>(q[7]);
+    if (jit != 0.0 && (code & 15) == 1) {
+      const Real xr = (x - msz.x1min)/hroot;
+      if (xr >= jx0 && xr < jx1) {x += jit*hroot*uni(rng); ++njit;}
+    }
+    while (x < msz.x1min) x += len1;
+    while (x >= msz.x1max) x -= len1;
+    hr(IPX,s) = x; hr(IPX1,s) = x; hr(IPY,s) = y; hr(IPY1,s) = y;
+    hr(IPM,s) = q[2]; hr(IPTS,s) = taus0;
+    hr(IPVX,s) = q[3]; hr(IPVY,s) = q[4]; hr(IPVZ,s) = q[5];
+    hr(IPVX1,s) = q[3]; hr(IPVY1,s) = q[4]; hr(IPVZ1,s) = q[5];
+    int owner = 0;
+    for (int mb=0; mb<nmb; ++mb) {
+      const auto &size = mbsize.h_view(mb);
+      if (x >= size.x1min && x < size.x1max && y >= size.x2min && y < size.x2max) {
+        owner = mb; break;
+      }
+    }
+    hi(PGID,s) = gids + owner; hi(PTAG,s) = static_cast<int>(q[6]); hi(PSP,s) = 0;
+    hi(PLEV,s) = code;
+    maxtag = std::max(maxtag, hi(PTAG,s));
+  }
+  Kokkos::deep_copy(pr, hr);
+  Kokkos::deep_copy(pi, hi);
+  ppar->nprtcl_thispack = np;
+  pm->nprtcl_thisrank = np;
+  pm->nprtcl_eachrank[global_variable::my_rank] = np;
+  pm->nprtcl_total = np;
+  pdust->cloud_next_tag = maxtag + 1;
+  pm->time = t0;
+  pm->ncycle = cyc0;
+  std::cout << "# merge_replay: " << fname << " t=" << t0 << " cycle=" << cyc0 << " particles="
+            << np << " jittered=" << njit << " (amplitude " << jit << " root cells)"
+            << " shuffle=" << shuffle << " pass offset=" << offset << std::endl;
+  snapshot_basename_ = pin->GetString("job", "basename") + ".replay";
+  snapshot_number_ = 0;
+  WriteStreamingSnapshot(pm);
+  const Real x1min = msz.x1min, x2min = msz.x2min;
+  for (int n=0; n<ncyc; ++n) {
+    pdust->SplitAndMergeClouds();
+    if (pdust->cloud_merge && (pm->ncycle + offset) % pdust->cloud_merge_interval == 0) {
+      pdust->MergeClouds();
+    }
+    auto &dr = ppar->prtcl_rdata;
+    auto &di = ppar->prtcl_idata;
+    const int npart = ppar->nprtcl_thispack;
+    par_for("replay_drift", DevExeSpace(), 0, npart - 1, KOKKOS_LAMBDA(const int p) {
+      Real x = dr(IPX,p) + dr(IPVX,p)*dt, y = dr(IPY,p) + dr(IPVY,p)*dt;
+      if (x < x1min) x += len1;
+      if (x >= x1min + len1) x -= len1;
+      if (y < x2min) y += len2;
+      if (y >= x2min + len2) y -= len2;
+      dr(IPX,p) = x; dr(IPX1,p) = x; dr(IPY,p) = y; dr(IPY1,p) = y;
+      for (int mb=0; mb<nmb; ++mb) {
+        if (x >= mbsize.d_view(mb).x1min && x < mbsize.d_view(mb).x1max &&
+            y >= mbsize.d_view(mb).x2min && y < mbsize.d_view(mb).x2max) {
+          di(PGID,p) = gids + mb; break;
+        }
+      }
+    });
+    pm->time += dt;
+    pm->ncycle += 1;
+    if ((n + 1) % snap_every == 0) WriteStreamingSnapshot(pm);
+  }
+  std::cout << "# merge_replay done: t=" << pm->time << " cycle=" << pm->ncycle
+            << " particles=" << ppar->nprtcl_thispack << std::endl;
+  std::exit(EXIT_SUCCESS);
 }
 
