@@ -1174,6 +1174,7 @@ int DustGasDrag::SplitCloudsP1() {
 //! part of the fitted velocity gradient and the residual part.  Host prototype for a
 //! single rank, like SplitCloudsP1; the algorithm only looks at a centre's tent support.
 int DustGasDrag::MergeClouds() {
+  if (cloud_merge_device) return MergeCloudsDevice();
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   const int npart = ppar->nprtcl_thispack;
