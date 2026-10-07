@@ -53,6 +53,7 @@
 void StreamingLinearHistory(HistoryData *pdata, Mesh *pm);
 void StreamingKx0Filter(Mesh *pm, const Real bdt);
 bool kx0_filter_phi = false;  // also filter the azimuthal momentum (IM3 in the 2-D r-z box)
+Real kx0_filter_tstart = 0.0;  // the filter acts from this time on
 
 namespace {
 
@@ -173,6 +174,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   // remove the z-dependent k_x = 0 part of the gas radial momentum every stage
   if (pin->GetOrAddBoolean("problem", "kx0_filter", false)) user_srcs_func = StreamingKx0Filter;
   kx0_filter_phi = pin->GetOrAddBoolean("problem", "kx0_filter_phi", false);
+  kx0_filter_tstart = pin->GetOrAddReal("problem", "kx0_filter_tstart", 0.0);
   // cache mode parameters for the history function (also needed on restart)
   kx_ = pin->GetReal("problem","kx");
   kz_ = pin->GetReal("problem","kz");
@@ -959,10 +961,12 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
 //! \brief Diagnostic user source: remove the z-dependent k_x = 0 component of
 //! the gas radial momentum, i.e. per row of the finest virtual grid the x-average of m_x
 //! minus its domain mean (the NSH background, uniform, and every k_x != 0 mode are kept);
-//! with <problem>/kx0_filter_phi the same for the azimuthal momentum.
+//! with <problem>/kx0_filter_phi the same for the azimuthal momentum; from
+//! <problem>/kx0_filter_tstart on.
 //! A coarse cell covering several finest rows takes the mean of their corrections.
 void StreamingKx0Filter(Mesh *pm, const Real bdt) {
   (void) bdt;
+  if (pm->time < kx0_filter_tstart) return;
   MeshBlockPack *pmbp = pm->pmb_pack;
   auto &u0 = pmbp->phydro->u0;
   auto &size = pmbp->pmb->mb_size;
