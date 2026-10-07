@@ -32,7 +32,9 @@
 #include <cstdio>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 // Athena++ headers
@@ -591,10 +593,153 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     pmy_mesh_->nprtcl_thisrank = nlattice;
     pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = nlattice;
     pmy_mesh_->nprtcl_total = nlattice;
-    // one pass per refinement level: children of the first pass may lie inside a
-    // still finer region
-    while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
-    int ntrans = pmbp->pdust->MakeTransitionClouds();
+    // <problem>/graded_split_layers = D >= 0 (diagnostic): instead of
+    // the run-time split, build a graded normal transition of a STATIC refined region:
+    // the equal-weight superposition of the D+1 static P1 + overlap split sets whose
+    // refined region is dilated by k = 0..D root cells (each set is P1-consistent, so the
+    // sum is), coincident pieces of equal code combined.  One refinement level, ppc = 1,
+    // seed_after_split, no merging, no lobe release; outside the refined region nothing
+    // is eligible at run time, so the graded pieces are never split again.
+    const int glayers = pin->GetOrAddInteger("problem", "graded_split_layers", -1);
+    int ntrans = 0;
+    if (glayers >= 0) {
+      auto *pd = pmbp->pdust;
+      if (transfer.cloud_nlev != 1 || ppc_int != 1 || !seed_after || !pd->cloud_p1_split ||
+          pd->cloud_merge || pd->cloud_p1_release_exit || !transfer.cloud_split_overlap ||
+          transfer.cloud_split_everywhere || global_variable::nranks != 1) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<problem>/graded_split_layers requires one refinement "
+                  << "level, ppc = 1, seed_after_split, cloud_p1_split with overlap, no "
+                  << "merging, no lobe release, no split everywhere, one rank" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      const int nf1 = transfer.nfine1, nf2 = transfer.nfine2;
+      const Real fd1 = transfer.fine_dx1, fd2 = transfer.fine_dx2;
+      const Real gx1min = transfer.x1min, gx2min = transfer.x2min;
+      const Real glen1 = transfer.x1max - gx1min, glen2 = transfer.x2max - gx2min;
+      auto lev_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), transfer.cloud_level);
+      // refined region dilated by k root cells (2k finest cells), k = 0..D
+      std::vector<std::vector<char>> dil(glayers + 1,
+          std::vector<char>(static_cast<std::size_t>(nf1)*nf2, 0));
+      for (int fj=0; fj<nf2; ++fj) {
+        for (int fi=0; fi<nf1; ++fi) dil[0][static_cast<std::size_t>(fj)*nf1 + fi] =
+            lev_h(fj, fi) >= 1 ? 1 : 0;
+      }
+      for (int k=1; k<=glayers; ++k) {
+        for (int fj=0; fj<nf2; ++fj) {
+          for (int fi=0; fi<nf1; ++fi) {
+            char v = 0;
+            for (int dj=-2; dj<=2 && !v; ++dj) {
+              const int wj = SMRCompositeTransfer::WrapIndex(fj + dj, nf2);
+              for (int di=-2; di<=2 && !v; ++di) {
+                v = dil[k-1][static_cast<std::size_t>(wj)*nf1 +
+                             SMRCompositeTransfer::WrapIndex(fi + di, nf1)];
+              }
+            }
+            dil[k][static_cast<std::size_t>(fj)*nf1 + fi] = v;
+          }
+        }
+      }
+      auto gwrap = [](Real x, Real xmin, Real len) {
+        while (x < xmin) x += len;
+        while (x >= xmin + len) x -= len;
+        return x;
+      };
+      // run-time eligibility of a root cloud (overlap rule) against the dilated region
+      const Real slack = pd->cloud_split_slack;
+      auto elig = [&](int k, Real x, Real y) {
+        x = gwrap(x, gx1min, glen1); y = gwrap(y, gx2min, glen2);
+        const Real r1 = (1.0 - slack)*transfer.CloudHalfWidth1(0);
+        const Real r2 = (1.0 - slack)*transfer.CloudHalfWidth2(0);
+        const int ia = static_cast<int>(std::floor((x - r1 - gx1min)/fd1));
+        const int ib = static_cast<int>(std::ceil((x + r1 - gx1min)/fd1)) - 1;
+        const int ja = static_cast<int>(std::floor((y - r2 - gx2min)/fd2));
+        const int jb = static_cast<int>(std::ceil((y + r2 - gx2min)/fd2)) - 1;
+        for (int fj=ja; fj<=jb; ++fj) {
+          const int wj = SMRCompositeTransfer::WrapIndex(fj, nf2);
+          for (int fi=ia; fi<=ib; ++fi) {
+            if (dil[k][static_cast<std::size_t>(wj)*nf1 +
+                       SMRCompositeTransfer::WrapIndex(fi, nf1)]) return true;
+          }
+        }
+        return false;
+      };
+      struct GP {Real x, y, m; int code;};
+      std::map<std::tuple<long long, long long, int>, GP> acc;
+      auto add = [&](Real x, Real y, Real m, int code) {
+        x = gwrap(x, gx1min, glen1); y = gwrap(y, gx2min, glen2);
+        auto key = std::make_tuple(std::llround(x/(1.0e-6*fd1)), std::llround(y/(1.0e-6*fd2)),
+                                   code);
+        auto it = acc.find(key);
+        if (it == acc.end()) acc[key] = GP{x, y, m, code};
+        else it->second.m += m;
+      };
+      const Real e1 = transfer.CloudHalfWidth1(1), e2 = transfer.CloudHalfWidth2(1);
+      const Real h1 = transfer.CloudHalfWidth1(0), h2 = transfer.CloudHalfWidth2(0);
+      const int sh1 = SMRCompositeTransfer::kCloudLobeShift1;
+      const int sh2 = SMRCompositeTransfer::kCloudLobeShift2;
+      for (int p=0; p<nlattice; ++p) {
+        const Real x = hr(IPX,p), y = hr(IPY,p), m = hr(IPM,p)/static_cast<Real>(glayers + 1);
+        for (int k=0; k<=glayers; ++k) {
+          if (!elig(k, x, y)) {add(x, y, m, 0); continue;}
+          // pieces along one direction: (offset in child half-widths, fraction, lobe)
+          auto dir = [](bool lo_sep, bool hi_sep, Real off[3], Real fr[3], int &lobe) {
+            int n = 0;
+            lobe = (lo_sep ? 0 : 1) | (hi_sep ? 0 : 2);
+            if (lo_sep) {off[n] = -1.0; fr[n++] = 0.25;}
+            off[n] = 0.0; fr[n++] = 0.5 + (lo_sep ? 0.0 : 0.25) + (hi_sep ? 0.0 : 0.25);
+            if (hi_sep) {off[n] = 1.0; fr[n++] = 0.25;}
+            return n;
+          };
+          Real o1[3], f1[3], o2[3], f2[3]; int l1, l2;
+          const int n1 = dir(elig(k, x - h1, y), elig(k, x + h1, y), o1, f1, l1);
+          const int n2 = dir(elig(k, x, y - h2), elig(k, x, y + h2), o2, f2, l2);
+          for (int b=0; b<n2; ++b) {
+            for (int a=0; a<n1; ++a) {
+              const int c1 = (o1[a] == 0.0) ? l1 : 0, c2 = (o2[b] == 0.0) ? l2 : 0;
+              add(x + o1[a]*e1, y + o2[b]*e2, m*f1[a]*f2[b], 1 | (c1 << sh1) | (c2 << sh2));
+            }
+          }
+        }
+      }
+      const int ng = static_cast<int>(acc.size());
+      Kokkos::realloc(pr, ppar->nrdata, ng);
+      Kokkos::realloc(pi, ppar->nidata, ng);
+      auto gr = Kokkos::create_mirror_view(pr);
+      auto gi = Kokkos::create_mirror_view(pi);
+      int s = 0;
+      for (const auto &kv : acc) {
+        const GP &g = kv.second;
+        for (int col=0; col<ppar->nrdata; ++col) gr(col,s) = 0.0;
+        gr(IPX,s) = g.x; gr(IPX1,s) = g.x; gr(IPY,s) = g.y; gr(IPY1,s) = g.y;
+        gr(IPM,s) = g.m; gr(IPTS,s) = taus0;
+        gr(IPVX,s) = vnx; gr(IPVZ,s) = vnp; gr(IPVX1,s) = vnx; gr(IPVZ1,s) = vnp;
+        int owner = 0;
+        for (int mb=0; mb<nmb; ++mb) {
+          const auto &size = mbsize.h_view(mb);
+          if (g.x >= size.x1min && g.x < size.x1max && g.y >= size.x2min && g.y < size.x2max) {
+            owner = mb; break;
+          }
+        }
+        gi(PGID,s) = gids + owner; gi(PTAG,s) = s; gi(PSP,s) = 0; gi(PLEV,s) = g.code;
+        ++s;
+      }
+      Kokkos::deep_copy(pr, gr);
+      Kokkos::deep_copy(pi, gi);
+      ppar->nprtcl_thispack = ng;
+      pmy_mesh_->nprtcl_thisrank = ng;
+      pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = ng;
+      pmy_mesh_->nprtcl_total = ng;
+      if (global_variable::my_rank == 0) {
+        std::cout << "# graded_split_layers = " << glayers << ": " << nlattice
+                  << " root clouds -> " << ng << " combined pieces" << std::endl;
+      }
+    } else {
+      // one pass per refinement level: children of the first pass may lie inside a
+      // still finer region
+      while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
+      ntrans = pmbp->pdust->MakeTransitionClouds();
+    }
     if (seed_after) {
       auto h2 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
       auto i2 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pi);
