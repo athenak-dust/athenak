@@ -170,13 +170,18 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     std::exit(EXIT_FAILURE);
   }
   if (cloud_split_buffer > 0) {
-    auto mesh_level = Kokkos::create_mirror_view(t.cloud_level);
-    Kokkos::deep_copy(mesh_level, level);
+    // a plain host copy: on a host backend the mirror view aliases the map itself
+    std::vector<int> mesh_level(static_cast<std::size_t>(t.nfine1)*t.nfine2);
+    for (int fj=0; fj<t.nfine2; ++fj) {
+      for (int fi=0; fi<t.nfine1; ++fi) {
+        mesh_level[static_cast<std::size_t>(fj)*t.nfine1 + fi] = level(fj,fi);
+      }
+    }
     for (int lev=1; lev<=nlev; ++lev) {
       const int r = cloud_split_buffer << (nlev - lev + 1);   // finest cells per buffer
       for (int fj=0; fj<t.nfine2; ++fj) {
         for (int fi=0; fi<t.nfine1; ++fi) {
-          if (mesh_level(fj,fi) < lev) continue;
+          if (mesh_level[static_cast<std::size_t>(fj)*t.nfine1 + fi] < lev) continue;
           for (int dj=-r; dj<=r; ++dj) {
             const int wj = SMRCompositeTransfer::WrapIndex(fj + dj, t.nfine2);
             for (int di=-r; di<=r; ++di) {
