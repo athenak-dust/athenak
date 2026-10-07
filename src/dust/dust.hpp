@@ -693,6 +693,8 @@ class DustGasDrag {
                                       // from the neighbouring nodes of the particle lattice,
                                       // positions relative to the centre piece, velocity
                                       // increments mass-mean-free (single-stream prototype)
+  bool cloud_split_device = false;    // P1 split on the device; the split log,
+                                      // cloud_split_interp and split_oracle keep the host path
   bool cloud_split_log = false;       // diagnostic: log every P1 split event (parent,
                                       // children, leaf deposit audit) to a text file
   bool cloud_split_log_leaves = false; // diagnostic (with cloud_split_log): per split call,
@@ -804,6 +806,7 @@ class DustGasDrag {
   int SplitAndMergeClouds();   // returns the number of clouds split
   int MakeTransitionClouds();  // P1 transition clouds at split edges
   int SplitCloudsP1();         // moving-particle P1 split
+  int SplitCloudsP1Device();   // device P1 split without the diagnostics
   TaskStatus RefineClouds(Driver *pdrive, int stage);
   int MergeClouds();
 

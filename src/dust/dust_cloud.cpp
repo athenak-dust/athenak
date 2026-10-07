@@ -574,6 +574,9 @@ int DustGasDrag::MakeTransitionClouds() {
 //! attributes, so independent streams and stopping times are preserved.
 
 int DustGasDrag::SplitCloudsP1() {
+  if (cloud_split_device && !cloud_split_log && !cloud_split_interp && !split_oracle) {
+    return SplitCloudsP1Device();
+  }
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   int npart = ppar->nprtcl_thispack;

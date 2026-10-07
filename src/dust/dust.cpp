@@ -349,6 +349,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", false);
       cloud_p1_release_exit = pin->GetOrAddBoolean("dust", "cloud_p1_release_exit", false);
       cloud_split_log = pin->GetOrAddBoolean("dust", "cloud_split_log", false);
+      cloud_split_device = pin->GetOrAddBoolean("dust", "cloud_split_device", false);
       cloud_split_log_leaves = pin->GetOrAddBoolean("dust", "cloud_split_log_leaves", false);
       cloud_split_interp = pin->GetOrAddBoolean("dust", "cloud_split_interp", false);
       cloud_merge = pin->GetOrAddBoolean("dust", "cloud_merge", false);
