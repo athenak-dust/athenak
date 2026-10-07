@@ -505,6 +505,7 @@ int DustGasDrag::MergeCloudsDevice() {
   const Real omega = is_shearing_box ? omega0 : 0.0;
   const Real alpha = cloud_merge_alpha, fmin = cloud_merge_min_mass;
   const bool nc = cloud_merge_nc;
+  const bool lobe_wait = cloud_merge_lobe_wait > 0, lobe_wait_dir = cloud_merge_lobe_wait == 2;
 
   for (int lev=1; lev<=nlev; ++lev) {
     const int L = lev - 1;
@@ -516,19 +517,26 @@ int DustGasDrag::MergeCloudsDevice() {
     const int n1 = mm.n1[L], n2 = mm.n2[L], ncl = n1*n2, nkey = nsp*ncl;
     // cell keys: plain level-lev pieces (m > 0) and plain level-L clouds, by species
     DvceArray1D<int> kp(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_kp"), npart), kc("merge_kc", npart);
+    DvceArray1D<int> kl("merge_kl", npart);   // unreleased lobed level-lev clouds (lobe wait)
     Kokkos::parallel_for("merge_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
       const int code = pi(PLEV,p);
-      kp(p) = -1; kc(p) = -1;
-      if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) return;
+      kp(p) = -1; kc(p) = -1; kl(p) = -1;
+      if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) {
+        if (lobe_wait && SMRCompositeTransfer::CloudLevel(code) == lev && pr(IPM,p) > 0.0) {
+          kl(p) = pi(PSP,p)*ncl + mm.Cell(pr(IPX,p), pr(IPY,p), L);
+        }
+        return;
+      }
       const int l = SMRCompositeTransfer::CloudLevel(code);
       const int key = pi(PSP,p)*ncl + mm.Cell(pr(IPX,p), pr(IPY,p), L);
       if (l == lev && pr(IPM,p) > 0.0) kp(p) = key;
       if (l == L) kc(p) = key;
     });
-    DvceArray1D<int> sp_start, sp_list, sc_start, sc_list;
+    DvceArray1D<int> sp_start, sp_list, sc_start, sc_list, sl_start, sl_list;
     BuildCSR(kp, nkey, sp_start, sp_list);
     BuildCSR(kc, nkey, sc_start, sc_list);
+    if (lobe_wait) BuildCSR(kl, nkey, sl_start, sl_list);
     auto tent = [=] KOKKOS_FUNCTION (const Real dx, const Real dy) {
       return Kokkos::fmax(0.0, 1.0 - Kokkos::fabs(Snap(dx, ell1))/H1)*
              Kokkos::fmax(0.0, 1.0 - Kokkos::fabs(Snap(dy, ell2))/H2);
@@ -638,6 +646,25 @@ int DustGasDrag::MergeCloudsDevice() {
               if (!mm.In(pr(IPX,t), pr(IPY,t), L)) {ready = false; break;}
               if (nnb == kNbMax) {over = true; ready = false; break;}
               nb[nnb++] = t;
+            }
+          }
+        }
+        // lobe wait: an unreleased lobed cloud whose released pieces could fall in this
+        // centre's tent makes the centre wait: reach H + ell in both directions
+        // (cloud_merge_lobe_wait = 1), or H plus ell only along the cloud's lobes (= 2)
+        if (ready && lobe_wait) {
+          for (int dj=-1; dj<=1 && ready; ++dj) {
+            for (int di=-1; di<=1 && ready; ++di) {
+              const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+                              SMRCompositeTransfer::WrapIndex(I + di, n1);
+              for (int k=sl_start(key); k<sl_start(key+1); ++k) {
+                const int t = sl_list(k);
+                const int ct = pi(PLEV,t);
+                const Real r1 = H1 + (lobe_wait_dir ? (SMRCompositeTransfer::CloudLobe1(ct) ? ell1 : 0.0) : ell1);
+                const Real r2 = H2 + (lobe_wait_dir ? (SMRCompositeTransfer::CloudLobe2(ct) ? ell2 : 0.0) : ell2);
+                if (Kokkos::fabs(transfer.MinImage1(pr(IPX,t) - xc0)) < r1*(1.0 - 1.0e-12) &&
+                    Kokkos::fabs(transfer.MinImage2(pr(IPY,t) - yc0)) < r2*(1.0 - 1.0e-12)) {ready = false; break;}
+              }
             }
           }
         }

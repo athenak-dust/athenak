@@ -683,6 +683,8 @@ class DustGasDrag {
   int merge_mask_geom[12] = {0};       // static SMR): per level n1, n2, offset
   bool merge_mask_built = false;
   bool cloud_merge_nc = true;         // merge-side node convention
+  int cloud_merge_lobe_wait = 0;      // a centre waits while an unreleased lobed cloud is near
+                                      // (1: reach H + ell, 2: reach per lobe direction)
   std::vector<Real> cloud_merge_mroot; // per species: root-level cloud mass (set on first pass)
   unsigned long long cloud_coarsen_events = 0, cloud_coarsen_in = 0;
   unsigned long long cloud_coarsen_reject = 0, cloud_far_release = 0;
