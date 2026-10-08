@@ -683,6 +683,7 @@ class DustGasDrag {
   int merge_mask_geom[12] = {0};       // static SMR): per level n1, n2, offset
   bool merge_mask_built = false;
   bool cloud_merge_nc = true;         // merge-side node convention
+  bool cloud_merge_absorb = false;    // orphan absorption into existing coarse clouds
   bool cloud_merge_d3 = false;        // diagnostic: per-pass coarse-row first-moment
   int cloud_merge_d3_iter = 30;       // matching of the new clouds' x positions (D3), Jacobi iterations
   int cloud_merge_lobe_wait = 0;      // a centre waits while an unreleased lobed cloud is near
