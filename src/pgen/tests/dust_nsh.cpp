@@ -62,6 +62,64 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm);
 
 namespace {
 
+bool ba_snapshots_ = false;
+int ba_snapshot_number_ = 0;
+Real ba_snapshot_dt_ = 40.0;
+std::string ba_snapshot_basename_;
+
+// Diagnostic only: the v2 LinA layout retains the exact particle masses and P1
+// lobe codes needed to reconstruct the cloud integral on every active leaf.
+void WriteBASnapshot(Mesh *pm) {
+  auto *pack = pm->pmb_pack;
+  auto &ind = pm->mb_indcs;
+  auto gas = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pack->phydro->u0);
+  auto pr = Kokkos::create_mirror_view_and_copy(HostMemSpace(),
+                                               pack->ppart->prtcl_rdata);
+  auto pi = Kokkos::create_mirror_view_and_copy(HostMemSpace(),
+                                               pack->ppart->prtcl_idata);
+  int ncell = pack->nmb_thispack*ind.nx1*ind.nx2;
+  int npart = pack->ppart->nprtcl_thispack;
+  std::vector<double> cells;
+  std::vector<double> particles;
+  cells.reserve(8*ncell);
+  particles.reserve(8*npart);
+  for (int m=0; m<pack->nmb_thispack; ++m) {
+    const auto &size = pack->pmb->mb_size.h_view(m);
+    for (int j=ind.js; j<=ind.je; ++j) {
+      for (int i=ind.is; i<=ind.ie; ++i) {
+        cells.insert(cells.end(), {size.x1min + (i-ind.is+0.5)*size.dx1,
+            size.x2min + (j-ind.js+0.5)*size.dx2, size.dx1, size.dx2,
+            gas(m,IDN,ind.ks,j,i), gas(m,IM1,ind.ks,j,i),
+            gas(m,IM2,ind.ks,j,i), gas(m,IM3,ind.ks,j,i)});
+      }
+    }
+  }
+  for (int p=0; p<npart; ++p) {
+    particles.insert(particles.end(), {pr(IPX,p), pr(IPY,p), pr(IPM,p),
+        pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p), static_cast<double>(pi(PTAG,p)),
+        static_cast<double>(pi(PLEV,p))});
+  }
+  char number[32];
+  std::snprintf(number, sizeof(number), ".%05d.ba", ba_snapshot_number_++);
+  std::string filename = ba_snapshot_basename_ + number;
+  FILE *file = std::fopen(filename.c_str(), "wb");
+  if (file == nullptr) {
+    std::cerr << "Cannot open BA snapshot " << filename << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  bool ok = std::fprintf(file, "AthenaK BA snapshot v2 f64-native\n"
+      "%.17g %d %d %d\n", pm->time, pm->ncycle, ncell, npart) > 0;
+  ok = (std::fwrite(cells.data(), sizeof(double), cells.size(), file)
+        == cells.size()) && ok;
+  ok = (std::fwrite(particles.data(), sizeof(double), particles.size(), file)
+        == particles.size()) && ok;
+  ok = (std::fclose(file) == 0) && ok;
+  if (!ok) {
+    std::cerr << "Failed writing BA snapshot " << filename << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+}
+
 //----------------------------------------------------------------------------------------
 //! \fn HashUniform01
 //! \brief Reproducible stateless pseudo-random number in [0,1), suitable for device code.
@@ -199,6 +257,30 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   }
   bool dust_active = has_particles && has_dust;
   bool random_placement = false;
+  bool cloud_root_random = pin->GetOrAddBoolean("problem", "cloud_root_random", false);
+  ba_snapshots_ = pin->GetOrAddBoolean("problem", "ba_f64_snapshots", false);
+  if (ba_snapshots_) {
+    if (global_variable::nranks != 1 || !dust_active ||
+        !pin->GetOrAddBoolean("problem", "user_hist", false)) {
+      std::cerr << "BA snapshots require dust, one MPI rank and user_hist=true"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    ba_snapshot_basename_ = pin->GetString("job", "basename");
+    ba_snapshot_number_ = 0;
+    ba_snapshot_dt_ = pin->GetOrAddReal("problem", "ba_snapshot_dt", 40.0);
+    if (ba_snapshot_dt_ <= 0.0) {
+      std::cerr << "ba_snapshot_dt must be positive" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+  if (cloud_root_random && (global_variable::nranks != 1 || !dust_active ||
+      pmbp->pdust->smr_transfer_mode != DustSMRTransfer::refinable_cloud ||
+      pmy_mesh_->three_d)) {
+    std::cerr << "cloud_root_random requires single-rank 2-D refinable_cloud dust"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (dust_active) {
     std::string placement =
         pin->GetOrAddString("problem","particle_placement","lattice");
@@ -326,6 +408,62 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   spdat.template modify<HostMemSpace>();
   spdat.template sync<DevExeSpace>();
 
+  if (cloud_root_random) {
+    // Four particles per ROOT cell, placed independently over the whole box.
+    // Refinement changes the cloud shape through the exact P1 split, never the
+    // prescribed parent mass. This is a warm Poisson seed, not a quiet lattice.
+    auto transfer = pmbp->pdust->smr_transfer;
+    int nroot = transfer.ncoarse1*transfer.ncoarse2;
+    int nparent = static_cast<int>(ppc)*nroot;
+    if (ppc != static_cast<Real>(static_cast<int>(ppc)) || nparent <= 0) {
+      std::cerr << "cloud_root_random requires positive integer root ppc" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    Kokkos::realloc(pr, ppar->nrdata, nparent);
+    Kokkos::realloc(pi, ppar->nidata, nparent);
+    ppar->nprtcl_thispack = nparent;
+    pmy_mesh_->nprtcl_thisrank = nparent;
+    pmy_mesh_->nprtcl_eachrank[0] = nparent;
+    pmy_mesh_->nprtcl_total = nparent;
+    auto pr0 = ppar->prtcl_rdata;
+    auto pi0 = ppar->prtcl_idata;
+    auto gids0 = pmbp->gids;
+    int nrdata = ppar->nrdata;
+    int ncells1 = pmbp->pdust->qdep.extent_int(4);
+    int ncells2 = pmbp->pdust->qdep.extent_int(3);
+    Real mass_unit = transfer.root_dx1*transfer.root_dx2;
+    par_for("nsh_cloud_root_random", DevExeSpace(), 0, nparent-1,
+    KOKKOS_LAMBDA(const int p) {
+      std::uint64_t key = static_cast<std::uint64_t>(p)
+                        + random_seed*UINT64_C(0x9e3779b97f4a7c15);
+      Real x = transfer.x1min + HashUniform01(key + UINT64_C(0x632be59bd9b4e019))
+                             *(transfer.x1max-transfer.x1min);
+      Real y = transfer.x2min + HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7))
+                             *(transfer.x2max-transfer.x2min);
+      int fi = static_cast<int>((x-transfer.x1min)/transfer.fine_dx1);
+      int fj = static_cast<int>((y-transfer.x2min)/transfer.fine_dx2);
+      if (fi >= transfer.nfine1) fi = transfer.nfine1-1;
+      if (fj >= transfer.nfine2) fj = transfer.nfine2-1;
+      int target = transfer.cloud_target(fj,fi);
+      int m = target/(ncells1*ncells2);
+      pi0(PGID,p) = gids0+m;
+      pi0(PTAG,p) = p;
+      pi0(PSP,p) = p % nspec;
+      pi0(PLEV,p) = 0;
+      for (int c=0; c<nrdata; ++c) pr0(c,p) = 0.0;
+      pr0(IPX,p) = x; pr0(IPX1,p) = x;
+      pr0(IPY,p) = y; pr0(IPY1,p) = y;
+      pr0(IPTS,p) = taus_.d_view(p % nspec);
+      pr0(IPM,p) = spdat.d_view(p % nspec,2)*mass_unit;
+      pr0(IPVX,p) = spdat.d_view(p % nspec,0);
+      pr0(IPVZ,p) = spdat.d_view(p % nspec,1);
+      pr0(IPVX1,p) = pr0(IPVX,p);
+      pr0(IPVZ1,p) = pr0(IPVZ,p);
+    });
+    while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
+    std::cout << "# BA random root clouds: " << nparent << " parents -> "
+              << ppar->nprtcl_thispack << " particles after P1 presplit" << std::endl;
+  } else {
   par_for("nsh_part", DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m, s;
     if (random_placement) {
@@ -378,6 +516,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     pr(IPRY,p) = 0.0;
     pr(IPRZ,p) = 0.0;
   });
+  }
 
   // particle timestep from the largest drift speed (transport is radial drift here)
   Real vmax = 1.0e-30;
@@ -544,5 +683,7 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     pdata->hdata[3*s+1] = sp;
     pdata->hdata[3*s+2] = sn;
   }
+  if (ba_snapshots_ && pm->time + 1.0e-10 >= ba_snapshot_dt_*ba_snapshot_number_)
+    WriteBASnapshot(pm);
   return;
 }
