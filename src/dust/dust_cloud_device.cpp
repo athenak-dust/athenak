@@ -511,7 +511,8 @@ int DustGasDrag::MergeCloudsDevice() {
   for (int sp=0; sp<nsp; ++sp) mrootsp[sp] = cloud_merge_mroot[sp];
 
   // counters: 0 commits, 1 contributions, 2 rejected, 3 pending, 4 nc shifts, 5 nc skipped
-  DvceArray1D<long long> icnt("merge_icnt", 6);
+  // 6..10 (pending log): not ready (mask), lobe wait, over limit, tolerance, min mass
+  DvceArray1D<long long> icnt("merge_icnt", 11);
   DvceArray1D<Real> dk("merge_dk", 2);   // dK_grad, dK_res
   const Real omega = is_shearing_box ? omega0 : 0.0;
   const Real alpha = cloud_merge_alpha, fmin = cloud_merge_min_mass;
@@ -652,7 +653,7 @@ int DustGasDrag::MergeCloudsDevice() {
         const Real mref = mrootsp[sp]/static_cast<Real>(1 << (2*L)), mnode = 0.25*mref;
         const Real xc0 = pr(IPX,c), yc0 = pr(IPY,c);
         // neighbours with a positive tent weight
-        int nb[kNbMax]; int nnb = 0; bool ready = true, over = false;
+        int nb[kNbMax]; int nnb = 0; bool ready = true, over = false; int why = 6;
         for (int dj=-1; dj<=1 && ready; ++dj) {
           for (int di=-1; di<=1 && ready; ++di) {
             const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
@@ -665,7 +666,7 @@ int DustGasDrag::MergeCloudsDevice() {
               if (Kokkos::fabs(dx) >= H1*(1.0 - 1.0e-12) || Kokkos::fabs(dy) >= H2*(1.0 - 1.0e-12)) continue;
               if (tent(dx, dy) <= 0.0) continue;
               if (!mm.In(pr(IPX,t), pr(IPY,t), L)) {ready = false; break;}
-              if (nnb == kNbMax) {over = true; ready = false; break;}
+              if (nnb == kNbMax) {over = true; ready = false; why = 8; break;}
               nb[nnb++] = t;
             }
           }
@@ -685,12 +686,12 @@ int DustGasDrag::MergeCloudsDevice() {
                 const Real r1 = H1 + (lobe_wait_dir ? (SMRCompositeTransfer::CloudLobe1(ct) ? ell1 : 0.0) : ell1);
                 const Real r2 = H2 + (lobe_wait_dir ? (SMRCompositeTransfer::CloudLobe2(ct) ? ell2 : 0.0) : ell2);
                 if (Kokkos::fabs(transfer.MinImage1(pr(IPX,t) - xc0)) < r1*(1.0 - 1.0e-12) &&
-                    Kokkos::fabs(transfer.MinImage2(pr(IPY,t) - yc0)) < r2*(1.0 - 1.0e-12)) {ready = false; break;}
+                    Kokkos::fabs(transfer.MinImage2(pr(IPY,t) - yc0)) < r2*(1.0 - 1.0e-12)) {ready = false; why = 7; break;}
               }
             }
           }
         }
-        if (!ready) {Kokkos::atomic_increment(&icnt(3)); return;}
+        if (!ready) {Kokkos::atomic_increment(&icnt(3)); Kokkos::atomic_increment(&icnt(why)); return;}
         (void) over;
         // nodes: key (r1, r2) for regular offsets (within 0.1 ell), an own node otherwise
         int nkey1[kNodeMax], nkey2[kNodeMax], nq0[kNodeMax], nnode = 0;
@@ -713,8 +714,8 @@ int DustGasDrag::MergeCloudsDevice() {
           pnode[npc] = k; pidx[npc] = t; ++npc;
           return true;
         };
-        if (!add_piece(c)) {Kokkos::atomic_increment(&icnt(3)); return;}
-        for (int k=0; k<nnb; ++k) if (!add_piece(nb[k])) {Kokkos::atomic_increment(&icnt(3)); return;}
+        if (!add_piece(c)) {Kokkos::atomic_increment(&icnt(3)); Kokkos::atomic_increment(&icnt(8)); return;}
+        for (int k=0; k<nnb; ++k) if (!add_piece(nb[k])) {Kokkos::atomic_increment(&icnt(3)); Kokkos::atomic_increment(&icnt(8)); return;}
         // node sums, implicit content, shares and effective positions
         Real E[kNodeMax], Ex[kNodeMax], Ey[kNodeMax], Im[kNodeMax], Ix[kNodeMax], Iy[kNodeMax];
         Real share[kNodeMax], ex[kNodeMax], ey[kNodeMax], ox0[kNodeMax], oy0[kNodeMax];
@@ -818,7 +819,9 @@ int DustGasDrag::MergeCloudsDevice() {
           if (pidx[worst] == c) break;
           act[worst] = false; --ncon;
         }
-        if (!ok || M < fmin*mref) {Kokkos::atomic_increment(&icnt(2)); return;}
+        if (!ok || M < fmin*mref) {
+          Kokkos::atomic_increment(&icnt(2)); Kokkos::atomic_increment(&icnt(ok ? 10 : 9)); return;
+        }
         // commit
         const int knew = Kokkos::atomic_fetch_add(&nnew(0), 1);
         for (int q=0; q<nrdata; ++q) nr(q,knew) = 0.0;
@@ -1219,6 +1222,10 @@ int DustGasDrag::MergeCloudsDevice() {
     if (d3) std::fprintf(fp, " %.9e %.9e", d3s[0], d3s[1]);
     // orphan absorption columns: absorbed n, absorbed mass, incompatible, no recipient, dK
     if (absorb) std::fprintf(fp, " %.0f %.9e %.0f %.0f %.9e", absc[0], absc[1], absc[2], absc[3], absc[4]);
+    // pending-reason columns: not ready (mask), lobe wait, over limit, tolerance, min mass
+    if (cloud_merge_pending_log) std::fprintf(fp, " %llu %llu %llu %llu %llu", static_cast<unsigned long long>(ic(6)),
+        static_cast<unsigned long long>(ic(7)), static_cast<unsigned long long>(ic(8)),
+        static_cast<unsigned long long>(ic(9)), static_cast<unsigned long long>(ic(10)));
     std::fprintf(fp, "\n");
     std::fclose(fp);
   }
