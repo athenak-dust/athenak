@@ -19,6 +19,9 @@ IsothermalHydro::IsothermalHydro(MeshBlockPack *pp, ParameterInput *pin) :
     EquationOfState("hydro", pp, pin) {
   eos_data.is_ideal = false;
   eos_data.iso_cs = pin->GetReal("hydro","iso_sound_speed");
+  // Harten entropy fix of the two shear waves in the isothermal Roe solver:
+  // |v_n| -> (v_n^2 + d^2)/(2 d) for |v_n| < d = roe_shear_fix*cs; acoustic waves unchanged
+  eos_data.roe_shear_fix = pin->GetOrAddReal("hydro", "roe_shear_fix", 0.0);
   eos_data.gamma = 0.0;
 }
 
