@@ -120,6 +120,151 @@ void WriteBASnapshot(Mesh *pm) {
   }
 }
 
+bool ba_fields_ = false;
+bool ba_history_ = false;
+int ba_field_number_ = 0;
+Real ba_field_dt_ = 1.0;
+constexpr int kBAFields = 11;
+
+// Diagnostic only: compact per-leaf field snapshot.  Gas density and
+// momenta, and the dust cloud integral of mass, momentum and the CENTRAL second
+// velocity moments about each leaf's own mean (two passes, so a cold stream gives zero
+// instead of a cancellation residue).  The deposit is the exact one the run uses: the
+// composite-transfer cloud weights, or canonical TSC on a uniform periodic mesh.
+// Geometry (x, z, dx, dz per active leaf, f64) is written once; fields are f32.
+void WriteBAFields(Mesh *pm) {
+  auto *pack = pm->pmb_pack;
+  auto *pdust = pack->pdust;
+  auto &ind = pm->mb_indcs;
+  int nmb = pack->nmb_thispack;
+  int is = ind.is, js = ind.js, ks = ind.ks;
+  int nx1 = ind.nx1, nx2 = ind.nx2;
+  int ncells1 = nx1 + 2*ind.ng, ncells2 = nx2 + 2*ind.ng;
+  auto &pr = pack->ppart->prtcl_rdata;
+  auto &pi = pack->ppart->prtcl_idata;
+  int npart = pack->ppart->nprtcl_thispack;
+  auto &mbsize = pack->pmb->mb_size;
+  DvceArray4D<Real> f("ba_fields", nmb, 7, ncells2, ncells1);
+  Kokkos::deep_copy(DevExeSpace(), f, 0.0);
+  bool composite = pdust->UsesCompositeTransfer();
+  auto transfer = pdust->smr_transfer;
+  // canonical TSC: global periodic stencil on the uniform root grid -> leaf index
+  int n1 = pm->mesh_indcs.nx1, n2 = pm->mesh_indcs.nx2;
+  Real gx1 = pm->mesh_size.x1min, gx2 = pm->mesh_size.x2min;
+  Real h1 = (pm->mesh_size.x1max - gx1)/n1, h2 = (pm->mesh_size.x2max - gx2)/n2;
+  DualArray2D<int> tgt("ba_tsc_target", composite ? 1 : n2, composite ? 1 : n1);
+  if (!composite) {
+    if (pm->multilevel || pdust->deposit != DustDeposit::tsc) {
+      std::cerr << "BA fields: canonical deposit requires TSC on a uniform mesh"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    for (int m=0; m<nmb; ++m) {
+      const auto &size = mbsize.h_view(m);
+      int i0 = static_cast<int>(std::lround((size.x1min - gx1)/h1));
+      int j0 = static_cast<int>(std::lround((size.x2min - gx2)/h2));
+      for (int j=0; j<nx2; ++j)
+        for (int i=0; i<nx1; ++i)
+          tgt.h_view(j0+j, i0+i) = (m*ncells2 + js + j)*ncells1 + is + i;
+    }
+    tgt.template modify<HostMemSpace>();
+    tgt.template sync<DevExeSpace>();
+  }
+  auto tgt_ = tgt.d_view;
+  // pass 0: mass and momentum; pass 1: central second moments about the leaf mean
+  for (int pass=0; pass<2; ++pass) {
+    par_for("ba_fields_deposit", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
+      Real mass = pr(IPM,p);
+      Real v[3] = {pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p)};
+      auto add = [&](const int target, const Real w) {
+        if (w == 0.0) return;
+        int ti = target % ncells1;
+        int tj = (target/ncells1) % ncells2;
+        int tm = target/(ncells1*ncells2);
+        Real d = mass*w/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
+        if (pass == 0) {
+          dust::DepositAdd(&f(tm,0,tj,ti), d);
+          for (int c=0; c<3; ++c) dust::DepositAdd(&f(tm,1+c,tj,ti), d*v[c]);
+        } else {
+          Real rho = f(tm,0,tj,ti);
+          for (int c=0; c<3; ++c) {
+            Real dv = v[c] - f(tm,1+c,tj,ti)/rho;
+            dust::DepositAdd(&f(tm,4+c,tj,ti), d*dv*dv);
+          }
+        }
+      };
+      if (composite) {
+        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p), add);
+      } else {
+        Real q1 = (pr(IPX,p) - gx1)/h1 - 0.5, q2 = (pr(IPY,p) - gx2)/h2 - 0.5;
+        int c1 = static_cast<int>(floor(q1 + 0.5)), c2 = static_cast<int>(floor(q2 + 0.5));
+        Real d1 = q1 - c1, d2 = q2 - c2;
+        Real w1[3] = {0.5*SQR(0.5-d1), 0.75-d1*d1, 0.5*SQR(0.5+d1)};
+        Real w2[3] = {0.5*SQR(0.5-d2), 0.75-d2*d2, 0.5*SQR(0.5+d2)};
+        for (int b=0; b<3; ++b) {
+          int jj = ((c2 + b - 1) % n2 + n2) % n2;
+          for (int a=0; a<3; ++a) {
+            int ii = ((c1 + a - 1) % n1 + n1) % n1;
+            add(tgt_(jj,ii), w1[a]*w2[b]);
+          }
+        }
+      }
+    });
+  }
+  auto fh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), f);
+  auto gas = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pack->phydro->u0);
+  auto prh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
+  double mtot = 0.0, mdep = 0.0;
+  for (int p=0; p<npart; ++p) mtot += prh(IPM,p);
+  int ncell = nmb*nx1*nx2;
+  std::vector<float> out;
+  out.reserve(static_cast<std::size_t>(kBAFields)*ncell);
+  std::vector<double> geom;
+  bool first = (ba_field_number_ == 0);
+  if (first) geom.reserve(4*ncell);
+  for (int m=0; m<nmb; ++m) {
+    const auto &size = mbsize.h_view(m);
+    for (int j=js; j<js+nx2; ++j) {
+      for (int i=is; i<is+nx1; ++i) {
+        if (first) geom.insert(geom.end(), {size.x1min + (i-is+0.5)*size.dx1,
+            size.x2min + (j-js+0.5)*size.dx2, size.dx1, size.dx2});
+        mdep += fh(m,0,j,i)*size.dx1*size.dx2;
+        out.insert(out.end(), {static_cast<float>(gas(m,IDN,ks,j,i)),
+            static_cast<float>(gas(m,IM1,ks,j,i)), static_cast<float>(gas(m,IM2,ks,j,i)),
+            static_cast<float>(gas(m,IM3,ks,j,i))});
+        for (int c=0; c<7; ++c) out.push_back(static_cast<float>(fh(m,c,j,i)));
+      }
+    }
+  }
+  if (std::fabs(mdep - mtot) > 1.0e-10*mtot) {
+    std::cerr << "BA fields: deposited mass " << mdep << " != particle mass " << mtot
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  auto write = [](const std::string &name, const std::string &header, const void *data,
+                  std::size_t size, std::size_t count) {
+    FILE *file = std::fopen(name.c_str(), "wb");
+    bool ok = (file != nullptr) && std::fputs(header.c_str(), file) >= 0;
+    ok = ok && std::fwrite(data, size, count, file) == count;
+    ok = (file != nullptr) && (std::fclose(file) == 0) && ok;
+    if (!ok) {
+      std::cerr << "Failed writing BA field file " << name << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  };
+  char line[160];
+  if (first) {
+    std::snprintf(line, sizeof(line), "AthenaK BA field geometry v1 f64\n%d\n", ncell);
+    write(ba_snapshot_basename_ + ".bafield.geom", line, geom.data(), sizeof(double),
+          geom.size());
+  }
+  std::snprintf(line, sizeof(line), "AthenaK BA fields v1 f32\n%.17g %d %d %d %.17g %d\n",
+                pm->time, pm->ncycle, ncell, kBAFields, mtot, npart);
+  char number[32];
+  std::snprintf(number, sizeof(number), ".%05d.baf", ba_field_number_++);
+  write(ba_snapshot_basename_ + number, line, out.data(), sizeof(float), out.size());
+}
+
 //----------------------------------------------------------------------------------------
 //! \fn HashUniform01
 //! \brief Reproducible stateless pseudo-random number in [0,1), suitable for device code.
@@ -271,6 +416,23 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     ba_snapshot_dt_ = pin->GetOrAddReal("problem", "ba_snapshot_dt", 40.0);
     if (ba_snapshot_dt_ <= 0.0) {
       std::cerr << "ba_snapshot_dt must be positive" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+  ba_fields_ = pin->GetOrAddBoolean("problem", "ba_fields", false);
+  ba_history_ = pin->GetOrAddBoolean("problem", "ba_history", false);
+  if (ba_fields_ || ba_history_) {
+    if (global_variable::nranks != 1 || !dust_active || pmy_mesh_->three_d ||
+        !pin->GetOrAddBoolean("problem", "user_hist", false)) {
+      std::cerr << "BA fields/history require 2-D dust, one MPI rank and user_hist=true"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    ba_snapshot_basename_ = pin->GetString("job", "basename");
+    ba_field_number_ = 0;
+    ba_field_dt_ = pin->GetOrAddReal("problem", "ba_field_dt", 1.0);
+    if (ba_field_dt_ <= 0.0) {
+      std::cerr << "ba_field_dt must be positive" << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
@@ -683,7 +845,45 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     pdata->hdata[3*s+1] = sp;
     pdata->hdata[3*s+2] = sn;
   }
+  if (ba_history_) {
+    // mass-weighted dust moments (all species) and the cumulative cloud
+    // machinery counters; the merge passes themselves are in cloud_merge_log.txt
+    int h = 3*nsout;
+    if (h + 14 > NHISTORY_VARIABLES) {
+      std::cerr << "BA history: too many species for the history columns" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const char *labels[14] = {"msum", "mvx", "mvz", "mvp", "mvx2", "mvz2", "mvp2",
+        "nsplit", "nlobesplit", "ncoarse", "ncoarsein", "ncoarserej", "nfar_rel",
+        "pcapacity"};
+    for (int c=0; c<14; ++c) pdata->label[h+c] = labels[c];
+    Real s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0, s5 = 0.0, s6 = 0.0;
+    Kokkos::parallel_reduce("ba_hist1",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
+    KOKKOS_LAMBDA(const int &p, Real &a0, Real &a1, Real &a2, Real &a3) {
+      Real m = pr(IPM,p);
+      a0 += m; a1 += m*pr(IPVX,p); a2 += m*pr(IPVY,p); a3 += m*pr(IPVZ,p);
+    }, Kokkos::Sum<Real>(s0), Kokkos::Sum<Real>(s1), Kokkos::Sum<Real>(s2),
+       Kokkos::Sum<Real>(s3));
+    Kokkos::parallel_reduce("ba_hist2",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
+    KOKKOS_LAMBDA(const int &p, Real &a4, Real &a5, Real &a6) {
+      Real m = pr(IPM,p);
+      a4 += m*SQR(pr(IPVX,p)); a5 += m*SQR(pr(IPVY,p)); a6 += m*SQR(pr(IPVZ,p));
+    }, Kokkos::Sum<Real>(s4), Kokkos::Sum<Real>(s5), Kokkos::Sum<Real>(s6));
+    Real sums[7] = {s0, s1, s2, s3, s4, s5, s6};
+    for (int c=0; c<7; ++c) pdata->hdata[h+c] = sums[c];
+    auto *pd = pm->pmb_pack->pdust;
+    pdata->hdata[h+7] = static_cast<Real>(pd->cloud_split_count);
+    pdata->hdata[h+8] = static_cast<Real>(pd->cloud_lobe_split_count);
+    pdata->hdata[h+9] = static_cast<Real>(pd->cloud_coarsen_events);
+    pdata->hdata[h+10] = static_cast<Real>(pd->cloud_coarsen_in);
+    pdata->hdata[h+11] = static_cast<Real>(pd->cloud_coarsen_reject);
+    pdata->hdata[h+12] = static_cast<Real>(pd->cloud_far_release);
+    pdata->hdata[h+13] = static_cast<Real>(pr.extent_int(1));
+    pdata->nhist = h + 14;
+  }
   if (ba_snapshots_ && pm->time + 1.0e-10 >= ba_snapshot_dt_*ba_snapshot_number_)
     WriteBASnapshot(pm);
+  if (ba_fields_ && pm->time + 1.0e-10 >= ba_field_dt_*ba_field_number_)
+    WriteBAFields(pm);
   return;
 }
