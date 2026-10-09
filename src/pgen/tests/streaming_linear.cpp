@@ -112,7 +112,9 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   kx_ = pin->GetReal("problem","kx");
   kz_ = pin->GetReal("problem","kz");
   rho0_ = pin->GetOrAddReal("problem","rho0",1.0);
-  if (restart) return;
+  // everything up to the NSH solve below only reads parameters and checks the setup, so it
+  // runs on restart too: the history function's peak-amplitude columns subtract the NSH
+  // background (ugx_, ugp_, vnx_, vnp_, rhop0_), which must be set before returning
 
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
   if (pmbp->phydro == nullptr || pmbp->ppart == nullptr || pmbp->pdust == nullptr ||
@@ -168,6 +170,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   Real ugx, ugp, vnx, vnp;
   SolveNSH2(omega0, qshear, ax, eps, taus, ugx, ugp, vnx, vnp);
   ugx_ = ugx; ugp_ = ugp; vnx_ = vnx; vnp_ = vnp; rhop0_ = eps*rho0;
+  if (restart) return;
 
   // initialize gas: NSH background + eigenmode at t=0
   auto &indcs = pmy_mesh_->mb_indcs;
