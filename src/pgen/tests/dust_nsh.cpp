@@ -436,11 +436,15 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       std::exit(EXIT_FAILURE);
     }
   }
+  // canonical_root: the same root parents with the standard deposit on a uniform mesh,
+  // so a uniform control shares the parent positions of a refinable-cloud run
+  bool canonical_root = cloud_root_random && dust_active &&
+      pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none && !pmy_mesh_->multilevel;
   if (cloud_root_random && (global_variable::nranks != 1 || !dust_active ||
-      pmbp->pdust->smr_transfer_mode != DustSMRTransfer::refinable_cloud ||
-      pmy_mesh_->three_d)) {
-    std::cerr << "cloud_root_random requires single-rank 2-D refinable_cloud dust"
-              << std::endl;
+      !(pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud ||
+        canonical_root) || pmy_mesh_->three_d)) {
+    std::cerr << "cloud_root_random requires single-rank 2-D dust with refinable_cloud "
+              << "transfer, or the canonical deposit on a uniform mesh" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (dust_active) {
@@ -575,6 +579,15 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // Refinement changes the cloud shape through the exact P1 split, never the
     // prescribed parent mass. This is a warm Poisson seed, not a quiet lattice.
     auto transfer = pmbp->pdust->smr_transfer;
+    if (canonical_root) {   // only the root geometry is used below
+      const auto &ms = pmy_mesh_->mesh_size;
+      const auto &mi = pmy_mesh_->mesh_indcs;
+      transfer.x1min = ms.x1min; transfer.x1max = ms.x1max;
+      transfer.x2min = ms.x2min; transfer.x2max = ms.x2max;
+      transfer.ncoarse1 = mi.nx1; transfer.ncoarse2 = mi.nx2;
+      transfer.root_dx1 = (ms.x1max - ms.x1min)/mi.nx1;
+      transfer.root_dx2 = (ms.x2max - ms.x2min)/mi.nx2;
+    }
     int nroot = transfer.ncoarse1*transfer.ncoarse2;
     int nparent = static_cast<int>(ppc)*nroot;
     if (ppc != static_cast<Real>(static_cast<int>(ppc)) || nparent <= 0) {
@@ -602,12 +615,20 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
                              *(transfer.x1max-transfer.x1min);
       Real y = transfer.x2min + HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7))
                              *(transfer.x2max-transfer.x2min);
-      int fi = static_cast<int>((x-transfer.x1min)/transfer.fine_dx1);
-      int fj = static_cast<int>((y-transfer.x2min)/transfer.fine_dx2);
-      if (fi >= transfer.nfine1) fi = transfer.nfine1-1;
-      if (fj >= transfer.nfine2) fj = transfer.nfine2-1;
-      int target = transfer.cloud_target(fj,fi);
-      int m = target/(ncells1*ncells2);
+      int m = 0;
+      if (canonical_root) {
+        for (int b=0; b<nmb; ++b) {
+          if (x >= mbsize.d_view(b).x1min && x < mbsize.d_view(b).x1max &&
+              y >= mbsize.d_view(b).x2min && y < mbsize.d_view(b).x2max) m = b;
+        }
+      } else {
+        int fi = static_cast<int>((x-transfer.x1min)/transfer.fine_dx1);
+        int fj = static_cast<int>((y-transfer.x2min)/transfer.fine_dx2);
+        if (fi >= transfer.nfine1) fi = transfer.nfine1-1;
+        if (fj >= transfer.nfine2) fj = transfer.nfine2-1;
+        int target = transfer.cloud_target(fj,fi);
+        m = target/(ncells1*ncells2);
+      }
       pi0(PGID,p) = gids0+m;
       pi0(PTAG,p) = p;
       pi0(PSP,p) = p % nspec;
@@ -622,9 +643,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       pr0(IPVX1,p) = pr0(IPVX,p);
       pr0(IPVZ1,p) = pr0(IPVZ,p);
     });
-    while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
-    std::cout << "# BA random root clouds: " << nparent << " parents -> "
-              << ppar->nprtcl_thispack << " particles after P1 presplit" << std::endl;
+    if (!canonical_root) while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
+    std::cout << "# BA random root " << (canonical_root ? "particles (canonical): "
+              : "clouds: ") << nparent << " parents -> " << ppar->nprtcl_thispack
+              << (canonical_root ? " particles" : " particles after P1 presplit")
+              << std::endl;
   } else {
   par_for("nsh_part", DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m, s;
