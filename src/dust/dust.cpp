@@ -365,6 +365,32 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_d3_iter = pin->GetOrAddInteger("dust", "cloud_merge_d3_iter", 30);
       cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", false);
       cloud_merge_tstop = pin->GetOrAddReal("dust", "cloud_merge_tstop", -1.0);
+      {
+        std::string mode = pin->GetOrAddString("dust", "cloud_merge_mode", "tent");
+        if (mode == "tent") cloud_merge_mode = 0;
+        else if (mode == "quantum") cloud_merge_mode = 1;
+        else {
+          std::cout << "### FATAL ERROR: <dust>/cloud_merge_mode must be tent or quantum" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+      }
+      cloud_merge_stencil = pin->GetOrAddBoolean("dust", "cloud_merge_stencil", true);
+      cloud_merge_stencil_tol = pin->GetOrAddReal("dust", "cloud_merge_stencil_tol", 0.02);
+      cloud_merge_smax = pin->GetOrAddReal("dust", "cloud_merge_smax", 1.0);
+      cloud_merge_K = pin->GetOrAddInteger("dust", "cloud_merge_K", 4);
+      cloud_compress = pin->GetOrAddBoolean("dust", "cloud_compress", false);
+      cloud_compress_smax = pin->GetOrAddReal("dust", "cloud_compress_smax", 0.5);
+      cloud_compress_ds = pin->GetOrAddReal("dust", "cloud_compress_ds", 0.1);
+      cloud_compress_buffer = pin->GetOrAddInteger("dust", "cloud_compress_buffer", 4);
+      if ((cloud_merge_mode == 1 || cloud_compress) &&
+          (!cloud_merge || !cloud_merge_device || cloud_merge_mode != 1 || cloud_merge_K < 1 ||
+           cloud_merge_K > 8 || cloud_merge_smax <= 0.0 || cloud_compress_smax <= 0.0 ||
+           cloud_compress_buffer < 1 || cloud_merge_d3)) {
+        std::cout << "### FATAL ERROR: <dust>/cloud_merge_mode = quantum (and cloud_compress) "
+                  << "need cloud_merge, cloud_merge_device, 1 <= cloud_merge_K <= 8, positive "
+                  << "extents, cloud_compress_buffer >= 1 and no cloud_merge_d3" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       if (cloud_merge && (!cloud_p1_split || cloud_split_interp || cloud_deform ||
                           cloud_merge_buffer < 2 ||
                           cloud_merge_alpha <= 0.0 || cloud_merge_interval < 1)) {

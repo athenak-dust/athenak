@@ -690,6 +690,22 @@ class DustGasDrag {
   int cloud_merge_lobe_wait = 0;      // a centre waits while an unreleased lobed cloud is near
                                       // (1: reach H + ell, 2: reach per lobe direction)
   std::vector<Real> cloud_merge_mroot; // per species: root-level cloud mass (set on first pass)
+  // quantum mode: stage X exact P1-stencil re-merge, stage G mass-quantum grouping
+  // (cross-level), stage C same-level compression in the fine interior
+  int cloud_merge_mode = 0;           // 0 tent, 1 quantum
+  bool cloud_merge_stencil = true;    // quantum: stage X on
+  Real cloud_merge_stencil_tol = 0.02;  // stage X offset tolerance (units of the piece half-width)
+  Real cloud_merge_smax = 1.0;        // stage G group position extent (units of the target cell)
+  int cloud_merge_K = 4;              // open groups per cell walk (1..8)
+  bool cloud_compress = false;        // stage C on (quantum mode only)
+  Real cloud_compress_smax = 0.5;     // stage C group extent (units of the piece's own cell)
+  Real cloud_compress_ds = 0.1;       // stage C |dS| budget per direction, fraction of M Var(hat)
+  int cloud_compress_buffer = 4;      // stage C cells: no coarser leaf within this many cells of
+                                      // the next-coarser level
+  int cloud_merge_pass = 0;           // pass counter (walk rotation)
+  DvceArray1D<char> compress_mask_d;  // stage C interior masks per level (built once)
+  int compress_mask_off[5] = {0};
+  bool compress_mask_built = false;
   unsigned long long cloud_coarsen_events = 0, cloud_coarsen_in = 0;
   unsigned long long cloud_coarsen_reject = 0, cloud_far_release = 0;
   Real cloud_coarsen_dk_grad = 0.0, cloud_coarsen_dk_res = 0.0;
