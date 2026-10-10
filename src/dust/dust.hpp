@@ -697,6 +697,9 @@ class DustGasDrag {
   Real cloud_merge_stencil_tol = 0.02;  // stage X offset tolerance (units of the piece half-width)
   Real cloud_merge_smax = 1.0;        // stage G group position extent (units of the target cell)
   int cloud_merge_K = 4;              // open groups per cell walk (1..8)
+  int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
+                                      // neighbourhood is in the merge zone: the outer band is
+                                      // left to stage X (found in the LinA tests)
   bool cloud_compress = false;        // stage C on (quantum mode only)
   Real cloud_compress_smax = 0.5;     // stage C group extent (units of the piece's own cell)
   Real cloud_compress_ds = 0.1;       // stage C |dS| budget per direction, fraction of M Var(hat)

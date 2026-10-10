@@ -701,6 +701,7 @@ int DustGasDrag::MergeCloudsDevice() {
       // level-lev interior cells -> level-lev clouds
       DvceArray1D<int> gid("q_gid", npart), gknew("q_gknew", nmax), gkey("q_gkey", nmax);
       DvceArray1D<int> ngroup("q_ngroup", 1);
+      DvceArray1D<char> gres("q_gres", npart);   // a G walk left the piece in an uncommitted group
       Kokkos::deep_copy(gid, -1);
       Kokkos::deep_copy(gknew, -1);
       const int nfl = 1 << (nlev - lev);   // fine cells per level-lev cell
@@ -718,6 +719,7 @@ int DustGasDrag::MergeCloudsDevice() {
         const int coff = compress_mask_off[(lev < 5) ? lev : 4];
         const Real qden = static_cast<Real>(1 << (2*tl));
         const int q0 = (stage == 1) ? 5 : 13;                    // counter block
+        const int glag = cloud_merge_g_lag;
         DvceArray1D<int> kq("q_key", npart);
         Kokkos::parallel_for("q_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
         KOKKOS_LAMBDA(const int p) {
@@ -730,6 +732,13 @@ int DustGasDrag::MergeCloudsDevice() {
           const int J = SMRCompositeTransfer::WrapIndex(static_cast<int>(Kokkos::floor(v)), m2);
           if (stage == 1) {
             if (!mm.In(x, y, L)) return;
+            for (int dj=-glag; dj<=glag; ++dj) {   // deep zone only: the outer band is stage X's
+              for (int di=-glag; di<=glag; ++di) {
+                const Real xn = transfer.x1min + (SMRCompositeTransfer::WrapIndex(I + di, m1) + 0.5)*cs1;
+                const Real yn = transfer.x2min + (SMRCompositeTransfer::WrapIndex(J + dj, m2) + 0.5)*cs2;
+                if (!mm.In(xn, yn, L)) return;
+              }
+            }
           } else {
             if (cmask(coff + J*m1 + I) == 0) return;
             if (pr(IPM,p) >= mrootsp[pi(PSP,p)]/qden*(1.0 - 1.0e-9)) return;
@@ -826,7 +835,7 @@ int DustGasDrag::MergeCloudsDevice() {
           const int g = gid(p);
           if (g < 0) return;
           const int k = gknew(g);
-          if (k < 0) return;
+          if (k < 0) {if (stage == 1) gres(p) = 1; return;}
           const Real m = pr(IPM,p);
           const Real dx = transfer.MinImage1(pr(IPX,p) - acc(6,k)), dy = transfer.MinImage2(pr(IPY,p) - acc(7,k));
           Kokkos::atomic_add(&acc(0,k), static_cast<double>(m));
@@ -899,7 +908,9 @@ int DustGasDrag::MergeCloudsDevice() {
         };
         Kokkos::parallel_for("qabs_orphans", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
         KOKKOS_LAMBDA(const int o) {
-          if (kp(o) < 0 || pr(IPM,o) <= 0.0) return;
+          // only a G residual: the piece was walked by G (deep zone) and left in an uncommitted
+          // group (not deferred, not waiting in stage X's outer band)
+          if (kp(o) < 0 || pr(IPM,o) <= 0.0 || gres(o) == 0) return;
           const Real xo = pr(IPX,o), yo = pr(IPY,o), mo = pr(IPM,o);
           if (!mm.In(xo, yo, L)) return;
           const int sp = pi(PSP,o), cell = kp(o) - sp*ncl, I = cell % n1, J = cell/n1;
