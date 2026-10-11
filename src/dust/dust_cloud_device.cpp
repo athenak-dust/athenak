@@ -647,6 +647,8 @@ int DustGasDrag::MergeCloudsDevice() {
   bool bdirty = false;               // the pass has changed the particle set
   double gcb[2][4] = {{0.0, 0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 0.0}};   // G / C: rejected groups, pieces, mass; evaluations
   double bcap = 0.0;                 // stages that hit the evaluation limit
+  const bool xgate = pbud && cloud_merge_budget_x;
+  double xgb[4] = {0.0, 0.0, 0.0, 0.0};   // X: rejected families, pieces, mass; evaluations
   if (pbud) {
     Kokkos::Timer btimer;
     BudgetDeposit(transfer, ppar->prtcl_rdata, ppar->prtcl_idata, npart0, 1.0, lent);
@@ -878,9 +880,10 @@ int DustGasDrag::MergeCloudsDevice() {
       if (cloud_merge_stencil) {
         DvceArray1D<int> owner("q_owner", npart);
         Kokkos::deep_copy(owner, -1);
-        DvceArray1D<int> xknew("audit_xknew", audit.on ? npart : 1);
-        if (audit.on) Kokkos::deep_copy(xknew, -1);
-        const bool aud = audit.on;
+        DvceArray1D<int> xknew("audit_xknew", (audit.on || xgate) ? npart : 1);
+        if (audit.on || xgate) Kokkos::deep_copy(xknew, -1);
+        const bool aud = audit.on || xgate;
+        DvceArray2D<double> xfam("q_xfam", 4, xgate ? nmax : 1);
         const Real dtol = cloud_merge_stencil_tol;
         const Real vn1 = H1*H1/6.0, vn2 = H2*H2/6.0, vo1 = ell1*ell1/6.0, vo2 = ell2*ell2/6.0;
         Kokkos::parallel_for("q_stencil", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -955,6 +958,12 @@ int DustGasDrag::MergeCloudsDevice() {
           nkind(knew) = 0;
           const double vb2 = nr(IPVX,knew)*nr(IPVX,knew) + nr(IPVY,knew)*nr(IPVY,knew) +
                              nr(IPVZ,knew)*nr(IPVZ,knew);
+          if (xgate) {   // decided after the kernel
+            xfam(0,knew) = M; xfam(1,knew) = 0.5*(svv - M*vb2);
+            xfam(2,knew) = M*vn1 - (sxx - sx*sx/M + M*vo1);
+            xfam(3,knew) = M*vn2 - (syy - sy*sy/M + M*vo2);
+            return;
+          }
           for (int k=0; k<9; ++k) pr(IPM,mem[k]) = 0.0;
           Kokkos::atomic_add(&qc(0), 1.0);
           Kokkos::atomic_add(&qc(1), M);
@@ -962,10 +971,139 @@ int DustGasDrag::MergeCloudsDevice() {
           Kokkos::atomic_add(&qc(3), M*vn1 - (sxx - sx*sx/M + M*vo1));
           Kokkos::atomic_add(&qc(4), M*vn2 - (syy - sy*sy/M + M*vo2));
         });
+        // ---- stage X is decided by the pass budget like stages G and C.  The kernel
+        // above only claimed and built the new clouds; the cumulated leaf change of the standing
+        // families (new cloud - nine members) is tested on top of the change made so far, families
+        // touching a violating leaf are rejected with their members kept exactly as they are.
+        DvceArray1D<int> xrej("q_xrej", xgate ? nmax : 1);
+        if (xgate) {
+          int nx = 0;
+          Kokkos::deep_copy(nx, Kokkos::subview(nnew, 0));
+          if (audit.on) audit.Add2("x" + std::to_string(lev) + "_nr0", nr, nrdata, nx > 0 ? nx : 0);
+          if (nx > 0) {
+            Kokkos::Timer btimer;
+            const Real beta = cloud_merge_budget, prior = cloud_merge_budget_prior;
+            const int maxev = cloud_merge_budget_evals;
+            const int xn12 = qdep.extent_int(4)*qdep.extent_int(3);
+            const auto xmbsz = pmy_pack->pmb->mb_size;
+            const Real xfloor = cloud_absorb_floor*mrootsp[0]/(transfer.root_dx1*transfer.root_dx2);
+            const Real xvmin = alpha*H*((omega > 0.0) ? omega : 0.0);
+            Kokkos::deep_copy(lcum, 0.0);
+            if (bdirty) {
+              BudgetDeposit(transfer, pr, pi, npart, 1.0, lcum);
+              Kokkos::parallel_for("budget_cum_x", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+              KOKKOS_LAMBDA(const int t) {
+                for (int c=0; c<4; ++c) lcum(c,t) -= lent(c,t);
+              });
+            }
+            if (prior != 0.0) {
+              Kokkos::parallel_for("budget_prior_x", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+              KOKKOS_LAMBDA(const int t) {
+                const int tb_ = t/xn12;
+                const Real vol = xmbsz.d_view(tb_).dx1*xmbsz.d_view(tb_).dx2;
+                lcum(0,t) += prior*beta*Kokkos::fmax(lent(0,t), xfloor*vol);
+              });
+            }
+            DvceArray2D<Real> ldelx("q_ldelx", 4, nbt);
+            DvceArray1D<int> lviolx("q_lviolx", nbt);
+            int nev = 0;
+            for (;;) {
+              ++nev;
+              Kokkos::deep_copy(ldelx, 0.0);
+              Kokkos::parallel_for("qx_members", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+              KOKKOS_LAMBDA(const int p) {
+                if (owner(p) < 0) return;
+                const int k = xknew(owner(p));
+                if (k < 0 || xrej(k)) return;
+                const Real m = pr(IPM,p);
+                const Real v1 = pr(IPVX,p), v2 = pr(IPVY,p), v3 = pr(IPVZ,p);
+                transfer.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p), [&](const int t, const Real w) {
+                  Kokkos::atomic_add(&ldelx(0,t), -m*w); Kokkos::atomic_add(&ldelx(1,t), -m*w*v1);
+                  Kokkos::atomic_add(&ldelx(2,t), -m*w*v2); Kokkos::atomic_add(&ldelx(3,t), -m*w*v3);
+                });
+              });
+              Kokkos::parallel_for("qx_new", Kokkos::RangePolicy<>(DevExeSpace(), 0, nx),
+              KOKKOS_LAMBDA(const int k) {
+                if (xrej(k)) return;
+                const Real m = nr(IPM,k);
+                const Real v1 = nr(IPVX,k), v2 = nr(IPVY,k), v3 = nr(IPVZ,k);
+                transfer.ForEachCloudWeight(nr(IPX,k), nr(IPY,k), ni(PLEV,k), [&](const int t, const Real w) {
+                  Kokkos::atomic_add(&ldelx(0,t), m*w); Kokkos::atomic_add(&ldelx(1,t), m*w*v1);
+                  Kokkos::atomic_add(&ldelx(2,t), m*w*v2); Kokkos::atomic_add(&ldelx(3,t), m*w*v3);
+                });
+              });
+              int nviol = 0;
+              Kokkos::parallel_reduce("qx_viol", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+              KOKKOS_LAMBDA(const int t, int &sum) {
+                int bad = 0;
+                if (ldelx(0,t) != 0.0 || ldelx(1,t) != 0.0 || ldelx(2,t) != 0.0 || ldelx(3,t) != 0.0) {
+                  const int tb_ = t/xn12;
+                  const Real vol = xmbsz.d_view(tb_).dx1*xmbsz.d_view(tb_).dx2;
+                  Real rp = 0.0;
+                  const Real rm = BudgetRatio(beta, xfloor*vol, xvmin, lent(0,t), lent(1,t), lent(2,t),
+                      lent(3,t), lcum(0,t) + ldelx(0,t), lcum(1,t) + ldelx(1,t), lcum(2,t) + ldelx(2,t),
+                      lcum(3,t) + ldelx(3,t), rp);
+                  bad = (rm > 1.0 || rp > 1.0) ? 1 : 0;
+                }
+                lviolx(t) = bad;
+                sum += bad;
+              }, nviol);
+              if (nviol == 0) break;
+              if (nev >= maxev) {   // no convergence: the rest of stage X is rejected
+                Kokkos::parallel_for("qx_rej_all", Kokkos::RangePolicy<>(DevExeSpace(), 0, nx),
+                KOKKOS_LAMBDA(const int k) {xrej(k) = 1;});
+                bcap += 1.0;
+                break;
+              }
+              Kokkos::parallel_for("qx_rej_new", Kokkos::RangePolicy<>(DevExeSpace(), 0, nx),
+              KOKKOS_LAMBDA(const int k) {
+                if (xrej(k)) return;
+                int bad = 0;
+                transfer.ForEachCloudWeight(nr(IPX,k), nr(IPY,k), ni(PLEV,k), [&](const int t, const Real w) {
+                  if (w != 0.0 && lviolx(t)) bad = 1;
+                });
+                if (bad) xrej(k) = 1;
+              });
+              Kokkos::parallel_for("qx_rej_members", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+              KOKKOS_LAMBDA(const int p) {
+                if (owner(p) < 0) return;
+                const int k = xknew(owner(p));
+                if (k < 0 || xrej(k)) return;
+                int bad = 0;
+                transfer.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p), [&](const int t, const Real w) {
+                  if (w != 0.0 && lviolx(t)) bad = 1;
+                });
+                if (bad) Kokkos::atomic_exchange(&xrej(k), 1);
+              });
+            }
+            double rp_ = 0.0, rm_ = 0.0, rg_ = 0.0;
+            Kokkos::parallel_reduce("qx_apply", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+            KOKKOS_LAMBDA(const int p, double &n, double &m) {
+              if (owner(p) < 0) return;
+              const int k = xknew(owner(p));
+              if (k < 0) return;
+              if (xrej(k)) {n += 1.0; m += pr(IPM,p); return;}
+              pr(IPM,p) = 0.0;
+            }, rp_, rm_);
+            Kokkos::parallel_reduce("qx_dead", Kokkos::RangePolicy<>(DevExeSpace(), 0, nx),
+            KOKKOS_LAMBDA(const int k, double &n) {
+              if (xrej(k)) {nr(IPM,k) = 0.0; n += 1.0; return;}
+              Kokkos::atomic_add(&qc(0), 1.0);
+              Kokkos::atomic_add(&qc(1), xfam(0,k));
+              Kokkos::atomic_add(&qc(2), xfam(1,k));
+              Kokkos::atomic_add(&qc(3), xfam(2,k));
+              Kokkos::atomic_add(&qc(4), xfam(3,k));
+            }, rg_);
+            Kokkos::fence();
+            tbud += btimer.seconds();
+            xgb[0] += rg_; xgb[1] += rp_; xgb[2] += rm_; xgb[3] += nev;
+          }
+        }
         if (audit.on) {
           int nx = 0;
           Kokkos::deep_copy(nx, Kokkos::subview(nnew, 0));
           const std::string l = std::to_string(lev);
+          if (xgate) audit.Add1("x" + l + "_xrej", xrej, nx > 0 ? nx : 0);
           audit.Add2("x" + l + "_pr", pr, nrdata, npart);
           audit.Add1("x" + l + "_owner", owner, npart);
           audit.Add1("x" + l + "_xknew", xknew, npart);
@@ -2551,6 +2689,8 @@ int DustGasDrag::MergeCloudsDevice() {
       std::fprintf(fp, " %.0f %.0f %.9e %.0f %.0f %.0f %.9e %.0f %.0f %.6e %.6e %.0f %.0f %.9e %.6e %.6e %.6e",
                    gcb[0][0], gcb[0][1], gcb[0][2], gcb[0][3], gcb[1][0], gcb[1][1], gcb[1][2], gcb[1][3],
                    bcap, bend[0], bend[1], bend[2], fim[0], fim[1], tpass_s, tbud, bend[3]);
+      // stage-X budget columns: X families rejected by the budget, their pieces and mass, evaluations
+      std::fprintf(fp, " %.0f %.0f %.9e %.0f", xgb[0], xgb[1], xgb[2], xgb[3]);
     }
     if (cloud_merge_pending_log) std::fprintf(fp, " %llu %llu %llu %llu %llu", static_cast<unsigned long long>(ic(6)),
         static_cast<unsigned long long>(ic(7)), static_cast<unsigned long long>(ic(8)),
@@ -2581,7 +2721,7 @@ int DustGasDrag::MergeCloudsDevice() {
                   bend[0], bend[1], bend[2], fim[0], fim[1], tpass_s, tbud, bend[3]);
     audit.Text("tail", tail);
     const bool changed = nrelease > 0 || qtot[0] + qtot[5] + qtot[13] > 0.0 || absc[0] > 0.0 ||
-                         nfinal != npart0 || (cloud_audit_rejected && gcb[0][0] + gcb[1][0] > 0.0);
+                         nfinal != npart0 || (cloud_audit_rejected && gcb[0][0] + gcb[1][0] + xgb[0] > 0.0);
     if (changed || cloud_audit_compact) audit.Write(pmesh->ncycle, changed);
   }
   (void) sh1; (void) sh2;
