@@ -706,6 +706,11 @@ class DustGasDrag {
                                        // momentum) an absorption may make, relative to the leaf
   Real cloud_absorb_floor = 0.1;       // ... with the leaf mass floored at this fraction of a
                                        // root cloud mass per root-cell volume
+  Real cloud_merge_budget = -1.0;      // > 0, one budget of leaf mass / momentum
+                                       // change for the whole pass (stages G, C, absorption)
+  int cloud_merge_budget_evals = 4;    // ... evaluations per stage before the rest is rejected
+  Real cloud_merge_budget_prior = 0.0; // ... testing only: fraction of the budget already used
+  bool cloud_audit_rejected = false;   // full audit file when G/C groups were budget-rejected
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
                                       // neighbourhood is in the merge zone: the outer band is
                                       // left to stage X (found in the LinA tests)
