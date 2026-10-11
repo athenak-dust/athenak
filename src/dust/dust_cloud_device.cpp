@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #include "athena.hpp"
@@ -311,6 +313,100 @@ void BuildCSR(const DvceArray1D<int> &key, const int nkey, DvceArray1D<int> &sta
 //! masses and the new clouds of concurrent centres never overlap.  On a quiet lattice the
 //! centres and the commits are the host's; for irregular particles the order differs.
 
+namespace {
+
+// merge-pass audit (diagnostic): named sections of one merge pass.  Each section is a header line
+// "S <name> <type d|i|c> <ndim> <dims...> <nbytes>\n" followed by the raw row-major bytes.
+struct PassAudit {
+  bool on = false;
+  std::vector<char> full, compact;
+  template <typename T>
+  static char Code() {
+    if constexpr (std::is_same_v<T, double>) return 'd';
+    else if constexpr (std::is_same_v<T, int>) return 'i';
+    else return 'c';
+  }
+  static void Raw(std::vector<char> &buf, const std::string &name, const char type,
+                  const std::vector<long long> &shape, const void *ptr, const std::size_t bytes) {
+    std::string h = "S " + name + " " + type + " " + std::to_string(shape.size());
+    for (auto d : shape) h += " " + std::to_string(d);
+    h += " " + std::to_string(bytes) + "\n";
+    buf.insert(buf.end(), h.begin(), h.end());
+    const char *c = static_cast<const char*>(ptr);
+    buf.insert(buf.end(), c, c + bytes);
+  }
+  template <typename T>
+  void Add1(const std::string &name, const DvceArray1D<T> &v, const int n) {
+    if (!on) return;
+    auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), v);
+    std::vector<T> out(static_cast<std::size_t>(n));
+    for (int i=0; i<n; ++i) out[i] = h(i);
+    Raw(full, name, Code<T>(), {n}, out.data(), out.size()*sizeof(T));
+  }
+  template <typename T>
+  void Add2(const std::string &name, const DvceArray2D<T> &v, const int n0, const int n1) {
+    if (!on) return;
+    auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), v);
+    std::vector<T> out(static_cast<std::size_t>(n0)*n1);
+    for (int i=0; i<n0; ++i)
+      for (int j=0; j<n1; ++j) out[static_cast<std::size_t>(i)*n1 + j] = h(i,j);
+    Raw(full, name, Code<T>(), {n0, n1}, out.data(), out.size()*sizeof(T));
+  }
+  void Text(const std::string &name, const std::string &t) {
+    if (!on) return;
+    Raw(full, name, 'c', {static_cast<long long>(t.size())}, t.data(), t.size());
+    Raw(compact, name, 'c', {static_cast<long long>(t.size())}, t.data(), t.size());
+  }
+  // particle state (x, y, m, vx, vy, vz, tag, code, ts) for the compact file
+  void Compact(const std::string &name, const DvceArray2D<Real> &pr, const DvceArray2D<int> &pi,
+               const int n) {
+    if (!on) return;
+    auto hr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
+    auto hi = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pi);
+    std::vector<double> out(static_cast<std::size_t>(n)*9);
+    for (int p=0; p<n; ++p) {
+      double *o = &out[static_cast<std::size_t>(p)*9];
+      o[0] = hr(IPX,p); o[1] = hr(IPY,p); o[2] = hr(IPM,p); o[3] = hr(IPVX,p);
+      o[4] = hr(IPVY,p); o[5] = hr(IPVZ,p); o[6] = hi(PTAG,p); o[7] = hi(PLEV,p); o[8] = hr(IPTS,p);
+    }
+    Raw(compact, name, 'd', {n, 9}, out.data(), out.size()*sizeof(double));
+  }
+  void Gas(MeshBlockPack *pack) {
+    if (!on) return;
+    auto &ind = pack->pmesh->mb_indcs;
+    auto gas = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pack->phydro->u0);
+    std::vector<double> cells;
+    for (int m=0; m<pack->nmb_thispack; ++m) {
+      const auto &size = pack->pmb->mb_size.h_view(m);
+      for (int j=ind.js; j<=ind.je; ++j) {
+        for (int i=ind.is; i<=ind.ie; ++i) {
+          cells.insert(cells.end(), {size.x1min + (i-ind.is+0.5)*size.dx1,
+              size.x2min + (j-ind.js+0.5)*size.dx2, size.dx1, size.dx2,
+              gas(m,IDN,ind.ks,j,i), gas(m,IM1,ind.ks,j,i), gas(m,IM2,ind.ks,j,i),
+              gas(m,IM3,ind.ks,j,i)});
+        }
+      }
+    }
+    const long long nc = static_cast<long long>(cells.size()/8);
+    Raw(full, "gas", 'd', {nc, 8}, cells.data(), cells.size()*sizeof(double));
+    Raw(compact, "gas", 'd', {nc, 8}, cells.data(), cells.size()*sizeof(double));
+  }
+  void Write(const int ncycle, const bool all) {
+    if (!on) return;
+    char fn[64];
+    std::snprintf(fn, sizeof(fn), "audit.%08d.bin", ncycle);
+    std::FILE *f = std::fopen(fn, "wb");
+    if (f == nullptr) return;
+    const char *head = all ? "AthenaK merge audit v1 full\n" : "AthenaK merge audit v1 compact\n";
+    std::fputs(head, f);
+    const auto &b = all ? full : compact;
+    std::fwrite(b.data(), 1, b.size(), f);
+    std::fclose(f);
+  }
+};
+
+}  // namespace
+
 int DustGasDrag::MergeCloudsDevice() {
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
@@ -328,6 +424,24 @@ int DustGasDrag::MergeCloudsDevice() {
   const int gids = pmy_pack->gids;
   const int ncell12 = qdep.extent_int(4)*qdep.extent_int(3);
   const int B = cloud_merge_buffer;
+  PassAudit audit;
+  audit.on = cloud_audit_t1 > 0.0 && pmesh->time >= cloud_audit_t0 && pmesh->time <= cloud_audit_t1;
+  if (audit.on) {
+    char meta[1024];
+    std::snprintf(meta, sizeof(meta), "time=%.17g ncycle=%d dt=%.17g npart0=%d merge_pass=%llu next_tag=%d "
+                  "nrdata=%d nidata=%d nlev=%d alpha=%.17g K=%d smax=%.17g csmax=%.17g cds=%.17g fmin=%.17g "
+                  "stencil_tol=%.17g glag=%d compress=%d absorb=%d B=%d mroot0=%.17g",
+                  pmesh->time, pmesh->ncycle, pmesh->dt, npart0,
+                  static_cast<unsigned long long>(cloud_merge_pass), cloud_next_tag, nrdata, nidata, nlev,
+                  cloud_merge_alpha, cloud_merge_K, cloud_merge_smax, cloud_compress_smax, cloud_compress_ds,
+                  cloud_merge_min_mass, cloud_merge_stencil_tol, cloud_merge_g_lag, cloud_compress ? 1 : 0,
+                  cloud_merge_absorb ? 1 : 0, B, cloud_merge_mroot.empty() ? -1.0 : cloud_merge_mroot[0]);
+    audit.Text("meta", meta);
+    audit.Add2("a0_pr", ppar->prtcl_rdata, nrdata, npart0);
+    audit.Add2("a0_pi", ppar->prtcl_idata, nidata, npart0);
+    audit.Compact("a0_c9", ppar->prtcl_rdata, ppar->prtcl_idata, npart0);
+    audit.Gas(pmy_pack);
+  }
   if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
 
   // merge-cell masks (host, as MergeClouds), built once: the refinement is static
@@ -478,6 +592,10 @@ int DustGasDrag::MergeCloudsDevice() {
     }
   }
 
+  if (audit.on) {
+    audit.Add2("a1_pr", ppar->prtcl_rdata, nrdata, ppar->nprtcl_thispack);
+    audit.Add2("a1_pi", ppar->prtcl_idata, nidata, ppar->nprtcl_thispack);
+  }
   // root-level cloud mass per species (first pass, as the host)
   if (cloud_merge_mroot.empty()) {
     auto pr = ppar->prtcl_rdata;
@@ -615,6 +733,9 @@ int DustGasDrag::MergeCloudsDevice() {
       if (cloud_merge_stencil) {
         DvceArray1D<int> owner("q_owner", npart);
         Kokkos::deep_copy(owner, -1);
+        DvceArray1D<int> xknew("audit_xknew", audit.on ? npart : 1);
+        if (audit.on) Kokkos::deep_copy(xknew, -1);
+        const bool aud = audit.on;
         const Real dtol = cloud_merge_stencil_tol;
         const Real vn1 = H1*H1/6.0, vn2 = H2*H2/6.0, vo1 = ell1*ell1/6.0, vo2 = ell2*ell2/6.0;
         Kokkos::parallel_for("q_stencil", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -662,6 +783,7 @@ int DustGasDrag::MergeCloudsDevice() {
             }
           }
           const int knew = Kokkos::atomic_fetch_add(&nnew(0), 1);
+          if (aud) xknew(c) = knew;
           double M = 0.0, sx = 0.0, sy = 0.0, sxx = 0.0, syy = 0.0, svv = 0.0;
           for (int q=0; q<nrdata; ++q) nr(q,knew) = 0.0;
           for (int k=0; k<9; ++k) {
@@ -695,6 +817,16 @@ int DustGasDrag::MergeCloudsDevice() {
           Kokkos::atomic_add(&qc(3), M*vn1 - (sxx - sx*sx/M + M*vo1));
           Kokkos::atomic_add(&qc(4), M*vn2 - (syy - sy*sy/M + M*vo2));
         });
+        if (audit.on) {
+          int nx = 0;
+          Kokkos::deep_copy(nx, Kokkos::subview(nnew, 0));
+          const std::string l = std::to_string(lev);
+          audit.Add2("x" + l + "_pr", pr, nrdata, npart);
+          audit.Add1("x" + l + "_owner", owner, npart);
+          audit.Add1("x" + l + "_xknew", xknew, npart);
+          audit.Add2("x" + l + "_nr", nr, nrdata, nx > 0 ? nx : 0);
+          audit.Add2("x" + l + "_ni", ni, nidata, nx > 0 ? nx : 0);
+        }
       }
       // ---- stages G and C: the cell walk.  stage 1 (G): pieces at level lev in level-L merge
       // cells -> level-L clouds; stage 2 (C): pieces lighter than the level-lev quantum in
@@ -851,6 +983,22 @@ int DustGasDrag::MergeCloudsDevice() {
           }
           pr(IPM,p) = 0.0;
         });
+        if (audit.on) {
+          int ng = 0, nn = 0;
+          Kokkos::deep_copy(ng, Kokkos::subview(ngroup, 0));
+          Kokkos::deep_copy(nn, Kokkos::subview(nnew, 0));
+          const std::string t = std::string(stage == 1 ? "g" : "c") + std::to_string(lev);
+          audit.Add2(t + "_pr", pr, nrdata, npart);
+          audit.Add1(t + "_kq", kq, npart);
+          audit.Add1(t + "_gid", gid, npart);
+          audit.Add1(t + "_gknew", gknew, ng);
+          audit.Add1(t + "_gkey", gkey, ng);
+          audit.Add1(t + "_nkind", nkind, nn);
+          audit.Add2(t + "_acc", acc, 8, nn);
+          audit.Add2(t + "_nr", nr, nrdata, nn);
+          audit.Add2(t + "_ni", ni, nidata, nn);
+          if (stage == 1) audit.Add1(t + "_gres", gres, npart);
+        }
         // a stage's group ids are not reused by the next stage
         Kokkos::deep_copy(gid, -1);
       }
@@ -885,6 +1033,13 @@ int DustGasDrag::MergeCloudsDevice() {
           Kokkos::atomic_add(&qc(b + 2), M*vn2 - (acc(4,k) - acc(2,k)*acc(2,k)/M + M*vF2));
         });
       }
+      if (audit.on) {
+        const std::string l = std::to_string(lev);
+        audit.Add1("f" + l + "_nkind", nkind, ncommit);
+        audit.Add2("f" + l + "_nr", nr, nrdata, ncommit);
+        audit.Add2("f" + l + "_ni", ni, nidata, ncommit);
+        audit.Add2("f" + l + "_acc", acc, 8, ncommit);
+      }
       // ---- absorption of G residuals deep in the merge zone: a piece left in an
       // uncommitted group, whose 3x3 level-L cells are all merge cells and with no unreleased lobed
       // cloud within reach, goes to the level-L clouds (existing and new X/G) whose tents cover it
@@ -903,6 +1058,14 @@ int DustGasDrag::MergeCloudsDevice() {
         }
         DvceArray2D<Real> accP("qabs_accP", 7, npart), accN("qabs_accN", 7, ncommit > 0 ? ncommit : 1);
         DvceArray1D<double> ac("qabs_count", 4);
+        // audit: per-piece status (0 not a G residual, 1 outside merge cells, 2 not deep, 3 lobed cloud
+        // near, 4 no compatible recipient, 5 no recipient, 6 absorbed) and donor -> recipient records
+        // (orphan, kind 0 old / 1 new, recipient, dm, dx, dy, w, wsum)
+        const bool aud = audit.on;
+        const int nrecmax = aud ? 32*npart : 1;
+        DvceArray1D<int> ostat("audit_ostat", aud ? npart : 1);
+        DvceArray2D<double> arec("audit_arec", 8, nrecmax);
+        DvceArray1D<int> narec("audit_narec", 1);
         auto tentc = [=] KOKKOS_FUNCTION (const Real dx, const Real dy) {
           return Kokkos::fmax(0.0, 1.0 - Kokkos::fabs(dx)/H1)*Kokkos::fmax(0.0, 1.0 - Kokkos::fabs(dy)/H2);
         };
@@ -910,15 +1073,16 @@ int DustGasDrag::MergeCloudsDevice() {
         KOKKOS_LAMBDA(const int o) {
           // only a G residual: the piece was walked by G (deep zone) and left in an uncommitted
           // group (not deferred, not waiting in stage X's outer band)
+          if (aud) ostat(o) = 0;
           if (kp(o) < 0 || pr(IPM,o) <= 0.0 || gres(o) == 0) return;
           const Real xo = pr(IPX,o), yo = pr(IPY,o), mo = pr(IPM,o);
-          if (!mm.In(xo, yo, L)) return;
+          if (!mm.In(xo, yo, L)) {if (aud) ostat(o) = 1; return;}
           const int sp = pi(PSP,o), cell = kp(o) - sp*ncl, I = cell % n1, J = cell/n1;
           for (int dj=-1; dj<=1; ++dj) {   // deep: the 3x3 cells are merge cells
             for (int di=-1; di<=1; ++di) {
               const Real xn = transfer.x1min + (SMRCompositeTransfer::WrapIndex(I + di, n1) + 0.5)*H1;
               const Real yn = transfer.x2min + (SMRCompositeTransfer::WrapIndex(J + dj, n2) + 0.5)*H2;
-              if (!mm.In(xn, yn, L)) return;
+              if (!mm.In(xn, yn, L)) {if (aud) ostat(o) = 2; return;}
             }
           }
           for (int dj=-2; dj<=2; ++dj) {   // no unreleased lobed cloud within reach
@@ -928,7 +1092,7 @@ int DustGasDrag::MergeCloudsDevice() {
               for (int k=sl_start(key); k<sl_start(key+1); ++k) {
                 const int t = sl_list(k);
                 if (Kokkos::fabs(transfer.MinImage1(pr(IPX,t) - xo)) < H1 + ell1 &&
-                    Kokkos::fabs(transfer.MinImage2(pr(IPY,t) - yo)) < H2 + ell2) return;
+                    Kokkos::fabs(transfer.MinImage2(pr(IPY,t) - yo)) < H2 + ell2) {if (aud) ostat(o) = 3; return;}
               }
             }
           }
@@ -955,6 +1119,13 @@ int DustGasDrag::MergeCloudsDevice() {
                   if (!compatible(pr(IPVX,q), pr(IPVY,q), pr(IPVZ,q), pr(IPTS,q))) continue;
                   if (ps == 0) {wsum += w; continue;}
                   const Real dm = w/wsum*mo;
+                  if (aud) {
+                    const int r = Kokkos::atomic_fetch_add(&narec(0), 1);
+                    if (r < nrecmax) {
+                      arec(0,r) = o; arec(1,r) = 0; arec(2,r) = q; arec(3,r) = dm;
+                      arec(4,r) = dx; arec(5,r) = dy; arec(6,r) = w; arec(7,r) = wsum;
+                    }
+                  }
                   Kokkos::atomic_add(&accP(0,q), dm);
                   Kokkos::atomic_add(&accP(1,q), dm*dx); Kokkos::atomic_add(&accP(2,q), dm*dy);
                   Kokkos::atomic_add(&accP(3,q), dm*vo[0]); Kokkos::atomic_add(&accP(4,q), dm*vo[1]);
@@ -969,6 +1140,13 @@ int DustGasDrag::MergeCloudsDevice() {
                   if (!compatible(nr(IPVX,q), nr(IPVY,q), nr(IPVZ,q), nr(IPTS,q))) continue;
                   if (ps == 0) {wsum += w; continue;}
                   const Real dm = w/wsum*mo;
+                  if (aud) {
+                    const int r = Kokkos::atomic_fetch_add(&narec(0), 1);
+                    if (r < nrecmax) {
+                      arec(0,r) = o; arec(1,r) = 1; arec(2,r) = q; arec(3,r) = dm;
+                      arec(4,r) = dx; arec(5,r) = dy; arec(6,r) = w; arec(7,r) = wsum;
+                    }
+                  }
                   Kokkos::atomic_add(&accN(0,q), dm);
                   Kokkos::atomic_add(&accN(1,q), dm*dx); Kokkos::atomic_add(&accN(2,q), dm*dy);
                   Kokkos::atomic_add(&accN(3,q), dm*vo[0]); Kokkos::atomic_add(&accN(4,q), dm*vo[1]);
@@ -977,8 +1155,12 @@ int DustGasDrag::MergeCloudsDevice() {
                 }
               }
             }
-            if (ps == 0 && wsum <= 0.0) {Kokkos::atomic_add(&ac(nrec > 0 ? 2 : 3), 1.0); return;}
+            if (ps == 0 && wsum <= 0.0) {
+              if (aud) ostat(o) = (nrec > 0) ? 4 : 5;
+              Kokkos::atomic_add(&ac(nrec > 0 ? 2 : 3), 1.0); return;
+            }
           }
+          if (aud) ostat(o) = 6;
           Kokkos::atomic_add(&ac(0), 1.0);
           Kokkos::atomic_add(&ac(1), static_cast<double>(mo));
           pr(IPM,o) = 0.0;
@@ -1022,6 +1204,18 @@ int DustGasDrag::MergeCloudsDevice() {
         auto ach = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ac);
         for (int c=0; c<4; ++c) absc[c] += ach(c);
         absc[4] += dkp + dkn;
+        if (audit.on) {
+          int nr_ = 0;
+          Kokkos::deep_copy(nr_, Kokkos::subview(narec, 0));
+          const std::string l = std::to_string(lev);
+          audit.Add1("b" + l + "_ostat", ostat, npart);
+          audit.Add2("b" + l + "_arec", arec, 8, nr_ < nrecmax ? nr_ : nrecmax);
+          audit.Add2("b" + l + "_accP", accP, 7, npart);
+          audit.Add2("b" + l + "_accN", accN, 7, ncommit > 0 ? ncommit : 0);
+          audit.Add2("b" + l + "_pr", pr, nrdata, npart);
+          audit.Add2("b" + l + "_nr", nr, nrdata, ncommit);
+          audit.Add2("b" + l + "_ni", ni, nidata, ncommit);
+        }
       }
       auto qch = Kokkos::create_mirror_view_and_copy(HostMemSpace(), qc);
       for (int c=0; c<24; ++c) qtot[c] += qch(c);
@@ -1737,6 +1931,18 @@ int DustGasDrag::MergeCloudsDevice() {
         static_cast<unsigned long long>(ic(9)), static_cast<unsigned long long>(ic(10)));
     std::fprintf(fp, "\n");
     std::fclose(fp);
+  }
+  if (audit.on) {
+    audit.Add2("z_pr", ppar->prtcl_rdata, nrdata, nfinal);
+    audit.Add2("z_pi", ppar->prtcl_idata, nidata, nfinal);
+    char tail[512];
+    std::snprintf(tail, sizeof(tail), "nrelease=%d nfinal=%d absorbed=%.0f absorbed_mass=%.17g X=%.0f G=%.0f "
+                  "Gres=%.0f C=%.0f Crej=%.0f", nrelease, nfinal, absc[0], absc[1], qtot[0], qtot[5],
+                  qtot[9], qtot[13], qtot[16]);
+    audit.Text("tail", tail);
+    const bool changed = nrelease > 0 || qtot[0] + qtot[5] + qtot[13] > 0.0 || absc[0] > 0.0 ||
+                         nfinal != npart0;
+    if (changed || cloud_audit_compact) audit.Write(pmesh->ncycle, changed);
   }
   (void) sh1; (void) sh2;
   return static_cast<int>(nevents);
