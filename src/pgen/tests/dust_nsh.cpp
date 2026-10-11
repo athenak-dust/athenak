@@ -59,6 +59,7 @@
 // functions for error output and user history
 void DustNSHErrors(ParameterInput *pin, Mesh *pm);
 void DustNSHHistory(HistoryData *pdata, Mesh *pm);
+void RunAuditReplay(ParameterInput *pin, Mesh *pm);   // streaming_linear.cpp
 
 namespace {
 
@@ -716,6 +717,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   if (three_d) {dtnew = std::min(dtnew, msize.h_view(0).dx3/vmax);}
   ppar->dtnew = dtnew;
 
+  // <problem>/merge_audit_replay = audit-format entry state (diagnostic): one
+  // merge pass from a saved state, then exit
+  if (!pin->GetOrAddString("problem", "merge_audit_replay", "").empty()) {
+    RunAuditReplay(pin, pmy_mesh_);
+  }
   return;
 }
 

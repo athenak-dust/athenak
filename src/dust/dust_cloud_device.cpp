@@ -2454,7 +2454,7 @@ int DustGasDrag::MergeCloudsDevice() {
   // pass-end check: the final state deposited again against the entry reference (not the running
   // ledger): largest |dM| / (beta Mf), largest |dP| / (beta Mf vref), leaves over the budget; and the
   // plain fine pieces still sitting in merge cells of the next-coarser level
-  double bend[3] = {0.0, 0.0, 0.0}, fim[2] = {0.0, 0.0};
+  double bend[4] = {0.0, 0.0, 0.0, 0.0}, fim[2] = {0.0, 0.0};
   if (cloud_merge_mode == 1 && (pbud || cloud_merge_xprotect || cloud_absorb_budget > 0.0)) {
     auto pr = ppar->prtcl_rdata;
     auto pi = ppar->prtcl_idata;
@@ -2475,7 +2475,16 @@ int DustGasDrag::MergeCloudsDevice() {
     const auto mbsz = pmy_pack->pmb->mb_size;
     const Real bfloor = cloud_absorb_floor*mrootsp[0]/(transfer.root_dx1*transfer.root_dx2);
     const Real bvmin = alpha*Kokkos::min(mm.dx1[nlev-1], mm.dx2[nlev-1])*((omega > 0.0) ? omega : 0.0);
-    double rmx = 0.0, rpx = 0.0, nover = 0.0;
+    double rmx = 0.0, rpx = 0.0, nover = 0.0, s2 = 0.0, sv = 0.0;
+    Kokkos::parallel_reduce("budget_end_rms", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+    KOKKOS_LAMBDA(const int t, double &a, double &b) {
+      if (lent(0,t) <= 0.0 && lfin(0,t) <= 0.0) return;
+      const int tb_ = t/n12;
+      const Real vol = mbsz.d_view(tb_).dx1*mbsz.d_view(tb_).dx2;
+      const Real r = (lfin(0,t) - lent(0,t))/Kokkos::fmax(lent(0,t), bfloor*vol);
+      a += vol*r*r; b += vol;
+    }, s2, sv);
+    bend[3] = (sv > 0.0) ? std::sqrt(s2/sv) : 0.0;
     Kokkos::parallel_reduce("budget_end", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
     KOKKOS_LAMBDA(const int t, double &a, double &b, double &c) {
       const int tb_ = t/n12;
@@ -2539,9 +2548,9 @@ int DustGasDrag::MergeCloudsDevice() {
       // pass-budget columns: G rejected groups, pieces, mass, evaluations; C the same; stages at the
       // evaluation limit; pass-end check: largest mass ratio, momentum ratio, leaves over; fine pieces
       // left in merge cells and their mass; seconds of the pass and of the budget kernels
-      std::fprintf(fp, " %.0f %.0f %.9e %.0f %.0f %.0f %.9e %.0f %.0f %.6e %.6e %.0f %.0f %.9e %.6e %.6e",
+      std::fprintf(fp, " %.0f %.0f %.9e %.0f %.0f %.0f %.9e %.0f %.0f %.6e %.6e %.0f %.0f %.9e %.6e %.6e %.6e",
                    gcb[0][0], gcb[0][1], gcb[0][2], gcb[0][3], gcb[1][0], gcb[1][1], gcb[1][2], gcb[1][3],
-                   bcap, bend[0], bend[1], bend[2], fim[0], fim[1], tpass_s, tbud);
+                   bcap, bend[0], bend[1], bend[2], fim[0], fim[1], tpass_s, tbud, bend[3]);
     }
     if (cloud_merge_pending_log) std::fprintf(fp, " %llu %llu %llu %llu %llu", static_cast<unsigned long long>(ic(6)),
         static_cast<unsigned long long>(ic(7)), static_cast<unsigned long long>(ic(8)),
@@ -2564,12 +2573,12 @@ int DustGasDrag::MergeCloudsDevice() {
                   "pass_budget=%.17g G_brej=%.0f G_brej_pieces=%.0f G_brej_mass=%.17g G_evals=%.0f "
                   "C_brej=%.0f C_brej_pieces=%.0f C_brej_mass=%.17g C_evals=%.0f budget_cap=%.0f "
                   "end_ratio_M=%.17g end_ratio_P=%.17g end_over=%.0f fine_left=%.0f fine_left_mass=%.17g "
-                  "t_pass=%.6e t_budget=%.6e",
+                  "t_pass=%.6e t_budget=%.6e end_rms_M=%.17g",
                   nrelease, nfinal, absc[0], absc[1], qtot[0], qtot[5],
                   qtot[9], qtot[13], qtot[16], xwtot[0], xwtot[1], budtot[0], budtot[1], budtot[2],
                   cloud_merge_xprotect ? 1 : 0, cloud_absorb_budget, cloud_merge_budget, gcb[0][0],
                   gcb[0][1], gcb[0][2], gcb[0][3], gcb[1][0], gcb[1][1], gcb[1][2], gcb[1][3], bcap,
-                  bend[0], bend[1], bend[2], fim[0], fim[1], tpass_s, tbud);
+                  bend[0], bend[1], bend[2], fim[0], fim[1], tpass_s, tbud, bend[3]);
     audit.Text("tail", tail);
     const bool changed = nrelease > 0 || qtot[0] + qtot[5] + qtot[13] > 0.0 || absc[0] > 0.0 ||
                          nfinal != npart0 || (cloud_audit_rejected && gcb[0][0] + gcb[1][0] > 0.0);
