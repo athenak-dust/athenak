@@ -145,6 +145,100 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
+      if (linear && !flocal && !fchild && !deform && !ag.on) {
+        // Production refinable-cloud advance: linear gather at the
+        // midpoint, implicit-midpoint kick and drift, cloud-weight impulse deposit.  Same
+        // arithmetic as dust_pc2_advance below, kept separate because the unused
+        // variants there cost registers and occupancy.
+        par_for("dust_pc2_advance_linear",DevExeSpace(),0,(npart-1),
+        KOKKOS_LAMBDA(const int p) {
+          Real x0 = pr(IPX1,p), y0 = pr(IPY1,p), z0 = pr(IPZ1,p);
+          Real vx0 = pr(IPVX1,p), vy0 = pr(IPVY1,p), vz0 = pr(IPVZ1,p);
+          Real xh = x0 + 0.5*dt*vx0;
+          Real yh = y0 + 0.5*dt*(vy0 - ((is_sbox && three_d) ? qshear_*omega0_*x0 : 0.0));
+          Real zh = three_d ? z0 + 0.5*dt*vz0 : z0;
+          Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
+          int glev = (gather_level >= 0) ? gather_level :
+                     SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode);
+          transfer.ForEachCloudMoment(xh, yh, glev,
+          [&](const int target, const Real w, const Real m1x, const Real m1y) {
+            int ti = target % ncells1;
+            int remainder = target/ncells1;
+            int tj = remainder % ncells2;
+            int tm = remainder/ncells2;
+            Real dx1 = mbsize.d_view(tm).dx1, dx2 = mbsize.d_view(tm).dx2;
+            Real xc = mbsize.d_view(tm).x1min + (ti - is + 0.5)*dx1;
+            Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
+            Real cx = 0.5*(m1x + transfer.MinImage1(xh - xc)*w)/dx1;
+            Real cy = 0.5*(m1y + transfer.MinImage2(yh - yc)*w)/dx2;
+            ugx += w*ustar_(tm,0,ks,tj,ti)
+                 + cx*(ustar_(tm,0,ks,tj,ti+1) - ustar_(tm,0,ks,tj,ti-1))
+                 + cy*(ustar_(tm,0,ks,tj+1,ti) - ustar_(tm,0,ks,tj-1,ti));
+            ugy += w*ustar_(tm,1,ks,tj,ti)
+                 + cx*(ustar_(tm,1,ks,tj,ti+1) - ustar_(tm,1,ks,tj,ti-1))
+                 + cy*(ustar_(tm,1,ks,tj+1,ti) - ustar_(tm,1,ks,tj-1,ti));
+            ugz += w*ustar_(tm,2,ks,tj,ti)
+                 + cx*(ustar_(tm,2,ks,tj,ti+1) - ustar_(tm,2,ks,tj,ti-1))
+                 + cy*(ustar_(tm,2,ks,tj+1,ti) - ustar_(tm,2,ks,tj-1,ti));
+          });
+          Real h = 0.5*dt;
+          Real lambda = h/pr(IPTS,p);
+          Real aa = 1.0 + lambda;
+          Real rx = vx0 + lambda*ugx;
+          Real ry = vy0 + lambda*ugy;
+          Real rz = vz0 + lambda*ugz;
+          Real vxh, vyh, vzh;
+          if (is_sbox && three_d) {
+            Real cxy = 2.0*h*omega0_;
+            Real cyx = h*(2.0-qshear_)*omega0_;
+            Real det = aa*aa + cxy*cyx;
+            vxh = (aa*rx + cxy*ry)/det;
+            vyh = (aa*ry - cyx*rx)/det;
+            if (is_strat) rz -= h*SQR(omega0_)*zh;
+            vzh = rz/aa;
+          } else if (is_sbox) {
+            Real cxz = 2.0*h*omega0_;
+            Real czx = h*(2.0-qshear_)*omega0_;
+            Real det = aa*aa + cxz*czx;
+            if (aphi != 0.0) rz += h*aphi;
+            vxh = (aa*rx + cxz*rz)/det;
+            vzh = (aa*rz - czx*rx)/det;
+            vyh = ry/aa;
+          } else {
+            vxh = rx/aa;
+            vyh = ry/aa;
+            vzh = rz/aa;
+          }
+          pr(IPVX,p) = 2.0*vxh - vx0;
+          pr(IPVY,p) = 2.0*vyh - vy0;
+          pr(IPVZ,p) = 2.0*vzh - vz0;
+          pr(IPX,p) = x0 + dt*vxh;
+          pr(IPY,p) = y0 + dt*(vyh - ((is_sbox && three_d) ? qshear_*omega0_*xh : 0.0));
+          if (three_d) pr(IPZ,p) = z0 + dt*vzh;
+          pr(IPX1,p) = xh; pr(IPY1,p) = yh; pr(IPZ1,p) = zh;
+          Real dvx_drag = dt*(ugx-vxh)/pr(IPTS,p);
+          Real dvy_drag = dt*(ugy-vyh)/pr(IPTS,p);
+          Real dvz_drag = dt*(ugz-vzh)/pr(IPTS,p);
+          pr(IPRX,p) = dvx_drag;
+          pr(IPRY,p) = dvy_drag;
+          pr(IPRZ,p) = dvz_drag;
+          if (!br) return;
+          Real mass = -pr(IPM,p);
+          transfer.ForEachCloudWeight(xh, yh, pi(PLEV,p),
+          [&](const int target, const Real particle_weight) {
+            int ti = target % ncells1;
+            int remainder = target/ncells1;
+            int tj = remainder % ncells2;
+            int tm = remainder/ncells2;
+            Real volume = mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2;
+            Real density_weight = mass*particle_weight/volume;
+            DepositAdd(&dmom_(tm,0,ks,tj,ti), density_weight*dvx_drag);
+            DepositAdd(&dmom_(tm,1,ks,tj,ti), density_weight*dvy_drag);
+            DepositAdd(&dmom_(tm,2,ks,tj,ti), density_weight*dvz_drag);
+          });
+        });
+        return TaskStatus::complete;
+      }
       par_for("dust_pc2_advance",DevExeSpace(),0,(npart-1),
       KOKKOS_LAMBDA(const int p) {
         int m = pi(PGID,p) - gids;

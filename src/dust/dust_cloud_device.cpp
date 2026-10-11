@@ -124,8 +124,17 @@ int DustGasDrag::SplitCloudsP1Device() {
   const int gids = pmy_pack->gids;
   const int ncell12 = qdep.extent_int(4)*qdep.extent_int(3);
 
-  // pieces per particle (0 = not flagged), and the numbers of parents / lobed events
-  DvceArray1D<int> np(Kokkos::view_alloc(Kokkos::WithoutInitializing, "dust_split_np"), npart);
+  // pieces per particle (0 = not flagged), and the numbers of parents / lobed events.
+  // The work arrays persist between cycles (per-cycle allocations and frees
+  // dominated the host side of a mixed-mesh cycle).
+  if (split_np.extent_int(0) < npart) {
+    split_np = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                                   "dust_split_np"), npart + npart/4);
+    split_off = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                                    "dust_split_off"), npart + npart/4);
+  }
+  auto np = split_np;
+  auto tagoff = split_off;
   int nflag = 0, nparent = 0;
   Kokkos::parallel_reduce("dust_split_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, int &sf, int &sp) {
@@ -141,70 +150,56 @@ int DustGasDrag::SplitCloudsP1Device() {
   if (nflag == 0) return 0;
   if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
 
-  // slots of the kept particles, first slots of the pieces, first new tags
-  DvceArray1D<int> keepoff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "dust_split_keepoff"), npart);
-  DvceArray1D<int> pieceoff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "dust_split_pieceoff"), npart);
-  DvceArray1D<int> tagoff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "dust_split_tagoff"), npart);
-  int nkeep = 0, npieces = 0, ntags = 0;
-  Kokkos::parallel_scan("dust_split_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
-    if (final) keepoff(p) = upd;
-    upd += (np(p) == 0) ? 1 : 0;
-  }, nkeep);
-  Kokkos::parallel_scan("dust_split_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
-    if (final) pieceoff(p) = upd;
-    upd += np(p);
-  }, npieces);
+  // In place: the centre piece (k = 0, which keeps the tag) overwrites its parent's slot,
+  // and the other pieces are appended after the npart particles, at the offsets (and with
+  // the tags) of the exclusive scan of the extra pieces.  The particle arrays keep 25%
+  // headroom so that the append rarely reallocates.
+  int ntags = 0;
   Kokkos::parallel_scan("dust_split_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
     if (final) tagoff(p) = upd;
     upd += (np(p) > 0) ? np(p) - 1 : 0;
   }, ntags);
-
-  const int nnew = nkeep + npieces;
-  DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata, nnew);
-  DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata, nnew);
+  const int nnew = npart + ntags;
+  if (ppar->prtcl_rdata.extent_int(1) < nnew) {
+    Kokkos::resize(ppar->prtcl_rdata, nrdata, nnew + nnew/4);
+    Kokkos::resize(ppar->prtcl_idata, nidata, nnew + nnew/4);
+  }
+  auto prv = ppar->prtcl_rdata;
+  auto piv = ppar->prtcl_idata;
   const int tag0 = cloud_next_tag;
   Kokkos::parallel_for("dust_split_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
-    if (np(p) == 0) {
-      const int s = keepoff(p);
-      for (int c=0; c<nrdata; ++c) prn(c,s) = pr(c,p);
-      for (int c=0; c<nidata; ++c) pin(c,s) = pi(c,p);
-      return;
-    }
-    const int code = pi(PLEV,p);
-    const Real x = pr(IPX,p), y = pr(IPY,p);
+    if (np(p) == 0) return;
+    const int code = piv(PLEV,p);
+    const Real x = prv(IPX,p), y = prv(IPY,p), mass = prv(IPM,p);
     DPiece p1[3], p2[3]; int n1, n2, clev; bool parent;
     P1Event(transfer, code, x, y, slack, presplit, release, p1, p2, n1, n2, clev, parent);
     const Real e1 = transfer.CloudHalfWidth1(clev), e2 = transfer.CloudHalfWidth2(clev);
-    int k = 0;
-    for (int b=0; b<n2; ++b) {
-      for (int a=0; a<n1; ++a) {
-        const int s = nkeep + pieceoff(p) + k;
-        const Real cx = SMRCompositeTransfer::WrapPosition(x + p1[a].off*e1, transfer.x1min,
-                                                           transfer.x1max);
-        const Real cy = SMRCompositeTransfer::WrapPosition(y + p2[b].off*e2, transfer.x2min,
-                                                           transfer.x2max);
-        for (int c=0; c<nrdata; ++c) prn(c,s) = pr(c,p);
-        for (int c=0; c<nidata; ++c) pin(c,s) = pi(c,p);
-        prn(IPX,s) = cx; prn(IPX1,s) = cx;
-        prn(IPY,s) = cy; prn(IPY1,s) = cy;
-        prn(IPM,s) = pr(IPM,p)*p1[a].frac*p2[b].frac;
-        pin(PLEV,s) = clev | (p1[a].lobe << sh1) | (p2[b].lobe << sh2);
-        const int fi = SMRCompositeTransfer::WrapIndex(static_cast<int>(
-            Kokkos::floor((cx - transfer.x1min)/transfer.fine_dx1)), transfer.nfine1);
-        const int fj = SMRCompositeTransfer::WrapIndex(static_cast<int>(
-            Kokkos::floor((cy - transfer.x2min)/transfer.fine_dx2)), transfer.nfine2);
-        pin(PGID,s) = gids + transfer.cloud_target(fj, fi)/ncell12;
-        if (k > 0) pin(PTAG,s) = tag0 + tagoff(p) + k - 1;   // the centre keeps the tag
-        ++k;
+    // the parent's slot is written last, after the appended pieces have copied it
+    for (int k=n1*n2-1; k>=0; --k) {
+      const int a = k % n1, b = k/n1;
+      const int s = (k == 0) ? p : npart + tagoff(p) + k - 1;
+      const Real cx = SMRCompositeTransfer::WrapPosition(x + p1[a].off*e1, transfer.x1min,
+                                                         transfer.x1max);
+      const Real cy = SMRCompositeTransfer::WrapPosition(y + p2[b].off*e2, transfer.x2min,
+                                                         transfer.x2max);
+      if (k > 0) {
+        for (int c=0; c<nrdata; ++c) prv(c,s) = prv(c,p);
+        for (int c=0; c<nidata; ++c) piv(c,s) = piv(c,p);
+        piv(PTAG,s) = tag0 + tagoff(p) + k - 1;   // the centre keeps the tag
       }
+      prv(IPX,s) = cx; prv(IPX1,s) = cx;
+      prv(IPY,s) = cy; prv(IPY1,s) = cy;
+      prv(IPM,s) = mass*p1[a].frac*p2[b].frac;
+      piv(PLEV,s) = clev | (p1[a].lobe << sh1) | (p2[b].lobe << sh2);
+      const int fi = SMRCompositeTransfer::WrapIndex(static_cast<int>(
+          Kokkos::floor((cx - transfer.x1min)/transfer.fine_dx1)), transfer.nfine1);
+      const int fj = SMRCompositeTransfer::WrapIndex(static_cast<int>(
+          Kokkos::floor((cy - transfer.x2min)/transfer.fine_dx2)), transfer.nfine2);
+      piv(PGID,s) = gids + transfer.cloud_target(fj, fi)/ncell12;
     }
   });
-  pr = prn;
-  pi = pin;
   cloud_next_tag += ntags;
   cloud_split_count += nparent;
   cloud_lobe_split_count += nflag - nparent;

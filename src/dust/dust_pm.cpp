@@ -79,6 +79,59 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       bool deform = cloud_deform && transfer.cloud_mode;
       int gather_level = cloud_gather_level;
       int tmode = cloud_transition;
+      if (linear && !flocal && !fchild && !deform) {
+        // Production refinable-cloud predictor: the linear gather and the
+        // cloud-weight deposit only.  Same arithmetic as the general kernel below, kept
+        // separate because the unused variants there cost registers and occupancy.
+        par_for("dust_pc2_cloud_predictor_linear",DevExeSpace(),0,(npart-1),
+        KOKKOS_LAMBDA(const int p) {
+          Real xp = pr(IPX,p), yp = pr(IPY,p);
+          int lev = pi(PLEV,p);
+          Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
+          transfer.ForEachCloudMoment(xp, yp, (gather_level >= 0) ? gather_level :
+                                      SMRCompositeTransfer::GatherCode(lev, tmode),
+          [&](const int target, const Real w, const Real m1x, const Real m1y) {
+            int ti = target % ncells1;
+            int remainder = target/ncells1;
+            int tj = remainder % ncells2;
+            int tm = remainder/ncells2;
+            Real dx1 = mbsize.d_view(tm).dx1, dx2 = mbsize.d_view(tm).dx2;
+            Real xc = mbsize.d_view(tm).x1min + (ti - is + 0.5)*dx1;
+            Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
+            Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
+            Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
+            Real invrho = 1.0/uold(tm,IDN,ks,tj,ti);
+            Real rip = 1.0/uold(tm,IDN,ks,tj,ti+1), rim = 1.0/uold(tm,IDN,ks,tj,ti-1);
+            Real rjp = 1.0/uold(tm,IDN,ks,tj+1,ti), rjm = 1.0/uold(tm,IDN,ks,tj-1,ti);
+            ugx += w*uold(tm,IM1,ks,tj,ti)*invrho
+                 + cx*(uold(tm,IM1,ks,tj,ti+1)*rip - uold(tm,IM1,ks,tj,ti-1)*rim)
+                 + cy*(uold(tm,IM1,ks,tj+1,ti)*rjp - uold(tm,IM1,ks,tj-1,ti)*rjm);
+            ugy += w*uold(tm,IM2,ks,tj,ti)*invrho
+                 + cx*(uold(tm,IM2,ks,tj,ti+1)*rip - uold(tm,IM2,ks,tj,ti-1)*rim)
+                 + cy*(uold(tm,IM2,ks,tj+1,ti)*rjp - uold(tm,IM2,ks,tj-1,ti)*rjm);
+            ugz += w*uold(tm,IM3,ks,tj,ti)*invrho
+                 + cx*(uold(tm,IM3,ks,tj,ti+1)*rip - uold(tm,IM3,ks,tj,ti-1)*rim)
+                 + cy*(uold(tm,IM3,ks,tj+1,ti)*rjp - uold(tm,IM3,ks,tj-1,ti)*rjm);
+          });
+          Real mass_rate = pr(IPM,p)/pr(IPTS,p);
+          Real gx = -dt*mass_rate*(ugx - pr(IPVX,p));
+          Real gy = -dt*mass_rate*(ugy - pr(IPVY,p));
+          Real gz = -dt*mass_rate*(ugz - pr(IPVZ,p));
+          transfer.ForEachCloudWeight(xp, yp, lev,
+          [&](const int target, const Real w) {
+            int ti = target % ncells1;
+            int remainder = target/ncells1;
+            int tj = remainder % ncells2;
+            int tm = remainder/ncells2;
+            Real inv_volume = 1.0/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
+            DepositAdd(&qdep_(tm,1,ks,tj,ti), inv_volume*w*gx);
+            DepositAdd(&qdep_(tm,2,ks,tj,ti), inv_volume*w*gy);
+            DepositAdd(&qdep_(tm,3,ks,tj,ti), inv_volume*w*gz);
+            DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
+          });
+        });
+        return TaskStatus::complete;
+      }
       if (linear || flocal || fchild || deform) {
         // Refinable-cloud variants: (linear) the gather integrates a linear
         // reconstruction of the old gas velocity over the cloud (central slopes over

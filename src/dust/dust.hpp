@@ -114,6 +114,15 @@ struct SMRCompositeTransfer {
   Real fine_dx1 = 0.0, fine_dx2 = 0.0;
   DvceArray2D<int> cloud_target;      // finest virtual cell -> encoded active leaf
   DvceArray2D<int> cloud_level;       // finest virtual cell -> owner level - root_level
+  // Level-native traversal (<dust>/cloud_native_transfer): for
+  // L = 0..cloud_nlev, the encoded leaf of every level-L cell that is itself an active
+  // leaf (-1 otherwise), row-major from native_offset[L] with rows of native_n1[L].
+  static constexpr int kMaxNativeLevels = 3;
+  bool native = false;
+  int native_n1[kMaxNativeLevels] = {0, 0, 0};
+  int native_n2[kMaxNativeLevels] = {0, 0, 0};
+  int native_offset[kMaxNativeLevels] = {0, 0, 0};
+  DvceArray1D<int> native_target;
   bool measure_correction = true;
   int ncoarse1 = 0, ncoarse2 = 0;
   int nfine1 = 0, nfine2 = 0;
@@ -280,15 +289,139 @@ struct SMRCompositeTransfer {
     return root_dx2/static_cast<Real>(1 << (lev & kCloudLevelMask));
   }
 
+  // Encoded leaf of the level-l cell (j, i) (indices wrapped), or -1 when that cell is
+  // not an active leaf of level l.
+  KOKKOS_INLINE_FUNCTION
+  int NativeTarget(const int l, const int j, const int i) const {
+    return native_target(native_offset[l] + WrapIndex(j, native_n2[l])*native_n1[l] +
+                         WrapIndex(i, native_n1[l]));
+  }
+
+  // CloudWeightsMoments1D (kMoments) or CloudWeights1D on at most three cells, with the
+  // loop unrolled so the arrays stay in registers.  Returns the cell count; a count above
+  // three leaves w and g unset (the caller falls back to the general traversal).
+  template <bool kMoments>
+  KOKKOS_INLINE_FUNCTION
+  static int CloudWeights3(const Real x, const Real ell_in, const Real xmin, const Real dx,
+                           int &i0, Real w[3], Real g[3], const int lobe_in,
+                           const bool point) {
+    const bool both = (lobe_in == 3);
+    const Real ell = both ? 2.0*ell_in : ell_in;
+    const int lobe = both ? 0 : lobe_in;
+    Real inv_ell = 1.0/ell;
+    Real sl = (lobe == 1) ? -ell : ell;
+    Real lo = (lobe == 1) ? x - 2.0*ell : x - ell;
+    Real hi = (lobe == 2) ? x + 2.0*ell : x + ell;
+    i0 = static_cast<int>(floor((lo - xmin)/dx));
+    int count = static_cast<int>(ceil((hi - xmin)/dx)) - i0;
+    if (count > 3) return count;
+    Real s = (xmin + i0*dx - x)*inv_ell;
+    Real prev = HatCDF(s), gprev = kMoments ? HatMoment(s) : 0.0;
+    Real t = lobe ? (xmin + i0*dx - x - sl)*inv_ell : 0.0;
+    Real prevl = HatCDF(t), gprevl = kMoments ? HatMoment(t) : 0.0;
+#pragma unroll
+    for (int a=0; a<3; ++a) {
+      w[a] = 0.0;
+      g[a] = 0.0;
+      if (a >= count) continue;
+      s = (xmin + (i0 + a + 1)*dx - x)*inv_ell;
+      Real next = HatCDF(s);
+      w[a] = next - prev;
+      prev = next;
+      if constexpr (kMoments) {
+        Real gnext = HatMoment(s);
+        g[a] = (both && point) ? 0.0 : ell*(gnext - gprev);
+        gprev = gnext;
+      }
+      if (lobe) {
+        t = (xmin + (i0 + a + 1)*dx - x - sl)*inv_ell;
+        Real nextl = HatCDF(t);
+        Real wl = nextl - prevl;
+        w[a] = (2.0/3.0)*w[a] + (1.0/3.0)*wl;
+        prevl = nextl;
+        if constexpr (kMoments) {
+          Real gnextl = HatMoment(t);
+          g[a] = point ? 0.0 : (2.0/3.0)*g[a] + (1.0/3.0)*(ell*(gnextl - gprevl) + sl*wl);
+          gprevl = gnextl;
+        }
+      }
+    }
+    return count;
+  }
+
+  // Level-native traversal.  When the support of the cloud `code` at the wrapped position
+  // (x1, x2) covers at most 3x3 cells of the level L of the leaf holding the particle and
+  // every one of them is an active leaf of level L, integrate the cloud over those leaves
+  // directly, one call per leaf, and return true.  This is the canonical TSC footprint of a
+  // plain level-L cloud; a finer cloud on coarser leaves covers at most 2x2.  A cloud's
+  // integral over a leaf is the sum of its integrals over the leaf's virtual finest
+  // sub-cells, so the weights and first moments equal those of the finest-grid traversal
+  // up to rounding.  Returns false, without calling `function`, otherwise (support across
+  // levels, or a lobed cloud wider than three cells).
+  template <bool kMoments, typename Function>
+  KOKKOS_INLINE_FUNCTION
+  bool NativeTraversal(const Real x1, const Real x2, const int code,
+                       const Function &function) const {
+    int l = 0;
+    for (; l<=cloud_nlev; ++l) {
+      Real d1 = root_dx1/static_cast<Real>(1 << l), d2 = root_dx2/static_cast<Real>(1 << l);
+      if (NativeTarget(l, static_cast<int>(floor((x2 - x2min)/d2)),
+                       static_cast<int>(floor((x1 - x1min)/d1))) >= 0) break;
+    }
+    if (l > cloud_nlev) return false;
+    Real d1 = root_dx1/static_cast<Real>(1 << l), d2 = root_dx2/static_cast<Real>(1 << l);
+    bool point = kMoments && (code & kCloudGatherPoint) != 0;
+    int i0, j0;
+    Real w1[3], w2[3], g1[3], g2[3];
+    int n1 = CloudWeights3<kMoments>(x1, CloudHalfWidth1(code), x1min, d1, i0, w1, g1,
+                                     CloudLobe1(code),
+                                     point && !(lobe3_integral && CloudLobe1(code) == 3));
+    if (n1 > 3) return false;
+    int n2 = CloudWeights3<kMoments>(x2, CloudHalfWidth2(code), x2min, d2, j0, w2, g2,
+                                     CloudLobe2(code),
+                                     point && !(lobe3_integral && CloudLobe2(code) == 3));
+    if (n2 > 3) return false;
+    int target[3][3];
+#pragma unroll
+    for (int b=0; b<3; ++b) {
+#pragma unroll
+      for (int a=0; a<3; ++a) {
+        target[b][a] = -1;
+        if (a >= n1 || b >= n2) continue;
+        target[b][a] = NativeTarget(l, j0 + b, i0 + a);
+        if (target[b][a] < 0) return false;
+      }
+    }
+#pragma unroll
+    for (int b=0; b<3; ++b) {
+#pragma unroll
+      for (int a=0; a<3; ++a) {
+        if (a >= n1 || b >= n2) continue;
+        Real w = w2[b]*w1[a];
+        if constexpr (kMoments) {
+          Real m1x = w2[b]*g1[a], m1y = w1[a]*g2[b];
+          if (w == 0.0 && m1x == 0.0 && m1y == 0.0) continue;
+          function(target[b][a], w, m1x, m1y);
+        } else {
+          if (w == 0.0) continue;
+          function(target[b][a], w);
+        }
+      }
+    }
+    return true;
+  }
+
   // Cloud-integrated weights on active leaves: the virtual finest cells overlapped by
   // the support are integrated exactly and forwarded to their owning leaf, so a
   // coarse leaf receives the sum of its sub-cell integrals (its own exact integral).
+  // With `native`, a support on leaves of one level takes the level-native traversal.
   template <typename Function>
   KOKKOS_INLINE_FUNCTION
   void ForEachCloudWeight(const Real particle_x1, const Real particle_x2, const int lev,
                           const Function &function) const {
     Real x1 = WrapPosition(particle_x1, x1min, x1max);
     Real x2 = WrapPosition(particle_x2, x2min, x2max);
+    if (native && NativeTraversal<false>(x1, x2, lev, function)) return;
     int i0, j0;
     Real w1[kMaxCloudStencil], w2[kMaxCloudStencil];
     int n1 = CloudWeights1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1,
@@ -347,12 +480,14 @@ struct SMRCompositeTransfer {
   // gather of a linearly reconstructed leaf field u_c + s.(x - x_c) is then
   // sum(w*u_c + (m1x + (x_p - x_c)*w)*s_x + (m1y + (y_p - y_c)*w)*s_y), exact for a
   // linear field and second-order accurate for any cloud/leaf size combination.
+  // With `native`, a support on leaves of one level takes the level-native traversal.
   template <typename Function>
   KOKKOS_INLINE_FUNCTION
   void ForEachCloudMoment(const Real particle_x1, const Real particle_x2, const int lev,
                           const Function &function) const {
     Real x1 = WrapPosition(particle_x1, x1min, x1max);
     Real x2 = WrapPosition(particle_x2, x2min, x2max);
+    if (native && NativeTraversal<true>(x1, x2, lev, function)) return;
     int i0, j0;
     Real w1[kMaxCloudStencil], w2[kMaxCloudStencil];
     Real g1[kMaxCloudStencil], g2[kMaxCloudStencil];
@@ -738,6 +873,9 @@ class DustGasDrag {
   Real cloud_coarsen_dk_grad = 0.0, cloud_coarsen_dk_res = 0.0;
   int cloud_split_buffer = 0;         // refined dust region reaches this many next-coarser
                                       // cells beyond the refined gas
+  int cloud_native_check = 0;         // diagnostic: every this many cycles, compare the
+                                      // level-native and finest-grid traversals
+  DvceArray1D<int> split_np, split_off;  // device split work arrays, kept between cycles
   bool cloud_presplit_x1 = false;     // diagnostic: every root cloud is
                                       // split along x1 only (x2 keeps the parent width as
                                       // lobe 3, gathered as a cloud integral), so a z-normal
@@ -866,6 +1004,7 @@ class DustGasDrag {
   int MergeCloudsDevice();    // device version of MergeClouds
   void AuditFeedback(DvceArray2D<Real> &fb);   // frozen-gas predictor feedback
   int ResampleClouds();       // returns the number of clouds removed
+  void CheckNativeTransfer();  // level-native against finest-grid traversal
 
   // ...in "before_timeintegrator" list
   TaskStatus GammaSwitch(Driver *pdrive, int stage);
