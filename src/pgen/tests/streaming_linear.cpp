@@ -1261,6 +1261,7 @@ void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
   }
   Kokkos::deep_copy(pmbp->phydro->u0, u0);
   pm->time = get("time");
+  pm->dt = get("dt");   // the frozen feedback diagnostic scales with dt
   pm->ncycle = static_cast<int>(get("ncycle"));
   pdust->cloud_merge_pass = static_cast<int>(get("merge_pass"));
   pdust->cloud_next_tag = static_cast<int>(get("next_tag"));
