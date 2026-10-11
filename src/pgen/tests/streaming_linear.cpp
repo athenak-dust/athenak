@@ -1177,7 +1177,7 @@ void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
     std::exit(EXIT_FAILURE);
   }
   std::string meta;
-  std::vector<double> rpr, gas;
+  std::vector<double> rpr, gas, gasfull;
   std::vector<int> ipi;
   long long n0r = 0, n1r = 0, n0i = 0, n1i = 0;
   while (std::fgets(line, sizeof(line), f) != nullptr) {
@@ -1201,6 +1201,8 @@ void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
       n0i = dims[0]; n1i = dims[1];
     } else if (nm == "gas") {
       gas.resize(buf.size()/sizeof(double)); std::memcpy(gas.data(), buf.data(), buf.size());
+    } else if (nm == "gas_full") {
+      gasfull.resize(buf.size()/sizeof(double)); std::memcpy(gasfull.data(), buf.data(), buf.size());
     }
   }
   std::fclose(f);
@@ -1236,6 +1238,9 @@ void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
   // gas of the active cells, in the audit writer's order (blocks, rows, columns)
   auto &ind = pm->mb_indcs;
   auto u0 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pmbp->phydro->u0);
+  // the whole array with ghost cells when the audit kept it (the linear gather reads ghosts)
+  const bool ghosts = gasfull.size() == u0.span();
+  if (ghosts) std::memcpy(u0.data(), gasfull.data(), gasfull.size()*sizeof(double));
   std::size_t k = 0;
   double maxdx = 0.0;
   for (int m=0; m<pmbp->nmb_thispack; ++m) {
@@ -1265,9 +1270,18 @@ void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
   std::cout << "# merge_audit_replay: " << fname << " t=" << pm->time << " cycle=" << pm->ncycle
             << " particles=" << np << " pass=" << pdust->cloud_merge_pass << " next_tag="
             << pdust->cloud_next_tag << " mroot=" << mroot << std::endl;
-  const int nev = pdust->MergeClouds();
-  std::cout << "# merge_audit_replay done: events=" << nev << " particles="
-            << ppar->nprtcl_thispack << std::endl;
+  // <problem>/merge_audit_replay_passes consecutive passes on the frozen state (no drift, no split)
+  const int npass = pin->GetOrAddInteger("problem", "merge_audit_replay_passes", 1);
+  const Real dtm = get("dt");
+  std::cout << "# merge_audit_replay: ghosts restored=" << (ghosts ? 1 : 0) << " passes=" << npass << std::endl;
+  for (int n=0; n<npass; ++n) {
+    const int nev = pdust->MergeClouds();
+    std::cout << "# merge_audit_replay pass " << n << " cycle=" << pm->ncycle << " events=" << nev
+              << " particles=" << ppar->nprtcl_thispack << std::endl;
+    pm->ncycle += pdust->cloud_merge_interval;
+    pm->time += pdust->cloud_merge_interval*dtm;
+  }
+  std::cout << "# merge_audit_replay done: particles=" << ppar->nprtcl_thispack << std::endl;
   std::exit(EXIT_SUCCESS);
 }
 

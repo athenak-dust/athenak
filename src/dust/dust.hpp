@@ -700,6 +700,12 @@ class DustGasDrag {
   Real cloud_audit_t0 = -1.0;          // merge audit (diagnostic): dump every merge pass in
   Real cloud_audit_t1 = -1.0;          // [t0, t1]; stages in full when the pass changed anything
   bool cloud_audit_compact = true;     // quiet passes: compact particle + gas snapshot
+  bool cloud_merge_xprotect = false;   // stage X's waiting candidates are not
+                                       // walked by G/C or absorbed in the same pass
+  Real cloud_absorb_budget = -1.0;     // > 0, largest leaf change of mass (and
+                                       // momentum) an absorption may make, relative to the leaf
+  Real cloud_absorb_floor = 0.1;       // ... with the leaf mass floored at this fraction of a
+                                       // root cloud mass per root-cell volume
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
                                       // neighbourhood is in the merge zone: the outer band is
                                       // left to stage X (found in the LinA tests)
@@ -843,6 +849,7 @@ class DustGasDrag {
   TaskStatus RefineClouds(Driver *pdrive, int stage);
   int MergeClouds();
   int MergeCloudsDevice();    // device version of MergeClouds
+  void AuditFeedback(DvceArray2D<Real> &fb);   // frozen-gas predictor feedback
 
   // ...in "before_timeintegrator" list
   TaskStatus GammaSwitch(Driver *pdrive, int stage);
