@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -55,6 +56,7 @@
 void StreamingLinearHistory(HistoryData *pdata, Mesh *pm);
 void StreamingKx0Filter(Mesh *pm, const Real bdt);
 void RunMergeReplay(ParameterInput *pin, Mesh *pm, const Real taus0);
+void RunAuditReplay(ParameterInput *pin, Mesh *pm);
 bool kx0_filter_phi = false;  // also filter the azimuthal momentum (IM3 in the 2-D r-z box)
 Real kx0_filter_tstart = 0.0;  // the filter acts from this time on
 
@@ -792,6 +794,11 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     if (!pin->GetOrAddString("problem", "merge_replay", "").empty()) {
       RunMergeReplay(pin, pmy_mesh_, taus0);
     }
+    // <problem>/merge_audit_replay = audit file (diagnostic): one merge pass
+    // from the entry state of a merge-pass audit
+    if (!pin->GetOrAddString("problem", "merge_audit_replay", "").empty()) {
+      RunAuditReplay(pin, pmy_mesh_);
+    }
   } else {
   int nrdata = ppar->nrdata;
   par_for("stream_part", DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
@@ -1147,6 +1154,120 @@ void RunMergeReplay(ParameterInput *pin, Mesh *pm, const Real taus0) {
   }
   std::cout << "# merge_replay done: t=" << pm->time << " cycle=" << pm->ncycle
             << " particles=" << ppar->nprtcl_thispack << std::endl;
+  std::exit(EXIT_SUCCESS);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void RunAuditReplay()
+//! \brief Diagnostic: replay one merge pass from the entry state of a
+//! merge-pass audit file (sections meta, a0_pr, a0_pi, gas).  Restores every particle
+//! column, the gas of the active cells, time, cycle, and the hidden merge state (pass
+//! counter, next tag, root mass); runs MergeClouds() once without split, drift or hydro;
+//! exits.  The pass writes its own audit when cloud_audit_t0/t1 cover the time.
+void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
+  MeshBlockPack *pmbp = pm->pmb_pack;
+  particles::Particles *ppar = pmbp->ppart;
+  auto *pdust = pmbp->pdust;
+  const std::string fname = pin->GetString("problem", "merge_audit_replay");
+  std::FILE *f = std::fopen(fname.c_str(), "rb");
+  char line[4096];
+  if (f == nullptr || std::fgets(line, sizeof(line), f) == nullptr ||
+      std::string(line).rfind("AthenaK merge audit v1", 0) != 0) {
+    std::cout << "### FATAL ERROR: merge_audit_replay: cannot read " << fname << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  std::string meta;
+  std::vector<double> rpr, gas;
+  std::vector<int> ipi;
+  long long n0r = 0, n1r = 0, n0i = 0, n1i = 0;
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    char name[64], type[4];
+    int nd = 0, used = 0;
+    if (std::sscanf(line, "S %63s %3s %d%n", name, type, &nd, &used) != 3) break;
+    long long dims[4] = {0, 0, 0, 0}, nbytes = 0;
+    const char *q = line + used;
+    for (int k=0; k<nd; ++k) {int u = 0; std::sscanf(q, "%lld%n", &dims[k], &u); q += u;}
+    std::sscanf(q, "%lld", &nbytes);
+    std::vector<char> buf(static_cast<std::size_t>(nbytes));
+    if (nbytes > 0 && std::fread(buf.data(), 1, buf.size(), f) != buf.size()) break;
+    const std::string nm(name);
+    if (nm == "meta") {
+      meta.assign(buf.begin(), buf.end());
+    } else if (nm == "a0_pr") {
+      rpr.resize(buf.size()/sizeof(double)); std::memcpy(rpr.data(), buf.data(), buf.size());
+      n0r = dims[0]; n1r = dims[1];
+    } else if (nm == "a0_pi") {
+      ipi.resize(buf.size()/sizeof(int)); std::memcpy(ipi.data(), buf.data(), buf.size());
+      n0i = dims[0]; n1i = dims[1];
+    } else if (nm == "gas") {
+      gas.resize(buf.size()/sizeof(double)); std::memcpy(gas.data(), buf.data(), buf.size());
+    }
+  }
+  std::fclose(f);
+  auto get = [&](const std::string &key) {
+    const auto at = meta.find(key + "=");
+    if (at == std::string::npos) {
+      std::cout << "### FATAL ERROR: merge_audit_replay: no " << key << " in meta" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    return std::strtod(meta.c_str() + at + key.size() + 1, nullptr);
+  };
+  const int np = static_cast<int>(n1r);
+  if (n0r != ppar->nrdata || n0i != ppar->nidata || n1i != n1r || np <= 0 || gas.empty()) {
+    std::cout << "### FATAL ERROR: merge_audit_replay: incompatible sections in " << fname << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  Kokkos::realloc(pr, ppar->nrdata, np);
+  Kokkos::realloc(pi, ppar->nidata, np);
+  auto hr = Kokkos::create_mirror_view(pr);
+  auto hi = Kokkos::create_mirror_view(pi);
+  for (int c=0; c<ppar->nrdata; ++c)
+    for (int p=0; p<np; ++p) hr(c,p) = rpr[static_cast<std::size_t>(c)*np + p];
+  for (int c=0; c<ppar->nidata; ++c)
+    for (int p=0; p<np; ++p) hi(c,p) = ipi[static_cast<std::size_t>(c)*np + p];
+  Kokkos::deep_copy(pr, hr);
+  Kokkos::deep_copy(pi, hi);
+  ppar->nprtcl_thispack = np;
+  pm->nprtcl_thisrank = np;
+  pm->nprtcl_eachrank[global_variable::my_rank] = np;
+  pm->nprtcl_total = np;
+  // gas of the active cells, in the audit writer's order (blocks, rows, columns)
+  auto &ind = pm->mb_indcs;
+  auto u0 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pmbp->phydro->u0);
+  std::size_t k = 0;
+  double maxdx = 0.0;
+  for (int m=0; m<pmbp->nmb_thispack; ++m) {
+    const auto &size = pmbp->pmb->mb_size.h_view(m);
+    for (int j=ind.js; j<=ind.je; ++j) {
+      for (int i=ind.is; i<=ind.ie; ++i, ++k) {
+        const double *c = &gas[8*k];
+        maxdx = std::max(maxdx, std::abs(c[0] - (size.x1min + (i-ind.is+0.5)*size.dx1)) +
+                                std::abs(c[1] - (size.x2min + (j-ind.js+0.5)*size.dx2)));
+        u0(m,IDN,ind.ks,j,i) = c[4]; u0(m,IM1,ind.ks,j,i) = c[5];
+        u0(m,IM2,ind.ks,j,i) = c[6]; u0(m,IM3,ind.ks,j,i) = c[7];
+      }
+    }
+  }
+  if (8*k != gas.size() || maxdx > 1.0e-12) {
+    std::cout << "### FATAL ERROR: merge_audit_replay: gas cells do not match the mesh" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  Kokkos::deep_copy(pmbp->phydro->u0, u0);
+  pm->time = get("time");
+  pm->ncycle = static_cast<int>(get("ncycle"));
+  pdust->cloud_merge_pass = static_cast<int>(get("merge_pass"));
+  pdust->cloud_next_tag = static_cast<int>(get("next_tag"));
+  const Real mroot = get("mroot0");
+  pdust->cloud_merge_mroot.clear();
+  if (mroot > 0.0) pdust->cloud_merge_mroot.push_back(mroot);
+  std::cout << "# merge_audit_replay: " << fname << " t=" << pm->time << " cycle=" << pm->ncycle
+            << " particles=" << np << " pass=" << pdust->cloud_merge_pass << " next_tag="
+            << pdust->cloud_next_tag << " mroot=" << mroot << std::endl;
+  const int nev = pdust->MergeClouds();
+  std::cout << "# merge_audit_replay done: events=" << nev << " particles="
+            << ppar->nprtcl_thispack << std::endl;
   std::exit(EXIT_SUCCESS);
 }
 
