@@ -124,6 +124,7 @@ void WriteBASnapshot(Mesh *pm) {
 bool ba_fields_ = false;
 bool ba_history_ = false;
 int ba_field_number_ = 0;
+bool ba_geom_written_ = false;   // the geometry file is written with the first field file
 Real ba_field_dt_ = 1.0;
 constexpr int kBAFields = 11;
 
@@ -221,7 +222,7 @@ void WriteBAFields(Mesh *pm) {
   std::vector<float> out;
   out.reserve(static_cast<std::size_t>(kBAFields)*ncell);
   std::vector<double> geom;
-  bool first = (ba_field_number_ == 0);
+  bool first = !ba_geom_written_;
   if (first) geom.reserve(4*ncell);
   for (int m=0; m<nmb; ++m) {
     const auto &size = mbsize.h_view(m);
@@ -258,6 +259,7 @@ void WriteBAFields(Mesh *pm) {
     std::snprintf(line, sizeof(line), "AthenaK BA field geometry v1 f64\n%d\n", ncell);
     write(ba_snapshot_basename_ + ".bafield.geom", line, geom.data(), sizeof(double),
           geom.size());
+    ba_geom_written_ = true;
   }
   std::snprintf(line, sizeof(line), "AthenaK BA fields v1 f32\n%.17g %d %d %d %.17g %d\n",
                 pm->time, pm->ncycle, ncell, kBAFields, mtot, npart);
@@ -721,6 +723,16 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   // merge pass from a saved state, then exit
   if (!pin->GetOrAddString("problem", "merge_audit_replay", "").empty()) {
     RunAuditReplay(pin, pmy_mesh_);
+    // only reached with merge_audit_restart: the run continues from the restored time, so the BA
+    // outputs are numbered by time and resume at the next multiple of their interval
+    // (numbering from zero would write one file per history call until it caught up)
+    if (ba_fields_) {
+      ba_field_number_ = static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_field_dt_));
+    }
+    if (ba_snapshots_) {
+      ba_snapshot_number_ =
+          static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_snapshot_dt_));
+    }
   }
   return;
 }
