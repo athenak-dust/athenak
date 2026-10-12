@@ -719,6 +719,7 @@ class DustGasDrag {
   int cloud_resample_patch = 2;        // ... patch size in root cells
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
+  bool cloud_resample_skip_at_cap = false;  // ... clouds at their cap stay out of the pool
   unsigned long long cloud_resample_pass = 0, cloud_resample_removed = 0;
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
                                       // neighbourhood is in the merge zone: the outer band is

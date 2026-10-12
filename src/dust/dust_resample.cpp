@@ -11,7 +11,8 @@
 //! the new masses keep, to round-off, every leaf's deposited mass and momentum, the three
 //! components of the frozen-gas drag feedback of every leaf (AuditFeedback), the centre of
 //! mass and the six velocity second moments of the patch; a mass never exceeds its cap
-//! eta m0 / 4^level, and clouds already above the cap are left alone.
+//! eta m0 / 4^level, and clouds already above the cap are left alone (with
+//! cloud_resample_skip_at_cap also the clouds at the cap).
 //!
 //! Device: selection of the pool, production gather of the gas velocity, cloud weights as a
 //! CSR list.  Host (std::thread over patches): constraint rows, null-space end-point
@@ -386,6 +387,7 @@ int DustGasDrag::ResampleClouds() {
   }
   const int np1 = nroot1/s, np2 = nroot2/s;
   const Real eta = cloud_resample_eta;
+  const bool skip_cap = cloud_resample_skip_at_cap;
   auto t_all = Clock::now();
   Kokkos::fence();
   auto t0 = Clock::now();
@@ -412,6 +414,7 @@ int DustGasDrag::ResampleClouds() {
     if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) {nl += 1.0; return;}
     const Real cap = (eta > 0.0) ? eta*m0/static_cast<Real>(1 << (2*lev)) : 1.0e300;
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
+    if (skip_cap && pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
     int c = 0;
     transfer.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), code, [&](const int, const Real) {++c;});
     cnt(p) = c;
