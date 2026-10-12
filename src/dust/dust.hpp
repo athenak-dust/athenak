@@ -713,6 +713,13 @@ class DustGasDrag {
   bool cloud_audit_rejected = false;   // full audit file when G/C groups were budget-rejected
   bool cloud_merge_budget_x = false;   // stage X is also decided by the pass budget
   bool cloud_audit_only = false;       // a merge pass writes its entry audit and returns
+  bool cloud_resample = false;         // conservative same-level resampling in the code
+  int cloud_resample_interval = 625;   // ... cycles between resamplings
+  Real cloud_resample_eta = 2.0;       // ... mass cap eta m0 / 4^level (<= 0: no cap)
+  int cloud_resample_patch = 2;        // ... patch size in root cells
+  int cloud_resample_threads = 1;      // ... host threads of the patch loop
+  Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
+  unsigned long long cloud_resample_pass = 0, cloud_resample_removed = 0;
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
                                       // neighbourhood is in the merge zone: the outer band is
                                       // left to stage X (found in the LinA tests)
@@ -857,6 +864,7 @@ class DustGasDrag {
   int MergeClouds();
   int MergeCloudsDevice();    // device version of MergeClouds
   void AuditFeedback(DvceArray2D<Real> &fb);   // frozen-gas predictor feedback
+  int ResampleClouds();       // returns the number of clouds removed
 
   // ...in "before_timeintegrator" list
   TaskStatus GammaSwitch(Driver *pdrive, int stage);

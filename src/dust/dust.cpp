@@ -391,6 +391,20 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_audit_rejected = pin->GetOrAddBoolean("dust", "cloud_audit_rejected", false);
       cloud_merge_budget_x = pin->GetOrAddBoolean("dust", "cloud_merge_budget_x", false);
       cloud_audit_only = pin->GetOrAddBoolean("dust", "cloud_audit_only", false);
+      cloud_resample = pin->GetOrAddBoolean("dust", "cloud_resample", false);
+      cloud_resample_interval = pin->GetOrAddInteger("dust", "cloud_resample_interval", 625);
+      cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 2.0);
+      cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
+      cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
+      cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
+      if (cloud_resample && (cloud_resample_interval < 1 || cloud_resample_patch < 1 ||
+                             cloud_gather_order != 2 || cloud_force_local || cloud_force_children ||
+                             cloud_deform)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "cloud_resample requires cloud_resample_interval >= 1, cloud_resample_patch >= 1,"
+                  << " cloud_gather_order = 2 and none of the force variants" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       cloud_compress = pin->GetOrAddBoolean("dust", "cloud_compress", false);
       cloud_compress_smax = pin->GetOrAddReal("dust", "cloud_compress_smax", 0.5);
       cloud_compress_ds = pin->GetOrAddReal("dust", "cloud_compress_ds", 0.1);
