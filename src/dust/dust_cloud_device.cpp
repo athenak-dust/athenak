@@ -566,6 +566,12 @@ int DustGasDrag::MergeCloudsDevice() {
       audit.Feedback("fb_a0", fb, pmy_pack);
     }
   }
+  // cloud_audit_only (diagnostic): the pass only writes its entry state (particles, gas with ghost cells,
+  // frozen feedback) and changes nothing
+  if (cloud_audit_only) {
+    audit.Write(pmesh->ncycle, true);
+    return 0;
+  }
   if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
 
   // merge-cell masks (host, as MergeClouds), built once: the refinement is static

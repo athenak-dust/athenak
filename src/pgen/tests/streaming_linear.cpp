@@ -1271,6 +1271,12 @@ void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
   std::cout << "# merge_audit_replay: " << fname << " t=" << pm->time << " cycle=" << pm->ncycle
             << " particles=" << np << " pass=" << pdust->cloud_merge_pass << " next_tag="
             << pdust->cloud_next_tag << " mroot=" << mroot << std::endl;
+  // <problem>/merge_audit_restart (diagnostic): no replay pass and no exit, the run
+  // continues from the restored state; the driver fills the ghost cells before the first cycle
+  if (pin->GetOrAddBoolean("problem", "merge_audit_restart", false)) {
+    std::cout << "# merge_audit_restart: continuing from the restored state" << std::endl;
+    return;
+  }
   // <problem>/merge_audit_replay_passes consecutive passes on the frozen state (no drift, no split)
   const int npass = pin->GetOrAddInteger("problem", "merge_audit_replay_passes", 1);
   const Real dtm = get("dt");

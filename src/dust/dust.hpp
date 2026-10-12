@@ -712,6 +712,7 @@ class DustGasDrag {
   Real cloud_merge_budget_prior = 0.0; // ... testing only: fraction of the budget already used
   bool cloud_audit_rejected = false;   // full audit file when G/C groups were budget-rejected
   bool cloud_merge_budget_x = false;   // stage X is also decided by the pass budget
+  bool cloud_audit_only = false;       // a merge pass writes its entry audit and returns
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
                                       // neighbourhood is in the merge zone: the outer band is
                                       // left to stage X (found in the LinA tests)
