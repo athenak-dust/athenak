@@ -765,6 +765,12 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
         if (x >= msz.x1max) x -= len1;
         h2(IPX,p) = x;
         h2(IPX1,p) = x;
+        // a sub-lattice with lattice_shift_z < 0 can start below the box (ppc = 25 with
+        // lattice_shift_z = -0.125 puts its first sub-row at z < x2min)
+        if (z < msz.x2min) z += len2;
+        if (z >= msz.x2max) z -= len2;
+        h2(IPY,p) = z;
+        h2(IPY1,p) = z;
         int owner = -1;
         for (int m=0; m<nmb && owner<0; ++m) {
           const auto &size = mbsize.h_view(m);
