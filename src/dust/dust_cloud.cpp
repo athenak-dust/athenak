@@ -196,12 +196,15 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   Kokkos::deep_copy(t.cloud_target, target);
   Kokkos::deep_copy(t.cloud_level, level);
 
-  // <dust>/cloud_native_transfer (default true): clouds whose support lies
+  // <dust>/cloud_native_transfer: clouds whose support lies
   // on leaves of one level are traversed on that level's own cells instead of the finest
   // virtual grid (same integrals up to rounding; see NativeTraversal).  The per-level maps
   // hold the mesh leaves only, never the split-buffer dilation of cloud_level.
   // <dust>/cloud_native_check (diagnostic, cycles, default 0) compares both traversals.
-  t.native = pin->GetOrAddBoolean("dust", "cloud_native_transfer", true);
+  // Default false: on GB200 the native traversal doubled the time of the two
+  // production cloud kernels of a BA run that is mostly fine clouds (87 s against 33 s for
+  // t = 0-100; 8% slower on an RTX 4080 as well); the integrals are the same to rounding.
+  t.native = pin->GetOrAddBoolean("dust", "cloud_native_transfer", false);
   cloud_native_check = pin->GetOrAddInteger("dust", "cloud_native_check", 0);
   if (nlev + 1 > SMRCompositeTransfer::kMaxNativeLevels) t.native = false;
   if (t.native || cloud_native_check > 0) {
