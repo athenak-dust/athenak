@@ -397,7 +397,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
       cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
-      cloud_resample_skip_at_cap = pin->GetOrAddBoolean("dust", "cloud_resample_skip_at_cap", false);
+      cloud_resample_skip_at_cap = pin->GetOrAddBoolean("dust", "cloud_resample_skip_at_cap", true);
       if (cloud_resample && (cloud_resample_interval < 1 || cloud_resample_patch < 1 ||
                              cloud_gather_order != 2 || cloud_force_local || cloud_force_children ||
                              cloud_deform)) {

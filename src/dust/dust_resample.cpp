@@ -11,8 +11,9 @@
 //! the new masses keep, to round-off, every leaf's deposited mass and momentum, the three
 //! components of the frozen-gas drag feedback of every leaf (AuditFeedback), the centre of
 //! mass and the six velocity second moments of the patch; a mass never exceeds its cap
-//! eta m0 / 4^level, and clouds already above the cap are left alone (with
-//! cloud_resample_skip_at_cap also the clouds at the cap).
+//! eta m0 / 4^level.  Clouds above the cap are left alone, and by default
+//! (cloud_resample_skip_at_cap = true) so are the clouds already at the cap; with false they
+//! stay in the pool and may only lose mass, as in the offline reference.
 //!
 //! Device: selection of the pool, production gather of the gas velocity, cloud weights as a
 //! CSR list.  Host (std::thread over patches): constraint rows, null-space end-point
