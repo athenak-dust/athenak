@@ -152,6 +152,9 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   if (evolution_t.compare("stationary") != 0) {
     // determine if FOFC is enabled
     use_fofc = pin->GetOrAddBoolean("hydro","fofc",false);
+    // default: on for device builds (the device memory is not host accessible)
+    x2_face_parallel = pin->GetOrAddBoolean("hydro","x2_face_parallel",
+        !Kokkos::SpaceAccessibility<Kokkos::HostSpace, DevMemSpace>::accessible);
 
     // select reconstruction method (default PLM)
     std::string xorder = pin->GetOrAddString("hydro","reconstruct","plm");

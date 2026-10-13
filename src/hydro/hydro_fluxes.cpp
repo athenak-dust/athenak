@@ -200,6 +200,81 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
       }
     }
 
+    if (x2_face_parallel) {
+    // One team per row of faces: wl = left state of row j-1 at its upper face, wr = right
+    // state of row j at its lower face, both reconstructed here (each row is reconstructed
+    // twice over the whole kernel); the same arithmetic per face as the walk below.
+    par_for_outer("hflux_x2",DevExeSpace(), scr_size, scr_level, 0, nmb1, kl, ku, jl+1, ju,
+    KOKKOS_LAMBDA(TeamMember_t member, const int m, const int k, const int j) {
+      ScrArray2D<Real> wl(member.team_scratch(scr_level), nvars, ncells1);
+      ScrArray2D<Real> wr(member.team_scratch(scr_level), nvars, ncells1);
+      ScrArray2D<Real> tmp(member.team_scratch(scr_level), nvars, ncells1);
+      switch (recon_method_) {
+        case ReconstructionMethod::dc:
+          DonorCellX2(member, m, k, j-1, il, iu, w0_, wl, tmp);
+          member.team_barrier();
+          DonorCellX2(member, m, k, j, il, iu, w0_, tmp, wr);
+          break;
+        case ReconstructionMethod::plm:
+          PiecewiseLinearX2(member, m, k, j-1, il, iu, w0_, wl, tmp);
+          member.team_barrier();
+          PiecewiseLinearX2(member, m, k, j, il, iu, w0_, tmp, wr);
+          break;
+        case ReconstructionMethod::ppm4:
+        case ReconstructionMethod::ppmx:
+          PiecewiseParabolicX2(member,eos_,extrema,true,m,k,j-1,il,iu, w0_, wl, tmp);
+          member.team_barrier();
+          PiecewiseParabolicX2(member,eos_,extrema,true,m,k,j,il,iu, w0_, tmp, wr);
+          break;
+        case ReconstructionMethod::wenoz:
+          WENOZX2(member, eos_, true, m, k, j-1, il, iu, w0_, wl, tmp);
+          member.team_barrier();
+          WENOZX2(member, eos_, true, m, k, j, il, iu, w0_, tmp, wr);
+          break;
+        default:
+          break;
+      }
+      member.team_barrier();
+      auto eos = eos_;
+      auto indcs = indcs_;
+      auto size = size_;
+      auto coord = coord_;
+      auto flx2 = flx2_;
+      if constexpr (rsolver_method_ == Hydro_RSolver::advect) {
+        Advect(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+      } else if constexpr (rsolver_method_ == Hydro_RSolver::llf) {
+        LLF(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+      } else if constexpr (rsolver_method_ == Hydro_RSolver::hlle) {
+        HLLE(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+      } else if constexpr (rsolver_method_ == Hydro_RSolver::hllc) {
+        HLLC(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+      } else if constexpr (rsolver_method_ == Hydro_RSolver::roe) {
+        Roe(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+      } else if constexpr (rsolver_method_ == Hydro_RSolver::llf_sr) {
+        LLF_SR(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+      } else if constexpr (rsolver_method_ == Hydro_RSolver::hlle_sr) {
+        HLLE_SR(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+      } else if constexpr (rsolver_method_ == Hydro_RSolver::hllc_sr) {
+        HLLC_SR(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+      } else if constexpr (rsolver_method_ == Hydro_RSolver::llf_gr) {
+        LLF_GR(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+      } else if constexpr (rsolver_method_ == Hydro_RSolver::hlle_gr) {
+        HLLE_GR(member, eos, indcs, size, coord, m, k, j, il, iu, IVY, wl, wr, flx2);
+      }
+      member.team_barrier();
+      if (nvars > nhyd_) {
+        for (int n=nhyd_; n<nvars; ++n) {
+          par_for_inner(member, is, ie, [&](const int i) {
+            if (flx2_(m,IDN,k,j,i) >= 0.0) {
+              flx2_(m,n,k,j,i) = flx2_(m,IDN,k,j,i)*wl(n,i);
+            } else {
+              flx2_(m,n,k,j,i) = flx2_(m,IDN,k,j,i)*wr(n,i);
+            }
+          });
+        }
+      }
+    });
+    } else {
     par_for_outer("hflux_x2",DevExeSpace(), scr_size, scr_level, 0, nmb1, kl, ku,
     KOKKOS_LAMBDA(TeamMember_t member, const int m, const int k) {
       ScrArray2D<Real> scr1(member.team_scratch(scr_level), nvars, ncells1);
@@ -282,6 +357,7 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
         }
       } // end of loop over j
     });
+    }
   }
 
   //--------------------------------------------------------------------------------------
