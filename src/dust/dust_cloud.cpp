@@ -235,7 +235,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     Kokkos::deep_copy(t.native_target, nt_h);
   }
 
-  if (global_variable::my_rank == 0) {
+  if (global_variable::my_rank == 0 && !cloud_map_announced) {
+    cloud_map_announced = true;
     std::cout << "# refinable_cloud map: levels=" << nlev
               << (nvirt > 0 ? " (" + std::to_string(nvirt) + " virtual)" : "") << ", virtual finest grid "
               << t.nfine1 << "x" << t.nfine2 << ", split slack=" << cloud_split_slack

@@ -62,7 +62,8 @@ void DustGasDrag::PackGatherField(const DvceArray5D<Real> &vel) {
   auto gp = gpack;
   auto v = vel;
   const int ks = pmy_pack->pmesh->mb_indcs.ks;
-  par_for("dust_gather_pack",DevExeSpace(),0,nmb-1,1,nj-2,1,ni-2,
+  // only the blocks that exist: with adaptive refinement the arrays hold more slots
+  par_for("dust_gather_pack",DevExeSpace(),0,pmy_pack->nmb_thispack-1,1,nj-2,1,ni-2,
   KOKKOS_LAMBDA(const int m, const int j, const int i) {
     for (int c=0; c<3; ++c) {
       gp(m,ks,j,i,c) = v(m,c,ks,j,i);
@@ -118,7 +119,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
                           uold.extent(4));
         }
         auto uvel = uvel_pred;
-        const int nmb_ = static_cast<int>(uold.extent(0));
+        const int nmb_ = pmy_pack->nmb_thispack;   // not the capacity of the array
         const int nj_ = static_cast<int>(uold.extent(3)), ni_ = static_cast<int>(uold.extent(4));
         par_for("dust_pc2_predictor_gasvel",DevExeSpace(),0,nmb_-1,0,nj_-1,0,ni_-1,
         KOKKOS_LAMBDA(const int m, const int j, const int i) {

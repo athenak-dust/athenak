@@ -999,6 +999,15 @@ class DustGasDrag {
   void SetDefaultMasses(ParameterInput *pin);
   void BuildSMRCompositeTransfer(ParameterInput *pin);
   void BuildRefinableCloudTransfer(ParameterInput *pin);
+  // experimental dynamic mesh (dust_amr.cpp): rebuild the leaf maps, mark
+  // the cached masks stale, set PGID from the positions and the particle time step again
+  void BeforeRegrid();                // particle count and checksum before the mesh changes
+  void RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin);
+  unsigned long long amr_checksum = 0ULL;
+  int amr_npart_before = -1;
+  bool experimental_amr = false;      // <dust>/experimental_amr
+  int amr_regrids = 0;                // regrids seen by RebuildAfterRegrid
+  bool cloud_map_announced = false;   // the map banner is printed once
   int SplitAndMergeClouds();   // returns the number of clouds split
   int MakeTransitionClouds();  // P1 transition clouds at split edges
   int SplitCloudsP1();         // moving-particle P1 split
@@ -1072,6 +1081,10 @@ class DustGasDrag {
  private:
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this DustGasDrag
 };
+
+// scheduled refinement request for tests (dust_amr.cpp); the schedule is read from <dust>
+int SetupScheduledRefinement(ParameterInput *pin);
+void ScheduledRefinement(MeshBlockPack *pmbp);
 
 } // namespace dust
 #endif // DUST_DUST_HPP_

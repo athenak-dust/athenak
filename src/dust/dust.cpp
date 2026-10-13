@@ -93,7 +93,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   if (pmy_pack->pmesh->multilevel) {
     bool experimental_smr = pin->GetOrAddBoolean(
         "dust", "experimental_static_smr", false);
-    if (!(experimental_smr && !(pmy_pack->pmesh->adaptive) &&
+    // <dust>/experimental_amr (dust_amr.cpp): adaptive refinement with the
+    // refinable-cloud transfer; the dust state is rebuilt after every regrid
+    experimental_amr = pin->GetOrAddBoolean("dust", "experimental_amr", false);
+    if (!(experimental_smr && (!(pmy_pack->pmesh->adaptive) || experimental_amr) &&
           pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic &&
           global_variable::nranks == 1)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -539,6 +542,12 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   if (drag_solver == DustDragSolver::pcg || drag_solver == DustDragSolver::adaptive) {
     Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
     Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
+  }
+  if (pmy_pack->pmesh->adaptive && smr_transfer_mode != DustSMRTransfer::refinable_cloud) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<dust>/experimental_amr requires experimental_smr_transfer = "
+              << "refinable_cloud" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
     BuildRefinableCloudTransfer(pin);

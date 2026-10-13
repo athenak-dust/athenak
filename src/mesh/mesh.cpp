@@ -184,8 +184,12 @@ Mesh::Mesh(ParameterInput *pin) :
   if (multilevel && pin->DoesBlockExist("shearing_box")) {
     bool experimental_dust_smr = pin->DoesBlockExist("dust") &&
         pin->GetOrAddBoolean("dust", "experimental_static_smr", false);
-    if (!(experimental_dust_smr && !adaptive && two_d && strictly_periodic &&
-          global_variable::nranks == 1)) {
+    // <dust>/experimental_amr also admits adaptive refinement, with the
+    // same restrictions
+    bool experimental_dust_amr = pin->DoesBlockExist("dust") &&
+        pin->GetOrAddBoolean("dust", "experimental_amr", false);
+    if (!(experimental_dust_smr && (!adaptive || experimental_dust_amr) && two_d &&
+          strictly_periodic && global_variable::nranks == 1)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Shearing box is not currently compatible with mesh "
                 << "refinement, except the explicitly enabled experimental dust "

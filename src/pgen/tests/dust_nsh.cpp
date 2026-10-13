@@ -125,6 +125,7 @@ bool ba_fields_ = false;
 bool ba_history_ = false;
 int ba_field_number_ = 0;
 bool ba_geom_written_ = false;   // the geometry file is written with the first field file
+int ba_geom_seq_ = -1;           // mesh update sequence of the geometry last written
 Real ba_field_dt_ = 1.0;
 constexpr int kBAFields = 11;
 
@@ -371,7 +372,10 @@ void WriteBAFields(Mesh *pm) {
   std::vector<float> out;
   out.reserve(static_cast<std::size_t>(kBAFields)*ncell);
   std::vector<double> geom;
-  bool first = !ba_geom_written_;
+  // the geometry is written again after every change of the mesh; the
+  // later files carry the number of the first field frame they belong to
+  const int mesh_seq = pm->GetAMRLoadBalanceUpdateSeq();
+  bool first = !ba_geom_written_ || mesh_seq != ba_geom_seq_;
   if (first) geom.reserve(4*ncell);
   for (int m=0; m<nmb; ++m) {
     const auto &size = mbsize.h_view(m);
@@ -411,9 +415,12 @@ void WriteBAFields(Mesh *pm) {
   char line[160];
   if (first) {
     std::snprintf(line, sizeof(line), "AthenaK BA field geometry v1 f64\n%d\n", ncell);
-    write(ba_snapshot_basename_ + ".bafield.geom", line, geom.data(), sizeof(double),
+    char gnum[32] = "";
+    if (ba_geom_written_) std::snprintf(gnum, sizeof(gnum), ".%05d", ba_field_number_);
+    write(ba_snapshot_basename_ + gnum + ".bafield.geom", line, geom.data(), sizeof(double),
           geom.size());
     ba_geom_written_ = true;
+    ba_geom_seq_ = mesh_seq;
   }
   std::snprintf(line, sizeof(line), "AthenaK BA fields v1 f32\n%.17g %d %d %d %.17g %d\n",
                 pm->time, pm->ncycle, ncell, kBAFields, mtot, npart);
@@ -629,6 +636,12 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   // Keep this enrolled in dust-free runs as well so an otherwise unchanged input
   // with user_hist=true remains valid; the callback emits no dust columns in that mode.
   user_hist_func = DustNSHHistory;
+  // experimental dynamic mesh: the scheduled refinement request of
+  // <dust>/amr_sched_* answers <amr_criterionN>/method = user
+  if (pmy_mesh_->adaptive && pin->DoesBlockExist("dust")) {
+    dust::SetupScheduledRefinement(pin);
+    user_ref_func = dust::ScheduledRefinement;
+  }
   if (restart) return;
 
   if (pmbp->phydro == nullptr) {

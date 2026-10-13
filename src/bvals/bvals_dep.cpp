@@ -43,7 +43,8 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
   if (pp->pmesh->multilevel) {
     bool experimental_smr = pin->GetOrAddBoolean(
         "dust", "experimental_static_smr", false);
-    if (!(experimental_smr && !(pp->pmesh->adaptive) && pp->pmesh->two_d &&
+    bool experimental_amr = pin->GetOrAddBoolean("dust", "experimental_amr", false);
+    if (!(experimental_smr && (!(pp->pmesh->adaptive) || experimental_amr) && pp->pmesh->two_d &&
           pp->pmesh->strictly_periodic && global_variable::nranks == 1)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Additive deposit exchange does not support this "

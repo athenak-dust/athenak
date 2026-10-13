@@ -175,6 +175,17 @@ void SolveNSH2(const Real omega0, const Real qshear, const Real ax,
 
 void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) {
   user_hist_func = StreamingLinearHistory;
+  // experimental dynamic mesh: scheduled refinement request
+  if (pmy_mesh_->adaptive && pin->DoesBlockExist("dust")) {
+    dust::SetupScheduledRefinement(pin);
+    user_ref_func = dust::ScheduledRefinement;
+    if (pin->GetOrAddBoolean("problem", "prescribed_gas", false)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<problem>/prescribed_gas keeps a copy of the mesh layout and is not "
+                << "available with adaptive refinement" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
   // <problem>/kx0_filter (diagnostic): with <problem>/user_srcs = true,
   // remove the z-dependent k_x = 0 part of the gas radial momentum every stage
   if (pin->GetOrAddBoolean("problem", "kx0_filter", false)) user_srcs_func = StreamingKx0Filter;
