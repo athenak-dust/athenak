@@ -354,6 +354,33 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
   return info;
 }
 
+// <dust>/cloud_resample_dump (diagnostic): the particle table of the pack as
+// f64 rows [x1, x2, mass, v1, v2, v3, tag, level code], the layout of the particle rows of the
+// test problems' snapshots.  File resample.CYCLE.WHEN.bin, WHEN = pre | post.
+void DumpResampleState(particles::Particles *ppar, Mesh *pmesh, const char *when) {
+  const int n = ppar->nprtcl_thispack;
+  auto pr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_rdata);
+  auto pi = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_idata);
+  std::vector<double> rows;
+  rows.reserve(static_cast<std::size_t>(8)*n);
+  for (int p=0; p<n; ++p) {
+    rows.insert(rows.end(), {pr(IPX,p), pr(IPY,p), pr(IPM,p), pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p),
+                             static_cast<double>(pi(PTAG,p)), static_cast<double>(pi(PLEV,p))});
+  }
+  char name[64];
+  std::snprintf(name, sizeof(name), "resample.%08d.%s.bin", pmesh->ncycle, when);
+  std::FILE *file = std::fopen(name, "wb");
+  bool ok = (file != nullptr) &&
+            std::fprintf(file, "AthenaK resample dump v1 f64\n%.17g %d %d\n", pmesh->time, pmesh->ncycle, n) > 0;
+  ok = ok && std::fwrite(rows.data(), sizeof(double), rows.size(), file) == rows.size();
+  ok = (file != nullptr) && (std::fclose(file) == 0) && ok;
+  if (!ok) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "cannot write " << name << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+}
+
 }  // namespace
 
 //----------------------------------------------------------------------------------------
@@ -372,6 +399,12 @@ int DustGasDrag::ResampleClouds() {
   const auto transfer = smr_transfer;
   const int nlev = transfer.cloud_nlev;
   if (npart == 0) return 0;
+  const bool dump = std::find(cloud_resample_dump.begin(), cloud_resample_dump.end(), pmesh->ncycle) !=
+                    cloud_resample_dump.end();
+  if (dump) {
+    DumpResampleState(ppar, pmesh, "pre");
+    DumpResampleState(ppar, pmesh, "post");   // rewritten below if the resampling changes anything
+  }
   Real m0 = cloud_resample_m0;
   if (m0 <= 0.0 && !cloud_merge_mroot.empty()) m0 = cloud_merge_mroot[0];
   if (m0 <= 0.0) {
@@ -634,6 +667,7 @@ int DustGasDrag::ResampleClouds() {
                  t_dev, t_copy, t_sort, t_host, cpu, t_back, nthread, nnz);
     std::fclose(fp);
   }
+  if (dump) DumpResampleState(ppar, pmesh, "post");
   return nremoved;
 }
 
