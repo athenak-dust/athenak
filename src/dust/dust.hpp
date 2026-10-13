@@ -73,6 +73,7 @@ struct SMRCompositeTransfer {
   // Largest 1-D cloud stencil on the finest virtual grid: 2*2^(nlev-lev)+1 cells, so
   // nine cells allow a root cloud to sit on leaves up to two levels finer.
   static constexpr int kMaxCloudStencil = 9;
+  static constexpr int kCloudWeightCache = 25;   // leaf weights a kernel keeps from its gather
 
   // Cloud code stored in PLEV: bits 0-3 the cloud level, bits 4-5 (x2) and 6-7 (x1) a
   // transition lobe (0 none, 1 lower, 2 upper, 3 both); bit 8 is set only on gather calls and
@@ -950,6 +951,8 @@ class DustGasDrag {
   DvceArray5D<Real> qdep;    // [0]=Q, [1-3]=P/predictor impulse, [4]=feedback rate
   DvceArray5D<Real> ustar;   // nvar=3: provisional drag-corrected gas velocity u*
   DvceArray5D<Real> uvel_pred;  // nvar=3: old-state gas velocity of the linear cloud predictor
+  DvceArray5D<Real> gpack;      // (m, k, j, i, 9): gas velocity and its central differences in
+                                // x1 and x2, side by side, for the linear cloud gather
   DvceArray5D<Real> dmom;    // nvar=3: PMBR momentum deposit; becomes R_g after apply
   DvceArray5D<Real> cdummy;  // 1-element dummy coarse array for ustar copy exchange
   DvceArray5D<Real> solver_r;   // coupled-solver residual
@@ -1005,6 +1008,7 @@ class DustGasDrag {
   int MergeCloudsDevice();    // device version of MergeClouds
   void AuditFeedback(DvceArray2D<Real> &fb);   // frozen-gas predictor feedback
   int ResampleClouds();       // returns the number of clouds removed
+  void PackGatherField(const DvceArray5D<Real> &vel);   // fills gpack from a velocity array
   void CheckNativeTransfer();  // level-native against finest-grid traversal
 
   // ...in "before_timeintegrator" list

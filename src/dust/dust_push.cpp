@@ -150,8 +150,13 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         // midpoint, implicit-midpoint kick and drift, cloud-weight impulse deposit.  Same
         // arithmetic as dust_pc2_advance below, kept separate because the unused
         // variants there cost registers and occupancy.
+        PackGatherField(ustar);
+        auto gp = gpack;
         par_for("dust_pc2_advance_linear",DevExeSpace(),0,(npart-1),
         KOKKOS_LAMBDA(const int p) {
+          // the gather's leaf weights are the deposit's: keep them
+          int nt = 0, tt[SMRCompositeTransfer::kCloudWeightCache];
+          Real tw[SMRCompositeTransfer::kCloudWeightCache];
           Real x0 = pr(IPX1,p), y0 = pr(IPY1,p), z0 = pr(IPZ1,p);
           Real vx0 = pr(IPVX1,p), vy0 = pr(IPVY1,p), vz0 = pr(IPVZ1,p);
           Real xh = x0 + 0.5*dt*vx0;
@@ -160,6 +165,8 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
           Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
           int glev = (gather_level >= 0) ? gather_level :
                      SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode);
+          // same shape for the gather and the deposit (the point flag changes moments only)
+          const bool same = (glev & ~SMRCompositeTransfer::kCloudGatherPoint) == pi(PLEV,p);
           transfer.ForEachCloudMoment(xh, yh, glev,
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
             int ti = target % ncells1;
@@ -171,15 +178,11 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
             Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
             Real cx = 0.5*(m1x + transfer.MinImage1(xh - xc)*w)/dx1;
             Real cy = 0.5*(m1y + transfer.MinImage2(yh - yc)*w)/dx2;
-            ugx += w*ustar_(tm,0,ks,tj,ti)
-                 + cx*(ustar_(tm,0,ks,tj,ti+1) - ustar_(tm,0,ks,tj,ti-1))
-                 + cy*(ustar_(tm,0,ks,tj+1,ti) - ustar_(tm,0,ks,tj-1,ti));
-            ugy += w*ustar_(tm,1,ks,tj,ti)
-                 + cx*(ustar_(tm,1,ks,tj,ti+1) - ustar_(tm,1,ks,tj,ti-1))
-                 + cy*(ustar_(tm,1,ks,tj+1,ti) - ustar_(tm,1,ks,tj-1,ti));
-            ugz += w*ustar_(tm,2,ks,tj,ti)
-                 + cx*(ustar_(tm,2,ks,tj,ti+1) - ustar_(tm,2,ks,tj,ti-1))
-                 + cy*(ustar_(tm,2,ks,tj+1,ti) - ustar_(tm,2,ks,tj-1,ti));
+            ugx += w*gp(tm,ks,tj,ti,0) + cx*gp(tm,ks,tj,ti,3) + cy*gp(tm,ks,tj,ti,6);
+            ugy += w*gp(tm,ks,tj,ti,1) + cx*gp(tm,ks,tj,ti,4) + cy*gp(tm,ks,tj,ti,7);
+            ugz += w*gp(tm,ks,tj,ti,2) + cx*gp(tm,ks,tj,ti,5) + cy*gp(tm,ks,tj,ti,8);
+            if (nt < SMRCompositeTransfer::kCloudWeightCache) {tt[nt] = target; tw[nt] = w;}
+            ++nt;
           });
           Real h = 0.5*dt;
           Real lambda = h/pr(IPTS,p);
@@ -224,8 +227,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
           pr(IPRZ,p) = dvz_drag;
           if (!br) return;
           Real mass = -pr(IPM,p);
-          transfer.ForEachCloudWeight(xh, yh, pi(PLEV,p),
-          [&](const int target, const Real particle_weight) {
+          auto add = [&](const int target, const Real particle_weight) {
             int ti = target % ncells1;
             int remainder = target/ncells1;
             int tj = remainder % ncells2;
@@ -235,7 +237,12 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
             DepositAdd(&dmom_(tm,0,ks,tj,ti), density_weight*dvx_drag);
             DepositAdd(&dmom_(tm,1,ks,tj,ti), density_weight*dvy_drag);
             DepositAdd(&dmom_(tm,2,ks,tj,ti), density_weight*dvz_drag);
-          });
+          };
+          if (same && nt <= SMRCompositeTransfer::kCloudWeightCache) {
+            for (int q=0; q<nt; ++q) if (tw[q] != 0.0) add(tt[q], tw[q]);
+          } else {
+            transfer.ForEachCloudWeight(xh, yh, pi(PLEV,p), add);
+          }
         });
         return TaskStatus::complete;
       }
