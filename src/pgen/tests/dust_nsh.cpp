@@ -128,6 +128,155 @@ bool ba_geom_written_ = false;   // the geometry file is written with the first 
 Real ba_field_dt_ = 1.0;
 constexpr int kBAFields = 11;
 
+// Diagnostic only: the distribution of the dust density measured at
+// the particle positions, weighted by the mass each particle represents, appended to
+// <basename>.ppdf with every field snapshot.  The leaf densities are the run's own deposit
+// (WriteBAFields).  Two estimates per particle, both a normalised point-TSC interpolation
+// of a uniform periodic grid at the particle centre (self contribution included):
+//   native   the grid of the level of the leaf that holds the particle; finer leaves are
+//            restricted to it conservatively, coarser leaves prolonged piecewise constant
+//   common   the reference grid of ba_ppdf_nref cells per x1 extent (leaves restricted)
+// Regions by particle centre: all; x1 below / above the middle of the box; the same two
+// without the bands of two reference cells around the middle and the box edge.
+// Record: kPPScal doubles (time, cycle, particles, mass, mean density, largest native and
+// common estimate; for native then common the mass fraction above 1, 3, 10, 30, 100, 300;
+// the mass fractions of the four regions), then 2 x 5 x (kPPBins + 2) floats: mass
+// fraction per bin of log10(density / mean), first / last bin = below / above the range.
+bool ba_ppdf_ = false;
+bool ba_fields_write_ = true;
+bool ba_ppdf_header_ = false;
+int ba_ppdf_nref_ = 128;
+constexpr int kPPBins = 1000, kPPScal = 23;
+constexpr double kPPLo = -6.0, kPPHi = 4.0;
+
+template <typename FieldHost, typename PrtclHost>
+void WriteBAParticlePDF(Mesh *pm, const FieldHost &fh, const PrtclHost &prh, const int npart,
+                        const double mtot) {
+  auto *pack = pm->pmb_pack;
+  auto &ind = pm->mb_indcs;
+  auto &mbsize = pack->pmb->mb_size;
+  const int nmb = pack->nmb_thispack, is = ind.is, js = ind.js, nx1 = ind.nx1, nx2 = ind.nx2;
+  const double x1min = pm->mesh_size.x1min, x2min = pm->mesh_size.x2min;
+  const double lx = pm->mesh_size.x1max - x1min, ly = pm->mesh_size.x2max - x2min;
+  const int n1 = pm->mesh_indcs.nx1, n2 = pm->mesh_indcs.nx2;
+  const double rdx = lx/n1;
+  std::vector<int> blev(nmb);
+  int nlev = 0;
+  for (int m=0; m<nmb; ++m) {
+    blev[m] = static_cast<int>(std::lround(std::log2(rdx/mbsize.h_view(m).dx1)));
+    nlev = std::max(nlev, blev[m]);
+  }
+  const int nr1 = ba_ppdf_nref_;
+  const int nr2 = static_cast<int>(std::lround(nr1*ly/lx));
+  const double hr1 = lx/nr1, hr2 = ly/nr2;
+  if (nlev > 4 || blev.empty() || rdx > hr1*(1.0 + 1.0e-9) || n1 % nr1 != 0) {
+    std::cerr << "BA particle distribution: needs at most 4 levels and a reference grid"
+              << " (ba_ppdf_nref) that divides the root grid" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const int nf1 = n1 << nlev, nf2 = n2 << nlev;
+  std::vector<std::vector<double>> grid(nlev + 1);
+  for (int L=0; L<=nlev; ++L) grid[L].assign(static_cast<std::size_t>(n1 << L)*(n2 << L), 0.0);
+  std::vector<signed char> lmap(static_cast<std::size_t>(nf1)*nf2, 0);
+  std::vector<double> ref(static_cast<std::size_t>(nr1)*nr2, 0.0);
+  for (int m=0; m<nmb; ++m) {
+    const auto &size = mbsize.h_view(m);
+    const int l = blev[m];
+    const int i0 = static_cast<int>(std::lround((size.x1min - x1min)/size.dx1));
+    const int j0 = static_cast<int>(std::lround((size.x2min - x2min)/size.dx2));
+    for (int j=0; j<nx2; ++j) {
+      for (int i=0; i<nx1; ++i) {
+        const double rho = fh(m,0,js+j,is+i);
+        const int ci = i0 + i, cj = j0 + j;
+        for (int L=0; L<=nlev; ++L) {
+          const int m1 = n1 << L;
+          if (L <= l) {
+            const int sh = l - L;
+            grid[L][static_cast<std::size_t>(cj >> sh)*m1 + (ci >> sh)] += rho/static_cast<double>(1 << (2*sh));
+          } else {
+            const int sh = L - l, w = 1 << sh;
+            for (int b=0; b<w; ++b)
+              for (int a=0; a<w; ++a)
+                grid[L][static_cast<std::size_t>((cj << sh) + b)*m1 + (ci << sh) + a] = rho;
+          }
+        }
+        const int sh = nlev - l, w = 1 << sh;
+        for (int b=0; b<w; ++b)
+          for (int a=0; a<w; ++a)
+            lmap[static_cast<std::size_t>((cj << sh) + b)*nf1 + (ci << sh) + a] = static_cast<signed char>(l);
+        const int ir = std::min(nr1 - 1, static_cast<int>((size.x1min + (i + 0.5)*size.dx1 - x1min)/hr1));
+        const int jr = std::min(nr2 - 1, static_cast<int>((size.x2min + (j + 0.5)*size.dx2 - x2min)/hr2));
+        ref[static_cast<std::size_t>(jr)*nr1 + ir] += rho*size.dx1*size.dx2/(hr1*hr2);
+      }
+    }
+  }
+  auto tsc = [&](const std::vector<double> &g, const int m1, const int m2, const double x,
+                 const double y) {
+    const double q1 = (x - x1min)/(lx/m1) - 0.5, q2 = (y - x2min)/(ly/m2) - 0.5;
+    const int c1 = static_cast<int>(std::floor(q1 + 0.5)), c2 = static_cast<int>(std::floor(q2 + 0.5));
+    const double d1 = q1 - c1, d2 = q2 - c2;
+    const double w1[3] = {0.5*SQR(0.5-d1), 0.75-d1*d1, 0.5*SQR(0.5+d1)};
+    const double w2[3] = {0.5*SQR(0.5-d2), 0.75-d2*d2, 0.5*SQR(0.5+d2)};
+    double v = 0.0;
+    for (int b=0; b<3; ++b) {
+      const int jj = ((c2 + b - 1) % m2 + m2) % m2;
+      for (int a=0; a<3; ++a) v += w2[b]*w1[a]*g[static_cast<std::size_t>(jj)*m1 + ((c1 + a - 1) % m1 + m1) % m1];
+    }
+    return v;
+  };
+  const double rbar = mtot/(lx*ly), band = 2.0*hr1, xmid = x1min + 0.5*lx;
+  const int nb2 = kPPBins + 2;
+  std::vector<double> hist(static_cast<std::size_t>(10)*nb2, 0.0);
+  const double thr[6] = {1.0, 3.0, 10.0, 30.0, 100.0, 300.0};
+  double above[2][6] = {{0.0}}, rmax[2] = {0.0, 0.0}, mreg[4] = {0.0, 0.0, 0.0, 0.0};
+  for (int p=0; p<npart; ++p) {
+    const double mass = prh(IPM,p);
+    if (!(mass > 0.0)) continue;
+    double x = prh(IPX,p), y = prh(IPY,p);
+    x -= lx*std::floor((x - x1min)/lx); y -= ly*std::floor((y - x2min)/ly);
+    const int fi = std::min(nf1 - 1, static_cast<int>((x - x1min)/(lx/nf1)));
+    const int fj = std::min(nf2 - 1, static_cast<int>((y - x2min)/(ly/nf2)));
+    const int L = lmap[static_cast<std::size_t>(fj)*nf1 + fi];
+    const double r[2] = {tsc(grid[L], n1 << L, n2 << L, x, y)/rbar, tsc(ref, nr1, nr2, x, y)/rbar};
+    const double dedge = std::min(x - x1min, x1min + lx - x), dmid = std::fabs(x - xmid);
+    const bool left = x < xmid, clear = dedge > band && dmid > band;
+    const int reg[3] = {0, left ? 1 : 2, clear ? (left ? 3 : 4) : -1};
+    mreg[left ? 0 : 1] += mass;
+    if (clear) mreg[left ? 2 : 3] += mass;
+    for (int e=0; e<2; ++e) {
+      int bin = 0;
+      if (r[e] > 0.0) {
+        const double sb = (std::log10(r[e]) - kPPLo)/(kPPHi - kPPLo)*kPPBins;
+        bin = (sb < 0.0) ? 0 : ((sb >= kPPBins) ? kPPBins + 1 : 1 + static_cast<int>(sb));
+      }
+      for (int k=0; k<3; ++k) if (reg[k] >= 0) hist[(static_cast<std::size_t>(e)*5 + reg[k])*nb2 + bin] += mass;
+      for (int k=0; k<6; ++k) if (r[e] > thr[k]) above[e][k] += mass;
+      rmax[e] = std::max(rmax[e], r[e]);
+    }
+  }
+  double scal[kPPScal] = {pm->time, static_cast<double>(pm->ncycle), static_cast<double>(npart),
+                          mtot, rbar, rmax[0], rmax[1]};
+  for (int e=0; e<2; ++e) for (int k=0; k<6; ++k) scal[7 + 6*e + k] = above[e][k]/mtot;
+  for (int k=0; k<4; ++k) scal[19 + k] = mreg[k]/mtot;
+  std::vector<float> out(hist.size());
+  for (std::size_t k=0; k<hist.size(); ++k) out[k] = static_cast<float>(hist[k]/mtot);
+  const std::string name = ba_snapshot_basename_ + ".ppdf";
+  FILE *file = std::fopen(name.c_str(), ba_ppdf_header_ ? "ab" : "wb");
+  bool ok = file != nullptr;
+  if (ok && !ba_ppdf_header_) {
+    ok = std::fprintf(file, "AthenaK BA particle density distribution v1\n%d 2 5 %d %.17g %.17g %d\n",
+                      kPPScal, kPPBins, kPPLo, kPPHi, nr1) > 0;
+    ba_ppdf_header_ = true;
+  }
+  ok = ok && std::fwrite(scal, sizeof(double), kPPScal, file) == kPPScal;
+  ok = ok && std::fwrite(out.data(), sizeof(float), out.size(), file) == out.size();
+  ok = (file != nullptr) && (std::fclose(file) == 0) && ok;
+  if (!ok) {
+    std::cerr << "Failed writing BA particle distribution " << name << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+}
+
 // Diagnostic only: compact per-leaf field snapshot.  Gas density and
 // momenta, and the dust cloud integral of mass, momentum and the CENTRAL second
 // velocity moments about each leaf's own mean (two passes, so a cold stream gives zero
@@ -242,6 +391,11 @@ void WriteBAFields(Mesh *pm) {
     std::cerr << "BA fields: deposited mass " << mdep << " != particle mass " << mtot
               << std::endl;
     std::exit(EXIT_FAILURE);
+  }
+  if (ba_ppdf_) WriteBAParticlePDF(pm, fh, prh, npart, mtot);
+  if (!ba_fields_write_) {
+    ++ba_field_number_;
+    return;
   }
   auto write = [](const std::string &name, const std::string &header, const void *data,
                   std::size_t size, std::size_t count) {
@@ -423,6 +577,14 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     }
   }
   ba_fields_ = pin->GetOrAddBoolean("problem", "ba_fields", false);
+  ba_ppdf_ = pin->GetOrAddBoolean("problem", "ba_ppdf", false);
+  ba_fields_write_ = pin->GetOrAddBoolean("problem", "ba_fields_write", true);
+  ba_ppdf_nref_ = pin->GetOrAddInteger("problem", "ba_ppdf_nref", 128);
+  if (ba_ppdf_ && !ba_fields_) {
+    std::cerr << "ba_ppdf is written with the BA field snapshots: set ba_fields = true"
+              << " (ba_fields_write = false skips the field files)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   ba_history_ = pin->GetOrAddBoolean("problem", "ba_history", false);
   if (ba_fields_ || ba_history_) {
     if (global_variable::nranks != 1 || !dust_active || pmy_mesh_->three_d ||
@@ -919,7 +1081,7 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     pdata->hdata[h+10] = static_cast<Real>(pd->cloud_coarsen_in);
     pdata->hdata[h+11] = static_cast<Real>(pd->cloud_coarsen_reject);
     pdata->hdata[h+12] = static_cast<Real>(pd->cloud_far_release);
-    pdata->hdata[h+13] = static_cast<Real>(pr.extent_int(1));
+    pdata->hdata[h+13] = static_cast<Real>(npart);   // the arrays may hold headroom (in-place split)
     pdata->nhist = h + 14;
   }
   if (ba_snapshots_ && pm->time + 1.0e-10 >= ba_snapshot_dt_*ba_snapshot_number_)
