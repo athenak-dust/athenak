@@ -949,6 +949,7 @@ class DustGasDrag {
   // deposited fields, dimensioned (nmb, nvar, ncells3, ncells2, ncells1)
   DvceArray5D<Real> qdep;    // [0]=Q, [1-3]=P/predictor impulse, [4]=feedback rate
   DvceArray5D<Real> ustar;   // nvar=3: provisional drag-corrected gas velocity u*
+  DvceArray5D<Real> uvel_pred;  // nvar=3: old-state gas velocity of the linear cloud predictor
   DvceArray5D<Real> dmom;    // nvar=3: PMBR momentum deposit; becomes R_g after apply
   DvceArray5D<Real> cdummy;  // 1-element dummy coarse array for ustar copy exchange
   DvceArray5D<Real> solver_r;   // coupled-solver residual

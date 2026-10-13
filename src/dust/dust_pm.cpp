@@ -83,6 +83,23 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         // Production refinable-cloud predictor: the linear gather and the
         // cloud-weight deposit only.  Same arithmetic as the general kernel below, kept
         // separate because the unused variants there cost registers and occupancy.
+        // The gas velocity of every cell (ghosts included) is formed once; the gather then
+        // reads velocities, as the advance does with u*, instead of dividing five momenta
+        // by five densities in each of the cloud's cells.
+        if (uvel_pred.extent(0) != uold.extent(0)) {
+          Kokkos::realloc(uvel_pred, uold.extent(0), 3, uold.extent(2), uold.extent(3),
+                          uold.extent(4));
+        }
+        auto uvel = uvel_pred;
+        const int nmb_ = static_cast<int>(uold.extent(0));
+        const int nj_ = static_cast<int>(uold.extent(3)), ni_ = static_cast<int>(uold.extent(4));
+        par_for("dust_pc2_predictor_gasvel",DevExeSpace(),0,nmb_-1,0,nj_-1,0,ni_-1,
+        KOKKOS_LAMBDA(const int m, const int j, const int i) {
+          const Real invrho = 1.0/uold(m,IDN,ks,j,i);
+          uvel(m,0,ks,j,i) = uold(m,IM1,ks,j,i)*invrho;
+          uvel(m,1,ks,j,i) = uold(m,IM2,ks,j,i)*invrho;
+          uvel(m,2,ks,j,i) = uold(m,IM3,ks,j,i)*invrho;
+        });
         par_for("dust_pc2_cloud_predictor_linear",DevExeSpace(),0,(npart-1),
         KOKKOS_LAMBDA(const int p) {
           Real xp = pr(IPX,p), yp = pr(IPY,p);
@@ -100,18 +117,15 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
             Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
             Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
-            Real invrho = 1.0/uold(tm,IDN,ks,tj,ti);
-            Real rip = 1.0/uold(tm,IDN,ks,tj,ti+1), rim = 1.0/uold(tm,IDN,ks,tj,ti-1);
-            Real rjp = 1.0/uold(tm,IDN,ks,tj+1,ti), rjm = 1.0/uold(tm,IDN,ks,tj-1,ti);
-            ugx += w*uold(tm,IM1,ks,tj,ti)*invrho
-                 + cx*(uold(tm,IM1,ks,tj,ti+1)*rip - uold(tm,IM1,ks,tj,ti-1)*rim)
-                 + cy*(uold(tm,IM1,ks,tj+1,ti)*rjp - uold(tm,IM1,ks,tj-1,ti)*rjm);
-            ugy += w*uold(tm,IM2,ks,tj,ti)*invrho
-                 + cx*(uold(tm,IM2,ks,tj,ti+1)*rip - uold(tm,IM2,ks,tj,ti-1)*rim)
-                 + cy*(uold(tm,IM2,ks,tj+1,ti)*rjp - uold(tm,IM2,ks,tj-1,ti)*rjm);
-            ugz += w*uold(tm,IM3,ks,tj,ti)*invrho
-                 + cx*(uold(tm,IM3,ks,tj,ti+1)*rip - uold(tm,IM3,ks,tj,ti-1)*rim)
-                 + cy*(uold(tm,IM3,ks,tj+1,ti)*rjp - uold(tm,IM3,ks,tj-1,ti)*rjm);
+            ugx += w*uvel(tm,0,ks,tj,ti)
+                 + cx*(uvel(tm,0,ks,tj,ti+1) - uvel(tm,0,ks,tj,ti-1))
+                 + cy*(uvel(tm,0,ks,tj+1,ti) - uvel(tm,0,ks,tj-1,ti));
+            ugy += w*uvel(tm,1,ks,tj,ti)
+                 + cx*(uvel(tm,1,ks,tj,ti+1) - uvel(tm,1,ks,tj,ti-1))
+                 + cy*(uvel(tm,1,ks,tj+1,ti) - uvel(tm,1,ks,tj-1,ti));
+            ugz += w*uvel(tm,2,ks,tj,ti)
+                 + cx*(uvel(tm,2,ks,tj,ti+1) - uvel(tm,2,ks,tj,ti-1))
+                 + cy*(uvel(tm,2,ks,tj+1,ti) - uvel(tm,2,ks,tj-1,ti));
           });
           Real mass_rate = pr(IPM,p)/pr(IPTS,p);
           Real gx = -dt*mass_rate*(ugx - pr(IPVX,p));

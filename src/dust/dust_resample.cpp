@@ -586,8 +586,11 @@ int DustGasDrag::ResampleClouds() {
       if (final) koff(p) = upd;
       upd += (pr(IPM,p) > 0.0) ? 1 : 0;
     }, nkeep);
-    DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata, nkeep);
-    DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata, nkeep);
+    // 25% headroom, as the in-place split keeps it
+    DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata,
+                          nkeep + nkeep/4);
+    DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata,
+                         nkeep + nkeep/4);
     Kokkos::parallel_for("rs_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
       if (pr(IPM,p) <= 0.0) return;
