@@ -39,6 +39,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>     // fopen(), fprintf()
+#include <unistd.h>   // truncate()
 #include <iostream>
 #include <limits>
 #include <string>
@@ -65,6 +66,11 @@ namespace {
 
 bool ba_snapshots_ = false;
 int ba_snapshot_number_ = 0;
+// native restart: the numbers of the next snapshot and field frame are kept
+// in the input block <problem> (rst_ba_snapshot_number, rst_ba_field_number), which every
+// restart file carries; the distribution file is continued after a restart
+ParameterInput *ba_pin_ = nullptr;
+bool ba_ppdf_resume_ = false;
 Real ba_snapshot_dt_ = 40.0;
 std::string ba_snapshot_basename_;
 
@@ -102,6 +108,7 @@ void WriteBASnapshot(Mesh *pm) {
   }
   char number[32];
   std::snprintf(number, sizeof(number), ".%05d.ba", ba_snapshot_number_++);
+  if (ba_pin_ != nullptr) ba_pin_->SetInteger("problem", "rst_ba_snapshot_number", ba_snapshot_number_);
   std::string filename = ba_snapshot_basename_ + number;
   FILE *file = std::fopen(filename.c_str(), "wb");
   if (file == nullptr) {
@@ -262,6 +269,43 @@ void WriteBAParticlePDF(Mesh *pm, const FieldHost &fh, const PrtclHost &prh, con
   std::vector<float> out(hist.size());
   for (std::size_t k=0; k<hist.size(); ++k) out[k] = static_cast<float>(hist[k]/mtot);
   const std::string name = ba_snapshot_basename_ + ".ppdf";
+  if (ba_ppdf_resume_) {
+    // first record after a restart: keep the leading records that are earlier than this one
+    // (a file written past the restart point is cut back), then append.  The records are
+    // told by their time, not by the frame number: a run continued from a saved state does
+    // not start its file at frame zero.
+    ba_ppdf_resume_ = false;
+    FILE *old = std::fopen(name.c_str(), "rb");
+    if (old != nullptr) {
+      char line[256];
+      const bool two = std::fgets(line, sizeof(line), old) != nullptr &&
+                       std::fgets(line, sizeof(line), old) != nullptr;
+      const long head = two ? std::ftell(old) : -1;
+      std::fseek(old, 0, SEEK_END);
+      const long size = std::ftell(old);
+      const long rec = static_cast<long>(kPPScal*sizeof(double) + hist.size()*sizeof(float));
+      long keep = 0;
+      if (head > 0) {
+        const long nrec = (size - head)/rec;
+        const double tnow = scal[0];
+        for (long k=0; k<nrec; ++k) {
+          double tk = 0.0;
+          std::fseek(old, head + k*rec, SEEK_SET);
+          if (std::fread(&tk, sizeof(double), 1, old) != 1 ||
+              !(tk < tnow - 1.0e-12*std::fabs(tnow))) break;
+          keep = k + 1;
+        }
+      }
+      std::fclose(old);
+      if (head > 0) {
+        if (size != head + rec*keep && truncate(name.c_str(), head + rec*keep) != 0) {
+          std::cerr << "Cannot cut " << name << " back to the restart point" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        ba_ppdf_header_ = true;
+      }
+    }
+  }
   FILE *file = std::fopen(name.c_str(), ba_ppdf_header_ ? "ab" : "wb");
   bool ok = file != nullptr;
   if (ok && !ba_ppdf_header_) {
@@ -399,6 +443,7 @@ void WriteBAFields(Mesh *pm) {
   if (ba_ppdf_) WriteBAParticlePDF(pm, fh, prh, npart, mtot);
   if (!ba_fields_write_) {
     ++ba_field_number_;
+    if (ba_pin_ != nullptr) ba_pin_->SetInteger("problem", "rst_ba_field_number", ba_field_number_);
     return;
   }
   auto write = [](const std::string &name, const std::string &header, const void *data,
@@ -426,6 +471,7 @@ void WriteBAFields(Mesh *pm) {
                 pm->time, pm->ncycle, ncell, kBAFields, mtot, npart);
   char number[32];
   std::snprintf(number, sizeof(number), ".%05d.baf", ba_field_number_++);
+  if (ba_pin_ != nullptr) ba_pin_->SetInteger("problem", "rst_ba_field_number", ba_field_number_);
   write(ba_snapshot_basename_ + number, line, out.data(), sizeof(float), out.size());
 }
 
@@ -642,7 +688,32 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     dust::SetupScheduledRefinement(pin);
     user_ref_func = dust::ScheduledRefinement;
   }
-  if (restart) return;
+  ba_pin_ = pin;
+  if (restart) {
+    // native restart: gas, particles and the dust counters come from the
+    // file.  The output numbers continue from the values the file carries in <problem>; a file
+    // without them falls back on the time.  No file is touched here (the run directory is set
+    // later); the distribution file is cut back and continued at its next record.
+    if (ba_snapshots_) {
+      ba_snapshot_number_ = pin->GetOrAddInteger("problem", "rst_ba_snapshot_number",
+          static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_snapshot_dt_)));
+    }
+    if (ba_fields_) {
+      ba_field_number_ = pin->GetOrAddInteger("problem", "rst_ba_field_number",
+          static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_field_dt_)));
+      ba_ppdf_resume_ = ba_ppdf_;
+      // on a mesh that may have changed, the first frame after the restart writes its own
+      // (numbered) geometry file instead of replacing the one of frame zero
+      ba_geom_written_ = ba_field_number_ > 0;
+    }
+    if (pmy_mesh_->pmb_pack->pdust != nullptr && pmy_mesh_->pmb_pack->ppart != nullptr &&
+        pmy_mesh_->pmb_pack->ppart->nprtcl_thispack == 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "restart of a dust run without particles in the restart file" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    return;
+  }
 
   if (pmbp->phydro == nullptr) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl

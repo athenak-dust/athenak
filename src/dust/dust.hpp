@@ -18,6 +18,7 @@
 //! Hydro and MHD: it owns the combined task graph, the deposited fields, and the drag
 //! kernels, while particle storage/migration stays in Particles and fluxes/BCs in Hydro.
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -855,6 +856,7 @@ class DustGasDrag {
   int cloud_resample_patch = 2;        // ... patch size in root cells
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
+  std::vector<int> cloud_resample_dump;     // cycles whose resampling writes the particle table before and after
   bool cloud_resample_skip_at_cap = true;   // ... clouds at their cap stay out of the pool
   unsigned long long cloud_resample_pass = 0, cloud_resample_removed = 0;
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
@@ -1008,6 +1010,10 @@ class DustGasDrag {
   bool experimental_amr = false;      // <dust>/experimental_amr
   int amr_regrids = 0;                // regrids seen by RebuildAfterRegrid
   bool cloud_map_announced = false;   // the map banner is printed once
+  // native restart (dust_restart.cpp): the records of what changes during
+  // a run and cannot be rebuilt from the particles
+  void PackRestartState(std::vector<char> &b) const;
+  void UnpackRestartState(const char *p, std::size_t nbytes);
   int SplitAndMergeClouds();   // returns the number of clouds split
   int MakeTransitionClouds();  // P1 transition clouds at split edges
   int SplitCloudsP1();         // moving-particle P1 split
@@ -1085,6 +1091,11 @@ class DustGasDrag {
 // scheduled refinement request for tests (dust_amr.cpp); the schedule is read from <dust>
 int SetupScheduledRefinement(ParameterInput *pin);
 void ScheduledRefinement(MeshBlockPack *pmbp);
+// particles and dust state in the native restart file (dust_restart.cpp)
+std::size_t ParticleRestartHeadBytes();
+std::uint64_t ParticleRestartSectionBytes(const char *head);
+void PackParticleRestart(MeshBlockPack *pmbp, std::vector<char> &buf);
+void UnpackParticleRestart(MeshBlockPack *pmbp, const std::vector<char> &buf);
 
 } // namespace dust
 #endif // DUST_DUST_HPP_

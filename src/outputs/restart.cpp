@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <utility> // make_pair
+#include <vector>
 
 #include "athena.hpp"
 #include "coordinates/cell_locations.hpp"
@@ -29,6 +30,8 @@
 #include "z4c/z4c.hpp"
 #include "radiation/radiation.hpp"
 #include "srcterms/turb_driver.hpp"
+#include "particles/particles.hpp"
+#include "dust/dust.hpp"
 //#include "outputs.hpp"
 
 //----------------------------------------------------------------------------------------
@@ -621,6 +624,32 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     }
     offset_myrank += nout1*nout2*nout3*nadm*sizeof(Real); // adm u_adm
     myoffset = offset_myrank;
+  }
+
+  // particles and dust state (dust/dust_restart.cpp): one section after the
+  // data of the last MeshBlock.  Runs without particles write nothing here.
+  if (pm->pmb_pack->ppart != nullptr) {
+    if (single_file_per_rank || global_variable::nranks > 1) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "restart files with particles are implemented for one MPI rank and a "
+                << "single file" << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    std::vector<char> pbuf;
+    dust::PackParticleRestart(pm->pmb_pack, pbuf);
+    const IOWrapperSizeT poff = step1size + step2size + step3size + sizeof(IOWrapperSizeT) +
+                                data_size*(pm->nmb_total);
+    const IOWrapperSizeT chunk = static_cast<IOWrapperSizeT>(1) << 30;
+    for (IOWrapperSizeT done = 0; done < pbuf.size(); done += chunk) {
+      const IOWrapperSizeT n = std::min<IOWrapperSizeT>(chunk, pbuf.size() - done);
+      if (resfile.Write_any_type_at(pbuf.data() + done, n, poff + done, "byte",
+                                    single_file_per_rank) != n) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "particle data not written correctly to rst file, restart file is "
+                  << "broken." << std::endl;
+        exit(EXIT_FAILURE);
+      }
+    }
   }
 
   // close file, clean up

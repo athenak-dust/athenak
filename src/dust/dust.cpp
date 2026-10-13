@@ -401,6 +401,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
       cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
       cloud_resample_skip_at_cap = pin->GetOrAddBoolean("dust", "cloud_resample_skip_at_cap", true);
+      // <dust>/cloud_resample_dump (diagnostic): comma-separated cycles; the
+      // resampling of each of them writes the particle table right before and right after
+      {
+        const std::string list = pin->GetOrAddString("dust", "cloud_resample_dump", "");
+        cloud_resample_dump.clear();
+        std::size_t at = 0;
+        while (at < list.size()) {
+          std::size_t end = list.find(',', at);
+          if (end == std::string::npos) end = list.size();
+          if (end > at) cloud_resample_dump.push_back(std::stoi(list.substr(at, end - at)));
+          at = end + 1;
+        }
+      }
       if (cloud_resample && (cloud_resample_interval < 1 || cloud_resample_patch < 1 ||
                              cloud_gather_order != 2 || cloud_force_local || cloud_force_children ||
                              cloud_deform)) {

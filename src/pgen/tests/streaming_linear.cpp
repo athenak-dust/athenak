@@ -72,6 +72,9 @@ bool cloud_mode_ = false;
 Real cloud_root_dx1_ = 0.0, cloud_root_dx2_ = 0.0;
 std::string snapshot_basename_;
 int snapshot_every_ = 1, snapshot_calls_ = 0;   // write every N-th history call
+// native restart: the snapshot counters are kept in the input block
+// <problem> (rst_snapshot_number, rst_snapshot_calls), which every restart file carries
+ParameterInput *lina_pin_ = nullptr;
 
 // Opt-in, single-rank diagnostic output at the history cadence. Native binary and
 // particle-VTK output round to float, which erases the small LinA perturbations.
@@ -110,6 +113,7 @@ void WriteStreamingSnapshot(Mesh *pm) {
   }
   char number[32];
   std::snprintf(number, sizeof(number), ".%05d.lina", snapshot_number_++);
+  if (lina_pin_ != nullptr) lina_pin_->SetInteger("problem", "rst_snapshot_number", snapshot_number_);
   std::string filename = snapshot_basename_ + number;
   FILE *file = std::fopen(filename.c_str(), "wb");
   if (file == nullptr) {
@@ -197,9 +201,9 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   rho0_ = pin->GetOrAddReal("problem","rho0",1.0);
   snapshots_ = pin->GetOrAddBoolean("problem", "double_precision_snapshots", false);
   if (snapshots_) {
-    if (restart || global_variable::nranks != 1 ||
+    if (global_variable::nranks != 1 ||
         !pin->GetOrAddBoolean("problem", "user_hist", false)) {
-      std::cerr << "LinA snapshots require a fresh, single-rank run with user_hist=true"
+      std::cerr << "LinA snapshots require a single-rank run with user_hist=true"
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
@@ -213,7 +217,30 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
               << "<problem>/prescribed_gas (diagnostic) requires a fresh run" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (restart) return;
+  lina_pin_ = pin;
+  if (restart) {
+    // native restart: gas, particles and the dust counters come from the
+    // file; here only what the history function needs.  The split oracle keeps functions of
+    // the initial state and is not available after a restart.
+    if (pin->GetOrAddBoolean("problem", "split_oracle", false)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<problem>/split_oracle (diagnostic) requires a fresh run" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (snapshots_) {
+      snapshot_number_ = pin->GetOrAddInteger("problem", "rst_snapshot_number", 0);
+      snapshot_calls_ = pin->GetOrAddInteger("problem", "rst_snapshot_calls", 0);
+    }
+    MeshBlockPack *pr = pmy_mesh_->pmb_pack;
+    if (pr->pdust != nullptr) {
+      cloud_mode_ = (pr->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud);
+      if (cloud_mode_) {
+        cloud_root_dx1_ = pr->pdust->smr_transfer.root_dx1;
+        cloud_root_dx2_ = pr->pdust->smr_transfer.root_dx2;
+      }
+    }
+    return;
+  }
 
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
   if (pmbp->phydro == nullptr || pmbp->ppart == nullptr || pmbp->pdust == nullptr ||
@@ -984,7 +1011,11 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
   pdata->hdata[3] = gim;
   pdata->hdata[4] = mre;
   pdata->hdata[5] = mim;
-  if (snapshots_ && (snapshot_calls_++ % snapshot_every_) == 0) WriteStreamingSnapshot(pm);
+  if (snapshots_) {
+    const bool due = (snapshot_calls_++ % snapshot_every_) == 0;
+    if (lina_pin_ != nullptr) lina_pin_->SetInteger("problem", "rst_snapshot_calls", snapshot_calls_);
+    if (due) WriteStreamingSnapshot(pm);
+  }
   return;
 }
 

@@ -61,7 +61,7 @@ class Particles {
 //  DvceArray2D<Real> prtcl_vel;     // velocities
   DvceArray2D<Real> prtcl_rdata;   // real number properties each particle (x,v,etc.)
   DvceArray2D<int>  prtcl_idata;   // integer properties each particle (gid, tag, etc.)
-  Real dtnew;
+  Real dtnew = 3.4028234e38;       // set by the pusher / problem generator / restart
 
   ParticlesPusher pusher;
 
