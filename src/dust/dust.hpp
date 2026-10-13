@@ -18,6 +18,7 @@
 //! Hydro and MHD: it owns the combined task graph, the deposited fields, and the drag
 //! kernels, while particle storage/migration stays in Particles and fluxes/BCs in Hydro.
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -1000,6 +1001,10 @@ class DustGasDrag {
   void SetDefaultMasses(ParameterInput *pin);
   void BuildSMRCompositeTransfer(ParameterInput *pin);
   void BuildRefinableCloudTransfer(ParameterInput *pin);
+  // native restart (dust_restart.cpp): the records of what changes during
+  // a run and cannot be rebuilt from the particles
+  void PackRestartState(std::vector<char> &b) const;
+  void UnpackRestartState(const char *p, std::size_t nbytes);
   int SplitAndMergeClouds();   // returns the number of clouds split
   int MakeTransitionClouds();  // P1 transition clouds at split edges
   int SplitCloudsP1();         // moving-particle P1 split
@@ -1073,6 +1078,12 @@ class DustGasDrag {
  private:
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this DustGasDrag
 };
+
+// particles and dust state in the native restart file (dust_restart.cpp)
+std::size_t ParticleRestartHeadBytes();
+std::uint64_t ParticleRestartSectionBytes(const char *head);
+void PackParticleRestart(MeshBlockPack *pmbp, std::vector<char> &buf);
+void UnpackParticleRestart(MeshBlockPack *pmbp, const std::vector<char> &buf);
 
 } // namespace dust
 #endif // DUST_DUST_HPP_
