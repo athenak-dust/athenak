@@ -1107,6 +1107,9 @@ class DustGasDrag {
 // scheduled refinement request for tests (dust_amr.cpp); the schedule is read from <dust>
 int SetupScheduledRefinement(ParameterInput *pin);
 void ScheduledRefinement(MeshBlockPack *pmbp);
+// dust-density refinement request (dust_amr.cpp)
+void SetupDensityTrigger(ParameterInput *pin);
+void DensityRefinement(MeshBlockPack *pmbp);
 // particles and dust state in the native restart file (dust_restart.cpp)
 std::size_t ParticleRestartHeadBytes();
 std::uint64_t ParticleRestartSectionBytes(const char *head);

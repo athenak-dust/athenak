@@ -183,6 +183,11 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   if (pmy_mesh_->adaptive && pin->DoesBlockExist("dust")) {
     dust::SetupScheduledRefinement(pin);
     user_ref_func = dust::ScheduledRefinement;
+    // the dust-density request instead of the schedule
+    if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {
+      dust::SetupDensityTrigger(pin);
+      user_ref_func = dust::DensityRefinement;
+    }
     if (pin->GetOrAddBoolean("problem", "prescribed_gas", false)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "<problem>/prescribed_gas keeps a copy of the mesh layout and is not "

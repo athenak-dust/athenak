@@ -687,6 +687,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   if (pmy_mesh_->adaptive && pin->DoesBlockExist("dust")) {
     dust::SetupScheduledRefinement(pin);
     user_ref_func = dust::ScheduledRefinement;
+    // the dust-density request instead of the schedule
+    if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {
+      dust::SetupDensityTrigger(pin);
+      user_ref_func = dust::DensityRefinement;
+    }
   }
   ba_pin_ = pin;
   if (restart) {
@@ -965,6 +970,27 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     auto &prs = ppar->prtcl_rdata;
     par_for("nsh_two_stream", DevExeSpace(), 0, ppar->nprtcl_thispack-1, KOKKOS_LAMBDA(const int p) {
       prs(IPVY,p) += (prs(IPY,p) < 0.0) ? two_stream_v : -two_stream_v;
+    });
+  }
+
+  // a dust blob; the particles within blob_r of (blob_x1, blob_x2)
+  // (periodic distance) carry (1 + blob_amp) times their mass (2-D lattice or random placement)
+  const Real blob_amp = pin->GetOrAddReal("problem", "blob_amp", 0.0);
+  if (blob_amp != 0.0) {
+    if (three_d || cloud_root_random) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<problem>/blob_amp needs a 2-D run without cloud_root_random" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const Real bx = pin->GetReal("problem", "blob_x1"), by = pin->GetReal("problem", "blob_x2");
+    const Real br = pin->GetReal("problem", "blob_r");
+    const Real lx = pmy_mesh_->mesh_size.x1max - pmy_mesh_->mesh_size.x1min;
+    const Real ly = pmy_mesh_->mesh_size.x2max - pmy_mesh_->mesh_size.x2min;
+    auto &prb = ppar->prtcl_rdata;
+    par_for("nsh_blob", DevExeSpace(), 0, ppar->nprtcl_thispack-1, KOKKOS_LAMBDA(const int p) {
+      Real dx = prb(IPX,p) - bx, dy = prb(IPY,p) - by;
+      dx -= lx*std::round(dx/lx); dy -= ly*std::round(dy/ly);
+      if (dx*dx + dy*dy < br*br) prb(IPM,p) *= (1.0 + blob_amp);
     });
   }
 
