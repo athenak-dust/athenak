@@ -21,6 +21,9 @@
 //! SVD; here they come from a Householder QR with column pivoting, so the surviving set is
 //! not the reference's cloud for cloud, while the same rows are kept.  Device: new masses,
 //! compaction.  Single rank only, like the merge pass.
+//!
+//! Schedule: every cloud_resample_interval cycles (default), or with
+//! cloud_resample_schedule = time at the planned times t0 + k dt; see ResampleDue.
 
 #include <algorithm>
 #include <atomic>
@@ -382,6 +385,93 @@ void DumpResampleState(particles::Particles *ppar, Mesh *pmesh, const char *when
 }
 
 }  // namespace
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::ResampleDue
+//! \brief Is a resampling due at the start of this cycle?  Cycle mode:
+//! every cloud_resample_interval cycles, as before.  Time mode: event k is planned at
+//! t0 + k dt and runs at the first cycle that starts at or after that time (the mesh time at
+//! the start of the cycle; the hydro time step is never changed for it).  A cycle that has
+//! passed several planned times runs once; the others count as skipped, and the next event
+//! is the first one planned after the time of this cycle.  The first event of a run is the
+//! first planned time not earlier than its start; a restart continues from the schedule
+//! record of the file when the origin and interval are unchanged, stops with an error when
+//! they changed (unless cloud_resample_schedule_reset), and derives the next event from the
+//! restart time when the file has no time-mode record.  Each event is logged in
+//! cloud_resample_schedule.txt.
+
+bool DustGasDrag::ResampleDue() {
+  Mesh *pmesh = pmy_pack->pmesh;
+  if (!cloud_resample_by_time) return pmesh->ncycle % cloud_resample_interval == 0;
+  const double t = pmesh->time, dt = cloud_resample_dt, t0 = cloud_resample_t0;
+  // slack only against round-off of a step that ends exactly on a planned time
+  auto eps = [](const double tk) { return 1.0e-12*std::fmax(1.0, std::fabs(tk)); };
+  auto planned = [&](const long long k) { return t0 + static_cast<double>(k)*dt; };
+  // number of the first planned time not earlier than tt
+  auto first_at_or_after = [&](const double tt) {
+    long long k = static_cast<long long>(std::ceil((tt - t0)/dt));
+    if (k < 0) k = 0;
+    while (k > 0 && planned(k - 1) >= tt - eps(planned(k - 1))) --k;
+    while (planned(k) < tt - eps(planned(k))) ++k;
+    return k;
+  };
+  if (cloud_resample_next < 0) {
+    std::string how;
+    if (cloud_resample_clock_restored && cloud_resample_t0_file == t0 &&
+        cloud_resample_dt_file == dt) {
+      cloud_resample_next = cloud_resample_next_file;
+      how = "continued from the schedule record of the restart file";
+    } else if (cloud_resample_clock_restored && !cloud_resample_schedule_reset) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "the restart file plans the resampling at t0 = " << cloud_resample_t0_file
+                << " + k " << cloud_resample_dt_file << ", the input at t0 = " << t0 << " + k "
+                << dt << "; set <dust>/cloud_resample_schedule_reset = true to change it"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    } else {
+      cloud_resample_next = first_at_or_after(t);
+      how = cloud_resample_clock_restored ? "reset at the restart: first planned time not earlier "
+                                            "than the restart time"
+          : cloud_resample_restarted ? "the restart file has no time-mode schedule record: first "
+                                       "planned time not earlier than the restart time"
+          : "first planned time not earlier than the start time";
+    }
+    if (global_variable::my_rank == 0) {
+      std::cout << "# resampling schedule: time mode, omega0 = " << cloud_resample_omega
+                << ", interval " << dt << " (code time), origin " << t0 << "; next event "
+                << cloud_resample_next << " planned at " << planned(cloud_resample_next) << " ("
+                << how << ")" << std::endl;
+    }
+  }
+  const double tprev = cloud_resample_tprev;
+  cloud_resample_tprev = t;
+  const double tk = planned(cloud_resample_next);
+  if (t < tk - eps(tk)) return false;
+  // every planned time up to t (within the slack) is done with this one execution
+  long long nxt = static_cast<long long>(std::floor((t - t0)/dt)) + 1;
+  if (nxt < cloud_resample_next + 1) nxt = cloud_resample_next + 1;
+  while (planned(nxt) <= t + eps(planned(nxt))) ++nxt;
+  while (nxt > cloud_resample_next + 1 && planned(nxt - 1) > t + eps(planned(nxt - 1))) --nxt;
+  const long long skipped = nxt - cloud_resample_next - 1;
+  if (global_variable::my_rank == 0) {
+    std::FILE *fp = std::fopen("cloud_resample_schedule.txt", "a");
+    if (fp != nullptr) {
+      std::fseek(fp, 0, SEEK_END);
+      if (std::ftell(fp) == 0) {
+        std::fprintf(fp, "# event planned_time ncycle time delay skipped time_prev_cycle dt_cycle"
+                     " interval omega0\n");
+      }
+      std::fprintf(fp, "%lld %.17g %d %.17g %.6e %lld %.17g %.6e %.17g %.17g\n",
+                   cloud_resample_next, tk, pmesh->ncycle, t, t - tk, skipped, tprev, pmesh->dt,
+                   dt, static_cast<double>(cloud_resample_omega));
+      std::fclose(fp);
+    }
+  }
+  ++cloud_resample_events;
+  cloud_resample_skipped += static_cast<unsigned long long>(skipped);
+  cloud_resample_next = nxt;
+  return true;
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ResampleClouds

@@ -859,6 +859,20 @@ class DustGasDrag {
   std::vector<int> cloud_resample_dump;     // cycles whose resampling writes the particle table before and after
   bool cloud_resample_skip_at_cap = true;   // ... clouds at their cap stay out of the pool
   unsigned long long cloud_resample_pass = 0, cloud_resample_removed = 0;
+  // resampling at planned physical times t0 + k dt instead of every N cycles
+  bool cloud_resample_by_time = false;      // <dust>/cloud_resample_schedule = time
+  Real cloud_resample_dt = 0.0;             // ... interval in code time (cloud_resample_dt, or
+                                            //     cloud_resample_dt_omega / <shearing_box>/omega0)
+  Real cloud_resample_t0 = 0.0;             // ... time origin of the planned times
+  Real cloud_resample_omega = 0.0;          // ... <shearing_box>/omega0 (0 without a shearing box)
+  bool cloud_resample_schedule_reset = false;  // ... a restart may change the origin / interval
+  long long cloud_resample_next = -1;       // ... number of the next event (-1: set at the first check)
+  unsigned long long cloud_resample_events = 0, cloud_resample_skipped = 0;
+  bool cloud_resample_restarted = false;    // ... this run continues from a restart file
+  bool cloud_resample_clock_restored = false;  // ... which had a time-mode schedule record:
+  Real cloud_resample_t0_file = 0.0, cloud_resample_dt_file = 0.0;  // its origin, interval
+  long long cloud_resample_next_file = -1;  // ... and next event
+  Real cloud_resample_tprev = -1.0;         // ... start time of the previous cycle (log only)
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
                                       // neighbourhood is in the merge zone: the outer band is
                                       // left to stage X (found in the LinA tests)
@@ -1014,6 +1028,7 @@ class DustGasDrag {
   int MergeCloudsDevice();    // device version of MergeClouds
   void AuditFeedback(DvceArray2D<Real> &fb);   // frozen-gas predictor feedback
   int ResampleClouds();       // returns the number of clouds removed
+  bool ResampleDue();         // is a resampling due at the start of this cycle?
   void PackGatherField(const DvceArray5D<Real> &vel);   // fills gpack from a velocity array
   void CheckNativeTransfer();  // level-native against finest-grid traversal
 
