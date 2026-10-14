@@ -959,9 +959,10 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
 
   // two cold streams along x2 for the multi-stream regrid test; the
   // particles below the midplane get +two_stream_v added to their x2 velocity, the others
-  // -two_stream_v (2-D lattice or random placement only)
+  // two_stream_v_upper (default -two_stream_v) (2-D lattice or random placement)
   const Real two_stream_v = pin->GetOrAddReal("problem", "two_stream_v", 0.0);
-  if (two_stream_v != 0.0) {
+  const Real two_stream_vu = pin->GetOrAddReal("problem", "two_stream_v_upper", -two_stream_v);
+  if (two_stream_v != 0.0 || two_stream_vu != 0.0) {
     if (three_d || cloud_root_random) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "<problem>/two_stream_v needs a 2-D run without cloud_root_random" << std::endl;
@@ -969,7 +970,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     }
     auto &prs = ppar->prtcl_rdata;
     par_for("nsh_two_stream", DevExeSpace(), 0, ppar->nprtcl_thispack-1, KOKKOS_LAMBDA(const int p) {
-      prs(IPVY,p) += (prs(IPY,p) < 0.0) ? two_stream_v : -two_stream_v;
+      prs(IPVY,p) += (prs(IPY,p) < 0.0) ? two_stream_v : two_stream_vu;
     });
   }
 
@@ -996,7 +997,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
 
   // particle timestep from the largest drift speed (transport is radial drift here)
   Real vmax = 1.0e-30;
-  vmax = std::max(vmax, std::fabs(two_stream_v));
+  vmax = std::max(vmax, std::max(std::fabs(two_stream_v), std::fabs(two_stream_vu)));
   for (int s=0; s<nspec; ++s) {
     vmax = std::max(vmax, fabs(vx[s]));
     vmax = std::max(vmax, fabs(vp[s]));
