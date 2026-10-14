@@ -897,6 +897,7 @@ class DustGasDrag {
                                       // split along x1 only (x2 keeps the parent width as
                                       // lobe 3, gathered as a cloud integral), so a z-normal
                                       // refinement edge has no along-edge width jump
+  bool cloud_split_enable = true;     // test only: false = no splitting at all
   bool cloud_split_interp = false;    // P1 split/release: pieces take the node-convention
                                       // (linear, P1) prolongation of displacement and velocity
                                       // from the neighbouring nodes of the particle lattice,

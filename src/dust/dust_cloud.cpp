@@ -344,6 +344,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
 //! column entering the fine region) and the mesh is single-rank by construction.
 
 int DustGasDrag::SplitAndMergeClouds() {
+  if (!cloud_split_enable) return 0;   // test switch
   if (cloud_p1_split) return SplitCloudsP1();
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
