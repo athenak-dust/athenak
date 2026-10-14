@@ -1022,6 +1022,15 @@ class DustGasDrag {
   void RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin);
   unsigned long long amr_checksum = 0ULL;
   int amr_npart_before = -1;
+  // Dynamic-mesh state across a restart.  The driver sets
+  // amr_check_after_output while it writes the outputs of a cycle (the mesh check of that
+  // cycle follows them); a restart file keeps it and the per-block cooldown ages
+  // (MeshRefinement::ncyc_since_ref), and ResumeAmrAfterRestart restores the ages and does
+  // the pending check before the first cycle.
+  bool amr_check_after_output = false;
+  bool amr_restart_state_found = false, amr_restart_pending = false;
+  std::vector<int> amr_restart_ages;
+  void ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin);
   bool experimental_amr = false;      // <dust>/experimental_amr
   int amr_regrids = 0;                // regrids seen by RebuildAfterRegrid
   bool cloud_map_announced = false;   // the map banner is printed once

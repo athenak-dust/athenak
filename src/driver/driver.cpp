@@ -24,6 +24,7 @@
 #include "ion-neutral/ion-neutral.hpp"
 #include "radiation/radiation.hpp"
 #include "driver.hpp"
+#include "dust/dust.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
@@ -312,6 +313,12 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   //---- Step 1.  Set conserved variables in ghost zones for all physics
   InitBoundaryValuesAndPrimitives(pmesh);
 
+  // A restarted dynamic dust mesh gets its cooldown ages back and the
+  // mesh check that followed the outputs of the restart cycle, before the time step
+  if (res_flag && pmesh->adaptive && pmesh->pmb_pack->pdust != nullptr) {
+    pmesh->pmb_pack->pdust->ResumeAmrAfterRestart(this, pin);
+  }
+
   //---- Step 2.  Compute time step (if problem involves time evolution)
   hydro::Hydro *phydro = pmesh->pmb_pack->phydro;
   mhd::MHD *pmhd = pmesh->pmb_pack->pmhd;
@@ -421,7 +428,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
             static_cast<float>(pmesh->nmb_total);
       }
 
-      // Test for/make outputs
+      // Test for/make outputs.  A restart file written here is followed by
+      // the mesh check of this cycle, which the dust module records in the file.
+      if (pmesh->pmb_pack->pdust != nullptr) pmesh->pmb_pack->pdust->amr_check_after_output = true;
       for (auto &out : pout->pout_list) {
         // compare at floating point (32-bit) precision to reduce effect of round off
         float time_32 = static_cast<float>(pmesh->time);
@@ -435,6 +444,8 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
           out->WriteOutputFile(pmesh, pin);
         }
       }
+
+      if (pmesh->pmb_pack->pdust != nullptr) pmesh->pmb_pack->pdust->amr_check_after_output = false;
 
       // AMR
       if (pmesh->adaptive) {pmesh->pmr->AdaptiveMeshRefinement(this, pin);}

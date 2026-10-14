@@ -114,6 +114,17 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   std::memcpy(clk, rc, sizeof(rc));
   std::memcpy(clk + sizeof(rc), rn, sizeof(rn));
   PutRecord(b, "resample_clk", clk, sizeof(clk));
+  // dynamic mesh: pending mesh check after these outputs, cooldown age per block
+  {
+    Mesh *pm = pmy_pack->pmesh;
+    if (experimental_amr && pm->adaptive && pm->pmr != nullptr) {
+      std::vector<std::int32_t> v(2 + pm->nmb_total);
+      v[0] = amr_check_after_output ? 1 : 0;
+      v[1] = pm->nmb_total;
+      for (int m=0; m<pm->nmb_total; ++m) v[2 + m] = pm->pmr->ncyc_since_ref(m);
+      PutRecord(b, "amr_state", v.data(), v.size()*sizeof(std::int32_t));
+    }
+  }
   const std::uint64_t sp[4] = {cloud_split_event, cloud_split_count, cloud_merge_count,
                                cloud_lobe_split_count};
   PutRecord(b, "split", sp, sizeof(sp));
@@ -157,6 +168,16 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
     } else if (name == "resample") {
       std::uint64_t v[2]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));
       cloud_resample_pass = v[0]; cloud_resample_removed = v[1];
+    } else if (name == "amr_state") {
+      if (n < static_cast<std::int32_t>(2*sizeof(std::int32_t)) || n % sizeof(std::int32_t) != 0) {
+        Broken("dust record amr_state has an unexpected size");
+      }
+      std::vector<std::int32_t> v(n/sizeof(std::int32_t));
+      std::memcpy(v.data(), d, n);
+      if (static_cast<std::size_t>(v[1]) + 2 != v.size()) Broken("dust record amr_state is inconsistent");
+      amr_restart_state_found = true;
+      amr_restart_pending = (v[0] != 0);
+      amr_restart_ages.assign(v.begin() + 2, v.end());
     } else if (name == "resample_clk") {
       double rc[2]; std::int64_t rn[4]; want(sizeof(rc) + sizeof(rn));
       std::memcpy(rc, d, sizeof(rc)); std::memcpy(rn, d + sizeof(rc), sizeof(rn));

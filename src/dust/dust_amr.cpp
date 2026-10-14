@@ -71,6 +71,10 @@ struct DensityTrigger {
   int buffer = 0;                               // root cells
 };
 DensityTrigger trig_;
+// Per-block audit of the trigger
+bool audit_ = false;
+int audit_max_ = 40, audit_dumps_ = 0;
+std::vector<long long> audit_prev_;   // (level, lx1, lx2, applied flag) of the previous check, flattened
 
 // Order-independent 64-bit sum over the particles of a hash of every real column and of every
 // integer column except PGID: equal before and after a regrid exactly when no particle was
@@ -173,6 +177,8 @@ void SetupDensityTrigger(ParameterInput *pin) {
   trig_.rho_refine = pin->GetReal("dust", "amr_rho_refine");
   trig_.rho_derefine = pin->GetReal("dust", "amr_rho_derefine");
   trig_.buffer = pin->GetOrAddInteger("dust", "amr_rho_buffer", 2);
+  audit_ = pin->GetOrAddBoolean("dust", "amr_trigger_audit", false);
+  audit_max_ = pin->GetOrAddInteger("dust", "amr_trigger_audit_max", 40);
   if (!(trig_.rho_derefine >= 0.0 && trig_.rho_derefine < trig_.rho_refine) || trig_.buffer < 0) {
     fatal("amr_density_trigger needs 0 <= amr_rho_derefine < amr_rho_refine and amr_rho_buffer >= 0");
   }
@@ -261,6 +267,8 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     }
   }
   int nref = 0, nder = 0;
+  std::vector<Real> qblk(nmb, 0.0);
+  std::vector<int> rawf(nmb, 0), appf(nmb, 0);
   for (int m=0; m<nmb; ++m) {
     const auto &sz = mbsize.h_view(m);
     const int i0 = static_cast<int>(std::floor((sz.x1min - x0)/hx + 1.0e-9));
@@ -278,9 +286,65 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     refine_flag.h_view(m + mbs) = flag;
     if (flag > 0) ++nref;
     if (flag < 0) ++nder;
+    // what CheckForRefinement keeps after this request: no change within refinement_interval
+    // cycles of the block's last change (its age was incremented before this call)
+    qblk[m] = q; rawf[m] = flag;
+    appf[m] = (pm->pmr->ncyc_since_ref(m + mbs) < pm->pmr->refinement_interval) ? 0 : flag;
   }
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
+  // Audit: per-block lines every check; the pre-regrid state (blocks and particles)
+  // at the checks whose applied flags differ from those of the previous check
+  if (audit_ && global_variable::my_rank == 0) {
+    std::vector<long long> cur;
+    for (int m=0; m<nmb; ++m) {
+      const auto &ll = pm->lloc_eachmb[m + mbs];
+      cur.insert(cur.end(), {ll.level, ll.lx1, ll.lx2, appf[m]});
+    }
+    std::FILE *fb = std::fopen("dust_trigger_blocks.txt", "a");
+    if (fb != nullptr) {
+      std::fseek(fb, 0, SEEK_END);
+      if (std::ftell(fb) == 0) {
+        std::fprintf(fb, "# ncycle time level lx1 lx2 q raw_flag applied_flag age\n");
+      }
+      for (int m=0; m<nmb; ++m) {
+        const auto &ll = pm->lloc_eachmb[m + mbs];
+        std::fprintf(fb, "%d %.17g %d %d %d %.17g %d %d %d\n", pm->ncycle, pm->time, ll.level, ll.lx1,
+                     ll.lx2, qblk[m], rawf[m], appf[m], pm->pmr->ncyc_since_ref(m + mbs));
+      }
+      std::fclose(fb);
+    }
+    if (cur != audit_prev_ && audit_dumps_ < audit_max_) {
+      ++audit_dumps_;
+      char name[64];
+      std::snprintf(name, sizeof(name), "trigger_audit.%08d.bin", pm->ncycle);
+      std::FILE *fd = std::fopen(name, "wb");
+      if (fd != nullptr) {
+        auto prh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
+        auto pih = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pi);
+        std::fprintf(fd, "AthenaK trigger audit v1\n%.17g %d %d %d %d %d %.17g %.17g %.17g %.17g %.17g %.17g %d %d\n",
+                     pm->time, pm->ncycle, nmb, npart, nr1, nr2, x0, pm->mesh_size.x1max, y0,
+                     pm->mesh_size.x2max, trig_.rho_refine, trig_.rho_derefine, trig_.buffer,
+                     pm->pmr->refinement_interval);
+        std::vector<double> row(13);
+        for (int m=0; m<nmb; ++m) {
+          const auto &ll = pm->lloc_eachmb[m + mbs];
+          const auto &sz = mbsize.h_view(m);
+          row = {static_cast<double>(ll.level), static_cast<double>(ll.lx1), static_cast<double>(ll.lx2),
+                 sz.x1min, sz.x1max, sz.x2min, sz.x2max, static_cast<double>(nx1), static_cast<double>(nx2),
+                 qblk[m], static_cast<double>(rawf[m]), static_cast<double>(appf[m]),
+                 static_cast<double>(pm->pmr->ncyc_since_ref(m + mbs))};
+          std::fwrite(row.data(), sizeof(double), row.size(), fd);
+        }
+        for (int p=0; p<npart; ++p) {
+          const double r4[4] = {prh(IPX,p), prh(IPY,p), prh(IPM,p), static_cast<double>(pih(PLEV,p))};
+          std::fwrite(r4, sizeof(double), 4, fd);
+        }
+        std::fclose(fd);
+      }
+    }
+    audit_prev_ = cur;
+  }
   if (global_variable::my_rank == 0) {
     std::FILE *fp = std::fopen("dust_trigger_log.txt", "a");
     if (fp != nullptr) {
@@ -295,6 +359,39 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       std::fclose(fp);
     }
   }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::ResumeAmrAfterRestart
+//! \brief Called by Driver::Initialize of a restarted run before the
+//! first time step.  Restores the cooldown age of every block and, when the file was written
+//! among the outputs of a cycle, carries out the mesh check that followed those outputs in
+//! the run that wrote it.  A file without the record (older code) keeps the old behaviour:
+//! ages start at zero and no check is repeated.
+
+void DustGasDrag::ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin) {
+  Mesh *pm = pmy_pack->pmesh;
+  if (!experimental_amr || !pm->adaptive || pm->pmr == nullptr) return;
+  if (!amr_restart_state_found) {
+    if (global_variable::my_rank == 0) {
+      std::cout << "# dust AMR restart: the file has no amr_state record: cooldown ages "
+                << "start at zero, the mesh check of the restart cycle is not repeated" << std::endl;
+    }
+    return;
+  }
+  if (static_cast<int>(amr_restart_ages.size()) != pm->nmb_total) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "amr_state of the restart file has " << amr_restart_ages.size()
+              << " blocks, the mesh " << pm->nmb_total << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  for (int m=0; m<pm->nmb_total; ++m) pm->pmr->ncyc_since_ref(m) = amr_restart_ages[m];
+  if (global_variable::my_rank == 0) {
+    std::cout << "# dust AMR restart: cooldown ages of " << pm->nmb_total
+              << " blocks restored; pending mesh check of cycle " << pm->ncycle << ": "
+              << (amr_restart_pending ? "done now" : "none") << std::endl;
+  }
+  if (amr_restart_pending) pm->pmr->AdaptiveMeshRefinement(pdrive, pin);
 }
 
 //----------------------------------------------------------------------------------------
