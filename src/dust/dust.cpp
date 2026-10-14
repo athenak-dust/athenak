@@ -395,7 +395,64 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_budget_x = pin->GetOrAddBoolean("dust", "cloud_merge_budget_x", false);
       cloud_audit_only = pin->GetOrAddBoolean("dust", "cloud_audit_only", false);
       cloud_resample = pin->GetOrAddBoolean("dust", "cloud_resample", false);
-      cloud_resample_interval = pin->GetOrAddInteger("dust", "cloud_resample_interval", 625);
+      // <dust>/cloud_resample_schedule = cycle (default: every
+      // cloud_resample_interval cycles, as before) or time (event k at t0 + k dt, dt from
+      // cloud_resample_dt in code time or cloud_resample_dt_omega in units of 1/omega0).  Only
+      // the chosen mode triggers; keys of the other mode are ignored with a warning (the input
+      // kept in a restart file still carries them when a run switches modes at a restart).
+      {
+        auto fatal = [](const std::string &msg) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << msg << std::endl;
+          std::exit(EXIT_FAILURE);
+        };
+        const bool g_int = pin->DoesParameterExist("dust", "cloud_resample_interval");
+        const bool g_dt = pin->DoesParameterExist("dust", "cloud_resample_dt");
+        const bool g_dto = pin->DoesParameterExist("dust", "cloud_resample_dt_omega");
+        const bool g_t0 = pin->DoesParameterExist("dust", "cloud_resample_t0");
+        const bool g_rst = pin->DoesParameterExist("dust", "cloud_resample_schedule_reset");
+        const std::string sched = pin->GetOrAddString("dust", "cloud_resample_schedule", "cycle");
+        if (pin->DoesBlockExist("shearing_box") &&
+            pin->DoesParameterExist("shearing_box", "omega0")) {
+          cloud_resample_omega = pin->GetReal("shearing_box", "omega0");
+        }
+        auto ignored = [](const std::string &keys, const std::string &mode) {
+          if (global_variable::my_rank == 0) {
+            std::cout << "# WARNING: " << keys << " ignored: cloud_resample_schedule = " << mode
+                      << std::endl;
+          }
+        };
+        if (sched == "time") {
+          cloud_resample_by_time = true;
+          if (g_int) ignored("cloud_resample_interval", "time");
+          if (g_dt == g_dto) {
+            fatal("cloud_resample_schedule = time needs exactly one of cloud_resample_dt and "
+                  "cloud_resample_dt_omega");
+          }
+          if (g_dto) {
+            if (!(cloud_resample_omega > 0.0)) {
+              fatal("cloud_resample_dt_omega needs <shearing_box>/omega0 > 0");
+            }
+            cloud_resample_dt = pin->GetReal("dust", "cloud_resample_dt_omega")/cloud_resample_omega;
+          } else {
+            cloud_resample_dt = pin->GetReal("dust", "cloud_resample_dt");
+          }
+          if (!(cloud_resample_dt > 0.0)) fatal("the resampling interval must be > 0");
+          cloud_resample_t0 = pin->GetOrAddReal("dust", "cloud_resample_t0", 0.0);
+          cloud_resample_schedule_reset =
+              pin->GetOrAddBoolean("dust", "cloud_resample_schedule_reset", false);
+        } else if (sched == "cycle") {
+          if (g_dt || g_dto || g_t0 || g_rst) {
+            ignored("cloud_resample_dt, cloud_resample_dt_omega, cloud_resample_t0 and "
+                    "cloud_resample_schedule_reset", "cycle");
+          }
+        } else {
+          fatal("cloud_resample_schedule must be cycle or time");
+        }
+      }
+      if (!cloud_resample_by_time) {
+        cloud_resample_interval = pin->GetOrAddInteger("dust", "cloud_resample_interval", 625);
+      }
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 2.0);
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
@@ -414,7 +471,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           at = end + 1;
         }
       }
-      if (cloud_resample && (cloud_resample_interval < 1 || cloud_resample_patch < 1 ||
+      if (cloud_resample && ((!cloud_resample_by_time && cloud_resample_interval < 1) ||
+                             cloud_resample_patch < 1 ||
                              cloud_gather_order != 2 || cloud_force_local || cloud_force_children ||
                              cloud_deform)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl

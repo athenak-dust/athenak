@@ -25,9 +25,11 @@
 //! changes during a run and cannot be rebuilt from the particles: the next free tag, the
 //! merge-pass counter (it rotates the walks), the root cloud masses, the resampling and the
 //! cumulative split / merge counters of the history, the state of the hybrid coupling.  The
-//! leaf maps, masks and per-cycle fields are rebuilt as in a fresh run; the merge and
-//! resampling schedules follow from the cycle number of the file.  Records are found by
-//! name, so a file written by a code with more (or fewer) records is still read.
+//! leaf maps, masks and per-cycle fields are rebuilt as in a fresh run; the merge schedule
+//! and the cycle-mode resampling schedule follow from the cycle number of the file, the
+//! time-mode resampling schedule from the record resample_clk (origin,
+//! interval, next event).  Records are found by name, so a file written by a code with more
+//! (or fewer) records is still read.
 //!
 //! One MPI rank only: the head has room for a per-rank layout, which is not implemented.
 //! Files without the section (written before this, or by runs without particles) are still
@@ -102,6 +104,16 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   }
   const std::uint64_t rs[2] = {cloud_resample_pass, cloud_resample_removed};
   PutRecord(b, "resample", rs, sizeof(rs));
+  // the time-mode resampling schedule (by_time 0 in cycle mode; next -1 before
+  // the first check)
+  const double rc[2] = {static_cast<double>(cloud_resample_t0), static_cast<double>(cloud_resample_dt)};
+  const std::int64_t rn[4] = {cloud_resample_by_time ? 1 : 0, cloud_resample_next,
+                              static_cast<std::int64_t>(cloud_resample_events),
+                              static_cast<std::int64_t>(cloud_resample_skipped)};
+  char clk[sizeof(rc) + sizeof(rn)];
+  std::memcpy(clk, rc, sizeof(rc));
+  std::memcpy(clk + sizeof(rc), rn, sizeof(rn));
+  PutRecord(b, "resample_clk", clk, sizeof(clk));
   const std::uint64_t sp[4] = {cloud_split_event, cloud_split_count, cloud_merge_count,
                                cloud_lobe_split_count};
   PutRecord(b, "split", sp, sizeof(sp));
@@ -122,6 +134,7 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
 
 void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
   std::size_t at = 0;
+  cloud_resample_restarted = true;
   while (at + 16 + sizeof(std::int32_t) <= nbytes) {
     char key[17] = {0};
     std::memcpy(key, p + at, 16);
@@ -144,6 +157,17 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
     } else if (name == "resample") {
       std::uint64_t v[2]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));
       cloud_resample_pass = v[0]; cloud_resample_removed = v[1];
+    } else if (name == "resample_clk") {
+      double rc[2]; std::int64_t rn[4]; want(sizeof(rc) + sizeof(rn));
+      std::memcpy(rc, d, sizeof(rc)); std::memcpy(rn, d + sizeof(rc), sizeof(rn));
+      // only a time-mode schedule that had started is continued (see ResampleDue)
+      if (rn[0] == 1 && rn[1] >= 0) {
+        cloud_resample_clock_restored = true;
+        cloud_resample_t0_file = rc[0]; cloud_resample_dt_file = rc[1];
+        cloud_resample_next_file = rn[1];
+        cloud_resample_events = static_cast<unsigned long long>(rn[2]);
+        cloud_resample_skipped = static_cast<unsigned long long>(rn[3]);
+      }
     } else if (name == "split") {
       std::uint64_t v[4]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));
       cloud_split_event = v[0]; cloud_split_count = v[1]; cloud_merge_count = v[2];
