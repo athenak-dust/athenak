@@ -118,6 +118,17 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
     fy = multi_d ? fy : 0;
     fz = three_d ? fz : 0;
 
+    // a particle moves less than one cell per step, so it can only have left for an adjacent
+    // MeshBlock; anything else means it was routed to a wrong MeshBlock before
+    if (abs(ix) > 1 || abs(iy) > 1 || abs(iz) > 1) {
+      Kokkos::printf("Particle routing: p=%d gid=%d x=(%.8e %.8e %.8e) lies more than one "
+                     "MeshBlock away from its MeshBlock x1=[%.6e,%.6e] x2=[%.6e,%.6e] "
+                     "x3=[%.6e,%.6e]\n", p, pi(PGID,p), x1, x2, x3, mbsize.d_view(m).x1min,
+                     mbsize.d_view(m).x1max, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max,
+                     mbsize.d_view(m).x3min, mbsize.d_view(m).x3max);
+      Kokkos::abort("particle outside the MeshBlocks adjacent to its own");
+    }
+
     // only update particle GID if it has crossed MeshBlock boundary
     if ((abs(ix) + abs(iy) + abs(iz)) != 0) {
       bool cross_in  = shear_x1 && (x1 < meshsize.x1min);
@@ -162,65 +173,98 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
         nb.dest = 0;
         UpdateGID(pi(PGID,p), nb, myrank, pcounter, psendl, p);
       } else {
+      // first non-empty slot of direction (jx,jy,jz) from slot k on; the search stays among the
+      // subslots of that direction (faces 4, edges 2, corners 1) and returns -1 if all are empty
+      auto filled = [&](int jx, int jy, int jz, int k) {
+        int nd = abs(jx) + abs(jy) + abs(jz);
+        int end = NeighborIndex(jx,jy,jz,0,0) + ((nd == 1) ? 4 : ((nd == 2) ? 2 : 1));
+        for (; k < end; ++k) {
+          if (nghbr.d_view(m,k).gid >= 0) {return k;}
+        }
+        return -1;
+      };
+      // An empty edge or corner slot: the region is covered by a coarser MeshBlock
+      // that is stored only once, under the lower-dimensional direction from which it is
+      // reached (e.g. the x1 face neighbour also covers the x1x2 edge when the x2 crossing
+      // stays inside this MeshBlock's parent).  That direction keeps the components of the
+      // crossing that leave the parent; the parity of the logical location tells which half
+      // of its parent this MeshBlock is.
+      auto coarse_cover = [&](int jx, int jy, int jz) {
+        int l1 = static_cast<int>(floor((mbsize.d_view(m).x1min - meshsize.x1min)/lx + 0.5));
+        int l2 = static_cast<int>(floor((mbsize.d_view(m).x2min - meshsize.x2min)/ly + 0.5));
+        int l3 = static_cast<int>(floor((mbsize.d_view(m).x3min - meshsize.x3min)/lz + 0.5));
+        int kx = (jx == 0 || ((l1 & 1) == ((jx > 0) ? 1 : 0))) ? jx : 0;
+        int ky = (jy == 0 || ((l2 & 1) == ((jy > 0) ? 1 : 0))) ? jy : 0;
+        int kz = (jz == 0 || ((l3 & 1) == ((jz > 0) ? 1 : 0))) ? jz : 0;
+        if ((abs(kx) + abs(ky) + abs(kz)) == 0 || (kx == jx && ky == jy && kz == jz)) {
+          return -1;
+        }
+        return filled(kx, ky, kz, NeighborIndex(kx,ky,kz,0,0));
+      };
+      int indx = -1;
       if (iz == 0) {
         if (iy == 0) {
           // x1 face
-          int indx = NeighborIndex(ix,0,0,0,0);           // neighbor at same level
+          indx = NeighborIndex(ix,0,0,0,0);               // neighbor at same level
           if (nghbr.d_view(m,indx).lev > mylevel) {       // neighbor at finer level
             indx = NeighborIndex(ix,0,0,fy,fz);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}  // neighbor at coarser level
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(ix,0,0,indx);                     // neighbor at coarser level
         } else if (ix == 0) {
           // x2 face
-          int indx = NeighborIndex(0,iy,0,0,0);
+          indx = NeighborIndex(0,iy,0,0,0);
           if (nghbr.d_view(m,indx).lev > mylevel) {
             indx = NeighborIndex(0,iy,0,fx,fz);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(0,iy,0,indx);
         } else {
           // x1x2 edge
-          int indx = NeighborIndex(ix,iy,0,0,0);
+          indx = NeighborIndex(ix,iy,0,0,0);
           if (nghbr.d_view(m,indx).lev > mylevel) {
             indx = NeighborIndex(ix,iy,0,fz,0);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(ix,iy,0,indx);
+          if (indx < 0) {indx = coarse_cover(ix,iy,0);}
         }
       } else if (iy == 0) {
         if (ix == 0) {
           // x3 face
-          int indx = NeighborIndex(0,0,iz,0,0);
+          indx = NeighborIndex(0,0,iz,0,0);
           if (nghbr.d_view(m,indx).lev > mylevel) {
             indx = NeighborIndex(0,0,iz,fx,fy);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(0,0,iz,indx);
         } else {
           // x3x1 edge
-          int indx = NeighborIndex(ix,0,iz,0,0);
+          indx = NeighborIndex(ix,0,iz,0,0);
           if (nghbr.d_view(m,indx).lev > mylevel) {
             indx = NeighborIndex(ix,0,iz,fy,0);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(ix,0,iz,indx);
+          if (indx < 0) {indx = coarse_cover(ix,0,iz);}
         }
       } else {
         if (ix == 0) {
           // x2x3 edge
-          int indx = NeighborIndex(0,iy,iz,0,0);
+          indx = NeighborIndex(0,iy,iz,0,0);
           if (nghbr.d_view(m,indx).lev > mylevel) {
             indx = NeighborIndex(0,iy,iz,fx,0);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(0,iy,iz,indx);
+          if (indx < 0) {indx = coarse_cover(0,iy,iz);}
         } else {
           // corners
-          int indx = NeighborIndex(ix,iy,iz,0,0);
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(ix,iy,iz,NeighborIndex(ix,iy,iz,0,0));
+          if (indx < 0) {indx = coarse_cover(ix,iy,iz);}
         }
       }
+      if (indx < 0) {
+        Kokkos::printf("Particle routing: p=%d gid=%d x=(%.8e %.8e %.8e) crossed in direction "
+                       "(%d %d %d) and no neighbor MeshBlock covers it\n", p, pi(PGID,p),
+                       x1, x2, x3, ix, iy, iz);
+        Kokkos::abort("no neighbor MeshBlock for a particle");
+      }
+      UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
 
       // reset x,y,z positions if particle crosses Mesh boundary using periodic BCs
       // RK position registers must be shifted with the position so the low-storage
