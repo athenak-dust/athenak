@@ -401,6 +401,7 @@ void DustGasDrag::ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin) {
 
 void DustGasDrag::BeforeRegrid() {
   amr_npart_before = pmy_pack->ppart->nprtcl_thispack;
+  amr_nmb_before = pmy_pack->pmesh->nmb_total;
   amr_checksum = ParticleChecksum(pmy_pack->ppart);
 }
 
@@ -423,6 +424,14 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   const int npart = ppar->nprtcl_thispack;
 
   BuildRefinableCloudTransfer(pin);
+  // A regrid that added blocks gets a resampling right after its split (if
+  // cloud_resample_after_refine); one that removed blocks starts a burst of merge passes
+  if (amr_nmb_before >= 0) {
+    if (pmesh->nmb_total > amr_nmb_before) amr_refined_pending = true;
+    if (pmesh->nmb_total < amr_nmb_before && cloud_merge_burst_dt > 0.0) {
+      cloud_merge_burst_until = pmesh->time + cloud_merge_burst_dt;
+    }
+  }
   merge_mask_built = false;       // built once per layout, at the next merge pass
   compress_mask_built = false;
 

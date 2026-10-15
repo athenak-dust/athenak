@@ -324,9 +324,22 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   SplitAndMergeClouds();
   // Resampling before the merge pass, so that an audit-only pass of the same cycle
   // writes the resampled state
-  // A resampling is due every cloud_resample_interval cycles, or at the planned physical times
-  if (cloud_resample && ResampleDue()) ResampleClouds();
-  if (cloud_merge && pmy_pack->pmesh->ncycle % cloud_merge_interval == 0 &&
+  // A resampling is due every cloud_resample_interval cycles, or at the planned physical times;
+  // and once more right after the split that follows a regrid which added blocks
+  {
+    const bool due = cloud_resample && ResampleDue();
+    const bool extra = cloud_resample && cloud_resample_after_refine && amr_refined_pending;
+    amr_refined_pending = false;
+    if (extra && !due) {
+      ++cloud_resample_extra;
+      if (global_variable::my_rank == 0) {
+        std::cout << "# resampling after a refinement: cycle " << pmy_pack->pmesh->ncycle
+                  << ", time " << pmy_pack->pmesh->time << std::endl;
+      }
+    }
+    if (due || extra) ResampleClouds();
+  }
+  if (cloud_merge && MergeDue() &&
       (cloud_merge_tstop < 0.0 || pmy_pack->pmesh->time < cloud_merge_tstop)) {
     MergeClouds();
   }

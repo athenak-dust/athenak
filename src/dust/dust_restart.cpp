@@ -114,6 +114,16 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   std::memcpy(clk, rc, sizeof(rc));
   std::memcpy(clk + sizeof(rc), rn, sizeof(rn));
   PutRecord(b, "resample_clk", clk, sizeof(clk));
+  // merge clock and burst
+  {
+    const double mc[3] = {static_cast<double>(cloud_merge_t0), static_cast<double>(cloud_merge_dt),
+                          static_cast<double>(cloud_merge_burst_until)};
+    const std::int64_t mn[2] = {cloud_merge_by_time ? 1 : 0, cloud_merge_next};
+    char mclk[sizeof(mc) + sizeof(mn)];
+    std::memcpy(mclk, mc, sizeof(mc));
+    std::memcpy(mclk + sizeof(mc), mn, sizeof(mn));
+    PutRecord(b, "merge_clk", mclk, sizeof(mclk));
+  }
   // dynamic mesh: pending mesh check after these outputs, cooldown age per block
   {
     Mesh *pm = pmy_pack->pmesh;
@@ -168,6 +178,14 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
     } else if (name == "resample") {
       std::uint64_t v[2]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));
       cloud_resample_pass = v[0]; cloud_resample_removed = v[1];
+    } else if (name == "merge_clk") {
+      double mc[3]; std::int64_t mn[2]; want(sizeof(mc) + sizeof(mn));
+      std::memcpy(mc, d, sizeof(mc)); std::memcpy(mn, d + sizeof(mc), sizeof(mn));
+      cloud_merge_burst_until = mc[2];
+      // the merge clock continues only with the same origin and interval
+      if (mn[0] == 1 && cloud_merge_by_time && mc[0] == cloud_merge_t0 && mc[1] == cloud_merge_dt) {
+        cloud_merge_next = mn[1]; cloud_merge_clock_restored = true;
+      }
     } else if (name == "amr_state") {
       if (n < static_cast<std::int32_t>(2*sizeof(std::int32_t)) || n % sizeof(std::int32_t) != 0) {
         Broken("dust record amr_state has an unexpected size");

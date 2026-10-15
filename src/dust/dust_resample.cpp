@@ -474,6 +474,42 @@ bool DustGasDrag::ResampleDue() {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::MergeDue
+//! \brief Is a merge pass due at the start of this cycle?  Cycle mode:
+//! every cloud_merge_interval cycles (unchanged).  Time mode: at the planned times
+//! t0 + k dt, by the rules of ResampleDue (first cycle that starts at or after the time; one
+//! pass however many planned times a cycle passed).  Either way, during a burst (after a
+//! regrid that removed blocks) also every cloud_merge_burst_interval cycles.
+
+bool DustGasDrag::MergeDue() {
+  Mesh *pmesh = pmy_pack->pmesh;
+  bool due = false;
+  if (!cloud_merge_by_time) {
+    due = (pmesh->ncycle % cloud_merge_interval == 0);
+  } else {
+    const double t = pmesh->time, dt = cloud_merge_dt, t0 = cloud_merge_t0;
+    auto eps = [](const double tk) { return 1.0e-12*std::fmax(1.0, std::fabs(tk)); };
+    auto planned = [&](const long long k) { return t0 + static_cast<double>(k)*dt; };
+    if (cloud_merge_next < 0) {
+      long long k = static_cast<long long>(std::ceil((t - t0)/dt));
+      if (k < 0) k = 0;
+      while (k > 0 && planned(k - 1) >= t - eps(planned(k - 1))) --k;
+      while (planned(k) < t - eps(planned(k))) ++k;
+      cloud_merge_next = k;
+    }
+    if (t >= planned(cloud_merge_next) - eps(planned(cloud_merge_next))) {
+      due = true;
+      long long nxt = static_cast<long long>(std::floor((t - t0)/dt)) + 1;
+      if (nxt < cloud_merge_next + 1) nxt = cloud_merge_next + 1;
+      while (planned(nxt) <= t + eps(planned(nxt))) ++nxt;
+      cloud_merge_next = nxt;
+    }
+  }
+  if (pmesh->time < cloud_merge_burst_until && pmesh->ncycle % cloud_merge_burst_interval == 0) due = true;
+  return due;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ResampleClouds
 //! \brief One resampling of the plain clouds (see the file header).  Returns the number of
 //! clouds removed.

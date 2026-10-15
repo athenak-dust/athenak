@@ -351,7 +351,9 @@ void WriteBAFields(Mesh *pm) {
   DualArray2D<int> tgt("ba_tsc_target", composite ? 1 : n2, composite ? 1 : n1);
   if (!composite) {
     if (pm->multilevel || pdust->deposit != DustDeposit::tsc) {
-      std::cerr << "BA fields: canonical deposit requires TSC on a uniform mesh"
+      std::cerr << "BA fields: canonical deposit requires TSC on a uniform mesh (static SMR with "
+                << "owner_overlap: no leaf deposit to write; with coupling = pc2 the run does not "
+                << "deposit a density either; use f64 snapshots and an offline estimator)"
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }

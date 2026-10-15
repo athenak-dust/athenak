@@ -816,6 +816,20 @@ class DustGasDrag {
   Real cloud_merge_min_mass = 0.5;    // a merge commits only with >= this fraction of m_ref
   bool cloud_merge_device = false;  // run MergeClouds on the device
   Real cloud_merge_tstop = -1.0;      // diagnostic: no merge passes after this time
+  // merge passes on a physical-time schedule (cloud_merge_schedule = time,
+  // cloud_merge_dt_omega) instead of every cloud_merge_interval cycles, and a burst of passes
+  // every cloud_merge_burst_interval cycles for cloud_merge_burst_dt_omega / omega0 after each
+  // regrid that removed blocks; resampling once more right after each regrid that added blocks
+  bool cloud_merge_by_time = false;
+  Real cloud_merge_dt = 0.0, cloud_merge_t0 = 0.0;
+  long long cloud_merge_next = -1;
+  Real cloud_merge_burst_dt = 0.0, cloud_merge_burst_until = -1.0;
+  int cloud_merge_burst_interval = 50;
+  bool cloud_merge_clock_restored = false;
+  bool cloud_resample_after_refine = false, amr_refined_pending = false;
+  unsigned long long cloud_resample_extra = 0;
+  int amr_nmb_before = -1;
+  bool MergeDue();
   DvceArray1D<char> merge_mask_d;     // device merge-cell masks of the level-L grids (built once,
   int merge_mask_geom[12] = {0};       // static SMR): per level n1, n2, offset
   bool merge_mask_built = false;

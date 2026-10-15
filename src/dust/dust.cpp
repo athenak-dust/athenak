@@ -370,6 +370,36 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_d3_iter = pin->GetOrAddInteger("dust", "cloud_merge_d3_iter", 30);
       cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", false);
       cloud_merge_tstop = pin->GetOrAddReal("dust", "cloud_merge_tstop", -1.0);
+      // Merge schedule in physical time, burst after derefinement
+      {
+        const std::string ms = pin->GetOrAddString("dust", "cloud_merge_schedule", "cycle");
+        Real om = 0.0;
+        if (pin->DoesBlockExist("shearing_box") && pin->DoesParameterExist("shearing_box", "omega0")) {
+          om = pin->GetReal("shearing_box", "omega0");
+        }
+        auto fatal = [](const std::string &msg) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << msg << std::endl;
+          std::exit(EXIT_FAILURE);
+        };
+        if (ms == "time") {
+          cloud_merge_by_time = true;
+          if (!(om > 0.0)) fatal("cloud_merge_schedule = time needs <shearing_box>/omega0 > 0");
+          cloud_merge_dt = pin->GetReal("dust", "cloud_merge_dt_omega")/om;
+          if (!(cloud_merge_dt > 0.0)) fatal("cloud_merge_dt_omega must be > 0");
+          cloud_merge_t0 = pin->GetOrAddReal("dust", "cloud_merge_t0", 0.0);
+        } else if (ms != "cycle") {
+          fatal("cloud_merge_schedule must be cycle or time");
+        }
+        const Real bdt = pin->GetOrAddReal("dust", "cloud_merge_burst_dt_omega", 0.0);
+        if (bdt > 0.0) {
+          if (!(om > 0.0)) fatal("cloud_merge_burst_dt_omega needs <shearing_box>/omega0 > 0");
+          cloud_merge_burst_dt = bdt/om;
+        }
+        cloud_merge_burst_interval = pin->GetOrAddInteger("dust", "cloud_merge_burst_interval", 50);
+        if (cloud_merge_burst_interval < 1) fatal("cloud_merge_burst_interval must be >= 1");
+        cloud_resample_after_refine = pin->GetOrAddBoolean("dust", "cloud_resample_after_refine", false);
+      }
       {
         std::string mode = pin->GetOrAddString("dust", "cloud_merge_mode", "tent");
         if (mode == "tent") cloud_merge_mode = 0;
