@@ -60,7 +60,14 @@ constexpr double kInf = std::numeric_limits<double>::infinity();
 struct PatchInfo {
   int n = 0, kept = 0, ncap = 0, fallback = 0, steps_zero = 0, steps_cap = 0, scans = 0;
   double res = 0.0;
+  // seconds spent in the stages of this patch
+  double t_rows = 0.0, t_scale = 0.0, t_qr = 0.0, t_null = 0.0, t_red = 0.0, t_check = 0.0;
 };
+
+using StageClock = std::chrono::steady_clock;
+inline double Since(const StageClock::time_point &a) {
+  return std::chrono::duration<double>(StageClock::now() - a).count();
+}
 
 struct Work {
   std::vector<double> a, b, qr, z, d, wa, ua, vn1, vn2, x, w, den, r0;
@@ -156,10 +163,13 @@ inline void Step(const double *d, const double *w, const double *u, const int n,
 void ReduceCap(const double *b, const int m, const int n, double *w, const double *u,
                char *fixed, PatchInfo &info, Work &ws) {
   for (int i=0; i<n; ++i) fixed[i] = 0;
+  const auto tq = StageClock::now();
   ws.qr.assign(b, b + static_cast<std::size_t>(m)*n);
   ws.perm.resize(n); ws.vn1.resize(n); ws.vn2.resize(n);
   const int r = PivotedQR(ws.qr.data(), m, n, ws.perm.data(), ws.vn1.data(), ws.vn2.data());
+  info.t_qr += Since(tq);
   if (r >= n) return;
+  const auto tn = StageClock::now();
   int ncol = n - r;
   ws.z.assign(static_cast<std::size_t>(n)*ncol, 0.0);
   ws.x.resize(r);
@@ -175,6 +185,8 @@ void ReduceCap(const double *b, const int m, const int n, double *w, const doubl
     for (int i=0; i<r; ++i) zc[ws.perm[i]] = -ws.x[i];
     zc[ws.perm[r + c]] = 1.0;
   }
+  info.t_null += Since(tn);
+  const auto tr = StageClock::now();
   ws.d.resize(n);
   std::vector<double> t(2*static_cast<std::size_t>(ncol));
   std::vector<int> kk(2*static_cast<std::size_t>(ncol));
@@ -233,6 +245,7 @@ void ReduceCap(const double *b, const int m, const int n, double *w, const doubl
       zc[k] = 0.0;
     }
   }
+  info.t_red += Since(tr);
 }
 
 // the clouds of one patch (indices a0..a1-1 of the patch-sorted pool): rows, bounded
@@ -248,6 +261,7 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
   auto P = [&](const int c, const int a) {return pd[static_cast<std::size_t>(a)*npd + c];};
   for (int a=a0; a<a1; ++a) mnew[a] = P(JM, a);
   if (n < 2) return info;
+  auto ts = StageClock::now();
   // leaves under the clouds of the patch
   ws.leaves.clear();
   for (int e=cptr[a0]; e<cptr[a1]; ++e) ws.leaves.push_back(ctgt[e]);
@@ -283,6 +297,8 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
     g[2] = c[0]*c[0]; g[3] = c[0]*c[1]; g[4] = c[0]*c[2]; g[5] = c[1]*c[1]; g[6] = c[1]*c[2];
     g[7] = c[2]*c[2];
   }
+  info.t_rows += Since(ts);
+  ts = StageClock::now();
   // scaled rows without the empty ones
   ws.r0.assign(nrow, 0.0);
   for (int j=0; j<n; ++j) {
@@ -305,6 +321,7 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
   ws.act.clear();
   int nxt = 0;
   std::vector<double> bact;
+  info.t_scale += Since(ts);
   while (true) {
     const int take = std::min(n - nxt, cap - static_cast<int>(ws.act.size()));
     for (int i=0; i<take; ++i) ws.act.push_back(nxt + i);
@@ -329,6 +346,7 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
     if (ws.left.size() == ws.act.size()) break;   // no room was made: the rest keeps its masses
     ws.act.swap(ws.left);
   }
+  ts = StageClock::now();
   // row check on the unscaled rows: |A w - A m| / (|A| m)
   bool bad = false;
   double res = 0.0;
@@ -342,6 +360,7 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
   }
   for (int i=0; i<nrow; ++i) res = std::max(res, std::fabs(dif[i])/std::max(ws.den[i], 1.0e-300));
   info.res = res;
+  info.t_check += Since(ts);
   if (bad || !(res <= kResMax)) {
     info.fallback = 2;
     return info;      // the patch keeps its masses
@@ -717,8 +736,11 @@ int DustGasDrag::ResampleClouds() {
   t0 = Clock::now();
   long long pool = 0, kept = 0, atcap = 0, nfall = 0, nred = 0, npat = 0, zsteps = 0, csteps = 0, scans = 0;
   double resmax = 0.0, cpu = 0.0;
+  double st[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // stage seconds, all threads
   for (const auto &f : infos) {
     if (f.n == 0) continue;
+    st[0] += f.t_rows; st[1] += f.t_scale; st[2] += f.t_qr; st[3] += f.t_null; st[4] += f.t_red;
+    st[5] += f.t_check;
     ++npat; pool += f.n; kept += f.kept; atcap += f.ncap; zsteps += f.steps_zero; csteps += f.steps_cap;
     scans += f.scans;
     if (f.fallback) ++nfall; else resmax = std::max(resmax, f.res);
@@ -784,13 +806,15 @@ int DustGasDrag::ResampleClouds() {
       std::fprintf(fp, "# ncycle time npart_before npart_after pool above_cap lobed patches"
                    " patches_reduced kept at_cap fallback max_res_accepted steps_zero steps_cap scans"
                    " M_b M_a PX_b PX_a t_total t_device t_copy t_sort t_host_wall t_host_cpu t_back"
-                   " threads nnz\n");
+                   " threads nnz s_rows s_scale s_qr s_null s_reduce s_check\n");
     }
     std::fprintf(fp, "%d %.17g %d %d %lld %.0f %.0f %lld %lld %lld %lld %lld %.3e %lld %lld %lld"
-                 " %.17g %.17g %.17g %.17g %.4e %.4e %.4e %.4e %.4e %.4e %.4e %d %d\n", pmesh->ncycle,
+                 " %.17g %.17g %.17g %.17g %.4e %.4e %.4e %.4e %.4e %.4e %.4e %d %d"
+                 " %.4e %.4e %.4e %.4e %.4e %.4e\n", pmesh->ncycle,
                  pmesh->time, npart, nfinal, pool, cnt_b[1], cnt_b[0], npat, nred, kept, atcap, nfall,
                  resmax, zsteps, csteps, scans, tot_b[0], tot_a[0], tot_b[1], tot_a[1], seconds(t_all),
-                 t_dev, t_copy, t_sort, t_host, cpu, t_back, nthread, nnz);
+                 t_dev, t_copy, t_sort, t_host, cpu, t_back, nthread, nnz, st[0], st[1], st[2],
+                 st[3], st[4], st[5]);
     std::fclose(fp);
   }
   if (dump) DumpResampleState(ppar, pmesh, "post");
