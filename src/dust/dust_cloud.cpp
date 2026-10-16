@@ -90,11 +90,12 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   cloud_sort_interval = pin->GetOrAddInteger("dust", "cloud_sort_interval", 0);
   {
     const std::string so = pin->GetOrAddString("dust", "cloud_sort_order", "linear");
-    if (so != "linear" && so != "morton") {
-      std::cout << "### FATAL ERROR: <dust>/cloud_sort_order must be linear or morton" << std::endl;
+    if (so != "linear" && so != "morton" && so != "random") {
+      std::cout << "### FATAL ERROR: <dust>/cloud_sort_order must be linear, morton or random" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     cloud_sort_morton = (so == "morton");
+    cloud_sort_random = (so == "random");   // diagnostic: a random permutation
     cloud_sort_at_start = pin->GetOrAddBoolean("dust", "cloud_sort_at_start", false);
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
   }
