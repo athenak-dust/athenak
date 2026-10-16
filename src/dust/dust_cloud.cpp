@@ -206,6 +206,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // t = 0-100; 8% slower on an RTX 4080 as well); the integrals are the same to rounding.
   t.native = pin->GetOrAddBoolean("dust", "cloud_native_transfer", false);
   cloud_native_check = pin->GetOrAddInteger("dust", "cloud_native_check", 0);
+  // The actual-leaf traversal is built with the maps; cloud_leaf_check compares it
+  cloud_leaf_check = pin->GetOrAddInteger("dust", "cloud_leaf_check", 0);
   if (nlev + 1 > SMRCompositeTransfer::kMaxNativeLevels) t.native = false;
   if (t.native || cloud_native_check > 0) {
     int total = 0;
@@ -258,6 +260,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << (t.native ? ", level-native traversal" : ", finest-grid traversal only")
               << std::endl;
   }
+  BuildLeafTraversal();
 }
 
 //----------------------------------------------------------------------------------------
@@ -341,6 +344,9 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   }
   if (cloud_native_check > 0 && pmy_pack->pmesh->ncycle % cloud_native_check == 0) {
     CheckNativeTransfer();
+  }
+  if (cloud_leaf_check > 0 && pmy_pack->pmesh->ncycle % cloud_leaf_check == 0) {
+    CheckLeafTraversal();
   }
   return TaskStatus::complete;
 }

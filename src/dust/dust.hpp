@@ -675,6 +675,151 @@ struct SMRCompositeTransfer {
 };
 
 //----------------------------------------------------------------------------------------
+//! \struct LeafTraversal
+//! Block-local traversal of the actual leaves under a
+//! refinable cloud, without the global virtual finest grid of SMRCompositeTransfer.
+//!
+//! Each MeshBlock knows its box, its level and its adjacent MeshBlocks (from the AthenaK
+//! neighbour table, every distinct neighbour once, with the periodic shift that puts it next
+//! to the block).  A cloud owned by block m is integrated exactly over every leaf cell of m
+//! and of its neighbours that its support overlaps: per direction the integral of the cloud
+//! shape over the leaf interval is a difference of the hat CDF (and of its first moment),
+//! the formulas of SMRCompositeTransfer::CloudWeightsMoments1D evaluated at the leaf faces
+//! instead of the faces of the virtual finest cells.  The integral over a leaf is the sum of
+//! the integrals over its finest sub-cells, so the weights and first moments equal those of
+//! the table up to round-off; lobes, gather codes and the point rule are handled as there.
+//! The sum of the weights is returned so that a support reaching beyond the neighbours
+//! (possible only for clouds much coarser than the leaves) is detected, not truncated.
+//!
+//! One MPI rank (the neighbours' boxes are read from the local pack); the structure is meant
+//! to receive cached remote boxes later.
+
+struct LeafTraversal {
+  static constexpr int kMaxNb = 16;    // distinct neighbours of a 2-D block (12 at most)
+  int nmb = 0, gids = 0;
+  int nx1 = 0, nx2 = 0, is = 0, js = 0, ncells1 = 0, ncells2 = 0;
+  Real lx = 0.0, ly = 0.0, x1min = 0.0, x2min = 0.0, x1max = 0.0, x2max = 0.0;
+  Real root_dx1 = 0.0, root_dx2 = 0.0;
+  bool lobe3_integral = false;
+  DvceArray2D<Real> box;               // (m, 0..3): x1min, x2min, dx1, dx2 of block m
+  DvceArray1D<int> nnb;                // number of neighbours of block m
+  DvceArray2D<int> nb;                 // (m, k): local index of neighbour k
+  DvceArray3D<int> nbs;                // (m, k, 0..1): periodic shift (in domain lengths)
+
+  KOKKOS_INLINE_FUNCTION
+  static Real Wrap(const Real x, const Real xmin, const Real xmax) {
+    const Real l = xmax - xmin;
+    Real w = x;
+    while (w < xmin) w += l;
+    while (w >= xmax) w -= l;
+    return w;
+  }
+
+  // the cloud shape along one direction (SMRCompositeTransfer::CloudWeightsMoments1D)
+  struct Shape {
+    Real x = 0.0, ell = 1.0, sl = 0.0, lo = 0.0, hi = 0.0;
+    int lobe = 0;
+    bool both = false, point = false;
+  };
+  KOKKOS_INLINE_FUNCTION
+  static Shape MakeShape(const Real x, const Real ell_in, const int lobe_in, const bool point) {
+    Shape s;
+    s.both = (lobe_in == 3);
+    s.ell = s.both ? 2.0*ell_in : ell_in;
+    s.lobe = s.both ? 0 : lobe_in;
+    s.sl = (s.lobe == 1) ? -s.ell : s.ell;
+    s.lo = (s.lobe == 1) ? x - 2.0*s.ell : x - s.ell;
+    s.hi = (s.lobe == 2) ? x + 2.0*s.ell : x + s.ell;
+    s.x = x;
+    s.point = point;
+    return s;
+  }
+  // weight and first moment (about the particle, length units) over [a, b]
+  KOKKOS_INLINE_FUNCTION
+  static void Interval(const Shape &s, const Real a, const Real b, Real &w, Real &g) {
+    using T = SMRCompositeTransfer;
+    const Real inv = 1.0/s.ell;
+    const Real sa = (a - s.x)*inv, sb = (b - s.x)*inv;
+    w = T::HatCDF(sb) - T::HatCDF(sa);
+    g = (s.both && s.point) ? 0.0 : s.ell*(T::HatMoment(sb) - T::HatMoment(sa));
+    if (s.lobe) {
+      const Real ta = (a - s.x - s.sl)*inv, tb = (b - s.x - s.sl)*inv;
+      const Real wl = T::HatCDF(tb) - T::HatCDF(ta);
+      w = (2.0/3.0)*w + (1.0/3.0)*wl;
+      g = s.point ? 0.0
+          : (2.0/3.0)*g + (1.0/3.0)*(s.ell*(T::HatMoment(tb) - T::HatMoment(ta)) + s.sl*wl);
+    }
+  }
+
+  // every leaf cell under the cloud `code` at (x1, x2) owned by block m: function(target, w,
+  // m1x, m1y) with kMoments (moments about the particle), function(target, w) without.
+  // Returns the sum of the weights.
+  template <bool kMoments, typename Function>
+  KOKKOS_INLINE_FUNCTION
+  Real ForEach(const Real px1, const Real px2, const int code, const int m,
+               const Function &function) const {
+    using T = SMRCompositeTransfer;
+    const Real x1 = Wrap(px1, x1min, x1max), x2 = Wrap(px2, x2min, x2max);
+    const int lev = T::CloudLevel(code);
+    const bool point = kMoments && (code & T::kCloudGatherPoint) != 0;
+    const int lb1 = T::CloudLobe1(code), lb2 = T::CloudLobe2(code);
+    const Shape s1 = MakeShape(x1, root_dx1/static_cast<Real>(1 << lev), lb1,
+                               point && !(lobe3_integral && lb1 == 3));
+    const Shape s2 = MakeShape(x2, root_dx2/static_cast<Real>(1 << lev), lb2,
+                               point && !(lobe3_integral && lb2 == 3));
+    Real wsum = 0.0;
+    const int nn = nnb(m);
+    for (int k=-1; k<nn; ++k) {
+      const int b = (k < 0) ? m : nb(m, k);
+      const Real sx = (k < 0) ? 0.0 : static_cast<Real>(nbs(m, k, 0));
+      const Real sy = (k < 0) ? 0.0 : static_cast<Real>(nbs(m, k, 1));
+      const Real dx = box(b, 2), dy = box(b, 3);
+      const Real bx0 = box(b, 0) - sx*lx, by0 = box(b, 1) - sy*ly;
+      const Real bx1 = bx0 + nx1*dx, by1 = by0 + nx2*dy;
+      if (s1.hi <= bx0 || s1.lo >= bx1 || s2.hi <= by0 || s2.lo >= by1) continue;
+      int ia = static_cast<int>(floor((s1.lo - bx0)/dx));
+      int ib = static_cast<int>(ceil((s1.hi - bx0)/dx)) - 1;
+      int ja = static_cast<int>(floor((s2.lo - by0)/dy));
+      int jb = static_cast<int>(ceil((s2.hi - by0)/dy)) - 1;
+      ia = (ia < 0) ? 0 : ia; ib = (ib > nx1 - 1) ? nx1 - 1 : ib;
+      ja = (ja < 0) ? 0 : ja; jb = (jb > nx2 - 1) ? nx2 - 1 : jb;
+      for (int j=ja; j<=jb; ++j) {
+        Real w2, g2;
+        Interval(s2, by0 + j*dy, by0 + (j + 1)*dy, w2, g2);
+        if (w2 == 0.0 && (!kMoments || g2 == 0.0)) continue;
+        for (int i=ia; i<=ib; ++i) {
+          Real w1, g1;
+          Interval(s1, bx0 + i*dx, bx0 + (i + 1)*dx, w1, g1);
+          const Real w = w2*w1;
+          wsum += w;
+          const int target = (b*ncells2 + j + js)*ncells1 + i + is;
+          if constexpr (kMoments) {
+            const Real m1x = w2*g1, m1y = w1*g2;
+            if (w == 0.0 && m1x == 0.0 && m1y == 0.0) continue;
+            function(target, w, m1x, m1y);
+          } else {
+            if (w == 0.0) continue;
+            function(target, w);
+          }
+        }
+      }
+    }
+    return wsum;
+  }
+
+  // encoded leaf cell of block m that holds (x1, x2)
+  KOKKOS_INLINE_FUNCTION
+  int Owner(const Real px1, const Real px2, const int m) const {
+    const Real x1 = Wrap(px1, x1min, x1max), x2 = Wrap(px2, x2min, x2max);
+    int i = static_cast<int>(floor((x1 - box(m, 0))/box(m, 2)));
+    int j = static_cast<int>(floor((x2 - box(m, 1))/box(m, 3)));
+    i = (i < 0) ? 0 : ((i > nx1 - 1) ? nx1 - 1 : i);
+    j = (j < 0) ? 0 : ((j > nx2 - 1) ? nx2 - 1 : j);
+    return (m*ncells2 + j + js)*ncells1 + i + is;
+  }
+};
+
+//----------------------------------------------------------------------------------------
 //! \struct DustGasDragTaskIDs
 //  \brief container to hold TaskIDs of all dust+hydro tasks
 
@@ -1076,6 +1221,11 @@ class DustGasDrag {
   bool ResampleDue();         // is a resampling due at the start of this cycle?
   void PackGatherField(const DvceArray5D<Real> &vel);   // fills gpack from a velocity array
   void CheckNativeTransfer();  // level-native against finest-grid traversal
+  // block-local traversal of the actual leaves (dust_leaf.cpp)
+  LeafTraversal leaf_traversal;
+  int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
+  void BuildLeafTraversal();
+  void CheckLeafTraversal();
 
   // ...in "before_timeintegrator" list
   TaskStatus GammaSwitch(Driver *pdrive, int stage);
