@@ -398,7 +398,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         }
         cloud_merge_burst_interval = pin->GetOrAddInteger("dust", "cloud_merge_burst_interval", 50);
         if (cloud_merge_burst_interval < 1) fatal("cloud_merge_burst_interval must be >= 1");
-        cloud_resample_after_refine = pin->GetOrAddBoolean("dust", "cloud_resample_after_refine", false);
       }
       {
         std::string mode = pin->GetOrAddString("dust", "cloud_merge_mode", "tent");
@@ -490,6 +489,31 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
       cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
       cloud_resample_skip_at_cap = pin->GetOrAddBoolean("dust", "cloud_resample_skip_at_cap", true);
+      // Resampling after every regrid, default on.  The older key
+      // (cloud_resample_after_refine: refine only, default off) maps onto it, so the inputs of
+      // earlier runs keep their meaning for "false" (no extra resampling).
+      {
+        const bool has_new = pin->DoesParameterExist("dust", "cloud_resample_after_regrid");
+        const bool has_old = pin->DoesParameterExist("dust", "cloud_resample_after_refine");
+        if (has_new && has_old) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << "set <dust>/cloud_resample_after_regrid only (cloud_resample_after_refine "
+                    << "is the old key)" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        bool dflt = true;
+        if (has_old) {
+          dflt = pin->GetBoolean("dust", "cloud_resample_after_refine");
+          if (global_variable::my_rank == 0) {
+            std::cout << "# NOTE (dust): cloud_resample_after_refine = " << (dflt ? "true" : "false")
+                      << " is read as cloud_resample_after_regrid = " << (dflt ? "true" : "false")
+                      << " (after every regrid, refine or derefine, once the particle "
+                      << "work of the regrid is done)" << std::endl;
+          }
+        }
+        cloud_resample_after_regrid = pin->GetOrAddBoolean("dust", "cloud_resample_after_regrid",
+                                                           dflt);
+      }
       // <dust>/cloud_resample_dump (diagnostic): comma-separated cycles; the
       // resampling of each of them writes the particle table right before and right after
       {

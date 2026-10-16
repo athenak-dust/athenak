@@ -819,17 +819,25 @@ class DustGasDrag {
   // merge passes on a physical-time schedule (cloud_merge_schedule = time,
   // cloud_merge_dt_omega) instead of every cloud_merge_interval cycles, and a burst of passes
   // every cloud_merge_burst_interval cycles for cloud_merge_burst_dt_omega / omega0 after each
-  // regrid that removed blocks; resampling once more right after each regrid that added blocks
+  // regrid that deleted blocks
   bool cloud_merge_by_time = false;
   Real cloud_merge_dt = 0.0, cloud_merge_t0 = 0.0;
   long long cloud_merge_next = -1;
   Real cloud_merge_burst_dt = 0.0, cloud_merge_burst_until = -1.0;
   int cloud_merge_burst_interval = 50;
   bool cloud_merge_clock_restored = false;
-  bool cloud_resample_after_refine = false, amr_refined_pending = false;
-  unsigned long long cloud_resample_extra = 0;
-  int amr_nmb_before = -1;
   bool MergeDue();
+  // One resampling after every regrid, once the particle work of that regrid
+  // is done (the split of the next cycle and, with merging on, the first merge pass of a
+  // derefinement); on by default in dynamic-mesh runs with resampling.  An event is a regrid
+  // that created (nnew) or deleted (ndel) blocks, whatever the net change of the block count.
+  bool cloud_resample_after_regrid = true;
+  bool amr_event_pending = false;
+  int amr_event_nnew = 0, amr_event_ndel = 0;  // summed if two regrids precede the handling
+  int amr_event_regrid = 0;                    // regrid number (amr_regrids) of the last one
+  long long amr_event_handled = 0, amr_event_merged = 0;
+  int amr_regrid_nnew = 0, amr_regrid_ndel = 0;  // of the regrid in progress (BeforeRegrid)
+  void HandleRegridEvent(const bool merge_due);
   DvceArray1D<char> merge_mask_d;     // device merge-cell masks of the level-L grids (built once,
   int merge_mask_geom[12] = {0};       // static SMR): per level n1, n2, offset
   bool merge_mask_built = false;
@@ -1032,7 +1040,8 @@ class DustGasDrag {
   void BuildRefinableCloudTransfer(ParameterInput *pin);
   // experimental dynamic mesh (dust_amr.cpp): rebuild the leaf maps, mark
   // the cached masks stale, set PGID from the positions and the particle time step again
-  void BeforeRegrid();                // particle count and checksum before the mesh changes
+  void BeforeRegrid(int nnew, int ndel);  // particle count and checksum before the mesh changes
+  int ResetPGIDFromPositions(const char *when);  // refinable clouds
   void RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin);
   unsigned long long amr_checksum = 0ULL;
   int amr_npart_before = -1;

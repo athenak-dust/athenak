@@ -322,31 +322,86 @@ void DustGasDrag::CheckNativeTransfer() {
 TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) return TaskStatus::complete;
   SplitAndMergeClouds();
-  // Resampling before the merge pass, so that an audit-only pass of the same cycle
-  // writes the resampled state
-  // A resampling is due every cloud_resample_interval cycles, or at the planned physical times;
-  // and once more right after the split that follows a regrid which added blocks
-  {
-    const bool due = cloud_resample && ResampleDue();
-    const bool extra = cloud_resample && cloud_resample_after_refine && amr_refined_pending;
-    amr_refined_pending = false;
-    if (extra && !due) {
-      ++cloud_resample_extra;
-      if (global_variable::my_rank == 0) {
-        std::cout << "# resampling after a refinement: cycle " << pmy_pack->pmesh->ncycle
-                  << ", time " << pmy_pack->pmesh->time << std::endl;
-      }
-    }
-    if (due || extra) ResampleClouds();
+  // the merge clock is read once per cycle (MergeDue advances it)
+  const bool merge_due = cloud_merge && MergeDue() &&
+      (cloud_merge_tstop < 0.0 || pmy_pack->pmesh->time < cloud_merge_tstop);
+  if (amr_event_pending && !(cloud_resample && cloud_resample_after_regrid)) {
+    amr_event_pending = false;          // no resampling after regrids: nothing to do
+    amr_event_nnew = amr_event_ndel = 0;
   }
-  if (cloud_merge && MergeDue() &&
-      (cloud_merge_tstop < 0.0 || pmy_pack->pmesh->time < cloud_merge_tstop)) {
-    MergeClouds();
+  if (amr_event_pending) {
+    // The cycle after a regrid: merge pass first, then one resampling
+    HandleRegridEvent(merge_due);
+  } else {
+    // Resampling before the merge pass, so that an audit-only pass of the same cycle
+    // writes the resampled state; it is due every cloud_resample_interval cycles, or at the
+    // planned physical times
+    if (cloud_resample && ResampleDue()) ResampleClouds();
+    if (merge_due) MergeClouds();
   }
   if (cloud_native_check > 0 && pmy_pack->pmesh->ncycle % cloud_native_check == 0) {
     CheckNativeTransfer();
   }
   return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::HandleRegridEvent
+//! \brief The first cycle after a regrid.  The split of this cycle
+//! has run (the particle refinement of the regrid).  With merging on, a merge pass runs next
+//! when one is due anyway or when the regrid deleted blocks (the first pass of the burst,
+//! whatever the phase of cloud_merge_burst_interval).  Then one resampling: a scheduled
+//! resampling of this cycle is the same one (its event number advances as usual); otherwise
+//! the schedule is not touched.  The event is done even if nothing could be resampled.  One
+//! line per event in regrid_event_log.txt and in the log.
+
+void DustGasDrag::HandleRegridEvent(const bool merge_due) {
+  Mesh *pmesh = pmy_pack->pmesh;
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int nnew = amr_event_nnew, ndel = amr_event_ndel;
+  const char *kind = (nnew > 0 && ndel > 0) ? "mixed" : ((ndel > 0) ? "derefine" : "refine");
+  const bool merge_ok = cloud_merge &&
+      (cloud_merge_tstop < 0.0 || pmesh->time < cloud_merge_tstop);
+  const bool do_merge = merge_due || (merge_ok && ndel > 0);
+  const char *why = !do_merge ? "none"
+                  : ((merge_due && ndel > 0) ? "due+derefine" : (merge_due ? "due" : "derefine"));
+  const int n0 = ppar->nprtcl_thispack;
+  Kokkos::Timer timer;
+  if (do_merge) MergeClouds();
+  Kokkos::fence();
+  const double t_merge = timer.seconds();
+  const int n1 = ppar->nprtcl_thispack;
+  const bool scheduled = ResampleDue();
+  timer.reset();
+  const int removed = ResampleClouds();
+  Kokkos::fence();
+  const double t_resample = timer.seconds();
+  const int n2 = ppar->nprtcl_thispack;
+  ++amr_event_handled;
+  if (scheduled) ++amr_event_merged;
+  if (global_variable::my_rank == 0) {
+    std::FILE *fp = std::fopen("regrid_event_log.txt", "a");
+    if (fp != nullptr) {
+      std::fseek(fp, 0, SEEK_END);
+      if (std::ftell(fp) == 0) {
+        std::fprintf(fp, "# event regrid ncycle time created deleted kind merge_pass "
+                     "with_scheduled_resampling npart_before npart_after_merge "
+                     "npart_after_resampling removed t_merge t_resampling\n");
+      }
+      std::fprintf(fp, "%lld %d %d %.17g %d %d %s %s %d %d %d %d %d %.4e %.4e\n",
+                   amr_event_handled, amr_event_regrid, pmesh->ncycle, pmesh->time, nnew, ndel,
+                   kind, why, scheduled ? 1 : 0, n0, n1, n2, removed, t_merge, t_resample);
+      std::fclose(fp);
+    }
+    std::cout << "# regrid event " << amr_event_handled << ": regrid "
+              << amr_event_regrid << ", " << kind << " (created " << nnew << ", deleted " << ndel
+              << "), cycle " << pmesh->ncycle << ", time " << pmesh->time << ": merge pass "
+              << why << ", resampling " << (scheduled ? "(the scheduled one of this cycle)"
+                                                      : "(extra)")
+              << " removed " << removed << " of " << n1 << std::endl;
+  }
+  amr_event_pending = false;
+  amr_event_nnew = amr_event_ndel = 0;
 }
 
 //----------------------------------------------------------------------------------------

@@ -28,8 +28,9 @@
 //! leaf maps, masks and per-cycle fields are rebuilt as in a fresh run; the merge schedule
 //! and the cycle-mode resampling schedule follow from the cycle number of the file, the
 //! time-mode resampling schedule from the record resample_clk (origin,
-//! interval, next event).  Records are found by name, so a file written by a code with more
-//! (or fewer) records is still read.
+//! interval, next event); a regrid whose resampling has not run yet
+//! from the record regrid_evt.  Records are found by name, so a file written by a code with
+//! more (or fewer) records is still read.
 //!
 //! One MPI rank only: the head has room for a per-rank layout, which is not implemented.
 //! Files without the section (written before this, or by runs without particles) are still
@@ -151,6 +152,11 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   PutRecord(b, "hybrid_n", hn, sizeof(hn));
   const std::int32_t am = amr_regrids;
   PutRecord(b, "amr_regrids", &am, sizeof(am));
+  // a regrid whose resampling is still to come (a file that Finalize writes
+  // right after the last regrid of a run) and the event counters
+  const std::int64_t ev[6] = {amr_event_pending ? 1 : 0, amr_event_nnew, amr_event_ndel,
+                              amr_event_regrid, amr_event_handled, amr_event_merged};
+  PutRecord(b, "regrid_evt", ev, sizeof(ev));
 }
 
 void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
@@ -229,6 +235,12 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
       hybrid_pc2_cycles = v[0]; hybrid_split_be_cycles = v[1];
     } else if (name == "amr_regrids") {
       std::int32_t v; want(sizeof(v)); std::memcpy(&v, d, sizeof(v)); amr_regrids = v;
+    } else if (name == "regrid_evt") {
+      std::int64_t v[6]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));
+      amr_event_pending = (v[0] != 0);
+      amr_event_nnew = static_cast<int>(v[1]); amr_event_ndel = static_cast<int>(v[2]);
+      amr_event_regrid = static_cast<int>(v[3]);
+      amr_event_handled = v[4]; amr_event_merged = v[5];
     } else if (global_variable::my_rank == 0) {
       std::cout << "# WARNING (dust restart): record '" << name << "' is not known to this code "
                 << "and is ignored" << std::endl;

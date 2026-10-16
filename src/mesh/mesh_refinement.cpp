@@ -161,7 +161,7 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
 
   // Refine/derefine mesh and evolved data, set boundary conditions/timestep on new mesh
   if (nnew != 0 || ndel != 0) { // at least one (de)refinement flagged
-    if (pmy_mesh->pmb_pack->pdust != nullptr) pmy_mesh->pmb_pack->pdust->BeforeRegrid();
+    if (pmy_mesh->pmb_pack->pdust != nullptr) pmy_mesh->pmb_pack->pdust->BeforeRegrid(nnew, ndel);
     RedistAndRefineMeshBlocks(pin, nnew, ndel);
 
     // Mark one mesh-topology update event (AMR and any resulting load balancing).

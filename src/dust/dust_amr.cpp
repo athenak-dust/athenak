@@ -16,7 +16,10 @@
 //!   - the maps from the virtual finest grid to the active leaves are rebuilt;
 //!   - the cached merge / compress masks are marked stale (rebuilt at their next use);
 //!   - every particle's MeshBlock id (PGID) is set again from its position;
-//!   - the particle time step is computed again with the new cell sizes.
+//!   - the particle time step is computed again with the new cell sizes;
+//!   - the regrid is marked as an event (blocks created / deleted): the next cycle runs its
+//!     split, then a merge pass if one is due or blocks were deleted, then one resampling
+//!     (HandleRegridEvent in dust_cloud.cpp).
 //! Tag, mass, position, velocity, cloud level and lobes of a particle are not touched: a
 //! coarser mesh does not make a cloud wider, a finer mesh does not split it (that is the
 //! split's decision at the next cycle, with the new maps).
@@ -367,10 +370,13 @@ void DensityRefinement(MeshBlockPack *pmbp) {
 //! first time step.  Restores the cooldown age of every block and, when the file was written
 //! among the outputs of a cycle, carries out the mesh check that followed those outputs in
 //! the run that wrote it.  A file without the record (older code) keeps the old behaviour:
-//! ages start at zero and no check is repeated.
+//! ages start at zero and no check is repeated.  First, on any mesh, the
+//! MeshBlock id of every refinable cloud is set from its position (files written before the
+//! routing fix 9807158d can name a wrong block; the composite weights never read it).
 
 void DustGasDrag::ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin) {
   Mesh *pm = pmy_pack->pmesh;
+  if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) ResetPGIDFromPositions("restart");
   if (!experimental_amr || !pm->adaptive || pm->pmr == nullptr) return;
   if (!amr_restart_state_found) {
     if (global_variable::my_rank == 0) {
@@ -395,13 +401,55 @@ void DustGasDrag::ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::ResetPGIDFromPositions
+//! \brief The MeshBlock id of every particle from the leaf that holds
+//! its position (refinable clouds: the leaf maps).  Returns how many ids changed and prints
+//! it; stops if a position has no owning block of this pack.
+
+int DustGasDrag::ResetPGIDFromPositions(const char *when) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  const auto transfer = smr_transfer;
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int ncell12 = (indcs.nx1 + 2*indcs.ng)*(indcs.nx2 + 2*indcs.ng);
+  const int nmb = pmy_pack->nmb_thispack;
+  const int gids = pmy_pack->gids;
+  int nchanged = 0, nbad = 0;
+  if (npart > 0) {
+    Kokkos::parallel_reduce("dust_pgid_reset", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
+      const int owner = transfer.LeafOwner(pr(IPX,p), pr(IPY,p))/ncell12;
+      if (owner < 0 || owner >= nmb) {
+        ++bad;
+      } else if (pi(PGID,p) != gids + owner) {
+        pi(PGID,p) = gids + owner;
+        ++changed;
+      }
+    }, Kokkos::Sum<int>(nchanged), Kokkos::Sum<int>(nbad));
+  }
+  if (nbad > 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << nbad << " particles have no owning MeshBlock (" << when << ")" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (global_variable::my_rank == 0) {
+    std::cout << "# dust: MeshBlock ids set from the positions at the " << when << ": "
+              << nchanged << " of " << npart << " changed" << std::endl;
+  }
+  return nchanged;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::BeforeRegrid
 //! \brief Called by MeshRefinement::AdaptiveMeshRefinement before the mesh changes: the
 //! particle count and checksum that RebuildAfterRegrid must find again.
 
-void DustGasDrag::BeforeRegrid() {
+void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
   amr_npart_before = pmy_pack->ppart->nprtcl_thispack;
-  amr_nmb_before = pmy_pack->pmesh->nmb_total;
+  amr_regrid_nnew = nnew;
+  amr_regrid_ndel = ndel;
   amr_checksum = ParticleChecksum(pmy_pack->ppart);
 }
 
@@ -424,13 +472,17 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   const int npart = ppar->nprtcl_thispack;
 
   BuildRefinableCloudTransfer(pin);
-  // A regrid that added blocks gets a resampling right after its split (if
-  // cloud_resample_after_refine); one that removed blocks starts a burst of merge passes
-  if (amr_nmb_before >= 0) {
-    if (pmesh->nmb_total > amr_nmb_before) amr_refined_pending = true;
-    if (pmesh->nmb_total < amr_nmb_before && cloud_merge_burst_dt > 0.0) {
-      cloud_merge_burst_until = pmesh->time + cloud_merge_burst_dt;
-    }
+  // Every regrid is an event, handled at the start of the next cycle after
+  // its split (HandleRegridEvent); refine / derefine from the blocks actually created and
+  // deleted, not from the net change of the block count.  A regrid that deleted blocks also
+  // starts a burst of merge passes.  Two regrids before one handling (possible
+  // only around a restart) make one event with the summed counts.
+  amr_event_pending = true;
+  amr_event_nnew += amr_regrid_nnew;
+  amr_event_ndel += amr_regrid_ndel;
+  amr_event_regrid = amr_regrids + 1;   // the number this regrid gets below
+  if (amr_regrid_ndel > 0 && cloud_merge_burst_dt > 0.0) {
+    cloud_merge_burst_until = pmesh->time + cloud_merge_burst_dt;
   }
   merge_mask_built = false;       // built once per layout, at the next merge pass
   compress_mask_built = false;
@@ -502,7 +554,8 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       std::fclose(fp);
     }
     std::cout << "# dust regrid " << amr_regrids << " cycle=" << pmesh->ncycle << " time="
-              << pmesh->time << " blocks=" << nmb << " (above root " << nlev1 << ") particles="
+              << pmesh->time << " blocks=" << nmb << " (above root " << nlev1 << ", created "
+              << amr_regrid_nnew << ", deleted " << amr_regrid_ndel << ") particles="
               << npart << " max|sum w - 1|=" << dwmax << std::endl;
   }
 }

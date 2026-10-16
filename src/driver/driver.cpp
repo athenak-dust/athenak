@@ -314,8 +314,9 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   InitBoundaryValuesAndPrimitives(pmesh);
 
   // A restarted dynamic dust mesh gets its cooldown ages back and the
-  // mesh check that followed the outputs of the restart cycle, before the time step
-  if (res_flag && pmesh->adaptive && pmesh->pmb_pack->pdust != nullptr) {
+  // mesh check that followed the outputs of the restart cycle, before the time step;
+  // refinable clouds get their MeshBlock ids from their positions (any mesh)
+  if (res_flag && pmesh->pmb_pack->pdust != nullptr) {
     pmesh->pmb_pack->pdust->ResumeAmrAfterRestart(this, pin);
   }
 
