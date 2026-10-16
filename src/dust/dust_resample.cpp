@@ -433,7 +433,7 @@ void AppendResampleLog(const char *row) {
                  " patches_reduced kept at_cap fallback max_res_accepted steps_zero steps_cap scans"
                  " M_b M_a PX_b PX_a t_total t_device t_copy t_sort t_host_wall t_host_cpu t_back"
                  " threads nnz s_rows s_scale s_qr s_null s_reduce s_check n_max nb_max n_ge64 n_ge256"
-                 " device t_dev_order t_dev_sizes t_dev_small t_dev_large\n");
+                 " device t_dev_order t_dev_sizes t_dev_small t_dev_large t_dev_mid\n");
   }
   std::fputs(row, fp);
   std::fclose(fp);
@@ -700,7 +700,7 @@ int DustGasDrag::ResampleClouds() {
     ++cloud_resample_pass;
     char row[1024];
     std::snprintf(row, sizeof(row), "%d %.17g %d %d %d %.0f %.0f 0 0 %d 0 0 0.000e+00 0 0 0"
-                  " %.17g %.17g %.17g %.17g %.4e 0 0 0 0 0 0 0 %d 0 0 0 0 0 0 0 0 0 0 %d 0 0 0 0\n",
+                  " %.17g %.17g %.17g %.17g %.4e 0 0 0 0 0 0 0 %d 0 0 0 0 0 0 0 0 0 0 %d 0 0 0 0 0\n",
                   pmesh->ncycle, pmesh->time, npart, npart, npool, cnt_b[1], cnt_b[0], npool, tot_b[0],
                   tot_b[0], tot_b[1], tot_b[1], seconds(t_all), nnz, cloud_resample_device ? 1 : 0);
     AppendResampleLog(row);
@@ -901,7 +901,7 @@ int DustGasDrag::ResampleClouds() {
   std::vector<PatchInfo> dinfos;     // device per-patch counters (cloud_resample_compare only)
   resample::PatchSummary dsum;       // device totals
   DvceArray1D<Real> mdev;
-  double dtim[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // device: order, sizes, small, large, solve
+  double dtim[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // device: order, sizes, small, large, solve, middle
   if (on_dev) {
     auto td = Clock::now();
     // the pool in patch order on the device: the unique keys patch * npool + a, sorted (the
@@ -954,9 +954,10 @@ int DustGasDrag::ResampleClouds() {
     DvceArray1D<double> mn("rs_dev_mnew", npool);
     DvceArray2D<int> outi("rs_dev_outi", npatch, resample::NPC);
     DvceArray1D<double> outr("rs_dev_outr", npatch);
-    double tim[4] = {0.0, 0.0, 0.0, 0.0};
-    resample::SolvePatchesDevice(pb, mn, outi, outr, cloud_resample_device_mem_mb, tim);
-    dtim[1] = tim[0]; dtim[2] = tim[1]; dtim[3] = tim[2]; dtim[4] = tim[3];
+    double tim[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    resample::SolvePatchesDevice(pb, mn, outi, outr, cloud_resample_device_mem_mb,
+                                 cloud_resample_device_mid, cloud_resample_device_mid_team, tim);
+    dtim[1] = tim[0]; dtim[2] = tim[1]; dtim[3] = tim[2]; dtim[4] = tim[3]; dtim[5] = tim[4];
     mdev = DvceArray1D<Real>("rs_mnew_dev", npool);
     auto mdv = mdev;
     Kokkos::parallel_for("rs_unsort", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
@@ -1111,12 +1112,12 @@ int DustGasDrag::ResampleClouds() {
     char row[1024];
     std::snprintf(row, sizeof(row), "%d %.17g %d %d %lld %.0f %.0f %lld %lld %lld %lld %lld %.3e %lld %lld"
                   " %lld %.17g %.17g %.17g %.17g %.4e %.4e %.4e %.4e %.4e %.4e %.4e %d %d"
-                  " %.4e %.4e %.4e %.4e %.4e %.4e %d %d %d %d %d %.4e %.4e %.4e %.4e\n", pmesh->ncycle,
+                  " %.4e %.4e %.4e %.4e %.4e %.4e %d %d %d %d %d %.4e %.4e %.4e %.4e %.4e\n", pmesh->ncycle,
                   pmesh->time, npart, nfinal, pool, cnt_b[1], cnt_b[0], npat, nred, kept, atcap, nfall,
                   resmax, zsteps, csteps, scans, tot_b[0], tot_a[0], tot_b[1], tot_a[1], seconds(t_all),
                   t_dev, t_copy, t_sort, t_host, cpu, t_back, nthread, nnz, st[0], st[1], st[2],
                   st[3], st[4], st[5], nmax, nbmax, n64, n256, cloud_resample_device ? 1 : 0,
-                  dtim[0], dtim[1], dtim[2], dtim[3]);
+                  dtim[0], dtim[1], dtim[2], dtim[3], dtim[5]);
     AppendResampleLog(row);
   }
   if (cloud_resample_feedback_check) {

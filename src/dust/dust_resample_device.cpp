@@ -595,11 +595,11 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
 //----------------------------------------------------------------------------------------
 //! \fn SolvePatchesDevice
 //! \brief See dust_resample.hpp.  timing: [0] sizes, [1] small bucket, [2] large bucket,
-//! [3] total, seconds (fenced).
+//! [3] total, [4] middle bucket, seconds (fenced).
 
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
-                        double timing[4]) {
+                        const int mid, const int mid_team, double timing[5]) {
   Kokkos::Timer t_all, t;
   const int npatch = pb.npatch;
   // per patch: clouds, CSR entries (device), distinct leaves (team sort of a copy)
@@ -638,48 +638,49 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       Kokkos::single(Kokkos::PerTeam(tm), [&]() {sz(q, 2) = nl;});
     });
   }
-  // buckets: at most 64 clouds, more; patches of one or no cloud only get their counters.  Per
-  // bucket the number of patches and the largest clouds / entries / leaves
-  int nqb[2] = {0, 0}, nmx[2] = {0, 0}, emx[2] = {1, 1}, lmx[2] = {1, 1};
+  // buckets: 0 at most 64 clouds, 1 (when mid > 64) at most mid clouds, 2 more;
+  // patches of one or no cloud only get their counters.  Per bucket the number of patches and
+  // the largest clouds / entries / leaves.  mid <= 64: no bucket 1 (the original two buckets)
+  constexpr int NB = 3;
+  int nqb[NB] = {0, 0, 0}, nmx[NB] = {0, 0, 0}, emx[NB] = {1, 1, 1}, lmx[NB] = {1, 1, 1};
   {
-    int r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int r[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     Kokkos::parallel_reduce("rs_dev_buckets", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-    KOKKOS_LAMBDA(const int q, int &c0, int &c1, int &n0, int &n1, int &e0, int &e1, int &l0,
-                  int &l1) {
+    KOKKOS_LAMBDA(const int q, int &c0, int &c1, int &c2, int &n0, int &n1, int &n2, int &e0,
+                  int &e1, int &e2, int &l0, int &l1, int &l2) {
       const int n = sz(q, 0);
       if (n < 2) return;
-      if (n <= 64) {
-        ++c0; n0 = Kokkos::max(n0, n); e0 = Kokkos::max(e0, sz(q, 1)); l0 = Kokkos::max(l0, sz(q, 2));
-      } else {
-        ++c1; n1 = Kokkos::max(n1, n); e1 = Kokkos::max(e1, sz(q, 1)); l1 = Kokkos::max(l1, sz(q, 2));
-      }
-    }, Kokkos::Sum<int>(r[0]), Kokkos::Sum<int>(r[1]), Kokkos::Max<int>(r[2]), Kokkos::Max<int>(r[3]),
-       Kokkos::Max<int>(r[4]), Kokkos::Max<int>(r[5]), Kokkos::Max<int>(r[6]), Kokkos::Max<int>(r[7]));
-    for (int b=0; b<2; ++b) {
+      const int b = (n <= 64) ? 0 : ((n <= mid) ? 1 : 2);
+      int &c = (b == 0) ? c0 : ((b == 1) ? c1 : c2);
+      int &nn = (b == 0) ? n0 : ((b == 1) ? n1 : n2);
+      int &ee = (b == 0) ? e0 : ((b == 1) ? e1 : e2);
+      int &ll = (b == 0) ? l0 : ((b == 1) ? l1 : l2);
+      ++c; nn = Kokkos::max(nn, n); ee = Kokkos::max(ee, sz(q, 1)); ll = Kokkos::max(ll, sz(q, 2));
+    }, Kokkos::Sum<int>(r[0]), Kokkos::Sum<int>(r[1]), Kokkos::Sum<int>(r[2]),
+       Kokkos::Max<int>(r[3]), Kokkos::Max<int>(r[4]), Kokkos::Max<int>(r[5]),
+       Kokkos::Max<int>(r[6]), Kokkos::Max<int>(r[7]), Kokkos::Max<int>(r[8]),
+       Kokkos::Max<int>(r[9]), Kokkos::Max<int>(r[10]), Kokkos::Max<int>(r[11]));
+    for (int b=0; b<NB; ++b) {
       nqb[b] = r[b];
-      nmx[b] = std::max(r[2 + b], 0); emx[b] = std::max(r[4 + b], 1); lmx[b] = std::max(r[6 + b], 1);
+      nmx[b] = std::max(r[3 + b], 0); emx[b] = std::max(r[6 + b], 1); lmx[b] = std::max(r[9 + b], 1);
     }
   }
-  // the patch lists, the largest patches first and by patch number among equal sizes (balance;
-  // the order does not change any result): keys (largest - n) npatch + q, bucket 0 first
+  // the patch lists: per bucket the largest patches first and by patch number among equal sizes
+  // (balance; the order does not change any result).  One sort of all patches by the key
+  // ((b 2^24 + 2^24 - 1 - n) npatch + q; patches of fewer than two clouds last): bucket b is the
+  // range off(b) .. off(b) + nqb(b) - 1
   DvceArray1D<std::int64_t> qkey(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_qkey"),
-                                 std::max(nqb[0] + nqb[1], 1));
+                                 std::max(npatch, 1));
   {
-    const std::int64_t np = npatch;
-    const int nb0 = nqb[0], nm0 = nmx[0], nm1 = nmx[1];
-    Kokkos::parallel_scan("rs_dev_lists", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-    KOKKOS_LAMBDA(const int q, std::int64_t &upd, const bool final) {
+    const std::int64_t np = npatch, top = std::int64_t(1) << 24;
+    Kokkos::parallel_for("rs_dev_lists", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+    KOKKOS_LAMBDA(const int q) {
       const int n = sz(q, 0);
-      if (n < 2) return;
-      const int b = (n <= 64) ? 0 : 1;   // counts of bucket 0 in the low, bucket 1 in the high bits
-      if (final) {
-        const int k = (b == 0) ? static_cast<int>(upd & 0xffffffffLL) : nb0 + static_cast<int>(upd >> 32);
-        qkey(k) = static_cast<std::int64_t>(((b == 0) ? nm0 : nm1) - n)*np + q;
-      }
-      upd += (b == 0) ? 1LL : (1LL << 32);
+      const int b = (n <= 64) ? 0 : ((n <= mid) ? 1 : 2);
+      qkey(q) = (n < 2) ? std::numeric_limits<std::int64_t>::max()
+                        : (b*top + top - 1 - n)*np + q;
     });
-    if (nqb[0] > 1) Kokkos::sort(Kokkos::subview(qkey, std::make_pair(0, nqb[0])));
-    if (nqb[1] > 1) Kokkos::sort(Kokkos::subview(qkey, std::make_pair(nqb[0], nqb[0] + nqb[1])));
+    if (npatch > 1) Kokkos::sort(qkey);
   }
   timing[0] = t.seconds();
   {
@@ -694,7 +695,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     });
   }
   const double budget = static_cast<double>(std::max(mem_mb, 64))*1048576.0;
-  for (int b=0; b<2; ++b) {
+  for (int b=0; b<NB; ++b) {
     Kokkos::fence();
     t.reset();
     const int nq = nqb[b];
@@ -705,7 +706,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       nslot = std::min(nslot, 4096);
       DvceArray1D<int> qlist(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_list"), nq);
       {
-        const int off = (b == 0) ? 0 : nqb[0];
+        const int off = (b == 0) ? 0 : ((b == 1) ? nqb[0] : nqb[0] + nqb[1]);
         const std::int64_t np = npatch;
         Kokkos::parallel_for("rs_dev_qlist", Kokkos::RangePolicy<>(DevExeSpace(), 0, nq),
         KOKKOS_LAMBDA(const int i) {qlist(i) = static_cast<int>(qkey(off + i) % np);});
@@ -732,24 +733,30 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
         }
       };
       // the large patches set the critical path of a resampling: the widest team the kernel
-      // allows (at most 512 threads); the small ones keep the automatic size
+      // allows (at most 512 threads); the small ones keep the automatic size.  However,
+      // a 512-thread team of the wide kernel (at most 128 registers per thread) fills the
+      // register file of an SM, so the middle bucket runs the same kernel with mid_team threads
+      // (several patches per SM)
       if (b == 0) {
         Kokkos::parallel_for("rs_dev_patches_small", Policy(nslot, Kokkos::AUTO), body);
       } else {
         const int tmax = PolicyWide(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
-        int ts = 1;   // the largest power of two the backend allows, at most 512
-        while (2*ts <= tmax && 2*ts <= 512) ts *= 2;
-        static bool told = false;
-        if (!told && global_variable::my_rank == 0) {
-          std::cout << "# device resampling: large patches with teams of " << ts
-                    << " threads (largest allowed " << tmax << ")" << std::endl;
-          told = true;
+        int ts = 1;   // the largest power of two the backend allows, at most 512 (or mid_team)
+        const int tcap = (b == 1) ? std::max(1, mid_team) : 512;
+        while (2*ts <= tmax && 2*ts <= tcap) ts *= 2;
+        static bool told[NB] = {false, false, false};
+        if (!told[b] && global_variable::my_rank == 0) {
+          std::cout << "# device resampling: " << ((b == 1) ? "middle" : "large")
+                    << " patches with teams of " << ts << " threads (largest allowed " << tmax << ")"
+                    << std::endl;
+          told[b] = true;
         }
-        Kokkos::parallel_for("rs_dev_patches_large", PolicyWide(nslot, ts), body);
+        Kokkos::parallel_for((b == 1) ? "rs_dev_patches_mid" : "rs_dev_patches_large",
+                             PolicyWide(nslot, ts), body);
       }
     }
     Kokkos::fence();
-    timing[1 + b] = t.seconds();
+    timing[(b == 0) ? 1 : ((b == 1) ? 4 : 2)] = t.seconds();
   }
   timing[3] = t_all.seconds();
 }

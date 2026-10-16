@@ -1510,6 +1510,8 @@ class DustGasDrag {
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
   bool cloud_resample_device = true;   // ... the patch solves on the device (default)
   int cloud_resample_device_mem_mb = 2048;  // ... workspace limit of the device solves
+  int cloud_resample_device_mid = 0;   // ... patches of 65..mid clouds in a middle
+  int cloud_resample_device_mid_team = 128;   //     bucket with teams of this many threads (0: off)
   int cloud_launch_bounds = 1;        // launch bound of the two
                                       // production cloud kernels (CloudParFor)
   bool cloud_resample_compare = false; // ... diagnostic: host and device on the same pool, compared
