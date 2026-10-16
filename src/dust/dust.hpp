@@ -1516,6 +1516,10 @@ class DustGasDrag {
                                       // production cloud kernels (CloudParFor)
   bool cloud_resample_compare = false; // ... diagnostic: host and device on the same pool, compared
   bool cloud_resample_feedback_check = false;   // ... diagnostic: AuditFeedback before / after
+  int cloud_resample_stress = 0;       // ... diagnostic: coincident copies, every N-th
+  int cloud_resample_stress_copies = 0;   //     candidate; K copies of the first one
+  bool cloud_resample_stress_done = false;
+  void StressResamplePool();
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
   std::vector<int> cloud_resample_dump;     // cycles whose resampling writes the particle table before and after
   bool cloud_resample_skip_at_cap = true;   // ... clouds at their cap stay out of the pool

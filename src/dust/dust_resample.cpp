@@ -569,6 +569,114 @@ bool DustGasDrag::MergeDue() {
 //! \brief One resampling of the plain clouds (see the file header).  Returns the number of
 //! clouds removed.
 
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::StressResamplePool
+//! \brief Diagnostic (Codex review: coincident and rank-critical clouds in
+//! the regression of the device resampling): before the first resampling, every
+//! cloud_resample_stress-th pool candidate (plain, positive mass, below its cap) becomes two
+//! copies of half its mass, in turn at the same position (exactly dependent columns), offset by
+//! 1e-13 and by 1e-10 of its cloud half width in x1 (rank-critical columns); with
+//! cloud_resample_stress_copies = K the first candidate becomes K + 1 equal copies at one point
+//! (a patch with a K-dimensional null space).  Masses add up to the old ones up to rounding;
+//! the resampling then has to keep the stressed state's leaf sums (cloud_resample_dump and
+//! r_leaf_check.py), cloud_resample_compare solves the same pool on the host and the device.
+
+void DustGasDrag::StressResamplePool() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  Mesh *pmesh = pmy_pack->pmesh;
+  const int npart = ppar->nprtcl_thispack;
+  if (npart == 0) return;
+  if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
+  const int nsp = std::max(1, nspecies);
+  DvceArray1D<Real> m0sp("rs_stress_m0", nsp);
+  {
+    auto mh = Kokkos::create_mirror_view(m0sp);
+    for (int sp=0; sp<nsp; ++sp) {
+      mh(sp) = (cloud_resample_m0 > 0.0) ? cloud_resample_m0
+             : ((static_cast<int>(cloud_merge_mroot.size()) > sp) ? cloud_merge_mroot[sp] : 0.0);
+    }
+    Kokkos::deep_copy(m0sp, mh);
+  }
+  const Real eta = cloud_resample_eta;
+  const bool skip_cap = cloud_resample_skip_at_cap;
+  const int every = cloud_resample_stress, kcopy = cloud_resample_stress_copies;
+  const int nrdata = ppar->nrdata, nidata = ppar->nidata;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  // candidates as the pool flags them, their rank, the number of extra copies
+  DvceArray1D<int> rk(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_stress_rank"), npart);
+  DvceArray1D<int> ex(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_stress_extra"), npart);
+  DvceArray1D<int> off(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_stress_off"), npart);
+  int ncand = 0;
+  Kokkos::parallel_scan("rs_stress_cand", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+    const int code = pi(PLEV,p);
+    bool ok = pr(IPM,p) > 0.0 && !SMRCompositeTransfer::CloudLobe1(code) &&
+              !SMRCompositeTransfer::CloudLobe2(code);
+    if (ok) {
+      const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
+      const int lev = SMRCompositeTransfer::CloudLevel(code);
+      const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
+      ok = (pr(IPM,p) <= cap*(1.0 + resample::kPoolTol)) &&
+           !(skip_cap && pr(IPM,p) >= cap*(1.0 - resample::kCapTol));
+    }
+    if (final) rk(p) = ok ? upd : -1;
+    if (ok) ++upd;
+  }, ncand);
+  int nextra = 0;
+  Kokkos::parallel_scan("rs_stress_extra", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+    const int r = rk(p);
+    int e = 0;
+    if (r >= 0 && kcopy > 0 && r == 0) e = kcopy;
+    else if (r >= 0 && every > 0 && r % every == 0) e = 1;
+    if (final) {ex(p) = e; off(p) = upd;}
+    upd += e;
+  }, nextra);
+  if (nextra > 0) {
+    const int nnew = npart + nextra;
+    if (ppar->prtcl_rdata.extent_int(1) < nnew) {
+      Kokkos::resize(ppar->prtcl_rdata, nrdata, nnew + nnew/4);
+      Kokkos::resize(ppar->prtcl_idata, nidata, nnew + nnew/4);
+    }
+    auto prv = ppar->prtcl_rdata;
+    auto piv = ppar->prtcl_idata;
+    if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
+    const int tag0 = cloud_next_tag;
+    const auto transfer = smr_transfer;
+    Kokkos::parallel_for("rs_stress_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      const int e = ex(p);
+      if (e == 0) return;
+      // 0 same point, 1 1e-13, 2 1e-10 apart; the K copies of the first candidate at one point
+      const int type = (every > 0 && !(kcopy > 0 && rk(p) == 0)) ? (rk(p)/every) % 3 : 0;
+      const Real m = prv(IPM,p)/static_cast<Real>(e + 1);
+      const Real dx = (type == 0) ? 0.0 : ((type == 1) ? 1.0e-13 : 1.0e-10)*
+                      transfer.CloudHalfWidth1(SMRCompositeTransfer::CloudLevel(piv(PLEV,p)));
+      prv(IPM,p) = m;
+      for (int k=0; k<e; ++k) {
+        const int s = npart + off(p) + k;
+        for (int c=0; c<nrdata; ++c) prv(c,s) = prv(c,p);
+        for (int c=0; c<nidata; ++c) piv(c,s) = piv(c,p);
+        piv(PTAG,s) = tag0 + off(p) + k;
+        prv(IPX,s) += dx; prv(IPX1,s) += dx;
+      }
+    });
+    cloud_next_tag += nextra;
+    ppar->nprtcl_thispack = nnew;
+    pmesh->nprtcl_thisrank = nnew;
+    pmesh->nprtcl_eachrank[global_variable::my_rank] = nnew;
+    pmesh->nprtcl_total = nnew;
+  }
+  if (global_variable::my_rank == 0) {
+    std::cout << "# resampling stress test, cycle " << pmesh->ncycle << ": " << ncand
+              << " candidates, " << nextra << " copies added (every " << every << "-th candidate "
+              << "split in two, in turn coincident / 1e-13 / 1e-10 of a half width apart; the first "
+              << kcopy << " extra copies at one point), particles " << npart << " -> "
+              << npart + nextra << std::endl;
+  }
+}
+
 int DustGasDrag::ResampleClouds() {
   using Clock = std::chrono::steady_clock;
   auto seconds = [](const Clock::time_point &a) {
@@ -576,6 +684,10 @@ int DustGasDrag::ResampleClouds() {
   };
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
+  if (!cloud_resample_stress_done && (cloud_resample_stress > 0 || cloud_resample_stress_copies > 0)) {
+    StressResamplePool();   // diagnostic: before the first resampling only
+    cloud_resample_stress_done = true;
+  }
   const int npart = ppar->nprtcl_thispack;
   const auto transfer = smr_transfer;
   const auto lt = leaf_traversal;   // cloud weights on the actual leaves

@@ -516,6 +516,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Diagnostic: production feedback before / after every resampling
       cloud_resample_feedback_check = pin->GetOrAddBoolean("dust", "cloud_resample_feedback_check",
                                                            false);
+      // Diagnostic: coincident and near-coincident copies before the first R
+      cloud_resample_stress = pin->GetOrAddInteger("dust", "cloud_resample_stress", 0);
+      cloud_resample_stress_copies = pin->GetOrAddInteger("dust", "cloud_resample_stress_copies", 0);
       cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
       if (cloud_resample_m0 > 0.0 && nspecies > 1 && global_variable::my_rank == 0) {
         std::cout << "# NOTE (dust): cloud_resample_m0 is the root cloud mass of every species "
