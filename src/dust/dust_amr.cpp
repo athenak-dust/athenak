@@ -558,6 +558,8 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
               << amr_regrid_nnew << ", deleted " << amr_regrid_ndel << ") particles="
               << npart << " max|sum w - 1|=" << dwmax << std::endl;
   }
+  // The leaf traversal also right after a regrid (old clouds on the new mesh)
+  if (cloud_leaf_check > 0) CheckLeafTraversal();
 }
 
 }  // namespace dust

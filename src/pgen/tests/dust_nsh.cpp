@@ -1015,6 +1015,12 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   // merge pass from a saved state, then exit
   if (!pin->GetOrAddString("problem", "merge_audit_replay", "").empty()) {
     RunAuditReplay(pin, pmy_mesh_);
+    // the replayed particles get their MeshBlock ids from their positions
+    // (the audit file does not carry valid ones for this mesh)
+    if (pmbp->pdust != nullptr &&
+        pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
+      pmbp->pdust->ResetPGIDFromPositions("audit replay");
+    }
     // only reached with merge_audit_restart: the run continues from the restored time, so the BA
     // outputs are numbered by time and resume at the next multiple of their interval
     // (numbering from zero would write one file per history call until it caught up)
