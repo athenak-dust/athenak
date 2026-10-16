@@ -22,8 +22,9 @@
 //! not the reference's cloud for cloud, while the same rows are kept.  Device: new masses,
 //! compaction.  Single rank only, like the merge pass.
 //!
-//! With <dust>/cloud_resample_device = true the pool is put in patch order
-//! and every patch is solved on the device (dust_resample_device.cpp, same algorithm); with
+//! By default (<dust>/cloud_resample_device = true) the pool is put in patch order
+//! and every patch is solved on the device (dust_resample_device.cpp, same algorithm; false keeps
+//! the host solves); with
 //! cloud_resample_compare = true both run on the same pool and cloud_resample_compare.txt
 //! records the differences (the device result is applied only with cloud_resample_device).
 //!

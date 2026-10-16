@@ -877,7 +877,7 @@ class DustGasDrag {
   Real cloud_resample_eta = 2.0;       // ... mass cap eta m0 / 4^level (<= 0: no cap)
   int cloud_resample_patch = 2;        // ... patch size in root cells
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
-  bool cloud_resample_device = false;  // ... the patch solves on the device
+  bool cloud_resample_device = true;   // ... the patch solves on the device (default)
   int cloud_resample_device_mem_mb = 2048;  // ... workspace limit of the device solves
   bool cloud_resample_compare = false; // ... diagnostic: host and device on the same pool, compared
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
