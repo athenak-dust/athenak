@@ -12,9 +12,11 @@
 //! particles in their order, then the pieces of the flagged particles in theirs.
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -27,6 +29,7 @@
 #include "particles/particles.hpp"
 #include "hydro/hydro.hpp"
 #include "dust.hpp"
+#include <Kokkos_Sort.hpp>
 
 namespace dust {
 
@@ -243,12 +246,12 @@ struct MergeMask {
   Real dx1[kL], dx2[kL];
   Real x1min, x2min, x1max, x2max;
   KOKKOS_INLINE_FUNCTION
-  int Cell(const Real x, const Real y, const int L) const {
+  std::int64_t Cell(const Real x, const Real y, const int L) const {   // J n1 + I
     const int I = SMRCompositeTransfer::WrapIndex(static_cast<int>(Kokkos::floor(
         (SMRCompositeTransfer::WrapPosition(x, x1min, x1max) - x1min)/dx1[L])), n1[L]);
     const int J = SMRCompositeTransfer::WrapIndex(static_cast<int>(Kokkos::floor(
         (SMRCompositeTransfer::WrapPosition(y, x2min, x2max) - x2min)/dx2[L])), n2[L]);
-    return J*n1[L] + I;
+    return static_cast<std::int64_t>(J)*n1[L] + I;
   }
   KOKKOS_INLINE_FUNCTION
   bool In(const Real x, const Real y, const int L, const int m) const {
@@ -279,35 +282,128 @@ int ReleasePieces(const int lobe_old, DPiece out[3]) {
   return n;
 }
 
-// counting sort of particles by key (key < 0: not listed): start(key), list
-void BuildCSR(const DvceArray1D<int> &key, const int nkey, DvceArray1D<int> &start,
-              DvceArray1D<int> &list) {
+// the pieces of a merge level by a 64-bit cell key, without a table over all cells
+// of the level (the dense counting sort above needed one entry per level-L cell): the
+// distinct keys in ascending order (ukey), the members of ukey(u) in list(start(u) ..
+// start(u+1) - 1) in ascending particle order; lookups by binary search.  Memory and work grow
+// with the listed pieces only.
+struct KeyCSR {
+  DvceArray1D<std::int64_t> ukey;
+  DvceArray1D<int> start, list;
+  int nu = 0;
+  KOKKOS_INLINE_FUNCTION
+  int Find(const std::int64_t key) const {   // index u of key, -1 if not listed
+    int lo = 0, hi = nu;
+    while (lo < hi) {
+      const int mid = (lo + hi)/2;
+      if (ukey(mid) < key) lo = mid + 1; else hi = mid;
+    }
+    return (lo < nu && ukey(lo) == key) ? lo : -1;
+  }
+  KOKKOS_INLINE_FUNCTION
+  int First(const std::int64_t key) const {const int u = Find(key); return (u < 0) ? 0 : start(u);}
+  KOKKOS_INLINE_FUNCTION
+  int Last(const std::int64_t key) const {const int u = Find(key); return (u < 0) ? 0 : start(u + 1);}
+};
+
+// key < 0: not listed
+void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, KeyCSR &c) {
   const int n = key.extent_int(0);
-  DvceArray1D<int> cnt("csr_cnt", nkey);
-  Kokkos::parallel_for("csr_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
-  KOKKOS_LAMBDA(const int p) {
-    if (key(p) >= 0) Kokkos::atomic_increment(&cnt(key(p)));
-  });
-  start = DvceArray1D<int>("csr_start", nkey + 1);
-  auto st = start;
-  Kokkos::parallel_scan("csr_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, nkey),
-  KOKKOS_LAMBDA(const int k, int &upd, const bool final) {
-    if (final) st(k) = upd;
-    upd += cnt(k);
-    if (final && k == nkey - 1) st(nkey) = upd;
-  });
-  int total = 0;
-  Kokkos::deep_copy(total, Kokkos::subview(start, nkey));
-  list = DvceArray1D<int>("csr_list", total > 0 ? total : 1);
-  auto ls = list;
-  Kokkos::deep_copy(cnt, 0);
-  Kokkos::parallel_for("csr_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
-  KOKKOS_LAMBDA(const int p) {
+  std::int64_t kmax = -1;
+  Kokkos::parallel_reduce("kcsr_max", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
+  KOKKOS_LAMBDA(const int p, std::int64_t &m) {if (key(p) > m) m = key(p);},
+  Kokkos::Max<std::int64_t>(kmax));
+  if (n > 0 && kmax >= std::numeric_limits<std::int64_t>::max()/n - 1) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "merge cell keys too large for the composite sort" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  DvceArray1D<int> pos(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_pos"), n > 0 ? n : 1);
+  int nl = 0;
+  Kokkos::parallel_scan("kcsr_pos", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
+  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
     if (key(p) < 0) return;
-    const int k = key(p);
-    ls(st(k) + Kokkos::atomic_fetch_add(&cnt(k), 1)) = p;
+    if (final) pos(p) = upd;
+    ++upd;
+  }, nl);
+  c.list = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_list"), nl > 0 ? nl : 1);
+  c.nu = 0;
+  if (nl == 0) {
+    c.ukey = DvceArray1D<std::int64_t>("kcsr_ukey", 1);
+    c.start = DvceArray1D<int>("kcsr_start", 1);
+    return;
+  }
+  // (key, particle) as one value key n + p, sorted
+  const std::int64_t nn = n;
+  DvceArray1D<std::int64_t> comp(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_comp"), nl);
+  Kokkos::parallel_for("kcsr_comp", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
+  KOKKOS_LAMBDA(const int p) {if (key(p) >= 0) comp(pos(p)) = key(p)*nn + p;});
+  Kokkos::sort(comp);
+  DvceArray1D<int> uidx(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_uidx"), nl);
+  int nu = 0;
+  Kokkos::parallel_scan("kcsr_distinct", Kokkos::RangePolicy<>(DevExeSpace(), 0, nl),
+  KOKKOS_LAMBDA(const int k, int &upd, const bool final) {
+    const bool first = (k == 0) || (comp(k)/nn != comp(k - 1)/nn);
+    if (final) uidx(k) = first ? upd : -1;
+    if (first) ++upd;
+  }, nu);
+  c.ukey = DvceArray1D<std::int64_t>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_ukey"), nu);
+  c.start = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_start"), nu + 1);
+  auto uk = c.ukey; auto st = c.start; auto ls = c.list;
+  const int nl_ = nl, nu_ = nu;
+  Kokkos::parallel_for("kcsr_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, nl),
+  KOKKOS_LAMBDA(const int k) {
+    ls(k) = static_cast<int>(comp(k) % nn);
+    if (uidx(k) >= 0) {uk(uidx(k)) = comp(k)/nn; st(uidx(k)) = k;}
+    if (k == nl_ - 1) st(nu_) = nl_;
   });
+  c.nu = nu;
 }
+
+// per-cell linked lists of the new clouds of a pass (the dense head array needed one
+// entry per level-L cell): an open-addressing hash table from the 64-bit cell key to the first
+// cloud of the cell (capacity a power of two, at least twice the clouds), nnext as before.
+// Push links cloud k in front of its cell's list and returns the previous first cloud; Head
+// returns the first cloud of a cell, -1 if none.  As with the dense heads, a lookup only asks
+// for cells filled by earlier kernels (a probe never stops at a slot filled later).
+struct CellLists {
+  DvceArray1D<std::int64_t> hkey;   // -1: empty
+  DvceArray1D<int> hhead;
+  unsigned mask = 0;
+  void Allocate(const int nmax) {
+    int cap = 16;
+    while (cap < 2*nmax + 16) cap *= 2;
+    hkey = DvceArray1D<std::int64_t>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "cl_key"), cap);
+    hhead = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "cl_head"), cap);
+    Kokkos::deep_copy(hkey, static_cast<std::int64_t>(-1));
+    Kokkos::deep_copy(hhead, -1);
+    mask = static_cast<unsigned>(cap - 1);
+  }
+  KOKKOS_INLINE_FUNCTION
+  static unsigned Hash(const std::int64_t key) {
+    return static_cast<unsigned>((static_cast<std::uint64_t>(key)*0x9E3779B97F4A7C15ull) >> 32);
+  }
+  KOKKOS_INLINE_FUNCTION
+  int Push(const std::int64_t key, const int k) const {
+    unsigned h = Hash(key) & mask;
+    while (true) {
+      const std::int64_t prev = Kokkos::atomic_compare_exchange(&hkey(h), static_cast<std::int64_t>(-1), key);
+      if (prev == -1 || prev == key) return Kokkos::atomic_exchange(&hhead(h), k);
+      h = (h + 1) & mask;
+    }
+  }
+  KOKKOS_INLINE_FUNCTION
+  int Head(const std::int64_t key) const {
+    unsigned h = Hash(key) & mask;
+    while (true) {
+      const std::int64_t s = hkey(h);
+      if (s == key) return hhead(h);
+      if (s == -1) return -1;
+      h = (h + 1) & mask;
+    }
+  }
+};
+
 
 }  // namespace
 
@@ -778,10 +874,12 @@ int DustGasDrag::MergeCloudsDevice() {
     const int npart = ppar->nprtcl_thispack;
     const Real H1 = mm.dx1[L], H2 = mm.dx2[L], H = Kokkos::min(H1, H2);
     const Real ell1 = transfer.CloudHalfWidth1(lev), ell2 = transfer.CloudHalfWidth2(lev);
-    const int n1 = mm.n1[L], n2 = mm.n2[L], ncl = n1*n2, nkey = nsp*ncl;
+    const int n1 = mm.n1[L], n2 = mm.n2[L];
+    const std::int64_t ncl = static_cast<std::int64_t>(n1)*n2;   // level-L cells (keys: sp ncl + cell)
     // cell keys: plain level-lev pieces (m > 0) and plain level-L clouds, by species
-    DvceArray1D<int> kp(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_kp"), npart), kc("merge_kc", npart);
-    DvceArray1D<int> kl("merge_kl", npart);   // unreleased lobed level-lev clouds (lobe wait)
+    DvceArray1D<std::int64_t> kp(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_kp"), npart);
+    DvceArray1D<std::int64_t> kc("merge_kc", npart);
+    DvceArray1D<std::int64_t> kl("merge_kl", npart);   // unreleased lobed level-lev clouds (lobe wait)
     Kokkos::parallel_for("merge_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
       const int code = pi(PLEV,p);
@@ -793,14 +891,15 @@ int DustGasDrag::MergeCloudsDevice() {
         return;
       }
       const int l = SMRCompositeTransfer::CloudLevel(code);
-      const int key = pi(PSP,p)*ncl + mm.Cell(pr(IPX,p), pr(IPY,p), L);
+      const std::int64_t key = pi(PSP,p)*ncl + mm.Cell(pr(IPX,p), pr(IPY,p), L);
       if (l == lev && pr(IPM,p) > 0.0) kp(p) = key;
       if (l == L) kc(p) = key;
     });
-    DvceArray1D<int> sp_start, sp_list, sc_start, sc_list, sl_start, sl_list;
-    BuildCSR(kp, nkey, sp_start, sp_list);
-    BuildCSR(kc, nkey, sc_start, sc_list);
-    if (lobe_wait || absorb) BuildCSR(kl, nkey, sl_start, sl_list);
+    // sparse cell lists (KeyCSR), no table over the level-L grid
+    KeyCSR spc, scc, slc;
+    BuildKeyCSR(kp, spc);
+    BuildKeyCSR(kc, scc);
+    if (lobe_wait || absorb) BuildKeyCSR(kl, slc);
     if (cloud_merge_mode == 1) {
       // ===== quantum mode =====
       // X: exact P1-stencil re-merge (geometric, strict tolerance, velocity bounding box);
@@ -843,10 +942,10 @@ int DustGasDrag::MergeCloudsDevice() {
               if (a == 0 && b == 0) continue;
               const Real w = mc/static_cast<Real>((a != 0 ? 2 : 1)*(b != 0 ? 2 : 1));
               const Real tx = xc0 + a*ell1, ty = yc0 + b*ell2;
-              const int key = sp*ncl + mm.Cell(tx, ty, L);
+              const std::int64_t key = sp*ncl + mm.Cell(tx, ty, L);
               int best = -1; Real bd = 1.0e30;
-              for (int k=sp_start(key); k<sp_start(key+1); ++k) {
-                const int q = sp_list(k);
+              for (int k=spc.First(key), ke=spc.Last(key); k<ke; ++k) {
+                const int q = spc.list(k);
                 if (q == c || pr(IPM,q) <= 0.0 || owner(q) >= 0) continue;
                 if (Kokkos::fabs(pr(IPM,q) - w) > 1.0e-6*w || pr(IPTS,q) != ts) continue;
                 const Real dx = Kokkos::fabs(transfer.MinImage1(pr(IPX,q) - tx));
@@ -1073,10 +1172,10 @@ int DustGasDrag::MergeCloudsDevice() {
                 if (a == 0 && b == 0) continue;
                 const Real w = mc/static_cast<Real>((a != 0 ? 2 : 1)*(b != 0 ? 2 : 1));
                 const Real tx = xc0 + a*ell1, ty = yc0 + b*ell2;
-                const int key = sp*ncl + mm.Cell(tx, ty, L);
+                const std::int64_t key = sp*ncl + mm.Cell(tx, ty, L);
                 int best = -1; Real bd = 1.0e30;
-                for (int k=sp_start(key); k<sp_start(key+1); ++k) {
-                  const int q = sp_list(k);
+                for (int k=spc.First(key), ke=spc.Last(key); k<ke; ++k) {
+                  const int q = spc.list(k);
                   if (q == c || pr(IPM,q) <= 0.0) continue;
                   if (Kokkos::fabs(pr(IPM,q) - w) > 1.0e-6*w || pr(IPTS,q) != ts) continue;
                   const Real dx = Kokkos::fabs(transfer.MinImage1(pr(IPX,q) - tx));
@@ -1158,7 +1257,7 @@ int DustGasDrag::MergeCloudsDevice() {
         const int tl = (stage == 1) ? L : lev;                  // target level
         const Real cs1 = (stage == 1) ? H1 : ell1, cs2 = (stage == 1) ? H2 : ell2;
         const int m1 = (stage == 1) ? n1 : transfer.nfine1/nfl, m2 = (stage == 1) ? n2 : transfer.nfine2/nfl;
-        const int nc = m1*m2;
+        const std::int64_t nc = static_cast<std::int64_t>(m1)*m2;
         const Real smax1 = ((stage == 1) ? cloud_merge_smax : cloud_compress_smax)*cs1;
         const Real smax2 = ((stage == 1) ? cloud_merge_smax : cloud_compress_smax)*cs2;
         const Real cds = cloud_compress_ds;
@@ -1167,7 +1266,7 @@ int DustGasDrag::MergeCloudsDevice() {
         const Real qden = static_cast<Real>(1 << (2*tl));
         const int q0 = (stage == 1) ? 5 : 13;                    // counter block
         const int glag = cloud_merge_g_lag;
-        DvceArray1D<int> kq("q_key", npart);
+        DvceArray1D<std::int64_t> kq("q_key", npart);
         int k0 = 0;   // this stage's new clouds are k0..k1-1
         Kokkos::deep_copy(k0, Kokkos::subview(nnew, 0));
         Kokkos::parallel_for("q_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -1196,15 +1295,31 @@ int DustGasDrag::MergeCloudsDevice() {
           const int si = Kokkos::min(3, static_cast<int>(Kokkos::floor(4.0*(u - Kokkos::floor(u)))));
           const int sj = Kokkos::min(3, static_cast<int>(Kokkos::floor(4.0*(v - Kokkos::floor(v)))));
           const int sub = ((sj >> 1) << 3) | ((si >> 1) << 2) | ((sj & 1) << 1) | (si & 1);   // Morton
-          kq(p) = ((pi(PSP,p)*nc + J*m1 + I) << 4) + sub;
+          kq(p) = ((pi(PSP,p)*nc + static_cast<std::int64_t>(J)*m1 + I) << 4) + sub;
         });
-        DvceArray1D<int> qs_start, qs_list;
-        BuildCSR(kq, nsp*nc*16, qs_start, qs_list);
-        Kokkos::parallel_for("q_walk", Kokkos::RangePolicy<>(DevExeSpace(), 0, nsp*nc),
-        KOKKOS_LAMBDA(const int kcell) {
-          const int base = kcell << 4;
-          if (qs_start(base) == qs_start(base + 16)) return;
-          const int sp = kcell/nc, cell = kcell % nc, I = cell % m1, J = cell/m1;
+        // sparse keys (cell << 4 | sub), the walk over the cells that hold pieces
+        KeyCSR qsc;
+        BuildKeyCSR(kq, qsc);
+        // the distinct cells: their first entry in qsc.ukey (the 16 sub-keys of a cell are adjacent)
+        DvceArray1D<int> cfirst(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q_cfirst"), qsc.nu + 1);
+        int ncell = 0;
+        {
+          auto uk = qsc.ukey; const int nu = qsc.nu;
+          Kokkos::parallel_scan("q_cells", Kokkos::RangePolicy<>(DevExeSpace(), 0, nu),
+          KOKKOS_LAMBDA(const int u, int &upd, const bool final) {
+            const bool first = (u == 0) || ((uk(u) >> 4) != (uk(u - 1) >> 4));
+            if (first && final) cfirst(upd) = u;
+            if (first) ++upd;
+            if (final && u == nu - 1) cfirst(upd) = nu;
+          }, ncell);
+        }
+        Kokkos::parallel_for("q_walk", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
+        KOKKOS_LAMBDA(const int ic) {
+          const int u0 = cfirst(ic), u1 = cfirst(ic + 1);
+          const std::int64_t kcell = qsc.ukey(u0) >> 4;
+          const int sp = static_cast<int>(kcell/nc);
+          const std::int64_t cell = kcell % nc;
+          const int I = static_cast<int>(cell % m1), J = static_cast<int>(cell/m1);
           const Real mq = mrootsp[sp]/qden;
           const Real xcc = transfer.x1min + (I + 0.5)*cs1, ycc = transfer.x2min + (J + 0.5)*cs2;
           Real gM[8], gsx[8], gsy[8], gsxx[8], gsyy[8], vlo[8][3], vhi[8][3];
@@ -1229,8 +1344,12 @@ int DustGasDrag::MergeCloudsDevice() {
           };
           for (int s=0; s<16; ++s) {
             const int sub = rev ? (rot + 16 - s) % 16 : (rot + s) % 16;
-            for (int k=qs_start(base + sub); k<qs_start(base + sub + 1); ++k) {
-              const int p = qs_list(k);
+            int kb = 0, ke = 0;   // the members of sub-cell sub
+            for (int u=u0; u<u1; ++u) {
+              if ((qsc.ukey(u) & 15) == sub) {kb = qsc.start(u); ke = qsc.start(u + 1); break;}
+            }
+            for (int k=kb; k<ke; ++k) {
+              const int p = qsc.list(k);
               const Real m = pr(IPM,p);
               if (m <= 0.0) continue;
               const Real dx = transfer.MinImage1(pr(IPX,p) - xcc), dy = transfer.MinImage2(pr(IPY,p) - ycc);
@@ -1477,14 +1596,15 @@ int DustGasDrag::MergeCloudsDevice() {
       // and whose velocity is within tol per component; tent-weighted, conserving mass, momentum
       // and the first moment; dK logged
       if (absorb) {
-        DvceArray1D<int> nhead("q_nhead", nkey), nnext("q_nnext", ncommit > 0 ? ncommit : 1);
-        Kokkos::deep_copy(nhead, -1);
+        CellLists nhead;   // hash of the cells, no level-L table
+        nhead.Allocate(ncommit);
+        DvceArray1D<int> nnext("q_nnext", ncommit > 0 ? ncommit : 1);
         if (ncommit > 0) {
           Kokkos::parallel_for("q_newlist", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncommit),
           KOKKOS_LAMBDA(const int k) {
             if (nkind(k) == 2 || nr(IPM,k) <= 0.0) return;   // not C clouds, not budget-rejected ones
-            const int key = ni(PSP,k)*ncl + mm.Cell(nr(IPX,k), nr(IPY,k), L);
-            nnext(k) = Kokkos::atomic_exchange(&nhead(key), k);
+            const std::int64_t key = ni(PSP,k)*ncl + mm.Cell(nr(IPX,k), nr(IPY,k), L);
+            nnext(k) = nhead.Push(key, k);
           });
         }
         DvceArray2D<Real> accP("qabs_accP", 7, npart), accN("qabs_accN", 7, ncommit > 0 ? ncommit : 1);
@@ -1561,7 +1681,8 @@ int DustGasDrag::MergeCloudsDevice() {
             if (kp(o) < 0 || pr(IPM,o) <= 0.0 || gres(o) == 0) return;
             const Real xo = pr(IPX,o), yo = pr(IPY,o), mo = pr(IPM,o);
             if (!mm.In(xo, yo, L, lt.Anchor(pi(PGID,o)))) {if (aud) ostat(o) = 1; return;}
-            const int sp = pi(PSP,o), cell = kp(o) - sp*ncl, I = cell % n1, J = cell/n1;
+            const int sp = pi(PSP,o); const std::int64_t cell = kp(o) - sp*ncl;
+      const int I = static_cast<int>(cell % n1), J = static_cast<int>(cell/n1);
             for (int dj=-1; dj<=1; ++dj) {   // deep: the 3x3 cells are merge cells
               for (int di=-1; di<=1; ++di) {
                 const Real xn = transfer.x1min + (SMRCompositeTransfer::WrapIndex(I + di, n1) + 0.5)*H1;
@@ -1571,10 +1692,10 @@ int DustGasDrag::MergeCloudsDevice() {
             }
             for (int dj=-2; dj<=2; ++dj) {   // no unreleased lobed cloud within reach
               for (int di=-2; di<=2; ++di) {
-                const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+                const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                                 SMRCompositeTransfer::WrapIndex(I + di, n1);
-                for (int k=sl_start(key); k<sl_start(key+1); ++k) {
-                  const int t = sl_list(k);
+                for (int k=slc.First(key), ke=slc.Last(key); k<ke; ++k) {
+                  const int t = slc.list(k);
                   if (Kokkos::fabs(transfer.MinImage1(pr(IPX,t) - xo)) < H1 + ell1 &&
                       Kokkos::fabs(transfer.MinImage2(pr(IPY,t) - yo)) < H2 + ell2) {if (aud) ostat(o) = 3; return;}
                 }
@@ -1593,10 +1714,10 @@ int DustGasDrag::MergeCloudsDevice() {
             for (int ps=0; ps<2; ++ps) {   // 0: weight sum, 1: accumulate
               for (int dj=-1; dj<=1; ++dj) {
                 for (int di=-1; di<=1; ++di) {
-                  const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+                  const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                                   SMRCompositeTransfer::WrapIndex(I + di, n1);
-                  for (int k=sc_start(key); k<sc_start(key+1); ++k) {
-                    const int q = sc_list(k);
+                  for (int k=scc.First(key), ke=scc.Last(key); k<ke; ++k) {
+                    const int q = scc.list(k);
                     const Real dx = transfer.MinImage1(xo - pr(IPX,q)), dy = transfer.MinImage2(yo - pr(IPY,q));
                     const Real w = tentc(dx, dy);
                     if (w <= 0.0 || pr(IPM,q) <= 0.0) continue;
@@ -1617,7 +1738,7 @@ int DustGasDrag::MergeCloudsDevice() {
                     Kokkos::atomic_add(&accP(5,q), dm*vo[2]);
                     Kokkos::atomic_add(&accP(6,q), dm*(vo[0]*vo[0] + vo[1]*vo[1] + vo[2]*vo[2]));
                   }
-                  for (int q=nhead(key); q>=0; q=nnext(q)) {
+                  for (int q=nhead.Head(key); q>=0; q=nnext(q)) {
                     const Real dx = transfer.MinImage1(xo - nr(IPX,q)), dy = transfer.MinImage2(yo - nr(IPY,q));
                     const Real w = tentc(dx, dy);
                     if (w <= 0.0) continue;
@@ -1895,13 +2016,14 @@ int DustGasDrag::MergeCloudsDevice() {
     KOKKOS_LAMBDA(const int p) {
       state(p) = 0;
       if (kp(p) < 0 || !mm.In(pr(IPX,p), pr(IPY,p), L, lt.Anchor(pi(PGID,p)))) return;
-      const int sp = pi(PSP,p), cell = kp(p) - sp*ncl, I = cell % n1, J = cell/n1;
+      const int sp = pi(PSP,p); const std::int64_t cell = kp(p) - sp*ncl;
+      const int I = static_cast<int>(cell % n1), J = static_cast<int>(cell/n1);
       for (int dj=-1; dj<=1; ++dj) {
         for (int di=-1; di<=1; ++di) {
-          const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+          const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                           SMRCompositeTransfer::WrapIndex(I + di, n1);
-          for (int k=sc_start(key); k<sc_start(key+1); ++k) {
-            const int q = sc_list(k);
+          for (int k=scc.First(key), ke=scc.Last(key); k<ke; ++k) {
+            const int q = scc.list(k);
             if (Kokkos::fabs(transfer.MinImage1(pr(IPX,p) - pr(IPX,q))) < b1 &&
                 Kokkos::fabs(transfer.MinImage2(pr(IPY,p) - pr(IPY,q))) < b2) {state(p) = 3; return;}
           }
@@ -1915,14 +2037,15 @@ int DustGasDrag::MergeCloudsDevice() {
       KOKKOS_LAMBDA(const int p) {
         win(p) = 0;
         if (state(p) != 1) return;
-        const int sp = pi(PSP,p), cell = kp(p) - sp*ncl, I = cell % n1, J = cell/n1;
+        const int sp = pi(PSP,p); const std::int64_t cell = kp(p) - sp*ncl;
+      const int I = static_cast<int>(cell % n1), J = static_cast<int>(cell/n1);
         const Real mp = pr(IPM,p), xp = pr(IPX,p), yp = pr(IPY,p);
         for (int dj=-1; dj<=1; ++dj) {
           for (int di=-1; di<=1; ++di) {
-            const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+            const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                             SMRCompositeTransfer::WrapIndex(I + di, n1);
-            for (int k=sp_start(key); k<sp_start(key+1); ++k) {
-              const int q = sp_list(k);
+            for (int k=spc.First(key), ke=spc.Last(key); k<ke; ++k) {
+              const int q = spc.list(k);
               if (q == p || (state(q) != 1 && state(q) != 2)) continue;
               if (Kokkos::fabs(transfer.MinImage1(xp - pr(IPX,q))) >= b1 ||
                   Kokkos::fabs(transfer.MinImage2(yp - pr(IPY,q))) >= b2) continue;
@@ -1952,8 +2075,8 @@ int DustGasDrag::MergeCloudsDevice() {
       if (state(p) != 2) return;
       const Real mp = pr(IPM,p), xp = pr(IPX,p), yp = pr(IPY,p);
       int r = 0;
-      for (int k=sp_start(kp(p)); k<sp_start(kp(p)+1); ++k) {
-        const int q = sp_list(k);
+      for (int k=spc.First(kp(p)), ke=spc.Last(kp(p)); k<ke; ++k) {
+        const int q = spc.list(k);
         if (q == p || state(q) != 2) continue;
         const Real mq = pr(IPM,q), xq = pr(IPX,q), yq = pr(IPY,q);
         if ((mq > mp) || (mq == mp && (xq < xp || (xq == xp && yq < yp)))) ++r;
@@ -1964,9 +2087,10 @@ int DustGasDrag::MergeCloudsDevice() {
     // new level-L clouds of this pass, and their per-cell linked lists
     DvceArray2D<Real> nr(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_nr"), nrdata, ncentre);
     DvceArray2D<int> ni(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_ni"), nidata, ncentre);
-    DvceArray1D<int> nhead("merge_nhead", nkey), nnext("merge_nnext", ncentre);
+    CellLists nhead;   // hash of the cells, no level-L table
+    nhead.Allocate(ncentre);
+    DvceArray1D<int> nnext("merge_nnext", ncentre);
     DvceArray1D<int> nnew("merge_nnew", 1);
-    Kokkos::deep_copy(nhead, -1);
     // D3 diagnostic: per new cloud, the x first-moment mismatch of its contributions in the
     // five coarse cell rows around it (relative to its own position), and its row index
     const Real hcz = transfer.CloudHalfWidth2(L);
@@ -1977,7 +2101,8 @@ int DustGasDrag::MergeCloudsDevice() {
       Kokkos::parallel_for("merge_commit", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
       KOKKOS_LAMBDA(const int c) {
         if (state(c) != 2 || rank(c) != sub) return;
-        const int sp = pi(PSP,c), cell = kp(c) - sp*ncl, I = cell % n1, J = cell/n1;
+        const int sp = pi(PSP,c); const std::int64_t cell = kp(c) - sp*ncl;
+      const int I = static_cast<int>(cell % n1), J = static_cast<int>(cell/n1);
         if ((I % 4) + 4*(J % 4) != col) return;
         if (pr(IPM,c) <= 0.0) return;
         const Real mref = mrootsp[sp]/static_cast<Real>(1 << (2*L)), mnode = 0.25*mref;
@@ -1986,10 +2111,10 @@ int DustGasDrag::MergeCloudsDevice() {
         int nb[kNbMax]; int nnb = 0; bool ready = true, over = false; int why = 6;
         for (int dj=-1; dj<=1 && ready; ++dj) {
           for (int di=-1; di<=1 && ready; ++di) {
-            const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+            const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                             SMRCompositeTransfer::WrapIndex(I + di, n1);
-            for (int k=sp_start(key); k<sp_start(key+1); ++k) {
-              const int t = sp_list(k);
+            for (int k=spc.First(key), ke=spc.Last(key); k<ke; ++k) {
+              const int t = spc.list(k);
               if (t == c || pr(IPM,t) <= 0.0) continue;
               const Real dx = transfer.MinImage1(pr(IPX,t) - xc0);
               const Real dy = transfer.MinImage2(pr(IPY,t) - yc0);
@@ -2008,10 +2133,10 @@ int DustGasDrag::MergeCloudsDevice() {
           // the reach (up to H + ell) can span two level-L cells: search +-2 cells
           for (int dj=-2; dj<=2 && ready; ++dj) {
             for (int di=-2; di<=2 && ready; ++di) {
-              const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+              const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                               SMRCompositeTransfer::WrapIndex(I + di, n1);
-              for (int k=sl_start(key); k<sl_start(key+1); ++k) {
-                const int t = sl_list(k);
+              for (int k=slc.First(key), ke=slc.Last(key); k<ke; ++k) {
+                const int t = slc.list(k);
                 const int ct = pi(PLEV,t);
                 const Real r1 = H1 + (lobe_wait_dir ? (SMRCompositeTransfer::CloudLobe1(ct) ? ell1 : 0.0) : ell1);
                 const Real r2 = H2 + (lobe_wait_dir ? (SMRCompositeTransfer::CloudLobe2(ct) ? ell2 : 0.0) : ell2);
@@ -2062,19 +2187,20 @@ int DustGasDrag::MergeCloudsDevice() {
           oy0[n] = transfer.MinImage2(pr(IPY,q0) - yc0);
           Im[n] = Ix[n] = Iy[n] = 0.0;
           const Real xn = pr(IPX,q0), yn = pr(IPY,q0);
-          const int ncell = mm.Cell(xn, yn, L), In_ = ncell % n1, Jn = ncell/n1;
+          const std::int64_t ncell = mm.Cell(xn, yn, L);
+          const int In_ = static_cast<int>(ncell % n1), Jn = static_cast<int>(ncell/n1);
           for (int dj=-1; dj<=1; ++dj) {
             for (int di=-1; di<=1; ++di) {
-              const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(Jn + dj, n2)*n1 +
+              const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(Jn + dj, n2)*n1 +
                               SMRCompositeTransfer::WrapIndex(In_ + di, n1);
-              for (int k=sc_start(key); k<sc_start(key+1); ++k) {
-                const int q = sc_list(k);
+              for (int k=scc.First(key), ke=scc.Last(key); k<ke; ++k) {
+                const int q = scc.list(k);
                 const Real dx = transfer.MinImage1(xn - pr(IPX,q)), dy = transfer.MinImage2(yn - pr(IPY,q));
                 const Real w = 0.25*pr(IPM,q)*tent(dx, dy);
                 if (w <= 0.0) continue;
                 Im[n] += w; Ix[n] += w*(Snap(dx, ell1) - dx); Iy[n] += w*(Snap(dy, ell2) - dy);
               }
-              for (int q=nhead(key); q>=0; q=nnext(q)) {
+              for (int q=nhead.Head(key); q>=0; q=nnext(q)) {
                 const Real dx = transfer.MinImage1(xn - nr(IPX,q)), dy = transfer.MinImage2(yn - nr(IPY,q));
                 const Real w = 0.25*nr(IPM,q)*tent(dx, dy);
                 if (w <= 0.0) continue;
@@ -2194,8 +2320,8 @@ int DustGasDrag::MergeCloudsDevice() {
         {
           ni(PGID,knew) = gids + NewCloudBlock(lt, px, py, lt.Anchor(ni(PGID,knew)), ncell12);
         }
-        const int key = sp*ncl + mm.Cell(px, py, L);
-        nnext(knew) = Kokkos::atomic_exchange(&nhead(key), knew);
+        const std::int64_t key = sp*ncl + mm.Cell(px, py, L);
+        nnext(knew) = nhead.Push(key, knew);
         // take the shares; the node convention shifts what is left of each node
         Real taken[kNodeMax];
         for (int n=0; n<nnode; ++n) taken[n] = 0.0;
@@ -2249,13 +2375,14 @@ int DustGasDrag::MergeCloudsDevice() {
       DvceArray1D<double> ssum("d3_ssum", 2);
       auto rowres = [=] KOKKOS_FUNCTION (const int k, const int m, const DvceArray1D<Real> &dX) -> Real {
         const Real xk = nr(IPX,k), zk = nr(IPY,k);
-        const int sp = ni(PSP,k), cell = mm.Cell(xk, zk, L), I = cell % n1, J = cell/n1;
+        const int sp = ni(PSP,k); const std::int64_t cell = mm.Cell(xk, zk, L);
+        const int I = static_cast<int>(cell % n1), J = static_cast<int>(cell/n1);
         Real r = 0.0;
         for (int dj=-3; dj<=3; ++dj) {
           for (int di=-1; di<=1; ++di) {
-            const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+            const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                             SMRCompositeTransfer::WrapIndex(I + di, n1);
-            for (int q=nhead(key); q>=0; q=nnext(q)) {
+            for (int q=nhead.Head(key); q>=0; q=nnext(q)) {
               if (Kokkos::fabs(transfer.MinImage1(nr(IPX,q) - xk)) >= 0.5*H1) continue;
               const Real zq = zk + transfer.MinImage2(nr(IPY,q) - zk);
               const int mzq = static_cast<int>(Kokkos::floor((zq - transfer.x2min)/H2));
@@ -2329,17 +2456,18 @@ int DustGasDrag::MergeCloudsDevice() {
         blk(p) = 0;
         if (kp(p) < 0 || pr(IPM,p) <= 0.0) return;
         const Real xp = pr(IPX,p), yp = pr(IPY,p);
-        const int sp = pi(PSP,p), cell = kp(p) - sp*ncl, I = cell % n1, J = cell/n1;
+        const int sp = pi(PSP,p); const std::int64_t cell = kp(p) - sp*ncl;
+      const int I = static_cast<int>(cell % n1), J = static_cast<int>(cell/n1);
         for (int dj=-1; dj<=1; ++dj) {
           for (int di=-1; di<=1; ++di) {
-            const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+            const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                             SMRCompositeTransfer::WrapIndex(I + di, n1);
-            for (int k=sc_start(key); k<sc_start(key+1); ++k) {
-              const int q = sc_list(k);
+            for (int k=scc.First(key), ke=scc.Last(key); k<ke; ++k) {
+              const int q = scc.list(k);
               if (Kokkos::fabs(transfer.MinImage1(xp - pr(IPX,q))) < b1 &&
                   Kokkos::fabs(transfer.MinImage2(yp - pr(IPY,q))) < b2) {blk(p) = 1; return;}
             }
-            for (int q=nhead(key); q>=0; q=nnext(q)) {
+            for (int q=nhead.Head(key); q>=0; q=nnext(q)) {
               if (Kokkos::fabs(transfer.MinImage1(xp - nr(IPX,q))) < b1 &&
                   Kokkos::fabs(transfer.MinImage2(yp - nr(IPY,q))) < b2) {blk(p) = 1; return;}
             }
@@ -2353,21 +2481,22 @@ int DustGasDrag::MergeCloudsDevice() {
         if (kp(o) < 0 || blk(o) == 0 || pr(IPM,o) <= 0.0) return;
         const Real xo = pr(IPX,o), yo = pr(IPY,o), mo = pr(IPM,o);
         if (!mm.In(xo, yo, L, lt.Anchor(pi(PGID,o)))) return;
-        const int sp = pi(PSP,o), cell = kp(o) - sp*ncl, I = cell % n1, J = cell/n1;
+        const int sp = pi(PSP,o); const std::int64_t cell = kp(o) - sp*ncl;
+      const int I = static_cast<int>(cell % n1), J = static_cast<int>(cell/n1);
         for (int dj=-2; dj<=2; ++dj) {
           for (int di=-2; di<=2; ++di) {
-            const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+            const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                             SMRCompositeTransfer::WrapIndex(I + di, n1);
             if (dj >= -1 && dj <= 1 && di >= -1 && di <= 1) {
-              for (int k=sp_start(key); k<sp_start(key+1); ++k) {
-                const int q = sp_list(k);
+              for (int k=spc.First(key), ke=spc.Last(key); k<ke; ++k) {
+                const int q = spc.list(k);
                 if (q == o || pr(IPM,q) <= 0.0 || blk(q) != 0) continue;
                 if (Kokkos::fabs(transfer.MinImage1(pr(IPX,q) - xo)) < H1 &&
                     Kokkos::fabs(transfer.MinImage2(pr(IPY,q) - yo)) < H2) return;   // still reachable
               }
             }
-            for (int k=sl_start(key); k<sl_start(key+1); ++k) {
-              const int t = sl_list(k);
+            for (int k=slc.First(key), ke=slc.Last(key); k<ke; ++k) {
+              const int t = slc.list(k);
               if (Kokkos::fabs(transfer.MinImage1(pr(IPX,t) - xo)) < H1 + ell1 &&
                   Kokkos::fabs(transfer.MinImage2(pr(IPY,t) - yo)) < H2 + ell2) return;   // lobe pending
             }
@@ -2385,10 +2514,10 @@ int DustGasDrag::MergeCloudsDevice() {
         for (int pass=0; pass<2; ++pass) {   // 0: weight sum, 1: accumulate
           for (int dj=-1; dj<=1; ++dj) {
             for (int di=-1; di<=1; ++di) {
-              const int key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
+              const std::int64_t key = sp*ncl + SMRCompositeTransfer::WrapIndex(J + dj, n2)*n1 +
                               SMRCompositeTransfer::WrapIndex(I + di, n1);
-              for (int k=sc_start(key); k<sc_start(key+1); ++k) {
-                const int q = sc_list(k);
+              for (int k=scc.First(key), ke=scc.Last(key); k<ke; ++k) {
+                const int q = scc.list(k);
                 const Real dx = transfer.MinImage1(xo - pr(IPX,q)), dy = transfer.MinImage2(yo - pr(IPY,q));
                 const Real w = tentc(dx, dy);
                 if (w <= 0.0 || pr(IPM,q) <= 0.0) continue;
@@ -2402,7 +2531,7 @@ int DustGasDrag::MergeCloudsDevice() {
                 Kokkos::atomic_add(&accP(5,q), dm*vo[2]);
                 Kokkos::atomic_add(&accP(6,q), dm*(vo[0]*vo[0] + vo[1]*vo[1] + vo[2]*vo[2]));
               }
-              for (int q=nhead(key); q>=0; q=nnext(q)) {
+              for (int q=nhead.Head(key); q>=0; q=nnext(q)) {
                 if (ni(PSP,q) != sp) continue;
                 const Real dx = transfer.MinImage1(xo - nr(IPX,q)), dy = transfer.MinImage2(yo - nr(IPY,q));
                 const Real w = tentc(dx, dy);
