@@ -80,6 +80,18 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   cloud_native_check = pin->GetOrAddInteger("dust", "cloud_native_check", 0);
   // cloud_leaf_check compares the actual-leaf traversal with the table
   cloud_leaf_check = pin->GetOrAddInteger("dust", "cloud_leaf_check", 0);
+  // Timing diagnostic: every cloud_sort_interval cycles (0: never) the particle
+  // arrays are reordered by block, cell in the block (cloud_sort_order = linear or morton) and
+  // old position, at the start of the cycle (SortParticles)
+  cloud_sort_interval = pin->GetOrAddInteger("dust", "cloud_sort_interval", 0);
+  {
+    const std::string so = pin->GetOrAddString("dust", "cloud_sort_order", "linear");
+    if (so != "linear" && so != "morton") {
+      std::cout << "### FATAL ERROR: <dust>/cloud_sort_order must be linear or morton" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    cloud_sort_morton = (so == "morton");
+  }
   const bool graded = pin->DoesParameterExist("problem", "graded_split_layers") &&
                       pin->GetInteger("problem", "graded_split_layers") >= 0;
   std::string users;
@@ -413,6 +425,9 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   }
   if (cloud_leaf_check > 0 && pmy_pack->pmesh->ncycle % cloud_leaf_check == 0) {
     CheckLeafTraversal();
+  }
+  if (cloud_sort_interval > 0 && pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
+    SortParticles();
   }
   return TaskStatus::complete;
 }

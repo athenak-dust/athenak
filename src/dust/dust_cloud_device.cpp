@@ -320,7 +320,7 @@ struct KeyCSR {
 struct KeyScratch {
   static constexpr int kSlots = 4;
   DvceArray1D<int> pos, uidx, list[kSlots], start[kSlots], hhead[kSlots];
-  DvceArray1D<std::int64_t> comp, ukey[kSlots], hkey[kSlots];
+  DvceArray1D<std::int64_t> comp, ukey[kSlots], hkey[kSlots], skey;   // skey: SortParticles
   DvceArray1D<char> sort_tmp;
   bool sort_busy = false;
 };
@@ -2843,6 +2843,105 @@ int DustGasDrag::MergeCloudsDevice() {
   }
   (void) sh1; (void) sh2;
   return static_cast<int>(nevents);
+}
+
+namespace {
+// bits of v (at most 16) spread to the even bit positions (Morton interleave)
+KOKKOS_INLINE_FUNCTION
+std::int64_t SpreadBits(unsigned v) {
+  v &= 0xffffu;
+  v = (v | (v << 8)) & 0x00ff00ffu;
+  v = (v | (v << 4)) & 0x0f0f0f0fu;
+  v = (v | (v << 2)) & 0x33333333u;
+  v = (v | (v << 1)) & 0x55555555u;
+  return static_cast<std::int64_t>(v);
+}
+}  // namespace
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::SortParticles
+//! \brief Timing diagnostic: reorders the
+//! particle arrays by (block, cell of the block, old position): the cells of a block row by row,
+//! or in Morton order (cloud_sort_order = morton, square blocks of a power of two), stable
+//! inside a cell.  Every nrdata / nidata column moves; the arrays are swapped with spare arrays
+//! of the same extent (kept for the next call).  Runs at the start of a cycle (RefineClouds),
+//! where no send list is pending.  The resampling and the merge pass take their candidates in
+//! array order, so their results change with the order (statistically the same).  One line per
+//! call in cloud_sort_log.txt (fenced stage times).
+
+void DustGasDrag::SortParticles() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  if (npart < 2) return;
+  Kokkos::fence();
+  Kokkos::Timer t;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  const int nrdata = ppar->nrdata, nidata = ppar->nidata;
+  const int nx1 = pmy_pack->pmesh->mb_indcs.nx1, nx2 = pmy_pack->pmesh->mb_indcs.nx2;
+  const int gids = pmy_pack->gids, nmb = pmy_pack->nmb_thispack;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  const bool morton = cloud_sort_morton && nx1 == nx2 && (nx1 & (nx1 - 1)) == 0 && nx1 <= 65536;
+  const std::int64_t ncell = static_cast<std::int64_t>(nx1)*nx2, np = npart;
+  KeyScratch &s = Scratch();
+  auto key = Grow(s.skey, npart, "sort_key");
+  Kokkos::parallel_for("sort_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    int m = pi(PGID,p) - gids;
+    m = (m < 0) ? 0 : ((m >= nmb) ? nmb - 1 : m);
+    int i = static_cast<int>(Kokkos::floor((pr(IPX,p) - mbsize.d_view(m).x1min)/mbsize.d_view(m).dx1));
+    int j = static_cast<int>(Kokkos::floor((pr(IPY,p) - mbsize.d_view(m).x2min)/mbsize.d_view(m).dx2));
+    i = (i < 0) ? 0 : ((i >= nx1) ? nx1 - 1 : i);
+    j = (j < 0) ? 0 : ((j >= nx2) ? nx2 - 1 : j);
+    const std::int64_t cell = morton ? (SpreadBits(i) | (SpreadBits(j) << 1))
+                                     : static_cast<std::int64_t>(j)*nx1 + i;
+    key(p) = (m*ncell + cell)*np + p;
+  });
+  Kokkos::fence();
+  const double t_key = t.seconds();
+  t.reset();
+  SortFirst(key, npart);
+  Kokkos::fence();
+  const double t_sort = t.seconds();
+  t.reset();
+  if (sort_spare_r.extent(0) != pr.extent(0) || sort_spare_r.extent(1) != pr.extent(1) ||
+      sort_spare_i.extent(0) != pi.extent(0) || sort_spare_i.extent(1) != pi.extent(1)) {
+    sort_spare_r = DvceArray2D<Real>();
+    sort_spare_i = DvceArray2D<int>();
+    sort_spare_r = DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"),
+                                     pr.extent(0), pr.extent(1));
+    sort_spare_i = DvceArray2D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"),
+                                    pi.extent(0), pi.extent(1));
+  }
+  auto nr = sort_spare_r;
+  auto ni = sort_spare_i;
+  int moved = 0;
+  Kokkos::parallel_reduce("sort_move", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int k, int &mv) {
+    const int p = static_cast<int>(key(k) % np);
+    for (int c=0; c<nrdata; ++c) nr(c,k) = pr(c,p);
+    for (int c=0; c<nidata; ++c) ni(c,k) = pi(c,p);
+    if (p != k) ++mv;
+  }, moved);
+  ppar->prtcl_rdata = nr;
+  ppar->prtcl_idata = ni;
+  sort_spare_r = pr;
+  sort_spare_i = pi;
+  Kokkos::fence();
+  const double t_move = t.seconds();
+  if (global_variable::my_rank == 0) {
+    std::FILE *fp = std::fopen("cloud_sort_log.txt", "a");
+    if (fp != nullptr) {
+      std::fseek(fp, 0, SEEK_END);
+      if (std::ftell(fp) == 0) {
+        std::fprintf(fp, "# cloud sort: ncycle time particles moved t_keys t_sort t_move (s, fenced); "
+                     "order %s\n", morton ? "morton" : "linear");
+      }
+      std::fprintf(fp, "%d %.17g %d %d %.4e %.4e %.4e\n", pmy_pack->pmesh->ncycle,
+                   pmy_pack->pmesh->time, npart, moved, t_key, t_sort, t_move);
+      std::fclose(fp);
+    }
+  }
 }
 
 }  // namespace dust

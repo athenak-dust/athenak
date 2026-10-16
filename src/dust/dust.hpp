@@ -1710,6 +1710,12 @@ class DustGasDrag {
   // block-local traversal of the actual leaves (dust_leaf.cpp)
   LeafTraversal leaf_traversal;
   int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
+  // timing diagnostic: storage order of the particles
+  int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)
+  bool cloud_sort_morton = false;     // cells of a block in Morton order (else row by row)
+  DvceArray2D<Real> sort_spare_r;     // the arrays the reordered particles are written to
+  DvceArray2D<int> sort_spare_i;
+  void SortParticles();
   void BuildLeafTraversal();
   void RequireCloudTable(const char *what) const;   // fatal without the table
   void EnsureRootCloudMass();          // cloud_merge_mroot once (merge pass, resampling caps)
