@@ -46,10 +46,12 @@ struct DevicePatchProblem {
   double lx = 0.0, ly = 0.0;
 };
 // mid > 64: patches of 65 .. mid clouds form a middle bucket solved with teams of mid_team threads
-// (three buckets); mid <= 64: the two buckets of <= 64 and > 64 clouds.
+// (three buckets); mid <= 64: the two buckets of <= 64 and > 64 clouds.  wide_team > 512: the large bucket
+// with teams of up to 1024 threads (a kernel bound to 1024 threads).
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
-                        const int mid, const int mid_team, double timing[5]);
+                        const int mid, const int mid_team, const int wide_team,
+                        double timing[5]);
 
 // Totals of one resampling over its patches (the log row), reduced on the device from outi /
 // outr, so that no per-patch data goes to the host: patches with clouds, pool,

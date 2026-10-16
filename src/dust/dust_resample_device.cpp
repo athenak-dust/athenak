@@ -44,6 +44,8 @@ using Policy = Kokkos::TeamPolicy<DevExeSpace>;
 using Member = Policy::member_type;
 // large patches: up to 512 threads per team, registers limited accordingly
 using PolicyWide = Kokkos::TeamPolicy<DevExeSpace, Kokkos::LaunchBounds<512, 1>>;
+// with cloud_resample_device_wide_team = 1024: teams of up to 1024 threads
+using PolicyWider = Kokkos::TeamPolicy<DevExeSpace, Kokkos::LaunchBounds<1024, 1>>;
 constexpr int kChunk = 8;   // a step search along one null vector is split in this many chunks
 
 // sizes of the per-team workspace of a bucket
@@ -599,7 +601,8 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
 
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
-                        const int mid, const int mid_team, double timing[5]) {
+                        const int mid, const int mid_team, const int wide_team,
+                        double timing[5]) {
   Kokkos::Timer t_all, t;
   const int npatch = pb.npatch;
   // per patch: clouds, CSR entries (device), distinct leaves (team sort of a copy)
@@ -745,14 +748,29 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
         const int tcap = (b == 1) ? std::max(1, mid_team) : 512;
         while (2*ts <= tmax && 2*ts <= tcap) ts *= 2;
         static bool told[NB] = {false, false, false};
-        if (!told[b] && global_variable::my_rank == 0) {
+        if (!told[b] && global_variable::my_rank == 0 && !(b == 2 && wide_team > 512)) {
           std::cout << "# device resampling: " << ((b == 1) ? "middle" : "large")
                     << " patches with teams of " << ts << " threads (largest allowed " << tmax << ")"
                     << std::endl;
           told[b] = true;
         }
-        Kokkos::parallel_for((b == 1) ? "rs_dev_patches_mid" : "rs_dev_patches_large",
-                             PolicyWide(nslot, ts), body);
+        if (b == 2 && wide_team > 512) {
+          // The large bucket with teams of up to 1024 threads (at most 64
+          // registers per thread)
+          const int tmax2 = PolicyWider(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
+          int ts2 = 1;
+          while (2*ts2 <= tmax2 && 2*ts2 <= wide_team) ts2 *= 2;
+          static bool told2 = false;
+          if (!told2 && global_variable::my_rank == 0) {
+            std::cout << "# device resampling: large patches with teams of " << ts2
+                      << " threads (largest allowed " << tmax2 << ", 1024-thread bound)" << std::endl;
+            told2 = true;
+          }
+          Kokkos::parallel_for("rs_dev_patches_large1024", PolicyWider(nslot, ts2), body);
+        } else {
+          Kokkos::parallel_for((b == 1) ? "rs_dev_patches_mid" : "rs_dev_patches_large",
+                               PolicyWide(nslot, ts), body);
+        }
       }
     }
     Kokkos::fence();

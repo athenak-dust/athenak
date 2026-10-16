@@ -1112,7 +1112,8 @@ int DustGasDrag::ResampleClouds() {
     DvceArray1D<double> outr("rs_dev_outr", npatch);
     double tim[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
     resample::SolvePatchesDevice(pb, mn, outi, outr, cloud_resample_device_mem_mb,
-                                 cloud_resample_device_mid, cloud_resample_device_mid_team, tim);
+                                 cloud_resample_device_mid, cloud_resample_device_mid_team,
+                                 cloud_resample_device_wide_team, tim);
     dtim[1] = tim[0]; dtim[2] = tim[1]; dtim[3] = tim[2]; dtim[4] = tim[3]; dtim[5] = tim[4];
     mdev = DvceArray1D<Real>("rs_mnew_dev", npool);
     auto mdv = mdev;
