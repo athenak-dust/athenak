@@ -62,6 +62,7 @@ struct PatchInfo {
   double res = 0.0;
   // seconds spent in the stages of this patch
   double t_rows = 0.0, t_scale = 0.0, t_qr = 0.0, t_null = 0.0, t_red = 0.0, t_check = 0.0;
+  int nrow = 0, nb = 0;   // rows of the patch and the non-empty ones (sizes for the device port)
 };
 
 using StageClock = std::chrono::steady_clock;
@@ -269,6 +270,7 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
   ws.leaves.erase(std::unique(ws.leaves.begin(), ws.leaves.end()), ws.leaves.end());
   const int nl = static_cast<int>(ws.leaves.size());
   const int nrow = 7*nl + 8;
+  info.nrow = nrow;
   double mt = 0.0, vb[3] = {0.0, 0.0, 0.0};
   for (int a=a0; a<a1; ++a) {
     mt += P(JM, a);
@@ -307,6 +309,7 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
   }
   int nb = 0;
   for (int i=0; i<nrow; ++i) if (ws.r0[i] > 0.0) ++nb;
+  info.nb = nb;
   ws.b.resize(static_cast<std::size_t>(nb)*n);
   for (int j=0; j<n; ++j) {
     const double *col = ws.a.data() + static_cast<std::size_t>(j)*nrow;
@@ -737,10 +740,14 @@ int DustGasDrag::ResampleClouds() {
   long long pool = 0, kept = 0, atcap = 0, nfall = 0, nred = 0, npat = 0, zsteps = 0, csteps = 0, scans = 0;
   double resmax = 0.0, cpu = 0.0;
   double st[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // stage seconds, all threads
+  int nmax = 0, nbmax = 0, n64 = 0, n256 = 0;      // largest patch, its rows; patches with >= 64 / 256 clouds
   for (const auto &f : infos) {
     if (f.n == 0) continue;
     st[0] += f.t_rows; st[1] += f.t_scale; st[2] += f.t_qr; st[3] += f.t_null; st[4] += f.t_red;
     st[5] += f.t_check;
+    nmax = std::max(nmax, f.n); nbmax = std::max(nbmax, f.nb);
+    if (f.n >= 64) ++n64;
+    if (f.n >= 256) ++n256;
     ++npat; pool += f.n; kept += f.kept; atcap += f.ncap; zsteps += f.steps_zero; csteps += f.steps_cap;
     scans += f.scans;
     if (f.fallback) ++nfall; else resmax = std::max(resmax, f.res);
@@ -806,15 +813,15 @@ int DustGasDrag::ResampleClouds() {
       std::fprintf(fp, "# ncycle time npart_before npart_after pool above_cap lobed patches"
                    " patches_reduced kept at_cap fallback max_res_accepted steps_zero steps_cap scans"
                    " M_b M_a PX_b PX_a t_total t_device t_copy t_sort t_host_wall t_host_cpu t_back"
-                   " threads nnz s_rows s_scale s_qr s_null s_reduce s_check\n");
+                   " threads nnz s_rows s_scale s_qr s_null s_reduce s_check n_max nb_max n_ge64 n_ge256\n");
     }
     std::fprintf(fp, "%d %.17g %d %d %lld %.0f %.0f %lld %lld %lld %lld %lld %.3e %lld %lld %lld"
                  " %.17g %.17g %.17g %.17g %.4e %.4e %.4e %.4e %.4e %.4e %.4e %d %d"
-                 " %.4e %.4e %.4e %.4e %.4e %.4e\n", pmesh->ncycle,
+                 " %.4e %.4e %.4e %.4e %.4e %.4e %d %d %d %d\n", pmesh->ncycle,
                  pmesh->time, npart, nfinal, pool, cnt_b[1], cnt_b[0], npat, nred, kept, atcap, nfall,
                  resmax, zsteps, csteps, scans, tot_b[0], tot_a[0], tot_b[1], tot_a[1], seconds(t_all),
                  t_dev, t_copy, t_sort, t_host, cpu, t_back, nthread, nnz, st[0], st[1], st[2],
-                 st[3], st[4], st[5]);
+                 st[3], st[4], st[5], nmax, nbmax, n64, n256);
     std::fclose(fp);
   }
   if (dump) DumpResampleState(ppar, pmesh, "post");
