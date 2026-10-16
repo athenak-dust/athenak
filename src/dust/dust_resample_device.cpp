@@ -30,6 +30,7 @@
 #include <vector>
 
 #include <Kokkos_Core.hpp>
+#include <Kokkos_Sort.hpp>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -612,9 +613,12 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       sz(q, 2) = 0;
     });
   }
-  auto sz_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), sz);
+  // Sizes, buckets and patch lists on the device; only a few totals go to the host
   int emax = 1;
-  for (int q=0; q<npatch; ++q) if (sz_h(q, 0) >= 2) emax = std::max(emax, sz_h(q, 1));
+  Kokkos::parallel_reduce("rs_dev_emax", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+  KOKKOS_LAMBDA(const int q, int &m) {if (sz(q, 0) >= 2 && sz(q, 1) > m) m = sz(q, 1);},
+  Kokkos::Max<int>(emax));
+  emax = std::max(emax, 1);
   {
     using ScratchInt = Kokkos::View<int*, DevExeSpace::scratch_memory_space,
                                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
@@ -634,19 +638,50 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       Kokkos::single(Kokkos::PerTeam(tm), [&]() {sz(q, 2) = nl;});
     });
   }
-  Kokkos::deep_copy(sz_h, sz);
-  timing[0] = t.seconds();
-  // buckets: at most 64 clouds, more; patches of one or no cloud only get their counters
-  std::vector<int> lst[2];
-  int nmx[2] = {0, 0}, emx[2] = {1, 1}, lmx[2] = {1, 1};
-  for (int q=0; q<npatch; ++q) {
-    const int n = sz_h(q, 0);
-    if (n < 2) continue;
-    const int b = (n <= 64) ? 0 : 1;
-    lst[b].push_back(q);
-    nmx[b] = std::max(nmx[b], n); emx[b] = std::max(emx[b], sz_h(q, 1));
-    lmx[b] = std::max(lmx[b], sz_h(q, 2));
+  // buckets: at most 64 clouds, more; patches of one or no cloud only get their counters.  Per
+  // bucket the number of patches and the largest clouds / entries / leaves
+  int nqb[2] = {0, 0}, nmx[2] = {0, 0}, emx[2] = {1, 1}, lmx[2] = {1, 1};
+  {
+    int r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    Kokkos::parallel_reduce("rs_dev_buckets", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+    KOKKOS_LAMBDA(const int q, int &c0, int &c1, int &n0, int &n1, int &e0, int &e1, int &l0,
+                  int &l1) {
+      const int n = sz(q, 0);
+      if (n < 2) return;
+      if (n <= 64) {
+        ++c0; n0 = Kokkos::max(n0, n); e0 = Kokkos::max(e0, sz(q, 1)); l0 = Kokkos::max(l0, sz(q, 2));
+      } else {
+        ++c1; n1 = Kokkos::max(n1, n); e1 = Kokkos::max(e1, sz(q, 1)); l1 = Kokkos::max(l1, sz(q, 2));
+      }
+    }, Kokkos::Sum<int>(r[0]), Kokkos::Sum<int>(r[1]), Kokkos::Max<int>(r[2]), Kokkos::Max<int>(r[3]),
+       Kokkos::Max<int>(r[4]), Kokkos::Max<int>(r[5]), Kokkos::Max<int>(r[6]), Kokkos::Max<int>(r[7]));
+    for (int b=0; b<2; ++b) {
+      nqb[b] = r[b];
+      nmx[b] = std::max(r[2 + b], 0); emx[b] = std::max(r[4 + b], 1); lmx[b] = std::max(r[6 + b], 1);
+    }
   }
+  // the patch lists, the largest patches first and by patch number among equal sizes (balance;
+  // the order does not change any result): keys (largest - n) npatch + q, bucket 0 first
+  DvceArray1D<std::int64_t> qkey(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_qkey"),
+                                 std::max(nqb[0] + nqb[1], 1));
+  {
+    const std::int64_t np = npatch;
+    const int nb0 = nqb[0], nm0 = nmx[0], nm1 = nmx[1];
+    Kokkos::parallel_scan("rs_dev_lists", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+    KOKKOS_LAMBDA(const int q, std::int64_t &upd, const bool final) {
+      const int n = sz(q, 0);
+      if (n < 2) return;
+      const int b = (n <= 64) ? 0 : 1;   // counts of bucket 0 in the low, bucket 1 in the high bits
+      if (final) {
+        const int k = (b == 0) ? static_cast<int>(upd & 0xffffffffLL) : nb0 + static_cast<int>(upd >> 32);
+        qkey(k) = static_cast<std::int64_t>(((b == 0) ? nm0 : nm1) - n)*np + q;
+      }
+      upd += (b == 0) ? 1LL : (1LL << 32);
+    });
+    if (nqb[0] > 1) Kokkos::sort(Kokkos::subview(qkey, std::make_pair(0, nqb[0])));
+    if (nqb[1] > 1) Kokkos::sort(Kokkos::subview(qkey, std::make_pair(nqb[0], nqb[0] + nqb[1])));
+  }
+  timing[0] = t.seconds();
   {
     auto pptr = pb.pptr; auto spd = pb.spd;
     Kokkos::parallel_for("rs_dev_small", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
@@ -662,20 +697,18 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
   for (int b=0; b<2; ++b) {
     Kokkos::fence();
     t.reset();
-    const int nq = static_cast<int>(lst[b].size());
+    const int nq = nqb[b];
     if (nq > 0) {
-      // the largest patches first (balance); the order does not change any result
-      std::stable_sort(lst[b].begin(), lst[b].end(),
-                       [&](const int x, const int y) {return sz_h(x, 0) > sz_h(y, 0);});
       const WsSize ws = Sizes(nmx[b], emx[b], lmx[b]);
       const double per = 8.0*ws.nd + 4.0*ws.ni;
       int nslot = static_cast<int>(std::min<double>(nq, std::max(1.0, budget/per)));
       nslot = std::min(nslot, 4096);
-      DvceArray1D<int> qlist("rs_dev_list", nq);
+      DvceArray1D<int> qlist(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_list"), nq);
       {
-        auto h = Kokkos::create_mirror_view(qlist);
-        for (int i=0; i<nq; ++i) h(i) = lst[b][i];
-        Kokkos::deep_copy(qlist, h);
+        const int off = (b == 0) ? 0 : nqb[0];
+        const std::int64_t np = npatch;
+        Kokkos::parallel_for("rs_dev_qlist", Kokkos::RangePolicy<>(DevExeSpace(), 0, nq),
+        KOKKOS_LAMBDA(const int i) {qlist(i) = static_cast<int>(qkey(off + i) % np);});
       }
       DvceArray1D<double> dws(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_ws_d"),
                               static_cast<std::size_t>(nslot)*ws.nd);
@@ -719,6 +752,36 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     timing[1 + b] = t.seconds();
   }
   timing[3] = t_all.seconds();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn SummarizePatchesDevice
+//! \brief See dust_resample.hpp (the host's loop over the patch infos, on the device).
+
+void SummarizePatchesDevice(DvceArray2D<int> outi, DvceArray1D<double> outr, PatchSummary &s) {
+  const int npatch = outi.extent_int(0);
+  long long c[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  int nmax = 0, nbmax = 0, n64 = 0, n256 = 0;
+  double resmax = 0.0;
+  Kokkos::parallel_reduce("rs_dev_summary", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+  KOKKOS_LAMBDA(const int q, long long &npat, long long &pool, long long &kept, long long &atcap,
+                long long &nfall, long long &nred, long long &zs, long long &cs, long long &sc,
+                double &rmax, int &nm, int &nbm, int &c64, int &c256) {
+    const int n = outi(q, PN);
+    if (n == 0) return;
+    nm = Kokkos::max(nm, n); nbm = Kokkos::max(nbm, outi(q, PNB));
+    if (n >= 64) ++c64;
+    if (n >= 256) ++c256;
+    ++npat; pool += n; kept += outi(q, PKEPT); atcap += outi(q, PNCAP);
+    zs += outi(q, PZERO); cs += outi(q, PCAPSTEP); sc += outi(q, PSCANS);
+    if (outi(q, PFALLBACK) != 0) ++nfall; else rmax = Kokkos::fmax(rmax, outr(q));
+    if (outi(q, PKEPT) < n) ++nred;
+  }, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], Kokkos::Max<double>(resmax),
+     Kokkos::Max<int>(nmax), Kokkos::Max<int>(nbmax), n64, n256);
+  s.npat = c[0]; s.pool = c[1]; s.kept = c[2]; s.atcap = c[3]; s.nfall = c[4]; s.nred = c[5];
+  s.zsteps = c[6]; s.csteps = c[7]; s.scans = c[8];
+  s.resmax = std::max(resmax, 0.0); s.nmax = std::max(nmax, 0); s.nbmax = std::max(nbmax, 0);
+  s.n64 = n64; s.n256 = n256;
 }
 
 }  // namespace resample

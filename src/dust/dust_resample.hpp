@@ -49,6 +49,18 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
                         double timing[4]);
 
+// Totals of one resampling over its patches (the log row), reduced on the device from outi /
+// outr, so that no per-patch data goes to the host: patches with clouds, pool,
+// kept, at the cap, fallbacks, reduced patches, steps to zero / to the cap, scans; the largest
+// accepted residual; the largest patch, its rows; patches with >= 64 / 256 clouds.
+struct PatchSummary {
+  long long npat = 0, pool = 0, kept = 0, atcap = 0, nfall = 0, nred = 0, zsteps = 0, csteps = 0,
+            scans = 0;
+  double resmax = 0.0;
+  int nmax = 0, nbmax = 0, n64 = 0, n256 = 0;
+};
+void SummarizePatchesDevice(DvceArray2D<int> outi, DvceArray1D<double> outr, PatchSummary &s);
+
 }  // namespace resample
 }  // namespace dust
 #endif  // DUST_DUST_RESAMPLE_HPP_

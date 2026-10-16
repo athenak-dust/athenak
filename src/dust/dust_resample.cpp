@@ -898,7 +898,8 @@ int DustGasDrag::ResampleClouds() {
       }
     }
   }
-  std::vector<PatchInfo> dinfos;
+  std::vector<PatchInfo> dinfos;     // device per-patch counters (cloud_resample_compare only)
+  resample::PatchSummary dsum;       // device totals
   DvceArray1D<Real> mdev;
   double dtim[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // device: order, sizes, small, large, solve
   if (on_dev) {
@@ -960,16 +961,21 @@ int DustGasDrag::ResampleClouds() {
     auto mdv = mdev;
     Kokkos::parallel_for("rs_unsort", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
     KOKKOS_LAMBDA(const int k) {mdv(sorder(k)) = mn(k);});
-    auto oi = Kokkos::create_mirror_view_and_copy(HostMemSpace(), outi);
-    auto orr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), outr);
-    dinfos.resize(npatch);
-    for (int q=0; q<npatch; ++q) {
-      PatchInfo f;
-      f.n = oi(q, resample::PN); f.kept = oi(q, resample::PKEPT); f.ncap = oi(q, resample::PNCAP);
-      f.fallback = oi(q, resample::PFALLBACK); f.steps_zero = oi(q, resample::PZERO);
-      f.steps_cap = oi(q, resample::PCAPSTEP); f.scans = oi(q, resample::PSCANS);
-      f.nrow = oi(q, resample::PNROW); f.nb = oi(q, resample::PNB); f.res = orr(q);
-      dinfos[q] = f;
+    // The log row's totals reduced on the device; the per-patch counters go to the
+    // host only for the comparison with the host solve
+    resample::SummarizePatchesDevice(outi, outr, dsum);
+    if (cloud_resample_compare) {
+      auto oi = Kokkos::create_mirror_view_and_copy(HostMemSpace(), outi);
+      auto orr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), outr);
+      dinfos.resize(npatch);
+      for (int q=0; q<npatch; ++q) {
+        PatchInfo f;
+        f.n = oi(q, resample::PN); f.kept = oi(q, resample::PKEPT); f.ncap = oi(q, resample::PNCAP);
+        f.fallback = oi(q, resample::PFALLBACK); f.steps_zero = oi(q, resample::PZERO);
+        f.steps_cap = oi(q, resample::PCAPSTEP); f.scans = oi(q, resample::PSCANS);
+        f.nrow = oi(q, resample::PNROW); f.nb = oi(q, resample::PNB); f.res = orr(q);
+        dinfos[q] = f;
+      }
     }
   }
   if (cloud_resample_compare) {
@@ -1020,7 +1026,13 @@ int DustGasDrag::ResampleClouds() {
   double resmax = 0.0;
   double st[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // stage seconds, all threads
   int nmax = 0, nbmax = 0, n64 = 0, n256 = 0;      // largest patch, its rows; patches with >= 64 / 256 clouds
-  for (const auto &f : (cloud_resample_device ? dinfos : infos)) {
+  if (cloud_resample_device) {   // stage seconds are host-only (zero)
+    npat = dsum.npat; pool = dsum.pool; kept = dsum.kept; atcap = dsum.atcap; nfall = dsum.nfall;
+    nred = dsum.nred; zsteps = dsum.zsteps; csteps = dsum.csteps; scans = dsum.scans;
+    resmax = dsum.resmax; nmax = dsum.nmax; nbmax = dsum.nbmax; n64 = dsum.n64; n256 = dsum.n256;
+  }
+  for (const auto &f : infos) {
+    if (cloud_resample_device) break;
     if (f.n == 0) continue;
     st[0] += f.t_rows; st[1] += f.t_scale; st[2] += f.t_qr; st[3] += f.t_null; st[4] += f.t_red;
     st[5] += f.t_check;
