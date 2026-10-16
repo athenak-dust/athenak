@@ -1070,7 +1070,10 @@ struct LeafTraversal {
   }
 
   // encoded leaf cell that holds (x1, x2), searched from the anchor block m (its own box, its
-  // neighbours, then every block); -1 if no block holds it.  *bout: the block.
+  // neighbours, then every block); -1 if no block holds it.  *bout: the block.  A position on a
+  // block face can round outside both blocks (y = -1.7e-17 against a face at 0: (y - y0)/dy is
+  // exactly nx2 below and negative above), so a last pass accepts 1e-9 cells around the blocks
+  // and clamps the cell (the table's finest-cell index always gave a leaf).
   KOKKOS_INLINE_FUNCTION
   int Owner(const Real px1, const Real px2, const int m, int *bout = nullptr) const {
     Real x1 = px1, x2 = px2;
@@ -1078,14 +1081,17 @@ struct LeafTraversal {
     int res = -1, bb = -1;
     const int ic = static_cast<int>(floor((x1 - x1min)/fine_dx1));
     const int jc = static_cast<int>(floor((x2 - x2min)/fine_dx2));
-    for (int pass=0; pass<2 && res < 0; ++pass) {
-      ForCandidates(m, pass == 1, ic - 1, ic + 1, jc - 1, jc + 1, 0,
+    for (int pass=0; pass<3 && res < 0; ++pass) {
+      const Real tol = (pass == 2) ? 1.0e-9 : 0.0;
+      ForCandidates(m, pass >= 1, ic - 1, ic + 1, jc - 1, jc + 1, 0,
                     [&](const int b, const int sx, const int sy) {
         if (res >= 0) return;
         const Real fi = (x1 - (box(b, 0) - sx*lx))/box(b, 2);
         const Real fj = (x2 - (box(b, 1) - sy*ly))/box(b, 3);
-        if (!(fi >= 0.0 && fi < nx1 && fj >= 0.0 && fj < nx2)) return;
-        const int i = static_cast<int>(floor(fi)), j = static_cast<int>(floor(fj));
+        if (!(fi >= -tol && fi < nx1 + tol && fj >= -tol && fj < nx2 + tol)) return;
+        int i = static_cast<int>(floor(fi)), j = static_cast<int>(floor(fj));
+        i = (i < 0) ? 0 : ((i > nx1 - 1) ? nx1 - 1 : i);
+        j = (j < 0) ? 0 : ((j > nx2 - 1) ? nx2 - 1 : j);
         res = (b*ncells2 + j + js)*ncells1 + i + is;
         bb = b;
       });

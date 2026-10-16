@@ -517,9 +517,33 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     }, Kokkos::Max<Real>(dwmax), Kokkos::Sum<int>(nbad), Kokkos::Sum<double>(msum));
   }
   if (nbad > 0 || dwmax > 1.0e-10) {
+    // the first particles without an owning block or with a weight outside the blocks
+    DvceArray2D<Real> ex("dust_amr_bad", 8, 6);
+    DvceArray1D<int> nex("dust_amr_nbad", 1);
+    Kokkos::parallel_for("dust_amr_bad", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      const Real xp = pr(IPX,p), yp = pr(IPY,p);
+      const int leaf = lt.LeafOwner(xp, yp, lt.Anchor(pi(PGID,p)));
+      int bad = (leaf < 0) ? 1 : 0, nout = 0;
+      lt.ForEachCloudWeight(xp, yp, pi(PLEV,p), lt.Anchor(pi(PGID,p)), [&](const int target, const Real) {
+        if (target < 0 || target/ncell12 >= nmb) ++nout;
+      });
+      if (bad == 0 && nout == 0) return;
+      const int k = Kokkos::atomic_fetch_add(&nex(0), 1);
+      if (k >= 8) return;
+      ex(k, 0) = xp; ex(k, 1) = yp; ex(k, 2) = pi(PGID,p) - gids; ex(k, 3) = leaf;
+      ex(k, 4) = nout; ex(k, 5) = pi(PLEV,p);
+    });
+    auto exh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ex);
+    auto nexh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), nex);
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "dust after a regrid: " << nbad << " cloud weights outside the mesh blocks, "
-              << "largest |sum of weights - 1| = " << dwmax << std::endl;
+              << "largest |sum of weights - 1| = " << dwmax << "; first of " << nexh(0)
+              << " particles (x, y, block, owner leaf, weights outside, code):" << std::endl;
+    for (int k=0; k<std::min(8, nexh(0)); ++k) {
+      std::cout << "  " << exh(k, 0) << " " << exh(k, 1) << " " << exh(k, 2) << " " << exh(k, 3)
+                << " " << exh(k, 4) << " " << exh(k, 5) << std::endl;
+    }
     std::exit(EXIT_FAILURE);
   }
 
