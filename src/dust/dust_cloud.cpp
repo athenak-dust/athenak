@@ -98,6 +98,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     cloud_sort_random = (so == "random");   // diagnostic: a random permutation
     cloud_sort_at_start = pin->GetOrAddBoolean("dust", "cloud_sort_at_start", false);
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
+    cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval", 0);
   }
   const bool graded = pin->DoesParameterExist("problem", "graded_split_layers") &&
                       pin->GetInteger("problem", "graded_split_layers") >= 0;
@@ -466,6 +467,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
       pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
     SortParticles();
   }
+  if (cloud_order_interval > 0) UpdateCloudOrder();
   return TaskStatus::complete;
 }
 

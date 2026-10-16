@@ -1350,6 +1350,15 @@ void CloudParFor(const std::string &name, const int bounds, const int n, const F
   }
 }
 
+// cloud_order_interval: the same kernels over the particles in the order of an
+// index (ord(k) for k < nidx, k itself for the particles appended since the index was built)
+template <typename Function>
+void CloudParForOrdered(const std::string &name, const int bounds, const int n,
+                        const DvceArray1D<int> &ord, const int nidx, const Function &f) {
+  auto g = KOKKOS_LAMBDA(const int k) {f((k < nidx) ? ord(k) : k);};
+  CloudParFor(name, bounds, n, g);
+}
+
 // Shared NGP/CIC/TSC stencil for deposits, matrix-free gathers, and the final kick.
 // One helper is used everywhere so the coupled operator and conservative commit cannot
 // silently acquire different particle-mesh weights.
@@ -1729,6 +1738,14 @@ class DustGasDrag {
   DvceArray2D<Real> sort_spare_r;     // the arrays the reordered particles are written to
   DvceArray2D<int> sort_spare_i;
   void SortParticles();
+  // an index of the particles in (block, cell) order for the two production cloud
+  // kernels, without moving them (cloud_order_interval = N: rebuilt every N cycles and whenever
+  // the check at the end of RefineClouds fails; 0: off)
+  int cloud_order_interval = 0;
+  DvceArray1D<int> cloud_ord, cloud_ord_tag;
+  int cloud_ord_n = 0;
+  unsigned long long cloud_ord_builds = 0;
+  void UpdateCloudOrder();
   void BuildLeafTraversal();
   void RequireCloudTable(const char *what) const;   // fatal without the table
   void EnsureRootCloudMass();          // cloud_merge_mroot once (merge pass, resampling caps)

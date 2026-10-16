@@ -131,8 +131,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         });
         PackGatherField(uvel_pred);
         auto gp = gpack;
-        CloudParFor("dust_pc2_cloud_predictor_linear", cloud_launch_bounds, npart,
-        KOKKOS_LAMBDA(const int p) {
+        auto pred_body = KOKKOS_LAMBDA(const int p) {
           Real xp = pr(IPX,p), yp = pr(IPY,p);
           const int am = lt.Anchor(pi(PGID,p));   // anchor block of the cloud
           int lev = pi(PLEV,p);
@@ -181,7 +180,13 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
           } else {
             lt.ForEachCloudWeight(xp, yp, lev, am, add);
           }
-        });
+        };
+        if (cloud_ord_n > 0) {   // in the order of the cell-sorted index
+          CloudParForOrdered("dust_pc2_cloud_predictor_linear", cloud_launch_bounds, npart, cloud_ord,
+                             cloud_ord_n, pred_body);
+        } else {
+          CloudParFor("dust_pc2_cloud_predictor_linear", cloud_launch_bounds, npart, pred_body);
+        }
         return TaskStatus::complete;
       }
       if (linear || flocal || fchild || deform) {

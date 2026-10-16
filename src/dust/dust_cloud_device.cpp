@@ -3006,4 +3006,83 @@ void DustGasDrag::SortParticles() {
   }
 }
 
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::UpdateCloudOrder
+//! \brief cloud_order_interval = N: an index of the particles in (block, cell,
+//! position) order, without moving them; the two production cloud kernels run in this order
+//! (CloudParForOrdered), the particles appended since the index was built in their own.  Every
+//! N cycles it is rebuilt; in between it is checked at the end of RefineClouds: each indexed
+//! slot must still hold the particle (PTAG) it held, which fails after any compaction or
+//! reordering (resampling, merge pass, restart, ...).  The storage order, and with it every
+//! resampling and merge decision, is that of a run without the index.
+
+void DustGasDrag::UpdateCloudOrder() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  bool rebuild = (pmy_pack->pmesh->ncycle % cloud_order_interval == 0) || cloud_ord_n == 0 ||
+                 cloud_ord_n > npart;
+  if (!rebuild) {
+    auto ord = cloud_ord; auto tg = cloud_ord_tag;
+    int bad = 0;
+    Kokkos::parallel_reduce("cloud_order_check", Kokkos::RangePolicy<>(DevExeSpace(), 0, cloud_ord_n),
+    KOKKOS_LAMBDA(const int k, int &b) {
+      const int p = ord(k);
+      if (p < 0 || p >= npart || pi(PTAG,p) != tg(k)) ++b;
+    }, bad);
+    rebuild = bad > 0;
+  }
+  if (!rebuild) return;
+  if (npart < 2) {cloud_ord_n = 0; return;}
+  Kokkos::Timer t;
+  const int nx1 = pmy_pack->pmesh->mb_indcs.nx1, nx2 = pmy_pack->pmesh->mb_indcs.nx2;
+  const int gids = pmy_pack->gids, nmb = pmy_pack->nmb_thispack;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  const std::int64_t ncell = static_cast<std::int64_t>(nx1)*nx2, np = npart;
+  KeyScratch &s = Scratch();
+  auto key = Grow(s.skey, npart, "sort_key");
+  Kokkos::parallel_for("cloud_order_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    int m = pi(PGID,p) - gids;
+    m = (m < 0) ? 0 : ((m >= nmb) ? nmb - 1 : m);
+    int i = static_cast<int>(Kokkos::floor((pr(IPX,p) - mbsize.d_view(m).x1min)/mbsize.d_view(m).dx1));
+    int j = static_cast<int>(Kokkos::floor((pr(IPY,p) - mbsize.d_view(m).x2min)/mbsize.d_view(m).dx2));
+    i = (i < 0) ? 0 : ((i >= nx1) ? nx1 - 1 : i);
+    j = (j < 0) ? 0 : ((j >= nx2) ? nx2 - 1 : j);
+    key(p) = (m*ncell + static_cast<std::int64_t>(j)*nx1 + i)*np + p;
+  });
+  SortFirst(key, npart);
+  if (cloud_ord.extent_int(0) < npart) {
+    cloud_ord = DvceArray1D<int>();
+    cloud_ord_tag = DvceArray1D<int>();
+    cloud_ord = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "cloud_ord"), npart + npart/4);
+    cloud_ord_tag = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "cloud_ord_tag"),
+                                     npart + npart/4);
+  }
+  auto ord = cloud_ord; auto tg = cloud_ord_tag;
+  Kokkos::parallel_for("cloud_order_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int k) {
+    const int p = static_cast<int>(key(k) % np);
+    ord(k) = p; tg(k) = pi(PTAG,p);
+  });
+  cloud_ord_n = npart;
+  ++cloud_ord_builds;
+  Kokkos::fence();
+  static std::FILE *fp = nullptr;   // open once, buffered (see SortParticles)
+  if (global_variable::my_rank == 0) {
+    if (fp == nullptr) {
+      fp = std::fopen("cloud_order_log.txt", "a");
+      if (fp != nullptr) {
+        std::fseek(fp, 0, SEEK_END);
+        if (std::ftell(fp) == 0) std::fprintf(fp, "# cloud order: ncycle time particles build seconds (fenced)\n");
+      }
+    }
+    if (fp != nullptr) {
+      std::fprintf(fp, "%d %.17g %d %llu %.4e\n", pmy_pack->pmesh->ncycle, pmy_pack->pmesh->time,
+                   npart, static_cast<unsigned long long>(cloud_ord_builds), t.seconds());
+    }
+  }
+}
+
 }  // namespace dust

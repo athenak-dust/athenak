@@ -153,8 +153,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         // variants there cost registers and occupancy.
         PackGatherField(ustar);
         auto gp = gpack;
-        CloudParFor("dust_pc2_advance_linear", cloud_launch_bounds, npart,
-        KOKKOS_LAMBDA(const int p) {
+        auto adv_body = KOKKOS_LAMBDA(const int p) {
           // the gather's leaf weights are the deposit's: keep them
           int nt = 0, tt[SMRCompositeTransfer::kCloudWeightCache];
           Real tw[SMRCompositeTransfer::kCloudWeightCache];
@@ -245,7 +244,13 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
           } else {
             lt.ForEachCloudWeight(xh, yh, pi(PLEV,p), am, add);
           }
-        });
+        };
+        if (cloud_ord_n > 0) {   // in the order of the cell-sorted index
+          CloudParForOrdered("dust_pc2_advance_linear", cloud_launch_bounds, npart, cloud_ord, cloud_ord_n,
+                             adv_body);
+        } else {
+          CloudParFor("dust_pc2_advance_linear", cloud_launch_bounds, npart, adv_body);
+        }
         return TaskStatus::complete;
       }
       par_for("dust_pc2_advance",DevExeSpace(),0,(npart-1),
