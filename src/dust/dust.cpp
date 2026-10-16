@@ -501,14 +501,18 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       {
         const bool has_new = pin->DoesParameterExist("dust", "cloud_resample_after_regrid");
         const bool has_old = pin->DoesParameterExist("dust", "cloud_resample_after_refine");
-        if (has_new && has_old) {
-          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                    << "set <dust>/cloud_resample_after_regrid only (cloud_resample_after_refine "
-                    << "is the old key)" << std::endl;
-          std::exit(EXIT_FAILURE);
+        // both keys: the new one decides.  A restart file of a run that read the old key carries
+        // the old one and the new one added here, and a restart may change the new one (Codex
+        // review)
+        if (has_new && has_old && global_variable::my_rank == 0 &&
+            pin->GetBoolean("dust", "cloud_resample_after_regrid") !=
+            pin->GetBoolean("dust", "cloud_resample_after_refine")) {
+          std::cout << "# NOTE (dust): cloud_resample_after_regrid = "
+                    << (pin->GetBoolean("dust", "cloud_resample_after_regrid") ? "true" : "false")
+                    << " is used; the old key cloud_resample_after_refine is ignored" << std::endl;
         }
         bool dflt = true;
-        if (has_old) {
+        if (has_old && !has_new) {
           dflt = pin->GetBoolean("dust", "cloud_resample_after_refine");
           if (global_variable::my_rank == 0) {
             std::cout << "# NOTE (dust): cloud_resample_after_refine = " << (dflt ? "true" : "false")

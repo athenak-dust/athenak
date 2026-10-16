@@ -198,9 +198,12 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
     Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, k, n), [&](const int j, int &v) {
       if (vn1[j] == vmax && j < v) v = j;
     }, Kokkos::Min<int>(p));
+    // the pivot norm from the team reduction (bitwise vn1[p]), not from vn1: the leader may
+    // already be swapping vn1[p] and vn1[k] below while a thread reads it
+    const double vp = (p < n) ? vmax : vn1[k];
     if (p >= n) p = k;
-    if (k == 0) first = vn1[p];
-    if (!(vn1[p] > kRankTol*first) || first == 0.0) {
+    if (k == 0) first = vp;
+    if (!(vp > kRankTol*first) || first == 0.0) {
       tm.team_barrier();
       return k;
     }
@@ -702,7 +705,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
         Kokkos::parallel_for("rs_dev_patches_small", Policy(nslot, Kokkos::AUTO), body);
       } else {
         const int tmax = PolicyWide(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
-        int ts = 32;
+        int ts = 1;   // the largest power of two the backend allows, at most 512
         while (2*ts <= tmax && 2*ts <= 512) ts *= 2;
         static bool told = false;
         if (!told && global_variable::my_rank == 0) {

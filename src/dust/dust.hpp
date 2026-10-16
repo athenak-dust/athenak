@@ -765,63 +765,27 @@ struct LeafTraversal {
     }
   }
 
-  // every leaf cell under the cloud `code` at (x1, x2) owned by block m: function(target, w,
-  // m1x, m1y) with kMoments (moments about the particle), function(target, w) without.
-  // Returns the sum of the weights.
-  template <bool kMoments, typename Function>
+  // ---- candidate blocks (Codex review) --------------------------------------------------
+  // Every query is answered in the frame of the anchor block m (the periodic image of the
+  // position next to m).  Local: m and its distinct neighbours, each with the periodic shift
+  // (domain lengths, from the direction of its neighbour slot) that puts it on that side of
+  // m, so the two images of a block that is the neighbour on both sides (one or two blocks
+  // across the domain) both appear.  Global: every block of the pack in its nine periodic
+  // images; used when the anchor's neighbourhood does not hold the whole query.
+  template <typename Function>
   KOKKOS_INLINE_FUNCTION
-  Real ForEach(const Real px1, const Real px2, const int code, const int m,
-               const Function &function) const {
-    using T = SMRCompositeTransfer;
-    const Real x1 = Wrap(px1, x1min, x1max), x2 = Wrap(px2, x2min, x2max);
-    const int lev = T::CloudLevel(code);
-    const bool point = kMoments && (code & T::kCloudGatherPoint) != 0;
-    const int lb1 = T::CloudLobe1(code), lb2 = T::CloudLobe2(code);
-    const Shape s1 = MakeShape(x1, root_dx1/static_cast<Real>(1 << lev), lb1,
-                               point && !(lobe3_integral && lb1 == 3));
-    const Shape s2 = MakeShape(x2, root_dx2/static_cast<Real>(1 << lev), lb2,
-                               point && !(lobe3_integral && lb2 == 3));
-    Real wsum = 0.0;
-    const int nn = nnb(m);
-    for (int k=-1; k<nn; ++k) {
-      const int b = (k < 0) ? m : nb(m, k);
-      const Real sx = (k < 0) ? 0.0 : static_cast<Real>(nbs(m, k, 0));
-      const Real sy = (k < 0) ? 0.0 : static_cast<Real>(nbs(m, k, 1));
-      const Real dx = box(b, 2), dy = box(b, 3);
-      const Real bx0 = box(b, 0) - sx*lx, by0 = box(b, 1) - sy*ly;
-      const Real bx1 = bx0 + nx1*dx, by1 = by0 + nx2*dy;
-      if (s1.hi <= bx0 || s1.lo >= bx1 || s2.hi <= by0 || s2.lo >= by1) continue;
-      int ia = static_cast<int>(floor((s1.lo - bx0)/dx));
-      int ib = static_cast<int>(ceil((s1.hi - bx0)/dx)) - 1;
-      int ja = static_cast<int>(floor((s2.lo - by0)/dy));
-      int jb = static_cast<int>(ceil((s2.hi - by0)/dy)) - 1;
-      ia = (ia < 0) ? 0 : ia; ib = (ib > nx1 - 1) ? nx1 - 1 : ib;
-      ja = (ja < 0) ? 0 : ja; jb = (jb > nx2 - 1) ? nx2 - 1 : jb;
-      for (int j=ja; j<=jb; ++j) {
-        Real w2, g2;
-        Interval(s2, by0 + j*dy, by0 + (j + 1)*dy, w2, g2);
-        if (w2 == 0.0 && (!kMoments || g2 == 0.0)) continue;
-        for (int i=ia; i<=ib; ++i) {
-          Real w1, g1;
-          Interval(s1, bx0 + i*dx, bx0 + (i + 1)*dx, w1, g1);
-          const Real w = w2*w1;
-          wsum += w;
-          const int target = (b*ncells2 + j + js)*ncells1 + i + is;
-          if constexpr (kMoments) {
-            const Real m1x = w2*g1, m1y = w1*g2;
-            if (w == 0.0 && m1x == 0.0 && m1y == 0.0) continue;
-            function(target, w, m1x, m1y);
-          } else {
-            if (w == 0.0) continue;
-            function(target, w);
-          }
-        }
+  void ForCandidates(const int m, const bool global, const Function &f) const {
+    if (!global) {
+      f(m, 0, 0);
+      for (int k=0; k<nnb(m); ++k) f(nb(m, k), nbs(m, k, 0), nbs(m, k, 1));
+      return;
+    }
+    for (int b=0; b<nmb; ++b) {
+      for (int sy=-1; sy<=1; ++sy) {
+        for (int sx=-1; sx<=1; ++sx) f(b, sx, sy);
       }
     }
-    return wsum;
   }
-
-  // ---- split / merge eligibility --------------------------------------------------------
   // the periodic image of (x1, x2) next to block m
   KOKKOS_INLINE_FUNCTION
   void Frame(const int m, Real &x1, Real &x2) const {
@@ -829,46 +793,52 @@ struct LeafTraversal {
     x1 -= lx*round((x1 - cx)/lx);
     x2 -= ly*round((x2 - cy)/ly);
   }
-  // finest-cell box [x0, x1) x [y0, y1) of block m (k < 0) or of its neighbour k, in the frame
-  // of m, widened by r
+  // finest-cell box [x0, x1) x [y0, y1) of block b in the image (sx, sy), widened by r
   KOKKOS_INLINE_FUNCTION
-  void NbRect(const int m, const int k, const int r, int &b, int &x0, int &x1, int &y0,
-              int &y1) const {
-    b = (k < 0) ? m : nb(m, k);
-    const int sx = (k < 0) ? 0 : nbs(m, k, 0), sy = (k < 0) ? 0 : nbs(m, k, 1);
+  void ImageRect(const int b, const int sx, const int sy, const int r, int &x0, int &x1, int &y0,
+                 int &y1) const {
     x0 = fbox(b, 0) - sx*nfine1 - r; x1 = fbox(b, 1) - sx*nfine1 + r;
     y0 = fbox(b, 2) - sy*nfine2 - r; y1 = fbox(b, 3) - sy*nfine2 + r;
   }
-  // does the finest-cell box [ia, ib] x [ja, jb] (inclusive, frame of m) meet the blocks of
-  // m and its neighbours with level >= minlev, each widened by r?
+  // does the finest-cell box [ia, ib] x [ja, jb] (inclusive) meet a candidate block of level
+  // >= minlev widened by r?
   KOKKOS_INLINE_FUNCTION
   bool Meets(const int m, const int ia, const int ib, const int ja, const int jb,
-             const int minlev, const int r) const {
-    for (int k=-1; k<nnb(m); ++k) {
-      int b, x0, x1, y0, y1;
-      NbRect(m, k, r, b, x0, x1, y0, y1);
-      if (blev(b) < minlev) continue;
-      if (ib < x0 || ia >= x1 || jb < y0 || ja >= y1) continue;
-      return true;
-    }
-    return false;
+             const int minlev, const int r, const bool global) const {
+    bool hit = false;
+    ForCandidates(m, global, [&](const int b, const int sx, const int sy) {
+      if (hit || blev(b) < minlev) return;
+      int x0, x1, y0, y1;
+      ImageRect(b, sx, sy, r, x0, x1, y0, y1);
+      if (ib < x0 || ia >= x1 || jb < y0 || ja >= y1) return;
+      hit = true;
+    });
+    return hit;
   }
-  // is that box entirely covered by them?  (coordinate compression of the box by the edges)
+  // is that box entirely covered by them?  (coordinate compression by the box edges)
   KOKKOS_INLINE_FUNCTION
   bool Covered(const int m, const int ia, const int ib, const int ja, const int jb,
-               const int minlev, const int r) const {
-    int rx0[kMaxNb + 1], rx1[kMaxNb + 1], ry0[kMaxNb + 1], ry1[kMaxNb + 1];
+               const int minlev, const int r, const bool global) const {
+    constexpr int kR = 64;
+    int rx0[kR], rx1[kR], ry0[kR], ry1[kR];
     int nr = 0;
-    for (int k=-1; k<nnb(m); ++k) {
-      int b, x0, x1, y0, y1;
-      NbRect(m, k, r, b, x0, x1, y0, y1);
-      if (blev(b) < minlev) continue;
-      if (ib < x0 || ia >= x1 || jb < y0 || ja >= y1) continue;
-      if (x0 <= ia && x1 > ib && y0 <= ja && y1 > jb) return true;
-      rx0[nr] = x0; rx1[nr] = x1; ry0[nr] = y0; ry1[nr] = y1; ++nr;
-    }
+    bool full = false, over = false;
+    ForCandidates(m, global, [&](const int b, const int sx, const int sy) {
+      if (full || blev(b) < minlev) return;
+      int x0, x1, y0, y1;
+      ImageRect(b, sx, sy, r, x0, x1, y0, y1);
+      if (ib < x0 || ia >= x1 || jb < y0 || ja >= y1) return;
+      if (x0 <= ia && x1 > ib && y0 <= ja && y1 > jb) {full = true; return;}
+      if (nr < kR) {
+        rx0[nr] = x0; rx1[nr] = x1; ry0[nr] = y0; ry1[nr] = y1; ++nr;
+      } else {
+        over = true;
+      }
+    });
+    if (full) return true;
     if (nr == 0) return false;
-    constexpr int kE = 2*kMaxNb + 4;
+    if (over) Kokkos::abort("LeafTraversal::Covered: more than 64 boxes meet one query");
+    constexpr int kE = 2*kR + 4;
     int xs[kE], ys[kE];
     int nxs = 0, nys = 0;
     xs[nxs++] = ia; xs[nxs++] = ib + 1; ys[nys++] = ja; ys[nys++] = jb + 1;
@@ -901,31 +871,126 @@ struct LeafTraversal {
     }
     return true;
   }
-  // the region of the table's level map above lev (see the members)
+  // true when the box widened by r is not held by the anchor's neighbourhood: blocks further
+  // away may matter, so the global candidates are used (a missing block is never read as
+  // "no finer leaf there")
+  KOKKOS_INLINE_FUNCTION
+  bool NeedGlobal(const int m, const int ia, const int ib, const int ja, const int jb,
+                  const int r) const {
+    int x0, x1, y0, y1;
+    ImageRect(m, 0, 0, 0, x0, x1, y0, y1);
+    if (x0 <= ia - r && x1 > ib + r && y0 <= ja - r && y1 > jb + r) return false;   // fast path
+    return !Covered(m, ia - r, ib + r, ja - r, jb + r, 0, 0, false);
+  }
+
+  // every leaf cell under the cloud `code` at (x1, x2), anchor block m: function(target, w,
+  // m1x, m1y) with kMoments (moments about the particle), function(target, w) without.
+  // Returns the sum of the weights.
+  template <bool kMoments, typename Function>
+  KOKKOS_INLINE_FUNCTION
+  Real ForEach(const Real px1, const Real px2, const int code, const int m,
+               const Function &function, bool *reach = nullptr) const {
+    using T = SMRCompositeTransfer;
+    Real x1 = px1, x2 = px2;
+    Frame(m, x1, x2);
+    const int lev = T::CloudLevel(code);
+    const bool point = kMoments && (code & T::kCloudGatherPoint) != 0;
+    const int lb1 = T::CloudLobe1(code), lb2 = T::CloudLobe2(code);
+    const Shape s1 = MakeShape(x1, root_dx1/static_cast<Real>(1 << lev), lb1,
+                               point && !(lobe3_integral && lb1 == 3));
+    const Shape s2 = MakeShape(x2, root_dx2/static_cast<Real>(1 << lev), lb2,
+                               point && !(lobe3_integral && lb2 == 3));
+    const int ia = static_cast<int>(floor((s1.lo - x1min)/fine_dx1));
+    const int ib = static_cast<int>(ceil((s1.hi - x1min)/fine_dx1)) - 1;
+    const int ja = static_cast<int>(floor((s2.lo - x2min)/fine_dx2));
+    const int jb = static_cast<int>(ceil((s2.hi - x2min)/fine_dx2)) - 1;
+    const bool global = NeedGlobal(m, ia, ib, ja, jb, 0);
+    if (reach != nullptr) *reach = !global;
+    Real wsum = 0.0;
+    ForCandidates(m, global, [&](const int b, const int sx, const int sy) {
+      const Real dx = box(b, 2), dy = box(b, 3);
+      const Real bx0 = box(b, 0) - sx*lx, by0 = box(b, 1) - sy*ly;
+      const Real bx1 = bx0 + nx1*dx, by1 = by0 + nx2*dy;
+      if (s1.hi <= bx0 || s1.lo >= bx1 || s2.hi <= by0 || s2.lo >= by1) return;
+      int i0 = static_cast<int>(floor((s1.lo - bx0)/dx));
+      int i1 = static_cast<int>(ceil((s1.hi - bx0)/dx)) - 1;
+      int j0 = static_cast<int>(floor((s2.lo - by0)/dy));
+      int j1 = static_cast<int>(ceil((s2.hi - by0)/dy)) - 1;
+      i0 = (i0 < 0) ? 0 : i0; i1 = (i1 > nx1 - 1) ? nx1 - 1 : i1;
+      j0 = (j0 < 0) ? 0 : j0; j1 = (j1 > nx2 - 1) ? nx2 - 1 : j1;
+      for (int j=j0; j<=j1; ++j) {
+        Real w2, g2;
+        Interval(s2, by0 + j*dy, by0 + (j + 1)*dy, w2, g2);
+        if (w2 == 0.0 && (!kMoments || g2 == 0.0)) continue;
+        for (int i=i0; i<=i1; ++i) {
+          Real w1, g1;
+          Interval(s1, bx0 + i*dx, bx0 + (i + 1)*dx, w1, g1);
+          const Real w = w2*w1;
+          wsum += w;
+          const int target = (b*ncells2 + j + js)*ncells1 + i + is;
+          if constexpr (kMoments) {
+            const Real m1x = w2*g1, m1y = w1*g2;
+            if (w == 0.0 && m1x == 0.0 && m1y == 0.0) continue;
+            function(target, w, m1x, m1y);
+          } else {
+            if (w == 0.0) continue;
+            function(target, w);
+          }
+        }
+      }
+    });
+    return wsum;
+  }
+
+  // encoded leaf cell that holds (x1, x2), searched from the anchor block m (its own box, its
+  // neighbours, then every block); -1 if no block holds it.  *bout: the block.
+  KOKKOS_INLINE_FUNCTION
+  int Owner(const Real px1, const Real px2, const int m, int *bout = nullptr) const {
+    Real x1 = px1, x2 = px2;
+    Frame(m, x1, x2);
+    int res = -1, bb = -1;
+    for (int pass=0; pass<2 && res < 0; ++pass) {
+      ForCandidates(m, pass == 1, [&](const int b, const int sx, const int sy) {
+        if (res >= 0) return;
+        const Real fi = (x1 - (box(b, 0) - sx*lx))/box(b, 2);
+        const Real fj = (x2 - (box(b, 1) - sy*ly))/box(b, 3);
+        if (!(fi >= 0.0 && fi < nx1 && fj >= 0.0 && fj < nx2)) return;
+        const int i = static_cast<int>(floor(fi)), j = static_cast<int>(floor(fj));
+        res = (b*ncells2 + j + js)*ncells1 + i + is;
+        bb = b;
+      });
+    }
+    if (bout != nullptr) *bout = bb;
+    return res;
+  }
+
+  // ---- split / merge eligibility ---------------------------------------------------------
+  // the region of the table's level map above lev (see the members), on the anchor's
+  // neighbourhood or, when that does not hold the box widened by the dilation, on all blocks
   KOKKOS_INLINE_FUNCTION
   bool AnyAbove(const int m, const int ia, const int ib, const int ja, const int jb,
-                const int lev) const {
+                const int lev, bool *reach = nullptr) const {
     if (lev + 1 > nlev) return false;
-    return Meets(m, ia, ib, ja, jb, lev + 1, rdil[lev + 1]);
+    const int r = rdil[lev + 1];
+    const bool g = NeedGlobal(m, ia, ib, ja, jb, r);
+    if (reach != nullptr) *reach = !g;
+    return Meets(m, ia, ib, ja, jb, lev + 1, r, g);
   }
   KOKKOS_INLINE_FUNCTION
   bool AllAbove(const int m, const int ia, const int ib, const int ja, const int jb,
-                const int lev) const {
+                const int lev, bool *reach = nullptr) const {
     if (lev + 1 > nlev) return false;
-    return Covered(m, ia, ib, ja, jb, lev + 1, rdil[lev + 1]);
-  }
-  // false when a box widened by r leaves block m and its neighbours: the answer would need
-  // blocks further away (only for clouds much coarser than the leaves; counted, not used)
-  KOKKOS_INLINE_FUNCTION
-  bool InReach(const int m, const int ia, const int ib, const int ja, const int jb,
-               const int r) const {
-    return Covered(m, ia - r, ib + r, ja - r, jb + r, 0, 0);
+    const int r = rdil[lev + 1];
+    const bool g = NeedGlobal(m, ia, ib, ja, jb, r);
+    if (reach != nullptr) *reach = !g;
+    return Covered(m, ia, ib, ja, jb, lev + 1, r, g);
   }
   // SMRCompositeTransfer::CloudInsideFiner on the actual leaves (anchor block m)
   KOKKOS_INLINE_FUNCTION
   bool InsideFiner(const Real px1, const Real px2, const int code, const Real slack, const int m,
                    bool *reach = nullptr) const {
     using T = SMRCompositeTransfer;
+    if (reach != nullptr) *reach = true;
     if (T::CloudLobe1(code) || T::CloudLobe2(code)) return false;
     const int lev = code & T::kCloudLevelMask;
     if (lev >= nlev || lev >= cloud_max_level) return false;
@@ -938,12 +1003,14 @@ struct LeafTraversal {
     const int ib = static_cast<int>(ceil((x1 + r1 - x1min)/fine_dx1)) - 1;
     const int ja = static_cast<int>(floor((x2 - r2 - x2min)/fine_dx2));
     const int jb = static_cast<int>(ceil((x2 + r2 - x2min)/fine_dx2)) - 1;
-    if (reach != nullptr) *reach = InReach(m, ia, ib, ja, jb, rdil[lev + 1]);
-    return split_overlap ? AnyAbove(m, ia, ib, ja, jb, lev) : AllAbove(m, ia, ib, ja, jb, lev);
+    return split_overlap ? AnyAbove(m, ia, ib, ja, jb, lev, reach)
+                         : AllAbove(m, ia, ib, ja, jb, lev, reach);
   }
   // SMRCompositeTransfer::CloudOverlapsFiner on the actual leaves
   KOKKOS_INLINE_FUNCTION
-  bool OverlapsFiner(const Real px1, const Real px2, const int code, const int m) const {
+  bool OverlapsFiner(const Real px1, const Real px2, const int code, const int m,
+                     bool *reach = nullptr) const {
+    if (reach != nullptr) *reach = true;
     const int lev = SMRCompositeTransfer::CloudLevel(code);
     if (lev >= nlev) return false;
     Real x1 = px1, x2 = px2;
@@ -953,42 +1020,34 @@ struct LeafTraversal {
     const int ib = static_cast<int>(ceil((x1 + r1 - x1min)/fine_dx1)) - 1;
     const int ja = static_cast<int>(floor((x2 - r2 - x2min)/fine_dx2));
     const int jb = static_cast<int>(ceil((x2 + r2 - x2min)/fine_dx2)) - 1;
-    return AnyAbove(m, ia, ib, ja, jb, lev);
+    return AnyAbove(m, ia, ib, ja, jb, lev, reach);
   }
   // the merge-cell mask of MergeCloudsDevice: the level-L cell holding (x1, x2) and the B
   // cells around it carry no dilated level above L
   KOKKOS_INLINE_FUNCTION
-  bool MergeOK(const Real px1, const Real px2, const int L, const int B, const int m) const {
+  bool MergeOK(const Real px1, const Real px2, const int L, const int B, const int m,
+               bool *reach = nullptr) const {
     Real x1 = px1, x2 = px2;
     Frame(m, x1, x2);
     const int r = 1 << (nlev - L);
     const int I = static_cast<int>(floor((x1 - x1min)/(root_dx1/static_cast<Real>(1 << L))));
     const int J = static_cast<int>(floor((x2 - x2min)/(root_dx2/static_cast<Real>(1 << L))));
-    return !AnyAbove(m, (I - B)*r, (I + B + 1)*r - 1, (J - B)*r, (J + B + 1)*r - 1, L);
+    if (reach != nullptr) *reach = true;
+    return !AnyAbove(m, (I - B)*r, (I + B + 1)*r - 1, (J - B)*r, (J + B + 1)*r - 1, L, reach);
   }
   // the stage C (compression) mask: every finest cell of the window around the level-lev cell
   // holding (x1, x2), widened by bf = 2 cloud_compress_buffer r, has a dilated level >= lev
   KOKKOS_INLINE_FUNCTION
-  bool CompressOK(const Real px1, const Real px2, const int lev, const int cbuf,
-                  const int m) const {
+  bool CompressOK(const Real px1, const Real px2, const int lev, const int cbuf, const int m,
+                  bool *reach = nullptr) const {
+    if (reach != nullptr) *reach = true;
     if (lev < 1) return false;
     Real x1 = px1, x2 = px2;
     Frame(m, x1, x2);
     const int r = 1 << (nlev - lev), bf = 2*cbuf*r;
     const int I = static_cast<int>(floor((x1 - x1min)/(fine_dx1*r)));
     const int J = static_cast<int>(floor((x2 - x2min)/(fine_dx2*r)));
-    return AllAbove(m, I*r - bf, I*r + r + bf - 1, J*r - bf, J*r + r + bf - 1, lev - 1);
-  }
-
-  // encoded leaf cell of block m that holds (x1, x2)
-  KOKKOS_INLINE_FUNCTION
-  int Owner(const Real px1, const Real px2, const int m) const {
-    const Real x1 = Wrap(px1, x1min, x1max), x2 = Wrap(px2, x2min, x2max);
-    int i = static_cast<int>(floor((x1 - box(m, 0))/box(m, 2)));
-    int j = static_cast<int>(floor((x2 - box(m, 1))/box(m, 3)));
-    i = (i < 0) ? 0 : ((i > nx1 - 1) ? nx1 - 1 : i);
-    j = (j < 0) ? 0 : ((j > nx2 - 1) ? nx2 - 1 : j);
-    return (m*ncells2 + j + js)*ncells1 + i + is;
+    return AllAbove(m, I*r - bf, I*r + r + bf - 1, J*r - bf, J*r + r + bf - 1, lev - 1, reach);
   }
 };
 

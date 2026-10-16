@@ -414,6 +414,23 @@ void DumpResampleState(particles::Particles *ppar, Mesh *pmesh, const char *when
   }
 }
 
+// one row of cloud_resample_log.txt, with the header in front of the first; written for every
+// pass, also when the pool is too small to resample
+void AppendResampleLog(const char *row) {
+  std::FILE *fp = std::fopen("cloud_resample_log.txt", "a");
+  if (fp == nullptr) return;
+  std::fseek(fp, 0, SEEK_END);
+  if (std::ftell(fp) == 0) {
+    std::fprintf(fp, "# ncycle time npart_before npart_after pool above_cap lobed patches"
+                 " patches_reduced kept at_cap fallback max_res_accepted steps_zero steps_cap scans"
+                 " M_b M_a PX_b PX_a t_total t_device t_copy t_sort t_host_wall t_host_cpu t_back"
+                 " threads nnz s_rows s_scale s_qr s_null s_reduce s_check n_max nb_max n_ge64 n_ge256"
+                 " device t_dev_order t_dev_sizes t_dev_small t_dev_large\n");
+  }
+  std::fputs(row, fp);
+  std::fclose(fp);
+}
+
 }  // namespace
 
 //----------------------------------------------------------------------------------------
@@ -619,7 +636,16 @@ int DustGasDrag::ResampleClouds() {
     if (final) coff(p) = upd;
     upd += (cnt(p) > 0) ? cnt(p) : 0;
   }, nnz);
-  if (npool < 2) return 0;
+  if (npool < 2) {   // nothing to resample; the pass keeps its log row (all patch columns 0)
+    ++cloud_resample_pass;
+    char row[1024];
+    std::snprintf(row, sizeof(row), "%d %.17g %d %d %d %.0f %.0f 0 0 %d 0 0 0.000e+00 0 0 0"
+                  " %.17g %.17g %.17g %.17g %.4e 0 0 0 0 0 0 0 %d 0 0 0 0 0 0 0 0 0 0 %d 0 0 0 0\n",
+                  pmesh->ncycle, pmesh->time, npart, npart, npool, cnt_b[1], cnt_b[0], npool, tot_b[0],
+                  tot_b[0], tot_b[1], tot_b[1], seconds(t_all), nnz, cloud_resample_device ? 1 : 0);
+    AppendResampleLog(row);
+    return 0;
+  }
 
   // device: pool table (x, y, m, v, ts, gathered gas velocity, cap), ids, CSR weights
   const int npd = 11;
@@ -960,25 +986,17 @@ int DustGasDrag::ResampleClouds() {
   const double t_back = seconds(t0);
   ++cloud_resample_pass;
   cloud_resample_removed += static_cast<unsigned long long>(nremoved);
-  std::FILE *fp = std::fopen("cloud_resample_log.txt", "a");
-  if (fp != nullptr) {
-    std::fseek(fp, 0, SEEK_END);
-    if (std::ftell(fp) == 0) {
-      std::fprintf(fp, "# ncycle time npart_before npart_after pool above_cap lobed patches"
-                   " patches_reduced kept at_cap fallback max_res_accepted steps_zero steps_cap scans"
-                   " M_b M_a PX_b PX_a t_total t_device t_copy t_sort t_host_wall t_host_cpu t_back"
-                   " threads nnz s_rows s_scale s_qr s_null s_reduce s_check n_max nb_max n_ge64 n_ge256"
-                   " device t_dev_order t_dev_sizes t_dev_small t_dev_large\n");
-    }
-    std::fprintf(fp, "%d %.17g %d %d %lld %.0f %.0f %lld %lld %lld %lld %lld %.3e %lld %lld %lld"
-                 " %.17g %.17g %.17g %.17g %.4e %.4e %.4e %.4e %.4e %.4e %.4e %d %d"
-                 " %.4e %.4e %.4e %.4e %.4e %.4e %d %d %d %d %d %.4e %.4e %.4e %.4e\n", pmesh->ncycle,
-                 pmesh->time, npart, nfinal, pool, cnt_b[1], cnt_b[0], npat, nred, kept, atcap, nfall,
-                 resmax, zsteps, csteps, scans, tot_b[0], tot_a[0], tot_b[1], tot_a[1], seconds(t_all),
-                 t_dev, t_copy, t_sort, t_host, cpu, t_back, nthread, nnz, st[0], st[1], st[2],
-                 st[3], st[4], st[5], nmax, nbmax, n64, n256, cloud_resample_device ? 1 : 0,
-                 dtim[0], dtim[1], dtim[2], dtim[3]);
-    std::fclose(fp);
+  {
+    char row[1024];
+    std::snprintf(row, sizeof(row), "%d %.17g %d %d %lld %.0f %.0f %lld %lld %lld %lld %lld %.3e %lld %lld"
+                  " %lld %.17g %.17g %.17g %.17g %.4e %.4e %.4e %.4e %.4e %.4e %.4e %d %d"
+                  " %.4e %.4e %.4e %.4e %.4e %.4e %d %d %d %d %d %.4e %.4e %.4e %.4e\n", pmesh->ncycle,
+                  pmesh->time, npart, nfinal, pool, cnt_b[1], cnt_b[0], npat, nred, kept, atcap, nfall,
+                  resmax, zsteps, csteps, scans, tot_b[0], tot_a[0], tot_b[1], tot_a[1], seconds(t_all),
+                  t_dev, t_copy, t_sort, t_host, cpu, t_back, nthread, nnz, st[0], st[1], st[2],
+                  st[3], st[4], st[5], nmax, nbmax, n64, n256, cloud_resample_device ? 1 : 0,
+                  dtim[0], dtim[1], dtim[2], dtim[3]);
+    AppendResampleLog(row);
   }
   if (dump) DumpResampleState(ppar, pmesh, "post");
   return nremoved;

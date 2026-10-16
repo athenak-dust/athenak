@@ -36,6 +36,11 @@ void DustGasDrag::BuildLeafTraversal() {
   auto &mbsize = pmy_pack->pmb->mb_size;
   auto &nghbr = pmy_pack->pmb->nghbr;
   const int nslot = pmy_pack->pmb->nnghbr;
+  if (!pm->two_d || nslot != 24) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "leaf traversal: 2-D meshes only (24 neighbour slots)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   auto &lt = leaf_traversal;
   lt.nmb = nmb;
   lt.gids = pmy_pack->gids;
@@ -60,7 +65,6 @@ void DustGasDrag::BuildLeafTraversal() {
   }
   for (int m=0; m<nmb; ++m) {
     const auto &sz = mbsize.h_view(m);
-    const Real cx = 0.5*(sz.x1min + sz.x1max), cy = 0.5*(sz.x2min + sz.x2max);
     int c = 0;
     for (int n=0; n<nslot; ++n) {
       const int gid = nghbr.h_view(m, n).gid;
@@ -72,9 +76,20 @@ void DustGasDrag::BuildLeafTraversal() {
                   << " is not in this pack (one MPI rank only)" << std::endl;
         std::exit(EXIT_FAILURE);
       }
+      // the side of m this slot looks to (2-D slots of nghbr_index.hpp: x1 faces 0-3 and 4-7,
+      // x2 faces 8-11 and 12-15, x1x2 edges 16-23), and the periodic shift that puts the
+      // neighbour there; the centre distance alone cannot tell the two sides apart when a
+      // direction has one or two blocks
+      int ix = 0, iy = 0;
+      if (n < 4) {ix = -1;} else if (n < 8) {ix = 1;} else if (n < 12) {iy = -1;}
+      else if (n < 16) {iy = 1;} else {ix = ((n - 16) & 2) - 1; iy = (((n - 16) & 4) >> 1) - 1;}
       const auto &nz = mbsize.h_view(b);
-      const int sx = static_cast<int>(std::lround((0.5*(nz.x1min + nz.x1max) - cx)/lt.lx));
-      const int sy = static_cast<int>(std::lround((0.5*(nz.x2min + nz.x2max) - cy)/lt.ly));
+      const int sx = static_cast<int>(std::lround(((ix > 0) ? nz.x1min - sz.x1max
+                                                 : ((ix < 0) ? nz.x1max - sz.x1min
+                                                             : nz.x1min - sz.x1min))/lt.lx));
+      const int sy = static_cast<int>(std::lround(((iy > 0) ? nz.x2min - sz.x2max
+                                                 : ((iy < 0) ? nz.x2max - sz.x2min
+                                                             : nz.x2min - sz.x2min))/lt.ly));
       bool seen = (b == m && sx == 0 && sy == 0);
       for (int k=0; k<c && !seen; ++k) seen = (nb(m, k) == b && nbs(m, k, 0) == sx && nbs(m, k, 1) == sy);
       if (seen) continue;
@@ -151,10 +166,10 @@ void DustGasDrag::CheckLeafTraversal() {
   const Real inv_dx = 1.0/smr_transfer.root_dx1;
   constexpr Real kTol = 1.0e-12;
   Real ew = 0.0, em = 0.0, es = 0.0;
-  int nbadw = 0, nbadm = 0, nbads = 0, nbado = 0, nlobed = 0;
+  int nbadw = 0, nbadm = 0, nbads = 0, nbado = 0, nlobed = 0, nglob = 0, nprobe = 0;
   Kokkos::parallel_reduce("dust_leaf_check", Kokkos::RangePolicy<DevExeSpace>(0, npart),
   KOKKOS_LAMBDA(const int p, Real &dw, Real &dm, Real &ds, int &bw, int &bm, int &bs, int &bo,
-                int &nlb) {
+                int &nlb, int &ng, int &np) {
     auto coef = [](const int target, const Real s) {
       Real v = sin(static_cast<Real>(target)*12.9898 + s)*43758.5453;
       return v - floor(v);
@@ -162,48 +177,59 @@ void DustGasDrag::CheckLeafTraversal() {
     const Real x1 = pr(IPX,p), x2 = pr(IPY,p);
     const int code = pi(PLEV,p), m = pi(PGID,p) - gids;
     const int gcode = SMRCompositeTransfer::GatherCode(code, tmode);
-    // table
-    Real tw[2] = {0.0, 0.0}, tm[2] = {0.0, 0.0};
-    tab.ForEachCloudWeight(x1, x2, code, [&](const int target, const Real w) {
-      tw[0] += w*coef(target, 0.3); tw[1] += w*coef(target, 4.1);
-    });
-    tab.ForEachCloudMoment(x1, x2, gcode,
-    [&](const int target, const Real w, const Real m1x, const Real m1y) {
-      tm[0] += w*coef(target, 0.3) + inv_dx*(m1x*coef(target, 1.7) + m1y*coef(target, 2.9));
-      tm[1] += w*coef(target, 5.3) + inv_dx*(m1x*coef(target, 6.7) + m1y*coef(target, 7.9));
-    });
-    // actual leaves
-    Real lw[2] = {0.0, 0.0}, lmo[2] = {0.0, 0.0};
-    const Real sum = lt.ForEach<false>(x1, x2, code, m, [&](const int target, const Real w) {
-      lw[0] += w*coef(target, 0.3); lw[1] += w*coef(target, 4.1);
-    });
-    lt.ForEach<true>(x1, x2, gcode, m,
-    [&](const int target, const Real w, const Real m1x, const Real m1y) {
-      lmo[0] += w*coef(target, 0.3) + inv_dx*(m1x*coef(target, 1.7) + m1y*coef(target, 2.9));
-      lmo[1] += w*coef(target, 5.3) + inv_dx*(m1x*coef(target, 6.7) + m1y*coef(target, 7.9));
-    });
-    const Real d1 = fmax(fabs(tw[0] - lw[0]), fabs(tw[1] - lw[1]));
-    const Real d2 = fmax(fabs(tm[0] - lmo[0]), fabs(tm[1] - lmo[1]));
-    const Real d3 = fabs(sum - 1.0);
-    dw = fmax(dw, d1); dm = fmax(dm, d2); ds = fmax(ds, d3);
-    if (d1 > kTol) ++bw;
-    if (d2 > kTol) ++bm;
-    if (d3 > kTol) ++bs;
-    if (lt.Owner(x1, x2, m) != tab.LeafOwner(x1, x2)) ++bo;
+    // the particle, and four positions half a cloud width away with the particle's block as
+    // the anchor (children of a split, half-step positions: they may lie in a neighbour or
+    // across a periodic edge)
+    const Real h1 = tab.CloudHalfWidth1(code), h2 = tab.CloudHalfWidth2(code);
+    for (int q=0; q<5; ++q) {
+      const Real px = x1 + ((q == 1) ? -h1 : ((q == 2) ? h1 : 0.0));
+      const Real py = x2 + ((q == 3) ? -h2 : ((q == 4) ? h2 : 0.0));
+      Real tw[2] = {0.0, 0.0}, tm[2] = {0.0, 0.0};
+      tab.ForEachCloudWeight(px, py, code, [&](const int target, const Real w) {
+        tw[0] += w*coef(target, 0.3); tw[1] += w*coef(target, 4.1);
+      });
+      tab.ForEachCloudMoment(px, py, gcode,
+      [&](const int target, const Real w, const Real m1x, const Real m1y) {
+        tm[0] += w*coef(target, 0.3) + inv_dx*(m1x*coef(target, 1.7) + m1y*coef(target, 2.9));
+        tm[1] += w*coef(target, 5.3) + inv_dx*(m1x*coef(target, 6.7) + m1y*coef(target, 7.9));
+      });
+      Real lw[2] = {0.0, 0.0}, lmo[2] = {0.0, 0.0};
+      bool reach = true;
+      const Real sum = lt.ForEach<false>(px, py, code, m, [&](const int target, const Real w) {
+        lw[0] += w*coef(target, 0.3); lw[1] += w*coef(target, 4.1);
+      }, &reach);
+      lt.ForEach<true>(px, py, gcode, m,
+      [&](const int target, const Real w, const Real m1x, const Real m1y) {
+        lmo[0] += w*coef(target, 0.3) + inv_dx*(m1x*coef(target, 1.7) + m1y*coef(target, 2.9));
+        lmo[1] += w*coef(target, 5.3) + inv_dx*(m1x*coef(target, 6.7) + m1y*coef(target, 7.9));
+      });
+      const Real d1 = fmax(fabs(tw[0] - lw[0]), fabs(tw[1] - lw[1]));
+      const Real d2 = fmax(fabs(tm[0] - lmo[0]), fabs(tm[1] - lmo[1]));
+      const Real d3 = fabs(sum - 1.0);
+      dw = fmax(dw, d1); dm = fmax(dm, d2); ds = fmax(ds, d3);
+      if (d1 > kTol) ++bw;
+      if (d2 > kTol) ++bm;
+      if (d3 > kTol) ++bs;
+      if (lt.Owner(px, py, m) != tab.LeafOwner(px, py)) ++bo;
+      if (!reach) ++ng;
+      ++np;
+    }
     if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) ++nlb;
   }, Kokkos::Max<Real>(ew), Kokkos::Max<Real>(em), Kokkos::Max<Real>(es), Kokkos::Sum<int>(nbadw),
      Kokkos::Sum<int>(nbadm), Kokkos::Sum<int>(nbads), Kokkos::Sum<int>(nbado),
-     Kokkos::Sum<int>(nlobed));
+     Kokkos::Sum<int>(nlobed), Kokkos::Sum<int>(nglob), Kokkos::Sum<int>(nprobe));
   if (global_variable::my_rank == 0) {
     std::FILE *fp = std::fopen("cloud_leaf_check.txt", "a");
     if (fp != nullptr) {
       std::fseek(fp, 0, SEEK_END);
       if (std::ftell(fp) == 0) {
         std::fprintf(fp, "# ncycle time particles max_dweight max_dmoment max_dsum bad_weight "
-                     "bad_moment bad_sum bad_owner lobed (bad: > 1e-12)\n");
+                     "bad_moment bad_sum bad_owner lobed probes global (bad: > 1e-12; 5 probes per "
+                     "particle)\n");
       }
-      std::fprintf(fp, "%d %.17g %d %.3e %.3e %.3e %d %d %d %d %d\n", pmy_pack->pmesh->ncycle,
-                   pmy_pack->pmesh->time, npart, ew, em, es, nbadw, nbadm, nbads, nbado, nlobed);
+      std::fprintf(fp, "%d %.17g %d %.3e %.3e %.3e %d %d %d %d %d %d %d\n", pmy_pack->pmesh->ncycle,
+                   pmy_pack->pmesh->time, npart, ew, em, es, nbadw, nbadm, nbads, nbado, nlobed,
+                   nprobe, nglob);
       std::fclose(fp);
     }
     std::cout << "# leaf traversal check cycle " << pmy_pack->pmesh->ncycle << ": "
@@ -256,6 +282,11 @@ void DustGasDrag::CheckLeafEligibility() {
       if (!reach) ++nr;
     };
     probe(x, y, code);
+    if (SMRCompositeTransfer::CloudLobe1(code) == 0 && SMRCompositeTransfer::CloudLobe2(code) == 0) {
+      // P1Event of a plain cloud: its own level, half its width away in each direction
+      const Real g1 = tab.CloudHalfWidth1(lev), g2 = tab.CloudHalfWidth2(lev);
+      probe(x - g1, y, lev); probe(x + g1, y, lev); probe(x, y - g2, lev); probe(x, y + g2, lev);
+    }
     if (lev > 0) {
       const Real h1 = tab.CloudHalfWidth1(lev - 1), h2 = tab.CloudHalfWidth2(lev - 1);
       probe(x, y, lev - 1);
@@ -263,9 +294,11 @@ void DustGasDrag::CheckLeafEligibility() {
       probe(x, y - h2, lev - 1); probe(x, y + h2, lev - 1);
     }
     {
-      const bool a = tab.CloudOverlapsFiner(x, y, code), b = lt.OverlapsFiner(x, y, code, m);
+      bool reach = true;
+      const bool a = tab.CloudOverlapsFiner(x, y, code), b = lt.OverlapsFiner(x, y, code, m, &reach);
       if (a) ++tov;
       if (a != b) ++dov;
+      if (!reach) ++nr;
     }
     // merge-cell masks
     const Real xw = T::WrapPosition(x, tab.x1min, tab.x1max), yw = T::WrapPosition(y, tab.x2min, tab.x2max);
@@ -286,7 +319,9 @@ void DustGasDrag::CheckLeafEligibility() {
             if (tab.cloud_level(wj, T::WrapIndex(fi, nf1)) > L) {ok = false; break;}
           }
         }
-        const bool b = lt.MergeOK(xw + ox, yw + oy, L, B, m);
+        bool reach = true;
+        const bool b = lt.MergeOK(xw + ox, yw + oy, L, B, m, &reach);
+        if (!reach) ++nr;
         ++nm;
         if (ok) ++tmr;
         if (ok != b) ++dmr;
@@ -305,7 +340,9 @@ void DustGasDrag::CheckLeafEligibility() {
           mn = (v < mn) ? v : mn;
         }
       }
-      const bool a = (mn >= l), b = lt.CompressOK(x, y, l, cbuf, m);
+      bool reach = true;
+      const bool a = (mn >= l), b = lt.CompressOK(x, y, l, cbuf, m, &reach);
+      if (!reach) ++nr;
       ++nc;
       if (a) ++tcm;
       if (a != b) ++dcm;
@@ -318,7 +355,8 @@ void DustGasDrag::CheckLeafEligibility() {
       if (std::ftell(fp) == 0) {
         std::fprintf(fp, "# ncycle time particles split_probes split_differ split_true overlap_differ "
                      "overlap_true merge_probes merge_differ merge_true compress_probes "
-                     "compress_differ compress_true split_out_of_reach\n");
+                     "compress_differ compress_true global_answers (probes beyond the anchor's "
+                     "neighbourhood)\n");
       }
       std::fprintf(fp, "%d %.17g %d %d %d %d %d %d %d %d %d %d %d %d %d\n", pmy_pack->pmesh->ncycle,
                    pmy_pack->pmesh->time, npart, n_ins, d_ins, t_ins, d_ovl, t_ovl, n_mrg, d_mrg, t_mrg,
