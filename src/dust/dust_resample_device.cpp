@@ -41,11 +41,14 @@ namespace {
 
 using Policy = Kokkos::TeamPolicy<DevExeSpace>;
 using Member = Policy::member_type;
+// large patches: up to 512 threads per team, registers limited accordingly
+using PolicyWide = Kokkos::TeamPolicy<DevExeSpace, Kokkos::LaunchBounds<512, 1>>;
 constexpr int kChunk = 8;   // a step search along one null vector is split in this many chunks
 
 // sizes of the per-team workspace of a bucket
 struct WsSize {
   int nmax = 0, emax = 1, rmax = 8, cmax = 32;   // clouds, CSR entries, rows, active columns
+  int lmax = 1, hmax = 4;                        // distinct leaves, hash table slots (power of 2)
   std::size_t nd = 0, ni = 0;                     // doubles and ints per team slot
 };
 
@@ -53,12 +56,16 @@ WsSize Sizes(const int nmax, const int emax, const int lmax) {
   WsSize z;
   z.nmax = std::max(nmax, 2);
   z.emax = std::max(emax, 1);
+  z.lmax = std::max(lmax, 1);
+  z.hmax = 4;
+  while (z.hmax < 4*z.lmax) z.hmax *= 2;
   z.rmax = 7*lmax + 8;
   const int rb = std::min(z.rmax, z.nmax);
   z.cmax = std::max(2*rb, rb + 32);
   const std::size_t r = z.rmax, n = z.nmax, c = z.cmax;
   z.nd = 2*r*n + r + n + 2*r*c + 2*c*c + 10*c + 32 + 3*2*c*kChunk + 3*c;
-  z.ni = 2*static_cast<std::size_t>(z.emax) + r + 2*n + 6*c + 16 + 2*2*c*kChunk;
+  z.ni = static_cast<std::size_t>(z.hmax) + 2*static_cast<std::size_t>(z.lmax) + r + 2*n + 6*c + 16
+       + 2*2*c*kChunk;
   return z;
 }
 
@@ -66,7 +73,7 @@ WsSize Sizes(const int nmax, const int emax, const int lmax) {
 struct Ws {
   double *A, *B, *r0, *w, *bact, *qr, *z, *xs, *vn1, *vn2, *d, *wa, *ua, *tt, *zmx, *sc;
   double *pa0, *pa1, *pzm, *score, *fac;   // chunk partials, scores, update factors
-  int *ents, *leaves, *rowidx, *act, *left, *perm, *kk, *fixed, *zr, *cnt, *pk0, *pk1;
+  int *tab, *ltmp, *leaves, *rowidx, *act, *left, *perm, *kk, *fixed, *zr, *cnt, *pk0, *pk1;
 };
 
 KOKKOS_INLINE_FUNCTION
@@ -94,8 +101,9 @@ Ws Carve(double *db, int *ib, const WsSize &z) {
   ws.pzm = db; db += 2*c*kChunk;
   ws.score = db; db += 2*c;
   ws.fac = db;
-  ws.ents = ib; ib += z.emax;
-  ws.leaves = ib; ib += z.emax;
+  ws.tab = ib; ib += z.hmax;
+  ws.ltmp = ib; ib += z.lmax;
+  ws.leaves = ib; ib += z.lmax;
   ws.rowidx = ib; ib += r;
   ws.act = ib; ib += n;
   ws.left = ib; ib += n;
@@ -109,25 +117,49 @@ Ws Carve(double *db, int *ib, const WsSize &z) {
   return ws;
 }
 
-// in-place heapsort of v[0..n-1] by one thread (deterministic, no extra memory)
-template <typename V>
+// the distinct values among ne integers, by a team: a hash set with linear probing (tab, H
+// slots, H a power of 2 at least twice the number of distinct values), then the members in
+// ascending order by their ranks.  Returns how many; sorted values in out when out != nullptr.
+// The set does not depend on the insertion order, so the result is deterministic.
+template <typename Get>
 KOKKOS_INLINE_FUNCTION
-void HeapSort(V &v, const int n) {
-  auto sift = [&](int i, const int end) {
+int DistinctSorted(const Member &tm, const int ne, const Get &get, int *tab, const int hmask,
+                   int *tmp, int *out) {
+  Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, hmask + 1), [&](const int h) {tab[h] = -1;});
+  tm.team_barrier();
+  Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, ne), [&](const int e) {
+    const int key = get(e);
+    unsigned h = (static_cast<unsigned>(key)*2654435761u) & static_cast<unsigned>(hmask);
     while (true) {
-      int c = 2*i + 1;
-      if (c >= end) break;
-      if (c + 1 < end && v[c] < v[c + 1]) ++c;
-      if (!(v[i] < v[c])) break;
-      const int t = v[i]; v[i] = v[c]; v[c] = t;
-      i = c;
+      const int prev = Kokkos::atomic_compare_exchange(&tab[h], -1, key);
+      if (prev == -1 || prev == key) break;
+      h = (h + 1) & static_cast<unsigned>(hmask);
     }
-  };
-  for (int i=n/2 - 1; i>=0; --i) sift(i, n);
-  for (int end=n - 1; end>0; --end) {
-    const int t = v[0]; v[0] = v[end]; v[end] = t;
-    sift(0, end);
+  });
+  tm.team_barrier();
+  int nd = 0;
+  if (tmp == nullptr) {
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, hmask + 1), [&](const int h, int &c) {
+      if (tab[h] != -1) ++c;
+    }, nd);
+    return nd;
   }
+  Kokkos::parallel_scan(Kokkos::TeamThreadRange(tm, hmask + 1), [&](const int h, int &upd,
+                                                                     const bool final) {
+    if (tab[h] != -1) {
+      if (final) tmp[upd] = tab[h];
+      ++upd;
+    }
+  }, nd);
+  tm.team_barrier();
+  Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, nd), [&](const int i) {
+    const int x = tmp[i];
+    int r = 0;
+    for (int j=0; j<nd; ++j) r += (tmp[j] < x) ? 1 : 0;
+    out[r] = x;
+  });
+  tm.team_barrier();
+  return nd;
 }
 
 KOKKOS_INLINE_FUNCTION
@@ -186,13 +218,14 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
     }
     // Householder vector of column k (entries a[i*n + k], i >= k)
     double tau = 0.0, sc = 0.0, beta = 0.0;
+    // the norm below the diagonal by a team sum (the host sums serially: round-off order differs)
+    double xsq = 0.0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, k + 1, m), [&](const int i, double &v) {
+      const double vi = a[static_cast<std::size_t>(i)*n + k];
+      v += vi*vi;
+    }, xsq);
     Kokkos::single(Kokkos::PerTeam(tm), [&](double &tv) {
-      double xnorm = 0.0;
-      for (int i=k+1; i<m; ++i) {
-        const double vi = a[static_cast<std::size_t>(i)*n + k];
-        xnorm += vi*vi;
-      }
-      xnorm = Kokkos::sqrt(xnorm);
+      const double xnorm = Kokkos::sqrt(xsq);
       tv = 0.0;
       if (xnorm > 0.0) {
         const double alpha = a[static_cast<std::size_t>(k)*n + k];
@@ -395,7 +428,8 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
 // by rows.
 KOKKOS_INLINE_FUNCTION
 void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, const Ws &ws,
-               DvceArray1D<double> &mnew, DvceArray2D<int> &outi, DvceArray1D<double> &outr) {
+               const int hmask, DvceArray1D<double> &mnew, DvceArray2D<int> &outi,
+               DvceArray1D<double> &outr) {
   const int a0 = pb.pptr(q), a1 = pb.pptr(q + 1), n = a1 - a0;
   const auto &spd = pb.spd;
   Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int j) {
@@ -410,21 +444,8 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
   if (n < 2) return;
   // leaves under the clouds of the patch (sorted, distinct)
   const int e0 = pb.sptr(a0), ne = pb.sptr(a1) - e0;
-  Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, ne), [&](const int e) {
-    ws.ents[e] = pb.stgt(e0 + e);
-  });
-  tm.team_barrier();
-  int nl = 0;
-  Kokkos::single(Kokkos::PerTeam(tm), [&](int &v) {
-    int *ents = ws.ents;
-    HeapSort(ents, ne);
-    int c = 0;
-    for (int e=0; e<ne; ++e) {
-      if (e == 0 || ws.ents[e] != ws.ents[e - 1]) ws.leaves[c++] = ws.ents[e];
-    }
-    v = c;
-  }, nl);
-  tm.team_barrier();
+  const int nl = DistinctSorted(tm, ne, [&](const int e) {return pb.stgt(e0 + e);}, ws.tab,
+                                hmask, ws.ltmp, ws.leaves);
   const int nrow = 7*nl + 8;
   // mass-weighted mean velocity, host order
   Kokkos::single(Kokkos::PerTeam(tm), [&]() {
@@ -595,7 +616,9 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
   {
     using ScratchInt = Kokkos::View<int*, DevExeSpace::scratch_memory_space,
                                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
-    const std::size_t bytes = ScratchInt::shmem_size(emax);
+    int hpre = 4;
+    while (hpre < 2*emax) hpre *= 2;
+    const std::size_t bytes = ScratchInt::shmem_size(hpre);
     auto pptr = pb.pptr; auto sptr = pb.sptr; auto stgt = pb.stgt;
     Kokkos::parallel_for("rs_dev_leaves",
     Policy(npatch, Kokkos::AUTO).set_scratch_size(1, Kokkos::PerTeam(bytes)),
@@ -603,16 +626,10 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       const int q = tm.league_rank();
       if (sz(q, 0) < 2) return;
       const int e0 = sptr(pptr(q)), ne = sz(q, 1);
-      ScratchInt v(tm.team_scratch(1), emax);
-      Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, ne), [&](const int e) {v(e) = stgt(e0 + e);});
-      tm.team_barrier();
-      Kokkos::single(Kokkos::PerTeam(tm), [&]() {
-        int *a = v.data();
-        HeapSort(a, ne);
-        int c = 0;
-        for (int e=0; e<ne; ++e) if (e == 0 || a[e] != a[e - 1]) ++c;
-        sz(q, 2) = c;
-      });
+      ScratchInt tab(tm.team_scratch(1), hpre);
+      const int nl = DistinctSorted(tm, ne, [&](const int e) {return stgt(e0 + e);}, tab.data(),
+                                    hpre - 1, nullptr, nullptr);
+      Kokkos::single(Kokkos::PerTeam(tm), [&]() {sz(q, 2) = nl;});
     });
   }
   Kokkos::deep_copy(sz_h, sz);
@@ -676,7 +693,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
             v = Kokkos::atomic_fetch_add(&counter(0), 1);
           }, i);
           if (i >= nq) break;
-          PatchTeam(tm, p, qlist(i), w, mn, oi, orr);
+          PatchTeam(tm, p, qlist(i), w, ws.hmax - 1, mn, oi, orr);
         }
       };
       // the large patches set the critical path of a resampling: the widest team the kernel
@@ -684,7 +701,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       if (b == 0) {
         Kokkos::parallel_for("rs_dev_patches_small", Policy(nslot, Kokkos::AUTO), body);
       } else {
-        const int tmax = Policy(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
+        const int tmax = PolicyWide(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
         int ts = 32;
         while (2*ts <= tmax && 2*ts <= 512) ts *= 2;
         static bool told = false;
@@ -693,7 +710,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                     << " threads (largest allowed " << tmax << ")" << std::endl;
           told = true;
         }
-        Kokkos::parallel_for("rs_dev_patches_large", Policy(nslot, ts), body);
+        Kokkos::parallel_for("rs_dev_patches_large", PolicyWide(nslot, ts), body);
       }
     }
     Kokkos::fence();
