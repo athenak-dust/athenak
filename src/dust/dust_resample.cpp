@@ -809,10 +809,29 @@ int DustGasDrag::ResampleClouds() {
     // sorting, several ranks); the CSR offsets follow the slots
     DvceArray1D<std::int64_t> tk(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_tagkey"), npool);
     DvceArray1D<int> pofs(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pofs"), npool);
-    const std::int64_t np64 = npart, tshift = std::int64_t(1) << 31;
+    const std::int64_t np64 = npart, tshift = std::int64_t(1) << 31, side = std::int64_t(1) << 20;
+    // position: rows of y, then x, 2^20 per side of the domain (cloud_resample_order = position)
+    const bool bypos = cloud_resample_pos_order;
+    if (bypos && static_cast<double>(side)*side*np64 >= 9.0e18) {
+      std::cout << "### FATAL ERROR: cloud_resample_order = position: too many particles" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const Real px0 = transfer.x1min, py0 = transfer.x2min;
+    const Real plx = transfer.x1max - transfer.x1min, ply = transfer.x2max - transfer.x2min;
     Kokkos::parallel_for("rs_tagkey", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
-      if (slot(p) >= 0) tk(slot(p)) = (static_cast<std::int64_t>(pi(PTAG,p)) + tshift)*np64 + p;
+      if (slot(p) < 0) return;
+      if (bypos) {
+        const Real x = SMRCompositeTransfer::WrapPosition(pr(IPX,p), transfer.x1min, transfer.x1max);
+        const Real y = SMRCompositeTransfer::WrapPosition(pr(IPY,p), transfer.x2min, transfer.x2max);
+        std::int64_t ix = static_cast<std::int64_t>((x - px0)/plx*side);
+        std::int64_t iy = static_cast<std::int64_t>((y - py0)/ply*side);
+        ix = (ix < 0) ? 0 : ((ix >= side) ? side - 1 : ix);
+        iy = (iy < 0) ? 0 : ((iy >= side) ? side - 1 : iy);
+        tk(slot(p)) = (iy*side + ix)*np64 + p;
+      } else {
+        tk(slot(p)) = (static_cast<std::int64_t>(pi(PTAG,p)) + tshift)*np64 + p;
+      }
     });
     Kokkos::sort(tk);
     Kokkos::parallel_for("rs_tagslot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),

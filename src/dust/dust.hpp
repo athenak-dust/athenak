@@ -1521,6 +1521,7 @@ class DustGasDrag {
   int cloud_resample_stress_copies = 0;   //     candidate; K copies of the first one
   bool cloud_resample_stress_done = false;
   bool cloud_resample_tag_order = false;   // ... pool in PTAG order (else array order)
+  bool cloud_resample_pos_order = false;   // ... pool in position order instead
   void StressResamplePool();
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
   std::vector<int> cloud_resample_dump;     // cycles whose resampling writes the particle table before and after
