@@ -39,6 +39,10 @@
 #include "hydro/hydro.hpp"
 #include "dust.hpp"
 
+#if MPI_PARALLEL_ENABLED
+#include <mpi.h>
+#endif
+
 namespace dust {
 namespace {
 
@@ -397,11 +401,34 @@ void DustGasDrag::CheckNativeTransfer() {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::EnsureNextTag
+//! \brief The first PTAG of created particles, once: the largest tag of all particles + 1.
+//! It used to be the particle count at the first creation, which repeats tags when
+//! particles were removed before (a resampling at t = 0 before the first split of a run that
+//! starts on the root grid: D6 had 251 tags twice).  Called at the start of every cycle, so
+//! that it is set before anything removes particles; restarts carry the counter.
+
+void DustGasDrag::EnsureNextTag() {
+  if (cloud_next_tag >= 0) return;
+  auto pi = pmy_pack->ppart->prtcl_idata;
+  const int npart = pmy_pack->ppart->nprtcl_thispack;
+  int mx = -1;
+  Kokkos::parallel_reduce("dust_max_tag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p, int &m) {if (pi(PTAG,p) > m) m = pi(PTAG,p);}, Kokkos::Max<int>(mx));
+  mx = std::max(mx, -1);
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &mx, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+#endif
+  cloud_next_tag = mx + 1;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::RefineClouds
 //! \brief Task wrapper: split eligible clouds at the start of every cycle.
 
 TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) return TaskStatus::complete;
+  EnsureNextTag();
   SplitAndMergeClouds();
   // the merge clock is read once per cycle (MergeDue advances it)
   const bool merge_due = cloud_merge && MergeDue() &&
@@ -527,7 +554,7 @@ int DustGasDrag::SplitAndMergeClouds() {
   auto flag_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), flag);
   auto target_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(),
                                                       transfer.cloud_target);
-  if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
+  EnsureNextTag();
 
   const Real x1min = transfer.x1min, x2min = transfer.x2min;
   const Real len1 = transfer.x1max - transfer.x1min;
@@ -894,7 +921,7 @@ int DustGasDrag::SplitCloudsP1() {
                                                       transfer.cloud_target);
   // host copy of the transfer for the eligibility tests (views point to host mirrors)
   auto level_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), transfer.cloud_level);
-  if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
+  EnsureNextTag();
   // diagnostic split log (<dust>/cloud_split_log): one S line per event (parent state
   // and the largest leaf change of deposited density and momentum density), C lines for
   // its pieces, W lines (leaf centre, volume, mass before/after) for the first events,
@@ -1457,7 +1484,7 @@ int DustGasDrag::MergeClouds() {
   auto pi_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pi);
   auto level_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), transfer.cloud_level);
   auto target_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), transfer.cloud_target);
-  if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
+  EnsureNextTag();
 
   const Real x1min = transfer.x1min, x2min = transfer.x2min;
   const Real len1 = transfer.x1max - transfer.x1min;

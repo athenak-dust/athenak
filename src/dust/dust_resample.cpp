@@ -641,7 +641,7 @@ void DustGasDrag::StressResamplePool() {
     }
     auto prv = ppar->prtcl_rdata;
     auto piv = ppar->prtcl_idata;
-    if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
+    EnsureNextTag();
     const int tag0 = cloud_next_tag;
     const auto transfer = smr_transfer;
     Kokkos::parallel_for("rs_stress_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -803,11 +803,36 @@ int DustGasDrag::ResampleClouds() {
     if (final) slot(p) = (cnt(p) >= 0) ? upd : -1;
     upd += (cnt(p) >= 0) ? 1 : 0;
   }, npool);
-  Kokkos::parallel_scan("rs_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
-    if (final) coff(p) = upd;
-    upd += (cnt(p) > 0) ? cnt(p) : 0;
-  }, nnz);
+  if (cloud_resample_tag_order && npool > 1) {
+    // With cloud_resample_order = tag the pool is put in PTAG order, so that the streaming
+    // order inside a patch does not depend on where the particles sit in the arrays (storage
+    // sorting, several ranks); the CSR offsets follow the slots
+    DvceArray1D<std::int64_t> tk(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_tagkey"), npool);
+    DvceArray1D<int> pofs(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pofs"), npool);
+    const std::int64_t np64 = npart, tshift = std::int64_t(1) << 31;
+    Kokkos::parallel_for("rs_tagkey", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      if (slot(p) >= 0) tk(slot(p)) = (static_cast<std::int64_t>(pi(PTAG,p)) + tshift)*np64 + p;
+    });
+    Kokkos::sort(tk);
+    Kokkos::parallel_for("rs_tagslot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int k) {
+      const int p = static_cast<int>(tk(k) % np64);
+      slot(p) = k; pofs(k) = p;
+    });
+    Kokkos::parallel_scan("rs_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int a, int &upd, const bool final) {
+      const int p = pofs(a);
+      if (final) coff(p) = upd;
+      upd += (cnt(p) > 0) ? cnt(p) : 0;
+    }, nnz);
+  } else {
+    Kokkos::parallel_scan("rs_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+      if (final) coff(p) = upd;
+      upd += (cnt(p) > 0) ? cnt(p) : 0;
+    }, nnz);
+  }
   if (npool < 2) {   // nothing to resample; the pass keeps its log row (all patch columns 0)
     ++cloud_resample_pass;
     char row[1024];

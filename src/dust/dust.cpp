@@ -519,6 +519,16 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Diagnostic: coincident and near-coincident copies before the first R
       cloud_resample_stress = pin->GetOrAddInteger("dust", "cloud_resample_stress", 0);
       cloud_resample_stress_copies = pin->GetOrAddInteger("dust", "cloud_resample_stress_copies", 0);
+      // The order in which a patch takes its candidates: array (default, as before)
+      // or tag (PTAG order, independent of the storage order)
+      {
+        const std::string ro = pin->GetOrAddString("dust", "cloud_resample_order", "array");
+        if (ro != "array" && ro != "tag") {
+          std::cout << "### FATAL ERROR: <dust>/cloud_resample_order must be array or tag" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        cloud_resample_tag_order = (ro == "tag");
+      }
       cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
       if (cloud_resample_m0 > 0.0 && nspecies > 1 && global_variable::my_rank == 0) {
         std::cout << "# NOTE (dust): cloud_resample_m0 is the root cloud mass of every species "

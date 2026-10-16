@@ -167,7 +167,7 @@ int DustGasDrag::SplitCloudsP1Device() {
     if (parent) sp += 1;
   }, Kokkos::Sum<int>(nflag), Kokkos::Sum<int>(nparent));
   if (nflag == 0) return 0;
-  if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
+  EnsureNextTag();
 
   // In place: the centre piece (k = 0, which keeps the tag) overwrites its parent's slot,
   // and the other pieces are appended after the npart particles, at the offsets (and with
@@ -772,7 +772,7 @@ int DustGasDrag::MergeCloudsDevice() {
     audit.Write(pmesh->ncycle, true);
     return 0;
   }
-  if (cloud_next_tag < 0) cloud_next_tag = pmesh->nprtcl_total;
+  EnsureNextTag();
 
   // level-L cell keys and the merge-cell mask on the actual leaves
   MergeMask mm;
