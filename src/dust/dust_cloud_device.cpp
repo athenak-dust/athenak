@@ -1986,6 +1986,9 @@ int DustGasDrag::MergeCloudsDevice() {
           y = SMRCompositeTransfer::WrapPosition(y, transfer.x2min, transfer.x2max);
           pr(IPM,q) += a[0];
           pr(IPX,q) = x; pr(IPX1,q) = x; pr(IPY,q) = y; pr(IPY1,q) = y;
+          // the absorbing cloud moved to the new centre (possibly across a block face or
+          // the periodic seam): its block follows (the stale one broke the particle routing)
+          pi(PGID,q) = gids + NewCloudBlock(lt, x, y, lt.Anchor(pi(PGID,q)), ncell12);
           pr(IPVX,q) = v[0]; pr(IPVY,q) = v[1]; pr(IPVZ,q) = v[2];
           pr(IPVX1,q) = v[0]; pr(IPVY1,q) = v[1]; pr(IPVZ1,q) = v[2];
         }, dkp);
@@ -2000,6 +2003,7 @@ int DustGasDrag::MergeCloudsDevice() {
             y = SMRCompositeTransfer::WrapPosition(y, transfer.x2min, transfer.x2max);
             nr(IPM,q) += a[0];
             nr(IPX,q) = x; nr(IPX1,q) = x; nr(IPY,q) = y; nr(IPY1,q) = y;
+            ni(PGID,q) = gids + NewCloudBlock(lt, x, y, lt.Anchor(ni(PGID,q)), ncell12);
             nr(IPVX,q) = v[0]; nr(IPVY,q) = v[1]; nr(IPVZ,q) = v[2];
             nr(IPVX1,q) = v[0]; nr(IPVY1,q) = v[1]; nr(IPVZ1,q) = v[2];
           }, dkn);
@@ -2639,6 +2643,9 @@ int DustGasDrag::MergeCloudsDevice() {
         y = SMRCompositeTransfer::WrapPosition(y, transfer.x2min, transfer.x2max);
         pr(IPM,q) += a[0];
         pr(IPX,q) = x; pr(IPX1,q) = x; pr(IPY,q) = y; pr(IPY1,q) = y;
+        // the absorbing cloud moved to the new centre (possibly across a block face or
+        // the periodic seam): its block follows (the stale one broke the particle routing)
+        pi(PGID,q) = gids + NewCloudBlock(lt, x, y, lt.Anchor(pi(PGID,q)), ncell12);
         pr(IPVX,q) = v[0]; pr(IPVY,q) = v[1]; pr(IPVZ,q) = v[2];
         pr(IPVX1,q) = v[0]; pr(IPVY1,q) = v[1]; pr(IPVZ1,q) = v[2];
       }, dkp);
@@ -2653,6 +2660,7 @@ int DustGasDrag::MergeCloudsDevice() {
           y = SMRCompositeTransfer::WrapPosition(y, transfer.x2min, transfer.x2max);
           nr(IPM,q) += a[0];
           nr(IPX,q) = x; nr(IPX1,q) = x; nr(IPY,q) = y; nr(IPY1,q) = y;
+          ni(PGID,q) = gids + NewCloudBlock(lt, x, y, lt.Anchor(ni(PGID,q)), ncell12);
           nr(IPVX,q) = v[0]; nr(IPVY,q) = v[1]; nr(IPVZ,q) = v[2];
           nr(IPVX1,q) = v[0]; nr(IPVY1,q) = v[1]; nr(IPVZ1,q) = v[2];
         }, dkn);
