@@ -197,6 +197,7 @@ void DustGasDrag::BuildLeafTraversal() {
 //! One line per check in cloud_leaf_check.txt.
 
 void DustGasDrag::CheckLeafTraversal() {
+  RequireCloudTable("cloud_leaf_check");
   particles::Particles *ppar = pmy_pack->ppart;
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;

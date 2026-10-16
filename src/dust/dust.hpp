@@ -111,6 +111,7 @@ struct SMRCompositeTransfer {
 
   bool enabled = false;
   bool cloud_mode = false;
+  bool cloud_table = false;            // cloud_target / cloud_level built
   int cloud_nlev = 0;                 // max_level - root_level
   int cloud_max_level = 0;            // clouds are never split beyond this level
   bool cloud_split_everywhere = false; // control: split regardless of the local mesh
@@ -1645,6 +1646,7 @@ class DustGasDrag {
   LeafTraversal leaf_traversal;
   int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
   void BuildLeafTraversal();
+  void RequireCloudTable(const char *what) const;   // fatal without the table
   void CheckLeafTraversal();
   void CheckLeafEligibility();        // called by CheckLeafTraversal
 

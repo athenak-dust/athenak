@@ -71,10 +71,51 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   const int nvirt = pin->GetOrAddInteger("dust", "cloud_virtual_levels", 0);
   int nlev = nlev_mesh + nvirt;
 
-  if (nlev_mesh < 0 || nvirt < 0 || nlev > 2) {
+  // The virtual finest-grid table (cloud_target, cloud_level) is read
+  // only by the host paths and the checks; the production device paths use the actual leaves
+  // (LeafTraversal).  <dust>/cloud_table = auto (default: built when one of its users is set),
+  // true or false.  The table supports the root and two levels of refinement; without it the
+  // levels are limited by the cloud code (4 bits) only.
+  const bool native_cfg = pin->GetOrAddBoolean("dust", "cloud_native_transfer", false);
+  cloud_native_check = pin->GetOrAddInteger("dust", "cloud_native_check", 0);
+  // cloud_leaf_check compares the actual-leaf traversal with the table
+  cloud_leaf_check = pin->GetOrAddInteger("dust", "cloud_leaf_check", 0);
+  const bool graded = pin->DoesParameterExist("problem", "graded_split_layers") &&
+                      pin->GetInteger("problem", "graded_split_layers") >= 0;
+  std::string users;
+  auto user = [&](const bool on, const char *name) {if (on) users += std::string(" ") + name;};
+  user(cloud_leaf_check > 0, "cloud_leaf_check");
+  user(cloud_native_check > 0, "cloud_native_check");
+  user(native_cfg, "cloud_native_transfer");
+  user(!cloud_p1_split, "cloud_p1_split=false (host split)");
+  user(cloud_p1_split && !cloud_split_device, "cloud_split_device=false (host split)");
+  user(cloud_split_log, "cloud_split_log (host split)");
+  user(cloud_split_interp, "cloud_split_interp (host split)");
+  user(cloud_merge && !cloud_merge_device, "cloud_merge_device=false (host merge)");
+  user(graded, "problem/graded_split_layers");
+  const std::string mode = pin->GetOrAddString("dust", "cloud_table", "auto");
+  bool table = !users.empty();
+  if (mode == "true") {
+    table = true;
+  } else if (mode == "false") {
+    if (!users.empty()) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<dust>/cloud_table = false, but these need the table:" << users << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    table = false;
+  } else if (mode != "auto") {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<dust>/cloud_table must be auto, true or false" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (nlev_mesh < 0 || nvirt < 0 || (table && nlev > 2) ||
+      nlev > SMRCompositeTransfer::kCloudLevelMask) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "refinable_cloud currently requires a uniform mesh or one "
-              << "or two levels of 2:1 static refinement (virtual levels included)"
+              << std::endl << "refinable_cloud requires a uniform mesh or 2:1 static refinement"
+              << " (virtual levels included) with at most "
+              << (table ? "two levels when the table is built (cloud_table; users:" + users + ")"
+                        : std::to_string(SMRCompositeTransfer::kCloudLevelMask) + " levels")
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -82,6 +123,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   auto &t = smr_transfer;
   t.enabled = true;
   t.cloud_mode = true;
+  t.cloud_table = table;
   t.cloud_nlev = nlev;
   t.ncoarse1 = pmesh->mesh_indcs.nx1;
   t.ncoarse2 = pmesh->mesh_indcs.nx2;
@@ -102,13 +144,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   t.cloud_split_overlap = pin->GetOrAddBoolean("dust", "cloud_split_overlap", false);
   t.lobe3_integral = cloud_presplit_x1;
 
-  t.cloud_target = DvceArray2D<int>("dust_cloud_target", t.nfine2, t.nfine1);
-  t.cloud_level = DvceArray2D<int>("dust_cloud_level", t.nfine2, t.nfine1);
-  auto target = Kokkos::create_mirror_view(t.cloud_target);
-  auto level = Kokkos::create_mirror_view(t.cloud_level);
-  Kokkos::deep_copy(target, -1);
-  Kokkos::deep_copy(level, -1);
-
+  // every block aligned with the finest virtual grid (the actual-leaf traversal relies on it)
   for (int m=0; m<nmb; ++m) {
     const auto &size = mbsize.h_view(m);
     int lev = mblev.h_view(m) - pmesh->root_level;
@@ -117,43 +153,13 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     Real off2 = (size.x2min - t.x2min)/t.fine_dx2;
     int fi0 = static_cast<int>(std::lround(off1));
     int fj0 = static_cast<int>(std::lround(off2));
-    if (std::abs(off1 - fi0) > 1.0e-8 || std::abs(off2 - fj0) > 1.0e-8 ||
+    if (lev < 0 || lev > nlev || std::abs(off1 - fi0) > 1.0e-8 || std::abs(off2 - fj0) > 1.0e-8 ||
         std::abs(size.dx1 - ratio*t.fine_dx1) > 1.0e-12*size.dx1 ||
         std::abs(size.dx2 - ratio*t.fine_dx2) > 1.0e-12*size.dx2) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "MeshBlock " << m << " is not aligned with the finest "
                 << "virtual grid" << std::endl;
       std::exit(EXIT_FAILURE);
-    }
-    for (int j=0; j<indcs.nx2; ++j) {
-      for (int i=0; i<indcs.nx1; ++i) {
-        int leaf = EncodeCloudLeaf(m, j + indcs.js, i + indcs.is, ncells2, ncells1);
-        for (int sj=0; sj<ratio; ++sj) {
-          for (int si=0; si<ratio; ++si) {
-            int fj = fj0 + j*ratio + sj;
-            int fi = fi0 + i*ratio + si;
-            if (fj < 0 || fj >= t.nfine2 || fi < 0 || fi >= t.nfine1 ||
-                target(fj,fi) >= 0) {
-              std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                        << std::endl << "virtual fine cell outside the mesh or owned "
-                        << "twice" << std::endl;
-              std::exit(EXIT_FAILURE);
-            }
-            target(fj,fi) = leaf;
-            level(fj,fi) = lev;
-          }
-        }
-      }
-    }
-  }
-  for (int fj=0; fj<t.nfine2; ++fj) {
-    for (int fi=0; fi<t.nfine1; ++fi) {
-      if (target(fj,fi) < 0) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "virtual fine cell has no active leaf owner"
-                  << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
     }
   }
   // <dust>/cloud_split_buffer (default 0): the refined dust region
@@ -169,32 +175,78 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << "cloud_p1_split and excludes cloud_force_children" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (cloud_split_buffer > 0) {
-    // a plain host copy: on a host backend the mirror view aliases the map itself
-    std::vector<int> mesh_level(static_cast<std::size_t>(t.nfine1)*t.nfine2);
-    for (int fj=0; fj<t.nfine2; ++fj) {
-      for (int fi=0; fi<t.nfine1; ++fi) {
-        mesh_level[static_cast<std::size_t>(fj)*t.nfine1 + fi] = level(fj,fi);
-      }
-    }
-    for (int lev=1; lev<=nlev; ++lev) {
-      const int r = cloud_split_buffer << (nlev - lev + 1);   // finest cells per buffer
-      for (int fj=0; fj<t.nfine2; ++fj) {
-        for (int fi=0; fi<t.nfine1; ++fi) {
-          if (mesh_level[static_cast<std::size_t>(fj)*t.nfine1 + fi] < lev) continue;
-          for (int dj=-r; dj<=r; ++dj) {
-            const int wj = SMRCompositeTransfer::WrapIndex(fj + dj, t.nfine2);
-            for (int di=-r; di<=r; ++di) {
-              int &l = level(wj, SMRCompositeTransfer::WrapIndex(fi + di, t.nfine1));
-              l = std::max(l, lev);
+
+  if (table) {
+    t.cloud_target = DvceArray2D<int>("dust_cloud_target", t.nfine2, t.nfine1);
+    t.cloud_level = DvceArray2D<int>("dust_cloud_level", t.nfine2, t.nfine1);
+    auto target = Kokkos::create_mirror_view(t.cloud_target);
+    auto level = Kokkos::create_mirror_view(t.cloud_level);
+    Kokkos::deep_copy(target, -1);
+    Kokkos::deep_copy(level, -1);
+    for (int m=0; m<nmb; ++m) {
+      const auto &size = mbsize.h_view(m);
+      int lev = mblev.h_view(m) - pmesh->root_level;
+      int ratio = 1 << (nlev - lev);
+      int fi0 = static_cast<int>(std::lround((size.x1min - t.x1min)/t.fine_dx1));
+      int fj0 = static_cast<int>(std::lround((size.x2min - t.x2min)/t.fine_dx2));
+      for (int j=0; j<indcs.nx2; ++j) {
+        for (int i=0; i<indcs.nx1; ++i) {
+          int leaf = EncodeCloudLeaf(m, j + indcs.js, i + indcs.is, ncells2, ncells1);
+          for (int sj=0; sj<ratio; ++sj) {
+            for (int si=0; si<ratio; ++si) {
+              int fj = fj0 + j*ratio + sj;
+              int fi = fi0 + i*ratio + si;
+              if (fj < 0 || fj >= t.nfine2 || fi < 0 || fi >= t.nfine1 ||
+                  target(fj,fi) >= 0) {
+                std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                          << std::endl << "virtual fine cell outside the mesh or owned "
+                          << "twice" << std::endl;
+                std::exit(EXIT_FAILURE);
+              }
+              target(fj,fi) = leaf;
+              level(fj,fi) = lev;
             }
           }
         }
       }
     }
+    for (int fj=0; fj<t.nfine2; ++fj) {
+      for (int fi=0; fi<t.nfine1; ++fi) {
+        if (target(fj,fi) < 0) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "virtual fine cell has no active leaf owner"
+                    << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+      }
+    }
+    if (cloud_split_buffer > 0) {
+      // a plain host copy: on a host backend the mirror view aliases the map itself
+      std::vector<int> mesh_level(static_cast<std::size_t>(t.nfine1)*t.nfine2);
+      for (int fj=0; fj<t.nfine2; ++fj) {
+        for (int fi=0; fi<t.nfine1; ++fi) {
+          mesh_level[static_cast<std::size_t>(fj)*t.nfine1 + fi] = level(fj,fi);
+        }
+      }
+      for (int lev=1; lev<=nlev; ++lev) {
+        const int r = cloud_split_buffer << (nlev - lev + 1);   // finest cells per buffer
+        for (int fj=0; fj<t.nfine2; ++fj) {
+          for (int fi=0; fi<t.nfine1; ++fi) {
+            if (mesh_level[static_cast<std::size_t>(fj)*t.nfine1 + fi] < lev) continue;
+            for (int dj=-r; dj<=r; ++dj) {
+              const int wj = SMRCompositeTransfer::WrapIndex(fj + dj, t.nfine2);
+              for (int di=-r; di<=r; ++di) {
+                int &l = level(wj, SMRCompositeTransfer::WrapIndex(fi + di, t.nfine1));
+                l = std::max(l, lev);
+              }
+            }
+          }
+        }
+      }
+    }
+    Kokkos::deep_copy(t.cloud_target, target);
+    Kokkos::deep_copy(t.cloud_level, level);
   }
-  Kokkos::deep_copy(t.cloud_target, target);
-  Kokkos::deep_copy(t.cloud_level, level);
 
   // <dust>/cloud_native_transfer: clouds whose support lies
   // on leaves of one level are traversed on that level's own cells instead of the finest
@@ -204,10 +256,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // Default false: on GB200 the native traversal doubled the time of the two
   // production cloud kernels of a BA run that is mostly fine clouds (87 s against 33 s for
   // t = 0-100; 8% slower on an RTX 4080 as well); the integrals are the same to rounding.
-  t.native = pin->GetOrAddBoolean("dust", "cloud_native_transfer", false);
-  cloud_native_check = pin->GetOrAddInteger("dust", "cloud_native_check", 0);
-  // The actual-leaf traversal is built with the maps; cloud_leaf_check compares it
-  cloud_leaf_check = pin->GetOrAddInteger("dust", "cloud_leaf_check", 0);
+  // Both belong to the table's traversal (read above).
+  t.native = native_cfg && table;
   if (nlev + 1 > SMRCompositeTransfer::kMaxNativeLevels) t.native = false;
   if (t.native || cloud_native_check > 0) {
     int total = 0;
@@ -240,7 +290,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   if (global_variable::my_rank == 0 && !cloud_map_announced) {
     cloud_map_announced = true;
     std::cout << "# refinable_cloud map: levels=" << nlev
-              << (nvirt > 0 ? " (" + std::to_string(nvirt) + " virtual)" : "") << ", virtual finest grid "
+              << (nvirt > 0 ? " (" + std::to_string(nvirt) + " virtual)" : "")
+              << (table ? ", finest-grid table " : ", no finest-grid table (actual leaves), finest level ")
               << t.nfine1 << "x" << t.nfine2 << ", split slack=" << cloud_split_slack
               << ", merge tolerance=" << cloud_merge_tolerance << " finest cells"
               << ", max cloud level=" << t.cloud_max_level
@@ -264,6 +315,20 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::RequireCloudTable
+//! \brief Stop when a path that reads the virtual finest-grid table runs without
+//! it (<dust>/cloud_table = auto builds it for the paths known at the start; a problem
+//! generator's split oracle, for example, is set later).
+
+void DustGasDrag::RequireCloudTable(const char *what) const {
+  if (smr_transfer.cloud_table) return;
+  std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+            << what << " reads the virtual finest-grid table, which was not built: set "
+            << "<dust>/cloud_table = true (at most two levels of refinement)" << std::endl;
+  std::exit(EXIT_FAILURE);
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::CheckNativeTransfer
 //! \brief Diagnostic (<dust>/cloud_native_check): traverse every particle's cloud with
 //! the level-native path and with the finest virtual grid, and print the largest
@@ -272,6 +337,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
 //! takes.  A wrong leaf, weight or moment shows as an O(1) difference; rounding as 1e-16.
 
 void DustGasDrag::CheckNativeTransfer() {
+  RequireCloudTable("cloud_native_check");
   particles::Particles *ppar = pmy_pack->ppart;
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
@@ -420,6 +486,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
 int DustGasDrag::SplitAndMergeClouds() {
   if (!cloud_split_enable) return 0;   // test switch
   if (cloud_p1_split) return SplitCloudsP1();
+  RequireCloudTable("the split without cloud_p1_split");
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   int npart = ppar->nprtcl_thispack;
@@ -621,6 +688,7 @@ int DustGasDrag::SplitAndMergeClouds() {
 
 int DustGasDrag::MakeTransitionClouds() {
   if (cloud_transition <= 0 || cloud_p1_split) return 0;
+  RequireCloudTable("the transition clouds of the split without cloud_p1_split");
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   int npart = ppar->nprtcl_thispack;
@@ -758,6 +826,8 @@ int DustGasDrag::SplitCloudsP1() {
   if (cloud_split_device && !cloud_split_log && !cloud_split_interp && !split_oracle) {
     return SplitCloudsP1Device();
   }
+  RequireCloudTable("the host P1 split (cloud_split_device = false, cloud_split_log, "
+                    "cloud_split_interp or a split oracle)");
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   int npart = ppar->nprtcl_thispack;
@@ -1356,6 +1426,7 @@ int DustGasDrag::SplitCloudsP1() {
 //! single rank, like SplitCloudsP1; the algorithm only looks at a centre's tent support.
 int DustGasDrag::MergeClouds() {
   if (cloud_merge_device) return MergeCloudsDevice();
+  RequireCloudTable("the host merge pass (cloud_merge_device = false)");
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   const int npart = ppar->nprtcl_thispack;

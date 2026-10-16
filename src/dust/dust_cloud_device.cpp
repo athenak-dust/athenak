@@ -238,8 +238,9 @@ Real Snap(const Real d, const Real ell) {
 struct MergeMask {
   LeafTraversal lt;
   int B = 0;
-  int n1[4], n2[4];
-  Real dx1[4], dx2[4];
+  static constexpr int kL = SMRCompositeTransfer::kCloudLevelMask + 1;
+  int n1[kL], n2[kL];
+  Real dx1[kL], dx2[kL];
   Real x1min, x2min, x1max, x2max;
   KOKKOS_INLINE_FUNCTION
   int Cell(const Real x, const Real y, const int L) const {
@@ -543,10 +544,6 @@ int DustGasDrag::MergeCloudsDevice() {
   const auto lt = leaf_traversal;   // the actual leaves
   const int nlev = transfer.cloud_nlev;
   if (npart0 == 0 || nlev == 0) return 0;
-  if (nlev > 3) {
-    std::cout << "### FATAL ERROR: MergeCloudsDevice supports at most 3 cloud levels" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
   const int sh1 = SMRCompositeTransfer::kCloudLobeShift1;
   const int sh2 = SMRCompositeTransfer::kCloudLobeShift2;
