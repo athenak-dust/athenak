@@ -30,6 +30,10 @@
 #include "hydro/hydro.hpp"
 #include "dust.hpp"
 #include <Kokkos_Sort.hpp>
+#if defined(KOKKOS_ENABLE_CUDA)
+#include <thrust/execution_policy.h>
+#include <thrust/sort.h>
+#endif
 
 namespace dust {
 
@@ -306,19 +310,78 @@ struct KeyCSR {
   int Last(const std::int64_t key) const {const int u = Find(key); return (u < 0) ? 0 : start(u + 1);}
 };
 
-// key < 0: not listed
-void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, KeyCSR &c) {
+// The device buffers of the sparse key tables, grown when needed
+// and kept across passes.  Allocating and freeing them in every pass (cudaMalloc and cudaFree
+// synchronise the device; thrust's sort allocated its own storage in every call) made the first
+// sparse version 1-3% slower than the dense tables at BA 128/256.  Released at Kokkos::finalize.
+// Slots: KeyCSR 0 pieces, 1 level-L clouds, 2 lobed clouds, 3 q-stage walk; CellLists 0 quantum
+// commits, 1 tent commits.  A slot is rebuilt only after the tables built in it are out of use
+// (kernels on the one stream run in order).
+struct KeyScratch {
+  static constexpr int kSlots = 4;
+  DvceArray1D<int> pos, uidx, list[kSlots], start[kSlots], hhead[kSlots];
+  DvceArray1D<std::int64_t> comp, ukey[kSlots], hkey[kSlots];
+  DvceArray1D<char> sort_tmp;
+  bool sort_busy = false;
+};
+KeyScratch *key_scratch = nullptr;
+KeyScratch &Scratch() {
+  if (key_scratch == nullptr) {
+    key_scratch = new KeyScratch;
+    Kokkos::push_finalize_hook([]() {delete key_scratch; key_scratch = nullptr;});
+  }
+  return *key_scratch;
+}
+// v with at least n entries (contents not kept)
+template <typename T>
+DvceArray1D<T> Grow(DvceArray1D<T> &v, const std::size_t n, const char *label) {
+  if (v.extent(0) < n) {
+    v = DvceArray1D<T>();
+    v = DvceArray1D<T>(Kokkos::view_alloc(Kokkos::WithoutInitializing, std::string(label)), n + n/4 + 64);
+  }
+  return v;
+}
+#if defined(KOKKOS_ENABLE_CUDA)
+// thrust's temporary storage of a sort from KeyScratch::sort_tmp (a second request while it is
+// in use gets its own allocation)
+struct SortTemp {
+  typedef char value_type;
+  char *allocate(const std::ptrdiff_t n) {
+    KeyScratch &s = Scratch();
+    if (s.sort_busy) return static_cast<char*>(Kokkos::kokkos_malloc<DevMemSpace>("key_sort_tmp2", n));
+    s.sort_busy = true;
+    return Grow(s.sort_tmp, static_cast<std::size_t>(n), "key_sort_tmp").data();
+  }
+  void deallocate(char *p, std::size_t) {
+    KeyScratch &s = Scratch();
+    if (s.sort_busy && p == s.sort_tmp.data()) s.sort_busy = false;
+    else Kokkos::kokkos_free<DevMemSpace>(p);
+  }
+};
+#endif
+// the first n entries of v in ascending order (Kokkos::sort on the device is the same thrust sort)
+void SortFirst(const DvceArray1D<std::int64_t> &v, const int n) {
+  if (n < 2) return;
+#if defined(KOKKOS_ENABLE_CUDA)
+  SortTemp alloc;
+  std::int64_t *d = v.data();
+  thrust::sort(thrust::cuda::par(alloc).on(DevExeSpace().cuda_stream()), d, d + n);
+#else
+  Kokkos::sort(Kokkos::subview(v, std::make_pair(0, n)));
+#endif
+}
+
+// key < 0: not listed; listed keys below kbound
+void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, const std::int64_t kbound, const int slot,
+                 KeyCSR &c) {
   const int n = key.extent_int(0);
-  std::int64_t kmax = -1;
-  Kokkos::parallel_reduce("kcsr_max", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
-  KOKKOS_LAMBDA(const int p, std::int64_t &m) {if (key(p) > m) m = key(p);},
-  Kokkos::Max<std::int64_t>(kmax));
-  if (n > 0 && kmax >= std::numeric_limits<std::int64_t>::max()/n - 1) {
+  if (n > 0 && kbound >= std::numeric_limits<std::int64_t>::max()/n - 1) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "merge cell keys too large for the composite sort" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  DvceArray1D<int> pos(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_pos"), n > 0 ? n : 1);
+  KeyScratch &s = Scratch();
+  auto pos = Grow(s.pos, n > 0 ? n : 1, "kcsr_pos");
   int nl = 0;
   Kokkos::parallel_scan("kcsr_pos", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
   KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
@@ -326,20 +389,20 @@ void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, KeyCSR &c) {
     if (final) pos(p) = upd;
     ++upd;
   }, nl);
-  c.list = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_list"), nl > 0 ? nl : 1);
+  c.list = Grow(s.list[slot], nl > 0 ? nl : 1, "kcsr_list");
   c.nu = 0;
   if (nl == 0) {
-    c.ukey = DvceArray1D<std::int64_t>("kcsr_ukey", 1);
-    c.start = DvceArray1D<int>("kcsr_start", 1);
+    c.ukey = Grow(s.ukey[slot], 1, "kcsr_ukey");
+    c.start = Grow(s.start[slot], 1, "kcsr_start");
     return;
   }
   // (key, particle) as one value key n + p, sorted
   const std::int64_t nn = n;
-  DvceArray1D<std::int64_t> comp(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_comp"), nl);
+  auto comp = Grow(s.comp, nl, "kcsr_comp");
   Kokkos::parallel_for("kcsr_comp", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
   KOKKOS_LAMBDA(const int p) {if (key(p) >= 0) comp(pos(p)) = key(p)*nn + p;});
-  Kokkos::sort(comp);
-  DvceArray1D<int> uidx(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_uidx"), nl);
+  SortFirst(comp, nl);
+  auto uidx = Grow(s.uidx, nl, "kcsr_uidx");
   int nu = 0;
   Kokkos::parallel_scan("kcsr_distinct", Kokkos::RangePolicy<>(DevExeSpace(), 0, nl),
   KOKKOS_LAMBDA(const int k, int &upd, const bool final) {
@@ -347,8 +410,8 @@ void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, KeyCSR &c) {
     if (final) uidx(k) = first ? upd : -1;
     if (first) ++upd;
   }, nu);
-  c.ukey = DvceArray1D<std::int64_t>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_ukey"), nu);
-  c.start = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "kcsr_start"), nu + 1);
+  c.ukey = Grow(s.ukey[slot], nu, "kcsr_ukey");
+  c.start = Grow(s.start[slot], nu + 1, "kcsr_start");
   auto uk = c.ukey; auto st = c.start; auto ls = c.list;
   const int nl_ = nl, nu_ = nu;
   Kokkos::parallel_for("kcsr_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, nl),
@@ -370,13 +433,14 @@ struct CellLists {
   DvceArray1D<std::int64_t> hkey;   // -1: empty
   DvceArray1D<int> hhead;
   unsigned mask = 0;
-  void Allocate(const int nmax) {
+  void Allocate(const int nmax, const int slot) {   // buffers of KeyScratch slot
     int cap = 16;
     while (cap < 2*nmax + 16) cap *= 2;
-    hkey = DvceArray1D<std::int64_t>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "cl_key"), cap);
-    hhead = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "cl_head"), cap);
-    Kokkos::deep_copy(hkey, static_cast<std::int64_t>(-1));
-    Kokkos::deep_copy(hhead, -1);
+    KeyScratch &s = Scratch();
+    hkey = Grow(s.hkey[slot], cap, "cl_key");
+    hhead = Grow(s.hhead[slot], cap, "cl_head");
+    Kokkos::deep_copy(Kokkos::subview(hkey, std::make_pair(0, cap)), static_cast<std::int64_t>(-1));
+    Kokkos::deep_copy(Kokkos::subview(hhead, std::make_pair(0, cap)), -1);
     mask = static_cast<unsigned>(cap - 1);
   }
   KOKKOS_INLINE_FUNCTION
@@ -897,9 +961,9 @@ int DustGasDrag::MergeCloudsDevice() {
     });
     // sparse cell lists (KeyCSR), no table over the level-L grid
     KeyCSR spc, scc, slc;
-    BuildKeyCSR(kp, spc);
-    BuildKeyCSR(kc, scc);
-    if (lobe_wait || absorb) BuildKeyCSR(kl, slc);
+    BuildKeyCSR(kp, 4*ncl, 0, spc);   // keys sp ncl + cell, at most 4 species
+    BuildKeyCSR(kc, 4*ncl, 1, scc);
+    if (lobe_wait || absorb) BuildKeyCSR(kl, 4*ncl, 2, slc);
     if (cloud_merge_mode == 1) {
       // ===== quantum mode =====
       // X: exact P1-stencil re-merge (geometric, strict tolerance, velocity bounding box);
@@ -1299,7 +1363,7 @@ int DustGasDrag::MergeCloudsDevice() {
         });
         // sparse keys (cell << 4 | sub), the walk over the cells that hold pieces
         KeyCSR qsc;
-        BuildKeyCSR(kq, qsc);
+        BuildKeyCSR(kq, (4*nc) << 4, 3, qsc);
         // the distinct cells: their first entry in qsc.ukey (the 16 sub-keys of a cell are adjacent)
         DvceArray1D<int> cfirst(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q_cfirst"), qsc.nu + 1);
         int ncell = 0;
@@ -1597,7 +1661,7 @@ int DustGasDrag::MergeCloudsDevice() {
       // and the first moment; dK logged
       if (absorb) {
         CellLists nhead;   // hash of the cells, no level-L table
-        nhead.Allocate(ncommit);
+        nhead.Allocate(ncommit, 0);
         DvceArray1D<int> nnext("q_nnext", ncommit > 0 ? ncommit : 1);
         if (ncommit > 0) {
           Kokkos::parallel_for("q_newlist", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncommit),
@@ -2088,7 +2152,7 @@ int DustGasDrag::MergeCloudsDevice() {
     DvceArray2D<Real> nr(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_nr"), nrdata, ncentre);
     DvceArray2D<int> ni(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_ni"), nidata, ncentre);
     CellLists nhead;   // hash of the cells, no level-L table
-    nhead.Allocate(ncentre);
+    nhead.Allocate(ncentre, 1);
     DvceArray1D<int> nnext("merge_nnext", ncentre);
     DvceArray1D<int> nnew("merge_nnew", 1);
     // D3 diagnostic: per new cloud, the x first-moment mismatch of its contributions in the
