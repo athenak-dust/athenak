@@ -8,10 +8,14 @@
 //! LeafTraversal (dust.hpp), rebuilt with the leaf maps after every regrid, and the
 //! diagnostic comparison with the virtual-finest-grid traversal (<dust>/cloud_leaf_check).
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <utility>
+#include <vector>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -175,6 +179,24 @@ void DustGasDrag::BuildLeafTraversal() {
       safe(m, 0) = s1; safe(m, 1) = s2;
     }
     Kokkos::deep_copy(lt.safe, safe);
+    // the index of logical locations (LeafTraversal::Locate)
+    {
+      std::vector<std::pair<std::int64_t, int>> kv(nmb);
+      for (int m=0; m<nmb; ++m) {
+        const int sh = lt.nlev - blev(m);
+        kv[m] = {LeafTraversal::LocKey(blev(m), fbox(m, 0)/(indcs.nx1 << sh),
+                                       fbox(m, 2)/(indcs.nx2 << sh)), m};
+      }
+      std::sort(kv.begin(), kv.end());
+      lt.lockey = DvceArray1D<std::int64_t>("dust_leaf_lockey", nmb);
+      lt.locblk = DvceArray1D<int>("dust_leaf_locblk", nmb);
+      auto kh = Kokkos::create_mirror_view(lt.lockey);
+      auto bh = Kokkos::create_mirror_view(lt.locblk);
+      for (int k=0; k<nmb; ++k) {kh(k) = kv[k].first; bh(k) = kv[k].second;}
+      Kokkos::deep_copy(lt.lockey, kh);
+      Kokkos::deep_copy(lt.locblk, bh);
+      lt.nloc = nmb;
+    }
     if (nunsafe > 0 && global_variable::my_rank == 0) {
       std::cout << "# NOTE (dust): leaf traversal: " << nunsafe << " of " << nmb << " blocks have "
                 << "no certain neighbour ring (their queries take the coverage test)" << std::endl;

@@ -733,6 +733,10 @@ struct LeafTraversal {
   // neighbours certainly hold: the smallest neighbour extent, checked when built (0 if the
   // check fails); a query inside it needs no coverage test
   DvceArray2D<int> safe;
+  // sorted logical-location keys of the blocks and their blocks (Locate)
+  DvceArray1D<std::int64_t> lockey;
+  DvceArray1D<int> locblk;
+  int nloc = 0;
 
   KOKKOS_INLINE_FUNCTION
   static Real Wrap(const Real x, const Real xmin, const Real xmax) {
@@ -1075,6 +1079,38 @@ struct LeafTraversal {
   // block face can round outside both blocks (y = -1.7e-17 against a face at 0: (y - y0)/dy is
   // exactly nx2 below and negative above), so a last pass accepts 1e-9 cells around the blocks
   // and clamps the cell (the table's finest-cell index always gave a leaf).
+  // The index of logical locations.  A block of level l at logical (lx1, lx2)
+  // (its finest-cell box over the block width in finest cells) has the key LocKey(l, lx1, lx2);
+  // lockey holds the keys of all blocks sorted, locblk the block of each.  The leaf cell with
+  // the finest-cell index (ic, jc) (periodic) is found by trying l = 0, 1, ... (the leaves tile
+  // the domain, one level matches), each a binary search: no grid, memory O(blocks).
+  KOKKOS_INLINE_FUNCTION
+  static std::int64_t LocKey(const int l, const int lx1, const int lx2) {
+    return (static_cast<std::int64_t>(l) << 56) | (static_cast<std::int64_t>(lx2) << 28) |
+           static_cast<std::int64_t>(lx1);
+  }
+  KOKKOS_INLINE_FUNCTION
+  int Locate(const int ic_in, const int jc_in, int *bout = nullptr) const {
+    const int ic = ((ic_in % nfine1) + nfine1) % nfine1, jc = ((jc_in % nfine2) + nfine2) % nfine2;
+    for (int l=0; l<=nlev; ++l) {
+      const int sh = nlev - l, w1 = nx1 << sh, w2 = nx2 << sh;
+      const std::int64_t key = LocKey(l, ic/w1, jc/w2);
+      int lo = 0, hi = nloc;
+      while (lo < hi) {
+        const int mid = (lo + hi)/2;
+        if (lockey(mid) < key) lo = mid + 1; else hi = mid;
+      }
+      if (lo < nloc && lockey(lo) == key) {
+        const int b = locblk(lo);
+        if (bout != nullptr) *bout = b;
+        const int i = (ic - fbox(b, 0)) >> sh, j = (jc - fbox(b, 2)) >> sh;
+        return (b*ncells2 + j + js)*ncells1 + i + is;
+      }
+    }
+    return -1;
+  }
+  // The search beyond the neighbours is the index of logical locations
+  // (Locate, O(levels log blocks)); the scan of all blocks remains for a structure without it.
   KOKKOS_INLINE_FUNCTION
   int Owner(const Real px1, const Real px2, const int m, int *bout = nullptr) const {
     Real x1 = px1, x2 = px2;
@@ -1083,6 +1119,10 @@ struct LeafTraversal {
     const int ic = static_cast<int>(floor((x1 - x1min)/fine_dx1));
     const int jc = static_cast<int>(floor((x2 - x2min)/fine_dx2));
     for (int pass=0; pass<3 && res < 0; ++pass) {
+      if (pass == 1 && nloc > 0) {
+        res = Locate(ic, jc, &bb);
+        break;
+      }
       const Real tol = (pass == 2) ? 1.0e-9 : 0.0;
       ForCandidates(m, pass >= 1, ic - 1, ic + 1, jc - 1, jc + 1, 0,
                     [&](const int b, const int sx, const int sy) {
