@@ -99,6 +99,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
 
     if (UsesCompositeTransfer()) {
       auto transfer = smr_transfer;
+      auto lt = leaf_traversal;   // cloud weights on the actual leaves
       int ncells1 = qdep.extent_int(4);
       int ncells2 = qdep.extent_int(3);
       bool linear = (cloud_gather_order == 2) && transfer.cloud_mode;
@@ -133,6 +134,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         par_for("dust_pc2_cloud_predictor_linear",DevExeSpace(),0,(npart-1),
         KOKKOS_LAMBDA(const int p) {
           Real xp = pr(IPX,p), yp = pr(IPY,p);
+          const int am = lt.Anchor(pi(PGID,p));   // anchor block of the cloud
           int lev = pi(PLEV,p);
           Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
           // the gather's leaf weights are the deposit's: keep them
@@ -142,7 +144,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
                             SMRCompositeTransfer::GatherCode(lev, tmode);
           // same shape for the gather and the deposit (the point flag changes moments only)
           const bool same = (gcode & ~SMRCompositeTransfer::kCloudGatherPoint) == lev;
-          transfer.ForEachCloudMoment(xp, yp, gcode,
+          lt.ForEachCloudMoment(xp, yp, gcode, am,
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
             int ti = target % ncells1;
             int remainder = target/ncells1;
@@ -177,7 +179,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
           if (same && nt <= SMRCompositeTransfer::kCloudWeightCache) {
             for (int q=0; q<nt; ++q) if (tw[q] != 0.0) add(tt[q], tw[q]);
           } else {
-            transfer.ForEachCloudWeight(xp, yp, lev, add);
+            lt.ForEachCloudWeight(xp, yp, lev, am, add);
           }
         });
         return TaskStatus::complete;
@@ -195,6 +197,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         par_for("dust_pc2_cloud_predictor",DevExeSpace(),0,(npart-1),
         KOKKOS_LAMBDA(const int p) {
           Real xp = pr(IPX,p), yp = pr(IPY,p);
+          const int am = lt.Anchor(pi(PGID,p));   // anchor block of the cloud
           int lev = pi(PLEV,p);
           auto leaf_value = [&](const Real px, const Real py,
                                 const int tm, const int tj, const int ti, const Real w,
@@ -220,8 +223,8 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
                 + cy*(uold(tm,IM3,ks,tj+1,ti)*rjp - uold(tm,IM3,ks,tj-1,ti)*rjm);
           };
           Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-          transfer.ForEachCloudMoment(xp, yp, (gather_level >= 0) ? gather_level :
-                                      SMRCompositeTransfer::GatherCode(lev, tmode),
+          lt.ForEachCloudMoment(xp, yp, (gather_level >= 0) ? gather_level :
+                                      SMRCompositeTransfer::GatherCode(lev, tmode), am,
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
             int ti = target % ncells1;
             int remainder = target/ncells1;
@@ -239,14 +242,14 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             gyx = pr(IPGYX,p); gyy = pr(IPGYY,p);
             gzx = pr(IPGZX,p); gzy = pr(IPGZY,p);
           }
-          if (fchild && transfer.CloudOverlapsFiner(xp, yp, lev)) {
+          if (fchild && lt.CloudOverlapsFiner(xp, yp, lev, am)) {
             // deposit as the 3^2 two-scale children: each child gathers its own mean
             // gas velocity and spreads (mean - v) with its own weights; the children's
             // gathers average exactly to the parent's, so the total is unchanged
             transfer.ForEachChild(xp, yp, lev,
             [&](const Real cx, const Real cy, const Real fraction) {
               Real cgx = 0.0, cgy = 0.0, cgz = 0.0;
-              transfer.ForEachCloudMoment(cx, cy, lev+1,
+              lt.ForEachCloudMoment(cx, cy, lev+1, am,
               [&](const int target, const Real w, const Real m1x, const Real m1y) {
                 int ti = target % ncells1;
                 int remainder = target/ncells1;
@@ -256,7 +259,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
                 leaf_value(cx, cy, tm, tj, ti, w, m1x, m1y, ux, uy, uz);
                 cgx += ux; cgy += uy; cgz += uz;
               });
-              transfer.ForEachCloudMoment(cx, cy, lev+1,
+              lt.ForEachCloudMoment(cx, cy, lev+1, am,
               [&](const int target, const Real w, const Real m1x, const Real m1y) {
                 int ti = target % ncells1;
                 int remainder = target/ncells1;
@@ -271,7 +274,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             });
             return;
           }
-          transfer.ForEachCloudMoment(xp, yp, lev,
+          lt.ForEachCloudMoment(xp, yp, lev, am,
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
             int ti = target % ncells1;
             int remainder = target/ncells1;
@@ -296,9 +299,10 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       par_for("dust_pc2_composite_predictor",DevExeSpace(),0,(npart-1),
       KOKKOS_LAMBDA(const int p) {
         Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p),
+        ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p),
                                (gather_level >= 0) ? gather_level :
                                SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode),
+                               lt.Anchor(pi(PGID,p)),
         [&](const int target, const Real particle_weight) {
           int ti = target % ncells1;
           int remainder = target/ncells1;
@@ -314,7 +318,8 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         Real gx = -dt*mass_rate*(ugx-pr(IPVX,p));
         Real gy = -dt*mass_rate*(ugy-pr(IPVY,p));
         Real gz = -dt*mass_rate*(ugz-pr(IPVZ,p));
-        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p),
+        ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p),
+                               lt.Anchor(pi(PGID,p)),
         [&](const int target, const Real particle_weight) {
           int ti = target % ncells1;
           int remainder = target/ncells1;
@@ -406,6 +411,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
 
   if (UsesCompositeTransfer()) {
     auto transfer = smr_transfer;
+    auto lt = leaf_traversal;   // cloud weights on the actual leaves
     int ncells1 = qdep.extent_int(4);
     int ncells2 = qdep.extent_int(3);
     par_for("dust_composite_scatter",DevExeSpace(),0,(npart-1),
@@ -413,7 +419,8 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       Real cj = a_dt/(pr(IPTS,p) + a_dt);
       Real mass_c = pr(IPM,p)*cj;
       Real vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
-      transfer.ForEachWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p),
+      ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p),
+                             lt.Anchor(pi(PGID,p)),
       [&](const int target, const Real particle_weight) {
         int ti = target % ncells1;
         int remainder = target/ncells1;
@@ -643,6 +650,7 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
 
   if (UsesCompositeTransfer()) {
     auto transfer = smr_transfer;
+    auto lt = leaf_traversal;   // cloud weights on the actual leaves
     int ncells1 = ustar.extent_int(4);
     int ncells2 = ustar.extent_int(3);
     int tmode = cloud_transition;
@@ -650,7 +658,9 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
     KOKKOS_LAMBDA(const int p) {
       Real x0 = pr(IPX,p), y0 = pr(IPY,p);
       Real ux = 0.0, uy = 0.0, uz = 0.0;
-      transfer.ForEachWeight(x0, y0, SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode),
+      ForEachCompositeWeight(transfer, lt, x0, y0,
+                             SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode),
+                             lt.Anchor(pi(PGID,p)),
       [&](const int target, const Real particle_weight) {
         int ti = target % ncells1;
         int remainder = target/ncells1;
@@ -674,7 +684,7 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
 
       if (br) {
         Real mass = -pr(IPM,p);
-        transfer.ForEachWeight(x0, y0, pi(PLEV,p),
+        ForEachCompositeWeight(transfer, lt, x0, y0, pi(PLEV,p), lt.Anchor(pi(PGID,p)),
         [&](const int target, const Real particle_weight) {
           int ti = target % ncells1;
           int remainder = target/ncells1;

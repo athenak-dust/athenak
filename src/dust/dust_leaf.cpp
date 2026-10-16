@@ -49,9 +49,11 @@ void DustGasDrag::BuildLeafTraversal() {
   lt.x1min = pm->mesh_size.x1min; lt.x1max = pm->mesh_size.x1max;
   lt.x2min = pm->mesh_size.x2min; lt.x2max = pm->mesh_size.x2max;
   lt.lx = lt.x1max - lt.x1min; lt.ly = lt.x2max - lt.x2min;
+  lt.ilx = 1.0/lt.lx; lt.ily = 1.0/lt.ly;
   lt.root_dx1 = smr_transfer.root_dx1; lt.root_dx2 = smr_transfer.root_dx2;
+  lt.iroot_dx1 = 1.0/lt.root_dx1; lt.iroot_dx2 = 1.0/lt.root_dx2;
   lt.lobe3_integral = smr_transfer.lobe3_integral;
-  lt.box = DvceArray2D<Real>("dust_leaf_box", nmb, 4);
+  lt.box = DvceArray2D<Real>("dust_leaf_box", nmb, 6);
   lt.nnb = DvceArray1D<int>("dust_leaf_nnb", nmb);
   lt.nb = DvceArray2D<int>("dust_leaf_nb", nmb, LeafTraversal::kMaxNb);
   lt.nbs = DvceArray3D<int>("dust_leaf_nbs", nmb, LeafTraversal::kMaxNb, 2);
@@ -62,6 +64,7 @@ void DustGasDrag::BuildLeafTraversal() {
   for (int m=0; m<nmb; ++m) {
     const auto &sz = mbsize.h_view(m);
     box(m, 0) = sz.x1min; box(m, 1) = sz.x2min; box(m, 2) = sz.dx1; box(m, 3) = sz.dx2;
+    box(m, 4) = 1.0/sz.dx1; box(m, 5) = 1.0/sz.dx2;
   }
   for (int m=0; m<nmb; ++m) {
     const auto &sz = mbsize.h_view(m);
@@ -137,6 +140,45 @@ void DustGasDrag::BuildLeafTraversal() {
     }
     Kokkos::deep_copy(lt.blev, blev);
     Kokkos::deep_copy(lt.fbox, fbox);
+    // the ring around each block that its neighbours certainly hold.  With s the
+    // smallest neighbour extent, every s-cell of the ring (aligned with the block) touches the
+    // block, so the leaf next to the block inside it is a neighbour, at least s wide and aligned:
+    // it holds the whole s-cell.  Checked cell by cell here; a block that fails gets 0 (its
+    // queries then take the coverage test).
+    lt.safe = DvceArray2D<int>("dust_leaf_safe", nmb, 2);
+    auto safe = Kokkos::create_mirror_view(lt.safe);
+    int nunsafe = 0;
+    for (int m=0; m<nmb; ++m) {
+      int s1 = 0, s2 = 0;
+      for (int k=0; k<nnb(m); ++k) {
+        const int b = nb(m, k);
+        const int w = fbox(b, 1) - fbox(b, 0), h = fbox(b, 3) - fbox(b, 2);
+        s1 = (k == 0 || w < s1) ? w : s1;
+        s2 = (k == 0 || h < s2) ? h : s2;
+      }
+      const int x0 = fbox(m, 0), x1 = fbox(m, 1), y0 = fbox(m, 2), y1 = fbox(m, 3);
+      bool ok = (s1 > 0 && s2 > 0 && (x1 - x0) % s1 == 0 && (y1 - y0) % s2 == 0);
+      for (int cy=y0 - s2; ok && cy<y1 + s2; cy+=s2) {
+        for (int cx=x0 - s1; ok && cx<x1 + s1; cx+=s1) {
+          if (cx >= x0 && cx < x1 && cy >= y0 && cy < y1) continue;
+          bool held = false;
+          for (int k=0; k<nnb(m) && !held; ++k) {
+            const int b = nb(m, k);
+            const int bx0 = fbox(b, 0) - nbs(m, k, 0)*lt.nfine1, bx1 = fbox(b, 1) - nbs(m, k, 0)*lt.nfine1;
+            const int by0 = fbox(b, 2) - nbs(m, k, 1)*lt.nfine2, by1 = fbox(b, 3) - nbs(m, k, 1)*lt.nfine2;
+            held = (bx0 <= cx && cx + s1 <= bx1 && by0 <= cy && cy + s2 <= by1);
+          }
+          ok = held;
+        }
+      }
+      if (!ok) {s1 = 0; s2 = 0; ++nunsafe;}
+      safe(m, 0) = s1; safe(m, 1) = s2;
+    }
+    Kokkos::deep_copy(lt.safe, safe);
+    if (nunsafe > 0 && global_variable::my_rank == 0) {
+      std::cout << "# NOTE (dust): leaf traversal: " << nunsafe << " of " << nmb << " blocks have "
+                << "no certain neighbour ring (their queries take the coverage test)" << std::endl;
+    }
   }
   Kokkos::deep_copy(lt.box, box);
   Kokkos::deep_copy(lt.nnb, nnb);

@@ -344,6 +344,7 @@ void WriteBAFields(Mesh *pm) {
   Kokkos::deep_copy(DevExeSpace(), f, 0.0);
   bool composite = pdust->UsesCompositeTransfer();
   auto transfer = pdust->smr_transfer;
+  auto lt = pdust->leaf_traversal;   // the actual leaves
   // canonical TSC: global periodic stencil on the uniform root grid -> leaf index
   int n1 = pm->mesh_indcs.nx1, n2 = pm->mesh_indcs.nx2;
   Real gx1 = pm->mesh_size.x1min, gx2 = pm->mesh_size.x2min;
@@ -392,7 +393,7 @@ void WriteBAFields(Mesh *pm) {
         }
       };
       if (composite) {
-        transfer.ForEachWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p), add);
+        ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)), add);
       } else {
         Real q1 = (pr(IPX,p) - gx1)/h1 - 0.5, q2 = (pr(IPY,p) - gx2)/h2 - 0.5;
         int c1 = static_cast<int>(floor(q1 + 0.5)), c2 = static_cast<int>(floor(q2 + 0.5));
@@ -835,6 +836,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // Refinement changes the cloud shape through the exact P1 split, never the
     // prescribed parent mass. This is a warm Poisson seed, not a quiet lattice.
     auto transfer = pmbp->pdust->smr_transfer;
+    auto lt = pmbp->pdust->leaf_traversal;
     if (canonical_root) {   // only the root geometry is used below
       const auto &ms = pmy_mesh_->mesh_size;
       const auto &mi = pmy_mesh_->mesh_indcs;
@@ -878,12 +880,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
               y >= mbsize.d_view(b).x2min && y < mbsize.d_view(b).x2max) m = b;
         }
       } else {
-        int fi = static_cast<int>((x-transfer.x1min)/transfer.fine_dx1);
-        int fj = static_cast<int>((y-transfer.x2min)/transfer.fine_dx2);
-        if (fi >= transfer.nfine1) fi = transfer.nfine1-1;
-        if (fj >= transfer.nfine2) fj = transfer.nfine2-1;
-        int target = transfer.cloud_target(fj,fi);
-        m = target/(ncells1*ncells2);
+        const int leaf = lt.LeafOwner(x, y, 0);   // the actual leaves
+        m = (leaf < 0) ? 0 : leaf/(ncells1*ncells2);
       }
       pi0(PGID,p) = gids0+m;
       pi0(PTAG,p) = p;

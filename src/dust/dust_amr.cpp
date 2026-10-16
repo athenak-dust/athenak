@@ -215,12 +215,14 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   auto pr = ppar->prtcl_rdata;
   auto pi = ppar->prtcl_idata;
   auto transfer = pdust->smr_transfer;
+  auto lt = pdust->leaf_traversal;   // the actual leaves
   // dust density on the current leaves from the particles at their new positions
   DvceArray3D<Real> f("amr_rho", nmb, ncells2, ncells1);
   Kokkos::deep_copy(DevExeSpace(), f, 0.0);
   par_for("amr_rho_deposit", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
     const Real mass = pr(IPM,p);
-    transfer.ForEachWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p), [&](const int target, const Real w) {
+    ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
+                           [&](const int target, const Real w) {
       if (w == 0.0) return;
       const int ti = target % ncells1, tj = (target/ncells1) % ncells2, tm = target/(ncells1*ncells2);
       DepositAdd(&f(tm,tj,ti), mass*w/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2));
@@ -411,7 +413,7 @@ int DustGasDrag::ResetPGIDFromPositions(const char *when) {
   const int npart = ppar->nprtcl_thispack;
   auto pr = ppar->prtcl_rdata;
   auto pi = ppar->prtcl_idata;
-  const auto transfer = smr_transfer;
+  const auto lt = leaf_traversal;   // the actual leaves
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   const int ncell12 = (indcs.nx1 + 2*indcs.ng)*(indcs.nx2 + 2*indcs.ng);
   const int nmb = pmy_pack->nmb_thispack;
@@ -420,7 +422,8 @@ int DustGasDrag::ResetPGIDFromPositions(const char *when) {
   if (npart > 0) {
     Kokkos::parallel_reduce("dust_pgid_reset", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
-      const int owner = transfer.LeafOwner(pr(IPX,p), pr(IPY,p))/ncell12;
+      const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)));
+      const int owner = (leaf < 0) ? -1 : leaf/ncell12;
       if (owner < 0 || owner >= nmb) {
         ++bad;
       } else if (pi(PGID,p) != gids + owner) {
@@ -484,10 +487,8 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   if (amr_regrid_ndel > 0 && cloud_merge_burst_dt > 0.0) {
     cloud_merge_burst_until = pmesh->time + cloud_merge_burst_dt;
   }
-  merge_mask_built = false;       // built once per layout, at the next merge pass
-  compress_mask_built = false;
 
-  const auto transfer = smr_transfer;
+  const auto lt = leaf_traversal;   // the actual leaves
   auto pr = ppar->prtcl_rdata;
   auto pi = ppar->prtcl_idata;
   auto &indcs = pmesh->mb_indcs;
@@ -501,11 +502,12 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     Kokkos::parallel_reduce("dust_amr_regrid", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, Real &dw, int &bad, double &ms) {
       const Real xp = pr(IPX,p), yp = pr(IPY,p);
-      const int owner = transfer.LeafOwner(xp, yp)/ncell12;
+      const int leaf = lt.LeafOwner(xp, yp, lt.Anchor(pi(PGID,p)));   // the old id: a guess only
+      const int owner = (leaf < 0) ? -1 : leaf/ncell12;
       pi(PGID,p) = gids + owner;
       Real sw = 0.0;
       int b = (owner < 0 || owner >= nmb) ? 1 : 0;
-      transfer.ForEachCloudWeight(xp, yp, pi(PLEV,p), [&](const int target, const Real w) {
+      lt.ForEachCloudWeight(xp, yp, pi(PLEV,p), lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
         sw += w;
         if (target < 0 || target/ncell12 >= nmb) ++b;
       });

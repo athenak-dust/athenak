@@ -570,6 +570,7 @@ int DustGasDrag::ResampleClouds() {
   Mesh *pmesh = pmy_pack->pmesh;
   const int npart = ppar->nprtcl_thispack;
   const auto transfer = smr_transfer;
+  const auto lt = leaf_traversal;   // cloud weights on the actual leaves
   const int nlev = transfer.cloud_nlev;
   if (npart == 0) return 0;
   const bool dump = std::find(cloud_resample_dump.begin(), cloud_resample_dump.end(), pmesh->ncycle) !=
@@ -623,7 +624,8 @@ int DustGasDrag::ResampleClouds() {
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
     if (skip_cap && pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
     int c = 0;
-    transfer.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), code, [&](const int, const Real) {++c;});
+    lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), code, lt.Anchor(pi(PGID,p)),
+                          [&](const int, const Real) {++c;});
     cnt(p) = c;
   }, tot_b[0], tot_b[1], cnt_b[0], cnt_b[1], cnt_b[2]);
   Kokkos::parallel_scan("rs_slot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -671,7 +673,8 @@ int DustGasDrag::ResampleClouds() {
     const int code = pi(PLEV,p);
     const int lev = SMRCompositeTransfer::CloudLevel(code);
     Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-    transfer.ForEachCloudMoment(xp, yp, SMRCompositeTransfer::GatherCode(code, tmode),
+    lt.ForEachCloudMoment(xp, yp, SMRCompositeTransfer::GatherCode(code, tmode),
+                          lt.Anchor(pi(PGID,p)),
     [&](const int target, const Real w, const Real m1x, const Real m1y) {
       const int ti = target % ncells1;
       const int remainder = target/ncells1;
@@ -707,7 +710,7 @@ int DustGasDrag::ResampleClouds() {
     pid(a,0) = (iy/s)*np1 + ix/s; pid(a,1) = p;
     cptr(a) = coff(p);
     int e = coff(p);
-    transfer.ForEachCloudWeight(xp, yp, code, [&](const int target, const Real w) {
+    lt.ForEachCloudWeight(xp, yp, code, lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
       ctgt(e) = target; cwgt(e) = w; ++e;
     });
   });

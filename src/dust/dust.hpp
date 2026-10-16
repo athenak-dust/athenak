@@ -32,6 +32,13 @@
 #include "tasklist/task_list.hpp"
 #include "bvals/bvals.hpp"
 
+// a device function kept out of line (rare paths of the hot cloud kernels)
+#if defined(__CUDACC__)
+#define DUST_NOINLINE __noinline__
+#else
+#define DUST_NOINLINE __attribute__((noinline))
+#endif
+
 // forward declarations
 class Driver;
 class MeshBlockPack;
@@ -699,9 +706,11 @@ struct LeafTraversal {
   int nmb = 0, gids = 0;
   int nx1 = 0, nx2 = 0, is = 0, js = 0, ncells1 = 0, ncells2 = 0;
   Real lx = 0.0, ly = 0.0, x1min = 0.0, x2min = 0.0, x1max = 0.0, x2max = 0.0;
+  Real ilx = 0.0, ily = 0.0;           // 1/lx, 1/ly
   Real root_dx1 = 0.0, root_dx2 = 0.0;
+  Real iroot_dx1 = 0.0, iroot_dx2 = 0.0;   // 1/root_dx1, 1/root_dx2
   bool lobe3_integral = false;
-  DvceArray2D<Real> box;               // (m, 0..3): x1min, x2min, dx1, dx2 of block m
+  DvceArray2D<Real> box;               // (m, 0..5): x1min, x2min, dx1, dx2, 1/dx1, 1/dx2 of block m
   DvceArray1D<int> nnb;                // number of neighbours of block m
   DvceArray2D<int> nb;                 // (m, k): local index of neighbour k
   DvceArray3D<int> nbs;                // (m, k, 0..1): periodic shift (in domain lengths)
@@ -719,6 +728,10 @@ struct LeafTraversal {
   bool split_everywhere = false, split_overlap = false;
   DvceArray1D<int> blev;
   DvceArray2D<int> fbox;
+  // (m, 0..1): width of the ring around block m (finest cells, per direction) that its
+  // neighbours certainly hold: the smallest neighbour extent, checked when built (0 if the
+  // check fails); a query inside it needs no coverage test
+  DvceArray2D<int> safe;
 
   KOKKOS_INLINE_FUNCTION
   static Real Wrap(const Real x, const Real xmin, const Real xmax) {
@@ -731,12 +744,13 @@ struct LeafTraversal {
 
   // the cloud shape along one direction (SMRCompositeTransfer::CloudWeightsMoments1D)
   struct Shape {
-    Real x = 0.0, ell = 1.0, sl = 0.0, lo = 0.0, hi = 0.0;
+    Real x = 0.0, ell = 1.0, inv = 1.0, sl = 0.0, lo = 0.0, hi = 0.0;
     int lobe = 0;
     bool both = false, point = false;
   };
   KOKKOS_INLINE_FUNCTION
-  static Shape MakeShape(const Real x, const Real ell_in, const int lobe_in, const bool point) {
+  static Shape MakeShape(const Real x, const Real ell_in, const Real inv_in, const int lobe_in,
+                         const bool point) {
     Shape s;
     s.both = (lobe_in == 3);
     s.ell = s.both ? 2.0*ell_in : ell_in;
@@ -746,22 +760,42 @@ struct LeafTraversal {
     s.hi = (s.lobe == 2) ? x + 2.0*s.ell : x + s.ell;
     s.x = x;
     s.point = point;
+    s.inv = s.both ? 0.5*inv_in : inv_in;   // = 1/ell (powers of two: exact)
     return s;
   }
-  // weight and first moment (about the particle, length units) over [a, b]
+  // the shape's cumulative values at a face z of one direction: the hat CDF of the plain part
+  // and of the lobe, and (kMoments) their first-moment antiderivatives.  A cell takes the
+  // differences of its two faces, so a run of cells evaluates each face once.
+  struct Face {Real c = 0.0, cl = 0.0, h = 0.0, hl = 0.0;};
+  template <bool kMoments>
   KOKKOS_INLINE_FUNCTION
-  static void Interval(const Shape &s, const Real a, const Real b, Real &w, Real &g) {
+  static Face FaceAt(const Shape &s, const Real z) {
     using T = SMRCompositeTransfer;
-    const Real inv = 1.0/s.ell;
-    const Real sa = (a - s.x)*inv, sb = (b - s.x)*inv;
-    w = T::HatCDF(sb) - T::HatCDF(sa);
-    g = (s.both && s.point) ? 0.0 : s.ell*(T::HatMoment(sb) - T::HatMoment(sa));
+    Face f;
+    const Real sz = (z - s.x)*s.inv;
+    f.c = T::HatCDF(sz);
+    if constexpr (kMoments) f.h = T::HatMoment(sz);
     if (s.lobe) {
-      const Real ta = (a - s.x - s.sl)*inv, tb = (b - s.x - s.sl)*inv;
-      const Real wl = T::HatCDF(tb) - T::HatCDF(ta);
+      const Real tz = (z - s.x - s.sl)*s.inv;
+      f.cl = T::HatCDF(tz);
+      if constexpr (kMoments) f.hl = T::HatMoment(tz);
+    }
+    return f;
+  }
+  // weight and (kMoments) first moment (about the particle, length units) over the cell
+  // between the faces a and b
+  template <bool kMoments>
+  KOKKOS_INLINE_FUNCTION
+  static void Cell(const Shape &s, const Face &a, const Face &b, Real &w, Real &g) {
+    w = b.c - a.c;
+    g = 0.0;
+    if constexpr (kMoments) g = (s.both && s.point) ? 0.0 : s.ell*(b.h - a.h);
+    if (s.lobe) {
+      const Real wl = b.cl - a.cl;
       w = (2.0/3.0)*w + (1.0/3.0)*wl;
-      g = s.point ? 0.0
-          : (2.0/3.0)*g + (1.0/3.0)*(s.ell*(T::HatMoment(tb) - T::HatMoment(ta)) + s.sl*wl);
+      if constexpr (kMoments) {
+        g = s.point ? 0.0 : (2.0/3.0)*g + (1.0/3.0)*(s.ell*(b.hl - a.hl) + s.sl*wl);
+      }
     }
   }
 
@@ -808,8 +842,8 @@ struct LeafTraversal {
   KOKKOS_INLINE_FUNCTION
   void Frame(const int m, Real &x1, Real &x2) const {
     const Real cx = box(m, 0) + 0.5*nx1*box(m, 2), cy = box(m, 1) + 0.5*nx2*box(m, 3);
-    x1 -= lx*round((x1 - cx)/lx);
-    x2 -= ly*round((x2 - cy)/ly);
+    x1 -= lx*round((x1 - cx)*ilx);
+    x2 -= ly*round((x2 - cy)*ily);
   }
   // finest-cell box [x0, x1) x [y0, y1) of block b in the image (sx, sy), widened by r
   KOKKOS_INLINE_FUNCTION
@@ -869,13 +903,81 @@ struct LeafTraversal {
                   const int r) const {
     int x0, x1, y0, y1;
     ImageRect(m, 0, 0, 0, x0, x1, y0, y1);
-    if (x0 <= ia - r && x1 > ib + r && y0 <= ja - r && y1 > jb + r) return false;   // fast path
+    // fast path: inside the ring around m that its neighbours certainly hold (safe)
+    const int s1 = safe(m, 0), s2 = safe(m, 1);
+    if (x0 - s1 <= ia - r && x1 + s1 > ib + r && y0 - s2 <= ja - r && y1 + s2 > jb + r) {
+      return false;
+    }
     return !Covered(m, ia - r, ib + r, ja - r, jb + r, 0, 0, false);
+  }
+
+  // the candidate blocks (block, image) of a support [lo1, hi1] x [lo2, hi2] (anchor frame) that
+  // does not lie inside the anchor block m: those of the anchor's neighbourhood (or of all
+  // blocks, when the neighbourhood does not hold the support) whose image box meets it.  In
+  // batches of at most kBatch from cursor (0 at the start); returns the count and sets cursor to
+  // the next batch, or -1.  Not inlined: the coverage test and the global
+  // enumeration stay out of the hot kernels, which only loop over the batch.
+  static constexpr int kBatch = 24;
+  // a candidate as one int: block << 8 | (sx + 8) << 4 | (sy + 8), shifts in -8..7
+  KOKKOS_INLINE_FUNCTION
+  static int Pack(const int b, const int sx, const int sy) {
+    return (b << 8) | ((sx + 8) << 4) | (sy + 8);
+  }
+  KOKKOS_INLINE_FUNCTION
+  static int UnpackSx(const int c) {return ((c >> 4) & 15) - 8;}
+  KOKKOS_INLINE_FUNCTION
+  static int UnpackSy(const int c) {return (c & 15) - 8;}
+  KOKKOS_FUNCTION DUST_NOINLINE
+  int Candidates(const Real lo1, const Real hi1, const Real lo2, const Real hi2, const int m,
+                 int &cursor, bool &global, int *cand) const {
+    const int ia = static_cast<int>(floor((lo1 - x1min)/fine_dx1));
+    const int ib = static_cast<int>(ceil((hi1 - x1min)/fine_dx1)) - 1;
+    const int ja = static_cast<int>(floor((lo2 - x2min)/fine_dx2));
+    const int jb = static_cast<int>(ceil((hi2 - x2min)/fine_dx2)) - 1;
+    auto meets = [&](const int b, const int sx, const int sy) {
+      const Real bx0 = box(b, 0) - sx*lx, by0 = box(b, 1) - sy*ly;
+      return !(hi1 <= bx0 || lo1 >= bx0 + nx1*box(b, 2) ||
+               hi2 <= by0 || lo2 >= by0 + nx2*box(b, 3));
+    };
+    int n = 0;
+    if (cursor == 0) {
+      global = NeedGlobal(m, ia, ib, ja, jb, 0);
+      if (!global) {
+        ForCandidates(m, false, ia, ib, ja, jb, 0, [&](const int b, const int sx, const int sy) {
+          if (!meets(b, sx, sy)) return;
+          cand[n++] = Pack(b, sx, sy);   // at most 1 + kMaxNb <= kBatch
+        });
+        cursor = -1;
+        return n;
+      }
+    }
+    // all blocks, every image that meets the support's finest cells (one cell wider against
+    // round-off), from block cursor - 1 on; a block's images never straddle two batches
+    int b = (cursor > 0) ? cursor - 1 : 0;
+    for (; b<nmb; ++b) {
+      int kx0, kx1, ky0, ky1;
+      ImageRange(fbox(b, 0), fbox(b, 1), 0, nfine1, ia - 1, ib + 1, kx0, kx1);
+      ImageRange(fbox(b, 2), fbox(b, 3), 0, nfine2, ja - 1, jb + 1, ky0, ky1);
+      const int nimg = (kx1 >= kx0 && ky1 >= ky0) ? (kx1 - kx0 + 1)*(ky1 - ky0 + 1) : 0;
+      if (nimg > kBatch || kx0 < -7 || kx1 > 8 || ky0 < -7 || ky1 > 8) {
+        Kokkos::abort("LeafTraversal::Candidates: a support meets too many periodic images");
+      }
+      if (n + nimg > kBatch) break;
+      for (int ky=ky0; ky<=ky1; ++ky) {
+        for (int kx=kx0; kx<=kx1; ++kx) {
+          if (!meets(b, -kx, -ky)) continue;
+          cand[n++] = Pack(b, -kx, -ky);
+        }
+      }
+    }
+    cursor = (b < nmb) ? b + 1 : -1;
+    return n;
   }
 
   // every leaf cell under the cloud `code` at (x1, x2), anchor block m: function(target, w,
   // m1x, m1y) with kMoments (moments about the particle), function(target, w) without.
-  // Returns the sum of the weights.
+  // Returns the sum of the weights.  The callback appears once, in loops that are not
+  // unrolled (code size of the hot kernels).
   template <bool kMoments, typename Function>
   KOKKOS_INLINE_FUNCTION
   Real ForEach(const Real px1, const Real px2, const int code, const int m,
@@ -886,51 +988,84 @@ struct LeafTraversal {
     const int lev = T::CloudLevel(code);
     const bool point = kMoments && (code & T::kCloudGatherPoint) != 0;
     const int lb1 = T::CloudLobe1(code), lb2 = T::CloudLobe2(code);
-    const Shape s1 = MakeShape(x1, root_dx1/static_cast<Real>(1 << lev), lb1,
+    const Shape s1 = MakeShape(x1, ldexp(root_dx1, -lev), ldexp(iroot_dx1, lev), lb1,
                                point && !(lobe3_integral && lb1 == 3));
-    const Shape s2 = MakeShape(x2, root_dx2/static_cast<Real>(1 << lev), lb2,
+    const Shape s2 = MakeShape(x2, ldexp(root_dx2, -lev), ldexp(iroot_dx2, lev), lb2,
                                point && !(lobe3_integral && lb2 == 3));
-    const int ia = static_cast<int>(floor((s1.lo - x1min)/fine_dx1));
-    const int ib = static_cast<int>(ceil((s1.hi - x1min)/fine_dx1)) - 1;
-    const int ja = static_cast<int>(floor((s2.lo - x2min)/fine_dx2));
-    const int jb = static_cast<int>(ceil((s2.hi - x2min)/fine_dx2)) - 1;
-    const bool global = NeedGlobal(m, ia, ib, ja, jb, 0);
+    // a support inside the anchor block meets only its cells (the common case)
+    const Real ax0 = box(m, 0), ay0 = box(m, 1);
+    const bool inside = (s1.lo >= ax0 && s1.hi <= ax0 + nx1*box(m, 2) &&
+                         s2.lo >= ay0 && s2.hi <= ay0 + nx2*box(m, 3));
+    int cand[kBatch];
+    int ncand = 1, cursor = -1;
+    bool global = false;
+    cand[0] = Pack(m, 0, 0);
+    if (!inside) {
+      cursor = 0;
+      ncand = Candidates(s1.lo, s1.hi, s2.lo, s2.hi, m, cursor, global, cand);
+    }
     if (reach != nullptr) *reach = !global;
     Real wsum = 0.0;
-    // the global images from the support's finest cells, one cell wider against round-off
-    ForCandidates(m, global, ia - 1, ib + 1, ja - 1, jb + 1, 0,
-                  [&](const int b, const int sx, const int sy) {
-      const Real dx = box(b, 2), dy = box(b, 3);
-      const Real bx0 = box(b, 0) - sx*lx, by0 = box(b, 1) - sy*ly;
-      const Real bx1 = bx0 + nx1*dx, by1 = by0 + nx2*dy;
-      if (s1.hi <= bx0 || s1.lo >= bx1 || s2.hi <= by0 || s2.lo >= by1) return;
-      int i0 = static_cast<int>(floor((s1.lo - bx0)/dx));
-      int i1 = static_cast<int>(ceil((s1.hi - bx0)/dx)) - 1;
-      int j0 = static_cast<int>(floor((s2.lo - by0)/dy));
-      int j1 = static_cast<int>(ceil((s2.hi - by0)/dy)) - 1;
-      i0 = (i0 < 0) ? 0 : i0; i1 = (i1 > nx1 - 1) ? nx1 - 1 : i1;
-      j0 = (j0 < 0) ? 0 : j0; j1 = (j1 > nx2 - 1) ? nx2 - 1 : j1;
-      for (int j=j0; j<=j1; ++j) {
-        Real w2, g2;
-        Interval(s2, by0 + j*dy, by0 + (j + 1)*dy, w2, g2);
-        if (w2 == 0.0 && (!kMoments || g2 == 0.0)) continue;
-        for (int i=i0; i<=i1; ++i) {
-          Real w1, g1;
-          Interval(s1, bx0 + i*dx, bx0 + (i + 1)*dx, w1, g1);
-          const Real w = w2*w1;
-          wsum += w;
-          const int target = (b*ncells2 + j + js)*ncells1 + i + is;
-          if constexpr (kMoments) {
-            const Real m1x = w2*g1, m1y = w1*g2;
-            if (w == 0.0 && m1x == 0.0 && m1y == 0.0) continue;
-            function(target, w, m1x, m1y);
-          } else {
-            if (w == 0.0) continue;
-            function(target, w);
+    while (true) {
+#pragma unroll 1
+      for (int k=0; k<ncand; ++k) {
+        const int b = cand[k] >> 8;
+        const Real dx = box(b, 2), dy = box(b, 3);
+        const Real bx0 = box(b, 0) - UnpackSx(cand[k])*lx, by0 = box(b, 1) - UnpackSy(cand[k])*ly;
+        const Real idx = box(b, 4), idy = box(b, 5);   // 1/dx, 1/dy
+        int i0 = static_cast<int>(floor((s1.lo - bx0)*idx));
+        int i1 = static_cast<int>(ceil((s1.hi - bx0)*idx)) - 1;
+        int j0 = static_cast<int>(floor((s2.lo - by0)*idy));
+        int j1 = static_cast<int>(ceil((s2.hi - by0)*idy)) - 1;
+        i0 = (i0 < 0) ? 0 : i0; i1 = (i1 > nx1 - 1) ? nx1 - 1 : i1;
+        j0 = (j0 < 0) ? 0 : j0; j1 = (j1 > nx2 - 1) ? nx2 - 1 : j1;
+        // the x1 integrals in runs of kRun cells, in registers across the rows
+        constexpr int kRun = 4;
+#pragma unroll 1
+        for (int ic=i0; ic<=i1; ic+=kRun) {
+          const int nr = (i1 - ic + 1 < kRun) ? i1 - ic + 1 : kRun;
+          Real w1[kRun], g1[kRun];
+          Face f1 = FaceAt<kMoments>(s1, bx0 + ic*dx);
+#pragma unroll
+          for (int a=0; a<kRun; ++a) {
+            w1[a] = 0.0; g1[a] = 0.0;
+            if (a < nr) {
+              const Face fn = FaceAt<kMoments>(s1, bx0 + (ic + a + 1)*dx);
+              Cell<kMoments>(s1, f1, fn, w1[a], g1[a]);
+              f1 = fn;
+            }
+          }
+          Face f2 = FaceAt<kMoments>(s2, by0 + j0*dy);
+#pragma unroll 1
+          for (int j=j0; j<=j1; ++j) {
+            const Face fn = FaceAt<kMoments>(s2, by0 + (j + 1)*dy);
+            Real w2, g2;
+            Cell<kMoments>(s2, f2, fn, w2, g2);
+            f2 = fn;
+            if (w2 == 0.0 && (!kMoments || g2 == 0.0)) continue;
+            const int row = (b*ncells2 + j + js)*ncells1 + ic + is;
+#pragma unroll 1
+            for (int a=0; a<nr; ++a) {
+              // the run's values by selection, so that they stay in registers
+              const Real wa = (a == 0) ? w1[0] : ((a == 1) ? w1[1] : ((a == 2) ? w1[2] : w1[3]));
+              const Real w = w2*wa;
+              wsum += w;
+              if constexpr (kMoments) {
+                const Real ga = (a == 0) ? g1[0] : ((a == 1) ? g1[1] : ((a == 2) ? g1[2] : g1[3]));
+                const Real m1x = w2*ga, m1y = wa*g2;
+                if (w == 0.0 && m1x == 0.0 && m1y == 0.0) continue;
+                function(row + a, w, m1x, m1y);
+              } else {
+                if (w == 0.0) continue;
+                function(row + a, w);
+              }
+            }
           }
         }
       }
-    });
+      if (cursor < 0) break;
+      ncand = Candidates(s1.lo, s1.hi, s2.lo, s2.hi, m, cursor, global, cand);
+    }
     return wsum;
   }
 
@@ -1044,7 +1179,65 @@ struct LeafTraversal {
     const int J = static_cast<int>(floor((x2 - x2min)/(fine_dx2*r)));
     return AllAbove(m, I*r - bf, I*r + r + bf - 1, J*r - bf, J*r + r + bf - 1, lev - 1, reach);
   }
+
+  // ---- the cloud interface of SMRCompositeTransfer on the actual
+  // leaves, with the anchor block m of the cloud (its particle's MeshBlock; a new cloud of a
+  // split or merge takes its parent's).  The results do not depend on the anchor; a good
+  // anchor only keeps the queries local.
+  // the anchor of a particle's MeshBlock id; an id outside the pack (e.g. before the ids are
+  // set again after a regrid) gives block 0, and the queries then fall back to all blocks
+  KOKKOS_INLINE_FUNCTION
+  Real CloudHalfWidth1(const int lev) const {
+    return root_dx1/static_cast<Real>(1 << (lev & SMRCompositeTransfer::kCloudLevelMask));
+  }
+  KOKKOS_INLINE_FUNCTION
+  Real CloudHalfWidth2(const int lev) const {
+    return root_dx2/static_cast<Real>(1 << (lev & SMRCompositeTransfer::kCloudLevelMask));
+  }
+  KOKKOS_INLINE_FUNCTION
+  int Anchor(const int pgid) const {
+    const int m = pgid - gids;
+    return (m >= 0 && m < nmb) ? m : 0;
+  }
+  template <typename Function>
+  KOKKOS_INLINE_FUNCTION
+  void ForEachCloudWeight(const Real x1, const Real x2, const int code, const int m,
+                          const Function &function) const {
+    ForEach<false>(x1, x2, code, m, function);
+  }
+  template <typename Function>
+  KOKKOS_INLINE_FUNCTION
+  void ForEachCloudMoment(const Real x1, const Real x2, const int code, const int m,
+                          const Function &function) const {
+    ForEach<true>(x1, x2, code, m, function);
+  }
+  KOKKOS_INLINE_FUNCTION
+  bool CloudInsideFiner(const Real x1, const Real x2, const int code, const Real slack,
+                        const int m) const {
+    return InsideFiner(x1, x2, code, slack, m);
+  }
+  KOKKOS_INLINE_FUNCTION
+  bool CloudOverlapsFiner(const Real x1, const Real x2, const int code, const int m) const {
+    return OverlapsFiner(x1, x2, code, m);
+  }
+  KOKKOS_INLINE_FUNCTION
+  int LeafOwner(const Real x1, const Real x2, const int m) const {return Owner(x1, x2, m);}
 };
+
+// the weights of a particle on the composite transfer, as
+// SMRCompositeTransfer::ForEachWeight(x1, x2, code, f): refinable clouds on the actual leaves
+// (anchor block m), the smooth transfer (smooth_p2, owner_overlap) on its own maps
+template <typename Function>
+KOKKOS_INLINE_FUNCTION
+void ForEachCompositeWeight(const SMRCompositeTransfer &t, const LeafTraversal &lt,
+                            const Real x1, const Real x2, const int code, const int m,
+                            const Function &function) {
+  if (t.cloud_mode) {
+    lt.ForEachCloudWeight(x1, x2, code, m, function);
+  } else {
+    t.ForEachWeight(x1, x2, function);
+  }
+}
 
 //----------------------------------------------------------------------------------------
 //! \struct DustGasDragTaskIDs
@@ -1210,9 +1403,6 @@ class DustGasDrag {
   long long amr_event_handled = 0, amr_event_merged = 0;
   int amr_regrid_nnew = 0, amr_regrid_ndel = 0;  // of the regrid in progress (BeforeRegrid)
   void HandleRegridEvent(const bool merge_due);
-  DvceArray1D<char> merge_mask_d;     // device merge-cell masks of the level-L grids (built once,
-  int merge_mask_geom[12] = {0};       // static SMR): per level n1, n2, offset
-  bool merge_mask_built = false;
   bool cloud_merge_nc = true;         // merge-side node convention
   bool cloud_merge_absorb = false;    // orphan absorption into existing coarse clouds
   bool cloud_merge_pending_log = false;  // log why designated centres did not commit
@@ -1279,9 +1469,6 @@ class DustGasDrag {
   int cloud_compress_buffer = 4;      // stage C cells: no coarser leaf within this many cells of
                                       // the next-coarser level
   int cloud_merge_pass = 0;           // pass counter (walk rotation)
-  DvceArray1D<char> compress_mask_d;  // stage C interior masks per level (built once)
-  int compress_mask_off[5] = {0};
-  bool compress_mask_built = false;
   unsigned long long cloud_coarsen_events = 0, cloud_coarsen_in = 0;
   unsigned long long cloud_coarsen_reject = 0, cloud_far_release = 0;
   Real cloud_coarsen_dk_grad = 0.0, cloud_coarsen_dk_res = 0.0;
