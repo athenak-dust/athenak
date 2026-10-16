@@ -392,21 +392,27 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
 // <dust>/cloud_resample_dump (diagnostic): the particle table of the pack as
 // f64 rows [x1, x2, mass, v1, v2, v3, tag, level code], the layout of the particle rows of the
 // test problems' snapshots.  File resample.CYCLE.WHEN.bin, WHEN = pre | post.
-void DumpResampleState(particles::Particles *ppar, Mesh *pmesh, const char *when) {
+void DumpResampleState(particles::Particles *ppar, Mesh *pmesh, const char *when,
+                       const bool species = false) {
   const int n = ppar->nprtcl_thispack;
   auto pr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_rdata);
   auto pi = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_idata);
   std::vector<double> rows;
-  rows.reserve(static_cast<std::size_t>(8)*n);
+  // v1: 8 columns (x, y, m, vx, vy, vz, tag, code); v2 (several species): and the species
+  const int nc = species ? 9 : 8;
+  rows.reserve(static_cast<std::size_t>(nc)*n);
   for (int p=0; p<n; ++p) {
     rows.insert(rows.end(), {pr(IPX,p), pr(IPY,p), pr(IPM,p), pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p),
                              static_cast<double>(pi(PTAG,p)), static_cast<double>(pi(PLEV,p))});
+    if (species) rows.push_back(static_cast<double>(pi(PSP,p)));
   }
   char name[64];
   std::snprintf(name, sizeof(name), "resample.%08d.%s.bin", pmesh->ncycle, when);
   std::FILE *file = std::fopen(name, "wb");
   bool ok = (file != nullptr) &&
-            std::fprintf(file, "AthenaK resample dump v1 f64\n%.17g %d %d\n", pmesh->time, pmesh->ncycle, n) > 0;
+            std::fprintf(file, species ? "AthenaK resample dump v2 f64 species\n%.17g %d %d\n"
+                                       : "AthenaK resample dump v1 f64\n%.17g %d %d\n",
+                         pmesh->time, pmesh->ncycle, n) > 0;
   ok = ok && std::fwrite(rows.data(), sizeof(double), rows.size(), file) == rows.size();
   ok = (file != nullptr) && (std::fclose(file) == 0) && ok;
   if (!ok) {
@@ -578,15 +584,33 @@ int DustGasDrag::ResampleClouds() {
   const bool dump = std::find(cloud_resample_dump.begin(), cloud_resample_dump.end(), pmesh->ncycle) !=
                     cloud_resample_dump.end();
   if (dump) {
-    DumpResampleState(ppar, pmesh, "pre");
-    DumpResampleState(ppar, pmesh, "post");   // rewritten below if the resampling changes anything
+    DumpResampleState(ppar, pmesh, "pre", nspecies > 1);
+    // rewritten below if the resampling changes anything
+    DumpResampleState(ppar, pmesh, "post", nspecies > 1);
   }
+  // the root cloud mass of every species (cap eta m0 / 4^level): cloud_resample_m0 for all of
+  // them, else the merge pass's per-species value.  The patches are also split by
+  // species, so every species keeps its own leaf masses (one species: no change)
+  // A species without such a value (no plain level-0/1 cloud) has a cap of zero: its clouds
+  // stay out of the pool.
+  const int nsp = std::max(1, nspecies);
+  DvceArray1D<Real> m0sp("rs_m0", nsp);
+  if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
   Real m0 = cloud_resample_m0;
-  if (m0 <= 0.0 && !cloud_merge_mroot.empty()) m0 = cloud_merge_mroot[0];
-  if (m0 <= 0.0) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "cloud_resample needs the root cloud mass: set <dust>/cloud_resample_m0" << std::endl;
-    std::exit(EXIT_FAILURE);
+  {
+    auto mh = Kokkos::create_mirror_view(m0sp);
+    for (int sp=0; sp<nsp; ++sp) {
+      mh(sp) = (cloud_resample_m0 > 0.0) ? cloud_resample_m0
+             : ((static_cast<int>(cloud_merge_mroot.size()) > sp) ? cloud_merge_mroot[sp] : 0.0);
+    }
+    if (!(mh(0) > 0.0)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "cloud_resample needs the root cloud mass: set <dust>/cloud_resample_m0"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    m0 = mh(0);
+    Kokkos::deep_copy(m0sp, mh);
   }
   // the patches.  root: s x s root cells; a patch of a block l
   // levels finer holds 4^l times as many leaves.  block (default): inside one MeshBlock, k x k
@@ -653,7 +677,8 @@ int DustGasDrag::ResampleClouds() {
     const int code = pi(PLEV,p);
     const int lev = SMRCompositeTransfer::CloudLevel(code);
     if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) {nl += 1.0; return;}
-    const Real cap = (eta > 0.0) ? eta*m0/static_cast<Real>(1 << (2*lev)) : 1.0e300;
+    const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
+    const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
     if (skip_cap && pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
     int c = 0;
@@ -734,7 +759,8 @@ int DustGasDrag::ResampleClouds() {
     pd(a,0) = xp; pd(a,1) = yp; pd(a,2) = pr(IPM,p);
     pd(a,3) = pr(IPVX,p); pd(a,4) = pr(IPVY,p); pd(a,5) = pr(IPVZ,p); pd(a,6) = pr(IPTS,p);
     pd(a,7) = ugx; pd(a,8) = ugy; pd(a,9) = ugz;
-    pd(a,10) = (eta > 0.0) ? eta*m0/static_cast<Real>(1 << (2*lev)) : 1.0e300;
+    const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
+    pd(a,10) = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
     if (bpatch) {
       // the leaf that holds the particle: its block and cell
       const int am = lt.Anchor(pi(PGID,p));
@@ -756,6 +782,7 @@ int DustGasDrag::ResampleClouds() {
       iy = (iy < 0) ? 0 : ((iy >= nroot2) ? nroot2 - 1 : iy);
       pid(a,0) = (iy/s)*np1 + ix/s;
     }
+    pid(a,0) = pid(a,0)*nsp + sp;   // one species per patch
     pid(a,1) = p;
     cptr(a) = coff(p);
     int e = coff(p);
@@ -766,7 +793,7 @@ int DustGasDrag::ResampleClouds() {
   Kokkos::fence();
   const double t_dev = seconds(t0);
   t0 = Clock::now();
-  const int npatch = bpatch ? poff_h[nmbp] : np1*np2;
+  const int npatch = (bpatch ? poff_h[nmbp] : np1*np2)*nsp;   // geometric patch x species
   const double lx = transfer.x1max - transfer.x1min, ly = transfer.x2max - transfer.x2min;
   // per patch: centre and length scale of the centre-of-mass rows (half the patch width; the
   // root patches keep their earlier values)
@@ -774,7 +801,8 @@ int DustGasDrag::ResampleClouds() {
   {
     const Real rx1 = root_dx1, rx2 = root_dx2;
     Kokkos::parallel_for("rs_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-    KOKKOS_LAMBDA(const int q) {
+    KOKKOS_LAMBDA(const int qs) {
+      const int q = qs/nsp;   // the geometric patch
       if (bpatch) {
         int lo = 0, hi = nmbp;   // the block of patch q: poff(b) <= q < poff(b + 1)
         while (hi - lo > 1) {
@@ -783,13 +811,13 @@ int DustGasDrag::ResampleClouds() {
         }
         const int b = lo, k = kblk(b), r = q - poff(b), nbx = bnx1/k, ip = r % nbx, jp = r/nbx;
         const Real d1 = mbsize.d_view(b).dx1, d2 = mbsize.d_view(b).dx2;
-        pgeo(q,0) = mbsize.d_view(b).x1min + (ip + 0.5)*k*d1;
-        pgeo(q,1) = mbsize.d_view(b).x2min + (jp + 0.5)*k*d2;
-        pgeo(q,2) = 0.5*k*d1; pgeo(q,3) = 0.5*k*d2;
+        pgeo(qs,0) = mbsize.d_view(b).x1min + (ip + 0.5)*k*d1;
+        pgeo(qs,1) = mbsize.d_view(b).x2min + (jp + 0.5)*k*d2;
+        pgeo(qs,2) = 0.5*k*d1; pgeo(qs,3) = 0.5*k*d2;
       } else {
-        pgeo(q,0) = x1min + (q % np1 + 0.5)*s*rx1;
-        pgeo(q,1) = x2min + (q/np1 + 0.5)*s*rx2;
-        pgeo(q,2) = rx1; pgeo(q,3) = rx2;
+        pgeo(qs,0) = x1min + (q % np1 + 0.5)*s*rx1;
+        pgeo(qs,1) = x2min + (q/np1 + 0.5)*s*rx2;
+        pgeo(qs,2) = rx1; pgeo(qs,3) = rx2;
       }
     });
   }
@@ -1074,7 +1102,7 @@ int DustGasDrag::ResampleClouds() {
                   dtim[0], dtim[1], dtim[2], dtim[3]);
     AppendResampleLog(row);
   }
-  if (dump) DumpResampleState(ppar, pmesh, "post");
+  if (dump) DumpResampleState(ppar, pmesh, "post", nspecies > 1);
   return nremoved;
 }
 

@@ -1671,6 +1671,7 @@ class DustGasDrag {
   int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
   void BuildLeafTraversal();
   void RequireCloudTable(const char *what) const;   // fatal without the table
+  void EnsureRootCloudMass();          // cloud_merge_mroot once (merge pass, resampling caps)
   void CheckLeafTraversal();
   void CheckLeafEligibility();        // called by CheckLeafTraversal
 

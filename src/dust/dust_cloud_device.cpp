@@ -536,6 +536,39 @@ void DustGasDrag::AuditFeedback(DvceArray2D<Real> &fb) {
   });
 }
 
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::EnsureRootCloudMass
+//! \brief The root cloud mass of every species, once (cloud_merge_mroot): the largest plain
+//! level-0 cloud, else four times the largest plain level-1 cloud.  Used by the merge pass and
+//! by the resampling caps, whichever runs first.
+
+void DustGasDrag::EnsureRootCloudMass() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  if (cloud_merge_mroot.empty()) {
+    auto pr = ppar->prtcl_rdata;
+    auto pi = ppar->prtcl_idata;
+    const int npart = ppar->nprtcl_thispack;
+    int nsp = 1;
+    Kokkos::parallel_reduce("merge_nsp", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &mx) {if (pi(PSP,p) + 1 > mx) mx = pi(PSP,p) + 1;},
+    Kokkos::Max<int>(nsp));
+    cloud_merge_mroot.assign(nsp, 0.0);
+    for (int sp=0; sp<nsp; ++sp) {
+      Real m0 = 0.0, m1 = 0.0;
+      Kokkos::parallel_reduce("merge_mroot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p, Real &a, Real &b) {
+        const int code = pi(PLEV,p);
+        if (pi(PSP,p) != sp || SMRCompositeTransfer::CloudLobe1(code) ||
+            SMRCompositeTransfer::CloudLobe2(code)) return;
+        const int l = SMRCompositeTransfer::CloudLevel(code);
+        if (l == 0 && pr(IPM,p) > a) a = pr(IPM,p);
+        if (l == 1 && pr(IPM,p) > b) b = pr(IPM,p);
+      }, Kokkos::Max<Real>(m0), Kokkos::Max<Real>(m1));
+      cloud_merge_mroot[sp] = (m0 > 0.0) ? m0 : 4.0*m1;
+    }
+  }
+}
+
 int DustGasDrag::MergeCloudsDevice() {
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
@@ -706,30 +739,8 @@ int DustGasDrag::MergeCloudsDevice() {
     audit.Add2("a1_pr", ppar->prtcl_rdata, nrdata, ppar->nprtcl_thispack);
     audit.Add2("a1_pi", ppar->prtcl_idata, nidata, ppar->nprtcl_thispack);
   }
-  // root-level cloud mass per species (first pass, as the host)
-  if (cloud_merge_mroot.empty()) {
-    auto pr = ppar->prtcl_rdata;
-    auto pi = ppar->prtcl_idata;
-    const int npart = ppar->nprtcl_thispack;
-    int nsp = 1;
-    Kokkos::parallel_reduce("merge_nsp", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p, int &mx) {if (pi(PSP,p) + 1 > mx) mx = pi(PSP,p) + 1;},
-    Kokkos::Max<int>(nsp));
-    cloud_merge_mroot.assign(nsp, 0.0);
-    for (int sp=0; sp<nsp; ++sp) {
-      Real m0 = 0.0, m1 = 0.0;
-      Kokkos::parallel_reduce("merge_mroot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-      KOKKOS_LAMBDA(const int p, Real &a, Real &b) {
-        const int code = pi(PLEV,p);
-        if (pi(PSP,p) != sp || SMRCompositeTransfer::CloudLobe1(code) ||
-            SMRCompositeTransfer::CloudLobe2(code)) return;
-        const int l = SMRCompositeTransfer::CloudLevel(code);
-        if (l == 0 && pr(IPM,p) > a) a = pr(IPM,p);
-        if (l == 1 && pr(IPM,p) > b) b = pr(IPM,p);
-      }, Kokkos::Max<Real>(m0), Kokkos::Max<Real>(m1));
-      cloud_merge_mroot[sp] = (m0 > 0.0) ? m0 : 4.0*m1;
-    }
-  }
+  // root-level cloud mass per species (first pass, as the host; shared with the resampling)
+  EnsureRootCloudMass();
   const int nsp = static_cast<int>(cloud_merge_mroot.size());
   if (nsp > 4) {
     std::cout << "### FATAL ERROR: MergeCloudsDevice supports at most 4 species" << std::endl;

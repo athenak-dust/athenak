@@ -510,6 +510,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_launch_bounds = pin->GetOrAddInteger("dust", "cloud_launch_bounds", 1);
       cloud_resample_compare = pin->GetOrAddBoolean("dust", "cloud_resample_compare", false);
       cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
+      if (cloud_resample_m0 > 0.0 && nspecies > 1 && global_variable::my_rank == 0) {
+        std::cout << "# NOTE (dust): cloud_resample_m0 is the root cloud mass of every species "
+                  << "(leave it unset for the per-species masses of the initial clouds)" << std::endl;
+      }
       cloud_resample_skip_at_cap = pin->GetOrAddBoolean("dust", "cloud_resample_skip_at_cap", true);
       // Resampling after every regrid, default on.  The older key
       // (cloud_resample_after_refine: refine only, default off) maps onto it, so the inputs of
