@@ -1290,6 +1290,26 @@ void DepositAdd(Real *destination, const Real value) {
   }
 }
 
+// Timing test: the two production cloud kernels over particles 0..n-1 with an
+// optional launch bound, <dust>/cloud_launch_bounds = 0 none, 1 <256, 2> (at most 128
+// registers), 2 <128, 3> (at most 168), 3 <256, 3> (at most 85): occupancy against spills on
+// the target GPU.
+template <typename Function>
+void CloudParFor(const std::string &name, const int bounds, const int n, const Function &f) {
+  using LB1 = Kokkos::RangePolicy<DevExeSpace, Kokkos::LaunchBounds<256, 2>>;
+  using LB2 = Kokkos::RangePolicy<DevExeSpace, Kokkos::LaunchBounds<128, 3>>;
+  using LB3 = Kokkos::RangePolicy<DevExeSpace, Kokkos::LaunchBounds<256, 3>>;
+  if (bounds == 1) {
+    Kokkos::parallel_for(name, LB1(0, n), f);
+  } else if (bounds == 2) {
+    Kokkos::parallel_for(name, LB2(0, n), f);
+  } else if (bounds == 3) {
+    Kokkos::parallel_for(name, LB3(0, n), f);
+  } else {
+    Kokkos::parallel_for(name, Kokkos::RangePolicy<DevExeSpace>(0, n), f);
+  }
+}
+
 // Shared NGP/CIC/TSC stencil for deposits, matrix-free gathers, and the final kick.
 // One helper is used everywhere so the coupled operator and conservative commit cannot
 // silently acquire different particle-mesh weights.
@@ -1448,6 +1468,8 @@ class DustGasDrag {
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
   bool cloud_resample_device = true;   // ... the patch solves on the device (default)
   int cloud_resample_device_mem_mb = 2048;  // ... workspace limit of the device solves
+  int cloud_launch_bounds = 0;        // timing test: launch bound of the two
+                                      // production cloud kernels (CloudParFor)
   bool cloud_resample_compare = false; // ... diagnostic: host and device on the same pool, compared
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
   std::vector<int> cloud_resample_dump;     // cycles whose resampling writes the particle table before and after

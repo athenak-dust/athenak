@@ -153,7 +153,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         // variants there cost registers and occupancy.
         PackGatherField(ustar);
         auto gp = gpack;
-        par_for("dust_pc2_advance_linear",DevExeSpace(),0,(npart-1),
+        CloudParFor("dust_pc2_advance_linear", cloud_launch_bounds, npart,
         KOKKOS_LAMBDA(const int p) {
           // the gather's leaf weights are the deposit's: keep them
           int nt = 0, tt[SMRCompositeTransfer::kCloudWeightCache];

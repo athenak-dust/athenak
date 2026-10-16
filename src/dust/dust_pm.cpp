@@ -131,7 +131,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         });
         PackGatherField(uvel_pred);
         auto gp = gpack;
-        par_for("dust_pc2_cloud_predictor_linear",DevExeSpace(),0,(npart-1),
+        CloudParFor("dust_pc2_cloud_predictor_linear", cloud_launch_bounds, npart,
         KOKKOS_LAMBDA(const int p) {
           Real xp = pr(IPX,p), yp = pr(IPY,p);
           const int am = lt.Anchor(pi(PGID,p));   // anchor block of the cloud
