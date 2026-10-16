@@ -765,24 +765,42 @@ struct LeafTraversal {
     }
   }
 
-  // ---- candidate blocks (Codex review) --------------------------------------------------
+  // ---- candidate blocks (Codex reviews) -------------------------------------------------
   // Every query is answered in the frame of the anchor block m (the periodic image of the
   // position next to m).  Local: m and its distinct neighbours, each with the periodic shift
   // (domain lengths, from the direction of its neighbour slot) that puts it on that side of
   // m, so the two images of a block that is the neighbour on both sides (one or two blocks
-  // across the domain) both appear.  Global: every block of the pack in its nine periodic
-  // images; used when the anchor's neighbourhood does not hold the whole query.
+  // across the domain) both appear.  Global: every block of the pack in every periodic image
+  // that meets the query box [ia, ib] x [ja, jb] (finest cells, inclusive) widened by r, so a
+  // query of any width is answered; used when the anchor's neighbourhood does not hold the
+  // whole query.  f(b, sx, sy): block b shifted by -(sx, sy) domain lengths.
+  KOKKOS_INLINE_FUNCTION
+  static int FloorDiv(const int a, const int n) {
+    const int q = a/n;
+    return (a % n != 0 && a < 0) ? q - 1 : q;
+  }
+  // the images k (shift +k n) of [c0 - r, c1 + r) that meet [a, b]: k0..k1 (none if k0 > k1)
+  KOKKOS_INLINE_FUNCTION
+  static void ImageRange(const int c0, const int c1, const int r, const int n, const int a,
+                         const int b, int &k0, int &k1) {
+    k0 = FloorDiv(a - (c1 + r), n) + 1;
+    k1 = FloorDiv(b - (c0 - r), n);
+  }
   template <typename Function>
   KOKKOS_INLINE_FUNCTION
-  void ForCandidates(const int m, const bool global, const Function &f) const {
+  void ForCandidates(const int m, const bool global, const int ia, const int ib, const int ja,
+                     const int jb, const int r, const Function &f) const {
     if (!global) {
       f(m, 0, 0);
       for (int k=0; k<nnb(m); ++k) f(nb(m, k), nbs(m, k, 0), nbs(m, k, 1));
       return;
     }
     for (int b=0; b<nmb; ++b) {
-      for (int sy=-1; sy<=1; ++sy) {
-        for (int sx=-1; sx<=1; ++sx) f(b, sx, sy);
+      int kx0, kx1, ky0, ky1;
+      ImageRange(fbox(b, 0), fbox(b, 1), r, nfine1, ia, ib, kx0, kx1);
+      ImageRange(fbox(b, 2), fbox(b, 3), r, nfine2, ja, jb, ky0, ky1);
+      for (int ky=ky0; ky<=ky1; ++ky) {
+        for (int kx=kx0; kx<=kx1; ++kx) f(b, -kx, -ky);
       }
     }
   }
@@ -806,7 +824,7 @@ struct LeafTraversal {
   bool Meets(const int m, const int ia, const int ib, const int ja, const int jb,
              const int minlev, const int r, const bool global) const {
     bool hit = false;
-    ForCandidates(m, global, [&](const int b, const int sx, const int sy) {
+    ForCandidates(m, global, ia, ib, ja, jb, r, [&](const int b, const int sx, const int sy) {
       if (hit || blev(b) < minlev) return;
       int x0, x1, y0, y1;
       ImageRect(b, sx, sy, r, x0, x1, y0, y1);
@@ -815,59 +833,31 @@ struct LeafTraversal {
     });
     return hit;
   }
-  // is that box entirely covered by them?  (coordinate compression by the box edges)
+  // is that box entirely covered by them?  A scan by row bands, without a list of boxes (any
+  // number of blocks and images): from the first cell (x, y) of a band not yet known to be
+  // covered, take the candidate box holding it that reaches furthest in x, continue at its x
+  // end; the rows up to the lowest top among the boxes taken are then covered over the whole
+  // width, and the next band starts there.  A cell held by no box: not covered.
   KOKKOS_INLINE_FUNCTION
   bool Covered(const int m, const int ia, const int ib, const int ja, const int jb,
                const int minlev, const int r, const bool global) const {
-    constexpr int kR = 64;
-    int rx0[kR], rx1[kR], ry0[kR], ry1[kR];
-    int nr = 0;
-    bool full = false, over = false;
-    ForCandidates(m, global, [&](const int b, const int sx, const int sy) {
-      if (full || blev(b) < minlev) return;
-      int x0, x1, y0, y1;
-      ImageRect(b, sx, sy, r, x0, x1, y0, y1);
-      if (ib < x0 || ia >= x1 || jb < y0 || ja >= y1) return;
-      if (x0 <= ia && x1 > ib && y0 <= ja && y1 > jb) {full = true; return;}
-      if (nr < kR) {
-        rx0[nr] = x0; rx1[nr] = x1; ry0[nr] = y0; ry1[nr] = y1; ++nr;
-      } else {
-        over = true;
+    int y = ja;
+    while (y <= jb) {
+      int x = ia, top = jb + 1;
+      while (x <= ib) {
+        int xe = x, ye = y;
+        ForCandidates(m, global, x, x, y, y, r, [&](const int b, const int sx, const int sy) {
+          if (blev(b) < minlev) return;
+          int x0, x1, y0, y1;
+          ImageRect(b, sx, sy, r, x0, x1, y0, y1);
+          if (x < x0 || x >= x1 || y < y0 || y >= y1) return;
+          if (x1 > xe || (x1 == xe && y1 > ye)) {xe = x1; ye = y1;}
+        });
+        if (xe == x) return false;
+        top = (ye < top) ? ye : top;
+        x = xe;
       }
-    });
-    if (full) return true;
-    if (nr == 0) return false;
-    if (over) Kokkos::abort("LeafTraversal::Covered: more than 64 boxes meet one query");
-    constexpr int kE = 2*kR + 4;
-    int xs[kE], ys[kE];
-    int nxs = 0, nys = 0;
-    xs[nxs++] = ia; xs[nxs++] = ib + 1; ys[nys++] = ja; ys[nys++] = jb + 1;
-    for (int q=0; q<nr; ++q) {
-      if (rx0[q] > ia && rx0[q] <= ib) xs[nxs++] = rx0[q];
-      if (rx1[q] > ia && rx1[q] <= ib) xs[nxs++] = rx1[q];
-      if (ry0[q] > ja && ry0[q] <= jb) ys[nys++] = ry0[q];
-      if (ry1[q] > ja && ry1[q] <= jb) ys[nys++] = ry1[q];
-    }
-    for (int u=1; u<nxs; ++u) {
-      const int t = xs[u]; int v = u - 1;
-      while (v >= 0 && xs[v] > t) {xs[v + 1] = xs[v]; --v;}
-      xs[v + 1] = t;
-    }
-    for (int u=1; u<nys; ++u) {
-      const int t = ys[u]; int v = u - 1;
-      while (v >= 0 && ys[v] > t) {ys[v + 1] = ys[v]; --v;}
-      ys[v + 1] = t;
-    }
-    for (int u=0; u+1<nxs; ++u) {
-      if (xs[u] == xs[u + 1]) continue;
-      for (int v=0; v+1<nys; ++v) {
-        if (ys[v] == ys[v + 1]) continue;
-        bool cov = false;
-        for (int q=0; q<nr && !cov; ++q) {
-          cov = (rx0[q] <= xs[u] && xs[u] < rx1[q] && ry0[q] <= ys[v] && ys[v] < ry1[q]);
-        }
-        if (!cov) return false;
-      }
+      y = top;
     }
     return true;
   }
@@ -907,7 +897,9 @@ struct LeafTraversal {
     const bool global = NeedGlobal(m, ia, ib, ja, jb, 0);
     if (reach != nullptr) *reach = !global;
     Real wsum = 0.0;
-    ForCandidates(m, global, [&](const int b, const int sx, const int sy) {
+    // the global images from the support's finest cells, one cell wider against round-off
+    ForCandidates(m, global, ia - 1, ib + 1, ja - 1, jb + 1, 0,
+                  [&](const int b, const int sx, const int sy) {
       const Real dx = box(b, 2), dy = box(b, 3);
       const Real bx0 = box(b, 0) - sx*lx, by0 = box(b, 1) - sy*ly;
       const Real bx1 = bx0 + nx1*dx, by1 = by0 + nx2*dy;
@@ -949,8 +941,11 @@ struct LeafTraversal {
     Real x1 = px1, x2 = px2;
     Frame(m, x1, x2);
     int res = -1, bb = -1;
+    const int ic = static_cast<int>(floor((x1 - x1min)/fine_dx1));
+    const int jc = static_cast<int>(floor((x2 - x2min)/fine_dx2));
     for (int pass=0; pass<2 && res < 0; ++pass) {
-      ForCandidates(m, pass == 1, [&](const int b, const int sx, const int sy) {
+      ForCandidates(m, pass == 1, ic - 1, ic + 1, jc - 1, jc + 1, 0,
+                    [&](const int b, const int sx, const int sy) {
         if (res >= 0) return;
         const Real fi = (x1 - (box(b, 0) - sx*lx))/box(b, 2);
         const Real fj = (x2 - (box(b, 1) - sy*ly))/box(b, 3);
