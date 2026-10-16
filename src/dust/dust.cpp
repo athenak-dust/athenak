@@ -509,6 +509,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // cloud kernels are 8-16% faster than without a bound (BA 128/256 and the dynamic mesh)
       cloud_launch_bounds = pin->GetOrAddInteger("dust", "cloud_launch_bounds", 1);
       cloud_resample_compare = pin->GetOrAddBoolean("dust", "cloud_resample_compare", false);
+      // Diagnostic: production feedback before / after every resampling
+      cloud_resample_feedback_check = pin->GetOrAddBoolean("dust", "cloud_resample_feedback_check",
+                                                           false);
       cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
       if (cloud_resample_m0 > 0.0 && nspecies > 1 && global_variable::my_rank == 0) {
         std::cout << "# NOTE (dust): cloud_resample_m0 is the root cloud mass of every species "

@@ -1473,6 +1473,7 @@ class DustGasDrag {
   int cloud_launch_bounds = 1;        // launch bound of the two
                                       // production cloud kernels (CloudParFor)
   bool cloud_resample_compare = false; // ... diagnostic: host and device on the same pool, compared
+  bool cloud_resample_feedback_check = false;   // ... diagnostic: AuditFeedback before / after
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
   std::vector<int> cloud_resample_dump;     // cycles whose resampling writes the particle table before and after
   bool cloud_resample_skip_at_cap = true;   // ... clouds at their cap stay out of the pool

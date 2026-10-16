@@ -1034,6 +1034,11 @@ int DustGasDrag::ResampleClouds() {
   }
   const int nremoved = static_cast<int>(pool - kept);
 
+  // Diagnostic (cloud_resample_feedback_check): the production predictor feedback
+  // on the frozen gas (AuditFeedback: linear gather, cloud-weight deposit) before the new masses
+  DvceArray2D<Real> fb_before;
+  if (cloud_resample_feedback_check) AuditFeedback(fb_before);
+
   // device: new masses, compaction
   if (nremoved > 0 || csteps > 0) {
     if (cloud_resample_device) {
@@ -1101,6 +1106,37 @@ int DustGasDrag::ResampleClouds() {
                   st[3], st[4], st[5], nmax, nbmax, n64, n256, cloud_resample_device ? 1 : 0,
                   dtim[0], dtim[1], dtim[2], dtim[3]);
     AppendResampleLog(row);
+  }
+  if (cloud_resample_feedback_check) {
+    // ... and after: per component the largest change of a leaf over the largest leaf value
+    DvceArray2D<Real> fb_after;
+    AuditFeedback(fb_after);
+    const int nt = fb_after.extent_int(1);
+    Real dl[4] = {0.0, 0.0, 0.0, 0.0}, rf[4] = {0.0, 0.0, 0.0, 0.0};
+    for (int c=0; c<4; ++c) {
+      auto a = fb_before, b = fb_after;
+      Kokkos::parallel_reduce("rs_fbcheck", Kokkos::RangePolicy<>(DevExeSpace(), 0, nt),
+      KOKKOS_LAMBDA(const int t, Real &d, Real &r) {
+        d = Kokkos::fmax(d, Kokkos::fabs(b(c,t) - a(c,t)));
+        r = Kokkos::fmax(r, Kokkos::fabs(a(c,t)));
+      }, Kokkos::Max<Real>(dl[c]), Kokkos::Max<Real>(rf[c]));
+    }
+    if (global_variable::my_rank == 0) {
+      std::FILE *fp = std::fopen("cloud_resample_fbcheck.txt", "a");
+      if (fp != nullptr) {
+        std::fseek(fp, 0, SEEK_END);
+        if (std::ftell(fp) == 0) {
+          std::fprintf(fp, "# ncycle time removed; per component (x, y, z momentum, mass rate) of the "
+                       "production feedback (AuditFeedback): largest |after - before| of a leaf / largest "
+                       "|before|, then the largest |before|\n");
+        }
+        std::fprintf(fp, "%d %.17g %d", pmesh->ncycle, pmesh->time, nremoved);
+        for (int c=0; c<4; ++c) std::fprintf(fp, " %.3e", (rf[c] > 0.0) ? dl[c]/rf[c] : dl[c]);
+        for (int c=0; c<4; ++c) std::fprintf(fp, " %.6e", rf[c]);
+        std::fprintf(fp, "\n");
+        std::fclose(fp);
+      }
+    }
   }
   if (dump) DumpResampleState(ppar, pmesh, "post", nspecies > 1);
   return nremoved;
