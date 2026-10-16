@@ -117,9 +117,10 @@ void DustGasDrag::CheckLeafTraversal() {
   const Real inv_dx = 1.0/smr_transfer.root_dx1;
   constexpr Real kTol = 1.0e-12;
   Real ew = 0.0, em = 0.0, es = 0.0;
-  int nbadw = 0, nbadm = 0, nbads = 0, nbado = 0;
+  int nbadw = 0, nbadm = 0, nbads = 0, nbado = 0, nlobed = 0;
   Kokkos::parallel_reduce("dust_leaf_check", Kokkos::RangePolicy<DevExeSpace>(0, npart),
-  KOKKOS_LAMBDA(const int p, Real &dw, Real &dm, Real &ds, int &bw, int &bm, int &bs, int &bo) {
+  KOKKOS_LAMBDA(const int p, Real &dw, Real &dm, Real &ds, int &bw, int &bm, int &bs, int &bo,
+                int &nlb) {
     auto coef = [](const int target, const Real s) {
       Real v = sin(static_cast<Real>(target)*12.9898 + s)*43758.5453;
       return v - floor(v);
@@ -155,18 +156,20 @@ void DustGasDrag::CheckLeafTraversal() {
     if (d2 > kTol) ++bm;
     if (d3 > kTol) ++bs;
     if (lt.Owner(x1, x2, m) != tab.LeafOwner(x1, x2)) ++bo;
+    if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) ++nlb;
   }, Kokkos::Max<Real>(ew), Kokkos::Max<Real>(em), Kokkos::Max<Real>(es), Kokkos::Sum<int>(nbadw),
-     Kokkos::Sum<int>(nbadm), Kokkos::Sum<int>(nbads), Kokkos::Sum<int>(nbado));
+     Kokkos::Sum<int>(nbadm), Kokkos::Sum<int>(nbads), Kokkos::Sum<int>(nbado),
+     Kokkos::Sum<int>(nlobed));
   if (global_variable::my_rank == 0) {
     std::FILE *fp = std::fopen("cloud_leaf_check.txt", "a");
     if (fp != nullptr) {
       std::fseek(fp, 0, SEEK_END);
       if (std::ftell(fp) == 0) {
         std::fprintf(fp, "# ncycle time particles max_dweight max_dmoment max_dsum bad_weight "
-                     "bad_moment bad_sum bad_owner (bad: > 1e-12)\n");
+                     "bad_moment bad_sum bad_owner lobed (bad: > 1e-12)\n");
       }
-      std::fprintf(fp, "%d %.17g %d %.3e %.3e %.3e %d %d %d %d\n", pmy_pack->pmesh->ncycle,
-                   pmy_pack->pmesh->time, npart, ew, em, es, nbadw, nbadm, nbads, nbado);
+      std::fprintf(fp, "%d %.17g %d %.3e %.3e %.3e %d %d %d %d %d\n", pmy_pack->pmesh->ncycle,
+                   pmy_pack->pmesh->time, npart, ew, em, es, nbadw, nbadm, nbads, nbado, nlobed);
       std::fclose(fp);
     }
     std::cout << "# leaf traversal check cycle " << pmy_pack->pmesh->ncycle << ": "
