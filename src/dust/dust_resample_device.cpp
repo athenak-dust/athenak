@@ -32,6 +32,7 @@
 #include <Kokkos_Core.hpp>
 
 #include "athena.hpp"
+#include "globals.hpp"
 #include "dust_resample.hpp"
 
 namespace dust {
@@ -663,8 +664,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                            static_cast<std::size_t>(nslot)*ws.ni);
       DvceArray1D<int> counter("rs_dev_counter", 1);
       const DevicePatchProblem p = pb;
-      Kokkos::parallel_for("rs_dev_patches", Policy(nslot, Kokkos::AUTO),
-      KOKKOS_LAMBDA(const Member &tm) {
+      auto body = KOKKOS_LAMBDA(const Member &tm) {
         const Ws w = Carve(dws.data() + static_cast<std::size_t>(tm.league_rank())*ws.nd,
                            iws.data() + static_cast<std::size_t>(tm.league_rank())*ws.ni, ws);
         DvceArray1D<double> mn = mnew;
@@ -678,7 +678,23 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
           if (i >= nq) break;
           PatchTeam(tm, p, qlist(i), w, mn, oi, orr);
         }
-      });
+      };
+      // the large patches set the critical path of a resampling: the widest team the kernel
+      // allows (at most 512 threads); the small ones keep the automatic size
+      if (b == 0) {
+        Kokkos::parallel_for("rs_dev_patches_small", Policy(nslot, Kokkos::AUTO), body);
+      } else {
+        const int tmax = Policy(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
+        int ts = 32;
+        while (2*ts <= tmax && 2*ts <= 512) ts *= 2;
+        static bool told = false;
+        if (!told && global_variable::my_rank == 0) {
+          std::cout << "# device resampling: large patches with teams of " << ts
+                    << " threads (largest allowed " << tmax << ")" << std::endl;
+          told = true;
+        }
+        Kokkos::parallel_for("rs_dev_patches_large", Policy(nslot, ts), body);
+      }
     }
     Kokkos::fence();
     timing[1 + b] = t.seconds();
