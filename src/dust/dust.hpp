@@ -1290,10 +1290,10 @@ void DepositAdd(Real *destination, const Real value) {
   }
 }
 
-// Timing test: the two production cloud kernels over particles 0..n-1 with an
-// optional launch bound, <dust>/cloud_launch_bounds = 0 none, 1 <256, 2> (at most 128
-// registers), 2 <128, 3> (at most 168), 3 <256, 3> (at most 85): occupancy against spills on
-// the target GPU.
+// The two production cloud kernels over particles 0..n-1 with a
+// launch bound, <dust>/cloud_launch_bounds = 0 none, 1 <256, 2> (at most 128 registers,
+// default: fastest on GB200), 2 <128, 3> (at most 168), 3 <256, 3> (at most 85); occupancy
+// against spills.
 template <typename Function>
 void CloudParFor(const std::string &name, const int bounds, const int n, const Function &f) {
   using LB1 = Kokkos::RangePolicy<DevExeSpace, Kokkos::LaunchBounds<256, 2>>;
@@ -1468,7 +1468,7 @@ class DustGasDrag {
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
   bool cloud_resample_device = true;   // ... the patch solves on the device (default)
   int cloud_resample_device_mem_mb = 2048;  // ... workspace limit of the device solves
-  int cloud_launch_bounds = 0;        // timing test: launch bound of the two
+  int cloud_launch_bounds = 1;        // launch bound of the two
                                       // production cloud kernels (CloudParFor)
   bool cloud_resample_compare = false; // ... diagnostic: host and device on the same pool, compared
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)

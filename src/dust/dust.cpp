@@ -492,7 +492,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // comparison runs both on the same pool and logs the differences (cloud_resample_compare.txt)
       cloud_resample_device = pin->GetOrAddBoolean("dust", "cloud_resample_device", true);
       cloud_resample_device_mem_mb = pin->GetOrAddInteger("dust", "cloud_resample_device_mem_mb", 2048);
-      cloud_launch_bounds = pin->GetOrAddInteger("dust", "cloud_launch_bounds", 0);
+      // Default <256, 2> (at most 128 registers): on GB200 the two production
+      // cloud kernels are 8-16% faster than without a bound (BA 128/256 and the dynamic mesh)
+      cloud_launch_bounds = pin->GetOrAddInteger("dust", "cloud_launch_bounds", 1);
       cloud_resample_compare = pin->GetOrAddBoolean("dust", "cloud_resample_compare", false);
       cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
       cloud_resample_skip_at_cap = pin->GetOrAddBoolean("dust", "cloud_resample_skip_at_cap", true);
