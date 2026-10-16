@@ -40,6 +40,7 @@ namespace {
 
 using Policy = Kokkos::TeamPolicy<DevExeSpace>;
 using Member = Policy::member_type;
+constexpr int kChunk = 8;   // a step search along one null vector is split in this many chunks
 
 // sizes of the per-team workspace of a bucket
 struct WsSize {
@@ -55,14 +56,16 @@ WsSize Sizes(const int nmax, const int emax, const int lmax) {
   const int rb = std::min(z.rmax, z.nmax);
   z.cmax = std::max(2*rb, rb + 32);
   const std::size_t r = z.rmax, n = z.nmax, c = z.cmax;
-  z.nd = 2*r*n + r + n + 2*r*c + 2*c*c + 10*c + 32;
-  z.ni = 2*static_cast<std::size_t>(z.emax) + r + 2*n + 6*c + 16;
+  z.nd = 2*r*n + r + n + 2*r*c + 2*c*c + 10*c + 32 + 3*2*c*kChunk + 3*c;
+  z.ni = 2*static_cast<std::size_t>(z.emax) + r + 2*n + 6*c + 16 + 2*2*c*kChunk;
   return z;
 }
 
+
 struct Ws {
   double *A, *B, *r0, *w, *bact, *qr, *z, *xs, *vn1, *vn2, *d, *wa, *ua, *tt, *zmx, *sc;
-  int *ents, *leaves, *rowidx, *act, *left, *perm, *kk, *fixed, *zr, *cnt;
+  double *pa0, *pa1, *pzm, *score, *fac;   // chunk partials, scores, update factors
+  int *ents, *leaves, *rowidx, *act, *left, *perm, *kk, *fixed, *zr, *cnt, *pk0, *pk1;
 };
 
 KOKKOS_INLINE_FUNCTION
@@ -84,7 +87,12 @@ Ws Carve(double *db, int *ib, const WsSize &z) {
   ws.ua = db; db += c;
   ws.tt = db; db += 2*c;
   ws.zmx = db; db += c;
-  ws.sc = db;                           // 16 scalars
+  ws.sc = db; db += 16;                 // 16 scalars
+  ws.pa0 = db; db += 2*c*kChunk;
+  ws.pa1 = db; db += 2*c*kChunk;
+  ws.pzm = db; db += 2*c*kChunk;
+  ws.score = db; db += 2*c;
+  ws.fac = db;
   ws.ents = ib; ib += z.emax;
   ws.leaves = ib; ib += z.emax;
   ws.rowidx = ib; ib += r;
@@ -94,7 +102,9 @@ Ws Carve(double *db, int *ib, const WsSize &z) {
   ws.kk = ib; ib += 2*c;
   ws.fixed = ib; ib += c;
   ws.zr = ib; ib += 2*c;
-  ws.cnt = ib;                          // 16 counters
+  ws.cnt = ib; ib += 16;                // 16 counters
+  ws.pk0 = ib; ib += 2*c*kChunk;
+  ws.pk1 = ib;
   return ws;
 }
 
@@ -261,34 +271,48 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
   tm.team_barrier();
   while (ncol > 0) {
     int nc = (kNCand < ncol) ? kNCand : ncol;
-    // largest steps along -+ the null vectors c0..c1-1, one thread per (vector, sign) in the
-    // host order; the largest |entry| of each vector for the score
+    // largest steps along -+ the null vectors c0..c1-1 and the largest |entry| of each vector
+    // (for the score).  Each (vector, sign) is scanned in kChunk chunks by as many threads; the
+    // chunks are merged in their order with the host's strict comparisons, so the first
+    // minimum wins exactly as in the host's single loop.
     auto steps = [&](const int c0, const int c1) {
-      Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, 2*c0, 2*c1), [&](const int e) {
+      const int lc = (n + kChunk - 1)/kChunk;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, 2*c0*kChunk, 2*c1*kChunk), [&](const int t) {
+        const int e = t/kChunk, h = t%kChunk;
         const int c = e/2, sg = e%2;
         const double sign = sg ? 1.0 : -1.0;
-        double a0 = kInf, a1 = kInf;
+        const int i0 = h*lc, i1 = (i0 + lc < n) ? i0 + lc : n;
+        double a0 = kInf, a1 = kInf, zm = 0.0;
         int k0 = 0, k1 = 0;
-        for (int i=0; i<n; ++i) {
+        for (int i=i0; i<i1; ++i) {
           const double zi = ws.z[static_cast<std::size_t>(i)*ld + c];
-          const double s = sign*zi;
-          if (s < 0.0) {
+          const double sgz = sign*zi;
+          if (sgz < 0.0) {
             const double v = w[i]/Kokkos::fabs(zi);
             if (v < a0) {a0 = v; k0 = i;}
-          } else if (s > 0.0) {
+          } else if (sgz > 0.0) {
             const double v = (u[i] - w[i])/Kokkos::fabs(zi);
             if (v < a1) {a1 = v; k1 = i;}
           }
+          zm = Kokkos::fmax(zm, Kokkos::fabs(zi));
+        }
+        ws.pa0[t] = a0; ws.pa1[t] = a1; ws.pk0[t] = k0; ws.pk1[t] = k1; ws.pzm[t] = zm;
+      });
+      tm.team_barrier();
+      Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, 2*c0, 2*c1), [&](const int e) {
+        double a0 = kInf, a1 = kInf, zm = 0.0;
+        int k0 = 0, k1 = 0;
+        for (int h=0; h<kChunk; ++h) {
+          const int t = e*kChunk + h;
+          if (ws.pa0[t] < a0) {a0 = ws.pa0[t]; k0 = ws.pk0[t];}
+          if (ws.pa1[t] < a1) {a1 = ws.pa1[t]; k1 = ws.pk1[t];}
+          zm = Kokkos::fmax(zm, ws.pzm[t]);
         }
         const bool zero = a0 <= a1;
         ws.tt[e] = zero ? a0 : a1;
         ws.kk[e] = zero ? k0 : k1;
         ws.zr[e] = zero ? 1 : 0;
-        if (sg == 0) {
-          double zm = 0.0;
-          for (int i=0; i<n; ++i) zm = Kokkos::fmax(zm, Kokkos::fabs(ws.z[static_cast<std::size_t>(i)*ld + c]));
-          ws.zmx[c] = zm;
-        }
+        if (e%2 == 0) ws.zmx[e/2] = zm;
       });
       tm.team_barrier();
     };
@@ -302,34 +326,32 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
       nc = ncol;
       Kokkos::single(Kokkos::PerTeam(tm), [&]() {++ws.cnt[2];});
     }
-    // the best (sign, vector): minus first, as the host's argmax over (sign, column)
-    int code = -1;
-    Kokkos::single(Kokkos::PerTeam(tm), [&](int &cv) {
-      double best = -1.0;
-      int bj = -1, bs = 0;
-      for (int sg=0; sg<2; ++sg) {
-        for (int c=0; c<nc; ++c) {
-          const int e = 2*c + sg;
-          if (!Kokkos::isfinite(ws.tt[e])) continue;
-          const double score = Kokkos::fabs(ws.z[static_cast<std::size_t>(ws.kk[e])*ld + c])/ws.zmx[c]
-                             + 2.0*ws.zr[e];
-          if (score > best) {best = score; bj = c; bs = sg;}
-        }
-      }
-      cv = (bj < 0) ? -1 : 2*bj + bs;
-    }, code);
+    // the best (sign, vector): the host's argmax over (sign, column), minus first; order index
+    // o = sg nc + c, the first maximum wins
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, 2*nc), [&](const int o) {
+      const int sg = o/nc, c = o%nc, e = 2*c + sg;
+      ws.score[o] = !Kokkos::isfinite(ws.tt[e]) ? -1.0
+                  : Kokkos::fabs(ws.z[static_cast<std::size_t>(ws.kk[e])*ld + c])/ws.zmx[c] + 2.0*ws.zr[e];
+    });
     tm.team_barrier();
+    double best = -1.0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, 2*nc), [&](const int o, double &v) {
+      if (ws.score[o] > v) v = ws.score[o];
+    }, Kokkos::Max<double>(best));
+    int ob = 2*nc;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, 2*nc), [&](const int o, int &v) {
+      if (ws.score[o] == best && ws.score[o] > -1.0 && o < v) v = o;
+    }, Kokkos::Min<int>(ob));
+    const int code = (ob >= 2*nc || !(best > -1.0)) ? -1 : 2*(ob%nc) + ob/nc;
     if (code < 0) break;
     const int bj = code/2, bs = code%2, e = 2*bj + bs;
     const int k = ws.kk[e];
     const double step = ws.tt[e]*(bs ? 1.0 : -1.0);
     const int zero = ws.zr[e];
     Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int i) {
-      ws.d[i] = ws.z[static_cast<std::size_t>(i)*ld + bj];
-    });
-    tm.team_barrier();
-    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int i) {
-      w[i] = Kokkos::fmin(Kokkos::fmax(w[i] + step*ws.d[i], 0.0), u[i]);
+      const double di = ws.z[static_cast<std::size_t>(i)*ld + bj];
+      ws.d[i] = di;
+      w[i] = Kokkos::fmin(Kokkos::fmax(w[i] + step*di, 0.0), u[i]);
     });
     tm.team_barrier();
     Kokkos::single(Kokkos::PerTeam(tm), [&]() {
@@ -348,12 +370,20 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
     tm.team_barrier();
     --ncol;
     const double dk = ws.d[k];
+    // the host's per-column update, entry by entry: factors first, then every (i, c) at once
     Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, ncol), [&](const int c) {
-      const double f = ws.z[static_cast<std::size_t>(k)*ld + c]/dk;
-      if (f != 0.0) {
-        for (int i=0; i<n; ++i) ws.z[static_cast<std::size_t>(i)*ld + c] -= f*ws.d[i];
+      ws.fac[c] = ws.z[static_cast<std::size_t>(k)*ld + c]/dk;
+    });
+    tm.team_barrier();
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n*ncol), [&](const int ec) {
+      const int i = ec/ncol, c = ec%ncol;
+      const double f = ws.fac[c];
+      double &zic = ws.z[static_cast<std::size_t>(i)*ld + c];
+      if (i == k) {
+        zic = 0.0;
+      } else if (f != 0.0) {
+        zic -= f*ws.d[i];
       }
-      ws.z[static_cast<std::size_t>(k)*ld + c] = 0.0;
     });
     tm.team_barrier();
   }
