@@ -96,6 +96,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     }
     cloud_sort_morton = (so == "morton");
     cloud_sort_at_start = pin->GetOrAddBoolean("dust", "cloud_sort_at_start", false);
+    cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
   }
   const bool graded = pin->DoesParameterExist("problem", "graded_split_layers") &&
                       pin->GetInteger("problem", "graded_split_layers") >= 0;

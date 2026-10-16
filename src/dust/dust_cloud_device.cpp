@@ -371,9 +371,11 @@ void SortFirst(const DvceArray1D<std::int64_t> &v, const int n) {
 #endif
 }
 
-// key < 0: not listed; listed keys below kbound
+// key < 0: not listed; listed keys below kbound.  rank / inv (optional): the members of
+// a key in the order of rank(p) (a permutation of 0..n-1 with inverse inv) instead of particle order
 void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, const std::int64_t kbound, const int slot,
-                 KeyCSR &c) {
+                 KeyCSR &c, const DvceArray1D<int> &rank, const DvceArray1D<int> &inv) {
+  const bool ranked = rank.extent(0) > 0;
   const int n = key.extent_int(0);
   if (n > 0 && kbound >= std::numeric_limits<std::int64_t>::max()/n - 1) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -400,7 +402,7 @@ void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, const std::int64_t kbound
   const std::int64_t nn = n;
   auto comp = Grow(s.comp, nl, "kcsr_comp");
   Kokkos::parallel_for("kcsr_comp", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
-  KOKKOS_LAMBDA(const int p) {if (key(p) >= 0) comp(pos(p)) = key(p)*nn + p;});
+  KOKKOS_LAMBDA(const int p) {if (key(p) >= 0) comp(pos(p)) = key(p)*nn + (ranked ? rank(p) : p);});
   SortFirst(comp, nl);
   auto uidx = Grow(s.uidx, nl, "kcsr_uidx");
   int nu = 0;
@@ -416,11 +418,15 @@ void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, const std::int64_t kbound
   const int nl_ = nl, nu_ = nu;
   Kokkos::parallel_for("kcsr_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, nl),
   KOKKOS_LAMBDA(const int k) {
-    ls(k) = static_cast<int>(comp(k) % nn);
+    ls(k) = ranked ? inv(static_cast<int>(comp(k) % nn)) : static_cast<int>(comp(k) % nn);
     if (uidx(k) >= 0) {uk(uidx(k)) = comp(k)/nn; st(uidx(k)) = k;}
     if (k == nl_ - 1) st(nu_) = nl_;
   });
   c.nu = nu;
+}
+void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, const std::int64_t kbound, const int slot,
+                 KeyCSR &c) {
+  BuildKeyCSR(key, kbound, slot, c, DvceArray1D<int>(), DvceArray1D<int>());
 }
 
 // per-cell linked lists of the new clouds of a pass (the dense head array needed one
@@ -1363,7 +1369,41 @@ int DustGasDrag::MergeCloudsDevice() {
         });
         // sparse keys (cell << 4 | sub), the walk over the cells that hold pieces
         KeyCSR qsc;
-        BuildKeyCSR(kq, (4*nc) << 4, 3, qsc);
+        if (cloud_merge_position_order) {
+          // (diagnostic) the walk takes the pieces of a sub-cell in the order of
+          // their positions (rows of y, then x, 2^20 per side of the domain; particle order
+          // among equal ones) instead of the particle order, which carries the storage history
+          // (the split appends children in the scan order of their parents)
+          const int np_ = npart;
+          DvceArray1D<std::int64_t> sk(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q_poskey"), np_);
+          DvceArray1D<int> qrank(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q_rank"), np_);
+          DvceArray1D<int> qinv(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q_inv"), np_);
+          const std::int64_t nn = np_, side = std::int64_t(1) << 20;
+          if (static_cast<double>(side)*side*nn >= 9.0e18) {
+            std::cout << "### FATAL ERROR: cloud_merge_position_order: too many particles" << std::endl;
+            std::exit(EXIT_FAILURE);
+          }
+          const Real lx1 = transfer.x1max - transfer.x1min, lx2 = transfer.x2max - transfer.x2min;
+          Kokkos::parallel_for("q_poskey", Kokkos::RangePolicy<>(DevExeSpace(), 0, np_),
+          KOKKOS_LAMBDA(const int p) {
+            const Real x = SMRCompositeTransfer::WrapPosition(pr(IPX,p), transfer.x1min, transfer.x1max);
+            const Real y = SMRCompositeTransfer::WrapPosition(pr(IPY,p), transfer.x2min, transfer.x2max);
+            std::int64_t ix = static_cast<std::int64_t>((x - transfer.x1min)/lx1*side);
+            std::int64_t iy = static_cast<std::int64_t>((y - transfer.x2min)/lx2*side);
+            ix = (ix < 0) ? 0 : ((ix >= side) ? side - 1 : ix);
+            iy = (iy < 0) ? 0 : ((iy >= side) ? side - 1 : iy);
+            sk(p) = (iy*side + ix)*nn + p;
+          });
+          Kokkos::sort(sk);
+          Kokkos::parallel_for("q_rank", Kokkos::RangePolicy<>(DevExeSpace(), 0, np_),
+          KOKKOS_LAMBDA(const int r) {
+            const int p = static_cast<int>(sk(r) % nn);
+            qrank(p) = r; qinv(r) = p;
+          });
+          BuildKeyCSR(kq, (4*nc) << 4, 3, qsc, qrank, qinv);
+        } else {
+          BuildKeyCSR(kq, (4*nc) << 4, 3, qsc);
+        }
         // the distinct cells: their first entry in qsc.ukey (the 16 sub-keys of a cell are adjacent)
         DvceArray1D<int> cfirst(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q_cfirst"), qsc.nu + 1);
         int ncell = 0;

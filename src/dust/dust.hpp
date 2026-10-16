@@ -1722,6 +1722,7 @@ class DustGasDrag {
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)
   bool cloud_sort_morton = false;     // cells of a block in Morton order (else row by row)
   bool cloud_sort_at_start = false;   // diagnostic: sort before split / R / merge of the cycle
+  bool cloud_merge_position_order = false;   // diagnostic: G walk takes pieces by position
   DvceArray2D<Real> sort_spare_r;     // the arrays the reordered particles are written to
   DvceArray2D<int> sort_spare_i;
   void SortParticles();
