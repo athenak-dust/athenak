@@ -48,6 +48,7 @@ add_executable(
         dust/dust_cloud.cpp
         dust/dust_cloud_device.cpp
         dust/dust_resample.cpp
+        dust/dust_resample_device.cpp
         dust/dust_amr.cpp
         dust/dust_restart.cpp
         dust/dust_tasks.cpp

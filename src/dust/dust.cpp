@@ -487,6 +487,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 2.0);
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
+      // The per-patch solves on the device (same patches and algorithm); the
+      // comparison runs both on the same pool and logs the differences (cloud_resample_compare.txt)
+      cloud_resample_device = pin->GetOrAddBoolean("dust", "cloud_resample_device", false);
+      cloud_resample_device_mem_mb = pin->GetOrAddInteger("dust", "cloud_resample_device_mem_mb", 2048);
+      cloud_resample_compare = pin->GetOrAddBoolean("dust", "cloud_resample_compare", false);
       cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
       cloud_resample_skip_at_cap = pin->GetOrAddBoolean("dust", "cloud_resample_skip_at_cap", true);
       // Resampling after every regrid, default on.  The older key

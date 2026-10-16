@@ -22,6 +22,11 @@
 //! not the reference's cloud for cloud, while the same rows are kept.  Device: new masses,
 //! compaction.  Single rank only, like the merge pass.
 //!
+//! With <dust>/cloud_resample_device = true the pool is put in patch order
+//! and every patch is solved on the device (dust_resample_device.cpp, same algorithm); with
+//! cloud_resample_compare = true both run on the same pool and cloud_resample_compare.txt
+//! records the differences (the device result is applied only with cloud_resample_device).
+//!
 //! Schedule: every cloud_resample_interval cycles (default), or with
 //! cloud_resample_schedule = time at the planned times t0 + k dt; see ResampleDue.
 
@@ -45,6 +50,8 @@
 #include "particles/particles.hpp"
 #include "hydro/hydro.hpp"
 #include "dust.hpp"
+#include "dust_resample.hpp"
+#include <Kokkos_Sort.hpp>
 
 namespace dust {
 
@@ -680,68 +687,209 @@ int DustGasDrag::ResampleClouds() {
   Kokkos::fence();
   const double t_dev = seconds(t0);
   t0 = Clock::now();
-  auto pd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pd);
-  auto pid_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pid);
-  auto cptr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cptr);
-  auto ctgt_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ctgt);
-  auto cwgt_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cwgt);
-  const double t_copy = seconds(t0);
-  t0 = Clock::now();
-
-  // host: clouds in patch order (counting sort), CSR in the same order
   const int npatch = np1*np2;
-  std::vector<int> pptr(npatch + 1, 0), order(npool);
-  for (int a=0; a<npool; ++a) ++pptr[pid_h(a,0) + 1];
-  for (int q=0; q<npatch; ++q) pptr[q+1] += pptr[q];
-  {
-    std::vector<int> fill(pptr.begin(), pptr.end() - 1);
-    for (int a=0; a<npool; ++a) order[fill[pid_h(a,0)]++] = a;
-  }
-  std::vector<double> spd(static_cast<std::size_t>(npool)*npd), swgt(nnz), mnew(npool);
-  std::vector<int> sptr(npool + 1), stgt(nnz);
-  sptr[0] = 0;
-  for (int k=0; k<npool; ++k) {
-    const int a = order[k];
-    for (int c=0; c<npd; ++c) spd[static_cast<std::size_t>(k)*npd + c] = pd_h(a,c);
-    int e = sptr[k];
-    for (int j=cptr_h(a); j<cptr_h(a+1); ++j) {stgt[e] = ctgt_h(j); swgt[e] = cwgt_h(j); ++e;}
-    sptr[k+1] = e;
-  }
-  const double t_sort = seconds(t0);
-  t0 = Clock::now();
   const double lx = transfer.x1max - transfer.x1min, ly = transfer.x2max - transfer.x2min;
+  // The patch solves on the host (default), on the device, or both on the same
+  // pool (cloud_resample_compare: the differences are logged, the device result is used)
+  const bool on_dev = cloud_resample_device || cloud_resample_compare;
+  const bool on_host = !cloud_resample_device || cloud_resample_compare;
+  double t_copy = 0.0, t_sort = 0.0, t_host = 0.0, cpu = 0.0;
+  int nthread = 0;
   std::vector<PatchInfo> infos(npatch);
-  std::atomic<int> next(0);
-  const int nthread = std::max(1, std::min(cloud_resample_threads, npatch));
-  std::vector<double> busy(nthread, 0.0);
-  auto worker = [&](const int tid) {
-    Work ws;
-    auto tw = Clock::now();
-    while (true) {
-      const int q = next.fetch_add(1);
-      if (q >= npatch) break;
-      if (pptr[q+1] - pptr[q] < 1) continue;
-      const double xc = transfer.x1min + (q % np1 + 0.5)*s*root_dx1;
-      const double yc = transfer.x2min + (q/np1 + 0.5)*s*root_dx2;
-      infos[q] = ResamplePatch(pptr[q], pptr[q+1], spd.data(), npd, sptr.data(), stgt.data(),
-                               swgt.data(), xc, yc, lx, ly, root_dx1, root_dx2, mnew.data(), ws);
+  std::vector<int> order;
+  std::vector<double> mnew;
+  Kokkos::View<Real**, Kokkos::LayoutRight, HostMemSpace> pdc;   // pool table (comparison)
+  Kokkos::View<int**, Kokkos::LayoutRight, HostMemSpace> pidc;
+  if (on_host) {
+    auto pd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pd);
+    auto pid_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pid);
+    auto cptr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cptr);
+    auto ctgt_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ctgt);
+    auto cwgt_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cwgt);
+    t_copy = seconds(t0);
+    t0 = Clock::now();
+
+    // host: clouds in patch order (counting sort), CSR in the same order
+    std::vector<int> pptr(npatch + 1, 0);
+    order.assign(npool, 0);
+    for (int a=0; a<npool; ++a) ++pptr[pid_h(a,0) + 1];
+    for (int q=0; q<npatch; ++q) pptr[q+1] += pptr[q];
+    {
+      std::vector<int> fill(pptr.begin(), pptr.end() - 1);
+      for (int a=0; a<npool; ++a) order[fill[pid_h(a,0)]++] = a;
     }
-    busy[tid] = seconds(tw);
-  };
-  if (nthread == 1) {
-    worker(0);
-  } else {
-    std::vector<std::thread> th;
-    for (int t=0; t<nthread; ++t) th.emplace_back(worker, t);
-    for (auto &t : th) t.join();
+    std::vector<double> spd(static_cast<std::size_t>(npool)*npd), swgt(nnz);
+    mnew.assign(npool, 0.0);
+    std::vector<int> sptr(npool + 1), stgt(nnz);
+    sptr[0] = 0;
+    for (int k=0; k<npool; ++k) {
+      const int a = order[k];
+      for (int c=0; c<npd; ++c) spd[static_cast<std::size_t>(k)*npd + c] = pd_h(a,c);
+      int e = sptr[k];
+      for (int j=cptr_h(a); j<cptr_h(a+1); ++j) {stgt[e] = ctgt_h(j); swgt[e] = cwgt_h(j); ++e;}
+      sptr[k+1] = e;
+    }
+    t_sort = seconds(t0);
+    t0 = Clock::now();
+    std::atomic<int> next(0);
+    nthread = std::max(1, std::min(cloud_resample_threads, npatch));
+    std::vector<double> busy(nthread, 0.0);
+    auto worker = [&](const int tid) {
+      Work ws;
+      auto tw = Clock::now();
+      while (true) {
+        const int q = next.fetch_add(1);
+        if (q >= npatch) break;
+        if (pptr[q+1] - pptr[q] < 1) continue;
+        const double xc = transfer.x1min + (q % np1 + 0.5)*s*root_dx1;
+        const double yc = transfer.x2min + (q/np1 + 0.5)*s*root_dx2;
+        infos[q] = ResamplePatch(pptr[q], pptr[q+1], spd.data(), npd, sptr.data(), stgt.data(),
+                                 swgt.data(), xc, yc, lx, ly, root_dx1, root_dx2, mnew.data(), ws);
+      }
+      busy[tid] = seconds(tw);
+    };
+    if (nthread == 1) {
+      worker(0);
+    } else {
+      std::vector<std::thread> th;
+      for (int t=0; t<nthread; ++t) th.emplace_back(worker, t);
+      for (auto &t : th) t.join();
+    }
+    t_host = seconds(t0);
+    for (double b : busy) cpu += b;
+    if (cloud_resample_compare) {
+      pdc = Kokkos::View<Real**, Kokkos::LayoutRight, HostMemSpace>("rs_pdc", npool, npd);
+      pidc = Kokkos::View<int**, Kokkos::LayoutRight, HostMemSpace>("rs_pidc", npool, 2);
+      for (int a=0; a<npool; ++a) {
+        for (int c=0; c<npd; ++c) pdc(a,c) = pd_h(a,c);
+        pidc(a,0) = pid_h(a,0); pidc(a,1) = pid_h(a,1);
+      }
+    }
   }
-  const double t_host = seconds(t0);
+  std::vector<PatchInfo> dinfos;
+  DvceArray1D<Real> mdev;
+  double dtim[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // device: order, sizes, small, large, solve
+  if (on_dev) {
+    auto td = Clock::now();
+    // the pool in patch order on the device: the unique keys patch * npool + a, sorted (the
+    // host's counting sort keeps the pool order inside a patch, so does this)
+    DvceArray1D<std::int64_t> key(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_key"), npool);
+    const std::int64_t npl = npool;
+    Kokkos::parallel_for("rs_key", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int a) {key(a) = static_cast<std::int64_t>(pid(a,0))*npl + a;});
+    Kokkos::sort(key);
+    resample::DevicePatchProblem pb;
+    pb.npool = npool; pb.npatch = npatch; pb.np1 = np1; pb.s = s;
+    pb.x1min = transfer.x1min; pb.x2min = transfer.x2min; pb.lx = lx; pb.ly = ly;
+    pb.rdx = root_dx1; pb.rdy = root_dx2;
+    pb.pptr = DvceArray1D<int>("rs_pptr", npatch + 1);
+    DvceArray1D<int> sorder(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_sorder"), npool);
+    DvceArray1D<int> scnt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_scnt"), npool);
+    auto pptr_d = pb.pptr;
+    Kokkos::parallel_for("rs_order", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int k) {
+      const int a = static_cast<int>(key(k) % npl), q = static_cast<int>(key(k)/npl);
+      sorder(k) = a;
+      scnt(k) = cptr(a + 1) - cptr(a);
+      Kokkos::atomic_inc(&pptr_d(q + 1));
+    });
+    Kokkos::parallel_scan("rs_pptr", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch + 1),
+    KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
+      upd += pptr_d(q);
+      if (final) pptr_d(q) = upd;
+    });
+    pb.sptr = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_sptr"), npool + 1);
+    auto sptr_d = pb.sptr;
+    Kokkos::parallel_scan("rs_sptr", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int k, int &upd, const bool final) {
+      if (final) sptr_d(k) = upd;
+      upd += scnt(k);
+      if (final && k == npl - 1) sptr_d(k + 1) = upd;
+    });
+    pb.spd = DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_spd"), npool, npd);
+    pb.stgt = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_stgt"), nnz);
+    pb.swgt = DvceArray1D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_swgt"), nnz);
+    auto spd_d = pb.spd; auto stgt_d = pb.stgt; auto swgt_d = pb.swgt;
+    Kokkos::parallel_for("rs_sfill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int k) {
+      const int a = sorder(k);
+      for (int c=0; c<npd; ++c) spd_d(k,c) = pd(a,c);
+      int e = sptr_d(k);
+      for (int j=cptr(a); j<cptr(a + 1); ++j) {stgt_d(e) = ctgt(j); swgt_d(e) = cwgt(j); ++e;}
+    });
+    Kokkos::fence();
+    dtim[0] = seconds(td);
+    DvceArray1D<double> mn("rs_dev_mnew", npool);
+    DvceArray2D<int> outi("rs_dev_outi", npatch, resample::NPC);
+    DvceArray1D<double> outr("rs_dev_outr", npatch);
+    double tim[4] = {0.0, 0.0, 0.0, 0.0};
+    resample::SolvePatchesDevice(pb, mn, outi, outr, cloud_resample_device_mem_mb, tim);
+    dtim[1] = tim[0]; dtim[2] = tim[1]; dtim[3] = tim[2]; dtim[4] = tim[3];
+    mdev = DvceArray1D<Real>("rs_mnew_dev", npool);
+    auto mdv = mdev;
+    Kokkos::parallel_for("rs_unsort", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int k) {mdv(sorder(k)) = mn(k);});
+    auto oi = Kokkos::create_mirror_view_and_copy(HostMemSpace(), outi);
+    auto orr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), outr);
+    dinfos.resize(npatch);
+    for (int q=0; q<npatch; ++q) {
+      PatchInfo f;
+      f.n = oi(q, resample::PN); f.kept = oi(q, resample::PKEPT); f.ncap = oi(q, resample::PNCAP);
+      f.fallback = oi(q, resample::PFALLBACK); f.steps_zero = oi(q, resample::PZERO);
+      f.steps_cap = oi(q, resample::PCAPSTEP); f.scans = oi(q, resample::PSCANS);
+      f.nrow = oi(q, resample::PNROW); f.nb = oi(q, resample::PNB); f.res = orr(q);
+      dinfos[q] = f;
+    }
+  }
+  if (cloud_resample_compare) {
+    // the same pool solved on the host and on the device: per cloud, per patch
+    auto md_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), mdev);
+    std::vector<double> mh(npool);
+    for (int k=0; k<npool; ++k) mh[order[k]] = mnew[k];
+    long long rem_h = 0, rem_d = 0, kdiff = 0;
+    double dmax = 0.0;
+    std::vector<char> pk(npatch, 0), pm(npatch, 0);
+    for (int a=0; a<npool; ++a) {
+      const double m0a = pdc(a, resample::JM);
+      if (!(mh[a] > 0.0)) ++rem_h;
+      if (!(md_h(a) > 0.0)) ++rem_d;
+      const int q = pidc(a, 0);
+      if ((mh[a] > 0.0) != (md_h(a) > 0.0)) {++kdiff; pk[q] = 1;}
+      const double rel = std::fabs(mh[a] - md_h(a))/m0a;
+      dmax = std::max(dmax, rel);
+      if (rel > 1.0e-12) pm[q] = 1;
+    }
+    long long fh = 0, fd = 0, npk = 0, npm = 0, nzh = 0, nzd = 0, nch = 0, ncd = 0;
+    for (int q=0; q<npatch; ++q) {
+      npk += pk[q]; npm += pm[q];
+      fh += (infos[q].fallback != 0); fd += (dinfos[q].fallback != 0);
+      nzh += infos[q].steps_zero; nzd += dinfos[q].steps_zero;
+      nch += infos[q].steps_cap; ncd += dinfos[q].steps_cap;
+    }
+    if (global_variable::my_rank == 0) {
+      std::FILE *fc = std::fopen("cloud_resample_compare.txt", "a");
+      if (fc != nullptr) {
+        std::fseek(fc, 0, SEEK_END);
+        if (std::ftell(fc) == 0) {
+          std::fprintf(fc, "# ncycle time pool removed_host removed_device clouds_kept_differ "
+                       "patches_kept_differ patches_mass_differ(>1e-12) max_rel_mass_diff "
+                       "fallback_host fallback_device steps_zero_host steps_zero_device "
+                       "steps_cap_host steps_cap_device t_host_wall t_device_solve\n");
+        }
+        std::fprintf(fc, "%d %.17g %d %lld %lld %lld %lld %lld %.3e %lld %lld %lld %lld %lld %lld %.4e %.4e\n",
+                     pmesh->ncycle, pmesh->time, npool, rem_h, rem_d, kdiff, npk, npm, dmax, fh, fd,
+                     nzh, nzd, nch, ncd, t_host, dtim[4]);
+        std::fclose(fc);
+      }
+    }
+  }
+  if (cloud_resample_device) {t_sort = dtim[0]; t_host = dtim[4];}
   t0 = Clock::now();
   long long pool = 0, kept = 0, atcap = 0, nfall = 0, nred = 0, npat = 0, zsteps = 0, csteps = 0, scans = 0;
-  double resmax = 0.0, cpu = 0.0;
+  double resmax = 0.0;
   double st[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // stage seconds, all threads
   int nmax = 0, nbmax = 0, n64 = 0, n256 = 0;      // largest patch, its rows; patches with >= 64 / 256 clouds
-  for (const auto &f : infos) {
+  for (const auto &f : (cloud_resample_device ? dinfos : infos)) {
     if (f.n == 0) continue;
     st[0] += f.t_rows; st[1] += f.t_scale; st[2] += f.t_qr; st[3] += f.t_null; st[4] += f.t_red;
     st[5] += f.t_check;
@@ -753,17 +901,22 @@ int DustGasDrag::ResampleClouds() {
     if (f.fallback) ++nfall; else resmax = std::max(resmax, f.res);
     if (f.kept < f.n) ++nred;
   }
-  for (double b : busy) cpu += b;
   const int nremoved = static_cast<int>(pool - kept);
 
   // device: new masses, compaction
   if (nremoved > 0 || csteps > 0) {
-    Kokkos::View<double*, HostMemSpace> mh("rs_mnew_h", npool);
-    for (int k=0; k<npool; ++k) mh(order[k]) = mnew[k];
-    DvceArray1D<Real> md("rs_mnew", npool);
-    Kokkos::deep_copy(md, mh);
-    Kokkos::parallel_for("rs_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int a) {pr(IPM, pid(a,1)) = md(a);});
+    if (cloud_resample_device) {
+      auto mdv = mdev;
+      Kokkos::parallel_for("rs_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int a) {pr(IPM, pid(a,1)) = mdv(a);});
+    } else {
+      Kokkos::View<double*, HostMemSpace> mh("rs_mnew_h", npool);
+      for (int k=0; k<npool; ++k) mh(order[k]) = mnew[k];
+      DvceArray1D<Real> md("rs_mnew", npool);
+      Kokkos::deep_copy(md, mh);
+      Kokkos::parallel_for("rs_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int a) {pr(IPM, pid(a,1)) = md(a);});
+    }
   }
   int nfinal = npart;
   if (nremoved > 0) {
@@ -813,15 +966,17 @@ int DustGasDrag::ResampleClouds() {
       std::fprintf(fp, "# ncycle time npart_before npart_after pool above_cap lobed patches"
                    " patches_reduced kept at_cap fallback max_res_accepted steps_zero steps_cap scans"
                    " M_b M_a PX_b PX_a t_total t_device t_copy t_sort t_host_wall t_host_cpu t_back"
-                   " threads nnz s_rows s_scale s_qr s_null s_reduce s_check n_max nb_max n_ge64 n_ge256\n");
+                   " threads nnz s_rows s_scale s_qr s_null s_reduce s_check n_max nb_max n_ge64 n_ge256"
+                   " device t_dev_order t_dev_sizes t_dev_small t_dev_large\n");
     }
     std::fprintf(fp, "%d %.17g %d %d %lld %.0f %.0f %lld %lld %lld %lld %lld %.3e %lld %lld %lld"
                  " %.17g %.17g %.17g %.17g %.4e %.4e %.4e %.4e %.4e %.4e %.4e %d %d"
-                 " %.4e %.4e %.4e %.4e %.4e %.4e %d %d %d %d\n", pmesh->ncycle,
+                 " %.4e %.4e %.4e %.4e %.4e %.4e %d %d %d %d %d %.4e %.4e %.4e %.4e\n", pmesh->ncycle,
                  pmesh->time, npart, nfinal, pool, cnt_b[1], cnt_b[0], npat, nred, kept, atcap, nfall,
                  resmax, zsteps, csteps, scans, tot_b[0], tot_a[0], tot_b[1], tot_a[1], seconds(t_all),
                  t_dev, t_copy, t_sort, t_host, cpu, t_back, nthread, nnz, st[0], st[1], st[2],
-                 st[3], st[4], st[5], nmax, nbmax, n64, n256);
+                 st[3], st[4], st[5], nmax, nbmax, n64, n256, cloud_resample_device ? 1 : 0,
+                 dtim[0], dtim[1], dtim[2], dtim[3]);
     std::fclose(fp);
   }
   if (dump) DumpResampleState(ppar, pmesh, "post");
