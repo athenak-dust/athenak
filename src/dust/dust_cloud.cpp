@@ -95,6 +95,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
       std::exit(EXIT_FAILURE);
     }
     cloud_sort_morton = (so == "morton");
+    cloud_sort_at_start = pin->GetOrAddBoolean("dust", "cloud_sort_at_start", false);
   }
   const bool graded = pin->DoesParameterExist("problem", "graded_split_layers") &&
                       pin->GetInteger("problem", "graded_split_layers") >= 0;
@@ -429,6 +430,12 @@ void DustGasDrag::EnsureNextTag() {
 TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) return TaskStatus::complete;
   EnsureNextTag();
+  // Diagnostic: cloud_sort_at_start sorts before the split, resampling and merge
+  // pass of the cycle (to compare their decisions on one state in two storage orders)
+  if (cloud_sort_at_start && cloud_sort_interval > 0 &&
+      pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
+    SortParticles();
+  }
   SplitAndMergeClouds();
   // the merge clock is read once per cycle (MergeDue advances it)
   const bool merge_due = cloud_merge && MergeDue() &&
@@ -453,7 +460,8 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (cloud_leaf_check > 0 && pmy_pack->pmesh->ncycle % cloud_leaf_check == 0) {
     CheckLeafTraversal();
   }
-  if (cloud_sort_interval > 0 && pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
+  if (!cloud_sort_at_start && cloud_sort_interval > 0 &&
+      pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
     SortParticles();
   }
   return TaskStatus::complete;
