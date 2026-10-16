@@ -486,6 +486,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 2.0);
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
+      // Patches inside one MeshBlock of min(cloud_resample_patch 2^level,
+      // cloud_resample_patch_cells)^2 of its cells (block, default) or of cloud_resample_patch^2
+      // root cells (root)
+      {
+        const std::string pm = pin->GetOrAddString("dust", "cloud_resample_patches", "block");
+        if (pm != "block" && pm != "root") {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << "<dust>/cloud_resample_patches must be block or root" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        cloud_resample_block_patches = (pm == "block");
+      }
+      cloud_resample_patch_cells = pin->GetOrAddInteger("dust", "cloud_resample_patch_cells", 4);   // cap
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
       // Rixin: the per-patch solves on the device by default (same patches and algorithm;
       // false keeps the host solves); the

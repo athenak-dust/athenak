@@ -463,8 +463,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
   tm.team_barrier();
   // rows: leaf mass, leaf momentum about the patch mean, centre of mass, velocity second
   // moments, leaf feedback; one thread per cloud (its column A[i*n + j])
-  const double xc = pb.x1min + (q % pb.np1 + 0.5)*pb.s*pb.rdx;
-  const double yc = pb.x2min + (q/pb.np1 + 0.5)*pb.s*pb.rdy;
+  const double xc = pb.pgeo(q,0), yc = pb.pgeo(q,1), rdx = pb.pgeo(q,2), rdy = pb.pgeo(q,3);
   Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int j) {
     const int a = a0 + j;
     auto col = [&](const int i) -> double & {return ws.A[static_cast<std::size_t>(i)*n + j];};
@@ -480,7 +479,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
     double dx = spd(a, JX) - xc, dy = spd(a, JY) - yc;
     dx -= pb.lx*Kokkos::floor(dx/pb.lx + 0.5); dy -= pb.ly*Kokkos::floor(dy/pb.ly + 0.5);
     const int g = 4*nl;
-    col(g) = dx/pb.rdx; col(g + 1) = dy/pb.rdy;
+    col(g) = dx/rdx; col(g + 1) = dy/rdy;
     col(g + 2) = c[0]*c[0]; col(g + 3) = c[0]*c[1]; col(g + 4) = c[0]*c[2]; col(g + 5) = c[1]*c[1];
     col(g + 6) = c[1]*c[2]; col(g + 7) = c[2]*c[2];
   });

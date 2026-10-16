@@ -7,7 +7,9 @@
 //! \brief Conservative same-level resampling of refinable clouds, in the
 //! code instead of the offline reference (rs_lib.py / rs2_lib.py: Domain, rows, prune_cap).
 //! Positions, velocities, shapes and stopping times are kept; only the masses of the plain
-//! clouds change, a cloud whose mass reaches zero is removed.  Per patch of s x s root cells
+//! clouds change, a cloud whose mass reaches zero is removed.  Per patch (kc x kc
+//! cells of one MeshBlock by default, so that a patch holds about the same number of leaves on
+//! every level; or s x s root cells, cloud_resample_patches = root)
 //! the new masses keep, to round-off, every leaf's deposited mass and momentum, the three
 //! components of the frozen-gas drag feedback of every leaf (AuditFeedback), the centre of
 //! mass and the six velocity second moments of the patch; a mass never exceeds its cap
@@ -586,12 +588,43 @@ int DustGasDrag::ResampleClouds() {
               << "cloud_resample needs the root cloud mass: set <dust>/cloud_resample_m0" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  const int s = cloud_resample_patch;
+  // the patches.  root: s x s root cells; a patch of a block l
+  // levels finer holds 4^l times as many leaves.  block (default): inside one MeshBlock, k x k
+  // of its cells with k = min(s 2^l, kc): the root patches up to the level where they reach
+  // kc x kc cells, never more, so a patch holds at most about (kc + 2)^2 leaves on any level
+  const bool bpatch = cloud_resample_block_patches;
+  const int s = cloud_resample_patch, kc = cloud_resample_patch_cells;
   const int nroot1 = transfer.nfine1 >> nlev, nroot2 = transfer.nfine2 >> nlev;
-  if (nroot1 % s != 0 || nroot2 % s != 0) {
+  const int nmbp = pmy_pack->nmb_thispack, bnx1 = pmesh->mb_indcs.nx1, bnx2 = pmesh->mb_indcs.nx2;
+  std::vector<int> kblk_h, poff_h(nmbp + 1, 0);   // block patches: k per block, patch offsets
+  bool bad = bpatch ? (kc < 1) : (nroot1 % s != 0 || nroot2 % s != 0);
+  if (bpatch && !bad) {
+    kblk_h.resize(nmbp);
+    for (int b=0; b<nmbp; ++b) {
+      const int lev = pmy_pack->pmb->mb_lev.h_view(b) - pmesh->root_level;
+      int k = s;
+      for (int l=0; l<lev && k < kc; ++l) k *= 2;
+      k = std::min(k, kc);
+      if (bnx1 % k != 0 || bnx2 % k != 0) bad = true;
+      kblk_h[b] = k;
+      poff_h[b + 1] = poff_h[b] + (bnx1/k)*(bnx2/k);
+    }
+  }
+  if (bad) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "cloud_resample_patch must divide the root grid" << std::endl;
+              << (bpatch ? "block patches of min(cloud_resample_patch 2^level, "
+                           "cloud_resample_patch_cells) cells must divide the MeshBlock"
+                         : "cloud_resample_patch must divide the root grid") << std::endl;
     std::exit(EXIT_FAILURE);
+  }
+  DvceArray1D<int> kblk("rs_kblk", bpatch ? nmbp : 1), poff("rs_poff", nmbp + 1);
+  if (bpatch) {
+    auto kb = Kokkos::create_mirror_view(kblk);
+    auto po = Kokkos::create_mirror_view(poff);
+    for (int b=0; b<nmbp; ++b) kb(b) = kblk_h[b];
+    for (int b=0; b<=nmbp; ++b) po(b) = poff_h[b];
+    Kokkos::deep_copy(kblk, kb);
+    Kokkos::deep_copy(poff, po);
   }
   const int np1 = nroot1/s, np2 = nroot2/s;
   const Real eta = cloud_resample_eta;
@@ -702,12 +735,28 @@ int DustGasDrag::ResampleClouds() {
     pd(a,3) = pr(IPVX,p); pd(a,4) = pr(IPVY,p); pd(a,5) = pr(IPVZ,p); pd(a,6) = pr(IPTS,p);
     pd(a,7) = ugx; pd(a,8) = ugy; pd(a,9) = ugz;
     pd(a,10) = (eta > 0.0) ? eta*m0/static_cast<Real>(1 << (2*lev)) : 1.0e300;
-    const Real xw = SMRCompositeTransfer::WrapPosition(xp, transfer.x1min, transfer.x1max);
-    const Real yw = SMRCompositeTransfer::WrapPosition(yp, transfer.x2min, transfer.x2max);
-    int ix = static_cast<int>(floor((xw - x1min)/root_dx1)), iy = static_cast<int>(floor((yw - x2min)/root_dx2));
-    ix = (ix < 0) ? 0 : ((ix >= nroot1) ? nroot1 - 1 : ix);
-    iy = (iy < 0) ? 0 : ((iy >= nroot2) ? nroot2 - 1 : iy);
-    pid(a,0) = (iy/s)*np1 + ix/s; pid(a,1) = p;
+    if (bpatch) {
+      // the leaf that holds the particle: its block and cell
+      const int am = lt.Anchor(pi(PGID,p));
+      const int t = lt.LeafOwner(xp, yp, am);
+      int b = am, ti = 0, tj = 0;
+      if (t >= 0) {
+        b = t/(ncells1*ncells2);
+        const int r = t % (ncells1*ncells2);
+        tj = r/ncells1 - js; ti = r % ncells1 - is;
+      }
+      const int k = kblk(b);
+      pid(a,0) = poff(b) + (tj/k)*(bnx1/k) + ti/k;
+    } else {
+      const Real xw = SMRCompositeTransfer::WrapPosition(xp, transfer.x1min, transfer.x1max);
+      const Real yw = SMRCompositeTransfer::WrapPosition(yp, transfer.x2min, transfer.x2max);
+      int ix = static_cast<int>(floor((xw - x1min)/root_dx1));
+      int iy = static_cast<int>(floor((yw - x2min)/root_dx2));
+      ix = (ix < 0) ? 0 : ((ix >= nroot1) ? nroot1 - 1 : ix);
+      iy = (iy < 0) ? 0 : ((iy >= nroot2) ? nroot2 - 1 : iy);
+      pid(a,0) = (iy/s)*np1 + ix/s;
+    }
+    pid(a,1) = p;
     cptr(a) = coff(p);
     int e = coff(p);
     lt.ForEachCloudWeight(xp, yp, code, lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
@@ -717,8 +766,33 @@ int DustGasDrag::ResampleClouds() {
   Kokkos::fence();
   const double t_dev = seconds(t0);
   t0 = Clock::now();
-  const int npatch = np1*np2;
+  const int npatch = bpatch ? poff_h[nmbp] : np1*np2;
   const double lx = transfer.x1max - transfer.x1min, ly = transfer.x2max - transfer.x2min;
+  // per patch: centre and length scale of the centre-of-mass rows (half the patch width; the
+  // root patches keep their earlier values)
+  DvceArray2D<Real> pgeo(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pgeo"), npatch, 4);
+  {
+    const Real rx1 = root_dx1, rx2 = root_dx2;
+    Kokkos::parallel_for("rs_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+    KOKKOS_LAMBDA(const int q) {
+      if (bpatch) {
+        int lo = 0, hi = nmbp;   // the block of patch q: poff(b) <= q < poff(b + 1)
+        while (hi - lo > 1) {
+          const int mid = (lo + hi)/2;
+          if (poff(mid) <= q) lo = mid; else hi = mid;
+        }
+        const int b = lo, k = kblk(b), r = q - poff(b), nbx = bnx1/k, ip = r % nbx, jp = r/nbx;
+        const Real d1 = mbsize.d_view(b).dx1, d2 = mbsize.d_view(b).dx2;
+        pgeo(q,0) = mbsize.d_view(b).x1min + (ip + 0.5)*k*d1;
+        pgeo(q,1) = mbsize.d_view(b).x2min + (jp + 0.5)*k*d2;
+        pgeo(q,2) = 0.5*k*d1; pgeo(q,3) = 0.5*k*d2;
+      } else {
+        pgeo(q,0) = x1min + (q % np1 + 0.5)*s*rx1;
+        pgeo(q,1) = x2min + (q/np1 + 0.5)*s*rx2;
+        pgeo(q,2) = rx1; pgeo(q,3) = rx2;
+      }
+    });
+  }
   // The patch solves on the host (default), on the device, or both on the same
   // pool (cloud_resample_compare: the differences are logged, the device result is used)
   const bool on_dev = cloud_resample_device || cloud_resample_compare;
@@ -732,6 +806,7 @@ int DustGasDrag::ResampleClouds() {
   Kokkos::View<int**, Kokkos::LayoutRight, HostMemSpace> pidc;
   if (on_host) {
     auto pd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pd);
+    auto pgeo_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pgeo);
     auto pid_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pid);
     auto cptr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cptr);
     auto ctgt_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ctgt);
@@ -771,10 +846,9 @@ int DustGasDrag::ResampleClouds() {
         const int q = next.fetch_add(1);
         if (q >= npatch) break;
         if (pptr[q+1] - pptr[q] < 1) continue;
-        const double xc = transfer.x1min + (q % np1 + 0.5)*s*root_dx1;
-        const double yc = transfer.x2min + (q/np1 + 0.5)*s*root_dx2;
         infos[q] = ResamplePatch(pptr[q], pptr[q+1], spd.data(), npd, sptr.data(), stgt.data(),
-                                 swgt.data(), xc, yc, lx, ly, root_dx1, root_dx2, mnew.data(), ws);
+                                 swgt.data(), pgeo_h(q,0), pgeo_h(q,1), lx, ly, pgeo_h(q,2),
+                                 pgeo_h(q,3), mnew.data(), ws);
       }
       busy[tid] = seconds(tw);
     };
@@ -809,9 +883,8 @@ int DustGasDrag::ResampleClouds() {
     KOKKOS_LAMBDA(const int a) {key(a) = static_cast<std::int64_t>(pid(a,0))*npl + a;});
     Kokkos::sort(key);
     resample::DevicePatchProblem pb;
-    pb.npool = npool; pb.npatch = npatch; pb.np1 = np1; pb.s = s;
-    pb.x1min = transfer.x1min; pb.x2min = transfer.x2min; pb.lx = lx; pb.ly = ly;
-    pb.rdx = root_dx1; pb.rdy = root_dx2;
+    pb.npool = npool; pb.npatch = npatch;
+    pb.lx = lx; pb.ly = ly; pb.pgeo = pgeo;
     pb.pptr = DvceArray1D<int>("rs_pptr", npatch + 1);
     DvceArray1D<int> sorder(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_sorder"), npool);
     DvceArray1D<int> scnt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_scnt"), npool);

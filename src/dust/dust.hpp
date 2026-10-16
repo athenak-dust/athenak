@@ -1464,7 +1464,9 @@ class DustGasDrag {
   bool cloud_resample = false;         // conservative same-level resampling in the code
   int cloud_resample_interval = 625;   // ... cycles between resamplings
   Real cloud_resample_eta = 2.0;       // ... mass cap eta m0 / 4^level (<= 0: no cap)
-  int cloud_resample_patch = 2;        // ... patch size in root cells
+  int cloud_resample_patch = 2;        // ... patch size in root cells (root patches)
+  bool cloud_resample_block_patches = true;   // patches inside one MeshBlock
+  int cloud_resample_patch_cells = 4;  // ... at most this many cells of the block per side
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
   bool cloud_resample_device = true;   // ... the patch solves on the device (default)
   int cloud_resample_device_mem_mb = 2048;  // ... workspace limit of the device solves

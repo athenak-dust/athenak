@@ -34,14 +34,16 @@ enum PatchCount {PN=0, PKEPT=1, PNCAP=2, PFALLBACK=3, PZERO=4, PCAPSTEP=5, PSCAN
 // The pool sorted by patch (k = 0..npool-1, patch q holds k in [pptr(q), pptr(q+1))): rows
 // spd (npool x NPD), CSR weights sptr / stgt / swgt in the same order.  New masses in mnew
 // (sorted order), counters in outi (npatch x NPC) and the accepted residual in outr (npatch).
-// Patch q is centred at (x1min + (q % np1 + 0.5) s rdx, x2min + (q / np1 + 0.5) s rdy).
+// Patch q is centred at (pgeo(q,0), pgeo(q,1)); its centre-of-mass rows are measured in units of
+// (pgeo(q,2), pgeo(q,3)).
 // Workspaces are allocated per team slot, with at most mem_mb megabytes in all.
 struct DevicePatchProblem {
   DvceArray2D<Real> spd;
   DvceArray1D<int> sptr, stgt, pptr;
   DvceArray1D<Real> swgt;
-  int npool = 0, npatch = 0, np1 = 0, s = 1;
-  double x1min = 0.0, x2min = 0.0, lx = 0.0, ly = 0.0, rdx = 0.0, rdy = 0.0;
+  DvceArray2D<Real> pgeo;
+  int npool = 0, npatch = 0;
+  double lx = 0.0, ly = 0.0;
 };
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
