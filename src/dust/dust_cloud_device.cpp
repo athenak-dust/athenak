@@ -2929,17 +2929,23 @@ void DustGasDrag::SortParticles() {
   sort_spare_i = pi;
   Kokkos::fence();
   const double t_move = t.seconds();
+  // the log stays open (buffered; flushed at exit): opening and closing it in every call cost
+  // about 1 ms per call on a parallel file system, more than the sort
+  static std::FILE *fp = nullptr;
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = std::fopen("cloud_sort_log.txt", "a");
-    if (fp != nullptr) {
-      std::fseek(fp, 0, SEEK_END);
-      if (std::ftell(fp) == 0) {
-        std::fprintf(fp, "# cloud sort: ncycle time particles moved t_keys t_sort t_move (s, fenced); "
-                     "order %s\n", morton ? "morton" : "linear");
+    if (fp == nullptr) {
+      fp = std::fopen("cloud_sort_log.txt", "a");
+      if (fp != nullptr) {
+        std::fseek(fp, 0, SEEK_END);
+        if (std::ftell(fp) == 0) {
+          std::fprintf(fp, "# cloud sort: ncycle time particles moved t_keys t_sort t_move (s, fenced); "
+                       "order %s\n", morton ? "morton" : "linear");
+        }
       }
+    }
+    if (fp != nullptr) {
       std::fprintf(fp, "%d %.17g %d %d %.4e %.4e %.4e\n", pmy_pack->pmesh->ncycle,
                    pmy_pack->pmesh->time, npart, moved, t_key, t_sort, t_move);
-      std::fclose(fp);
     }
   }
 }
