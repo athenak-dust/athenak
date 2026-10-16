@@ -705,6 +705,20 @@ struct LeafTraversal {
   DvceArray1D<int> nnb;                // number of neighbours of block m
   DvceArray2D<int> nb;                 // (m, k): local index of neighbour k
   DvceArray3D<int> nbs;                // (m, k, 0..1): periodic shift (in domain lengths)
+  // Split / merge eligibility on integer coordinates of the finest level (no
+  // stored grid).  Block m covers the finest cells [fbox(m,0), fbox(m,1)) x [fbox(m,2),
+  // fbox(m,3)); blev(m) is its level above the root.  The region where the (dilated) level
+  // map of the table exceeds lev is the union of the blocks of level >= lev + 1, each widened
+  // by rdil[lev + 1] finest cells (cloud_split_buffer): a higher level has a
+  // smaller region and a smaller widening, so it lies inside.
+  static constexpr int kMaxLev = 16;
+  int nlev = 0, nfine1 = 0, nfine2 = 0;
+  Real fine_dx1 = 0.0, fine_dx2 = 0.0;
+  int rdil[kMaxLev + 1] = {0};
+  int cloud_max_level = 0;
+  bool split_everywhere = false, split_overlap = false;
+  DvceArray1D<int> blev;
+  DvceArray2D<int> fbox;
 
   KOKKOS_INLINE_FUNCTION
   static Real Wrap(const Real x, const Real xmin, const Real xmax) {
@@ -805,6 +819,165 @@ struct LeafTraversal {
       }
     }
     return wsum;
+  }
+
+  // ---- split / merge eligibility --------------------------------------------------------
+  // the periodic image of (x1, x2) next to block m
+  KOKKOS_INLINE_FUNCTION
+  void Frame(const int m, Real &x1, Real &x2) const {
+    const Real cx = box(m, 0) + 0.5*nx1*box(m, 2), cy = box(m, 1) + 0.5*nx2*box(m, 3);
+    x1 -= lx*round((x1 - cx)/lx);
+    x2 -= ly*round((x2 - cy)/ly);
+  }
+  // finest-cell box [x0, x1) x [y0, y1) of block m (k < 0) or of its neighbour k, in the frame
+  // of m, widened by r
+  KOKKOS_INLINE_FUNCTION
+  void NbRect(const int m, const int k, const int r, int &b, int &x0, int &x1, int &y0,
+              int &y1) const {
+    b = (k < 0) ? m : nb(m, k);
+    const int sx = (k < 0) ? 0 : nbs(m, k, 0), sy = (k < 0) ? 0 : nbs(m, k, 1);
+    x0 = fbox(b, 0) - sx*nfine1 - r; x1 = fbox(b, 1) - sx*nfine1 + r;
+    y0 = fbox(b, 2) - sy*nfine2 - r; y1 = fbox(b, 3) - sy*nfine2 + r;
+  }
+  // does the finest-cell box [ia, ib] x [ja, jb] (inclusive, frame of m) meet the blocks of
+  // m and its neighbours with level >= minlev, each widened by r?
+  KOKKOS_INLINE_FUNCTION
+  bool Meets(const int m, const int ia, const int ib, const int ja, const int jb,
+             const int minlev, const int r) const {
+    for (int k=-1; k<nnb(m); ++k) {
+      int b, x0, x1, y0, y1;
+      NbRect(m, k, r, b, x0, x1, y0, y1);
+      if (blev(b) < minlev) continue;
+      if (ib < x0 || ia >= x1 || jb < y0 || ja >= y1) continue;
+      return true;
+    }
+    return false;
+  }
+  // is that box entirely covered by them?  (coordinate compression of the box by the edges)
+  KOKKOS_INLINE_FUNCTION
+  bool Covered(const int m, const int ia, const int ib, const int ja, const int jb,
+               const int minlev, const int r) const {
+    int rx0[kMaxNb + 1], rx1[kMaxNb + 1], ry0[kMaxNb + 1], ry1[kMaxNb + 1];
+    int nr = 0;
+    for (int k=-1; k<nnb(m); ++k) {
+      int b, x0, x1, y0, y1;
+      NbRect(m, k, r, b, x0, x1, y0, y1);
+      if (blev(b) < minlev) continue;
+      if (ib < x0 || ia >= x1 || jb < y0 || ja >= y1) continue;
+      if (x0 <= ia && x1 > ib && y0 <= ja && y1 > jb) return true;
+      rx0[nr] = x0; rx1[nr] = x1; ry0[nr] = y0; ry1[nr] = y1; ++nr;
+    }
+    if (nr == 0) return false;
+    constexpr int kE = 2*kMaxNb + 4;
+    int xs[kE], ys[kE];
+    int nxs = 0, nys = 0;
+    xs[nxs++] = ia; xs[nxs++] = ib + 1; ys[nys++] = ja; ys[nys++] = jb + 1;
+    for (int q=0; q<nr; ++q) {
+      if (rx0[q] > ia && rx0[q] <= ib) xs[nxs++] = rx0[q];
+      if (rx1[q] > ia && rx1[q] <= ib) xs[nxs++] = rx1[q];
+      if (ry0[q] > ja && ry0[q] <= jb) ys[nys++] = ry0[q];
+      if (ry1[q] > ja && ry1[q] <= jb) ys[nys++] = ry1[q];
+    }
+    for (int u=1; u<nxs; ++u) {
+      const int t = xs[u]; int v = u - 1;
+      while (v >= 0 && xs[v] > t) {xs[v + 1] = xs[v]; --v;}
+      xs[v + 1] = t;
+    }
+    for (int u=1; u<nys; ++u) {
+      const int t = ys[u]; int v = u - 1;
+      while (v >= 0 && ys[v] > t) {ys[v + 1] = ys[v]; --v;}
+      ys[v + 1] = t;
+    }
+    for (int u=0; u+1<nxs; ++u) {
+      if (xs[u] == xs[u + 1]) continue;
+      for (int v=0; v+1<nys; ++v) {
+        if (ys[v] == ys[v + 1]) continue;
+        bool cov = false;
+        for (int q=0; q<nr && !cov; ++q) {
+          cov = (rx0[q] <= xs[u] && xs[u] < rx1[q] && ry0[q] <= ys[v] && ys[v] < ry1[q]);
+        }
+        if (!cov) return false;
+      }
+    }
+    return true;
+  }
+  // the region of the table's level map above lev (see the members)
+  KOKKOS_INLINE_FUNCTION
+  bool AnyAbove(const int m, const int ia, const int ib, const int ja, const int jb,
+                const int lev) const {
+    if (lev + 1 > nlev) return false;
+    return Meets(m, ia, ib, ja, jb, lev + 1, rdil[lev + 1]);
+  }
+  KOKKOS_INLINE_FUNCTION
+  bool AllAbove(const int m, const int ia, const int ib, const int ja, const int jb,
+                const int lev) const {
+    if (lev + 1 > nlev) return false;
+    return Covered(m, ia, ib, ja, jb, lev + 1, rdil[lev + 1]);
+  }
+  // false when a box widened by r leaves block m and its neighbours: the answer would need
+  // blocks further away (only for clouds much coarser than the leaves; counted, not used)
+  KOKKOS_INLINE_FUNCTION
+  bool InReach(const int m, const int ia, const int ib, const int ja, const int jb,
+               const int r) const {
+    return Covered(m, ia - r, ib + r, ja - r, jb + r, 0, 0);
+  }
+  // SMRCompositeTransfer::CloudInsideFiner on the actual leaves (anchor block m)
+  KOKKOS_INLINE_FUNCTION
+  bool InsideFiner(const Real px1, const Real px2, const int code, const Real slack, const int m,
+                   bool *reach = nullptr) const {
+    using T = SMRCompositeTransfer;
+    if (T::CloudLobe1(code) || T::CloudLobe2(code)) return false;
+    const int lev = code & T::kCloudLevelMask;
+    if (lev >= nlev || lev >= cloud_max_level) return false;
+    if (split_everywhere) return true;
+    Real x1 = px1, x2 = px2;
+    Frame(m, x1, x2);
+    const Real r1 = (1.0 - slack)*root_dx1/static_cast<Real>(1 << lev);
+    const Real r2 = (1.0 - slack)*root_dx2/static_cast<Real>(1 << lev);
+    const int ia = static_cast<int>(floor((x1 - r1 - x1min)/fine_dx1));
+    const int ib = static_cast<int>(ceil((x1 + r1 - x1min)/fine_dx1)) - 1;
+    const int ja = static_cast<int>(floor((x2 - r2 - x2min)/fine_dx2));
+    const int jb = static_cast<int>(ceil((x2 + r2 - x2min)/fine_dx2)) - 1;
+    if (reach != nullptr) *reach = InReach(m, ia, ib, ja, jb, rdil[lev + 1]);
+    return split_overlap ? AnyAbove(m, ia, ib, ja, jb, lev) : AllAbove(m, ia, ib, ja, jb, lev);
+  }
+  // SMRCompositeTransfer::CloudOverlapsFiner on the actual leaves
+  KOKKOS_INLINE_FUNCTION
+  bool OverlapsFiner(const Real px1, const Real px2, const int code, const int m) const {
+    const int lev = SMRCompositeTransfer::CloudLevel(code);
+    if (lev >= nlev) return false;
+    Real x1 = px1, x2 = px2;
+    Frame(m, x1, x2);
+    const Real r1 = root_dx1/static_cast<Real>(1 << lev), r2 = root_dx2/static_cast<Real>(1 << lev);
+    const int ia = static_cast<int>(floor((x1 - r1 - x1min)/fine_dx1));
+    const int ib = static_cast<int>(ceil((x1 + r1 - x1min)/fine_dx1)) - 1;
+    const int ja = static_cast<int>(floor((x2 - r2 - x2min)/fine_dx2));
+    const int jb = static_cast<int>(ceil((x2 + r2 - x2min)/fine_dx2)) - 1;
+    return AnyAbove(m, ia, ib, ja, jb, lev);
+  }
+  // the merge-cell mask of MergeCloudsDevice: the level-L cell holding (x1, x2) and the B
+  // cells around it carry no dilated level above L
+  KOKKOS_INLINE_FUNCTION
+  bool MergeOK(const Real px1, const Real px2, const int L, const int B, const int m) const {
+    Real x1 = px1, x2 = px2;
+    Frame(m, x1, x2);
+    const int r = 1 << (nlev - L);
+    const int I = static_cast<int>(floor((x1 - x1min)/(root_dx1/static_cast<Real>(1 << L))));
+    const int J = static_cast<int>(floor((x2 - x2min)/(root_dx2/static_cast<Real>(1 << L))));
+    return !AnyAbove(m, (I - B)*r, (I + B + 1)*r - 1, (J - B)*r, (J + B + 1)*r - 1, L);
+  }
+  // the stage C (compression) mask: every finest cell of the window around the level-lev cell
+  // holding (x1, x2), widened by bf = 2 cloud_compress_buffer r, has a dilated level >= lev
+  KOKKOS_INLINE_FUNCTION
+  bool CompressOK(const Real px1, const Real px2, const int lev, const int cbuf,
+                  const int m) const {
+    if (lev < 1) return false;
+    Real x1 = px1, x2 = px2;
+    Frame(m, x1, x2);
+    const int r = 1 << (nlev - lev), bf = 2*cbuf*r;
+    const int I = static_cast<int>(floor((x1 - x1min)/(fine_dx1*r)));
+    const int J = static_cast<int>(floor((x2 - x2min)/(fine_dx2*r)));
+    return AllAbove(m, I*r - bf, I*r + r + bf - 1, J*r - bf, J*r + r + bf - 1, lev - 1);
   }
 
   // encoded leaf cell of block m that holds (x1, x2)
@@ -1226,6 +1399,7 @@ class DustGasDrag {
   int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
   void BuildLeafTraversal();
   void CheckLeafTraversal();
+  void CheckLeafEligibility();        // called by CheckLeafTraversal
 
   // ...in "before_timeintegrator" list
   TaskStatus GammaSwitch(Driver *pdrive, int stage);

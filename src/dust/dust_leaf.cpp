@@ -89,6 +89,40 @@ void DustGasDrag::BuildLeafTraversal() {
     }
     nnb(m) = c;
   }
+  // finest-level integer boxes, levels, the dilation of the split buffer
+  {
+    const auto &t = smr_transfer;
+    lt.nlev = t.cloud_nlev; lt.nfine1 = t.nfine1; lt.nfine2 = t.nfine2;
+    lt.fine_dx1 = t.fine_dx1; lt.fine_dx2 = t.fine_dx2;
+    lt.cloud_max_level = t.cloud_max_level;
+    lt.split_everywhere = t.cloud_split_everywhere; lt.split_overlap = t.cloud_split_overlap;
+    if (lt.nlev > LeafTraversal::kMaxLev) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "leaf traversal: more than " << LeafTraversal::kMaxLev << " levels" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    for (int l=0; l<=LeafTraversal::kMaxLev; ++l) {
+      lt.rdil[l] = (cloud_split_buffer > 0 && l >= 1 && l <= lt.nlev)
+                 ? (cloud_split_buffer << (lt.nlev - l + 1)) : 0;
+    }
+    lt.blev = DvceArray1D<int>("dust_leaf_blev", nmb);
+    lt.fbox = DvceArray2D<int>("dust_leaf_fbox", nmb, 4);
+    auto blev = Kokkos::create_mirror_view(lt.blev);
+    auto fbox = Kokkos::create_mirror_view(lt.fbox);
+    auto &mblev = pmy_pack->pmb->mb_lev;
+    for (int m=0; m<nmb; ++m) {
+      const auto &sz = mbsize.h_view(m);
+      const int lev = mblev.h_view(m) - pm->root_level;
+      const int ratio = 1 << (lt.nlev - lev);
+      blev(m) = lev;
+      fbox(m, 0) = static_cast<int>(std::lround((sz.x1min - lt.x1min)/lt.fine_dx1));
+      fbox(m, 1) = fbox(m, 0) + indcs.nx1*ratio;
+      fbox(m, 2) = static_cast<int>(std::lround((sz.x2min - lt.x2min)/lt.fine_dx2));
+      fbox(m, 3) = fbox(m, 2) + indcs.nx2*ratio;
+    }
+    Kokkos::deep_copy(lt.blev, blev);
+    Kokkos::deep_copy(lt.fbox, fbox);
+  }
   Kokkos::deep_copy(lt.box, box);
   Kokkos::deep_copy(lt.nnb, nnb);
   Kokkos::deep_copy(lt.nb, nb);
@@ -176,6 +210,127 @@ void DustGasDrag::CheckLeafTraversal() {
               << npart << " particles, max |d weights| " << ew << ", max |d moments| " << em
               << ", max |weight sum - 1| " << es << "; over 1e-12: " << nbadw << " / " << nbadm
               << " / " << nbads << ", owner differs " << nbado << std::endl;
+  }
+  CheckLeafEligibility();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::CheckLeafEligibility
+//! \brief Part of cloud_leaf_check: for every particle the split / release
+//! tests (the probes of P1Flag: the cloud itself; level - 1 at the particle and half a
+//! level-(lev-1) width away in each direction), CloudOverlapsFiner, the merge-cell mask of
+//! every level at the particle and one cell away in each direction, and the stage C mask of
+//! every level at the particle, on the actual leaves against the table (masks taken directly
+//! from the level map as MergeCloudsDevice builds them).  Counts the differing answers, the
+//! true answers of the table (so that the test is not vacuous), and the probes whose box
+//! leaves the anchor block and its neighbours.  One line per check in cloud_leaf_elig.txt.
+
+void DustGasDrag::CheckLeafEligibility() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  const int npart = ppar->nprtcl_thispack;
+  const SMRCompositeTransfer tab = smr_transfer;
+  const LeafTraversal lt = leaf_traversal;
+  const int gids = pmy_pack->gids;
+  const Real slack = cloud_split_slack;
+  const int B = cloud_merge_buffer, cbuf = cloud_compress_buffer;
+  const int nlev = tab.cloud_nlev, nf1 = tab.nfine1, nf2 = tab.nfine2;
+  int d_ins = 0, d_ovl = 0, d_mrg = 0, d_cmp = 0, t_ins = 0, t_ovl = 0, t_mrg = 0, t_cmp = 0;
+  int n_ins = 0, n_mrg = 0, n_cmp = 0, nreach = 0;
+  Kokkos::parallel_reduce("dust_leaf_elig", Kokkos::RangePolicy<DevExeSpace>(0, npart),
+  KOKKOS_LAMBDA(const int p, int &di, int &dov, int &dmr, int &dcm, int &ti, int &tov, int &tmr,
+                int &tcm, int &ni, int &nm, int &nc, int &nr) {
+    using T = SMRCompositeTransfer;
+    const Real x = pr(IPX,p), y = pr(IPY,p);
+    const int code = pi(PLEV,p), m = pi(PGID,p) - gids;
+    const int lev = T::CloudLevel(code);
+    // split / release probes
+    auto probe = [&](const Real px, const Real py, const int c) {
+      bool reach = true;
+      const bool a = tab.CloudInsideFiner(px, py, c, slack);
+      const bool b = lt.InsideFiner(px, py, c, slack, m, &reach);
+      ++ni;
+      if (a) ++ti;
+      if (a != b) ++di;
+      if (!reach) ++nr;
+    };
+    probe(x, y, code);
+    if (lev > 0) {
+      const Real h1 = tab.CloudHalfWidth1(lev - 1), h2 = tab.CloudHalfWidth2(lev - 1);
+      probe(x, y, lev - 1);
+      probe(x - h1, y, lev - 1); probe(x + h1, y, lev - 1);
+      probe(x, y - h2, lev - 1); probe(x, y + h2, lev - 1);
+    }
+    {
+      const bool a = tab.CloudOverlapsFiner(x, y, code), b = lt.OverlapsFiner(x, y, code, m);
+      if (a) ++tov;
+      if (a != b) ++dov;
+    }
+    // merge-cell masks
+    const Real xw = T::WrapPosition(x, tab.x1min, tab.x1max), yw = T::WrapPosition(y, tab.x2min, tab.x2max);
+    for (int L=0; L<nlev; ++L) {
+      const int r = 1 << (nlev - L), n1 = nf1/r, n2 = nf2/r;
+      const Real dl1 = tab.root_dx1/static_cast<Real>(1 << L), dl2 = tab.root_dx2/static_cast<Real>(1 << L);
+      for (int q=0; q<5; ++q) {
+        const Real ox = (q == 1) ? -dl1 : ((q == 2) ? dl1 : 0.0);
+        const Real oy = (q == 3) ? -dl2 : ((q == 4) ? dl2 : 0.0);
+        const Real qx = T::WrapPosition(xw + ox, tab.x1min, tab.x1max);
+        const Real qy = T::WrapPosition(yw + oy, tab.x2min, tab.x2max);
+        const int I = T::WrapIndex(static_cast<int>(floor((qx - tab.x1min)/dl1)), n1);
+        const int J = T::WrapIndex(static_cast<int>(floor((qy - tab.x2min)/dl2)), n2);
+        bool ok = true;
+        for (int fj=(J - B)*r; fj<(J + B + 1)*r && ok; ++fj) {
+          const int wj = T::WrapIndex(fj, nf2);
+          for (int fi=(I - B)*r; fi<(I + B + 1)*r; ++fi) {
+            if (tab.cloud_level(wj, T::WrapIndex(fi, nf1)) > L) {ok = false; break;}
+          }
+        }
+        const bool b = lt.MergeOK(xw + ox, yw + oy, L, B, m);
+        ++nm;
+        if (ok) ++tmr;
+        if (ok != b) ++dmr;
+      }
+    }
+    // stage C masks
+    for (int l=1; l<=nlev && l<5; ++l) {
+      const int r = 1 << (nlev - l), bf = 2*cbuf*r;
+      const int I = static_cast<int>(floor((xw - tab.x1min)/(tab.fine_dx1*r)));
+      const int J = static_cast<int>(floor((yw - tab.x2min)/(tab.fine_dx2*r)));
+      int mn = 1 << 20;
+      for (int fj=J*r - bf; fj<J*r + r + bf; ++fj) {
+        const int wj = T::WrapIndex(fj, nf2);
+        for (int fi=I*r - bf; fi<I*r + r + bf; ++fi) {
+          const int v = tab.cloud_level(wj, T::WrapIndex(fi, nf1));
+          mn = (v < mn) ? v : mn;
+        }
+      }
+      const bool a = (mn >= l), b = lt.CompressOK(x, y, l, cbuf, m);
+      ++nc;
+      if (a) ++tcm;
+      if (a != b) ++dcm;
+    }
+  }, d_ins, d_ovl, d_mrg, d_cmp, t_ins, t_ovl, t_mrg, t_cmp, n_ins, n_mrg, n_cmp, nreach);
+  if (global_variable::my_rank == 0) {
+    std::FILE *fp = std::fopen("cloud_leaf_elig.txt", "a");
+    if (fp != nullptr) {
+      std::fseek(fp, 0, SEEK_END);
+      if (std::ftell(fp) == 0) {
+        std::fprintf(fp, "# ncycle time particles split_probes split_differ split_true overlap_differ "
+                     "overlap_true merge_probes merge_differ merge_true compress_probes "
+                     "compress_differ compress_true split_out_of_reach\n");
+      }
+      std::fprintf(fp, "%d %.17g %d %d %d %d %d %d %d %d %d %d %d %d %d\n", pmy_pack->pmesh->ncycle,
+                   pmy_pack->pmesh->time, npart, n_ins, d_ins, t_ins, d_ovl, t_ovl, n_mrg, d_mrg, t_mrg,
+                   n_cmp, d_cmp, t_cmp, nreach);
+      std::fclose(fp);
+    }
+    std::cout << "# leaf eligibility check cycle " << pmy_pack->pmesh->ncycle
+              << ": split probes " << n_ins << " differ " << d_ins << " (table true " << t_ins
+              << "), overlap differ " << d_ovl << " (true " << t_ovl << "), merge probes " << n_mrg
+              << " differ " << d_mrg << " (true " << t_mrg << "), compress probes " << n_cmp
+              << " differ " << d_cmp << " (true " << t_cmp << "), out of reach " << nreach
+              << std::endl;
   }
 }
 
