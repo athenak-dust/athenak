@@ -52,8 +52,36 @@ namespace dust {
 //! short run of memory per leaf instead of fifteen values spread over nine rows of three
 //! arrays; the values and the order of the operations are those of the unpacked gather.
 
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::PackGasGather
+//! \brief The gas velocity of every cell (ghosts included) of a conserved state u into
+//! uvel_pred, then PackGatherField: the gather field of the linear cloud gather from u (the
+//! predictor's old state; also the resampling's current state, which reads it
+//! through the halo like the predictor).
+
+void DustGasDrag::PackGasGather(const DvceArray5D<Real> &u) {
+  auto uold = u;
+  if (uvel_pred.extent(0) != uold.extent(0)) {
+    Kokkos::realloc(uvel_pred, uold.extent(0), 3, uold.extent(2), uold.extent(3),
+                    uold.extent(4));
+  }
+  auto uvel = uvel_pred;
+  const int ks = pmy_pack->pmesh->mb_indcs.ks;
+  const int nmb_ = pmy_pack->nmb_thispack;   // not the capacity of the array
+  const int nj_ = static_cast<int>(uold.extent(3)), ni_ = static_cast<int>(uold.extent(4));
+  par_for("dust_pc2_predictor_gasvel",DevExeSpace(),0,nmb_-1,0,nj_-1,0,ni_-1,
+  KOKKOS_LAMBDA(const int m, const int j, const int i) {
+    const Real invrho = 1.0/uold(m,IDN,ks,j,i);
+    uvel(m,0,ks,j,i) = uold(m,IM1,ks,j,i)*invrho;
+    uvel(m,1,ks,j,i) = uold(m,IM2,ks,j,i)*invrho;
+    uvel(m,2,ks,j,i) = uold(m,IM3,ks,j,i)*invrho;
+  });
+  PackGatherField(uvel_pred);
+}
+
 void DustGasDrag::PackGatherField(const DvceArray5D<Real> &vel) {
-  const int nmb = vel.extent_int(0), nk = vel.extent_int(2);
+  // Room for the halo slots (their values come from HaloForwardPack)
+  const int nmb = std::max(vel.extent_int(0), leaf_traversal.nfld), nk = vel.extent_int(2);
   const int nj = vel.extent_int(3), ni = vel.extent_int(4);
   if (gpack.extent_int(0) != nmb || gpack.extent_int(1) != nk || gpack.extent_int(2) != nj ||
       gpack.extent_int(3) != ni) {
@@ -71,6 +99,7 @@ void DustGasDrag::PackGatherField(const DvceArray5D<Real> &vel) {
       gp(m,ks,j,i,6+c) = v(m,c,ks,j+1,i) - v(m,c,ks,j-1,i);
     }
   });
+  HaloForwardPack(gpack);   // the owners' values on the halo blocks
 }
 
 TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
@@ -115,21 +144,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         // The gas velocity of every cell (ghosts included) is formed once; the gather then
         // reads velocities, as the advance does with u*, instead of dividing five momenta
         // by five densities in each of the cloud's cells.
-        if (uvel_pred.extent(0) != uold.extent(0)) {
-          Kokkos::realloc(uvel_pred, uold.extent(0), 3, uold.extent(2), uold.extent(3),
-                          uold.extent(4));
-        }
-        auto uvel = uvel_pred;
-        const int nmb_ = pmy_pack->nmb_thispack;   // not the capacity of the array
-        const int nj_ = static_cast<int>(uold.extent(3)), ni_ = static_cast<int>(uold.extent(4));
-        par_for("dust_pc2_predictor_gasvel",DevExeSpace(),0,nmb_-1,0,nj_-1,0,ni_-1,
-        KOKKOS_LAMBDA(const int m, const int j, const int i) {
-          const Real invrho = 1.0/uold(m,IDN,ks,j,i);
-          uvel(m,0,ks,j,i) = uold(m,IM1,ks,j,i)*invrho;
-          uvel(m,1,ks,j,i) = uold(m,IM2,ks,j,i)*invrho;
-          uvel(m,2,ks,j,i) = uold(m,IM3,ks,j,i)*invrho;
-        });
-        PackGatherField(uvel_pred);
+        PackGasGather(uold);
         auto gp = gpack;
         auto pred_body = KOKKOS_LAMBDA(const int p) {
           Real xp = pr(IPX,p), yp = pr(IPY,p);
@@ -149,9 +164,10 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             int remainder = target/ncells1;
             int tj = remainder % ncells2;
             int tm = remainder/ncells2;
-            Real dx1 = mbsize.d_view(tm).dx1, dx2 = mbsize.d_view(tm).dx2;
-            Real xc = mbsize.d_view(tm).x1min + (ti - is + 0.5)*dx1;
-            Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
+            // the leaf's block slot may be a halo block: its box from lt
+            Real dx1 = lt.box(tm,2), dx2 = lt.box(tm,3);
+            Real xc = lt.box(tm,0) + (ti - is + 0.5)*dx1;
+            Real yc = lt.box(tm,1) + (tj - js + 0.5)*dx2;
             Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
             Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
             ugx += w*gp(tm,ks,tj,ti,0) + cx*gp(tm,ks,tj,ti,3) + cy*gp(tm,ks,tj,ti,6);
@@ -169,7 +185,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             int remainder = target/ncells1;
             int tj = remainder % ncells2;
             int tm = remainder/ncells2;
-            Real inv_volume = 1.0/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
+            Real inv_volume = 1.0/(lt.box(tm,2)*lt.box(tm,3));
             DepositAdd(&qdep_(tm,1,ks,tj,ti), inv_volume*w*gx);
             DepositAdd(&qdep_(tm,2,ks,tj,ti), inv_volume*w*gy);
             DepositAdd(&qdep_(tm,3,ks,tj,ti), inv_volume*w*gz);
@@ -187,6 +203,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         } else {
           CloudParFor("dust_pc2_cloud_predictor_linear", cloud_launch_bounds, npart, pred_body);
         }
+        HaloReverseAdd(qdep, 1, 4);   // deposits on halo blocks back to their owners
         return TaskStatus::complete;
       }
       if (linear || flocal || fchild || deform) {

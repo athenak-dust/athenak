@@ -19,6 +19,7 @@
 //! kernels, while particle storage/migration stays in Particles and fluxes/BCs in Hydro.
 
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <map>
 #include <memory>
@@ -27,7 +28,11 @@
 #include <vector>
 
 #include "athena.hpp"
+#if MPI_PARALLEL_ENABLED
+#include <mpi.h>
+#endif
 #include "coordinates/cell_locations.hpp"
+#include "globals.hpp"
 #include "parameter_input.hpp"
 #include "tasklist/task_list.hpp"
 #include "bvals/bvals.hpp"
@@ -699,21 +704,24 @@ struct SMRCompositeTransfer {
 //! The sum of the weights is returned so that a support reaching beyond the neighbours
 //! (possible only for clouds much coarser than the leaves) is detected, not truncated.
 //!
-//! One MPI rank (the neighbours' boxes are read from the local pack); the structure is meant
-//! to receive cached remote boxes later.
+//! Block slots: [0, nmb) the blocks of this rank (slot = gid - gids), [nmb, nfld)
+//! the blocks of other ranks next to them (halo blocks: their leaf fields are exchanged, see
+//! DustHalo), [nfld, nall) every other block of the mesh (geometry only, for the eligibility
+//! queries that leave the neighbourhood and for Locate).  One rank: nfld = nall = nmb.
 
 struct LeafTraversal {
   static constexpr int kMaxNb = 16;    // distinct neighbours of a 2-D block (12 at most)
   int nmb = 0, gids = 0;
+  int nfld = 0, nall = 0;              // slots with leaf fields (local + halo), all slots
   int nx1 = 0, nx2 = 0, is = 0, js = 0, ncells1 = 0, ncells2 = 0;
   Real lx = 0.0, ly = 0.0, x1min = 0.0, x2min = 0.0, x1max = 0.0, x2max = 0.0;
   Real ilx = 0.0, ily = 0.0;           // 1/lx, 1/ly
   Real root_dx1 = 0.0, root_dx2 = 0.0;
   Real iroot_dx1 = 0.0, iroot_dx2 = 0.0;   // 1/root_dx1, 1/root_dx2
   bool lobe3_integral = false;
-  DvceArray2D<Real> box;               // (m, 0..5): x1min, x2min, dx1, dx2, 1/dx1, 1/dx2 of block m
-  DvceArray1D<int> nnb;                // number of neighbours of block m
-  DvceArray2D<int> nb;                 // (m, k): local index of neighbour k
+  DvceArray2D<Real> box;               // (b, 0..5): x1min, x2min, dx1, dx2, 1/dx1, 1/dx2 of slot b
+  DvceArray1D<int> nnb;                // number of neighbours of local block m
+  DvceArray2D<int> nb;                 // (m, k): slot of neighbour k (local or halo)
   DvceArray3D<int> nbs;                // (m, k, 0..1): periodic shift (in domain lengths)
   // Split / merge eligibility on integer coordinates of the finest level (no
   // stored grid).  Block m covers the finest cells [fbox(m,0), fbox(m,1)) x [fbox(m,2),
@@ -834,7 +842,7 @@ struct LeafTraversal {
       for (int k=0; k<nnb(m); ++k) f(nb(m, k), nbs(m, k, 0), nbs(m, k, 1));
       return;
     }
-    for (int b=0; b<nmb; ++b) {
+    for (int b=0; b<nall; ++b) {
       int kx0, kx1, ky0, ky1;
       ImageRange(fbox(b, 0), fbox(b, 1), r, nfine1, ia, ib, kx0, kx1);
       ImageRange(fbox(b, 2), fbox(b, 3), r, nfine2, ja, jb, ky0, ky1);
@@ -959,7 +967,7 @@ struct LeafTraversal {
     // all blocks, every image that meets the support's finest cells (one cell wider against
     // round-off), from block cursor - 1 on; a block's images never straddle two batches
     int b = (cursor > 0) ? cursor - 1 : 0;
-    for (; b<nmb; ++b) {
+    for (; b<nall; ++b) {
       int kx0, kx1, ky0, ky1;
       ImageRange(fbox(b, 0), fbox(b, 1), 0, nfine1, ia - 1, ib + 1, kx0, kx1);
       ImageRange(fbox(b, 2), fbox(b, 3), 0, nfine2, ja - 1, jb + 1, ky0, ky1);
@@ -971,11 +979,14 @@ struct LeafTraversal {
       for (int ky=ky0; ky<=ky1; ++ky) {
         for (int kx=kx0; kx<=kx1; ++kx) {
           if (!meets(b, -kx, -ky)) continue;
+          // a block without leaf fields here (beyond the halo of this rank): the weights would be
+          // lost
+          if (b >= nfld) Kokkos::abort("LeafTraversal::Candidates: a cloud reaches beyond the halo");
           cand[n++] = Pack(b, -kx, -ky);
         }
       }
     }
-    cursor = (b < nmb) ? b + 1 : -1;
+    cursor = (b < nall) ? b + 1 : -1;
     return n;
   }
 
@@ -1269,6 +1280,34 @@ struct LeafTraversal {
   }
   KOKKOS_INLINE_FUNCTION
   int LeafOwner(const Real x1, const Real x2, const int m) const {return Owner(x1, x2, m);}
+};
+
+// the name of a per-rank log file: unchanged on one rank, name.rNNNN.ext on several
+inline std::string RankFile(const std::string &name) {
+  if (global_variable::nranks == 1) return name;
+  char sfx[16];
+  std::snprintf(sfx, sizeof(sfx), ".r%04d", global_variable::my_rank);
+  const auto dot = name.rfind('.');
+  return (dot == std::string::npos) ? name + sfx : name.substr(0, dot) + sfx + name.substr(dot);
+}
+
+//----------------------------------------------------------------------------------------
+//! \struct DustHalo
+//! The exchange lists of the dust halo (dust_halo.cpp).  Per peer rank p
+//! (ascending), the blocks of this rank sent to it, sblk[soff[p] .. soff[p+1]), and the halo
+//! slots received from it, rblk[roff[p] .. roff[p+1]), both in ascending gid.  Whole blocks
+//! (interior cells) for now; one rank: no peers.
+struct DustHalo {
+  int nx1 = 0, nx2 = 0, is = 0, js = 0;
+  int npeer = 0;
+  unsigned long long builds = 0;
+  std::vector<int> peer, soff, roff;
+  DvceArray1D<int> sblk, rblk;
+  DvceArray1D<Real> sbuf, rbuf;
+#if MPI_PARALLEL_ENABLED
+  MPI_Comm comm = MPI_COMM_NULL;
+  bool comm_set = false;
+#endif
 };
 
 // the weights of a particle on the composite transfer, as
@@ -1726,6 +1765,7 @@ class DustGasDrag {
   int ResampleClouds();       // returns the number of clouds removed
   bool ResampleDue();         // is a resampling due at the start of this cycle?
   void PackGatherField(const DvceArray5D<Real> &vel);   // fills gpack from a velocity array
+  void PackGasGather(const DvceArray5D<Real> &u);       // ... from a conserved state
   void CheckNativeTransfer();  // level-native against finest-grid traversal
   // block-local traversal of the actual leaves (dust_leaf.cpp)
   LeafTraversal leaf_traversal;
@@ -1748,6 +1788,22 @@ class DustGasDrag {
   unsigned long long cloud_ord_builds = 0;
   void UpdateCloudOrder();
   void BuildLeafTraversal();
+  // multi-rank refinable clouds (<dust>/experimental_mpi): the gid of every block
+  // slot of the leaf traversal, the halo lists and the exchanges (dust_halo.cpp)
+  bool experimental_mpi = false;
+  std::vector<int> leaf_slot_gid;
+  DustHalo halo_;
+  void BuildHalo(const std::vector<int> &slot_gid);
+  void CheckMultiRank();
+  void MigrateClouds();
+  int cloud_particle_dump = -1;       // diagnostic: cycle at whose start the particles are written
+  void DumpParticles();
+  void HaloForwardPack(DvceArray5D<Real> &gp);
+  void HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int nc);
+  void HaloForwardFlat(DvceArray2D<Real> &f, const int nc);
+  void HaloReverseAddFlat(DvceArray2D<Real> &f, const int nc);
+  void HaloForwardFlags(DvceArray1D<int> &f);
+  void HaloReverseAddFlags(DvceArray1D<int> &f);
   void RequireCloudTable(const char *what) const;   // fatal without the table
   void EnsureRootCloudMass();          // cloud_merge_mroot once (merge pass, resampling caps)
   void CheckLeafTraversal();

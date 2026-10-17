@@ -174,9 +174,10 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
             int remainder = target/ncells1;
             int tj = remainder % ncells2;
             int tm = remainder/ncells2;
-            Real dx1 = mbsize.d_view(tm).dx1, dx2 = mbsize.d_view(tm).dx2;
-            Real xc = mbsize.d_view(tm).x1min + (ti - is + 0.5)*dx1;
-            Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
+            // the leaf's block slot may be a halo block: its box from lt
+            Real dx1 = lt.box(tm,2), dx2 = lt.box(tm,3);
+            Real xc = lt.box(tm,0) + (ti - is + 0.5)*dx1;
+            Real yc = lt.box(tm,1) + (tj - js + 0.5)*dx2;
             Real cx = 0.5*(m1x + transfer.MinImage1(xh - xc)*w)/dx1;
             Real cy = 0.5*(m1y + transfer.MinImage2(yh - yc)*w)/dx2;
             ugx += w*gp(tm,ks,tj,ti,0) + cx*gp(tm,ks,tj,ti,3) + cy*gp(tm,ks,tj,ti,6);
@@ -233,7 +234,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
             int remainder = target/ncells1;
             int tj = remainder % ncells2;
             int tm = remainder/ncells2;
-            Real volume = mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2;
+            Real volume = lt.box(tm,2)*lt.box(tm,3);
             Real density_weight = mass*particle_weight/volume;
             DepositAdd(&dmom_(tm,0,ks,tj,ti), density_weight*dvx_drag);
             DepositAdd(&dmom_(tm,1,ks,tj,ti), density_weight*dvy_drag);
@@ -251,6 +252,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         } else {
           CloudParFor("dust_pc2_advance_linear", cloud_launch_bounds, npart, adv_body);
         }
+        if (br) HaloReverseAdd(dmom, 0, 3);   // halo deposits back to their owners
         return TaskStatus::complete;
       }
       par_for("dust_pc2_advance",DevExeSpace(),0,(npart-1),

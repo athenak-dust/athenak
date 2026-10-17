@@ -29,14 +29,17 @@ namespace dust {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::BuildLeafTraversal
-//! \brief Box, cell size and the distinct adjacent blocks (with the periodic shift that
-//! places each next to the block) of every MeshBlock of the pack, from mb_size and the
-//! AthenaK neighbour table.  One rank: a neighbour must be a block of this pack.
+//! \brief Box, cell size, level and finest-cell box of every block slot (the
+//! blocks of this rank, then the halo blocks of other ranks next to them, then all other
+//! blocks), computed from the logical locations as AthenaK computes mb_size; and the distinct
+//! adjacent blocks (with the periodic shift that places each next to the block) of every
+//! MeshBlock of the pack, from the AthenaK neighbour table.  Then the halo exchange lists.
 
 void DustGasDrag::BuildLeafTraversal() {
   Mesh *pm = pmy_pack->pmesh;
   auto &indcs = pm->mb_indcs;
   const int nmb = pmy_pack->nmb_thispack;
+  const int gids = pmy_pack->gids;
   auto &mbsize = pmy_pack->pmb->mb_size;
   auto &nghbr = pmy_pack->pmb->nghbr;
   const int nslot = pmy_pack->pmb->nnghbr;
@@ -45,9 +48,41 @@ void DustGasDrag::BuildLeafTraversal() {
               << "leaf traversal: 2-D meshes only (24 neighbour slots)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  // block slots.  Local blocks first (slot = gid - gids), then the distinct blocks
+  // of other ranks in the neighbour tables (halo, ascending gid), then every other block
+  const int ntot = pm->nmb_total;
+  std::vector<int> slot_of(ntot, -1), slot_gid;
+  slot_gid.reserve(ntot);
+  for (int m=0; m<nmb; ++m) {slot_of[gids + m] = m; slot_gid.push_back(gids + m);}
+  {
+    std::vector<int> h;
+    for (int m=0; m<nmb; ++m) {
+      for (int n=0; n<nslot; ++n) {
+        const int g = nghbr.h_view(m, n).gid;
+        if (g >= 0 && slot_of[g] < 0) h.push_back(g);
+      }
+    }
+    std::sort(h.begin(), h.end());
+    h.erase(std::unique(h.begin(), h.end()), h.end());
+    for (const int g : h) {slot_of[g] = static_cast<int>(slot_gid.size()); slot_gid.push_back(g);}
+  }
+  const int nfld = static_cast<int>(slot_gid.size());
+  for (int g=0; g<ntot; ++g) {
+    if (slot_of[g] < 0) {slot_of[g] = static_cast<int>(slot_gid.size()); slot_gid.push_back(g);}
+  }
+  const int nall = static_cast<int>(slot_gid.size());
+  if (global_variable::nranks == 1 && (nfld != nmb || nall != nmb)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "leaf traversal: one rank but " << nfld - nmb << " halo and " << nall - nfld
+              << " other blocks" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  leaf_slot_gid = slot_gid;
   auto &lt = leaf_traversal;
   lt.nmb = nmb;
-  lt.gids = pmy_pack->gids;
+  lt.nfld = nfld;
+  lt.nall = nall;
+  lt.gids = gids;
   lt.nx1 = indcs.nx1; lt.nx2 = indcs.nx2; lt.is = indcs.is; lt.js = indcs.js;
   lt.ncells1 = indcs.nx1 + 2*indcs.ng; lt.ncells2 = indcs.nx2 + 2*indcs.ng;
   lt.x1min = pm->mesh_size.x1min; lt.x1max = pm->mesh_size.x1max;
@@ -57,7 +92,7 @@ void DustGasDrag::BuildLeafTraversal() {
   lt.root_dx1 = smr_transfer.root_dx1; lt.root_dx2 = smr_transfer.root_dx2;
   lt.iroot_dx1 = 1.0/lt.root_dx1; lt.iroot_dx2 = 1.0/lt.root_dx2;
   lt.lobe3_integral = smr_transfer.lobe3_integral;
-  lt.box = DvceArray2D<Real>("dust_leaf_box", nmb, 6);
+  lt.box = DvceArray2D<Real>("dust_leaf_box", nall, 6);
   lt.nnb = DvceArray1D<int>("dust_leaf_nnb", nmb);
   lt.nb = DvceArray2D<int>("dust_leaf_nb", nmb, LeafTraversal::kMaxNb);
   lt.nbs = DvceArray3D<int>("dust_leaf_nbs", nmb, LeafTraversal::kMaxNb, 2);
@@ -65,22 +100,45 @@ void DustGasDrag::BuildLeafTraversal() {
   auto nnb = Kokkos::create_mirror_view(lt.nnb);
   auto nb = Kokkos::create_mirror_view(lt.nb);
   auto nbs = Kokkos::create_mirror_view(lt.nbs);
-  for (int m=0; m<nmb; ++m) {
-    const auto &sz = mbsize.h_view(m);
-    box(m, 0) = sz.x1min; box(m, 1) = sz.x2min; box(m, 2) = sz.dx1; box(m, 3) = sz.dx2;
-    box(m, 4) = 1.0/sz.dx1; box(m, 5) = 1.0/sz.dx2;
+  // the box of every slot as the MeshBlock constructor computes mb_size (meshblock.cpp)
+  const auto &ms = pm->mesh_size;
+  std::vector<Real> bx1max(nall), bx2max(nall);
+  for (int b=0; b<nall; ++b) {
+    const LogicalLocation &ll = pm->lloc_eachmb[slot_gid[b]];
+    const std::int32_t nmbx1 = pm->nmb_rootx1 << (ll.level - pm->root_level);
+    const std::int32_t nmbx2 = pm->nmb_rootx2 << (ll.level - pm->root_level);
+    const Real x1a = (ll.lx1 == 0) ? ms.x1min : LeftEdgeX(ll.lx1, nmbx1, ms.x1min, ms.x1max);
+    const Real x1b = (ll.lx1 == nmbx1 - 1) ? ms.x1max
+                     : LeftEdgeX(ll.lx1 + 1, nmbx1, ms.x1min, ms.x1max);
+    const Real x2a = (ll.lx2 == 0) ? ms.x2min : LeftEdgeX(ll.lx2, nmbx2, ms.x2min, ms.x2max);
+    const Real x2b = (ll.lx2 == nmbx2 - 1) ? ms.x2max
+                     : LeftEdgeX(ll.lx2 + 1, nmbx2, ms.x2min, ms.x2max);
+    const Real dx1 = (x1b - x1a)/static_cast<Real>(indcs.nx1);
+    const Real dx2 = (x2b - x2a)/static_cast<Real>(indcs.nx2);
+    box(b, 0) = x1a; box(b, 1) = x2a; box(b, 2) = dx1; box(b, 3) = dx2;
+    box(b, 4) = 1.0/dx1; box(b, 5) = 1.0/dx2;
+    bx1max[b] = x1b; bx2max[b] = x2b;
+    if (b < nmb) {
+      const auto &sz = mbsize.h_view(b);
+      if (sz.x1min != x1a || sz.x2min != x2a || sz.dx1 != dx1 || sz.dx2 != dx2 ||
+          sz.x1max != x1b || sz.x2max != x2b) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "leaf traversal: the box of block " << gids + b << " from its logical "
+                  << "location differs from mb_size" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+    }
   }
   for (int m=0; m<nmb; ++m) {
-    const auto &sz = mbsize.h_view(m);
     int c = 0;
     for (int n=0; n<nslot; ++n) {
       const int gid = nghbr.h_view(m, n).gid;
       if (gid < 0) continue;
-      const int b = gid - lt.gids;
-      if (b < 0 || b >= nmb) {
+      const int b = slot_of[gid];
+      if (b >= nfld) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "leaf traversal: neighbour " << gid << " of block " << m
-                  << " is not in this pack (one MPI rank only)" << std::endl;
+                  << "leaf traversal: neighbour " << gid << " of block " << gids + m
+                  << " has no halo slot" << std::endl;
         std::exit(EXIT_FAILURE);
       }
       // the side of m this slot looks to (2-D slots of nghbr_index.hpp: x1 faces 0-3 and 4-7,
@@ -90,13 +148,12 @@ void DustGasDrag::BuildLeafTraversal() {
       int ix = 0, iy = 0;
       if (n < 4) {ix = -1;} else if (n < 8) {ix = 1;} else if (n < 12) {iy = -1;}
       else if (n < 16) {iy = 1;} else {ix = ((n - 16) & 2) - 1; iy = (((n - 16) & 4) >> 1) - 1;}
-      const auto &nz = mbsize.h_view(b);
-      const int sx = static_cast<int>(std::lround(((ix > 0) ? nz.x1min - sz.x1max
-                                                 : ((ix < 0) ? nz.x1max - sz.x1min
-                                                             : nz.x1min - sz.x1min))/lt.lx));
-      const int sy = static_cast<int>(std::lround(((iy > 0) ? nz.x2min - sz.x2max
-                                                 : ((iy < 0) ? nz.x2max - sz.x2min
-                                                             : nz.x2min - sz.x2min))/lt.ly));
+      const int sx = static_cast<int>(std::lround(((ix > 0) ? box(b, 0) - bx1max[m]
+                                                 : ((ix < 0) ? bx1max[b] - box(m, 0)
+                                                             : box(b, 0) - box(m, 0)))/lt.lx));
+      const int sy = static_cast<int>(std::lround(((iy > 0) ? box(b, 1) - bx2max[m]
+                                                 : ((iy < 0) ? bx2max[b] - box(m, 1)
+                                                             : box(b, 1) - box(m, 1)))/lt.ly));
       bool seen = (b == m && sx == 0 && sy == 0);
       for (int k=0; k<c && !seen; ++k) seen = (nb(m, k) == b && nbs(m, k, 0) == sx && nbs(m, k, 1) == sy);
       if (seen) continue;
@@ -127,20 +184,26 @@ void DustGasDrag::BuildLeafTraversal() {
       lt.rdil[l] = (cloud_split_buffer > 0 && l >= 1 && l <= lt.nlev)
                  ? (cloud_split_buffer << (lt.nlev - l + 1)) : 0;
     }
-    lt.blev = DvceArray1D<int>("dust_leaf_blev", nmb);
-    lt.fbox = DvceArray2D<int>("dust_leaf_fbox", nmb, 4);
+    lt.blev = DvceArray1D<int>("dust_leaf_blev", nall);
+    lt.fbox = DvceArray2D<int>("dust_leaf_fbox", nall, 4);
     auto blev = Kokkos::create_mirror_view(lt.blev);
     auto fbox = Kokkos::create_mirror_view(lt.fbox);
-    auto &mblev = pmy_pack->pmb->mb_lev;
-    for (int m=0; m<nmb; ++m) {
-      const auto &sz = mbsize.h_view(m);
-      const int lev = mblev.h_view(m) - pm->root_level;
+    for (int b=0; b<nall; ++b) {
+      const LogicalLocation &ll = pm->lloc_eachmb[slot_gid[b]];
+      const int lev = ll.level - pm->root_level;
       const int ratio = 1 << (lt.nlev - lev);
-      blev(m) = lev;
-      fbox(m, 0) = static_cast<int>(std::lround((sz.x1min - lt.x1min)/lt.fine_dx1));
-      fbox(m, 1) = fbox(m, 0) + indcs.nx1*ratio;
-      fbox(m, 2) = static_cast<int>(std::lround((sz.x2min - lt.x2min)/lt.fine_dx2));
-      fbox(m, 3) = fbox(m, 2) + indcs.nx2*ratio;
+      blev(b) = lev;
+      fbox(b, 0) = static_cast<int>(std::lround((box(b, 0) - lt.x1min)/lt.fine_dx1));
+      fbox(b, 1) = fbox(b, 0) + indcs.nx1*ratio;
+      fbox(b, 2) = static_cast<int>(std::lround((box(b, 1) - lt.x2min)/lt.fine_dx2));
+      fbox(b, 3) = fbox(b, 2) + indcs.nx2*ratio;
+      if (lev > lt.nlev || fbox(b, 0) != ll.lx1*indcs.nx1*ratio ||
+          fbox(b, 2) != ll.lx2*indcs.nx2*ratio) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "leaf traversal: block " << slot_gid[b] << " (level " << lev
+                  << ") does not fit the finest grid of " << lt.nlev << " levels" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
     }
     Kokkos::deep_copy(lt.blev, blev);
     Kokkos::deep_copy(lt.fbox, fbox);
@@ -179,23 +242,23 @@ void DustGasDrag::BuildLeafTraversal() {
       safe(m, 0) = s1; safe(m, 1) = s2;
     }
     Kokkos::deep_copy(lt.safe, safe);
-    // the index of logical locations (LeafTraversal::Locate)
+    // the index of logical locations (LeafTraversal::Locate), every slot
     {
-      std::vector<std::pair<std::int64_t, int>> kv(nmb);
-      for (int m=0; m<nmb; ++m) {
-        const int sh = lt.nlev - blev(m);
-        kv[m] = {LeafTraversal::LocKey(blev(m), fbox(m, 0)/(indcs.nx1 << sh),
-                                       fbox(m, 2)/(indcs.nx2 << sh)), m};
+      std::vector<std::pair<std::int64_t, int>> kv(nall);
+      for (int b=0; b<nall; ++b) {
+        const int sh = lt.nlev - blev(b);
+        kv[b] = {LeafTraversal::LocKey(blev(b), fbox(b, 0)/(indcs.nx1 << sh),
+                                       fbox(b, 2)/(indcs.nx2 << sh)), b};
       }
       std::sort(kv.begin(), kv.end());
-      lt.lockey = DvceArray1D<std::int64_t>("dust_leaf_lockey", nmb);
-      lt.locblk = DvceArray1D<int>("dust_leaf_locblk", nmb);
+      lt.lockey = DvceArray1D<std::int64_t>("dust_leaf_lockey", nall);
+      lt.locblk = DvceArray1D<int>("dust_leaf_locblk", nall);
       auto kh = Kokkos::create_mirror_view(lt.lockey);
       auto bh = Kokkos::create_mirror_view(lt.locblk);
-      for (int k=0; k<nmb; ++k) {kh(k) = kv[k].first; bh(k) = kv[k].second;}
+      for (int k=0; k<nall; ++k) {kh(k) = kv[k].first; bh(k) = kv[k].second;}
       Kokkos::deep_copy(lt.lockey, kh);
       Kokkos::deep_copy(lt.locblk, bh);
-      lt.nloc = nmb;
+      lt.nloc = nall;
     }
     if (nunsafe > 0 && global_variable::my_rank == 0) {
       std::cout << "# NOTE (dust): leaf traversal: " << nunsafe << " of " << nmb << " blocks have "
@@ -206,6 +269,16 @@ void DustGasDrag::BuildLeafTraversal() {
   Kokkos::deep_copy(lt.nnb, nnb);
   Kokkos::deep_copy(lt.nb, nb);
   Kokkos::deep_copy(lt.nbs, nbs);
+  // the leaf fields written or read on halo blocks hold nfld blocks
+  if (qdep.extent_int(0) < nfld) {
+    Kokkos::realloc(qdep, nfld, qdep.extent(1), qdep.extent(2), qdep.extent(3), qdep.extent(4));
+    Kokkos::deep_copy(qdep, 0.0);
+  }
+  if (dmom.extent_int(0) < nfld) {
+    Kokkos::realloc(dmom, nfld, dmom.extent(1), dmom.extent(2), dmom.extent(3), dmom.extent(4));
+    Kokkos::deep_copy(dmom, 0.0);
+  }
+  BuildHalo(slot_gid);
 }
 
 //----------------------------------------------------------------------------------------

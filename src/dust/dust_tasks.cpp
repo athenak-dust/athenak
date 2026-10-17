@@ -213,7 +213,11 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
        hybrid_mode == HybridMode::split_be && stage == 2);
   bool use_dmom = (coupling == DustCoupling::imex) ||
       (coupling == DustCoupling::hybrid && stage == 2);
-  if (back_reaction && use_qp) {
+  // composite transfer on SMR / AMR deposits into the leaves directly and its additive
+  // exchanges return at once (bvals_dep.cpp, local_smr_direct_): posting their receives would
+  // leave them waiting for sends that never come on several ranks
+  const bool direct = UsesCompositeTransfer() && pmy_pack->pmesh->multilevel;
+  if (back_reaction && use_qp && !direct) {
     tstat = pbval_qp->InitRecv(5);
     if (tstat != TaskStatus::complete) return tstat;
   }
@@ -221,7 +225,7 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
     tstat = pbval_us->InitRecv(3);
     if (tstat != TaskStatus::complete) return tstat;
   }
-  if (back_reaction && use_dmom) {
+  if (back_reaction && use_dmom && !direct) {
     tstat = pbval_dm->InitRecv(3);
     if (tstat != TaskStatus::complete) return tstat;
   }

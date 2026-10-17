@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -84,6 +85,9 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   cloud_native_check = pin->GetOrAddInteger("dust", "cloud_native_check", 0);
   // cloud_leaf_check compares the actual-leaf traversal with the table
   cloud_leaf_check = pin->GetOrAddInteger("dust", "cloud_leaf_check", 0);
+  // cloud_particle_dump (diagnostic): at the start of cycle N every rank writes its particles
+  // (dust_particles.cNNNNNNNN[.rRRRR].bin), to compare runs on different numbers of ranks
+  cloud_particle_dump = pin->GetOrAddInteger("dust", "cloud_particle_dump", -1);
   // Timing diagnostic: every cloud_sort_interval cycles (0: never) the particle
   // arrays are reordered by block, cell in the block (cloud_sort_order = linear or morton) and
   // old position, at the start of the cycle (SortParticles)
@@ -431,7 +435,83 @@ void DustGasDrag::EnsureNextTag() {
 #if MPI_PARALLEL_ENABLED
   MPI_Allreduce(MPI_IN_PLACE, &mx, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 #endif
-  cloud_next_tag = mx + 1;
+  // Each rank hands out mx + 1 + rank, then steps by the number of ranks
+  cloud_next_tag = mx + 1 + global_variable::my_rank;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::DumpParticles
+//! \brief Diagnostic (<dust>/cloud_particle_dump): this rank's particles, as
+//! int32 magic 0x44505031, npart, nrdata, nidata, ncycle, int32 nranks, double time, then the
+//! real columns (column by column) and the integer columns.
+
+void DustGasDrag::DumpParticles() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack, nr = ppar->nrdata, ni = ppar->nidata;
+  auto rh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_rdata);
+  auto ih = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_idata);
+  char name[64];
+  std::snprintf(name, sizeof(name), "dust_particles.c%08d.bin", pmy_pack->pmesh->ncycle);
+  std::FILE *f = std::fopen(RankFile(name).c_str(), "wb");
+  if (f == nullptr) return;
+  const std::int32_t head[6] = {0x44505031, npart, nr, ni, pmy_pack->pmesh->ncycle,
+                                global_variable::nranks};
+  const double t = pmy_pack->pmesh->time;
+  std::fwrite(head, sizeof(head), 1, f);
+  std::fwrite(&t, sizeof(t), 1, f);
+  std::vector<double> col(npart);
+  for (int c=0; c<nr; ++c) {
+    for (int p=0; p<npart; ++p) col[p] = rh(c,p);
+    std::fwrite(col.data(), sizeof(double), npart, f);
+  }
+  std::vector<std::int32_t> icol(npart);
+  for (int c=0; c<ni; ++c) {
+    for (int p=0; p<npart; ++p) icol[p] = ih(c,p);
+    std::fwrite(icol.data(), sizeof(std::int32_t), npart, f);
+  }
+  std::fclose(f);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::MigrateClouds
+//! \brief Several ranks only.  A cloud created or moved in RefineClouds whose
+//! block is on another rank keeps its parent's block (NewCloudBlock); the AthenaK particle
+//! exchange moves it to the block that holds it (at most one block away).  One rank: the
+//! blocks are set already, nothing to do.
+
+void DustGasDrag::MigrateClouds() {
+  if (global_variable::nranks == 1) return;
+  // a new cloud's position is wrapped into the domain, but the block it keeps may be across a
+  // periodic boundary: put it in the image next to its block (positions and the RK position
+  // registers together), so that the particle exchange sees a step of one block at most and
+  // wraps it again
+  {
+    auto pr = pmy_pack->ppart->prtcl_rdata;
+    auto pi = pmy_pack->ppart->prtcl_idata;
+    const auto lt = leaf_traversal;
+    const int npart = pmy_pack->ppart->nprtcl_thispack;
+    Kokkos::parallel_for("dust_migrate_frame", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      const int m = lt.Anchor(pi(PGID,p));
+      const Real cx = lt.box(m,0) + 0.5*lt.nx1*lt.box(m,2), cy = lt.box(m,1) + 0.5*lt.nx2*lt.box(m,3);
+      const Real sx = lt.lx*round((pr(IPX,p) - cx)*lt.ilx), sy = lt.ly*round((pr(IPY,p) - cy)*lt.ily);
+      if (sx != 0.0) {pr(IPX,p) -= sx; pr(IPX1,p) -= sx;}
+      if (sy != 0.0) {pr(IPY,p) -= sy; pr(IPY1,p) -= sy;}
+    });
+  }
+  auto *pb = pmy_pack->ppart->pbval_part;
+  pb->SetNewPrtclGID();
+  pb->CountSendsAndRecvs();
+  pb->InitPrtclRecv();
+  pb->PackAndSendPrtcls();
+  while (pb->RecvAndUnpackPrtcls() != TaskStatus::complete) {}
+  pb->ClearPrtclSend();
+  pb->ClearPrtclRecv();
+  // the counts of all ranks are known now (RecvAndUnpackPrtcls): the total for the outputs
+  Mesh *pm = pmy_pack->pmesh;
+  int tot = 0;
+  for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
+  pm->nprtcl_total = tot;
 }
 
 //----------------------------------------------------------------------------------------
@@ -440,6 +520,7 @@ void DustGasDrag::EnsureNextTag() {
 
 TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) return TaskStatus::complete;
+  if (cloud_particle_dump >= 0 && pmy_pack->pmesh->ncycle == cloud_particle_dump) DumpParticles();
   EnsureNextTag();
   // Diagnostic: cloud_sort_at_start sorts before the split, resampling and merge
   // pass of the cycle (to compare their decisions on one state in two storage orders)
@@ -448,6 +529,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
     SortParticles();
   }
   SplitAndMergeClouds();
+  MigrateClouds();   // split pieces to the rank of their block before R and G
   // the merge clock is read once per cycle (MergeDue advances it)
   const bool merge_due = cloud_merge && MergeDue() &&
       (cloud_merge_tstop < 0.0 || pmy_pack->pmesh->time < cloud_merge_tstop);
@@ -465,6 +547,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
     if (cloud_resample && ResampleDue()) ResampleClouds();
     if (merge_due) MergeClouds();
   }
+  MigrateClouds();   // merged clouds to the rank of their block
   if (cloud_native_check > 0 && pmy_pack->pmesh->ncycle % cloud_native_check == 0) {
     CheckNativeTransfer();
   }
@@ -514,7 +597,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   ++amr_event_handled;
   if (scheduled) ++amr_event_merged;
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = std::fopen("regrid_event_log.txt", "a");
+    std::FILE *fp = std::fopen(RankFile("regrid_event_log.txt").c_str(), "a");
     if (fp != nullptr) {
       std::fseek(fp, 0, SEEK_END);
       if (std::ftell(fp) == 0) {
@@ -708,7 +791,7 @@ int DustGasDrag::SplitAndMergeClouds() {
           rr(IPM,s) = mass;
           ii(PLEV,s) = lev + 1;
           ii(PGID,s) = owner_gid(x, y);
-          ii(PTAG,s) = cloud_next_tag++;
+          ii(PTAG,s) = cloud_next_tag; cloud_next_tag += global_variable::nranks;
           bins[bin_key(x, y)].push_back(s);
         }
       }
@@ -1134,7 +1217,9 @@ int DustGasDrag::SplitCloudsP1() {
         rr(IPM,s) = pr_h(IPM,p)*p1[a].frac*p2[b].frac;
         ii(PLEV,s) = clev | (p1[a].lobe << sh1) | (p2[b].lobe << sh2);
         ii(PGID,s) = owner_gid(cx, cy);
-        if (a > 0 || b > 0) ii(PTAG,s) = cloud_next_tag++;   // the centre keeps the tag
+        if (a > 0 || b > 0) {   // the centre keeps the tag
+          ii(PTAG,s) = cloud_next_tag; cloud_next_tag += global_variable::nranks;
+        }
       }
     }
     // diagnostic position oracle (<problem>/split_oracle): give the pieces of an in-run
@@ -1613,7 +1698,7 @@ int DustGasDrag::MergeClouds() {
         r[IPM] = rrow[IPM]*p1[a].frac*p2[b].frac;
         i[PLEV] = lev;
         i[PGID] = owner_gid(cx, cy);
-        if (a > 0 || b > 0) i[PTAG] = cloud_next_tag++;
+        if (a > 0 || b > 0) {i[PTAG] = cloud_next_tag; cloud_next_tag += global_variable::nranks;}
         R.push_back(r); I.push_back(i);
       }
     }
@@ -2004,7 +2089,7 @@ int DustGasDrag::MergeClouds() {
   cloud_coarsen_dk_grad += dk_grad;
   cloud_coarsen_dk_res += dk_res;
   // one line per pass: counts, energy removed, conservation and the mass by cloud type
-  std::FILE *fp = std::fopen("cloud_merge_log.txt", "a");
+  std::FILE *fp = std::fopen(RankFile("cloud_merge_log.txt").c_str(), "a");
   if (fp != nullptr) {
     std::fseek(fp, 0, SEEK_END);
     if (std::ftell(fp) == 0) {

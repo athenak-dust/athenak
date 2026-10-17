@@ -623,7 +623,8 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
         Real z0 = size.x2min + (static_cast<Real>(j) + lshiftz
                   + (static_cast<Real>(jp) + 0.5)/static_cast<Real>(npar1d))*hz;
         hi(PGID,p) = gids + m;
-        hi(PTAG,p) = p;
+        // unique over the ranks (one rank: p)
+        hi(PTAG,p) = p*global_variable::nranks + global_variable::my_rank;
         hi(PSP,p) = 0;
         hi(PLEV,p) = 0;
         for (int col=0; col<ppar->nrdata; ++col) hr(col,p) = 0.0;
@@ -792,7 +793,8 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       }
     } else {
       // one pass per refinement level: children of the first pass may lie inside a
-      // still finer region
+      // still finer region (the tag counter is set collectively first)
+      pmbp->pdust->EnsureNextTag();
       while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
       ntrans = pmbp->pdust->MakeTransitionClouds();
     }
@@ -822,6 +824,9 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
           }
         }
         if (owner < 0) {
+          // several ranks: a piece in another rank's block keeps its block;
+          // the cloud migration of the first cycle moves it
+          if (global_variable::nranks > 1) continue;
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                     << std::endl << "seed_after_split: particle outside every MeshBlock"
                     << std::endl;

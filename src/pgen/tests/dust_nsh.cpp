@@ -661,11 +661,16 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   // so a uniform control shares the parent positions of a refinable-cloud run
   bool canonical_root = cloud_root_random && dust_active &&
       pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none && !pmy_mesh_->multilevel;
-  if (cloud_root_random && (global_variable::nranks != 1 || !dust_active ||
+  // several ranks: refinable clouds with <dust>/experimental_mpi; every rank
+  // draws the same parents and keeps those in its blocks
+  const bool ranks_ok = (global_variable::nranks == 1) ||
+      (dust_active && pmbp->pdust->experimental_mpi && !canonical_root);
+  if (cloud_root_random && (!ranks_ok || !dust_active ||
       !(pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud ||
         canonical_root) || pmy_mesh_->three_d)) {
-    std::cerr << "cloud_root_random requires single-rank 2-D dust with refinable_cloud "
-              << "transfer, or the canonical deposit on a uniform mesh" << std::endl;
+    std::cerr << "cloud_root_random requires single-rank (or <dust>/experimental_mpi) 2-D "
+              << "dust with refinable_cloud transfer, or the canonical deposit on a uniform "
+              << "mesh" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (dust_active) {
@@ -852,21 +857,13 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       std::cerr << "cloud_root_random requires positive integer root ppc" << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    Kokkos::realloc(pr, ppar->nrdata, nparent);
-    Kokkos::realloc(pi, ppar->nidata, nparent);
-    ppar->nprtcl_thispack = nparent;
-    pmy_mesh_->nprtcl_thisrank = nparent;
-    pmy_mesh_->nprtcl_eachrank[0] = nparent;
-    pmy_mesh_->nprtcl_total = nparent;
-    auto pr0 = ppar->prtcl_rdata;
-    auto pi0 = ppar->prtcl_idata;
-    auto gids0 = pmbp->gids;
-    int nrdata = ppar->nrdata;
     int ncells1 = pmbp->pdust->qdep.extent_int(4);
     int ncells2 = pmbp->pdust->qdep.extent_int(3);
-    Real mass_unit = transfer.root_dx1*transfer.root_dx2;
-    par_for("nsh_cloud_root_random", DevExeSpace(), 0, nparent-1,
-    KOKKOS_LAMBDA(const int p) {
+    // the parents of this rank: those whose leaf is in one of its blocks, in
+    // the order of their global index p, which stays the tag (one rank: all of them)
+    const int nlocal_mb = nmb;
+    DvceArray1D<int> pslot("nsh_root_slot", nparent);
+    par_for("nsh_cloud_root_owner", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int p) {
       std::uint64_t key = static_cast<std::uint64_t>(p)
                         + random_seed*UINT64_C(0x9e3779b97f4a7c15);
       Real x = transfer.x1min + HashUniform01(key + UINT64_C(0x632be59bd9b4e019))
@@ -883,20 +880,54 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
         const int leaf = lt.LeafOwner(x, y, 0);   // the actual leaves
         m = (leaf < 0) ? 0 : leaf/(ncells1*ncells2);
       }
+      pslot(p) = m;
+    });
+    DvceArray1D<int> pnew("nsh_root_new", nparent);
+    int nkeep = 0;
+    Kokkos::parallel_scan("nsh_root_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, nparent),
+    KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+      const bool keep = (pslot(p) < nlocal_mb);
+      if (final) pnew(p) = keep ? upd : -1;
+      if (keep) ++upd;
+    }, nkeep);
+    Kokkos::realloc(pr, ppar->nrdata, nkeep);
+    Kokkos::realloc(pi, ppar->nidata, nkeep);
+    ppar->nprtcl_thispack = nkeep;
+    pmy_mesh_->nprtcl_thisrank = nkeep;
+    pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = nkeep;
+    pmy_mesh_->nprtcl_total = nparent;
+    auto pr0 = ppar->prtcl_rdata;
+    auto pi0 = ppar->prtcl_idata;
+    auto gids0 = pmbp->gids;
+    int nrdata = ppar->nrdata;
+    Real mass_unit = transfer.root_dx1*transfer.root_dx2;
+    par_for("nsh_cloud_root_random", DevExeSpace(), 0, nparent-1,
+    KOKKOS_LAMBDA(const int q) {
+      const int p = pnew(q);
+      if (p < 0) return;
+      std::uint64_t key = static_cast<std::uint64_t>(q)
+                        + random_seed*UINT64_C(0x9e3779b97f4a7c15);
+      Real x = transfer.x1min + HashUniform01(key + UINT64_C(0x632be59bd9b4e019))
+                             *(transfer.x1max-transfer.x1min);
+      Real y = transfer.x2min + HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7))
+                             *(transfer.x2max-transfer.x2min);
+      const int m = pslot(q);
       pi0(PGID,p) = gids0+m;
-      pi0(PTAG,p) = p;
-      pi0(PSP,p) = p % nspec;
+      pi0(PTAG,p) = q;
+      pi0(PSP,p) = q % nspec;
       pi0(PLEV,p) = 0;
       for (int c=0; c<nrdata; ++c) pr0(c,p) = 0.0;
       pr0(IPX,p) = x; pr0(IPX1,p) = x;
       pr0(IPY,p) = y; pr0(IPY1,p) = y;
-      pr0(IPTS,p) = taus_.d_view(p % nspec);
-      pr0(IPM,p) = spdat.d_view(p % nspec,2)*mass_unit;
-      pr0(IPVX,p) = spdat.d_view(p % nspec,0);
-      pr0(IPVZ,p) = spdat.d_view(p % nspec,1);
+      pr0(IPTS,p) = taus_.d_view(q % nspec);
+      pr0(IPM,p) = spdat.d_view(q % nspec,2)*mass_unit;
+      pr0(IPVX,p) = spdat.d_view(q % nspec,0);
+      pr0(IPVZ,p) = spdat.d_view(q % nspec,1);
       pr0(IPVX1,p) = pr0(IPVX,p);
       pr0(IPVZ1,p) = pr0(IPVZ,p);
     });
+    // the tag counter is set collectively before the splits
+    if (!canonical_root) pmbp->pdust->EnsureNextTag();
     if (!canonical_root) while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
     std::cout << "# BA random root " << (canonical_root ? "particles (canonical): "
               : "clouds: ") << nparent << " parents -> " << ppar->nprtcl_thispack

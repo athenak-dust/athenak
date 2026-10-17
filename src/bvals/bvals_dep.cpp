@@ -44,8 +44,13 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
     bool experimental_smr = pin->GetOrAddBoolean(
         "dust", "experimental_static_smr", false);
     bool experimental_amr = pin->GetOrAddBoolean("dust", "experimental_amr", false);
+    // several ranks only for refinable clouds with the dust halo, which deposit
+    // into the leaves directly: this exchange is not used then
+    bool experimental_mpi = pin->GetOrAddBoolean("dust", "experimental_mpi", false) &&
+        pin->GetOrAddString("dust", "experimental_smr_transfer", "smooth_p2") == "refinable_cloud";
     if (!(experimental_smr && (!(pp->pmesh->adaptive) || experimental_amr) && pp->pmesh->two_d &&
-          pp->pmesh->strictly_periodic && global_variable::nranks == 1)) {
+          pp->pmesh->strictly_periodic &&
+          (global_variable::nranks == 1 || (experimental_mpi && !(pp->pmesh->adaptive))))) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Additive deposit exchange does not support this "
                 << "SMR/AMR configuration" << std::endl;

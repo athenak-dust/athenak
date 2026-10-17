@@ -425,7 +425,7 @@ void DumpResampleState(particles::Particles *ppar, Mesh *pmesh, const char *when
 // one row of cloud_resample_log.txt, with the header in front of the first; written for every
 // pass, also when the pool is too small to resample
 void AppendResampleLog(const char *row) {
-  std::FILE *fp = std::fopen("cloud_resample_log.txt", "a");
+  std::FILE *fp = std::fopen(RankFile("cloud_resample_log.txt").c_str(), "a");
   if (fp == nullptr) return;
   std::fseek(fp, 0, SEEK_END);
   if (std::ftell(fp) == 0) {
@@ -509,7 +509,7 @@ bool DustGasDrag::ResampleDue() {
   while (nxt > cloud_resample_next + 1 && planned(nxt - 1) > t + eps(planned(nxt - 1))) --nxt;
   const long long skipped = nxt - cloud_resample_next - 1;
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = std::fopen("cloud_resample_schedule.txt", "a");
+    std::FILE *fp = std::fopen(RankFile("cloud_resample_schedule.txt").c_str(), "a");
     if (fp != nullptr) {
       std::fseek(fp, 0, SEEK_END);
       if (std::ftell(fp) == 0) {
@@ -642,7 +642,7 @@ void DustGasDrag::StressResamplePool() {
     auto prv = ppar->prtcl_rdata;
     auto piv = ppar->prtcl_idata;
     EnsureNextTag();
-    const int tag0 = cloud_next_tag;
+    const int tag0 = cloud_next_tag, tstride = global_variable::nranks;   // tags unique over the ranks
     const auto transfer = smr_transfer;
     Kokkos::parallel_for("rs_stress_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
@@ -658,11 +658,11 @@ void DustGasDrag::StressResamplePool() {
         const int s = npart + off(p) + k;
         for (int c=0; c<nrdata; ++c) prv(c,s) = prv(c,p);
         for (int c=0; c<nidata; ++c) piv(c,s) = piv(c,p);
-        piv(PTAG,s) = tag0 + off(p) + k;
+        piv(PTAG,s) = tag0 + (off(p) + k)*tstride;
         prv(IPX,s) += dx; prv(IPX1,s) += dx;
       }
     });
-    cloud_next_tag += nextra;
+    cloud_next_tag += nextra*global_variable::nranks;
     ppar->nprtcl_thispack = nnew;
     pmesh->nprtcl_thisrank = nnew;
     pmesh->nprtcl_eachrank[global_variable::my_rank] = nnew;
@@ -692,6 +692,12 @@ int DustGasDrag::ResampleClouds() {
   const auto transfer = smr_transfer;
   const auto lt = leaf_traversal;   // cloud weights on the actual leaves
   const int nlev = transfer.cloud_nlev;
+  // The gas velocity and its differences of every leaf of the current state, the
+  // owners' values on the halo blocks, for the gather of the pool (the predictor's packed
+  // field).  Before any return: the halo exchange is collective.
+  PackGasGather(pmy_pack->phydro->u0);
+  // the root cloud mass (reduced over the ranks): also before any return
+  if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
   if (npart == 0) return 0;
   const bool dump = std::find(cloud_resample_dump.begin(), cloud_resample_dump.end(), pmesh->ncycle) !=
                     cloud_resample_dump.end();
@@ -707,7 +713,6 @@ int DustGasDrag::ResampleClouds() {
   // stay out of the pool.
   const int nsp = std::max(1, nspecies);
   DvceArray1D<Real> m0sp("rs_m0", nsp);
-  if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
   {
     // Codex review: a missing value only takes its own species out of the pool (it was
     // fatal when species 0 had none, e.g. eps_1 = 0 with a second species); fatal only when no
@@ -886,12 +891,12 @@ int DustGasDrag::ResampleClouds() {
   DvceArray1D<Real> cwgt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_cwgt"), nnz);
   auto &indcs = pmesh->mb_indcs;
   const int is = indcs.is, js = indcs.js, ks = indcs.ks;
-  auto &mbsize = pmy_pack->pmb->mb_size;
-  auto &uold = pmy_pack->phydro->u0;
+  auto gp = gpack;   // PackGasGather above
   const int ncells1 = qdep.extent_int(4), ncells2 = qdep.extent_int(3);
   const int tmode = cloud_transition;
   const Real x1min = transfer.x1min, x2min = transfer.x2min;
   const int nnz_ = nnz;
+  const int nmbp_ = pmy_pack->nmb_thispack;
   Kokkos::parallel_for("rs_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     const int a = slot(p);
@@ -908,23 +913,16 @@ int DustGasDrag::ResampleClouds() {
       const int remainder = target/ncells1;
       const int tj = remainder % ncells2;
       const int tm = remainder/ncells2;
-      const Real dx1 = mbsize.d_view(tm).dx1, dx2 = mbsize.d_view(tm).dx2;
-      const Real xc = mbsize.d_view(tm).x1min + (ti - is + 0.5)*dx1;
-      const Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
+      // the leaf's block slot may be a halo block: its box from lt, the gas from
+      // the packed field (the predictor's gather)
+      const Real dx1 = lt.box(tm,2), dx2 = lt.box(tm,3);
+      const Real xc = lt.box(tm,0) + (ti - is + 0.5)*dx1;
+      const Real yc = lt.box(tm,1) + (tj - js + 0.5)*dx2;
       const Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
       const Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
-      const Real invrho = 1.0/uold(tm,IDN,ks,tj,ti);
-      const Real rip = 1.0/uold(tm,IDN,ks,tj,ti+1), rim = 1.0/uold(tm,IDN,ks,tj,ti-1);
-      const Real rjp = 1.0/uold(tm,IDN,ks,tj+1,ti), rjm = 1.0/uold(tm,IDN,ks,tj-1,ti);
-      ugx += w*uold(tm,IM1,ks,tj,ti)*invrho
-           + cx*(uold(tm,IM1,ks,tj,ti+1)*rip - uold(tm,IM1,ks,tj,ti-1)*rim)
-           + cy*(uold(tm,IM1,ks,tj+1,ti)*rjp - uold(tm,IM1,ks,tj-1,ti)*rjm);
-      ugy += w*uold(tm,IM2,ks,tj,ti)*invrho
-           + cx*(uold(tm,IM2,ks,tj,ti+1)*rip - uold(tm,IM2,ks,tj,ti-1)*rim)
-           + cy*(uold(tm,IM2,ks,tj+1,ti)*rjp - uold(tm,IM2,ks,tj-1,ti)*rjm);
-      ugz += w*uold(tm,IM3,ks,tj,ti)*invrho
-           + cx*(uold(tm,IM3,ks,tj,ti+1)*rip - uold(tm,IM3,ks,tj,ti-1)*rim)
-           + cy*(uold(tm,IM3,ks,tj+1,ti)*rjp - uold(tm,IM3,ks,tj-1,ti)*rjm);
+      ugx += w*gp(tm,ks,tj,ti,0) + cx*gp(tm,ks,tj,ti,3) + cy*gp(tm,ks,tj,ti,6);
+      ugy += w*gp(tm,ks,tj,ti,1) + cx*gp(tm,ks,tj,ti,4) + cy*gp(tm,ks,tj,ti,7);
+      ugz += w*gp(tm,ks,tj,ti,2) + cx*gp(tm,ks,tj,ti,5) + cy*gp(tm,ks,tj,ti,8);
     });
     pd(a,0) = xp; pd(a,1) = yp; pd(a,2) = pr(IPM,p);
     pd(a,3) = pr(IPVX,p); pd(a,4) = pr(IPVY,p); pd(a,5) = pr(IPVZ,p); pd(a,6) = pr(IPTS,p);
@@ -941,6 +939,8 @@ int DustGasDrag::ResampleClouds() {
         const int r = t % (ncells1*ncells2);
         tj = r/ncells1 - js; ti = r % ncells1 - is;
       }
+      // the clouds were moved to the rank of their block before (MigrateClouds)
+      if (b >= nmbp_) Kokkos::abort("resampling: a cloud in a block of another rank");
       const int k = kblk(b);
       pid(a,0) = poff(b) + (tj/k)*(bnx1/k) + ti/k;
     } else {
@@ -980,9 +980,9 @@ int DustGasDrag::ResampleClouds() {
           if (poff(mid) <= q) lo = mid; else hi = mid;
         }
         const int b = lo, k = kblk(b), r = q - poff(b), nbx = bnx1/k, ip = r % nbx, jp = r/nbx;
-        const Real d1 = mbsize.d_view(b).dx1, d2 = mbsize.d_view(b).dx2;
-        pgeo(qs,0) = mbsize.d_view(b).x1min + (ip + 0.5)*k*d1;
-        pgeo(qs,1) = mbsize.d_view(b).x2min + (jp + 0.5)*k*d2;
+        const Real d1 = lt.box(b,2), d2 = lt.box(b,3);   // = mb_size of local block b
+        pgeo(qs,0) = lt.box(b,0) + (ip + 0.5)*k*d1;
+        pgeo(qs,1) = lt.box(b,1) + (jp + 0.5)*k*d2;
         pgeo(qs,2) = 0.5*k*d1; pgeo(qs,3) = 0.5*k*d2;
       } else {
         pgeo(qs,0) = x1min + (q % np1 + 0.5)*s*rx1;

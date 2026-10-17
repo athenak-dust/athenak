@@ -90,19 +90,24 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
               << "or hybrid requires integrator=rk2" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  // <dust>/experimental_mpi: refinable clouds on several MPI ranks with the dust
+  // halo (dust_halo.cpp); static mesh only for now, the supported options in CheckMultiRank
+  experimental_mpi = pin->GetOrAddBoolean("dust", "experimental_mpi", false);
   if (pmy_pack->pmesh->multilevel) {
     bool experimental_smr = pin->GetOrAddBoolean(
         "dust", "experimental_static_smr", false);
     // <dust>/experimental_amr (dust_amr.cpp): adaptive refinement with the
     // refinable-cloud transfer; the dust state is rebuilt after every regrid
     experimental_amr = pin->GetOrAddBoolean("dust", "experimental_amr", false);
+    const bool ranks_ok = (global_variable::nranks == 1) ||
+                          (experimental_mpi && !(pmy_pack->pmesh->adaptive));
     if (!(experimental_smr && (!(pmy_pack->pmesh->adaptive) || experimental_amr) &&
-          pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic &&
-          global_variable::nranks == 1)) {
+          pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic && ranks_ok)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Dust drag does not support SMR/AMR. The current "
                 << "experimental exception requires explicit opt-in, static 2-D SMR, "
-                << "ordinary periodic boundaries, and one MPI rank" << std::endl;
+                << "ordinary periodic boundaries, and one MPI rank (several ranks: "
+                << "<dust>/experimental_mpi and a static mesh)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
@@ -733,6 +738,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
     BuildRefinableCloudTransfer(pin);
+    CheckMultiRank();
     if (global_variable::my_rank == 0) {
       std::cout << "# WARNING (dust): experimental static-SMR refinable_cloud transfer "
                 << "is enabled (hat clouds, exact leaf integrals, two-scale split; "
@@ -791,6 +797,52 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::CheckMultiRank
+//! \brief With several MPI ranks, refinable clouds run only the production path
+//! that the dust halo covers (PC2 linear gather, quantum G with or without the pass budget,
+//! device or host R); every other option stops here until it has its exchange.
+
+void DustGasDrag::CheckMultiRank() {
+  if (global_variable::nranks == 1) return;
+  std::vector<std::string> bad;
+  if (!experimental_mpi) bad.push_back("<dust>/experimental_mpi = false");
+  if (pmy_pack->pmesh->adaptive) bad.push_back("adaptive mesh refinement");
+  if (!(coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2)) {
+    bad.push_back("a coupling other than PC2 (coupling = pc2 or hybrid_force_mode = pc2)");
+  }
+  if (drag_solver != DustDragSolver::local) bad.push_back("drag_solver other than local");
+  if (cloud_gather_order != 2 || cloud_force_local || cloud_force_children || cloud_deform ||
+      analytic_gather.on) {
+    bad.push_back("gather variants (cloud_gather_order != 2, force_local/children, deform, "
+                  "analytic_gather)");
+  }
+  if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_stencil ||
+                      cloud_merge_absorb || cloud_compress)) {
+    bad.push_back("merging other than the device quantum G (tent, X, absorption, compression)");
+  }
+  if (cloud_resample && !cloud_resample_block_patches) {
+    bad.push_back("resampling on root patches (cloud_resample_block_patches = false)");
+  }
+  if (cloud_split_interp || cloud_split_log) bad.push_back("cloud_split_interp / cloud_split_log");
+  if (cloud_leaf_check > 0) bad.push_back("cloud_leaf_check");
+  if (cloud_audit_t0 >= 0.0) bad.push_back("merge pass audits (cloud_audit_t0)");
+  if (cloud_resample_compare || cloud_resample_feedback_check || cloud_resample_stress > 0 ||
+      !cloud_resample_dump.empty()) {
+    bad.push_back("resampling diagnostics (compare, feedback_check, stress, dump)");
+  }
+  if (smr_transfer.native) bad.push_back("the level-native traversal");
+  if (!bad.empty()) {
+    if (global_variable::my_rank == 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "Refinable clouds on " << global_variable::nranks << " MPI ranks "
+                << "do not support yet:" << std::endl;
+      for (const auto &b : bad) std::cout << "  - " << b << std::endl;
+    }
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+//----------------------------------------------------------------------------------------
 // destructor
 
 DustGasDrag::~DustGasDrag() {
@@ -817,7 +869,10 @@ DustGasDrag::~DustGasDrag() {
                   " far_releases=" + std::to_string(cloud_far_release) +
                   " dK_grad=" + std::to_string(cloud_coarsen_dk_grad) +
                   " dK_res=" + std::to_string(cloud_coarsen_dk_res) : std::string())
-              << " particles=" << pmy_pack->ppart->nprtcl_thispack << std::endl;
+              // with several ranks the counters are rank 0's, the particles all ranks'
+              << " particles=" << ((global_variable::nranks > 1) ? pmy_pack->pmesh->nprtcl_total
+                                                                  : pmy_pack->ppart->nprtcl_thispack)
+              << ((global_variable::nranks > 1) ? " counters=rank0" : "") << std::endl;
   }
   if (global_variable::my_rank == 0 && solver_stage_count > 0) {
     auto quantile = [&](double fraction) {
