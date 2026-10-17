@@ -32,19 +32,28 @@
 //! from the record regrid_evt.  Records are found by name, so a file written by a code with
 //! more (or fewer) records is still read.
 //!
-//! One MPI rank only: the head has room for a per-rank layout, which is not implemented.
-//! Files without the section (written before this, or by runs without particles) are still
-//! readable by runs without particles.
+//! Several MPI ranks: every rank writes one such section with its particles,
+//! one after the other in rank order; "ranks written" in the head of every section is their
+//! number.  The dust records of a section are its rank's (the tag counter differs by rank) and
+//! include rank_blocks (rank, first gid, number of blocks).  A run on as many ranks with the
+//! same blocks per rank takes its own section back exactly; any other run reads all sections,
+//! keeps the particles of its blocks, takes the records of section 0 and starts the tag counter
+//! anew.  Files without the section (written before this, or by runs without particles) are
+//! still readable by runs without particles.
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <vector>
 
 #include "athena.hpp"
+#if MPI_PARALLEL_ENABLED
+#include <mpi.h>
+#endif
 #include "globals.hpp"
 #include "mesh/mesh.hpp"
 #include "mesh/meshblock_pack.hpp"
@@ -99,6 +108,9 @@ std::uint64_t ParticleRestartSectionBytes(const char *head) {
 void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   const std::int32_t tag = cloud_next_tag, pass = cloud_merge_pass;
   PutRecord(b, "next_tag", &tag, sizeof(tag));
+  // the blocks of the rank that writes this section
+  const std::int32_t rb[3] = {global_variable::my_rank, pmy_pack->gids, pmy_pack->nmb_thispack};
+  PutRecord(b, "rank_blocks", rb, sizeof(rb));
   PutRecord(b, "merge_pass", &pass, sizeof(pass));
   if (!cloud_merge_mroot.empty()) {
     PutRecord(b, "mroot", cloud_merge_mroot.data(), cloud_merge_mroot.size()*sizeof(Real));
@@ -175,6 +187,8 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
     };
     if (name == "next_tag") {
       std::int32_t v; want(sizeof(v)); std::memcpy(&v, d, sizeof(v)); cloud_next_tag = v;
+    } else if (name == "rank_blocks") {
+      std::int32_t v[3]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));   // read by the caller
     } else if (name == "merge_pass") {
       std::int32_t v; want(sizeof(v)); std::memcpy(&v, d, sizeof(v)); cloud_merge_pass = v;
     } else if (name == "mroot") {
@@ -255,8 +269,8 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
 
 void PackParticleRestart(MeshBlockPack *pmbp, std::vector<char> &buf) {
   particles::Particles *ppar = pmbp->ppart;
-  if (global_variable::nranks > 1) {
-    Broken("particles in the restart file are implemented for one MPI rank only");
+  if (global_variable::nranks > 1 && pmbp->pdust == nullptr) {
+    Broken("particles without dust in the restart file are implemented for one MPI rank only");
   }
   const std::int64_t np = ppar->nprtcl_thispack;
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
@@ -267,7 +281,8 @@ void PackParticleRestart(MeshBlockPack *pmbp, std::vector<char> &buf) {
               static_cast<std::size_t>(np)*(nrdata*sizeof(Real) + nidata*sizeof(int)));
   Put(buf, kMagic, 8);
   const std::int32_t head[6] = {kVersion, static_cast<std::int32_t>(sizeof(Real)),
-                                static_cast<std::int32_t>(sizeof(int)), 1, nrdata, nidata};
+                                static_cast<std::int32_t>(sizeof(int)), global_variable::nranks,
+                                nrdata, nidata};
   Put(buf, head, sizeof(head));
   const std::uint64_t total = kHeadBytes + sizeof(std::int64_t) + sizeof(Real) + sizeof(std::int32_t) +
       state.size() + static_cast<std::uint64_t>(np)*(nrdata*sizeof(Real) + nidata*sizeof(int)) + 8;
@@ -293,17 +308,25 @@ void PackParticleRestart(MeshBlockPack *pmbp, std::vector<char> &buf) {
 }
 
 //----------------------------------------------------------------------------------------
-//! \fn dust::UnpackParticleRestart
-//! \brief Restore the particles (and the dust records) of this pack from a section read from
-//! a restart file.  The arrays are sized to the particles of the file, with the headroom of
-//! the device split when clouds are refinable.
+//! \fn dust::ParticleRestartSections
+//! \brief The number of sections (ranks that wrote the file) from the head of the first one.
 
-void UnpackParticleRestart(MeshBlockPack *pmbp, const std::vector<char> &buf) {
-  particles::Particles *ppar = pmbp->ppart;
-  Mesh *pm = pmbp->pmesh;
-  if (global_variable::nranks > 1) {
-    Broken("particles in the restart file are implemented for one MPI rank only");
-  }
+int ParticleRestartSections(const char *head) {
+  std::int32_t h[6];
+  std::memcpy(h, head + 8, sizeof(h));
+  return h[3];
+}
+
+namespace {
+// the parts of one section, after checking its head and sizes against this run
+struct Section {
+  std::int64_t np = 0;
+  Real dtnew = 0.0;
+  const char *state = nullptr;
+  std::int32_t nstate = 0;
+  const char *rows = nullptr;   // nrdata rows of Real, then nidata rows of int
+};
+Section ParseSection(const std::vector<char> &buf, const int nsec, const int nrdata, const int nidata) {
   if (buf.size() < kHeadBytes + 8 || std::memcmp(buf.data(), kMagic, 8) != 0 ||
       std::memcmp(buf.data() + buf.size() - 8, kMagic, 8) != 0) {
     Broken("missing or truncated (no head or end marker)");
@@ -311,29 +334,128 @@ void UnpackParticleRestart(MeshBlockPack *pmbp, const std::vector<char> &buf) {
   std::int32_t head[6];
   std::memcpy(head, buf.data() + 8, sizeof(head));
   if (head[0] != kVersion || head[1] != static_cast<std::int32_t>(sizeof(Real)) ||
-      head[2] != static_cast<std::int32_t>(sizeof(int)) || head[3] != 1 ||
-      head[4] != ppar->nrdata || head[5] != ppar->nidata) {
+      head[2] != static_cast<std::int32_t>(sizeof(int)) || head[3] != nsec ||
+      head[4] != nrdata || head[5] != nidata) {
     Broken("version, type sizes, rank count or the number of particle columns do not match "
            "this run (file: version " + std::to_string(head[0]) + ", Real " +
            std::to_string(head[1]) + " bytes, int " + std::to_string(head[2]) + " bytes, ranks " +
            std::to_string(head[3]) + ", nrdata " + std::to_string(head[4]) + ", nidata " +
-           std::to_string(head[5]) + "; run: nrdata " + std::to_string(ppar->nrdata) +
-           ", nidata " + std::to_string(ppar->nidata) + ")");
+           std::to_string(head[5]) + "; run: nrdata " + std::to_string(nrdata) +
+           ", nidata " + std::to_string(nidata) + ")");
   }
+  Section s;
   std::size_t at = kHeadBytes;
-  std::int64_t np = 0;
-  std::memcpy(&np, buf.data() + at, sizeof(np)); at += sizeof(np);
-  Real dtnew = 0.0;
-  std::memcpy(&dtnew, buf.data() + at, sizeof(dtnew)); at += sizeof(dtnew);
-  std::int32_t nstate = 0;
-  std::memcpy(&nstate, buf.data() + at, sizeof(nstate)); at += sizeof(nstate);
-  const int nrdata = ppar->nrdata, nidata = ppar->nidata;
-  const std::size_t need = at + static_cast<std::size_t>(nstate) +
-      static_cast<std::size_t>(np)*(nrdata*sizeof(Real) + nidata*sizeof(int)) + 8;
-  if (np < 0 || nstate < 0 || need != buf.size()) Broken("sizes inside the section are inconsistent");
-  if (pmbp->pdust != nullptr) pmbp->pdust->UnpackRestartState(buf.data() + at, nstate);
-  at += nstate;
+  std::memcpy(&s.np, buf.data() + at, sizeof(s.np)); at += sizeof(s.np);
+  std::memcpy(&s.dtnew, buf.data() + at, sizeof(s.dtnew)); at += sizeof(s.dtnew);
+  std::memcpy(&s.nstate, buf.data() + at, sizeof(s.nstate)); at += sizeof(s.nstate);
+  const std::size_t need = at + static_cast<std::size_t>(s.nstate) +
+      static_cast<std::size_t>(s.np)*(nrdata*sizeof(Real) + nidata*sizeof(int)) + 8;
+  if (s.np < 0 || s.nstate < 0 || need != buf.size()) Broken("sizes inside the section are inconsistent");
+  s.state = buf.data() + at;
+  s.rows = buf.data() + at + s.nstate;
+  return s;
+}
+// the record rank_blocks of a section's dust records (false if there is none)
+bool RankBlocks(const char *p, const std::int32_t nbytes, std::int32_t rb[3]) {
+  std::size_t at = 0;
+  while (at + 16 + sizeof(std::int32_t) <= static_cast<std::size_t>(nbytes)) {
+    char key[17] = {0};
+    std::memcpy(key, p + at, 16);
+    std::int32_t n = 0;
+    std::memcpy(&n, p + at + 16, sizeof(n));
+    if (n < 0) return false;
+    if (std::string(key) == "rank_blocks" && n == static_cast<std::int32_t>(3*sizeof(std::int32_t))) {
+      std::memcpy(rb, p + at + 16 + sizeof(n), 3*sizeof(std::int32_t));
+      return true;
+    }
+    at += 16 + sizeof(n) + static_cast<std::size_t>(n);
+  }
+  return false;
+}
+}  // namespace
 
+//----------------------------------------------------------------------------------------
+//! \fn dust::UnpackParticleRestart
+//! \brief Restore the particles (and the dust records) of this pack from the nsec sections of
+//! a restart file (read(k, buf) fills buf with section k).  The arrays are sized to the
+//! particles of the file, with the headroom of the device split when clouds are refinable.
+//! As many ranks with the same blocks as the writer: this rank's own section, exactly.  Else
+//! the particles of this rank's blocks from all sections, the records of
+//! section 0, a new tag counter.
+
+void UnpackParticleRestart(MeshBlockPack *pmbp, const int nsec,
+                           const std::function<void(int, std::vector<char>&)> &read) {
+  particles::Particles *ppar = pmbp->ppart;
+  Mesh *pm = pmbp->pmesh;
+  const int nranks = global_variable::nranks, me = global_variable::my_rank;
+  const int gids = pmbp->gids, nmb = pmbp->nmb_thispack;
+  const int nrdata = ppar->nrdata, nidata = ppar->nidata;
+  if (nsec < 1) Broken("no section");
+  std::vector<char> own;
+  int exact = 0;
+  if (nsec == nranks) {
+    read(me, own);
+    const Section s = ParseSection(own, nsec, nrdata, nidata);
+    std::int32_t rb[3];
+    // one rank: also files written before rank_blocks existed
+    if (nranks == 1 || (RankBlocks(s.state, s.nstate, rb) && rb[0] == me && rb[1] == gids &&
+                        rb[2] == nmb)) {
+      exact = 1;
+    }
+  }
+#if MPI_PARALLEL_ENABLED
+  if (nranks > 1) MPI_Allreduce(MPI_IN_PLACE, &exact, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+#endif
+  // the particles kept, column by column
+  std::vector<std::vector<Real>> rc(nrdata);
+  std::vector<std::vector<int>> ic(nidata);
+  Real dtnew = 0.0;
+  std::int64_t nread = 0;
+  auto take = [&](const Section &s, const bool all) {
+    const Real *r = reinterpret_cast<const Real*>(s.rows);
+    std::vector<Real> row(static_cast<std::size_t>(s.np));
+    std::vector<int> irow(static_cast<std::size_t>(s.np));
+    // which particles: all (exact) or those of this rank's blocks
+    std::vector<std::int64_t> sel;
+    const char *ip = s.rows + static_cast<std::size_t>(s.np)*nrdata*sizeof(Real);
+    std::memcpy(irow.data(), ip + static_cast<std::size_t>(PGID)*s.np*sizeof(int), s.np*sizeof(int));
+    for (std::int64_t p=0; p<s.np; ++p) {
+      const bool mine = (irow[p] >= gids && irow[p] < gids + nmb);
+      if (all && !mine) Broken("a particle names a MeshBlock that does not exist");
+      if (mine) sel.push_back(p);
+    }
+    for (int c=0; c<nrdata; ++c) {
+      std::memcpy(row.data(), reinterpret_cast<const char*>(r) + static_cast<std::size_t>(c)*s.np*sizeof(Real),
+                  s.np*sizeof(Real));
+      for (const auto p : sel) rc[c].push_back(row[p]);
+    }
+    for (int c=0; c<nidata; ++c) {
+      std::memcpy(irow.data(), ip + static_cast<std::size_t>(c)*s.np*sizeof(int), s.np*sizeof(int));
+      for (const auto p : sel) ic[c].push_back(irow[p]);
+    }
+    nread += s.np;
+  };
+  if (exact) {
+    const Section s = ParseSection(own, nsec, nrdata, nidata);
+    if (pmbp->pdust != nullptr) pmbp->pdust->UnpackRestartState(s.state, s.nstate);
+    dtnew = s.dtnew;
+    take(s, true);
+  } else {
+    std::vector<char> buf;
+    for (int k=0; k<nsec; ++k) {
+      if (k == me && !own.empty()) {buf.swap(own);} else {read(k, buf);}
+      const Section s = ParseSection(buf, nsec, nrdata, nidata);
+      if (k == 0) {
+        if (pmbp->pdust != nullptr) pmbp->pdust->UnpackRestartState(s.state, s.nstate);
+        dtnew = s.dtnew;
+      }
+      take(s, false);
+    }
+    // the counters of the sections were per rank: the tag counter starts again from the largest
+    // tag (EnsureNextTag, collectively at the first cycle)
+    if (pmbp->pdust != nullptr) pmbp->pdust->cloud_next_tag = -1;
+  }
+  const std::int64_t np = rc.empty() ? 0 : static_cast<std::int64_t>(rc[0].size());
   const bool clouds = pmbp->pdust != nullptr &&
                       pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud;
   const std::int64_t cap = std::max<std::int64_t>(1, clouds ? np + np/4 : np);
@@ -343,32 +465,32 @@ void UnpackParticleRestart(MeshBlockPack *pmbp, const std::vector<char> &buf) {
   auto pi = Kokkos::create_mirror_view(ppar->prtcl_idata);
   Kokkos::deep_copy(pr, 0.0);
   Kokkos::deep_copy(pi, 0);
-  std::vector<Real> row(static_cast<std::size_t>(np));
-  for (int c=0; c<nrdata; ++c) {
-    std::memcpy(row.data(), buf.data() + at, row.size()*sizeof(Real)); at += row.size()*sizeof(Real);
-    for (std::int64_t p=0; p<np; ++p) pr(c,p) = row[p];
-  }
-  std::vector<int> irow(static_cast<std::size_t>(np));
-  const int gids = pmbp->gids, nmb = pmbp->nmb_thispack;
-  for (int c=0; c<nidata; ++c) {
-    std::memcpy(irow.data(), buf.data() + at, irow.size()*sizeof(int)); at += irow.size()*sizeof(int);
-    for (std::int64_t p=0; p<np; ++p) pi(c,p) = irow[p];
-    if (c == PGID) {
-      for (std::int64_t p=0; p<np; ++p) {
-        if (irow[p] < gids || irow[p] >= gids + nmb) Broken("a particle names a MeshBlock that does not exist");
-      }
-    }
-  }
+  for (int c=0; c<nrdata; ++c) for (std::int64_t p=0; p<np; ++p) pr(c,p) = rc[c][p];
+  for (int c=0; c<nidata; ++c) for (std::int64_t p=0; p<np; ++p) pi(c,p) = ic[c][p];
   Kokkos::deep_copy(ppar->prtcl_rdata, pr);
   Kokkos::deep_copy(ppar->prtcl_idata, pi);
   ppar->nprtcl_thispack = static_cast<int>(np);
   ppar->dtnew = dtnew;
   pm->nprtcl_thisrank = static_cast<int>(np);
-  pm->nprtcl_eachrank[global_variable::my_rank] = static_cast<int>(np);
-  pm->nprtcl_total = static_cast<int>(np);
-  if (global_variable::my_rank == 0) {
-    std::cout << "# restart: " << np << " particles restored (" << nrdata << " real and " << nidata
-              << " integer columns), particle dt " << dtnew;
+  pm->nprtcl_eachrank[me] = static_cast<int>(np);
+  long long tot = np;
+#if MPI_PARALLEL_ENABLED
+  if (nranks > 1) {
+    int n32 = static_cast<int>(np);
+    MPI_Allgather(&n32, 1, MPI_INT, pm->nprtcl_eachrank, 1, MPI_INT, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &tot, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
+  pm->nprtcl_total = static_cast<int>(tot);
+  // every rank read all sections: each particle of the file is kept by exactly one rank
+  if (!exact && tot != nread) {
+    Broken("the particles of the file do not fall into the blocks of this run (" +
+           std::to_string(tot) + " kept, " + std::to_string(nread) + " in the file)");
+  }
+  if (me == 0) {
+    std::cout << "# restart: " << tot << " particles restored from " << nsec << " section(s) "
+              << (exact ? "(each rank its own)" : "(sorted by block)") << " (" << nrdata
+              << " real and " << nidata << " integer columns), particle dt " << dtnew;
     if (pmbp->pdust != nullptr) {
       std::cout << ", next cloud tag " << pmbp->pdust->cloud_next_tag << ", merge pass "
                 << pmbp->pdust->cloud_merge_pass;

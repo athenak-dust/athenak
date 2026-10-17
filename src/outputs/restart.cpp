@@ -629,16 +629,24 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   // particles and dust state (dust/dust_restart.cpp): one section after the
   // data of the last MeshBlock.  Runs without particles write nothing here.
   if (pm->pmb_pack->ppart != nullptr) {
-    if (single_file_per_rank || global_variable::nranks > 1) {
+    if (single_file_per_rank) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "restart files with particles are implemented for one MPI rank and a "
-                << "single file" << std::endl;
+                << "restart files with particles are implemented for a single file" << std::endl;
       exit(EXIT_FAILURE);
     }
     std::vector<char> pbuf;
     dust::PackParticleRestart(pm->pmb_pack, pbuf);
+    // several ranks: one section per rank, in rank order
+    IOWrapperSizeT before = 0;
+#if MPI_PARALLEL_ENABLED
+    {
+      unsigned long long mine = pbuf.size(), sum = 0;
+      MPI_Exscan(&mine, &sum, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+      if (global_variable::my_rank > 0) before = static_cast<IOWrapperSizeT>(sum);
+    }
+#endif
     const IOWrapperSizeT poff = step1size + step2size + step3size + sizeof(IOWrapperSizeT) +
-                                data_size*(pm->nmb_total);
+                                data_size*(pm->nmb_total) + before;
     const IOWrapperSizeT chunk = static_cast<IOWrapperSizeT>(1) << 30;
     for (IOWrapperSizeT done = 0; done < pbuf.size(); done += chunk) {
       const IOWrapperSizeT n = std::min<IOWrapperSizeT>(chunk, pbuf.size() - done);

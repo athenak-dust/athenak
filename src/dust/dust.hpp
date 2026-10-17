@@ -1881,7 +1881,9 @@ void DensityRefinement(MeshBlockPack *pmbp);
 std::size_t ParticleRestartHeadBytes();
 std::uint64_t ParticleRestartSectionBytes(const char *head);
 void PackParticleRestart(MeshBlockPack *pmbp, std::vector<char> &buf);
-void UnpackParticleRestart(MeshBlockPack *pmbp, const std::vector<char> &buf);
+int ParticleRestartSections(const char *head);
+void UnpackParticleRestart(MeshBlockPack *pmbp, const int nsec,
+                           const std::function<void(int, std::vector<char>&)> &read);
 
 } // namespace dust
 #endif // DUST_DUST_HPP_
