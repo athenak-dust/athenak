@@ -404,11 +404,17 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       std::fseek(fp, 0, SEEK_END);
       if (std::ftell(fp) == 0) {
         std::fprintf(fp, "# ncycle time max_rho/mean blocks flag_refine flag_derefine fine_volume_share "
-                     "fine_dust_mass_share clouds_root clouds_finer_plain clouds_lobed\n");
+                     "fine_dust_mass_share clouds_root clouds_finer_plain clouds_lobed "
+                     "blocks_per_level(0/1/...)\n");
       }
       const Real vbox = (pm->mesh_size.x1max - x0)*(pm->mesh_size.x2max - y0);
-      std::fprintf(fp, "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d\n", pm->ncycle, pm->time, qmax, nblk,
-                   nflag[0], nflag[1], vfine/vbox, mfine/mtot, nlev[0], nlev[1], nlev[2]);
+      // the blocks of every level, from the global block list
+      std::vector<int> perlev(pm->max_level - pm->root_level + 1, 0);
+      for (int g=0; g<pm->nmb_total; ++g) ++perlev[pm->lloc_eachmb[g].level - pm->root_level];
+      std::string pl;
+      for (std::size_t l=0; l<perlev.size(); ++l) pl += (l ? "/" : "") + std::to_string(perlev[l]);
+      std::fprintf(fp, "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d %s\n", pm->ncycle, pm->time, qmax, nblk,
+                   nflag[0], nflag[1], vfine/vbox, mfine/mtot, nlev[0], nlev[1], nlev[2], pl.c_str());
       std::fclose(fp);
     }
   }
