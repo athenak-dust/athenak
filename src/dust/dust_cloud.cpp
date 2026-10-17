@@ -733,7 +733,15 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   CheckHaloReach("regrid event");
   const int n0 = ppar->nprtcl_thispack;
   Kokkos::Timer timer;
-  if (do_merge) MergeClouds();
+  if (do_merge) {
+    MergeClouds();
+    // several ranks: a merged cloud whose block is on another rank keeps its parent's block
+    // (NewCloudBlock); R bins every cloud by the leaf that holds it, so it moves first.  The
+    // cycle path runs R before G and leaves this to the push migration.  (GB200 AMR pilot,
+    // 2026-10-17: the first derefinement on 4 ranks aborted in R.)
+    MigrateClouds();
+    CheckHaloReach("regrid event merge");
+  }
   Kokkos::fence();
   const double t_merge = timer.seconds();
   const int n1 = ppar->nprtcl_thispack;
