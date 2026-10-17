@@ -509,6 +509,7 @@ struct PassAudit {
   static char Code() {
     if constexpr (std::is_same_v<T, double>) return 'd';
     else if constexpr (std::is_same_v<T, int>) return 'i';
+    else if constexpr (std::is_same_v<T, std::int64_t>) return 'l';   // 64-bit cell keys
     else return 'c';
   }
   static void Raw(std::vector<char> &buf, const std::string &name, const char type,
@@ -935,6 +936,10 @@ int DustGasDrag::MergeCloudsDevice() {
   DvceArray1D<Real> dk("merge_dk", 2);   // dK_grad, dK_res
   const Real omega = is_shearing_box ? omega0 : 0.0;
   const Real alpha = cloud_merge_alpha, fmin = cloud_merge_min_mass;
+  // the members of a G / C group and of an X family have bitwise equal ts;
+  // with cloud_merge_exact_ts the new cloud keeps that value instead of the mass-weighted mean,
+  // whose last bits follow the order of the atomic sums (and so the storage order)
+  const bool exact_ts = cloud_merge_exact_ts;
   const bool nc = cloud_merge_nc;
   const bool lobe_wait = cloud_merge_lobe_wait > 0, lobe_wait_dir = cloud_merge_lobe_wait == 2;
   const bool d3 = cloud_merge_d3;
@@ -1066,6 +1071,7 @@ int DustGasDrag::MergeCloudsDevice() {
             for (int q=0; q<nrdata; ++q) nr(q,knew) += m*pr(q,t);
           }
           for (int q=0; q<nrdata; ++q) nr(q,knew) /= M;
+          if (exact_ts) nr(IPTS,knew) = ts;   // the family's common ts
           const Real px = SMRCompositeTransfer::WrapPosition(xc0 + sx/M, transfer.x1min, transfer.x1max);
           const Real py = SMRCompositeTransfer::WrapPosition(yc0 + sy/M, transfer.x2min, transfer.x2max);
           nr(IPM,knew) = M;
@@ -1455,6 +1461,7 @@ int DustGasDrag::MergeCloudsDevice() {
             for (int q=0; q<nidata; ++q) ni(q,knew) = pi(q,gfirst[j]);
             ni(PLEV,knew) = tl;
             nkind(knew) = stage;
+            if (exact_ts) nr(IPTS,knew) = gts[j];   // the group's common ts
             acc(6,knew) = xcc; acc(7,knew) = ycc;
             Kokkos::atomic_add(&qc(q0), 1.0);
             Kokkos::atomic_add(&qc(q0 + 1), static_cast<double>(gn[j]));
@@ -1534,6 +1541,7 @@ int DustGasDrag::MergeCloudsDevice() {
                              pr(IPVY,p)*pr(IPVY,p) + pr(IPVZ,p)*pr(IPVZ,p))));
           for (int q=0; q<nrdata; ++q) {
             if (q == IPM || q == IPX || q == IPY || q == IPX1 || q == IPY1) continue;
+            if (exact_ts && q == IPTS) continue;   // set at the commit
             Kokkos::atomic_add(&nr(q,k), m*pr(q,p));
           }
           if (!pbud) pr(IPM,p) = 0.0;
@@ -1548,6 +1556,7 @@ int DustGasDrag::MergeCloudsDevice() {
             const double M = acc(0,k);
             for (int q=0; q<nrdata; ++q) {
               if (q == IPM || q == IPX || q == IPY || q == IPX1 || q == IPY1) continue;
+              if (exact_ts && q == IPTS) continue;   // set at the commit
               nr(q,k) /= M;
             }
             const Real px = SMRCompositeTransfer::WrapPosition(acc(6,k) + acc(1,k)/M, transfer.x1min, transfer.x1max);

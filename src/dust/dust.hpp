@@ -1495,6 +1495,7 @@ class DustGasDrag {
   Real cloud_merge_stencil_tol = 0.02;  // stage X offset tolerance (units of the piece half-width)
   Real cloud_merge_smax = 1.0;        // stage G group position extent (units of the target cell)
   int cloud_merge_K = 4;              // open groups per cell walk (1..8)
+  bool cloud_merge_exact_ts = false;  // merged clouds keep the common ts of their members
   Real cloud_audit_t0 = -1.0;          // merge audit (diagnostic): dump every merge pass in
   Real cloud_audit_t1 = -1.0;          // [t0, t1]; stages in full when the pass changed anything
   bool cloud_audit_compact = true;     // quiet passes: compact particle + gas snapshot
