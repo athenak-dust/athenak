@@ -18,6 +18,7 @@
 //! Hydro and MHD: it owns the combined task graph, the deposited fields, and the drag
 //! kernels, while particle storage/migration stays in Particles and fluxes/BCs in Hydro.
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -1293,12 +1294,15 @@ inline std::string RankFile(const std::string &name) {
 
 //----------------------------------------------------------------------------------------
 //! \struct DustHalo
-//! The exchange lists of the dust halo (dust_halo.cpp).  Per peer rank p
-//! (ascending), the blocks of this rank sent to it, sblk[soff[p] .. soff[p+1]), and the halo
-//! slots received from it, rblk[roff[p] .. roff[p+1]), both in ascending gid.  Whole blocks
-//! (interior cells) for now; one rank: no peers.
+//! The exchange lists of the dust halo (dust_halo.cpp), cell by cell.  Per
+//! peer rank p (ascending), the cells of this rank's blocks sent to it, scell[soff[p] ..
+//! soff[p+1]), and the cells of the halo slots received from it, rcell[roff[p] .. roff[p+1]),
+//! as flat leaf indices (block slot, j, i); the blocks in ascending gid, each block's cells
+//! row by row over its rectangle (the whole block, or with <dust>/cloud_halo_strips the
+//! part that the clouds of the receiving rank can reach).  One rank: no peers.
 struct DustHalo {
-  int nx1 = 0, nx2 = 0, is = 0, js = 0;
+  int nx1 = 0, nx2 = 0, is = 0, js = 0, ncells1 = 0, ncells2 = 0;
+  int hslot0 = 0, hslot1 = 0;          // the halo slots [hslot0, hslot1)
   int npeer = 0;
   unsigned long long builds = 0;
   // seconds of the exchanges, forward [0..3] and reverse [4..7]: waiting for the kernels before
@@ -1306,8 +1310,14 @@ struct DustHalo {
   double tsec[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   unsigned long long nexch[2] = {0, 0};
   std::vector<int> peer, soff, roff;
-  DvceArray1D<int> sblk, rblk;
+  DvceArray1D<int> scell, rcell;
   DvceArray1D<Real> sbuf, rbuf;
+  long long nblk_send = 0, nblk_recv = 0;   // blocks in the lists (for the log)
+  // the rectangle [i0, i1) x [j0, j1) (interior cell indices) of every halo slot that this rank
+  // receives, by halo slot (slot - nmb); and the guard of the strips (test)
+  std::vector<std::array<int, 4>> rect;
+  DvceArray2D<int> rect_d;
+  bool guard = false;
 #if MPI_PARALLEL_ENABLED
   MPI_Comm comm = MPI_COMM_NULL;
   bool comm_set = false;
@@ -1807,6 +1817,8 @@ class DustGasDrag {
   // furthest a support may extend beyond each block
   int cloud_halo_coarser = -1;         // test: levels a cloud may be coarser than its block (-1: auto)
   int cloud_halo_test_shrink = 0;      // test: the rule's reach divided by 2^this (forces widenings)
+  bool cloud_halo_strips = false;      // exchange only the reachable cells of each block
+  bool cloud_halo_strip_guard = false; // test: NaN outside the strips before forward, zero check before reverse
   std::vector<std::int64_t> halo_need_, halo_reach_, halo_allow_;
   int halo_need_seq_ = -1;
   DvceArray1D<std::int64_t> halo_allow_d_;

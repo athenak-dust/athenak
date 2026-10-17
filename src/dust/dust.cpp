@@ -891,7 +891,10 @@ DustGasDrag::~DustGasDrag() {
               << t[0] << " pack=" << t[1] << " mpi=" << t[2] << " unpack=" << t[3]
               << " | halo reverse (" << halo_.nexch[1] << "): kernels_before=" << t[4] << " pack="
               << t[5] << " mpi=" << t[6] << " add=" << t[7] << " | halo widenings " << halo_widenings_
-              << ", halo blocks " << leaf_traversal.nfld - leaf_traversal.nmb << std::endl;
+              << ", halo blocks " << leaf_traversal.nfld - leaf_traversal.nmb << ", cells sent "
+              << (halo_.soff.empty() ? 0 : halo_.soff.back()) << " received "
+              << (halo_.roff.empty() ? 0 : halo_.roff.back())
+              << (cloud_halo_strips ? " (strips)" : " (whole blocks)") << std::endl;
   }
   if (global_variable::my_rank == 0 && solver_stage_count > 0) {
     auto quantile = [&](double fraction) {

@@ -9,6 +9,8 @@
 //! diagnostic comparison with the virtual-finest-grid traversal (<dust>/cloud_leaf_check).
 
 #include <algorithm>
+#include <unordered_map>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -59,6 +61,9 @@ void DustGasDrag::BuildLeafTraversal() {
   std::vector<int> slot_of(ntot, -1), slot_gid;
   slot_gid.reserve(ntot);
   for (int m=0; m<nmb; ++m) {slot_of[gids + m] = m; slot_gid.push_back(gids + m);}
+  // the cells of each halo block that the clouds of this rank can reach (the
+  // bounding box over this rank's blocks of the block cut by their reach), by gid
+  std::unordered_map<int, std::array<int, 4>> hrect;
   {
     std::vector<int> h;
     for (int m=0; m<nmb; ++m) {
@@ -122,6 +127,29 @@ void DustGasDrag::BuildLeafTraversal() {
               if (overlap(gb[0], gb[1], mb[0] - rf, mb[1] + rf, nf1) &&
                   overlap(gb[2], gb[3], mb[2] - rf, mb[3] + rf, nf2)) {
                 h.push_back(g);
+                // the part of g within the reach (every periodic image), in g's cells
+                const LogicalLocation &gl = pm->lloc_eachmb[g];
+                const std::int64_t ratio = static_cast<std::int64_t>(1) << (nl - (gl.level - pm->root_level));
+                std::int64_t r[4] = {gb[1], gb[0], gb[3], gb[2]};   // empty
+                for (int sft=-1; sft<=1; ++sft) {
+                  const std::int64_t a0 = std::max(gb[0], mb[0] - rf - sft*nf1);
+                  const std::int64_t a1 = std::min(gb[1], mb[1] + rf - sft*nf1);
+                  if (a0 < a1) {r[0] = std::min(r[0], a0); r[1] = std::max(r[1], a1);}
+                  const std::int64_t b0 = std::max(gb[2], mb[2] - rf - sft*nf2);
+                  const std::int64_t b1 = std::min(gb[3], mb[3] + rf - sft*nf2);
+                  if (b0 < b1) {r[2] = std::min(r[2], b0); r[3] = std::max(r[3], b1);}
+                }
+                const std::array<int, 4> c = {static_cast<int>((r[0] - gb[0])/ratio),
+                                              static_cast<int>((r[1] - gb[0] + ratio - 1)/ratio),
+                                              static_cast<int>((r[2] - gb[2])/ratio),
+                                              static_cast<int>((r[3] - gb[2] + ratio - 1)/ratio)};
+                auto it = hrect.find(g);
+                if (it == hrect.end()) {
+                  hrect[g] = c;
+                } else {
+                  it->second = {std::min(it->second[0], c[0]), std::max(it->second[1], c[1]),
+                                std::min(it->second[2], c[2]), std::max(it->second[3], c[3])};
+                }
               }
             }
           }
@@ -133,6 +161,20 @@ void DustGasDrag::BuildLeafTraversal() {
     for (const int g : h) {slot_of[g] = static_cast<int>(slot_gid.size()); slot_gid.push_back(g);}
   }
   const int nfld = static_cast<int>(slot_gid.size());
+  // the rectangle of every halo slot: the reachable cells with cloud_halo_strips, else (and for
+  // a block without one, which the reach always gives) the whole block
+  halo_.rect.assign(nfld - nmb, {0, indcs.nx1, 0, indcs.nx2});
+  if (cloud_halo_strips) {
+    for (int b=nmb; b<nfld; ++b) {
+      auto it = hrect.find(slot_gid[b]);
+      if (it != hrect.end()) {
+        auto c = it->second;
+        c[0] = std::max(0, c[0]); c[1] = std::min(indcs.nx1, c[1]);
+        c[2] = std::max(0, c[2]); c[3] = std::min(indcs.nx2, c[3]);
+        if (c[0] < c[1] && c[2] < c[3]) halo_.rect[b - nmb] = c;
+      }
+    }
+  }
   for (int g=0; g<ntot; ++g) {
     if (slot_of[g] < 0) {slot_of[g] = static_cast<int>(slot_gid.size()); slot_gid.push_back(g);}
   }

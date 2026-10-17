@@ -93,6 +93,10 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // reach of the halo (-1: from the split rule); the per-cycle check widens it where needed
   cloud_halo_coarser = pin->GetOrAddInteger("dust", "cloud_halo_coarser", -1);
   cloud_halo_test_shrink = pin->GetOrAddInteger("dust", "cloud_halo_test_shrink", 0);
+  // cloud_halo_strips: exchange only the cells of each halo block that this rank's clouds can reach
+  // (false: whole blocks); the guard (test) checks that nothing outside them is read or written
+  cloud_halo_strips = pin->GetOrAddBoolean("dust", "cloud_halo_strips", false);
+  cloud_halo_strip_guard = pin->GetOrAddBoolean("dust", "cloud_halo_strip_guard", false);
   // Every cloud_sort_interval cycles (0: never) the particle arrays are reordered
   // by block, cell in the block (cloud_sort_order = linear or morton) and old position, after
   // the split, resampling and merge pass of the cycle (SortParticles).
