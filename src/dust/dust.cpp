@@ -412,8 +412,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_stencil_tol = pin->GetOrAddReal("dust", "cloud_merge_stencil_tol", 0.02);
       cloud_merge_smax = pin->GetOrAddReal("dust", "cloud_merge_smax", 1.0);
       cloud_merge_K = pin->GetOrAddInteger("dust", "cloud_merge_K", 4);
-      // Diagnostic for now: merged clouds keep their members' common ts exactly
-      cloud_merge_exact_ts = pin->GetOrAddBoolean("dust", "cloud_merge_exact_ts", false);
+      // Merged clouds keep their members' common ts (default); false reproduces the
+      // runs before 2026-10-16, where ts was mass-averaged with the velocities (last-bit drift)
+      cloud_merge_exact_ts = pin->GetOrAddBoolean("dust", "cloud_merge_exact_ts", true);
       cloud_merge_g_lag = pin->GetOrAddInteger("dust", "cloud_merge_g_lag", 2);
       cloud_audit_t0 = pin->GetOrAddReal("dust", "cloud_audit_t0", -1.0);
       cloud_audit_t1 = pin->GetOrAddReal("dust", "cloud_audit_t1", -1.0);
