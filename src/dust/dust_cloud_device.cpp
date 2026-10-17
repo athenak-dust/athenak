@@ -2431,6 +2431,7 @@ int DustGasDrag::MergeCloudsDevice() {
         nr(IPM,knew) = M;
         nr(IPX,knew) = px; nr(IPX1,knew) = px; nr(IPY,knew) = py; nr(IPY1,knew) = py;
         nr(IPVX,knew) = vm[0]; nr(IPVY,knew) = vm[1]; nr(IPVZ,knew) = vm[2];
+        if (exact_ts) nr(IPTS,knew) = pr(IPTS,c);   // the centre's ts (one species)
         if (d3) {
           const int mz = static_cast<int>(Kokkos::floor((py - transfer.x2min)/H2));
           drow(knew) = mz;

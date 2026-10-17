@@ -1915,6 +1915,7 @@ int DustGasDrag::MergeClouds() {
         r[IPM] = M;
         r[IPX] = px; r[IPX1] = px; r[IPY] = py; r[IPY1] = py;
         r[IPVX] = vm[0]; r[IPVY] = vm[1]; r[IPVZ] = vm[2];
+        if (cloud_merge_exact_ts) r[IPTS] = R[c][IPTS];   // the centre's ts (one species)
         std::vector<int> i = I[c];
         i[PLEV] = L;
         i[PGID] = owner_gid(px, py);
