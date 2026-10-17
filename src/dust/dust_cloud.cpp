@@ -609,6 +609,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   const bool do_merge = merge_due || (merge_ok && ndel > 0);
   const char *why = !do_merge ? "none"
                   : ((merge_due && ndel > 0) ? "due+derefine" : (merge_due ? "due" : "derefine"));
+  MigrateClouds();   // every cloud in its block before G and R
   const int n0 = ppar->nprtcl_thispack;
   Kokkos::Timer timer;
   if (do_merge) MergeClouds();

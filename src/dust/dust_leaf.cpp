@@ -78,6 +78,15 @@ void DustGasDrag::BuildLeafTraversal() {
     std::exit(EXIT_FAILURE);
   }
   leaf_slot_gid = slot_gid;
+  {
+    leaf_slot_gid_d = DvceArray1D<int>("dust_slot_gid", nall);
+    leaf_slot_rank_d = DvceArray1D<int>("dust_slot_rank", nall);
+    auto gh = Kokkos::create_mirror_view(leaf_slot_gid_d);
+    auto rh = Kokkos::create_mirror_view(leaf_slot_rank_d);
+    for (int b=0; b<nall; ++b) {gh(b) = slot_gid[b]; rh(b) = pm->rank_eachmb[slot_gid[b]];}
+    Kokkos::deep_copy(leaf_slot_gid_d, gh);
+    Kokkos::deep_copy(leaf_slot_rank_d, rh);
+  }
   auto &lt = leaf_traversal;
   lt.nmb = nmb;
   lt.nfld = nfld;

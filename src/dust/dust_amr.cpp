@@ -216,18 +216,19 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   auto pi = ppar->prtcl_idata;
   auto transfer = pdust->smr_transfer;
   auto lt = pdust->leaf_traversal;   // the actual leaves
-  // dust density on the current leaves from the particles at their new positions
-  DvceArray3D<Real> f("amr_rho", nmb, ncells2, ncells1);
-  Kokkos::deep_copy(DevExeSpace(), f, 0.0);
+  // dust density on the current leaves from the particles at their new positions; several
+  // ranks: leaves of the halo blocks too, added back to their owners
+  DvceArray2D<Real> f("amr_rho", 1, std::max(1, lt.nfld*ncells2*ncells1));
   par_for("amr_rho_deposit", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
     const Real mass = pr(IPM,p);
     ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
                            [&](const int target, const Real w) {
       if (w == 0.0) return;
-      const int ti = target % ncells1, tj = (target/ncells1) % ncells2, tm = target/(ncells1*ncells2);
-      DepositAdd(&f(tm,tj,ti), mass*w/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2));
+      const int tm = target/(ncells1*ncells2);
+      DepositAdd(&f(0,target), mass*w/(lt.box(tm,2)*lt.box(tm,3)));
     });
   });
+  pdust->HaloReverseAddFlat(f, 1);
   Real mtot = 0.0;
   int nlev[3] = {0, 0, 0};   // clouds at the root level, finer plain, lobed
   Kokkos::parallel_reduce("amr_rho_totals", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -236,7 +237,14 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     const int code = pi(PLEV,p);
     if (code > 15) ++nl; else if ((code & 15) == 0) ++n0; else ++n1;
   }, mtot, nlev[0], nlev[1], nlev[2]);
-  auto fh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), f);
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, nlev, 3, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
+  auto fhf = Kokkos::create_mirror_view_and_copy(HostMemSpace(), f);
+  auto fh = [&](const int m, const int j, const int i) {return fhf(0, (m*ncells2 + j)*ncells1 + i);};
   const int nr1 = pm->mesh_indcs.nx1, nr2 = pm->mesh_indcs.nx2;
   const Real x0 = pm->mesh_size.x1min, y0 = pm->mesh_size.x2min;
   const Real hx = (pm->mesh_size.x1max - x0)/nr1, hy = (pm->mesh_size.x2max - y0)/nr2;
@@ -259,6 +267,16 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     }
     if (fine) vfine += nx1*sz.dx1*nx2*sz.dx2;
   }
+#if MPI_PARALLEL_ENABLED
+  // the root-cell maxima and the totals over all ranks
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, rmax.data(), nr1*nr2, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &qmax, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+    Real fv[2] = {mfine, vfine};
+    MPI_Allreduce(MPI_IN_PLACE, fv, 2, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+    mfine = fv[0]; vfine = fv[1];
+  }
+#endif
   const int b = trig_.buffer;
   for (int rj=0; rj<nr2; ++rj) {
     for (int ri=0; ri<nr1; ++ri) {
@@ -409,6 +427,7 @@ void DustGasDrag::ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin) {
 //! it; stops if a position has no owning block of this pack.
 
 int DustGasDrag::ResetPGIDFromPositions(const char *when) {
+  if (global_variable::nranks > 1) return RouteToOwnerBlocks(when);
   particles::Particles *ppar = pmy_pack->ppart;
   const int npart = ppar->nprtcl_thispack;
   auto pr = ppar->prtcl_rdata;
@@ -445,6 +464,85 @@ int DustGasDrag::ResetPGIDFromPositions(const char *when) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::RouteToOwnerBlocks
+//! \brief Several ranks: every particle to the block that holds its position
+//! (the leaf traversal of the current mesh, all blocks of the mesh): its MeshBlock id, and the
+//! particles of blocks of other ranks (after a regrid with load balancing: anywhere) through
+//! the AthenaK particle exchange, with a send list filled here.  Returns how many ids of this
+//! rank's particles changed.
+
+int DustGasDrag::RouteToOwnerBlocks(const char *when) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto *pb = ppar->pbval_part;
+  const int npart = ppar->nprtcl_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  const auto lt = leaf_traversal;
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int ncell12 = (indcs.nx1 + 2*indcs.ng)*(indcs.nx2 + 2*indcs.ng);
+  const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
+  auto sgid = leaf_slot_gid_d;
+  auto srank = leaf_slot_rank_d;
+  int nchanged = 0, nbad = 0;
+#if MPI_PARALLEL_ENABLED
+  if (pb->sendlist.extent_int(0) < std::max(npart, 1)) Kokkos::realloc(pb->sendlist, std::max(npart, 1));
+  Kokkos::deep_copy(pb->send_count.d_view, 0);
+  auto psendl = pb->sendlist.d_view;
+  int *pcounter = pb->send_count.d_view.data();
+  if (npart > 0) {
+    Kokkos::parallel_reduce("dust_route_owner", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
+      const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)));
+      const int slot = (leaf < 0) ? -1 : leaf/ncell12;
+      if (slot < 0) {++bad; return;}
+      const int g = (slot < nmb) ? gids + slot : sgid(slot);
+      if (pi(PGID,p) != g) {pi(PGID,p) = g; ++changed;}
+      if (slot >= nmb) {
+        const int k = Kokkos::atomic_fetch_add(pcounter, 1);
+        psendl(k).prtcl_indx = p;
+        psendl(k).dest_gid = g;
+        psendl(k).dest_rank = srank(slot);
+      }
+    }, Kokkos::Sum<int>(nchanged), Kokkos::Sum<int>(nbad));
+  }
+  if (nbad > 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << nbad << " particles have no owning MeshBlock (" << when << ")" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  Kokkos::deep_copy(pb->send_count.h_view, pb->send_count.d_view);
+  pb->nprtcl_send = pb->send_count.h_view(0);
+  if (pb->nprtcl_send > 0) {
+    auto d = Kokkos::subview(pb->sendlist.d_view, std::make_pair(0, pb->nprtcl_send));
+    auto h = Kokkos::subview(pb->sendlist.h_view, std::make_pair(0, pb->nprtcl_send));
+    Kokkos::deep_copy(h, d);
+  }
+  const int nsent = pb->nprtcl_send;
+  pb->CountSendsAndRecvs();
+  pb->InitPrtclRecv();
+  pb->PackAndSendPrtcls();
+  while (pb->RecvAndUnpackPrtcls() != TaskStatus::complete) {}
+  pb->ClearPrtclSend();
+  pb->ClearPrtclRecv();
+  Mesh *pm = pmy_pack->pmesh;
+  long long tot = 0;
+  for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
+  pm->nprtcl_total = static_cast<int>(tot);
+  long long sums[2] = {nchanged, nsent};
+  MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  if (global_variable::my_rank == 0) {
+    std::cout << "# dust: MeshBlock ids set from the positions at the " << when << ": "
+              << sums[0] << " of " << tot << " changed, " << sums[1] << " sent to other ranks"
+              << std::endl;
+  }
+#else
+  (void)pb; (void)npart; (void)pr; (void)pi; (void)ncell12; (void)nmb; (void)gids;
+  (void)sgid; (void)srank; (void)nbad; (void)when;
+#endif
+  return nchanged;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::BeforeRegrid
 //! \brief Called by MeshRefinement::AdaptiveMeshRefinement before the mesh changes: the
 //! particle count and checksum that RebuildAfterRegrid must find again.
@@ -472,9 +570,12 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   }
   Mesh *pmesh = pmy_pack->pmesh;
   particles::Particles *ppar = pmy_pack->ppart;
-  const int npart = ppar->nprtcl_thispack;
 
   BuildRefinableCloudTransfer(pin);
+  // Several ranks: the particles follow their blocks to the ranks that hold
+  // them on the new mesh (load balancing may move blocks anywhere)
+  if (global_variable::nranks > 1) RouteToOwnerBlocks("regrid");
+  const int npart = ppar->nprtcl_thispack;
   // Every regrid is an event, handled at the start of the next cycle after
   // its split (HandleRegridEvent); refine / derefine from the blocks actually created and
   // deleted, not from the net change of the block count.  A regrid that deleted blocks also
@@ -509,7 +610,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       int b = (owner < 0 || owner >= nmb) ? 1 : 0;
       lt.ForEachCloudWeight(xp, yp, pi(PLEV,p), lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
         sw += w;
-        if (target < 0 || target/ncell12 >= nmb) ++b;
+        if (target < 0 || target/ncell12 >= lt.nfld) ++b;   // halo blocks included
       });
       dw = Kokkos::fmax(dw, Kokkos::fabs(sw - 1.0));
       bad += b;
@@ -526,7 +627,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       const int leaf = lt.LeafOwner(xp, yp, lt.Anchor(pi(PGID,p)));
       int bad = (leaf < 0) ? 1 : 0, nout = 0;
       lt.ForEachCloudWeight(xp, yp, pi(PLEV,p), lt.Anchor(pi(PGID,p)), [&](const int target, const Real) {
-        if (target < 0 || target/ncell12 >= nmb) ++nout;
+        if (target < 0 || target/ncell12 >= lt.nfld) ++nout;
       });
       if (bad == 0 && nout == 0) return;
       const int k = Kokkos::atomic_fetch_add(&nex(0), 1);
@@ -547,9 +648,20 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     std::exit(EXIT_FAILURE);
   }
 
-  // nothing but PGID may have changed since BeforeRegrid
-  const unsigned long long check = ParticleChecksum(ppar);
-  if (amr_npart_before != npart || check != amr_checksum) {
+  // nothing but PGID may have changed since BeforeRegrid (several ranks: over all ranks; the
+  // checksum is a sum over the particles)
+  unsigned long long check = ParticleChecksum(ppar);
+  long long nb4 = amr_npart_before, naft = npart;
+  unsigned long long ck4 = amr_checksum;
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, &nb4, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &naft, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &ck4, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &check, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
+  if (nb4 != naft || check != ck4) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "dust after a regrid: particles " << amr_npart_before << " -> " << npart
               << ", checksum " << amr_checksum << " -> " << check << std::endl;

@@ -188,13 +188,13 @@ Mesh::Mesh(ParameterInput *pin) :
     // same restrictions
     bool experimental_dust_amr = pin->DoesBlockExist("dust") &&
         pin->GetOrAddBoolean("dust", "experimental_amr", false);
-    // <dust>/experimental_mpi: several ranks on a static mesh; the
-    // dust module checks the rest
+    // <dust>/experimental_mpi: several ranks; the dust module checks
+    // the rest
     bool experimental_dust_mpi = pin->DoesBlockExist("dust") &&
         pin->GetOrAddBoolean("dust", "experimental_mpi", false);
     if (!(experimental_dust_smr && (!adaptive || experimental_dust_amr) && two_d &&
           strictly_periodic &&
-          (global_variable::nranks == 1 || (experimental_dust_mpi && !adaptive)))) {
+          (global_variable::nranks == 1 || experimental_dust_mpi))) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Shearing box is not currently compatible with mesh "
                 << "refinement, except the explicitly enabled experimental dust "

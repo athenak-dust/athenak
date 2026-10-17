@@ -1792,11 +1792,13 @@ class DustGasDrag {
   // slot of the leaf traversal, the halo lists and the exchanges (dust_halo.cpp)
   bool experimental_mpi = false;
   std::vector<int> leaf_slot_gid;
+  DvceArray1D<int> leaf_slot_gid_d, leaf_slot_rank_d;   // gid and rank of every block slot
   DustHalo halo_;
   void BuildHalo(const std::vector<int> &slot_gid);
   void CheckMultiRank();
   void MigrateClouds();
   void FrameToBlock();
+  int RouteToOwnerBlocks(const char *when);   // after a regrid / restart
   // several ranks: seconds and calls of 0 MigrateClouds, 1 the migration after the
   // push, 2 halo forward, 3 halo reverse (this rank)
   double mpi_time[4] = {0.0, 0.0, 0.0, 0.0};

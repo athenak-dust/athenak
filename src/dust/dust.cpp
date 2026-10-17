@@ -91,7 +91,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     std::exit(EXIT_FAILURE);
   }
   // <dust>/experimental_mpi: refinable clouds on several MPI ranks with the dust
-  // halo (dust_halo.cpp); static mesh only for now, the supported options in CheckMultiRank
+  // halo (dust_halo.cpp); the supported options in CheckMultiRank
   experimental_mpi = pin->GetOrAddBoolean("dust", "experimental_mpi", false);
   if (pmy_pack->pmesh->multilevel) {
     bool experimental_smr = pin->GetOrAddBoolean(
@@ -99,15 +99,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     // <dust>/experimental_amr (dust_amr.cpp): adaptive refinement with the
     // refinable-cloud transfer; the dust state is rebuilt after every regrid
     experimental_amr = pin->GetOrAddBoolean("dust", "experimental_amr", false);
-    const bool ranks_ok = (global_variable::nranks == 1) ||
-                          (experimental_mpi && !(pmy_pack->pmesh->adaptive));
+    const bool ranks_ok = (global_variable::nranks == 1) || experimental_mpi;
     if (!(experimental_smr && (!(pmy_pack->pmesh->adaptive) || experimental_amr) &&
           pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic && ranks_ok)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Dust drag does not support SMR/AMR. The current "
                 << "experimental exception requires explicit opt-in, static 2-D SMR, "
                 << "ordinary periodic boundaries, and one MPI rank (several ranks: "
-                << "<dust>/experimental_mpi and a static mesh)" << std::endl;
+                << "<dust>/experimental_mpi)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
@@ -806,7 +805,6 @@ void DustGasDrag::CheckMultiRank() {
   if (global_variable::nranks == 1) return;
   std::vector<std::string> bad;
   if (!experimental_mpi) bad.push_back("<dust>/experimental_mpi = false");
-  if (pmy_pack->pmesh->adaptive) bad.push_back("adaptive mesh refinement");
   if (!(coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2)) {
     bad.push_back("a coupling other than PC2 (coupling = pc2 or hybrid_force_mode = pc2)");
   }

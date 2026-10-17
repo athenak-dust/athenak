@@ -50,7 +50,7 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
         pin->GetOrAddString("dust", "experimental_smr_transfer", "smooth_p2") == "refinable_cloud";
     if (!(experimental_smr && (!(pp->pmesh->adaptive) || experimental_amr) && pp->pmesh->two_d &&
           pp->pmesh->strictly_periodic &&
-          (global_variable::nranks == 1 || (experimental_mpi && !(pp->pmesh->adaptive))))) {
+          (global_variable::nranks == 1 || experimental_mpi))) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Additive deposit exchange does not support this "
                 << "SMR/AMR configuration" << std::endl;
