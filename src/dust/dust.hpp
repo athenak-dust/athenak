@@ -1740,7 +1740,7 @@ class DustGasDrag {
   void SortParticles();
   // an index of the particles in (block, cell) order for the two production cloud
   // kernels, without moving them (cloud_order_interval = N: rebuilt every N cycles and whenever
-  // the check at the end of RefineClouds fails; 0: off)
+  // the check at the end of RefineClouds fails; 0: off; default 8 on the production PC2 path)
   int cloud_order_interval = 0;
   DvceArray1D<int> cloud_ord, cloud_ord_tag;
   int cloud_ord_n = 0;

@@ -98,7 +98,15 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     cloud_sort_random = (so == "random");   // diagnostic: a random permutation
     cloud_sort_at_start = pin->GetOrAddBoolean("dust", "cloud_sort_at_start", false);
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
-    cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval", 0);
+    // The cell-sorted index is on by default (every 8 cycles) where the two
+    // production cloud kernels run (hybrid / PC2 coupling, linear gather, no force or deform
+    // variant); 0 turns it off (the control, and the runs before ce92ed4b)
+    {
+      const bool prod = coupling == DustCoupling::hybrid &&
+                        hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2 &&
+                        !cloud_force_local && !cloud_force_children && !cloud_deform;
+      cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval", prod ? 8 : 0);
+    }
   }
   const bool graded = pin->DoesParameterExist("problem", "graded_split_layers") &&
                       pin->GetInteger("problem", "graded_split_layers") >= 0;
