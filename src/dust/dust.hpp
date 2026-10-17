@@ -1689,6 +1689,12 @@ class DustGasDrag {
     return (smr_transfer_mode == DustSMRTransfer::smooth_p2 ||
             smr_transfer_mode == DustSMRTransfer::refinable_cloud);
   }
+  // u* is exchanged into the ghost cells for the TSC gather and for the linear cloud gather
+  // (central differences); the piecewise-constant composite gathers read leaf cells only
+  bool UstarGhosts() const {
+    return !UsesCompositeTransfer() ||
+           (smr_transfer_mode == DustSMRTransfer::refinable_cloud && cloud_gather_order == 2);
+  }
   Real drag_rtol, drag_atol;
   int drag_iter_max, drag_diagnostic_interval;
   Real adaptive_order_c, adaptive_rtol_max, adaptive_tref, adaptive_state_floor;

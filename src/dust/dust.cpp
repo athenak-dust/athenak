@@ -363,6 +363,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << "cloud_gather_order=2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
+      // The force/deformation experiments and a fixed gather level exist only in the PC2
+      // kernels; the implicit stages (imex2+, and split-BE, which automatic hybrid can enter)
+      // gather with the production cloud weights (piecewise constant or linear).
+      if ((coupling == DustCoupling::imex ||
+           (coupling == DustCoupling::hybrid && hybrid_force_mode != HybridForceMode::pc2)) &&
+          variant) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "IMEX/split-BE refinable_cloud does not support "
+                  << "cloud_force_local, cloud_force_children, cloud_deform or "
+                  << "cloud_gather_level; use coupling=pc2 for these experiments"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       cloud_p1_release_exit = pin->GetOrAddBoolean("dust", "cloud_p1_release_exit", false);
       cloud_split_log = pin->GetOrAddBoolean("dust", "cloud_split_log", false);
       cloud_split_device = pin->GetOrAddBoolean("dust", "cloud_split_device", false);
@@ -746,6 +759,17 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
     BuildRefinableCloudTransfer(pin);
+    // the linear gather of the implicit stages reads u* in the ghost cells (its central
+    // differences): with several levels the u* exchange restricts and prolongates through a
+    // coarse buffer (PC2 forms its midpoint velocity from gas states that include ghosts)
+    const bool implicit_stages = coupling == DustCoupling::imex ||
+        (coupling == DustCoupling::hybrid && hybrid_force_mode != HybridForceMode::pc2);
+    if (pmy_pack->pmesh->multilevel && implicit_stages && UstarGhosts()) {
+      int nccells1 = indcs.cnx1 + 2*(indcs.ng);
+      int nccells2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*(indcs.ng)) : 1;
+      int nccells3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*(indcs.ng)) : 1;
+      Kokkos::realloc(cdummy, nmb, 3, nccells3, nccells2, nccells1);
+    }
     CheckMultiRank();
     if (global_variable::my_rank == 0) {
       std::cout << "# WARNING (dust): experimental static-SMR refinable_cloud transfer "
@@ -814,8 +838,12 @@ void DustGasDrag::CheckMultiRank() {
   if (global_variable::nranks == 1) return;
   std::vector<std::string> bad;
   if (!experimental_mpi) bad.push_back("<dust>/experimental_mpi = false");
-  if (!(coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2)) {
-    bad.push_back("a coupling other than PC2 (coupling = pc2 or hybrid_force_mode = pc2)");
+  // PC2, or imex2+ (2026-10-17: its deposit and gather-kick kernels use the halo); not the
+  // automatic hybrid, whose split-BE preparation pass has no halo exchange yet
+  if (!(coupling == DustCoupling::imex ||
+        (coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2))) {
+    bad.push_back("a coupling other than PC2 or IMEX (coupling = pc2 / imex, or "
+                  "hybrid_force_mode = pc2)");
   }
   if (drag_solver != DustDragSolver::local) bad.push_back("drag_solver other than local");
   if (cloud_gather_order != 2 || cloud_force_local || cloud_force_children || cloud_deform ||

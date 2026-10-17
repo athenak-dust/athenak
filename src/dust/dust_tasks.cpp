@@ -247,7 +247,7 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
     tstat = pbval_qp->InitRecv(5);
     if (tstat != TaskStatus::complete) return tstat;
   }
-  if (use_ustar) {
+  if (use_ustar && UstarGhosts()) {
     tstat = pbval_us->InitRecv(3);
     if (tstat != TaskStatus::complete) return tstat;
   }
@@ -293,7 +293,7 @@ TaskStatus DustGasDrag::SendUstar(Driver *pdrive, int stage) {
       (coupling == DustCoupling::hybrid &&
        hybrid_mode == HybridMode::split_be && stage == 2);
   if (!ActiveStage(pdrive, stage) || !use) {return TaskStatus::complete;}
-  if (UsesCompositeTransfer()) {
+  if (!UstarGhosts()) {   // the piecewise-constant composite gathers read leaf cells only
     return TaskStatus::complete;
   }
   if (pmy_pack->pmesh->multilevel) {
@@ -307,7 +307,7 @@ TaskStatus DustGasDrag::RecvUstar(Driver *pdrive, int stage) {
       (coupling == DustCoupling::hybrid &&
        hybrid_mode == HybridMode::split_be && stage == 2);
   if (!ActiveStage(pdrive, stage) || !use) {return TaskStatus::complete;}
-  if (UsesCompositeTransfer()) {
+  if (!UstarGhosts()) {   // the piecewise-constant composite gathers read leaf cells only
     return TaskStatus::complete;
   }
   TaskStatus status = pbval_us->RecvAndUnpackCC(ustar, cdummy);
