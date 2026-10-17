@@ -337,12 +337,22 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_split_slack = pin->GetOrAddReal("dust", "cloud_split_slack", 0.02);
       cloud_merge_tolerance = pin->GetOrAddReal("dust", "cloud_merge_tolerance", 0.05);
       cloud_deform = pin->GetOrAddBoolean("dust", "cloud_deform", false);
-      cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order",
-                                                cloud_deform ? 2 : 1);
       cloud_force_local = pin->GetOrAddBoolean("dust", "cloud_force_local", false);
       cloud_force_children = pin->GetOrAddBoolean("dust", "cloud_force_children", false);
       cloud_gather_level = pin->GetOrAddInteger("dust", "cloud_gather_level", -1);
-      cloud_transition = pin->GetOrAddInteger("dust", "cloud_transition", 0);
+      // Rixin: the production split is the default: the moving P1 split, splitting on
+      // the first overlap with finer leaves (cloud_split_overlap, dust_cloud.cpp), with the P1
+      // transition clouds of mode 2 and the linear gather that mode needs.  The research gather
+      // variants (deform, force_local / force_children, a fixed gather level), which exclude
+      // transition clouds, keep the old defaults (no P1 split, no transitions).  Inputs written
+      // before 2026-10-17 that leave these keys out get the new values.
+      const bool variant = cloud_deform || cloud_force_local || cloud_force_children ||
+                           cloud_gather_level >= 0;
+      cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", !variant);
+      cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order",
+                                                (cloud_deform || cloud_p1_split) ? 2 : 1);
+      cloud_transition = pin->GetOrAddInteger("dust", "cloud_transition",
+                                              cloud_p1_split ? (cloud_gather_order == 2 ? 2 : 1) : 0);
       if (cloud_transition < 0 || cloud_transition > 2 ||
           (cloud_transition > 0 && (cloud_deform || cloud_force_local ||
                                     cloud_force_children || cloud_gather_level >= 0)) ||
@@ -353,7 +363,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << "cloud_gather_order=2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", false);
       cloud_p1_release_exit = pin->GetOrAddBoolean("dust", "cloud_p1_release_exit", false);
       cloud_split_log = pin->GetOrAddBoolean("dust", "cloud_split_log", false);
       cloud_split_device = pin->GetOrAddBoolean("dust", "cloud_split_device", false);

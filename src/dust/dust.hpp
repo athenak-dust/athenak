@@ -120,7 +120,7 @@ struct SMRCompositeTransfer {
   int cloud_nlev = 0;                 // max_level - root_level
   int cloud_max_level = 0;            // clouds are never split beyond this level
   bool cloud_split_everywhere = false; // control: split regardless of the local mesh
-  bool cloud_split_overlap = false;    // split once the (shrunk) support touches finer leaves
+  bool cloud_split_overlap = true;     // split once the (shrunk) support touches finer leaves
                                        // instead of once it lies entirely on them
   bool lobe3_integral = false;         // diagnostic (<dust>/cloud_presplit_x1): a lobe-3
                                        // direction (parent width) of a transition-2 gather

@@ -185,7 +185,9 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // dust on the mixed gas mesh); cloud_split_everywhere refines the whole lattice
   t.cloud_max_level = pin->GetOrAddInteger("dust", "cloud_max_level", nlev);
   t.cloud_split_everywhere = pin->GetOrAddBoolean("dust", "cloud_split_everywhere", false);
-  t.cloud_split_overlap = pin->GetOrAddBoolean("dust", "cloud_split_overlap", false);
+  // Rixin: split on the first overlap with finer leaves by default (the production
+  // rule since the P1 + overlap round; false is the older rule, kept for comparison)
+  t.cloud_split_overlap = pin->GetOrAddBoolean("dust", "cloud_split_overlap", true);
   t.lobe3_integral = cloud_presplit_x1;
 
   // every block aligned with the finest virtual grid (the actual-leaf traversal relies on it)
