@@ -377,11 +377,6 @@ void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, const std::int64_t kbound
                  KeyCSR &c, const DvceArray1D<int> &rank, const DvceArray1D<int> &inv) {
   const bool ranked = rank.extent(0) > 0;
   const int n = key.extent_int(0);
-  if (n > 0 && kbound >= std::numeric_limits<std::int64_t>::max()/n - 1) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "merge cell keys too large for the composite sort" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
   KeyScratch &s = Scratch();
   auto pos = Grow(s.pos, n > 0 ? n : 1, "kcsr_pos");
   int nl = 0;
@@ -397,6 +392,21 @@ void BuildKeyCSR(const DvceArray1D<std::int64_t> &key, const std::int64_t kbound
     c.ukey = Grow(s.ukey[slot], 1, "kcsr_ukey");
     c.start = Grow(s.start[slot], 1, "kcsr_start");
     return;
+  }
+  // the composite key n + p must fit in 64 bits, checked only for a
+  // non-empty list (an empty deep level was stopped by the bound of its whole grid), and against
+  // the largest listed key when the caller's bound is too large
+  if (kbound >= std::numeric_limits<std::int64_t>::max()/n - 1) {
+    std::int64_t kmax = 0;
+    Kokkos::parallel_reduce("kcsr_max", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
+    KOKKOS_LAMBDA(const int p, std::int64_t &m) {if (key(p) > m) m = key(p);},
+    Kokkos::Max<std::int64_t>(kmax));
+    if (kmax >= std::numeric_limits<std::int64_t>::max()/n - 1) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "merge cell keys too large for the composite sort (largest key " << kmax
+                << ", " << n << " particles)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
   }
   // (key, particle) as one value key n + p, sorted
   const std::int64_t nn = n;
@@ -914,6 +924,10 @@ int DustGasDrag::MergeCloudsDevice() {
   }
   Real mrootsp[4] = {0.0, 0.0, 0.0, 0.0};
   for (int sp=0; sp<nsp; ++sp) mrootsp[sp] = cloud_merge_mroot[sp];
+  // the mass floor of the budgets (cloud_absorb_floor root clouds per root cell): the largest
+  // root cloud mass of the species (species 0 may have none, e.g. eps_1 = 0)
+  Real mroot_floor = 0.0;
+  for (int sp=0; sp<nsp; ++sp) mroot_floor = std::max(mroot_floor, mrootsp[sp]);
 
   // counters: 0 commits, 1 contributions, 2 rejected, 3 pending, 4 nc shifts, 5 nc skipped
   // 6..10 (pending log): not ready (mask), lobe wait, over limit, tolerance, min mass
@@ -1092,7 +1106,7 @@ int DustGasDrag::MergeCloudsDevice() {
             const int maxev = cloud_merge_budget_evals;
             const int xn12 = qdep.extent_int(4)*qdep.extent_int(3);
             const auto xmbsz = pmy_pack->pmb->mb_size;
-            const Real xfloor = cloud_absorb_floor*mrootsp[0]/(transfer.root_dx1*transfer.root_dx2);
+            const Real xfloor = cloud_absorb_floor*mroot_floor/(transfer.root_dx1*transfer.root_dx2);
             const Real xvmin = alpha*H*((omega > 0.0) ? omega : 0.0);
             Kokkos::deep_copy(lcum, 0.0);
             if (bdirty) {
@@ -1280,7 +1294,7 @@ int DustGasDrag::MergeCloudsDevice() {
       // levels), from the actual state: live pieces and the new clouds of stage X, minus the entry
       const int gb_n12 = qdep.extent_int(4)*qdep.extent_int(3);
       const auto gb_mbsz = pmy_pack->pmb->mb_size;
-      const Real gb_floor = cloud_absorb_floor*mrootsp[0]/(transfer.root_dx1*transfer.root_dx2);
+      const Real gb_floor = cloud_absorb_floor*mroot_floor/(transfer.root_dx1*transfer.root_dx2);
       const Real gb_vmin = alpha*H*((omega > 0.0) ? omega : 0.0);
       if (pbud) {
         Kokkos::Timer btimer;
@@ -1742,7 +1756,7 @@ int DustGasDrag::MergeCloudsDevice() {
         DvceArray1D<int> lviol("qabs_lviol", ntgt);
         DvceArray1D<int> badP("qabs_badP", bud ? npart : 1), badN("qabs_badN", (bud && ncommit > 0) ? ncommit : 1);
         const auto mbsz = pmy_pack->pmb->mb_size;
-        const Real bfloor = cloud_absorb_floor*mrootsp[0]/(transfer.root_dx1*transfer.root_dx2);
+        const Real bfloor = cloud_absorb_floor*mroot_floor/(transfer.root_dx1*transfer.root_dx2);
         const Real bvmin = alpha*H*((omega > 0.0) ? omega : 0.0);
         if (bud && !pbud) {
           Kokkos::parallel_for("qabs_ref", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -2776,7 +2790,7 @@ int DustGasDrag::MergeCloudsDevice() {
     const Real beta = cloud_merge_budget;
     const int n12 = qdep.extent_int(4)*qdep.extent_int(3);
     const auto mbsz = pmy_pack->pmb->mb_size;
-    const Real bfloor = cloud_absorb_floor*mrootsp[0]/(transfer.root_dx1*transfer.root_dx2);
+    const Real bfloor = cloud_absorb_floor*mroot_floor/(transfer.root_dx1*transfer.root_dx2);
     const Real bvmin = alpha*Kokkos::min(mm.dx1[nlev-1], mm.dx2[nlev-1])*((omega > 0.0) ? omega : 0.0);
     double rmx = 0.0, rpx = 0.0, nover = 0.0, s2 = 0.0, sv = 0.0;
     Kokkos::parallel_reduce("budget_end_rms", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),

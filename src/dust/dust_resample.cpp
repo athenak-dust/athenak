@@ -708,20 +708,34 @@ int DustGasDrag::ResampleClouds() {
   const int nsp = std::max(1, nspecies);
   DvceArray1D<Real> m0sp("rs_m0", nsp);
   if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
-  Real m0 = cloud_resample_m0;
   {
+    // Codex review: a missing value only takes its own species out of the pool (it was
+    // fatal when species 0 had none, e.g. eps_1 = 0 with a second species); fatal only when no
+    // species has one
     auto mh = Kokkos::create_mirror_view(m0sp);
+    bool any = false;
     for (int sp=0; sp<nsp; ++sp) {
       mh(sp) = (cloud_resample_m0 > 0.0) ? cloud_resample_m0
              : ((static_cast<int>(cloud_merge_mroot.size()) > sp) ? cloud_merge_mroot[sp] : 0.0);
+      if (mh(sp) > 0.0) any = true;
     }
-    if (!(mh(0) > 0.0)) {
+    if (!any) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "cloud_resample needs the root cloud mass: set <dust>/cloud_resample_m0"
-                << std::endl;
+                << "cloud_resample needs the root cloud mass: no species has a plain level-0 or "
+                << "level-1 cloud; set <dust>/cloud_resample_m0" << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    m0 = mh(0);
+    static bool told = false;
+    if (!told && global_variable::my_rank == 0) {
+      for (int sp=0; sp<nsp; ++sp) {
+        if (!(mh(sp) > 0.0)) {
+          std::cout << "# NOTE (dust): species " << sp << " has no root cloud mass (no plain level-0 "
+                    << "or level-1 cloud of positive mass): its clouds stay out of the resampling"
+                    << std::endl;
+        }
+      }
+      told = true;
+    }
     Kokkos::deep_copy(m0sp, mh);
   }
   // the patches.  root: s x s root cells; a patch of a block l
