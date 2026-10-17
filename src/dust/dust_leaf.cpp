@@ -48,8 +48,13 @@ void DustGasDrag::BuildLeafTraversal() {
               << "leaf traversal: 2-D meshes only (24 neighbour slots)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // block slots.  Local blocks first (slot = gid - gids), then the distinct blocks
-  // of other ranks in the neighbour tables (halo, ascending gid), then every other block
+  // block slots.  Local blocks first (slot = gid - gids), then the blocks of other
+  // ranks that a cloud of this rank can reach (halo, ascending gid), then every other block.
+  // A cloud reaches at most 2 cells of its level from its centre (two-sided lobes), clouds are
+  // never coarser than the root level, and a new cloud's centre lies at most one root cell
+  // outside the block it keeps until it migrates: the halo holds every block within 4 root
+  // cells of a block of this rank (the neighbours alone do not cover a
+  // root-level cloud over a deep mesh), found through the root block that holds each block.
   const int ntot = pm->nmb_total;
   std::vector<int> slot_of(ntot, -1), slot_gid;
   slot_gid.reserve(ntot);
@@ -60,6 +65,55 @@ void DustGasDrag::BuildLeafTraversal() {
       for (int n=0; n<nslot; ++n) {
         const int g = nghbr.h_view(m, n).gid;
         if (g >= 0 && slot_of[g] < 0) h.push_back(g);
+      }
+    }
+    if (global_variable::nranks > 1) {
+      const int nl = smr_transfer.cloud_nlev;
+      const std::int64_t rf = static_cast<std::int64_t>(kHaloRootCells) << nl;   // finest cells
+      const int nbx = pm->nmb_rootx1, nby = pm->nmb_rootx2;
+      const std::int64_t bw1 = static_cast<std::int64_t>(indcs.nx1) << nl;    // root block width
+      const std::int64_t bw2 = static_cast<std::int64_t>(indcs.nx2) << nl;
+      const std::int64_t nf1 = bw1*nbx, nf2 = bw2*nby;
+      auto fb = [&](const int g, std::int64_t b[4]) {
+        const LogicalLocation &ll = pm->lloc_eachmb[g];
+        const int sh = nl - (ll.level - pm->root_level);
+        b[0] = static_cast<std::int64_t>(ll.lx1)*indcs.nx1 << sh;
+        b[1] = b[0] + (static_cast<std::int64_t>(indcs.nx1) << sh);
+        b[2] = static_cast<std::int64_t>(ll.lx2)*indcs.nx2 << sh;
+        b[3] = b[2] + (static_cast<std::int64_t>(indcs.nx2) << sh);
+      };
+      std::vector<std::vector<int>> bucket(static_cast<std::size_t>(nbx)*nby);
+      for (int g=0; g<ntot; ++g) {
+        const LogicalLocation &ll = pm->lloc_eachmb[g];
+        const int lev = ll.level - pm->root_level;
+        bucket[static_cast<std::size_t>(ll.lx2 >> lev)*nbx + (ll.lx1 >> lev)].push_back(g);
+      }
+      const int kx = static_cast<int>((rf + bw1 - 1)/bw1), ky = static_cast<int>((rf + bw2 - 1)/bw2);
+      auto overlap = [](std::int64_t a0, std::int64_t a1, std::int64_t c0, std::int64_t c1,
+                        std::int64_t n) {
+        for (int s=-1; s<=1; ++s) {
+          if (a0 + s*n < c1 && c0 < a1 + s*n) return true;
+        }
+        return false;
+      };
+      for (int m=0; m<nmb; ++m) {
+        std::int64_t mb[4];
+        fb(gids + m, mb);
+        const int bx = static_cast<int>(mb[0]/bw1), by = static_cast<int>(mb[2]/bw2);
+        for (int dy=-ky; dy<=ky; ++dy) {
+          for (int dx=-kx; dx<=kx; ++dx) {
+            const int cx = ((bx + dx) % nbx + nbx) % nbx, cy = ((by + dy) % nby + nby) % nby;
+            for (const int g : bucket[static_cast<std::size_t>(cy)*nbx + cx]) {
+              if (slot_of[g] >= 0) continue;
+              std::int64_t gb[4];
+              fb(g, gb);
+              if (overlap(gb[0], gb[1], mb[0] - rf, mb[1] + rf, nf1) &&
+                  overlap(gb[2], gb[3], mb[2] - rf, mb[3] + rf, nf2)) {
+                h.push_back(g);
+              }
+            }
+          }
+        }
       }
     }
     std::sort(h.begin(), h.end());

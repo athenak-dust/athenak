@@ -1297,10 +1297,17 @@ inline std::string RankFile(const std::string &name) {
 //! (ascending), the blocks of this rank sent to it, sblk[soff[p] .. soff[p+1]), and the halo
 //! slots received from it, rblk[roff[p] .. roff[p+1]), both in ascending gid.  Whole blocks
 //! (interior cells) for now; one rank: no peers.
+// the halo holds every block of another rank within this many root cells of a
+// block of this rank (the largest reach of a cloud, with a margin)
+constexpr int kHaloRootCells = 4;
 struct DustHalo {
   int nx1 = 0, nx2 = 0, is = 0, js = 0;
   int npeer = 0;
   unsigned long long builds = 0;
+  // seconds of the exchanges, forward [0..3] and reverse [4..7]: waiting for the kernels before
+  // the exchange, packing, MPI (posting, the receives, the sends), unpacking; and their counts
+  double tsec[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  unsigned long long nexch[2] = {0, 0};
   std::vector<int> peer, soff, roff;
   DvceArray1D<int> sblk, rblk;
   DvceArray1D<Real> sbuf, rbuf;
@@ -1800,7 +1807,8 @@ class DustGasDrag {
   void FrameToBlock();
   int RouteToOwnerBlocks(const char *when);   // after a regrid / restart
   // several ranks: seconds and calls of 0 MigrateClouds, 1 the migration after the
-  // push, 2 halo forward, 3 halo reverse (this rank)
+  // push, 2 the kernels these waited for (a fence before each); the halo exchanges keep their
+  // own split (DustHalo::tsec)
   double mpi_time[4] = {0.0, 0.0, 0.0, 0.0};
   unsigned long long mpi_count[4] = {0, 0, 0, 0};
   int cloud_particle_dump = -1;       // diagnostic: cycle at whose start the particles are written

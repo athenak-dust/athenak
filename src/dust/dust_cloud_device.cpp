@@ -2296,6 +2296,9 @@ int DustGasDrag::MergeCloudsDevice() {
             for (int k=spc.First(key), ke=spc.Last(key); k<ke; ++k) {
               const int t = spc.list(k);
               if (t == c || pr(IPM,t) <= 0.0) continue;
+              // with exact_ts the new cloud takes the centre's ts: only pieces with that same ts
+              // (bitwise) join (G and X compare ts the same way)
+              if (exact_ts && pr(IPTS,t) != pr(IPTS,c)) continue;
               const Real dx = transfer.MinImage1(pr(IPX,t) - xc0);
               const Real dy = transfer.MinImage2(pr(IPY,t) - yc0);
               if (Kokkos::fabs(dx) >= H1*(1.0 - 1.0e-12) || Kokkos::fabs(dy) >= H2*(1.0 - 1.0e-12)) continue;
@@ -2480,7 +2483,7 @@ int DustGasDrag::MergeCloudsDevice() {
         nr(IPM,knew) = M;
         nr(IPX,knew) = px; nr(IPX1,knew) = px; nr(IPY,knew) = py; nr(IPY1,knew) = py;
         nr(IPVX,knew) = vm[0]; nr(IPVY,knew) = vm[1]; nr(IPVZ,knew) = vm[2];
-        if (exact_ts) nr(IPTS,knew) = pr(IPTS,c);   // the centre's ts (one species)
+        if (exact_ts) nr(IPTS,knew) = pr(IPTS,c);   // the common ts of the pieces
         if (d3) {
           const int mz = static_cast<int>(Kokkos::floor((py - transfer.x2min)/H2));
           drow(knew) = mz;

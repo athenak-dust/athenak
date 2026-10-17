@@ -5,15 +5,15 @@
 //========================================================================================
 //! \file dust_halo.cpp
 //! \brief The dust halo: the leaf fields of whole
-//! MeshBlocks are exchanged with the ranks that own the neighbours: forward, the owner sends
-//! the values of its blocks (gas velocity and its differences, computed by the owner) to the
-//! halo slots of the ranks next to them; reverse, a rank sends what it deposited into its halo
-//! slots back to the owner, which adds it.  One aggregated message per peer rank and
-//! direction; the lists are built with the block slots (BuildLeafTraversal) and are the same
-//! on both sides of every pair (a block of this rank goes to rank r when it has a neighbour on
-//! r; rank r receives exactly its neighbours on this rank).  The reverse sums are added peer
-//! by peer in rank order, without atomics, so the result does not depend on message timing.
-//! One rank: no peers, every exchange returns at once.
+//! MeshBlocks are exchanged with the ranks that own the blocks a cloud can reach (the halo
+//! blocks of BuildLeafTraversal: every block of another rank within kHaloRootCells root cells):
+//! forward, the owner sends the values of its blocks (gas velocity and its differences,
+//! computed by the owner) to the halo slots of the ranks that hold them; reverse, a rank sends
+//! what it deposited into its halo slots back to the owner, which adds it.  One aggregated
+//! message per peer rank and direction; the lists come from the requests of the receiving
+//! ranks (BuildHalo).  The reverse sums are added peer by peer in rank order, without atomics,
+//! so they do not depend on the arrival order of the messages.  One rank: no peers, every
+//! exchange returns at once.
 
 #include <algorithm>
 #include <chrono>
@@ -95,6 +95,15 @@ template <typename Acc>
 void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
 #if MPI_PARALLEL_ENABLED
   if (h.npeer == 0) return;
+  using Clock = std::chrono::steady_clock;
+  auto since = [](const Clock::time_point &a) {
+    return std::chrono::duration<double>(Clock::now() - a).count();
+  };
+  double *ts = h.tsec + (reverse ? 4 : 0);
+  ++h.nexch[reverse ? 1 : 0];
+  Clock::time_point tc = Clock::now();
+  Kokkos::fence();                     // the kernels before the exchange (their time, not MPI)
+  ts[0] += since(tc);
   const int nx1 = h.nx1, nx2 = h.nx2, is = h.is, js = h.js;
   const int bs = nc*nx1*nx2;                         // values per block
   // forward: send the owner list, receive into the halo slots; reverse: the other way
@@ -109,12 +118,15 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
   auto rbuf = h.rbuf;
   const int tag = reverse ? 2 : 1;
   std::vector<MPI_Request> rreq(h.npeer, MPI_REQUEST_NULL), sreq(h.npeer, MPI_REQUEST_NULL);
+  tc = Clock::now();
   for (int p=0; p<h.npeer; ++p) {
     const int n = (in_off[p + 1] - in_off[p])*bs;
     if (n == 0) continue;
     MPI_Irecv(rbuf.data() + static_cast<std::size_t>(in_off[p])*bs, n, MPI_ATHENA_REAL, h.peer[p],
               tag, h.comm, &rreq[p]);
   }
+  ts[2] += since(tc);
+  tc = Clock::now();
   if (nout > 0) {
     Kokkos::parallel_for("dust_halo_pack", Kokkos::RangePolicy<>(DevExeSpace(), 0, nout*bs),
     KOKKOS_LAMBDA(const int q) {
@@ -126,6 +138,8 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
     });
     Kokkos::fence();
   }
+  ts[1] += since(tc);
+  tc = Clock::now();
   for (int p=0; p<h.npeer; ++p) {
     const int n = (out_off[p + 1] - out_off[p])*bs;
     if (n == 0) continue;
@@ -133,6 +147,8 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
               tag, h.comm, &sreq[p]);
   }
   MPI_Waitall(h.npeer, rreq.data(), MPI_STATUSES_IGNORE);
+  ts[2] += since(tc);
+  tc = Clock::now();
   if (!reverse) {
     if (nin > 0) {
       Kokkos::parallel_for("dust_halo_unpack", Kokkos::RangePolicy<>(DevExeSpace(), 0, nin*bs),
@@ -160,7 +176,10 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
     }
   }
   Kokkos::fence();
+  ts[3] += since(tc);
+  tc = Clock::now();
   MPI_Waitall(h.npeer, sreq.data(), MPI_STATUSES_IGNORE);
+  ts[2] += since(tc);
 #else
   (void)h; (void)nc; (void)reverse; (void)acc;
 #endif
@@ -170,10 +189,11 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::BuildHalo
-//! \brief The exchange lists of the halo from the block slots of BuildLeafTraversal: per
-//! peer rank (ascending), the blocks of this rank that have a neighbour on it (ascending gid)
-//! and the halo slots of its blocks (ascending gid).  The counts are checked against the
-//! peer's.
+//! \brief The exchange lists of the halo from the block slots of BuildLeafTraversal.  Every
+//! rank asks the owners of its halo slots for those blocks (ascending gid; one all-to-all of
+//! the counts and one of the gid lists), so that both sides of every pair hold the same lists:
+//! per peer rank (ascending), the blocks of this rank asked for by it and the halo slots it
+//! fills.  (The halo may hold blocks beyond the neighbours, so it is not symmetric in general.)
 
 void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
   Mesh *pm = pmy_pack->pmesh;
@@ -188,53 +208,46 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
     h.comm_set = true;
   }
   const int nmb = lt.nmb, nfld = lt.nfld, gids = lt.gids;
-  const int myrank = global_variable::my_rank;
-  auto &nghbr = pmy_pack->pmb->nghbr;
-  const int nslot = pmy_pack->pmb->nnghbr;
-  // send: (peer, local block) pairs; receive: (owner, halo slot)
-  std::vector<std::pair<int, int>> snd, rcv;
-  for (int m=0; m<nmb; ++m) {
-    std::vector<int> to;
-    for (int n=0; n<nslot; ++n) {
-      const int g = nghbr.h_view(m, n).gid;
-      if (g < 0) continue;
-      const int r = pm->rank_eachmb[g];
-      if (r != myrank) to.push_back(r);
-    }
-    std::sort(to.begin(), to.end());
-    to.erase(std::unique(to.begin(), to.end()), to.end());
-    for (const int r : to) snd.push_back({r, gids + m});
-  }
-  for (int b=nmb; b<nfld; ++b) rcv.push_back({pm->rank_eachmb[slot_gid[b]], slot_gid[b]});
-  std::sort(snd.begin(), snd.end());
-  std::sort(rcv.begin(), rcv.end());
-  for (const auto &e : snd) h.peer.push_back(e.first);
-  for (const auto &e : rcv) h.peer.push_back(e.first);
-  std::sort(h.peer.begin(), h.peer.end());
-  h.peer.erase(std::unique(h.peer.begin(), h.peer.end()), h.peer.end());
-  h.npeer = static_cast<int>(h.peer.size());
-  std::vector<int> sh, rh;
-  h.soff.assign(h.npeer + 1, 0); h.roff.assign(h.npeer + 1, 0);
-  {
-    std::size_t a = 0, c = 0;
-    for (int p=0; p<h.npeer; ++p) {
-      while (a < snd.size() && snd[a].first == h.peer[p]) {sh.push_back(snd[a].second - gids); ++a;}
-      while (c < rcv.size() && rcv[c].first == h.peer[p]) {
-        rh.push_back(nmb + static_cast<int>(std::lower_bound(slot_gid.begin() + nmb,
-                     slot_gid.begin() + nfld, rcv[c].second) - (slot_gid.begin() + nmb)));
-        ++c;
-      }
-      h.soff[p + 1] = static_cast<int>(sh.size());
-      h.roff[p + 1] = static_cast<int>(rh.size());
-    }
-  }
-  for (std::size_t k=0; k<rh.size(); ++k) {
-    if (slot_gid[rh[k]] != rcv[k].second) {
+  const int myrank = global_variable::my_rank, nranks = global_variable::nranks;
+  // what this rank needs, by owner (halo slots are in ascending gid, so is each list)
+  std::vector<std::vector<int>> want(nranks), wslot(nranks);
+  for (int b=nmb; b<nfld; ++b) {
+    const int r = pm->rank_eachmb[slot_gid[b]];
+    if (r == myrank) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "dust halo: halo slots are not in ascending gid order" << std::endl;
+                << "dust halo: halo block " << slot_gid[b] << " is on this rank" << std::endl;
       std::exit(EXIT_FAILURE);
     }
+    want[r].push_back(slot_gid[b]);
+    wslot[r].push_back(b);
   }
+  std::vector<int> nwant(nranks), ngive(nranks), sdisp(nranks + 1, 0), rdisp(nranks + 1, 0);
+  for (int r=0; r<nranks; ++r) nwant[r] = static_cast<int>(want[r].size());
+  MPI_Alltoall(nwant.data(), 1, MPI_INT, ngive.data(), 1, MPI_INT, h.comm);
+  for (int r=0; r<nranks; ++r) {sdisp[r + 1] = sdisp[r] + nwant[r]; rdisp[r + 1] = rdisp[r] + ngive[r];}
+  std::vector<int> wflat(std::max(sdisp[nranks], 1)), gflat(std::max(rdisp[nranks], 1));
+  for (int r=0; r<nranks; ++r) std::copy(want[r].begin(), want[r].end(), wflat.begin() + sdisp[r]);
+  MPI_Alltoallv(wflat.data(), nwant.data(), sdisp.data(), MPI_INT, gflat.data(), ngive.data(),
+                rdisp.data(), MPI_INT, h.comm);
+  std::vector<int> sh, rh;
+  for (int r=0; r<nranks; ++r) {
+    if (nwant[r] == 0 && ngive[r] == 0) continue;
+    h.peer.push_back(r);
+    for (int k=rdisp[r]; k<rdisp[r + 1]; ++k) {
+      const int g = gflat[k];
+      if (g < gids || g >= gids + nmb) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "dust halo: rank " << r << " asks rank " << myrank << " for block " << g
+                  << ", which is not on it" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      sh.push_back(g - gids);
+    }
+    rh.insert(rh.end(), wslot[r].begin(), wslot[r].end());
+    h.soff.push_back(static_cast<int>(sh.size()));
+    h.roff.push_back(static_cast<int>(rh.size()));
+  }
+  h.npeer = static_cast<int>(h.peer.size());
   h.sblk = DvceArray1D<int>("dust_halo_sblk", std::max<std::size_t>(sh.size(), 1));
   h.rblk = DvceArray1D<int>("dust_halo_rblk", std::max<std::size_t>(rh.size(), 1));
   auto sb = Kokkos::create_mirror_view(h.sblk);
@@ -243,44 +256,6 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
   for (std::size_t k=0; k<rh.size(); ++k) rb(k) = rh[k];
   Kokkos::deep_copy(h.sblk, sb);
   Kokkos::deep_copy(h.rblk, rb);
-  // the lists of the two sides of every pair must agree (gids, in order)
-  {
-    std::vector<MPI_Request> rq(2*h.npeer);
-    std::vector<int> nrecv(h.npeer), nsend(h.npeer);
-    for (int p=0; p<h.npeer; ++p) {
-      nsend[p] = h.soff[p + 1] - h.soff[p];
-      MPI_Irecv(&nrecv[p], 1, MPI_INT, h.peer[p], 3, h.comm, &rq[2*p]);
-      MPI_Isend(&nsend[p], 1, MPI_INT, h.peer[p], 3, h.comm, &rq[2*p + 1]);
-    }
-    MPI_Waitall(2*h.npeer, rq.data(), MPI_STATUSES_IGNORE);
-    std::vector<std::vector<int>> gin(h.npeer), gout(h.npeer);
-    for (int p=0; p<h.npeer; ++p) {
-      if (nrecv[p] != h.roff[p + 1] - h.roff[p]) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "dust halo: rank " << myrank << " expects " << h.roff[p + 1] - h.roff[p]
-                  << " blocks from rank " << h.peer[p] << ", which sends " << nrecv[p] << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-      gin[p].resize(std::max(nrecv[p], 1));
-      gout[p].resize(std::max(nsend[p], 1));
-      for (int k=0; k<nsend[p]; ++k) gout[p][k] = gids + sh[h.soff[p] + k];
-    }
-    for (int p=0; p<h.npeer; ++p) {
-      MPI_Irecv(gin[p].data(), nrecv[p], MPI_INT, h.peer[p], 4, h.comm, &rq[2*p]);
-      MPI_Isend(gout[p].data(), nsend[p], MPI_INT, h.peer[p], 4, h.comm, &rq[2*p + 1]);
-    }
-    MPI_Waitall(2*h.npeer, rq.data(), MPI_STATUSES_IGNORE);
-    for (int p=0; p<h.npeer; ++p) {
-      for (int k=0; k<nrecv[p]; ++k) {
-        if (gin[p][k] != slot_gid[rh[h.roff[p] + k]]) {
-          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                    << "dust halo: block lists of ranks " << myrank << " and " << h.peer[p]
-                    << " disagree" << std::endl;
-          std::exit(EXIT_FAILURE);
-        }
-      }
-    }
-  }
   ++h.builds;
 #else
   (void)pm; (void)slot_gid;
@@ -295,56 +270,38 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
 
 void DustGasDrag::HaloForwardPack(DvceArray5D<Real> &gp) {
   if (halo_.npeer == 0) return;
-  const auto t0 = std::chrono::steady_clock::now();
   AccPack a; a.f = gp; a.ks = pmy_pack->pmesh->mb_indcs.ks;
   Exchange(halo_, gp.extent_int(4), false, a);
-  mpi_time[2] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  ++mpi_count[2];
 }
 
 void DustGasDrag::HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int nc) {
   if (halo_.npeer == 0) return;
-  const auto t0 = std::chrono::steady_clock::now();
   Acc5D a; a.f = f; a.c0 = c0; a.ks = pmy_pack->pmesh->mb_indcs.ks;
   Exchange(halo_, nc, true, a);
-  mpi_time[3] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  ++mpi_count[3];
 }
 
 void DustGasDrag::HaloForwardFlat(DvceArray2D<Real> &f, const int nc) {
   if (halo_.npeer == 0) return;
-  const auto t0 = std::chrono::steady_clock::now();
   AccFlat a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
   Exchange(halo_, nc, false, a);
-  mpi_time[2] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  ++mpi_count[2];
 }
 
 void DustGasDrag::HaloReverseAddFlat(DvceArray2D<Real> &f, const int nc) {
   if (halo_.npeer == 0) return;
-  const auto t0 = std::chrono::steady_clock::now();
   AccFlat a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
   Exchange(halo_, nc, true, a);
-  mpi_time[3] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  ++mpi_count[3];
 }
 
 void DustGasDrag::HaloForwardFlags(DvceArray1D<int> &f) {
   if (halo_.npeer == 0) return;
-  const auto t0 = std::chrono::steady_clock::now();
   AccFlatInt a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
   Exchange(halo_, 1, false, a);
-  mpi_time[2] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  ++mpi_count[2];
 }
 
 void DustGasDrag::HaloReverseAddFlags(DvceArray1D<int> &f) {
   if (halo_.npeer == 0) return;
-  const auto t0 = std::chrono::steady_clock::now();
   AccFlatInt a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
   Exchange(halo_, 1, true, a);
-  mpi_time[3] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  ++mpi_count[3];
 }
 
 }  // namespace dust

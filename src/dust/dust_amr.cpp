@@ -368,6 +368,14 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     }
     audit_prev_ = cur;
   }
+  // several ranks (Codex review): the log holds totals over the ranks
+  int nblk = nmb, nflag[2] = {nref, nder};
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    nblk = pm->nmb_total;
+    MPI_Allreduce(MPI_IN_PLACE, nflag, 2, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
   if (global_variable::my_rank == 0) {
     std::FILE *fp = std::fopen("dust_trigger_log.txt", "a");
     if (fp != nullptr) {
@@ -377,8 +385,8 @@ void DensityRefinement(MeshBlockPack *pmbp) {
                      "fine_dust_mass_share clouds_root clouds_finer_plain clouds_lobed\n");
       }
       const Real vbox = (pm->mesh_size.x1max - x0)*(pm->mesh_size.x2max - y0);
-      std::fprintf(fp, "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d\n", pm->ncycle, pm->time, qmax, nmb,
-                   nref, nder, vfine/vbox, mfine/mtot, nlev[0], nlev[1], nlev[2]);
+      std::fprintf(fp, "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d\n", pm->ncycle, pm->time, qmax, nblk,
+                   nflag[0], nflag[1], vfine/vbox, mfine/mtot, nlev[0], nlev[1], nlev[2]);
       std::fclose(fp);
     }
   }
@@ -679,6 +687,21 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       if (mblev.h_view(m) > pmesh->root_level) ++nlev1;
     }
   }
+  // several ranks (Codex review): the log holds totals over the ranks (sums;
+  // the largest weight error; the smallest particle step)
+  int nblk = nmb;
+  long long nprt = npart;
+  Real dtp = ppar->dtnew;
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    nblk = pmesh->nmb_total;
+    MPI_Allreduce(MPI_IN_PLACE, &nlev1, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &nprt, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &msum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &dwmax, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &dtp, 1, MPI_ATHENA_REAL, MPI_MIN, MPI_COMM_WORLD);
+  }
+#endif
   if (global_variable::my_rank == 0) {
     std::FILE *fp = std::fopen("dust_amr_log.txt", "a");
     if (fp != nullptr) {
@@ -687,14 +710,14 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
         std::fprintf(fp, "# regrid ncycle time blocks blocks_above_root particles particle_mass "
                      "max|sum_w-1| dt_particles checksum\n");
       }
-      std::fprintf(fp, "%d %d %.17g %d %d %d %.17g %.3e %.9e %llu\n", amr_regrids, pmesh->ncycle,
-                   pmesh->time, nmb, nlev1, npart, msum, dwmax, ppar->dtnew, check);
+      std::fprintf(fp, "%d %d %.17g %d %d %lld %.17g %.3e %.9e %llu\n", amr_regrids, pmesh->ncycle,
+                   pmesh->time, nblk, nlev1, nprt, msum, dwmax, dtp, check);
       std::fclose(fp);
     }
     std::cout << "# dust regrid " << amr_regrids << " cycle=" << pmesh->ncycle << " time="
-              << pmesh->time << " blocks=" << nmb << " (above root " << nlev1 << ", created "
+              << pmesh->time << " blocks=" << nblk << " (above root " << nlev1 << ", created "
               << amr_regrid_nnew << ", deleted " << amr_regrid_ndel << ") particles="
-              << npart << " max|sum w - 1|=" << dwmax << std::endl;
+              << nprt << " max|sum w - 1|=" << dwmax << std::endl;
   }
   // The leaf traversal also right after a regrid (old clouds on the new mesh)
   if (cloud_leaf_check > 0) CheckLeafTraversal();

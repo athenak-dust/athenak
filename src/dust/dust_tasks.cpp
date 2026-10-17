@@ -13,6 +13,7 @@
 //! kick/drift/migration after the final hydro stage.  The common drag chain sits between
 //! the explicit gas update and the boundary communication tail.
 
+#include <chrono>
 #include <map>
 #include <memory>
 #include <string>
@@ -127,8 +128,14 @@ namespace {
 // several ranks: seconds of the particle migration after the push
 struct MigTimer {
   double &acc;
-  std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-  explicit MigTimer(double &a) : acc(a) {}
+  std::chrono::steady_clock::time_point t0;
+  // the kernels before are waited for first and counted apart (wait)
+  MigTimer(double &a, double &wait) : acc(a) {
+    const auto tw = std::chrono::steady_clock::now();
+    Kokkos::fence();
+    t0 = std::chrono::steady_clock::now();
+    wait += std::chrono::duration<double>(t0 - tw).count();
+  }
   ~MigTimer() {acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();}
 };
 }  // namespace
@@ -140,7 +147,7 @@ struct MigTimer {
 
 TaskStatus DustGasDrag::UpdateParticleGIDs(Driver *pdrive, int stage) {
   if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
-  MigTimer timer(mpi_time[1]);
+  MigTimer timer(mpi_time[1], mpi_time[2]);
   // several ranks: clouds made at the start of the cycle may keep a block across a periodic
   // boundary
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) FrameToBlock();
@@ -149,26 +156,26 @@ TaskStatus DustGasDrag::UpdateParticleGIDs(Driver *pdrive, int stage) {
 
 TaskStatus DustGasDrag::CountParticleSends(Driver *pdrive, int stage) {
   if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
-  MigTimer timer(mpi_time[1]);
+  MigTimer timer(mpi_time[1], mpi_time[2]);
   ++mpi_count[1];
   return pmy_pack->ppart->SendCnt(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::InitParticleRecv(Driver *pdrive, int stage) {
   if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
-  MigTimer timer(mpi_time[1]);
+  MigTimer timer(mpi_time[1], mpi_time[2]);
   return pmy_pack->ppart->InitRecv(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::SendParticles(Driver *pdrive, int stage) {
   if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
-  MigTimer timer(mpi_time[1]);
+  MigTimer timer(mpi_time[1], mpi_time[2]);
   return pmy_pack->ppart->SendP(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::RecvParticles(Driver *pdrive, int stage) {
   if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
-  MigTimer timer(mpi_time[1]);
+  MigTimer timer(mpi_time[1], mpi_time[2]);
   return pmy_pack->ppart->RecvP(pdrive, stage);
 }
 

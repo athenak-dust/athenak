@@ -89,10 +89,21 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // cloud_particle_dump (diagnostic): at the start of cycle N every rank writes its particles
   // (dust_particles.cNNNNNNNN[.rRRRR].bin), to compare runs on different numbers of ranks
   cloud_particle_dump = pin->GetOrAddInteger("dust", "cloud_particle_dump", -1);
-  // Timing diagnostic: every cloud_sort_interval cycles (0: never) the particle
-  // arrays are reordered by block, cell in the block (cloud_sort_order = linear or morton) and
-  // old position, at the start of the cycle (SortParticles)
-  cloud_sort_interval = pin->GetOrAddInteger("dust", "cloud_sort_interval", 0);
+  // Every cloud_sort_interval cycles (0: never) the particle arrays are reordered
+  // by block, cell in the block (cloud_sort_order = linear or morton) and old position, after
+  // the split, resampling and merge pass of the cycle (SortParticles).
+  // Following a Codex review, every 64 cycles by default on the configuration where it was timed and
+  // its effect on G checked (production PC2 path, device G and R, cloud_merge_exact_ts, stopping
+  // times fixed per species: stopping_time_mode = species_fixed); 0 is the control
+  {
+    const bool prod = coupling == DustCoupling::hybrid &&
+                      hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2 &&
+                      !cloud_force_local && !cloud_force_children && !cloud_deform;
+    const bool sortdef = prod && (!cloud_merge || cloud_merge_device) &&
+                         (!cloud_resample || cloud_resample_device) && cloud_merge_exact_ts &&
+                         stopping_time_mode == DustStoppingTimeMode::species_fixed;
+    cloud_sort_interval = pin->GetOrAddInteger("dust", "cloud_sort_interval", sortdef ? 64 : 0);
+  }
   {
     const std::string so = pin->GetOrAddString("dust", "cloud_sort_order", "linear");
     if (so != "linear" && so != "morton" && so != "random") {
@@ -482,6 +493,11 @@ void DustGasDrag::DumpParticles() {
 
 void DustGasDrag::MigrateClouds() {
   if (global_variable::nranks == 1) return;
+  {
+    const auto tw = std::chrono::steady_clock::now();
+    Kokkos::fence();   // the kernels before (their time, not the migration's)
+    mpi_time[2] += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
+  }
   const auto t0 = std::chrono::steady_clock::now();
   FrameToBlock();
   auto *pb = pmy_pack->ppart->pbval_part;
@@ -624,8 +640,17 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   const int n2 = ppar->nprtcl_thispack;
   ++amr_event_handled;
   if (scheduled) ++amr_event_merged;
+  // several ranks: totals over the ranks (Codex review), the slowest rank's times
+  long long nn[4] = {n0, n1, n2, removed};
+  double tt[2] = {t_merge, t_resample};
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, nn, 4, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, tt, 2, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  }
+#endif
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = std::fopen(RankFile("regrid_event_log.txt").c_str(), "a");
+    std::FILE *fp = std::fopen("regrid_event_log.txt", "a");
     if (fp != nullptr) {
       std::fseek(fp, 0, SEEK_END);
       if (std::ftell(fp) == 0) {
@@ -633,9 +658,9 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
                      "with_scheduled_resampling npart_before npart_after_merge "
                      "npart_after_resampling removed t_merge t_resampling\n");
       }
-      std::fprintf(fp, "%lld %d %d %.17g %d %d %s %s %d %d %d %d %d %.4e %.4e\n",
+      std::fprintf(fp, "%lld %d %d %.17g %d %d %s %s %d %lld %lld %lld %lld %.4e %.4e\n",
                    amr_event_handled, amr_event_regrid, pmesh->ncycle, pmesh->time, nnew, ndel,
-                   kind, why, scheduled ? 1 : 0, n0, n1, n2, removed, t_merge, t_resample);
+                   kind, why, scheduled ? 1 : 0, nn[0], nn[1], nn[2], nn[3], tt[0], tt[1]);
       std::fclose(fp);
     }
     std::cout << "# regrid event " << amr_event_handled << ": regrid "
@@ -643,7 +668,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
               << "), cycle " << pmesh->ncycle << ", time " << pmesh->time << ": merge pass "
               << why << ", resampling " << (scheduled ? "(the scheduled one of this cycle)"
                                                       : "(extra)")
-              << " removed " << removed << " of " << n1 << std::endl;
+              << " removed " << nn[3] << " of " << nn[1] << std::endl;
   }
   amr_event_pending = false;
   amr_event_nnew = amr_event_ndel = 0;
@@ -1898,6 +1923,9 @@ int DustGasDrag::MergeClouds() {
         std::vector<int> nb, nb0;
         near(c, hp, nb0);
         for (int t : nb0) {   // pieces with a positive tent weight only
+          // with cloud_merge_exact_ts only pieces with the centre's ts (bitwise): the new cloud
+          // takes that ts (Codex review)
+          if (cloud_merge_exact_ts && R[t][IPTS] != R[c][IPTS]) continue;
           if (tent(transfer.MinImage1(R[t][IPX] - R[c][IPX]),
                    transfer.MinImage2(R[t][IPY] - R[c][IPY])) > 0.0) nb.push_back(t);
         }
@@ -2028,7 +2056,7 @@ int DustGasDrag::MergeClouds() {
         r[IPM] = M;
         r[IPX] = px; r[IPX1] = px; r[IPY] = py; r[IPY1] = py;
         r[IPVX] = vm[0]; r[IPVY] = vm[1]; r[IPVZ] = vm[2];
-        if (cloud_merge_exact_ts) r[IPTS] = R[c][IPTS];   // the centre's ts (one species)
+        if (cloud_merge_exact_ts) r[IPTS] = R[c][IPTS];   // the common ts of the pieces
         std::vector<int> i = I[c];
         i[PLEV] = L;
         i[PGID] = owner_gid(px, py);

@@ -294,6 +294,12 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
     }
   });
 #if MPI_PARALLEL_ENABLED
+  // one rank: nothing can leave it, so no count, no copy to the host and no MPI calls (dust
+  // runs: they made an MPI build about 13% slower than a serial one on one GPU)
+  if (global_variable::nranks == 1) {
+    nprtcl_send = 0;
+    return TaskStatus::complete;
+  }
   // This deep copy also synchronizes completion of the device append kernel.  Copy only
   // the valid prefix to the host; DualView::sync() would copy the full capacity.
   Kokkos::deep_copy(send_count.h_view, send_count.d_view);
@@ -336,6 +342,11 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
 
 TaskStatus ParticlesBoundaryValues::CountSendsAndRecvs() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) {   // one rank: no messages
+    sends_thisrank.clear(); recvs_thisrank.clear();
+    nsends = 0; nrecvs = 0; nprtcl_send = 0; nprtcl_recv = 0;
+    return TaskStatus::complete;
+  }
   // Sort sendlist on host by destrank.
   std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByRank);
   // Copy only the sorted valid prefix back to the device.
@@ -406,6 +417,7 @@ TaskStatus ParticlesBoundaryValues::CountSendsAndRecvs() {
 
 TaskStatus ParticlesBoundaryValues::InitPrtclRecv() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) return TaskStatus::complete;
   // load STL::vector of ParticleMessageData with <sendrank,recvrank,nprtcl_recv> for
   // receives // on this rank. Length will be nrecvs, initially this length is unknown
   recvs_thisrank.clear();
@@ -493,6 +505,7 @@ TaskStatus ParticlesBoundaryValues::InitPrtclRecv() {
 
 TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) return TaskStatus::complete;
   // Figure out how many particles will be sent from this ranks
   nprtcl_send=0;
   for (int n=0; n<nsends; ++n) {
@@ -590,6 +603,11 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
 
 TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) {   // one rank: the count is unchanged
+    pmy_part->pmy_pack->pmesh->nprtcl_thisrank = pmy_part->nprtcl_thispack;
+    pmy_part->pmy_pack->pmesh->nprtcl_eachrank[0] = pmy_part->nprtcl_thispack;
+    return TaskStatus::complete;
+  }
   // Sort sendlist on host by index in particle array
   std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByIndex);
   // Copy only the sorted valid prefix back to the device.
@@ -720,6 +738,7 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
 
 TaskStatus ParticlesBoundaryValues::ClearPrtclSend() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) return TaskStatus::complete;
   bool no_errors=true;
   // wait for all non-blocking sends for vars to finish before continuing
   for (int n=0; n<nsends; ++n) {
@@ -747,6 +766,7 @@ TaskStatus ParticlesBoundaryValues::ClearPrtclSend() {
 
 TaskStatus ParticlesBoundaryValues::ClearPrtclRecv() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) return TaskStatus::complete;
   bool no_errors=true;
   // wait for all non-blocking receives to finish before continuing
   for (int n=0; n<nrecvs; ++n) {
