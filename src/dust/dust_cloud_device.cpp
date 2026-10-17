@@ -2706,6 +2706,9 @@ int DustGasDrag::MergeCloudsDevice() {
                 const Real w = tentc(dx, dy);
                 if (w <= 0.0 || pr(IPM,q) <= 0.0) continue;
                 if (pass == 0) ++nrec;
+                // with exact_ts a recipient of another ts would change the ts of the absorbed mass
+                // so it counts as incompatible, as in G, X and tent
+                if (exact_ts && pr(IPTS,q) != pr(IPTS,o)) continue;
                 if (!compatible(pr(IPVX,q), pr(IPVY,q), pr(IPVZ,q))) continue;
                 if (pass == 0) {wsum += w; continue;}
                 const Real dm = w/wsum*mo;
@@ -2721,6 +2724,7 @@ int DustGasDrag::MergeCloudsDevice() {
                 const Real w = tentc(dx, dy);
                 if (w <= 0.0) continue;
                 if (pass == 0) ++nrec;
+                if (exact_ts && nr(IPTS,q) != pr(IPTS,o)) continue;   // see above
                 if (!compatible(nr(IPVX,q), nr(IPVY,q), nr(IPVZ,q))) continue;
                 if (pass == 0) {wsum += w; continue;}
                 const Real dm = w/wsum*mo;

@@ -204,6 +204,11 @@ void DensityRefinement(MeshBlockPack *pmbp) {
               << "amr_density_trigger needs 2-D refinable-cloud dust" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  // several ranks (Codex review): the deposit below traverses the supports, so
+  // the reach of the halo is checked first, before the leaf traversal is copied: after the
+  // push (particles moved and may have changed owner) and after a restart whose pending mesh
+  // check runs before any cycle
+  pdust->CheckHaloReach("density trigger");
   particles::Particles *ppar = pmbp->ppart;
   auto &refine_flag = pm->pmr->refine_flag;
   auto &ind = pm->mb_indcs;
