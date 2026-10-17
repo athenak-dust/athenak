@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -481,10 +482,34 @@ void DustGasDrag::DumpParticles() {
 
 void DustGasDrag::MigrateClouds() {
   if (global_variable::nranks == 1) return;
-  // a new cloud's position is wrapped into the domain, but the block it keeps may be across a
-  // periodic boundary: put it in the image next to its block (positions and the RK position
-  // registers together), so that the particle exchange sees a step of one block at most and
-  // wraps it again
+  const auto t0 = std::chrono::steady_clock::now();
+  FrameToBlock();
+  auto *pb = pmy_pack->ppart->pbval_part;
+  pb->SetNewPrtclGID();
+  pb->CountSendsAndRecvs();
+  pb->InitPrtclRecv();
+  pb->PackAndSendPrtcls();
+  while (pb->RecvAndUnpackPrtcls() != TaskStatus::complete) {}
+  pb->ClearPrtclSend();
+  pb->ClearPrtclRecv();
+  // the counts of all ranks are known now (RecvAndUnpackPrtcls): the total for the outputs
+  Mesh *pm = pmy_pack->pmesh;
+  int tot = 0;
+  for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
+  pm->nprtcl_total = tot;
+  mpi_time[0] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  ++mpi_count[0];
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::FrameToBlock
+//! \brief Several ranks: a new cloud's position is wrapped into the domain, but
+//! the block it keeps may be across a periodic boundary.  Put such particles in the image next
+//! to their block (positions and the RK position registers together), so that the particle
+//! exchange sees a step of one block at most and wraps them again.
+
+void DustGasDrag::FrameToBlock() {
+  if (global_variable::nranks == 1) return;
   {
     auto pr = pmy_pack->ppart->prtcl_rdata;
     auto pi = pmy_pack->ppart->prtcl_idata;
@@ -499,19 +524,6 @@ void DustGasDrag::MigrateClouds() {
       if (sy != 0.0) {pr(IPY,p) -= sy; pr(IPY1,p) -= sy;}
     });
   }
-  auto *pb = pmy_pack->ppart->pbval_part;
-  pb->SetNewPrtclGID();
-  pb->CountSendsAndRecvs();
-  pb->InitPrtclRecv();
-  pb->PackAndSendPrtcls();
-  while (pb->RecvAndUnpackPrtcls() != TaskStatus::complete) {}
-  pb->ClearPrtclSend();
-  pb->ClearPrtclRecv();
-  // the counts of all ranks are known now (RecvAndUnpackPrtcls): the total for the outputs
-  Mesh *pm = pmy_pack->pmesh;
-  int tot = 0;
-  for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
-  pm->nprtcl_total = tot;
 }
 
 //----------------------------------------------------------------------------------------
@@ -529,7 +541,6 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
     SortParticles();
   }
   SplitAndMergeClouds();
-  MigrateClouds();   // split pieces to the rank of their block before R and G
   // the merge clock is read once per cycle (MergeDue advances it)
   const bool merge_due = cloud_merge && MergeDue() &&
       (cloud_merge_tstop < 0.0 || pmy_pack->pmesh->time < cloud_merge_tstop);
@@ -544,10 +555,26 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
     // Resampling before the merge pass, so that an audit-only pass of the same cycle
     // writes the resampled state; it is due every cloud_resample_interval cycles, or at the
     // planned physical times
-    if (cloud_resample && ResampleDue()) ResampleClouds();
+    const bool resample_due = cloud_resample && ResampleDue();
+    // Several ranks: the split pieces go to the rank of their block before R and G
+    // (other cycles leave them to the migration after the push; until then they keep a block
+    // of this rank as their anchor, which the leaf traversal allows)
+    if (resample_due || merge_due) MigrateClouds();
+    if (resample_due) ResampleClouds();
     if (merge_due) MergeClouds();
   }
-  MigrateClouds();   // merged clouds to the rank of their block
+#if MPI_PARALLEL_ENABLED
+  // the counts of all ranks for the outputs (the split, R and G changed them)
+  if (global_variable::nranks > 1) {
+    Mesh *pm = pmy_pack->pmesh;
+    int n = pmy_pack->ppart->nprtcl_thispack;
+    MPI_Allgather(&n, 1, MPI_INT, pm->nprtcl_eachrank, 1, MPI_INT, MPI_COMM_WORLD);
+    int tot = 0;
+    for (int r=0; r<global_variable::nranks; ++r) tot += pm->nprtcl_eachrank[r];
+    pm->nprtcl_total = tot;
+    pm->nprtcl_thisrank = n;
+  }
+#endif
   if (cloud_native_check > 0 && pmy_pack->pmesh->ncycle % cloud_native_check == 0) {
     CheckNativeTransfer();
   }

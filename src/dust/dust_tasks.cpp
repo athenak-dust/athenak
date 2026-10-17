@@ -123,6 +123,16 @@ void DustGasDrag::AssembleDustGasDragTasks(
   return;
 }
 
+namespace {
+// several ranks: seconds of the particle migration after the push
+struct MigTimer {
+  double &acc;
+  std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  explicit MigTimer(double &a) : acc(a) {}
+  ~MigTimer() {acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();}
+};
+}  // namespace
+
 //----------------------------------------------------------------------------------------
 //! \brief Particle migration wrappers for the combined dust task graph.  The final
 //! imex2+ stage only assembles the explicit solution and does not move particles, so a
@@ -130,26 +140,35 @@ void DustGasDrag::AssembleDustGasDragTasks(
 
 TaskStatus DustGasDrag::UpdateParticleGIDs(Driver *pdrive, int stage) {
   if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  MigTimer timer(mpi_time[1]);
+  // several ranks: clouds made at the start of the cycle may keep a block across a periodic
+  // boundary
+  if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) FrameToBlock();
   return pmy_pack->ppart->NewGID(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::CountParticleSends(Driver *pdrive, int stage) {
   if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  MigTimer timer(mpi_time[1]);
+  ++mpi_count[1];
   return pmy_pack->ppart->SendCnt(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::InitParticleRecv(Driver *pdrive, int stage) {
   if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  MigTimer timer(mpi_time[1]);
   return pmy_pack->ppart->InitRecv(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::SendParticles(Driver *pdrive, int stage) {
   if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  MigTimer timer(mpi_time[1]);
   return pmy_pack->ppart->SendP(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::RecvParticles(Driver *pdrive, int stage) {
   if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  MigTimer timer(mpi_time[1]);
   return pmy_pack->ppart->RecvP(pdrive, stage);
 }
 

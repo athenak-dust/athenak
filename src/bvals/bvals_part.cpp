@@ -601,11 +601,14 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
     Kokkos::deep_copy(d_prefix, h_prefix);
   }
 
-  // increase size of particle arrays if needed
+  // increase size of particle arrays if needed.  The arrays keep their capacity (their
+  // extent may exceed the number of particles) and grow with 25% headroom, so that a net
+  // inflow of a few particles does not reallocate them every cycle
   int new_npart = pmy_part->nprtcl_thispack + (nprtcl_recv - nprtcl_send);
-  if (nprtcl_recv > nprtcl_send) {
-    Kokkos::resize(pmy_part->prtcl_idata, pmy_part->nidata, new_npart);
-    Kokkos::resize(pmy_part->prtcl_rdata, pmy_part->nrdata, new_npart);
+  if (new_npart > pmy_part->prtcl_rdata.extent_int(1) ||
+      new_npart > pmy_part->prtcl_idata.extent_int(1)) {
+    Kokkos::resize(pmy_part->prtcl_idata, pmy_part->nidata, new_npart + new_npart/4);
+    Kokkos::resize(pmy_part->prtcl_rdata, pmy_part->nrdata, new_npart + new_npart/4);
   }
 
   // check that particle communications have all completed
@@ -666,30 +669,40 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
   // remaining holes
   int nremain = nprtcl_send - nprtcl_recv;
   if (nremain > 0) {
+    // the (hole, last particle) pairs as before, found on the host; the copies in one kernel
+    // instead of two device copies per pair
     int &npart = pmy_part->nprtcl_thispack;
     int i_last_hole = nprtcl_send-1;
     int i_next_hole = nprtcl_recv;
+    std::vector<int> pairs;
     for (int n=1; n<=nremain; ++n) {
       int nend = npart-n;
       if (nend > sendlist.h_view(i_last_hole).prtcl_indx) {
         // copy particle from end into hole
-        int next_hole = sendlist.h_view(i_next_hole).prtcl_indx;
-        auto rdest = Kokkos::subview(pmy_part->prtcl_rdata, Kokkos::ALL, next_hole);
-        auto rsrc  = Kokkos::subview(pmy_part->prtcl_rdata, Kokkos::ALL, nend);
-        Kokkos::deep_copy(rdest, rsrc);
-        auto idest = Kokkos::subview(pmy_part->prtcl_idata, Kokkos::ALL, next_hole);
-        auto isrc  = Kokkos::subview(pmy_part->prtcl_idata, Kokkos::ALL, nend);
-        Kokkos::deep_copy(idest, isrc);
+        pairs.push_back(sendlist.h_view(i_next_hole).prtcl_indx);
+        pairs.push_back(nend);
         i_next_hole += 1;
       } else {
         // this index contains a hole, so do nothing except find new index of last hole
         i_last_hole -= 1;
       }
     }
-
-    // shrink size of particle data arrays
-    Kokkos::resize(pmy_part->prtcl_idata, pmy_part->nidata, new_npart);
-    Kokkos::resize(pmy_part->prtcl_rdata, pmy_part->nrdata, new_npart);
+    const int npair = static_cast<int>(pairs.size())/2;
+    if (npair > 0) {
+      Kokkos::View<int*, HostMemSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+          hpairs(pairs.data(), pairs.size());
+      DvceArray1D<int> dpairs("prtcl_fill_pairs", pairs.size());
+      Kokkos::deep_copy(dpairs, hpairs);
+      auto &pr = pmy_part->prtcl_rdata;
+      auto &pi = pmy_part->prtcl_idata;
+      const int nrdata = pmy_part->nrdata, nidata = pmy_part->nidata;
+      par_for("prtcl_fill_holes",DevExeSpace(),0,npair-1, KOKKOS_LAMBDA(const int k) {
+        const int dst = dpairs(2*k), src = dpairs(2*k + 1);
+        for (int i=0; i<nrdata; ++i) pr(i,dst) = pr(i,src);
+        for (int i=0; i<nidata; ++i) pi(i,dst) = pi(i,src);
+      });
+    }
+    // the arrays keep their capacity (no shrink)
   }
 
   // Update nparticles_thisrank.  Update cost array (use npart_thismb[nmb]?)

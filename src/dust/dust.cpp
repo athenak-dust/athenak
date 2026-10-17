@@ -874,6 +874,14 @@ DustGasDrag::~DustGasDrag() {
                                                                   : pmy_pack->ppart->nprtcl_thispack)
               << ((global_variable::nranks > 1) ? " counters=rank0" : "") << std::endl;
   }
+  if (global_variable::my_rank == 0 && global_variable::nranks > 1 &&
+      smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
+    // Rank 0's seconds in the multi-rank parts of the dust
+    std::cout << "# DUST_MPI_TIMING rank0 migrate_refine=" << mpi_time[0] << " (" << mpi_count[0]
+              << ") migrate_push=" << mpi_time[1] << " (" << mpi_count[1] << ") halo_forward="
+              << mpi_time[2] << " (" << mpi_count[2] << ") halo_reverse=" << mpi_time[3] << " ("
+              << mpi_count[3] << ")" << std::endl;
+  }
   if (global_variable::my_rank == 0 && solver_stage_count > 0) {
     auto quantile = [&](double fraction) {
       if (solver_pcg_stage_count == 0) return 0;

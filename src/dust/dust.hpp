@@ -1796,6 +1796,11 @@ class DustGasDrag {
   void BuildHalo(const std::vector<int> &slot_gid);
   void CheckMultiRank();
   void MigrateClouds();
+  void FrameToBlock();
+  // several ranks: seconds and calls of 0 MigrateClouds, 1 the migration after the
+  // push, 2 halo forward, 3 halo reverse (this rank)
+  double mpi_time[4] = {0.0, 0.0, 0.0, 0.0};
+  unsigned long long mpi_count[4] = {0, 0, 0, 0};
   int cloud_particle_dump = -1;       // diagnostic: cycle at whose start the particles are written
   void DumpParticles();
   void HaloForwardPack(DvceArray5D<Real> &gp);

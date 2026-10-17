@@ -16,6 +16,7 @@
 //! One rank: no peers, every exchange returns at once.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -294,38 +295,56 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
 
 void DustGasDrag::HaloForwardPack(DvceArray5D<Real> &gp) {
   if (halo_.npeer == 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   AccPack a; a.f = gp; a.ks = pmy_pack->pmesh->mb_indcs.ks;
   Exchange(halo_, gp.extent_int(4), false, a);
+  mpi_time[2] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  ++mpi_count[2];
 }
 
 void DustGasDrag::HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int nc) {
   if (halo_.npeer == 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   Acc5D a; a.f = f; a.c0 = c0; a.ks = pmy_pack->pmesh->mb_indcs.ks;
   Exchange(halo_, nc, true, a);
+  mpi_time[3] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  ++mpi_count[3];
 }
 
 void DustGasDrag::HaloForwardFlat(DvceArray2D<Real> &f, const int nc) {
   if (halo_.npeer == 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   AccFlat a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
   Exchange(halo_, nc, false, a);
+  mpi_time[2] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  ++mpi_count[2];
 }
 
 void DustGasDrag::HaloReverseAddFlat(DvceArray2D<Real> &f, const int nc) {
   if (halo_.npeer == 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   AccFlat a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
   Exchange(halo_, nc, true, a);
+  mpi_time[3] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  ++mpi_count[3];
 }
 
 void DustGasDrag::HaloForwardFlags(DvceArray1D<int> &f) {
   if (halo_.npeer == 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   AccFlatInt a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
   Exchange(halo_, 1, false, a);
+  mpi_time[2] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  ++mpi_count[2];
 }
 
 void DustGasDrag::HaloReverseAddFlags(DvceArray1D<int> &f) {
   if (halo_.npeer == 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   AccFlatInt a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
   Exchange(halo_, 1, true, a);
+  mpi_time[3] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  ++mpi_count[3];
 }
 
 }  // namespace dust
