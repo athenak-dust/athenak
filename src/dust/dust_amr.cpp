@@ -515,7 +515,8 @@ int DustGasDrag::RouteToOwnerBlocks(const char *when) {
   }
   if (nbad > 0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << nbad << " particles have no owning MeshBlock (" << when << ")" << std::endl;
+              << nbad << " particles have no owning MeshBlock (" << (when ? when : "split") << ")"
+              << std::endl;
     std::exit(EXIT_FAILURE);
   }
   Kokkos::deep_copy(pb->send_count.h_view, pb->send_count.d_view);
@@ -538,7 +539,7 @@ int DustGasDrag::RouteToOwnerBlocks(const char *when) {
   pm->nprtcl_total = static_cast<int>(tot);
   long long sums[2] = {nchanged, nsent};
   MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-  if (global_variable::my_rank == 0) {
+  if (global_variable::my_rank == 0 && when != nullptr) {   // nullptr: quiet (SplitToLeaves)
     std::cout << "# dust: MeshBlock ids set from the positions at the " << when << ": "
               << sums[0] << " of " << tot << " changed, " << sums[1] << " sent to other ranks"
               << std::endl;
@@ -582,7 +583,10 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   BuildRefinableCloudTransfer(pin);
   // Several ranks: the particles follow their blocks to the ranks that hold
   // them on the new mesh (load balancing may move blocks anywhere)
-  if (global_variable::nranks > 1) RouteToOwnerBlocks("regrid");
+  if (global_variable::nranks > 1) {
+    RouteToOwnerBlocks("regrid");
+    CheckHaloReach("regrid");   // clouds one level behind the new mesh
+  }
   const int npart = ppar->nprtcl_thispack;
   // Every regrid is an event, handled at the start of the next cycle after
   // its split (HandleRegridEvent); refine / derefine from the blocks actually created and

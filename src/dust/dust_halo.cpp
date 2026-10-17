@@ -6,7 +6,8 @@
 //! \file dust_halo.cpp
 //! \brief The dust halo: the leaf fields of whole
 //! MeshBlocks are exchanged with the ranks that own the blocks a cloud can reach (the halo
-//! blocks of BuildLeafTraversal: every block of another rank within kHaloRootCells root cells):
+//! blocks of BuildLeafTraversal: every block of another rank within the reach of a block of this
+//! rank):
 //! forward, the owner sends the values of its blocks (gas velocity and its differences,
 //! computed by the owner) to the halo slots of the ranks that hold them; reverse, a rank sends
 //! what it deposited into its halo slots back to the owner, which adds it.  One aggregated

@@ -928,7 +928,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     });
     // the tag counter is set collectively before the splits
     if (!canonical_root) pmbp->pdust->EnsureNextTag();
-    if (!canonical_root) while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
+    if (!canonical_root) pmbp->pdust->SplitToLeaves();
     std::cout << "# BA random root " << (canonical_root ? "particles (canonical): "
               : "clouds: ") << nparent << " parents -> " << ppar->nprtcl_thispack
               << (canonical_root ? " particles" : " particles after P1 presplit")

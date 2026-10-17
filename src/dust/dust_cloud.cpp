@@ -89,6 +89,10 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // cloud_particle_dump (diagnostic): at the start of cycle N every rank writes its particles
   // (dust_particles.cNNNNNNNN[.rRRRR].bin), to compare runs on different numbers of ranks
   cloud_particle_dump = pin->GetOrAddInteger("dust", "cloud_particle_dump", -1);
+  // cloud_halo_coarser (test): levels a cloud may be coarser than the block of its centre, for the
+  // reach of the halo (-1: from the split rule); the per-cycle check widens it where needed
+  cloud_halo_coarser = pin->GetOrAddInteger("dust", "cloud_halo_coarser", -1);
+  cloud_halo_test_shrink = pin->GetOrAddInteger("dust", "cloud_halo_test_shrink", 0);
   // Every cloud_sort_interval cycles (0: never) the particle arrays are reordered
   // by block, cell in the block (cloud_sort_order = linear or morton) and old position, after
   // the split, resampling and merge pass of the cycle (SortParticles).
@@ -520,6 +524,96 @@ void DustGasDrag::MigrateClouds() {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::SplitToLeaves
+//! \brief The initial split of a problem generator: split passes until no cloud anywhere can
+//! be split (one level per pass).  Several ranks: after every pass the pieces go
+//! to the rank of the block that holds them, by position (RouteToOwnerBlocks: a root cloud
+//! over a deep mesh has children several small blocks away, further than the neighbour step
+//! of the particle exchange), and the loop ends when no rank split anything.  One rank: the
+//! passes alone, as before.  Returns the number of particles split.
+
+int DustGasDrag::SplitToLeaves() {
+  long long total = 0;
+  while (true) {
+    long long n = SplitAndMergeClouds();
+    total += n;
+    if (global_variable::nranks > 1) RouteToOwnerBlocks(nullptr);
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      MPI_Allreduce(MPI_IN_PLACE, &n, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    }
+#endif
+    if (n == 0) break;
+  }
+  return static_cast<int>(total);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::CheckHaloReach
+//! \brief Several ranks: the actual supports against the reach of the halo.  For
+//! every cloud, how far its support (two cells of its level on a lobed side, one otherwise)
+//! extends beyond the block that holds it; where that exceeds the block's allowance, the
+//! block's reach is widened (until the mesh changes) and every rank rebuilds the leaf traversal
+//! and the halo.  The level rule (HaloReach) is then only an estimate: a case it misses costs a
+//! rebuild, not a lost deposit.  Returns whether the halo was rebuilt.
+
+bool DustGasDrag::CheckHaloReach(const char *when) {
+  if (global_variable::nranks == 1) return false;
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  const int nmb = pmy_pack->nmb_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  const auto lt = leaf_traversal;
+  auto allow = halo_allow_d_;
+  DvceArray1D<std::int64_t> need("dust_halo_need", std::max(nmb, 1));
+  int nover = 0;
+  if (npart > 0) {
+    Kokkos::parallel_reduce("dust_halo_reach", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &cnt) {
+      const int m = lt.Anchor(pi(PGID,p));
+      Real x = pr(IPX,p), y = pr(IPY,p);
+      lt.Frame(m, x, y);
+      const int code = pi(PLEV,p);
+      const int lev = SMRCompositeTransfer::CloudLevel(code);
+      const Real e1 = (SMRCompositeTransfer::CloudLobe1(code) ? 2.0 : 1.0)*lt.CloudHalfWidth1(lev);
+      const Real e2 = (SMRCompositeTransfer::CloudLobe2(code) ? 2.0 : 1.0)*lt.CloudHalfWidth2(lev);
+      const Real bx0 = lt.box(m,0), bx1 = bx0 + lt.nx1*lt.box(m,2);
+      const Real by0 = lt.box(m,1), by1 = by0 + lt.nx2*lt.box(m,3);
+      const Real o1 = Kokkos::fmax(0.0, Kokkos::fmax(bx0 - (x - e1), (x + e1) - bx1));
+      const Real o2 = Kokkos::fmax(0.0, Kokkos::fmax(by0 - (y - e2), (y + e2) - by1));
+      const std::int64_t d = static_cast<std::int64_t>(Kokkos::fmax(Kokkos::ceil(o1/lt.fine_dx1),
+                                                                     Kokkos::ceil(o2/lt.fine_dx2)));
+      if (d > allow(m)) {
+        const std::int64_t margin = static_cast<std::int64_t>(1) << (lt.nlev - lt.blev(m));
+        Kokkos::atomic_max(&need(m), d + margin);
+        ++cnt;
+      }
+    }, Kokkos::Sum<int>(nover));
+  }
+  long long tot = nover;
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &tot, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  if (tot == 0) return false;
+  auto nh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), need);
+  int nwide = 0;
+  for (int m=0; m<nmb; ++m) {
+    if (nh(m) > halo_need_[m]) {halo_need_[m] = nh(m); ++nwide;}
+  }
+  halo_widenings_ += static_cast<unsigned long long>(nwide);
+  const int nhalo_before = leaf_traversal.nfld - leaf_traversal.nmb;
+  BuildLeafTraversal();
+  if (global_variable::my_rank == 0) {
+    std::cout << "# dust halo: " << tot << " clouds reached beyond the halo ("
+              << when << ", cycle " << pmy_pack->pmesh->ncycle << "); rank 0 widened " << nwide
+              << " blocks, halo blocks " << nhalo_before << " -> "
+              << leaf_traversal.nfld - leaf_traversal.nmb << std::endl;
+  }
+  return true;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::FrameToBlock
 //! \brief Several ranks: a new cloud's position is wrapped into the domain, but
 //! the block it keeps may be across a periodic boundary.  Put such particles in the image next
@@ -577,7 +671,10 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
     // Several ranks: the split pieces go to the rank of their block before R and G
     // (other cycles leave them to the migration after the push; until then they keep a block
     // of this rank as their anchor, which the leaf traversal allows)
-    if (resample_due || merge_due) MigrateClouds();
+    if (resample_due || merge_due) {
+      MigrateClouds();
+      CheckHaloReach("split");   // R and G traverse the supports too
+    }
     if (resample_due) ResampleClouds();
     if (merge_due) MergeClouds();
   }
@@ -593,6 +690,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
     pm->nprtcl_thisrank = n;
   }
 #endif
+  CheckHaloReach("refine");   // before this cycle's gathers and deposits
   if (cloud_native_check > 0 && pmy_pack->pmesh->ncycle % cloud_native_check == 0) {
     CheckNativeTransfer();
   }
@@ -628,6 +726,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   const char *why = !do_merge ? "none"
                   : ((merge_due && ndel > 0) ? "due+derefine" : (merge_due ? "due" : "derefine"));
   MigrateClouds();   // every cloud in its block before G and R
+  CheckHaloReach("regrid event");
   const int n0 = ppar->nprtcl_thispack;
   Kokkos::Timer timer;
   if (do_merge) MergeClouds();

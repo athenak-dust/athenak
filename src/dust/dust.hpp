@@ -1297,9 +1297,6 @@ inline std::string RankFile(const std::string &name) {
 //! (ascending), the blocks of this rank sent to it, sblk[soff[p] .. soff[p+1]), and the halo
 //! slots received from it, rblk[roff[p] .. roff[p+1]), both in ascending gid.  Whole blocks
 //! (interior cells) for now; one rank: no peers.
-// the halo holds every block of another rank within this many root cells of a
-// block of this rank (the largest reach of a cloud, with a margin)
-constexpr int kHaloRootCells = 4;
 struct DustHalo {
   int nx1 = 0, nx2 = 0, is = 0, js = 0;
   int npeer = 0;
@@ -1805,6 +1802,18 @@ class DustGasDrag {
   void CheckMultiRank();
   void MigrateClouds();
   void FrameToBlock();
+  // the reach of the halo per block of this rank (finest cells): the level rule
+  // (HaloReach), the widenings found by CheckHaloReach (kept until the mesh changes), and the
+  // furthest a support may extend beyond each block
+  int cloud_halo_coarser = -1;         // test: levels a cloud may be coarser than its block (-1: auto)
+  int cloud_halo_test_shrink = 0;      // test: the rule's reach divided by 2^this (forces widenings)
+  std::vector<std::int64_t> halo_need_, halo_reach_, halo_allow_;
+  int halo_need_seq_ = -1;
+  DvceArray1D<std::int64_t> halo_allow_d_;
+  unsigned long long halo_widenings_ = 0;
+  void HaloReach(const int lev, const std::int64_t need, std::int64_t &reach, std::int64_t &allow) const;
+  bool CheckHaloReach(const char *when);
+  int SplitToLeaves();   // the initial split of a problem generator
   int RouteToOwnerBlocks(const char *when);   // after a regrid / restart
   // several ranks: seconds and calls of 0 MigrateClouds, 1 the migration after the
   // push, 2 the kernels these waited for (a fence before each); the halo exchanges keep their

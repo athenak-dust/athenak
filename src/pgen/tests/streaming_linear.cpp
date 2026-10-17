@@ -795,7 +795,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       // one pass per refinement level: children of the first pass may lie inside a
       // still finer region (the tag counter is set collectively first)
       pmbp->pdust->EnsureNextTag();
-      while (pmbp->pdust->SplitAndMergeClouds() > 0) {}
+      pmbp->pdust->SplitToLeaves();
       ntrans = pmbp->pdust->MakeTransitionClouds();
     }
     if (seed_after) {

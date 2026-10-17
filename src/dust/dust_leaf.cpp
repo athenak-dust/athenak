@@ -50,11 +50,11 @@ void DustGasDrag::BuildLeafTraversal() {
   }
   // block slots.  Local blocks first (slot = gid - gids), then the blocks of other
   // ranks that a cloud of this rank can reach (halo, ascending gid), then every other block.
-  // A cloud reaches at most 2 cells of its level from its centre (two-sided lobes), clouds are
-  // never coarser than the root level, and a new cloud's centre lies at most one root cell
-  // outside the block it keeps until it migrates: the halo holds every block within 4 root
-  // cells of a block of this rank (the neighbours alone do not cover a
-  // root-level cloud over a deep mesh), found through the root block that holds each block.
+  // The reach of block m (HaloReach) follows from the coarsest cloud its centre
+  // can hold, widened where CheckHaloReach found a cloud reaching further; the halo holds every
+  // block of another rank within that reach of a block of this rank (the
+  // neighbours alone do not cover a root-level cloud over a deep mesh), found through the root
+  // block that holds each block.
   const int ntot = pm->nmb_total;
   std::vector<int> slot_of(ntot, -1), slot_gid;
   slot_gid.reserve(ntot);
@@ -69,7 +69,18 @@ void DustGasDrag::BuildLeafTraversal() {
     }
     if (global_variable::nranks > 1) {
       const int nl = smr_transfer.cloud_nlev;
-      const std::int64_t rf = static_cast<std::int64_t>(kHaloRootCells) << nl;   // finest cells
+      // the widenings found by CheckHaloReach stay until the mesh changes
+      if (halo_need_seq_ != pm->GetAMRLoadBalanceUpdateSeq() ||
+          static_cast<int>(halo_need_.size()) != nmb) {
+        halo_need_.assign(nmb, 0);
+        halo_need_seq_ = pm->GetAMRLoadBalanceUpdateSeq();
+      }
+      halo_reach_.assign(nmb, 0);
+      halo_allow_.assign(nmb, 0);
+      for (int m=0; m<nmb; ++m) {
+        const int lev = pm->lloc_eachmb[gids + m].level - pm->root_level;
+        HaloReach(lev, halo_need_[m], halo_reach_[m], halo_allow_[m]);
+      }
       const int nbx = pm->nmb_rootx1, nby = pm->nmb_rootx2;
       const std::int64_t bw1 = static_cast<std::int64_t>(indcs.nx1) << nl;    // root block width
       const std::int64_t bw2 = static_cast<std::int64_t>(indcs.nx2) << nl;
@@ -88,7 +99,6 @@ void DustGasDrag::BuildLeafTraversal() {
         const int lev = ll.level - pm->root_level;
         bucket[static_cast<std::size_t>(ll.lx2 >> lev)*nbx + (ll.lx1 >> lev)].push_back(g);
       }
-      const int kx = static_cast<int>((rf + bw1 - 1)/bw1), ky = static_cast<int>((rf + bw2 - 1)/bw2);
       auto overlap = [](std::int64_t a0, std::int64_t a1, std::int64_t c0, std::int64_t c1,
                         std::int64_t n) {
         for (int s=-1; s<=1; ++s) {
@@ -99,6 +109,8 @@ void DustGasDrag::BuildLeafTraversal() {
       for (int m=0; m<nmb; ++m) {
         std::int64_t mb[4];
         fb(gids + m, mb);
+        const std::int64_t rf = halo_reach_[m];   // finest cells
+        const int kx = static_cast<int>((rf + bw1 - 1)/bw1), ky = static_cast<int>((rf + bw2 - 1)/bw2);
         const int bx = static_cast<int>(mb[0]/bw1), by = static_cast<int>(mb[2]/bw2);
         for (int dy=-ky; dy<=ky; ++dy) {
           for (int dx=-kx; dx<=kx; ++dx) {
@@ -342,6 +354,42 @@ void DustGasDrag::BuildLeafTraversal() {
     Kokkos::deep_copy(dmom, 0.0);
   }
   BuildHalo(slot_gid);
+  // the reach of every block of this rank, for CheckHaloReach (several ranks)
+  halo_allow_d_ = DvceArray1D<std::int64_t>("dust_halo_allow", std::max(nmb, 1));
+  if (global_variable::nranks > 1) {
+    auto ah = Kokkos::create_mirror_view(halo_allow_d_);
+    for (int m=0; m<nmb; ++m) ah(m) = halo_allow_[m];
+    Kokkos::deep_copy(halo_allow_d_, ah);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::HaloReach
+//! \brief The reach of a block of level lev (finest cells): reach = 3 cells of
+//! the coarsest cloud level Lmin that its clouds can have, and allow = reach minus one cell of
+//! the block's level (the drift of half a step before the gather), the furthest a cloud's
+//! support may extend beyond the block (CheckHaloReach).  The split runs every cycle before
+//! any gather or deposit; with the overlap rule a cloud is never coarser than the block that
+//! holds its centre, with the older rule at most one level, and right after a regrid both are
+//! one level coarser until the next split (the only traversal then is the post-regrid check):
+//! Lmin = lev - 1 (overlap) or lev - 2, never below 0 or above cloud_max_level, and 0 when the
+//! split is switched off.  <dust>/cloud_halo_coarser sets the levels instead (test).  need: a
+//! widening found by CheckHaloReach.
+
+void DustGasDrag::HaloReach(const int lev, const std::int64_t need, std::int64_t &reach,
+                            std::int64_t &allow) const {
+  const auto &t = smr_transfer;
+  const int nl = t.cloud_nlev;
+  const int coarser = (cloud_halo_coarser >= 0) ? cloud_halo_coarser : (t.cloud_split_overlap ? 1 : 2);
+  int lmin = std::min(std::max(0, lev - coarser), t.cloud_max_level);
+  if (!cloud_split_enable) lmin = 0;
+  lmin = std::max(0, std::min(lmin, nl));
+  const std::int64_t margin = static_cast<std::int64_t>(1) << (nl - std::min(lev, nl));
+  // cloud_halo_test_shrink (test only): the rule's reach divided by 2^shrink, too short on
+  // purpose, so that CheckHaloReach has to widen it
+  const std::int64_t rule = (static_cast<std::int64_t>(3) << (nl - lmin)) >> cloud_halo_test_shrink;
+  reach = std::max(rule, need);
+  allow = reach - margin;
 }
 
 //----------------------------------------------------------------------------------------
