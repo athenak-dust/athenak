@@ -72,6 +72,10 @@ std::vector<SchedPatch> sched_;
 struct DensityTrigger {
   Real rho_refine = 0.0, rho_derefine = 0.0;   // in units of the mean dust density
   int buffer = 0;                               // root cells
+  // amr_rho_level_scaling = mass: the thresholds grow by 2^dim per
+  // level, i.e. a fixed dust mass per cell: a block of level l is refined at rho_refine 2^(dim l)
+  // and derefined below rho_derefine 2^(dim (l - 1)); none: the same thresholds on every level
+  Real level_factor = 1.0;
 };
 DensityTrigger trig_;
 // Per-block audit of the trigger
@@ -180,6 +184,14 @@ void SetupDensityTrigger(ParameterInput *pin) {
   trig_.rho_refine = pin->GetReal("dust", "amr_rho_refine");
   trig_.rho_derefine = pin->GetReal("dust", "amr_rho_derefine");
   trig_.buffer = pin->GetOrAddInteger("dust", "amr_rho_buffer", 2);
+  {
+    const std::string sc = pin->GetOrAddString("dust", "amr_rho_level_scaling", "none");
+    if (sc == "mass") {
+      trig_.level_factor = 4.0;   // 2-D (the trigger is 2-D only)
+    } else if (sc != "none") {
+      fatal("<dust>/amr_rho_level_scaling must be none or mass");
+    }
+  }
   audit_ = pin->GetOrAddBoolean("dust", "amr_trigger_audit", false);
   audit_max_ = pin->GetOrAddInteger("dust", "amr_trigger_audit_max", 40);
   if (!(trig_.rho_derefine >= 0.0 && trig_.rho_derefine < trig_.rho_refine) || trig_.buffer < 0) {
@@ -188,7 +200,8 @@ void SetupDensityTrigger(ParameterInput *pin) {
   if (global_variable::my_rank == 0) {
     std::cout << "# dust density trigger: refine at rho_d/mean >= " << trig_.rho_refine
               << ", derefine below " << trig_.rho_derefine << ", buffer " << trig_.buffer
-              << " root cells" << std::endl;
+              << " root cells" << ((trig_.level_factor > 1.0) ?
+                 "; thresholds x4 per level (a fixed dust mass per cell)" : "") << std::endl;
   }
 }
 
@@ -309,8 +322,12 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     }
     const int lev = pm->lloc_eachmb[m + mbs].level;
     int flag = 0;
-    if (q >= trig_.rho_refine && lev < pm->max_level) flag = 1;
-    else if (q < trig_.rho_derefine && lev > pm->root_level) flag = -1;
+    // the thresholds of this block's level (amr_rho_level_scaling)
+    const int l = lev - pm->root_level;
+    const Real fr = std::pow(trig_.level_factor, l);
+    const Real fd = (l > 0) ? std::pow(trig_.level_factor, l - 1) : 1.0;
+    if (q >= trig_.rho_refine*fr && lev < pm->max_level) flag = 1;
+    else if (q < trig_.rho_derefine*fd && lev > pm->root_level) flag = -1;
     refine_flag.h_view(m + mbs) = flag;
     if (flag > 0) ++nref;
     if (flag < 0) ++nder;

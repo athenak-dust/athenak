@@ -1817,7 +1817,7 @@ class DustGasDrag {
   // furthest a support may extend beyond each block
   int cloud_halo_coarser = -1;         // test: levels a cloud may be coarser than its block (-1: auto)
   int cloud_halo_test_shrink = 0;      // test: the rule's reach divided by 2^this (forces widenings)
-  bool cloud_halo_strips = false;      // exchange only the reachable cells of each block
+  bool cloud_halo_strips = true;       // exchange only the reachable cells of each block
   bool cloud_halo_strip_guard = false; // test: NaN outside the strips before forward, zero check before reverse
   std::vector<std::int64_t> halo_need_, halo_reach_, halo_allow_;
   int halo_need_seq_ = -1;
