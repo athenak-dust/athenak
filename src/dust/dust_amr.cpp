@@ -208,6 +208,10 @@ void SetupDensityTrigger(ParameterInput *pin) {
     } else if (sc != "none") {
       fatal("<dust>/amr_rho_level_scaling must be none or mass");
     }
+    // Any factor per level; amr_rho_level_factor = 2 follows the
+    // growth of the peak density with resolution in the 2048^2 run.  Default: 4 with mass, else 1
+    trig_.level_factor = pin->GetOrAddReal("dust", "amr_rho_level_factor", trig_.level_factor);
+    if (!(trig_.level_factor >= 1.0)) fatal("<dust>/amr_rho_level_factor must be >= 1");
   }
   audit_ = pin->GetOrAddBoolean("dust", "amr_trigger_audit", false);
   audit_max_ = pin->GetOrAddInteger("dust", "amr_trigger_audit_max", 40);
@@ -223,8 +227,8 @@ void SetupDensityTrigger(ParameterInput *pin) {
     std::cout << "# dust density trigger: refine at rho_d/mean >= " << trig_.rho_refine
               << ", derefine below " << trig_.rho_derefine << ", buffer " << trig_.buffer
               << (trig_.map_block ? " cells of the block's level, each block on its own leaf cells"
-                                  : " root cells, root-grid map") << ((trig_.level_factor > 1.0) ?
-                 "; thresholds x4 per level (a fixed dust mass per cell)" : "") << std::endl;
+                                  : " root cells, root-grid map")
+              << "; thresholds x" << trig_.level_factor << " per level" << std::endl;
   }
 }
 
