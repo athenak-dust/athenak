@@ -392,7 +392,9 @@ void WriteBAFieldsGlobal(Mesh *pm) {
         const int jj = ((c2 + b - 1) % n2 + n2) % n2;
         for (int a=0; a<3; ++a) {
           const int ii = ((c1 + a - 1) % n1 + n1) % n1;
-          const Real d = mass*w1[a]*w2[b]*inv_area;
+          const Real wab = w1[a]*w2[b];
+          if (wab == 0.0) continue;   // as the block writer: an empty cell gets nothing (0/0 below)
+          const Real d = mass*wab*inv_area;
           if (pass == 0) {
             dust::DepositAdd(&g0(0,jj,ii), d);
             for (int c=0; c<3; ++c) dust::DepositAdd(&g0(1+c,jj,ii), d*v[c]);
@@ -483,14 +485,21 @@ void WriteBAFieldsGlobal(Mesh *pm) {
     }
   };
   char line[160];
-  if (!ba_geom_written_) {   // a uniform mesh: once
+  // the geometry (row order) with the first frame of this process: after a restart it is written
+  // again, numbered with that frame, since the earlier frames may come from the block writer (one
+  // rank, block order) or from another directory (Codex review)
+  const int mesh_seq = pm->GetAMRLoadBalanceUpdateSeq();
+  if (!ba_geom_written_ || mesh_seq != ba_geom_seq_) {
     std::vector<double> geom;
     geom.reserve(4*ncell);
     for (int j=0; j<n2; ++j)
       for (int i=0; i<n1; ++i) geom.insert(geom.end(), {gx1 + (i + 0.5)*h1, gx2 + (j + 0.5)*h2, h1, h2});
     std::snprintf(line, sizeof(line), "AthenaK BA field geometry v1 f64\n%zu\n", ncell);
-    write(ba_snapshot_basename_ + ".bafield.geom", line, geom.data(), sizeof(double), geom.size());
+    char gnum[32] = "";
+    if (ba_geom_written_) std::snprintf(gnum, sizeof(gnum), ".%05d", number);
+    write(ba_snapshot_basename_ + gnum + ".bafield.geom", line, geom.data(), sizeof(double), geom.size());
     ba_geom_written_ = true;
+    ba_geom_seq_ = mesh_seq;
   }
   std::vector<float> out;
   out.reserve(static_cast<std::size_t>(kBAFields)*ncell);

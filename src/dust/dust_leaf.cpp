@@ -431,6 +431,8 @@ void DustGasDrag::HaloReach(const int lev, const std::int64_t need, std::int64_t
   // purpose, so that CheckHaloReach has to widen it
   const std::int64_t rule = (static_cast<std::int64_t>(3) << (nl - lmin)) >> cloud_halo_test_shrink;
   reach = std::max(rule, need);
+  // the trigger's buffer (cells of this level) lies within the reach
+  reach = std::max(reach, static_cast<std::int64_t>(halo_trigger_cells) << (nl - std::min(lev, nl)));
   allow = reach - margin;
 }
 

@@ -681,10 +681,10 @@ void DustGasDrag::CheckUstarLinear(const int stage) {
   auto gp = gpack;
   // (1) the leaf cells of this rank
   Real ev = 0.0, ex = 0.0, ey = 0.0;
-  int ncell = 0;
+  int ncell = 0, nbad_cell = 0, nbad_cloud = 0;
   const int ncb = nx1*nx2;
   Kokkos::parallel_reduce("dust_ustar_check_cells", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*ncb),
-  KOKKOS_LAMBDA(const int idx, Real &v, Real &sx, Real &sy, int &n) {
+  KOKKOS_LAMBDA(const int idx, Real &v, Real &sx, Real &sy, int &n, int &bad) {
     const int m = idx/ncb, j = (idx % ncb)/nx1 + js, i = idx % nx1 + is;
     const Real dx = mbsize.d_view(m).dx1, dy = mbsize.d_view(m).dx2;
     const Real x = mbsize.d_view(m).x1min + (i - is + 0.5)*dx, y = mbsize.d_view(m).x2min + (j - js + 0.5)*dy;
@@ -693,12 +693,14 @@ void DustGasDrag::CheckUstarLinear(const int stage) {
     // jumps): 5.5 cells of the cell's level
     if (x - 5.5*dx < x1min || x + 5.5*dx > x1max || y - 5.5*dy < x2min || y + 5.5*dy > x2max) return;
     ++n;
+    for (int q=0; q<9; ++q) if (!Kokkos::isfinite(gp(m,ks,j,i,q))) {++bad; return;}   // fmax drops NaN
     for (int c=0; c<3; ++c) {
       v = fmax(v, fabs(gp(m,ks,j,i,c) - fld.Value(c, x, y)));
       sx = fmax(sx, fabs(gp(m,ks,j,i,3+c) - 2.0*dx*fld.Bx(c)));
       sy = fmax(sy, fabs(gp(m,ks,j,i,6+c) - 2.0*dy*fld.By(c)));
     }
-  }, Kokkos::Max<Real>(ev), Kokkos::Max<Real>(ex), Kokkos::Max<Real>(ey), Kokkos::Sum<int>(ncell));
+  }, Kokkos::Max<Real>(ev), Kokkos::Max<Real>(ex), Kokkos::Max<Real>(ey), Kokkos::Sum<int>(ncell),
+     Kokkos::Sum<int>(nbad_cell));
   // (2) the clouds
   particles::Particles *ppar = pmy_pack->ppart;
   auto pr = ppar->prtcl_rdata;
@@ -712,7 +714,7 @@ void DustGasDrag::CheckUstarLinear(const int stage) {
   Real eg = 0.0, ua = 0.0;
   int nchk = 0;
   Kokkos::parallel_reduce("dust_ustar_check_clouds", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, Real &e, Real &u, int &n) {
+  KOKKOS_LAMBDA(const int p, Real &e, Real &u, int &n, int &bad) {
     const Real x0 = pr(IPX,p), y0 = pr(IPY,p);
     if (x0 - mx < x1min || x0 + mx > x1max || y0 - my < x2min || y0 + my > x2max) return;
     ++n;
@@ -730,8 +732,11 @@ void DustGasDrag::CheckUstarLinear(const int stage) {
         ux[c] += w*fld.Value(c, xc, yc) + cx*2.0*dx1*fld.Bx(c) + cy*2.0*dx2*fld.By(c);
       }
     });
-    for (int c=0; c<3; ++c) {e = fmax(e, fabs(ug[c] - ux[c])); u = fmax(u, fabs(ux[c]));}
-  }, Kokkos::Max<Real>(eg), Kokkos::Max<Real>(ua), Kokkos::Sum<int>(nchk));
+    for (int c=0; c<3; ++c) {
+      if (!Kokkos::isfinite(ug[c])) {++bad; return;}
+      e = fmax(e, fabs(ug[c] - ux[c])); u = fmax(u, fabs(ux[c]));
+    }
+  }, Kokkos::Max<Real>(eg), Kokkos::Max<Real>(ua), Kokkos::Sum<int>(nchk), Kokkos::Sum<int>(nbad_cloud));
   // the worst cells (test output): where the differences exceed 1e-12
   if (ex > 1.0e-12 || ey > 1.0e-12 || ev > 1.0e-12) {
     auto gph = Kokkos::create_mirror_view_and_copy(HostMemSpace(), gp);
@@ -761,18 +766,19 @@ void DustGasDrag::CheckUstarLinear(const int stage) {
     }
   }
   Real mxv[5] = {ev, ex, ey, eg, ua};
-  long long cnt[2] = {ncell, nchk};
+  long long cnt[4] = {ncell, nchk, nbad_cell, nbad_cloud};
 #if MPI_PARALLEL_ENABLED
   if (global_variable::nranks > 1) {
     MPI_Allreduce(MPI_IN_PLACE, mxv, 5, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
-    MPI_Allreduce(MPI_IN_PLACE, cnt, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, cnt, 4, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
   }
 #endif
   if (global_variable::my_rank == 0) {
     std::printf("# DUST_USTAR_CHECK cycle %d stage %d: %lld leaf cells, max |value - exact| %.3e, "
                 "|x1 difference - exact| %.3e, |x2 difference - exact| %.3e; %lld clouds, "
-                "max |gather - exact| %.3e (largest |u| %.3e)\n", pmy_pack->pmesh->ncycle, stage,
-                cnt[0], mxv[0], mxv[1], mxv[2], cnt[1], mxv[3], mxv[4]);
+                "max |gather - exact| %.3e (largest |u| %.3e); non-finite cells %lld clouds %lld\n",
+                pmy_pack->pmesh->ncycle, stage, cnt[0], mxv[0], mxv[1], mxv[2], cnt[1], mxv[3], mxv[4],
+                cnt[2], cnt[3]);
   }
 }
 

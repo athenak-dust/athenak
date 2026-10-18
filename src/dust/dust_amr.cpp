@@ -218,11 +218,8 @@ void SetupDensityTrigger(ParameterInput *pin) {
   if (!(trig_.rho_derefine >= 0.0 && trig_.rho_derefine < trig_.rho_refine) || trig_.buffer < 0) {
     fatal("amr_density_trigger needs 0 <= amr_rho_derefine < amr_rho_refine and amr_rho_buffer >= 0");
   }
-  // several ranks: the buffer cells on other ranks come from the halo strips, which hold the
-  // cells within 3 root-level cells of a root block and 6 own cells of a finer block
-  if (trig_.map_block && global_variable::nranks > 1 && trig_.buffer > 3) {
-    fatal("amr_rho_map = block on several ranks needs amr_rho_buffer <= 3");
-  }
+  // several ranks: the buffer is part of the reach of the halo (DustGasDrag::HaloReach), so the
+  // strips hold the buffer cells; BlockValue checks that the received cells cover it
   if (global_variable::my_rank == 0) {
     std::cout << "# dust density trigger: refine at rho_d/mean >= " << trig_.rho_refine
               << ", derefine below " << trig_.rho_derefine << ", buffer " << trig_.buffer
@@ -351,30 +348,42 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     const Real ey0 = by0 - trig_.buffer*bdy, ey1 = by1 + trig_.buffer*bdy;
     const Real tol = 1.0e-9*std::min(bdx, bdy);
     Real q = 0.0, area = 0.0;
+    int nbad = 0;
     for (int s=0; s<nslot; ++s) {
       const Real sdx = boxh(s,2), sdy = boxh(s,3);
+      // a halo slot holds only the cells it receives (its strip, or the whole block)
+      int r0 = 0, r1 = nx1, r2 = 0, r3 = nx2;
+      if (s >= nmb) {
+        const auto &rc = pdust->halo_.rect[s - nmb];
+        r0 = rc[0]; r1 = rc[1]; r2 = rc[2]; r3 = rc[3];
+      }
       for (int oy=-1; oy<=1; ++oy) {
         for (int ox=-1; ox<=1; ++ox) {
-          const Real a0 = boxh(s,0) + ox*lx, a1 = a0 + nx1*sdx;
-          const Real c0 = boxh(s,1) + oy*ly, c1 = c0 + nx2*sdy;
+          const Real b0 = boxh(s,0) + ox*lx, d0 = boxh(s,1) + oy*ly;
+          const Real a0 = b0 + r0*sdx, a1 = b0 + r1*sdx;   // the received cells
+          const Real c0 = d0 + r2*sdy, c1 = d0 + r3*sdy;
           if (a1 <= ex0 + tol || a0 >= ex1 - tol || c1 <= ey0 + tol || c0 >= ey1 - tol) continue;
           area += (std::min(a1, ex1) - std::max(a0, ex0))*(std::min(c1, ey1) - std::max(c0, ey0));
-          const int i0 = std::max(0, static_cast<int>(std::floor((ex0 - a0)/sdx + 1.0e-9)));
-          const int i1 = std::min(nx1, static_cast<int>(std::ceil((ex1 - a0)/sdx - 1.0e-9)));
-          const int j0 = std::max(0, static_cast<int>(std::floor((ey0 - c0)/sdy + 1.0e-9)));
-          const int j1 = std::min(nx2, static_cast<int>(std::ceil((ey1 - c0)/sdy - 1.0e-9)));
+          const int i0 = std::max(r0, static_cast<int>(std::floor((ex0 - b0)/sdx + 1.0e-9)));
+          const int i1 = std::min(r1, static_cast<int>(std::ceil((ex1 - b0)/sdx - 1.0e-9)));
+          const int j0 = std::max(r2, static_cast<int>(std::floor((ey0 - d0)/sdy + 1.0e-9)));
+          const int j1 = std::min(r3, static_cast<int>(std::ceil((ey1 - d0)/sdy - 1.0e-9)));
           for (int j=j0; j<j1; ++j) {
-            for (int i=i0; i<i1; ++i) q = std::max(q, fh(s, js+j, is+i)/mean);
+            for (int i=i0; i<i1; ++i) {
+              const Real v = fh(s, js+j, is+i);
+              if (!std::isfinite(v)) {++nbad; continue;}   // std::max would drop a NaN
+              q = std::max(q, v/mean);
+            }
           }
         }
       }
     }
     const Real want = (ex1 - ex0)*(ey1 - ey0);
-    if (std::fabs(area - want) > 1.0e-9*want) {
+    if (std::fabs(area - want) > 1.0e-9*want || nbad > 0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "amr_rho_map = block: the buffer of block " << m + mbs << " (" << trig_.buffer
                 << " cells) is not covered by the local and halo blocks (covered area "
-                << area << " of " << want << "); reduce amr_rho_buffer" << std::endl;
+                << area << " of " << want << ", " << nbad << " non-finite cells)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     return q;

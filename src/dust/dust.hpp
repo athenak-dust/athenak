@@ -1827,6 +1827,9 @@ class DustGasDrag {
   // with the exact values (CheckUstarLinear).  skip_exchange (negative control, one rank): no u*
   // ghost exchange
   bool test_ustar_linear = false, test_ustar_skip_exchange = false;
+  // the buffer of the density trigger (amr_rho_map = block), cells of a block's level: part of the
+  // reach of the halo, so that the strips hold the buffer cells (Codex review)
+  int halo_trigger_cells = 0;
   void CheckUstarLinear(const int stage);
   std::vector<int> leaf_slot_gid;
   DvceArray1D<int> leaf_slot_gid_d, leaf_slot_rank_d;   // gid and rank of every block slot
