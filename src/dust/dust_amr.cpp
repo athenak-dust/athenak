@@ -30,10 +30,15 @@
 //! DensityRefinement() is the minimal dust-density request: at the
 //! check (end of the cycle, after the outputs, before the regrid) the dust mass of the
 //! particles at their new positions is deposited on the current leaves with the exact cloud
-//! integrals (the transfer of the coupling and of the field outputs); rho_d / mean is taken
-//! as a maximum onto the root grid, the map is widened by amr_rho_buffer root cells
-//! (periodic), and a block whose cover reaches amr_rho_refine is flagged for refinement,
-//! one that stays below amr_rho_derefine (< amr_rho_refine, hysteresis) for derefinement.
+//! integrals (the transfer of the coupling and of the field outputs).  amr_rho_map = block
+//! (the default, as the AthenaK criteria): a block is judged on the maximum
+//! of rho_d / mean over its own leaf cells, widened by amr_rho_buffer cells of its own level
+//! (periodic; the cells of neighbouring blocks, from the halo on several ranks).  root (the
+//! original rule, for one level above the root): rho_d / mean is taken as a maximum
+//! onto the root grid, widened by amr_rho_buffer root cells, and a block takes the maximum
+//! over the root cells it covers.  A block whose value reaches amr_rho_refine is flagged for
+//! refinement, one that stays below amr_rho_derefine (< amr_rho_refine, hysteresis) for
+//! derefinement.
 //! The sibling, 2:1 and refinement_interval rules of MeshRefinement apply as usual.  Each
 //! check writes a line to dust_trigger_log.txt.
 
@@ -71,7 +76,8 @@ std::vector<SchedPatch> sched_;
 // the dust-density request (SetupDensityTrigger)
 struct DensityTrigger {
   Real rho_refine = 0.0, rho_derefine = 0.0;   // in units of the mean dust density
-  int buffer = 0;                               // root cells
+  int buffer = 0;                               // cells of the block's level (map = block) or root cells
+  bool map_block = true;                        // amr_rho_map: block (own leaf cells) or root
   // amr_rho_level_scaling = mass: the thresholds grow by 2^dim per
   // level, i.e. a fixed dust mass per cell: a block of level l is refined at rho_refine 2^(dim l)
   // and derefined below rho_derefine 2^(dim (l - 1)); none: the same thresholds on every level
@@ -185,6 +191,17 @@ void SetupDensityTrigger(ParameterInput *pin) {
   trig_.rho_derefine = pin->GetReal("dust", "amr_rho_derefine");
   trig_.buffer = pin->GetOrAddInteger("dust", "amr_rho_buffer", 2);
   {
+    // Rixin: each block on its own leaf cells, as the AthenaK criteria; root keeps the
+    // root-grid map (inputs written before 2026-10-17 that leave the key out get
+    // the new rule)
+    const std::string mp = pin->GetOrAddString("dust", "amr_rho_map", "block");
+    if (mp == "root") {
+      trig_.map_block = false;
+    } else if (mp != "block") {
+      fatal("<dust>/amr_rho_map must be block or root");
+    }
+  }
+  {
     const std::string sc = pin->GetOrAddString("dust", "amr_rho_level_scaling", "none");
     if (sc == "mass") {
       trig_.level_factor = 4.0;   // 2-D (the trigger is 2-D only)
@@ -197,10 +214,16 @@ void SetupDensityTrigger(ParameterInput *pin) {
   if (!(trig_.rho_derefine >= 0.0 && trig_.rho_derefine < trig_.rho_refine) || trig_.buffer < 0) {
     fatal("amr_density_trigger needs 0 <= amr_rho_derefine < amr_rho_refine and amr_rho_buffer >= 0");
   }
+  // several ranks: the buffer cells on other ranks come from the halo strips, which hold the
+  // cells within 3 root-level cells of a root block and 6 own cells of a finer block
+  if (trig_.map_block && global_variable::nranks > 1 && trig_.buffer > 3) {
+    fatal("amr_rho_map = block on several ranks needs amr_rho_buffer <= 3");
+  }
   if (global_variable::my_rank == 0) {
     std::cout << "# dust density trigger: refine at rho_d/mean >= " << trig_.rho_refine
               << ", derefine below " << trig_.rho_derefine << ", buffer " << trig_.buffer
-              << " root cells" << ((trig_.level_factor > 1.0) ?
+              << (trig_.map_block ? " cells of the block's level, each block on its own leaf cells"
+                                  : " root cells, root-grid map") << ((trig_.level_factor > 1.0) ?
                  "; thresholds x4 per level (a fixed dust mass per cell)" : "") << std::endl;
   }
 }
@@ -247,6 +270,10 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     });
   });
   pdust->HaloReverseAddFlat(f, 1);
+  // map = block: the buffer cells of a block may lie on a halo block; the owners' sums there
+  // (the strips hold every cell within the reach of the local blocks, at least 3 cells of the
+  // root level and 6 of any finer level, checked below)
+  if (trig_.map_block && trig_.buffer > 0) pdust->HaloForwardFlat(f, 1);
   Real mtot = 0.0;
   int nlev[3] = {0, 0, 0};   // clouds at the root level, finer plain, lobed
   Kokkos::parallel_reduce("amr_rho_totals", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -307,6 +334,47 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       wide[rj*nr1 + ri] = w;
     }
   }
+  // map = block: the maximum of rho_d / mean over the leaf cells (local and halo slots) that
+  // overlap the block widened by the buffer, periodic images included; the widened box must be
+  // covered by those slots (a buffer cell outside the halo would make the result depend on the
+  // ranks)
+  const Real lx = pm->mesh_size.x1max - x0, ly = pm->mesh_size.x2max - y0;
+  const int nslot = lt.nfld;   // local and halo slots: the deposit f covers these
+  auto boxh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), lt.box);
+  auto BlockValue = [&](const int m, const Real bx0, const Real bx1, const Real by0, const Real by1,
+                        const Real bdx, const Real bdy) {
+    const Real ex0 = bx0 - trig_.buffer*bdx, ex1 = bx1 + trig_.buffer*bdx;
+    const Real ey0 = by0 - trig_.buffer*bdy, ey1 = by1 + trig_.buffer*bdy;
+    const Real tol = 1.0e-9*std::min(bdx, bdy);
+    Real q = 0.0, area = 0.0;
+    for (int s=0; s<nslot; ++s) {
+      const Real sdx = boxh(s,2), sdy = boxh(s,3);
+      for (int oy=-1; oy<=1; ++oy) {
+        for (int ox=-1; ox<=1; ++ox) {
+          const Real a0 = boxh(s,0) + ox*lx, a1 = a0 + nx1*sdx;
+          const Real c0 = boxh(s,1) + oy*ly, c1 = c0 + nx2*sdy;
+          if (a1 <= ex0 + tol || a0 >= ex1 - tol || c1 <= ey0 + tol || c0 >= ey1 - tol) continue;
+          area += (std::min(a1, ex1) - std::max(a0, ex0))*(std::min(c1, ey1) - std::max(c0, ey0));
+          const int i0 = std::max(0, static_cast<int>(std::floor((ex0 - a0)/sdx + 1.0e-9)));
+          const int i1 = std::min(nx1, static_cast<int>(std::ceil((ex1 - a0)/sdx - 1.0e-9)));
+          const int j0 = std::max(0, static_cast<int>(std::floor((ey0 - c0)/sdy + 1.0e-9)));
+          const int j1 = std::min(nx2, static_cast<int>(std::ceil((ey1 - c0)/sdy - 1.0e-9)));
+          for (int j=j0; j<j1; ++j) {
+            for (int i=i0; i<i1; ++i) q = std::max(q, fh(s, js+j, is+i)/mean);
+          }
+        }
+      }
+    }
+    const Real want = (ex1 - ex0)*(ey1 - ey0);
+    if (std::fabs(area - want) > 1.0e-9*want) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "amr_rho_map = block: the buffer of block " << m + mbs << " (" << trig_.buffer
+                << " cells) is not covered by the local and halo blocks (covered area "
+                << area << " of " << want << "); reduce amr_rho_buffer" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    return q;
+  };
   int nref = 0, nder = 0;
   std::vector<Real> qblk(nmb, 0.0);
   std::vector<int> rawf(nmb, 0), appf(nmb, 0);
@@ -317,8 +385,12 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     const int j0 = static_cast<int>(std::floor((sz.x2min - y0)/hy + 1.0e-9));
     const int j1 = static_cast<int>(std::ceil((sz.x2max - y0)/hy - 1.0e-9));
     Real q = 0.0;
-    for (int rj=j0; rj<j1; ++rj) {
-      for (int ri=i0; ri<i1; ++ri) q = std::max(q, wide[rj*nr1 + ri]);
+    if (trig_.map_block) {
+      q = BlockValue(m, sz.x1min, sz.x1max, sz.x2min, sz.x2max, sz.dx1, sz.dx2);
+    } else {
+      for (int rj=j0; rj<j1; ++rj) {
+        for (int ri=i0; ri<i1; ++ri) q = std::max(q, wide[rj*nr1 + ri]);
+      }
     }
     const int lev = pm->lloc_eachmb[m + mbs].level;
     int flag = 0;
