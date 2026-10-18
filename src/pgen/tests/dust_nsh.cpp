@@ -152,10 +152,140 @@ constexpr int kBAFields = 11;
 // fraction per bin of log10(density / mean), first / last bin = below / above the range.
 bool ba_ppdf_ = false;
 bool ba_fields_write_ = true;
+bool ba_fields_global_test_ = false;   // test: the several-rank writer on one rank
 bool ba_ppdf_header_ = false;
 int ba_ppdf_nref_ = 128;
 constexpr int kPPBins = 1000, kPPScal = 23;
 constexpr double kPPLo = -6.0, kPPHi = 4.0;
+
+// The particle loop and the record of WriteBAParticlePDF, on grids of the whole mesh (grid[L]: the
+// density on level L, lmap: the level of the leaf of every finest cell, ref: the reference grid).
+template <typename PrtclHost>
+void FinishBAParticlePDF(Mesh *pm, const std::vector<std::vector<double>> &grid,
+                         const std::vector<signed char> &lmap, const int nlev,
+                         const std::vector<double> &ref, const int nr1, const int nr2,
+                         const PrtclHost &prh, const int npart, const double mtot) {
+  const double x1min = pm->mesh_size.x1min, x2min = pm->mesh_size.x2min;
+  const double lx = pm->mesh_size.x1max - x1min, ly = pm->mesh_size.x2max - x2min;
+  const int n1 = pm->mesh_indcs.nx1, n2 = pm->mesh_indcs.nx2;
+  const int nf1 = n1 << nlev, nf2 = n2 << nlev;
+  const double hr1 = lx/nr1;
+  auto tsc = [&](const std::vector<double> &g, const int m1, const int m2, const double x,
+                 const double y) {
+    const double q1 = (x - x1min)/(lx/m1) - 0.5, q2 = (y - x2min)/(ly/m2) - 0.5;
+    const int c1 = static_cast<int>(std::floor(q1 + 0.5)), c2 = static_cast<int>(std::floor(q2 + 0.5));
+    const double d1 = q1 - c1, d2 = q2 - c2;
+    const double w1[3] = {0.5*SQR(0.5-d1), 0.75-d1*d1, 0.5*SQR(0.5+d1)};
+    const double w2[3] = {0.5*SQR(0.5-d2), 0.75-d2*d2, 0.5*SQR(0.5+d2)};
+    double v = 0.0;
+    for (int b=0; b<3; ++b) {
+      const int jj = ((c2 + b - 1) % m2 + m2) % m2;
+      for (int a=0; a<3; ++a) v += w2[b]*w1[a]*g[static_cast<std::size_t>(jj)*m1 + ((c1 + a - 1) % m1 + m1) % m1];
+    }
+    return v;
+  };
+  const double rbar = mtot/(lx*ly), band = 2.0*hr1, xmid = x1min + 0.5*lx;
+  const int nb2 = kPPBins + 2;
+  std::vector<double> hist(static_cast<std::size_t>(10)*nb2, 0.0);
+  const double thr[6] = {1.0, 3.0, 10.0, 30.0, 100.0, 300.0};
+  double above[2][6] = {{0.0}}, rmax[2] = {0.0, 0.0}, mreg[4] = {0.0, 0.0, 0.0, 0.0};
+  for (int p=0; p<npart; ++p) {
+    const double mass = prh(IPM,p);
+    if (!(mass > 0.0)) continue;
+    double x = prh(IPX,p), y = prh(IPY,p);
+    x -= lx*std::floor((x - x1min)/lx); y -= ly*std::floor((y - x2min)/ly);
+    const int fi = std::min(nf1 - 1, static_cast<int>((x - x1min)/(lx/nf1)));
+    const int fj = std::min(nf2 - 1, static_cast<int>((y - x2min)/(ly/nf2)));
+    const int L = lmap[static_cast<std::size_t>(fj)*nf1 + fi];
+    const double r[2] = {tsc(grid[L], n1 << L, n2 << L, x, y)/rbar, tsc(ref, nr1, nr2, x, y)/rbar};
+    const double dedge = std::min(x - x1min, x1min + lx - x), dmid = std::fabs(x - xmid);
+    const bool left = x < xmid, clear = dedge > band && dmid > band;
+    const int reg[3] = {0, left ? 1 : 2, clear ? (left ? 3 : 4) : -1};
+    mreg[left ? 0 : 1] += mass;
+    if (clear) mreg[left ? 2 : 3] += mass;
+    for (int e=0; e<2; ++e) {
+      int bin = 0;
+      if (r[e] > 0.0) {
+        const double sb = (std::log10(r[e]) - kPPLo)/(kPPHi - kPPLo)*kPPBins;
+        bin = (sb < 0.0) ? 0 : ((sb >= kPPBins) ? kPPBins + 1 : 1 + static_cast<int>(sb));
+      }
+      for (int k=0; k<3; ++k) if (reg[k] >= 0) hist[(static_cast<std::size_t>(e)*5 + reg[k])*nb2 + bin] += mass;
+      for (int k=0; k<6; ++k) if (r[e] > thr[k]) above[e][k] += mass;
+      rmax[e] = std::max(rmax[e], r[e]);
+    }
+  }
+  // several ranks (2026-10-17, U2048): every rank evaluates its particles on the global grids;
+  // the sums go to rank 0, which writes the record
+  long long ntot = npart;
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, hist.data(), static_cast<int>(hist.size()), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &above[0][0], 12, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, mreg, 4, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, rmax, 2, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &ntot, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
+  if (global_variable::my_rank != 0) return;
+  double scal[kPPScal] = {pm->time, static_cast<double>(pm->ncycle), static_cast<double>(ntot),
+                          mtot, rbar, rmax[0], rmax[1]};
+  for (int e=0; e<2; ++e) for (int k=0; k<6; ++k) scal[7 + 6*e + k] = above[e][k]/mtot;
+  for (int k=0; k<4; ++k) scal[19 + k] = mreg[k]/mtot;
+  std::vector<float> out(hist.size());
+  for (std::size_t k=0; k<hist.size(); ++k) out[k] = static_cast<float>(hist[k]/mtot);
+  const std::string name = ba_snapshot_basename_ + ".ppdf";
+  if (ba_ppdf_resume_) {
+    // first record after a restart: keep the leading records that are earlier than this one
+    // (a file written past the restart point is cut back), then append.  The records are
+    // told by their time, not by the frame number: a run continued from a saved state does
+    // not start its file at frame zero.
+    ba_ppdf_resume_ = false;
+    FILE *old = std::fopen(name.c_str(), "rb");
+    if (old != nullptr) {
+      char line[256];
+      const bool two = std::fgets(line, sizeof(line), old) != nullptr &&
+                       std::fgets(line, sizeof(line), old) != nullptr;
+      const long head = two ? std::ftell(old) : -1;
+      std::fseek(old, 0, SEEK_END);
+      const long size = std::ftell(old);
+      const long rec = static_cast<long>(kPPScal*sizeof(double) + hist.size()*sizeof(float));
+      long keep = 0;
+      if (head > 0) {
+        const long nrec = (size - head)/rec;
+        const double tnow = scal[0];
+        for (long k=0; k<nrec; ++k) {
+          double tk = 0.0;
+          std::fseek(old, head + k*rec, SEEK_SET);
+          if (std::fread(&tk, sizeof(double), 1, old) != 1 ||
+              !(tk < tnow - 1.0e-12*std::fabs(tnow))) break;
+          keep = k + 1;
+        }
+      }
+      std::fclose(old);
+      if (head > 0) {
+        if (size != head + rec*keep && truncate(name.c_str(), head + rec*keep) != 0) {
+          std::cerr << "Cannot cut " << name << " back to the restart point" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        ba_ppdf_header_ = true;
+      }
+    }
+  }
+  FILE *file = std::fopen(name.c_str(), ba_ppdf_header_ ? "ab" : "wb");
+  bool ok = file != nullptr;
+  if (ok && !ba_ppdf_header_) {
+    ok = std::fprintf(file, "AthenaK BA particle density distribution v1\n%d 2 5 %d %.17g %.17g %d\n",
+                      kPPScal, kPPBins, kPPLo, kPPHi, nr1) > 0;
+    ba_ppdf_header_ = true;
+  }
+  ok = ok && std::fwrite(scal, sizeof(double), kPPScal, file) == kPPScal;
+  ok = ok && std::fwrite(out.data(), sizeof(float), out.size(), file) == out.size();
+  ok = (file != nullptr) && (std::fclose(file) == 0) && ok;
+  if (!ok) {
+    std::cerr << "Failed writing BA particle distribution " << name << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+}
 
 template <typename FieldHost, typename PrtclHost>
 void WriteBAParticlePDF(Mesh *pm, const FieldHost &fh, const PrtclHost &prh, const int npart,
@@ -218,108 +348,168 @@ void WriteBAParticlePDF(Mesh *pm, const FieldHost &fh, const PrtclHost &prh, con
       }
     }
   }
-  auto tsc = [&](const std::vector<double> &g, const int m1, const int m2, const double x,
-                 const double y) {
-    const double q1 = (x - x1min)/(lx/m1) - 0.5, q2 = (y - x2min)/(ly/m2) - 0.5;
-    const int c1 = static_cast<int>(std::floor(q1 + 0.5)), c2 = static_cast<int>(std::floor(q2 + 0.5));
-    const double d1 = q1 - c1, d2 = q2 - c2;
-    const double w1[3] = {0.5*SQR(0.5-d1), 0.75-d1*d1, 0.5*SQR(0.5+d1)};
-    const double w2[3] = {0.5*SQR(0.5-d2), 0.75-d2*d2, 0.5*SQR(0.5+d2)};
-    double v = 0.0;
-    for (int b=0; b<3; ++b) {
-      const int jj = ((c2 + b - 1) % m2 + m2) % m2;
-      for (int a=0; a<3; ++a) v += w2[b]*w1[a]*g[static_cast<std::size_t>(jj)*m1 + ((c1 + a - 1) % m1 + m1) % m1];
-    }
-    return v;
-  };
-  const double rbar = mtot/(lx*ly), band = 2.0*hr1, xmid = x1min + 0.5*lx;
-  const int nb2 = kPPBins + 2;
-  std::vector<double> hist(static_cast<std::size_t>(10)*nb2, 0.0);
-  const double thr[6] = {1.0, 3.0, 10.0, 30.0, 100.0, 300.0};
-  double above[2][6] = {{0.0}}, rmax[2] = {0.0, 0.0}, mreg[4] = {0.0, 0.0, 0.0, 0.0};
-  for (int p=0; p<npart; ++p) {
-    const double mass = prh(IPM,p);
-    if (!(mass > 0.0)) continue;
-    double x = prh(IPX,p), y = prh(IPY,p);
-    x -= lx*std::floor((x - x1min)/lx); y -= ly*std::floor((y - x2min)/ly);
-    const int fi = std::min(nf1 - 1, static_cast<int>((x - x1min)/(lx/nf1)));
-    const int fj = std::min(nf2 - 1, static_cast<int>((y - x2min)/(ly/nf2)));
-    const int L = lmap[static_cast<std::size_t>(fj)*nf1 + fi];
-    const double r[2] = {tsc(grid[L], n1 << L, n2 << L, x, y)/rbar, tsc(ref, nr1, nr2, x, y)/rbar};
-    const double dedge = std::min(x - x1min, x1min + lx - x), dmid = std::fabs(x - xmid);
-    const bool left = x < xmid, clear = dedge > band && dmid > band;
-    const int reg[3] = {0, left ? 1 : 2, clear ? (left ? 3 : 4) : -1};
-    mreg[left ? 0 : 1] += mass;
-    if (clear) mreg[left ? 2 : 3] += mass;
-    for (int e=0; e<2; ++e) {
-      int bin = 0;
-      if (r[e] > 0.0) {
-        const double sb = (std::log10(r[e]) - kPPLo)/(kPPHi - kPPLo)*kPPBins;
-        bin = (sb < 0.0) ? 0 : ((sb >= kPPBins) ? kPPBins + 1 : 1 + static_cast<int>(sb));
-      }
-      for (int k=0; k<3; ++k) if (reg[k] >= 0) hist[(static_cast<std::size_t>(e)*5 + reg[k])*nb2 + bin] += mass;
-      for (int k=0; k<6; ++k) if (r[e] > thr[k]) above[e][k] += mass;
-      rmax[e] = std::max(rmax[e], r[e]);
-    }
-  }
-  double scal[kPPScal] = {pm->time, static_cast<double>(pm->ncycle), static_cast<double>(npart),
-                          mtot, rbar, rmax[0], rmax[1]};
-  for (int e=0; e<2; ++e) for (int k=0; k<6; ++k) scal[7 + 6*e + k] = above[e][k]/mtot;
-  for (int k=0; k<4; ++k) scal[19 + k] = mreg[k]/mtot;
-  std::vector<float> out(hist.size());
-  for (std::size_t k=0; k<hist.size(); ++k) out[k] = static_cast<float>(hist[k]/mtot);
-  const std::string name = ba_snapshot_basename_ + ".ppdf";
-  if (ba_ppdf_resume_) {
-    // first record after a restart: keep the leading records that are earlier than this one
-    // (a file written past the restart point is cut back), then append.  The records are
-    // told by their time, not by the frame number: a run continued from a saved state does
-    // not start its file at frame zero.
-    ba_ppdf_resume_ = false;
-    FILE *old = std::fopen(name.c_str(), "rb");
-    if (old != nullptr) {
-      char line[256];
-      const bool two = std::fgets(line, sizeof(line), old) != nullptr &&
-                       std::fgets(line, sizeof(line), old) != nullptr;
-      const long head = two ? std::ftell(old) : -1;
-      std::fseek(old, 0, SEEK_END);
-      const long size = std::ftell(old);
-      const long rec = static_cast<long>(kPPScal*sizeof(double) + hist.size()*sizeof(float));
-      long keep = 0;
-      if (head > 0) {
-        const long nrec = (size - head)/rec;
-        const double tnow = scal[0];
-        for (long k=0; k<nrec; ++k) {
-          double tk = 0.0;
-          std::fseek(old, head + k*rec, SEEK_SET);
-          if (std::fread(&tk, sizeof(double), 1, old) != 1 ||
-              !(tk < tnow - 1.0e-12*std::fabs(tnow))) break;
-          keep = k + 1;
-        }
-      }
-      std::fclose(old);
-      if (head > 0) {
-        if (size != head + rec*keep && truncate(name.c_str(), head + rec*keep) != 0) {
-          std::cerr << "Cannot cut " << name << " back to the restart point" << std::endl;
-          std::exit(EXIT_FAILURE);
-        }
-        ba_ppdf_header_ = true;
-      }
-    }
-  }
-  FILE *file = std::fopen(name.c_str(), ba_ppdf_header_ ? "ab" : "wb");
-  bool ok = file != nullptr;
-  if (ok && !ba_ppdf_header_) {
-    ok = std::fprintf(file, "AthenaK BA particle density distribution v1\n%d 2 5 %d %.17g %.17g %d\n",
-                      kPPScal, kPPBins, kPPLo, kPPHi, nr1) > 0;
-    ba_ppdf_header_ = true;
-  }
-  ok = ok && std::fwrite(scal, sizeof(double), kPPScal, file) == kPPScal;
-  ok = ok && std::fwrite(out.data(), sizeof(float), out.size(), file) == out.size();
-  ok = (file != nullptr) && (std::fclose(file) == 0) && ok;
-  if (!ok) {
-    std::cerr << "Failed writing BA particle distribution " << name << std::endl;
+  FinishBAParticlePDF(pm, grid, lmap, nlev, ref, nr1, nr2, prh, npart, mtot);
+}
+
+// Several ranks (2026-10-17, U2048): the field snapshot of a uniform mesh with the canonical
+// TSC deposit.  Every rank deposits its particles on the global periodic grid; the sums are
+// reduced (mass and momentum to all ranks for the second pass, the central moments and the gas
+// to rank 0), and rank 0 writes the cells in row order (x fastest) with that geometry, in the
+// formats of WriteBAFields.  The particle distribution is evaluated by every rank on the global
+// density and reduced (FinishBAParticlePDF).
+void WriteBAFieldsGlobal(Mesh *pm) {
+#if MPI_PARALLEL_ENABLED
+  auto *pack = pm->pmb_pack;
+  auto *pdust = pack->pdust;
+  auto &ind = pm->mb_indcs;
+  const int nmb = pack->nmb_thispack, is = ind.is, js = ind.js, ks = ind.ks;
+  const int nx1 = ind.nx1, nx2 = ind.nx2;
+  auto &pr = pack->ppart->prtcl_rdata;
+  const int npart = pack->ppart->nprtcl_thispack;
+  auto &mbsize = pack->pmb->mb_size;
+  if (pm->multilevel || pdust->UsesCompositeTransfer() || pdust->deposit != DustDeposit::tsc) {
+    std::cerr << "BA fields on several ranks: only the canonical TSC deposit on a uniform mesh" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  const int n1 = pm->mesh_indcs.nx1, n2 = pm->mesh_indcs.nx2;
+  const Real gx1 = pm->mesh_size.x1min, gx2 = pm->mesh_size.x2min;
+  const Real h1 = (pm->mesh_size.x1max - gx1)/n1, h2 = (pm->mesh_size.x2max - gx2)/n2;
+  const std::size_t ncell = static_cast<std::size_t>(n1)*n2;
+  DvceArray3D<Real> g0("ba_g0", 4, n2, n1), g1("ba_g1", 3, n2, n1);
+  Kokkos::deep_copy(DevExeSpace(), g0, 0.0);
+  Kokkos::deep_copy(DevExeSpace(), g1, 0.0);
+  const Real inv_area = 1.0/(h1*h2);
+  for (int pass=0; pass<2; ++pass) {
+    par_for("ba_fields_global", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
+      const Real mass = pr(IPM,p);
+      const Real v[3] = {pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p)};
+      const Real q1 = (pr(IPX,p) - gx1)/h1 - 0.5, q2 = (pr(IPY,p) - gx2)/h2 - 0.5;
+      const int c1 = static_cast<int>(floor(q1 + 0.5)), c2 = static_cast<int>(floor(q2 + 0.5));
+      const Real d1 = q1 - c1, d2 = q2 - c2;
+      const Real w1[3] = {0.5*SQR(0.5-d1), 0.75-d1*d1, 0.5*SQR(0.5+d1)};
+      const Real w2[3] = {0.5*SQR(0.5-d2), 0.75-d2*d2, 0.5*SQR(0.5+d2)};
+      for (int b=0; b<3; ++b) {
+        const int jj = ((c2 + b - 1) % n2 + n2) % n2;
+        for (int a=0; a<3; ++a) {
+          const int ii = ((c1 + a - 1) % n1 + n1) % n1;
+          const Real d = mass*w1[a]*w2[b]*inv_area;
+          if (pass == 0) {
+            dust::DepositAdd(&g0(0,jj,ii), d);
+            for (int c=0; c<3; ++c) dust::DepositAdd(&g0(1+c,jj,ii), d*v[c]);
+          } else {
+            const Real rho = g0(0,jj,ii);
+            for (int c=0; c<3; ++c) {
+              const Real dv = v[c] - g0(1+c,jj,ii)/rho;
+              dust::DepositAdd(&g1(c,jj,ii), d*dv*dv);
+            }
+          }
+        }
+      }
+    });
+    if (pass == 0) {   // the mass and momentum of all ranks, on every rank
+      auto h0 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), g0);
+      MPI_Allreduce(MPI_IN_PLACE, h0.data(), static_cast<int>(4*ncell), MPI_ATHENA_REAL, MPI_SUM,
+                    MPI_COMM_WORLD);
+      Kokkos::deep_copy(g0, h0);
+    }
+  }
+  auto h0 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), g0);
+  auto h1v = Kokkos::create_mirror_view_and_copy(HostMemSpace(), g1);
+  const bool root = global_variable::my_rank == 0;
+  MPI_Reduce(root ? MPI_IN_PLACE : h1v.data(), h1v.data(), static_cast<int>(3*ncell), MPI_ATHENA_REAL,
+             MPI_SUM, 0, MPI_COMM_WORLD);
+  // the gas of every block in the global grid (zero elsewhere), summed on rank 0
+  std::vector<double> gas(4*ncell, 0.0);
+  auto u0 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pack->phydro->u0);
+  for (int m=0; m<nmb; ++m) {
+    const auto &size = mbsize.h_view(m);
+    const int i0 = static_cast<int>(std::lround((size.x1min - gx1)/h1));
+    const int j0 = static_cast<int>(std::lround((size.x2min - gx2)/h2));
+    for (int j=0; j<nx2; ++j)
+      for (int i=0; i<nx1; ++i) {
+        const std::size_t k = static_cast<std::size_t>(j0 + j)*n1 + i0 + i;
+        gas[k] = u0(m,IDN,ks,js+j,is+i); gas[ncell + k] = u0(m,IM1,ks,js+j,is+i);
+        gas[2*ncell + k] = u0(m,IM2,ks,js+j,is+i); gas[3*ncell + k] = u0(m,IM3,ks,js+j,is+i);
+      }
+  }
+  MPI_Reduce(root ? MPI_IN_PLACE : gas.data(), gas.data(), static_cast<int>(4*ncell), MPI_DOUBLE, MPI_SUM,
+             0, MPI_COMM_WORLD);
+  auto prh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
+  double mtot = 0.0;
+  long long ntot = npart;
+  for (int p=0; p<npart; ++p) mtot += prh(IPM,p);
+  MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &ntot, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  double mdep = 0.0;
+  for (std::size_t k=0; k<ncell; ++k) mdep += h0(0, k/n1, k%n1)*h1*h2;
+  if (std::fabs(mdep - mtot) > 1.0e-8*mtot) {
+    if (root) std::fprintf(stderr, "BA fields: deposited mass %.17g != particle mass %.17g\n", mdep, mtot);
+    std::exit(EXIT_FAILURE);
+  }
+  if (ba_ppdf_) {
+    const int nr1 = ba_ppdf_nref_;
+    const double lx = pm->mesh_size.x1max - gx1, ly = pm->mesh_size.x2max - gx2;
+    const int nr2 = static_cast<int>(std::lround(nr1*ly/lx));
+    if (n1 % nr1 != 0) {
+      std::cerr << "BA particle distribution: ba_ppdf_nref must divide the root grid" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const double hr1 = lx/nr1, hr2 = ly/nr2;
+    std::vector<std::vector<double>> grid(1, std::vector<double>(ncell));
+    std::vector<signed char> lmap(ncell, 0);
+    std::vector<double> ref(static_cast<std::size_t>(nr1)*nr2, 0.0);
+    for (int j=0; j<n2; ++j)
+      for (int i=0; i<n1; ++i) {
+        const double rho = h0(0,j,i);
+        grid[0][static_cast<std::size_t>(j)*n1 + i] = rho;
+        const int ir = std::min(nr1 - 1, static_cast<int>((i + 0.5)*h1/hr1));
+        const int jr = std::min(nr2 - 1, static_cast<int>((j + 0.5)*h2/hr2));
+        ref[static_cast<std::size_t>(jr)*nr1 + ir] += rho*h1*h2/(hr1*hr2);
+      }
+    FinishBAParticlePDF(pm, grid, lmap, 0, ref, nr1, nr2, prh, npart, mtot);
+  }
+  const int number = ba_field_number_++;
+  if (ba_pin_ != nullptr) ba_pin_->SetInteger("problem", "rst_ba_field_number", ba_field_number_);
+  if (!ba_fields_write_ || !root) return;
+  auto write = [](const std::string &name, const std::string &header, const void *data,
+                  std::size_t size, std::size_t count) {
+    FILE *file = std::fopen(name.c_str(), "wb");
+    bool ok = (file != nullptr) && std::fputs(header.c_str(), file) >= 0;
+    ok = ok && std::fwrite(data, size, count, file) == count;
+    ok = (file != nullptr) && (std::fclose(file) == 0) && ok;
+    if (!ok) {
+      std::cerr << "Failed writing BA field file " << name << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  };
+  char line[160];
+  if (!ba_geom_written_) {   // a uniform mesh: once
+    std::vector<double> geom;
+    geom.reserve(4*ncell);
+    for (int j=0; j<n2; ++j)
+      for (int i=0; i<n1; ++i) geom.insert(geom.end(), {gx1 + (i + 0.5)*h1, gx2 + (j + 0.5)*h2, h1, h2});
+    std::snprintf(line, sizeof(line), "AthenaK BA field geometry v1 f64\n%zu\n", ncell);
+    write(ba_snapshot_basename_ + ".bafield.geom", line, geom.data(), sizeof(double), geom.size());
+    ba_geom_written_ = true;
+  }
+  std::vector<float> out;
+  out.reserve(static_cast<std::size_t>(kBAFields)*ncell);
+  for (int j=0; j<n2; ++j)
+    for (int i=0; i<n1; ++i) {
+      const std::size_t k = static_cast<std::size_t>(j)*n1 + i;
+      out.insert(out.end(), {static_cast<float>(gas[k]), static_cast<float>(gas[ncell + k]),
+                             static_cast<float>(gas[2*ncell + k]), static_cast<float>(gas[3*ncell + k])});
+      for (int c=0; c<4; ++c) out.push_back(static_cast<float>(h0(c,j,i)));
+      for (int c=0; c<3; ++c) out.push_back(static_cast<float>(h1v(c,j,i)));
+    }
+  std::snprintf(line, sizeof(line), "AthenaK BA fields v1 f32\n%.17g %d %zu %d %.17g %lld\n",
+                pm->time, pm->ncycle, ncell, kBAFields, mtot, ntot);
+  char name[32];
+  std::snprintf(name, sizeof(name), ".%05d.baf", number);
+  write(ba_snapshot_basename_ + name, line, out.data(), sizeof(float), out.size());
+#else
+  (void)pm;
+#endif
 }
 
 // Diagnostic only: compact per-leaf field snapshot.  Gas density and
@@ -329,6 +519,7 @@ void WriteBAParticlePDF(Mesh *pm, const FieldHost &fh, const PrtclHost &prh, con
 // composite-transfer cloud weights, or canonical TSC on a uniform periodic mesh.
 // Geometry (x, z, dx, dz per active leaf, f64) is written once; fields are f32.
 void WriteBAFields(Mesh *pm) {
+  if (global_variable::nranks > 1 || ba_fields_global_test_) {WriteBAFieldsGlobal(pm); return;}
   auto *pack = pm->pmb_pack;
   auto *pdust = pack->pdust;
   auto &ind = pm->mb_indcs;
@@ -438,9 +629,8 @@ void WriteBAFields(Mesh *pm) {
       }
     }
   }
-  if (std::fabs(mdep - mtot) > 1.0e-10*mtot) {
-    std::cerr << "BA fields: deposited mass " << mdep << " != particle mass " << mtot
-              << std::endl;
+  if (std::fabs(mdep - mtot) > 1.0e-8*mtot) {   // rounding of ~1e7 particles on ~4e6 cells (U2048)
+    std::fprintf(stderr, "BA fields: deposited mass %.17g != particle mass %.17g\n", mdep, mtot);
     std::exit(EXIT_FAILURE);
   }
   if (ba_ppdf_) WriteBAParticlePDF(pm, fh, prh, npart, mtot);
@@ -635,6 +825,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   ba_fields_ = pin->GetOrAddBoolean("problem", "ba_fields", false);
   ba_ppdf_ = pin->GetOrAddBoolean("problem", "ba_ppdf", false);
   ba_fields_write_ = pin->GetOrAddBoolean("problem", "ba_fields_write", true);
+  ba_fields_global_test_ = pin->GetOrAddBoolean("problem", "ba_fields_global_test", false);
   ba_ppdf_nref_ = pin->GetOrAddInteger("problem", "ba_ppdf_nref", 128);
   if (ba_ppdf_ && !ba_fields_) {
     std::cerr << "ba_ppdf is written with the BA field snapshots: set ba_fields = true"
@@ -642,8 +833,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     std::exit(EXIT_FAILURE);
   }
   ba_history_ = pin->GetOrAddBoolean("problem", "ba_history", false);
+  // several ranks: fields of the canonical TSC deposit on a uniform mesh (WriteBAFieldsGlobal)
+  const bool fields_mpi = dust_active && !pmy_mesh_->multilevel &&
+      pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none && !ba_history_;
   if (ba_fields_ || ba_history_) {
-    if (global_variable::nranks != 1 || !dust_active || pmy_mesh_->three_d ||
+    if ((global_variable::nranks != 1 && !fields_mpi) || !dust_active || pmy_mesh_->three_d ||
         !pin->GetOrAddBoolean("problem", "user_hist", false)) {
       std::cerr << "BA fields/history require 2-D dust, one MPI rank and user_hist=true"
                 << std::endl;
