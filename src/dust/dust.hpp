@@ -1343,6 +1343,17 @@ void ForEachCompositeWeight(const SMRCompositeTransfer &t, const LeafTraversal &
 //! \struct DustGasDragTaskIDs
 //  \brief container to hold TaskIDs of all dust+hydro tasks
 
+// the known velocity field of <dust>/test_ustar_linear: each component linear in x1 and x2
+struct UstarLinearField {
+  Real x0 = 0.0, y0 = 0.0, lx = 1.0, ly = 1.0;
+  KOKKOS_INLINE_FUNCTION Real A(const int c) const {return (c == 0) ? 0.1 : ((c == 1) ? -0.2 : 0.05);}
+  KOKKOS_INLINE_FUNCTION Real Bx(const int c) const {return ((c == 0) ? 0.3 : ((c == 1) ? -0.7 : 0.2))/lx;}
+  KOKKOS_INLINE_FUNCTION Real By(const int c) const {return ((c == 0) ? -0.4 : ((c == 1) ? 0.25 : 0.6))/ly;}
+  KOKKOS_INLINE_FUNCTION Real Value(const int c, const Real x, const Real y) const {
+    return A(c) + Bx(c)*(x - x0) + By(c)*(y - y0);
+  }
+};
+
 struct DustGasDragTaskIDs {
   // "before_timeintegrator" tasks
   TaskID gswitch, cloud;
@@ -1811,6 +1822,12 @@ class DustGasDrag {
   // multi-rank refinable clouds (<dust>/experimental_mpi): the gid of every block
   // slot of the leaf traversal, the halo lists and the exchanges (dust_halo.cpp)
   bool experimental_mpi = false;
+  // test (Codex review): u* set to a known linear field before its ghost
+  // exchange; the packed gather field on the leaf cells and every cloud's linear gather are compared
+  // with the exact values (CheckUstarLinear).  skip_exchange (negative control, one rank): no u*
+  // ghost exchange
+  bool test_ustar_linear = false, test_ustar_skip_exchange = false;
+  void CheckUstarLinear(const int stage);
   std::vector<int> leaf_slot_gid;
   DvceArray1D<int> leaf_slot_gid_d, leaf_slot_rank_d;   // gid and rank of every block slot
   DustHalo halo_;

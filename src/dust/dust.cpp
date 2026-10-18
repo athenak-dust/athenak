@@ -93,6 +93,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // <dust>/experimental_mpi: refinable clouds on several MPI ranks with the dust
   // halo (dust_halo.cpp); the supported options in CheckMultiRank
   experimental_mpi = pin->GetOrAddBoolean("dust", "experimental_mpi", false);
+  test_ustar_linear = pin->GetOrAddBoolean("dust", "test_ustar_linear", false);
+  test_ustar_skip_exchange = pin->GetOrAddBoolean("dust", "test_ustar_skip_exchange", false);
   if (pmy_pack->pmesh->multilevel) {
     bool experimental_smr = pin->GetOrAddBoolean(
         "dust", "experimental_static_smr", false);
