@@ -175,35 +175,6 @@ int LowerBound(const int *v, const int n, const int x) {
   return lo;
 }
 
-// (value, index) of the first maximum, for one team reduction instead of a maximum
-// and then the smallest index holding it; ties keep the smaller index, as the host's strict
-// comparisons do
-struct FirstMaxVal {
-  double val;
-  int idx;
-};
-struct FirstMax {
-  using reducer = FirstMax;
-  using value_type = FirstMaxVal;
-  using result_view_type = Kokkos::View<value_type, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>;
-  value_type &value;
-  KOKKOS_INLINE_FUNCTION explicit FirstMax(value_type &v) : value(v) {}
-  KOKKOS_INLINE_FUNCTION void join(value_type &dest, const value_type &src) const {
-    if (src.val > dest.val || (src.val == dest.val && src.idx < dest.idx)) dest = src;
-  }
-  KOKKOS_INLINE_FUNCTION void init(value_type &v) const {
-    v.val = Kokkos::reduction_identity<double>::max();   // the lowest double, as Max<double>
-    v.idx = Kokkos::reduction_identity<int>::min();      // the largest int, as Min<int>
-  }
-  KOKKOS_INLINE_FUNCTION value_type &reference() const {return value;}
-  KOKKOS_INLINE_FUNCTION result_view_type view() const {return result_view_type(&value);}
-  KOKKOS_INLINE_FUNCTION bool references_scalar() const {return true;}
-};
-// the Householder reflector of one QR step, formed by one thread and broadcast
-struct HouseholderStep {
-  double tau, sc, beta;
-};
-
 // Householder QR with column pivoting of the m x n matrix a, stored by rows (a[i*n + j]) so
 // that the threads of a team, one per column, read consecutive addresses: a P = Q R; the
 // numerical rank.  Every thread runs the host PivotedQR loops of its column in the host order.
@@ -221,14 +192,15 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
   const double tol3z = 1.4901161193847656e-08;   // sqrt(DBL_EPSILON)
   double first = 0.0;
   for (int k=0; k<kmax; ++k) {
-    // the host keeps the first column of largest norm: one team reduction of (norm, index)
-    // (before: the maximum, then the smallest index holding it)
-    FirstMaxVal fv;
-    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, k, n), [&](const int j, FirstMaxVal &v) {
-      if (vn1[j] > v.val || (vn1[j] == v.val && j < v.idx)) {v.val = vn1[j]; v.idx = j;}
-    }, FirstMax(fv));
-    const double vmax = fv.val;
-    int p = (fv.idx < n) ? fv.idx : n;
+    // the host keeps the first column of largest norm
+    double vmax = 0.0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, k, n), [&](const int j, double &v) {
+      if (vn1[j] > v) v = vn1[j];
+    }, Kokkos::Max<double>(vmax));
+    int p = n;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, k, n), [&](const int j, int &v) {
+      if (vn1[j] == vmax && j < v) v = j;
+    }, Kokkos::Min<int>(p));
     // the pivot norm from the team reduction (bitwise vn1[p]), not from vn1: the leader may
     // already be swapping vn1[p] and vn1[k] below while a thread reads it
     const double vp = (p < n) ? vmax : vn1[k];
@@ -251,44 +223,42 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
       tm.team_barrier();
     }
     // Householder vector of column k (entries a[i*n + k], i >= k)
-    double tau = 0.0, sc = 0.0;
+    double tau = 0.0, sc = 0.0, beta = 0.0;
     // the norm below the diagonal by a team sum (the host sums serially: round-off order differs)
     double xsq = 0.0;
     Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, k + 1, m), [&](const int i, double &v) {
       const double vi = a[static_cast<std::size_t>(i)*n + k];
       v += vi*vi;
     }, xsq);
-    // tau, the scale and beta from one thread in one broadcast; R's diagonal is
-    // written at once, and the vector below it stays unscaled: the update multiplies by the scale
-    // on the fly (the same rounded products as the stored scaled vector), and only the upper
-    // triangle is read after the factorization
-    HouseholderStep hh;
-    Kokkos::single(Kokkos::PerTeam(tm), [&](HouseholderStep &hv) {
+    Kokkos::single(Kokkos::PerTeam(tm), [&](double &tv) {
       const double xnorm = Kokkos::sqrt(xsq);
-      hv.tau = 0.0; hv.sc = 0.0; hv.beta = 0.0;
+      tv = 0.0;
       if (xnorm > 0.0) {
         const double alpha = a[static_cast<std::size_t>(k)*n + k];
         const double bt = -Kokkos::copysign(Kokkos::hypot(alpha, xnorm), alpha);
-        hv.tau = (bt - alpha)/bt;
-        hv.sc = 1.0/(alpha - bt);
-        hv.beta = bt;
-        a[static_cast<std::size_t>(k)*n + k] = bt;
+        tv = (bt - alpha)/bt;
+        a[static_cast<std::size_t>(k)*n + k] = 1.0/(alpha - bt);   // the scale, for a moment
+        vn2[n + 0] = bt;                                           // scratch slot past the norms
       }
-    }, hh);
-    tau = hh.tau; sc = hh.sc;
+    }, tau);
+    tm.team_barrier();
+    if (tau != 0.0) {
+      sc = a[static_cast<std::size_t>(k)*n + k];
+      beta = vn2[n + 0];
+      Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, k + 1, m), [&](const int i) {
+        a[static_cast<std::size_t>(i)*n + k] *= sc;
+      });
+      tm.team_barrier();
+      Kokkos::single(Kokkos::PerTeam(tm), [&]() {a[static_cast<std::size_t>(k)*n + k] = beta;});
+      tm.team_barrier();
+    }
     Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, k + 1, n), [&](const int j) {
       if (tau != 0.0) {
         double s = a[static_cast<std::size_t>(k)*n + j];
-        for (int i=k+1; i<m; ++i) {
-          const double v = a[static_cast<std::size_t>(i)*n + k]*sc;
-          s += v*a[static_cast<std::size_t>(i)*n + j];
-        }
+        for (int i=k+1; i<m; ++i) s += a[static_cast<std::size_t>(i)*n + k]*a[static_cast<std::size_t>(i)*n + j];
         s *= tau;
         a[static_cast<std::size_t>(k)*n + j] -= s;
-        for (int i=k+1; i<m; ++i) {
-          const double v = a[static_cast<std::size_t>(i)*n + k]*sc;
-          a[static_cast<std::size_t>(i)*n + j] -= s*v;
-        }
+        for (int i=k+1; i<m; ++i) a[static_cast<std::size_t>(i)*n + j] -= s*a[static_cast<std::size_t>(i)*n + k];
       }
       if (vn1[j] != 0.0) {
         double t = Kokkos::fabs(a[static_cast<std::size_t>(k)*n + j])/vn1[j];
@@ -401,70 +371,75 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
       tm.team_barrier();
     };
     steps(0, nc);
-    // The at most 2 nc candidates are read by every thread itself (no team
-    // reductions): any step to zero, then the best (sign, vector), the host's argmax over the
-    // order index o = sg nc + c with the first maximum winning
     int anyzero = 0;
-    for (int e=0; e<2*nc; ++e) anyzero += ws.zr[e];
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, 2*nc), [&](const int e, int &v) {
+      v += ws.zr[e];
+    }, anyzero);
     if (!anyzero && ncol > nc) {
       steps(nc, ncol);
       nc = ncol;
       Kokkos::single(Kokkos::PerTeam(tm), [&]() {++ws.cnt[2];});
     }
-    double best = Kokkos::reduction_identity<double>::max();
-    int ob = 2*nc;
-    for (int o=0; o<2*nc; ++o) {
+    // the best (sign, vector): the host's argmax over (sign, column), minus first; order index
+    // o = sg nc + c, the first maximum wins
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, 2*nc), [&](const int o) {
       const int sg = o/nc, c = o%nc, e = 2*c + sg;
-      const double sco = !Kokkos::isfinite(ws.tt[e]) ? -1.0
-          : Kokkos::fabs(ws.z[static_cast<std::size_t>(ws.kk[e])*ld + c])/ws.zmx[c] + 2.0*ws.zr[e];
-      if (sco > best) {best = sco; ob = o;}
-    }
+      ws.score[o] = !Kokkos::isfinite(ws.tt[e]) ? -1.0
+                  : Kokkos::fabs(ws.z[static_cast<std::size_t>(ws.kk[e])*ld + c])/ws.zmx[c] + 2.0*ws.zr[e];
+    });
+    tm.team_barrier();
+    double best = -1.0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, 2*nc), [&](const int o, double &v) {
+      if (ws.score[o] > v) v = ws.score[o];
+    }, Kokkos::Max<double>(best));
+    int ob = 2*nc;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, 2*nc), [&](const int o, int &v) {
+      if (ws.score[o] == best && ws.score[o] > -1.0 && o < v) v = o;
+    }, Kokkos::Min<int>(ob));
     const int code = (ob >= 2*nc || !(best > -1.0)) ? -1 : 2*(ob%nc) + ob/nc;
     if (code < 0) break;
     const int bj = code/2, bs = code%2, e = 2*bj + bs;
     const int k = ws.kk[e];
     const double step = ws.tt[e]*(bs ? 1.0 : -1.0);
     const int zero = ws.zr[e];
-    const double dk = ws.z[static_cast<std::size_t>(k)*ld + bj];   // d[k], read before any write
-    const int nc1 = ncol - 1;
-    // one pass: the moving direction d, the new masses (cloud k to zero or to its cap), and the
-    // factors of the remaining columns after the last one has moved into column bj
-    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, (n > nc1) ? n : nc1), [&](const int t) {
-      if (t < n) {
-        const double di = ws.z[static_cast<std::size_t>(t)*ld + bj];
-        ws.d[t] = di;
-        if (t == k) {
-          if (zero) {
-            w[k] = 0.0; ++ws.cnt[0];
-          } else {
-            w[k] = u[k]; fixed[k] = 1; ++ws.cnt[1];
-          }
-        } else {
-          w[t] = Kokkos::fmin(Kokkos::fmax(w[t] + step*di, 0.0), u[t]);
-        }
-      }
-      if (t < nc1) {
-        const int src = (t == bj) ? nc1 : t;
-        ws.fac[t] = ws.z[static_cast<std::size_t>(k)*ld + src]/dk;
-      }
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int i) {
+      const double di = ws.z[static_cast<std::size_t>(i)*ld + bj];
+      ws.d[i] = di;
+      w[i] = Kokkos::fmin(Kokkos::fmax(w[i] + step*di, 0.0), u[i]);
     });
     tm.team_barrier();
-    // one pass: drop column bj (the last column moves in) and remove cloud k from the others;
-    // an entry is written only by the thread that reads its source (column nc1 is not written)
-    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n*nc1), [&](const int ec) {
-      const int i = ec/nc1, c = ec%nc1;
-      const int src = (c == bj) ? nc1 : c;
-      double zic = ws.z[static_cast<std::size_t>(i)*ld + src];
-      if (i == k) {
-        zic = 0.0;
+    Kokkos::single(Kokkos::PerTeam(tm), [&]() {
+      if (zero) {
+        w[k] = 0.0; ++ws.cnt[0];
       } else {
-        const double f = ws.fac[c];
-        if (f != 0.0) zic -= f*ws.d[i];
+        w[k] = u[k]; fixed[k] = 1; ++ws.cnt[1];
       }
-      ws.z[static_cast<std::size_t>(i)*ld + c] = zic;
     });
+    // drop column bj and remove cloud k from the remaining null vectors
+    if (bj != ncol - 1) {
+      Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int i) {
+        ws.z[static_cast<std::size_t>(i)*ld + bj] = ws.z[static_cast<std::size_t>(i)*ld + ncol - 1];
+      });
+    }
     tm.team_barrier();
     --ncol;
+    const double dk = ws.d[k];
+    // the host's per-column update, entry by entry: factors first, then every (i, c) at once
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, ncol), [&](const int c) {
+      ws.fac[c] = ws.z[static_cast<std::size_t>(k)*ld + c]/dk;
+    });
+    tm.team_barrier();
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n*ncol), [&](const int ec) {
+      const int i = ec/ncol, c = ec%ncol;
+      const double f = ws.fac[c];
+      double &zic = ws.z[static_cast<std::size_t>(i)*ld + c];
+      if (i == k) {
+        zic = 0.0;
+      } else if (f != 0.0) {
+        zic -= f*ws.d[i];
+      }
+    });
+    tm.team_barrier();
   }
   if (prof) Kokkos::atomic_add(&st(3), (unsigned long long)(Clk() - c0));
 }
