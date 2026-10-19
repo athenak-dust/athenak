@@ -825,6 +825,12 @@ int DustGasDrag::ResampleClouds(const bool local) {
   }
   const bool use_mask = local;
   const int np1 = nroot1/s, np2 = nroot2/s;
+  // With cloud_resample_patch_split = N > 0 every block patch of k x k cells has one
+  // slot per cell (kc^2 slots); a patch, or a quadrant of it, whose pool (one species) holds more
+  // than N clouds is solved as its four quadrants, recursively down to single cells; each final
+  // square is one patch in the slot of its lower-left cell
+  const int psplit = bpatch ? cloud_resample_patch_split : 0;
+  const int psub = (psplit > 0) ? kc*kc : 1;
   const Real eta = cloud_resample_eta;
   const bool skip_cap = cloud_resample_skip_at_cap;
   auto t_all = Clock::now();
@@ -989,7 +995,9 @@ int DustGasDrag::ResampleClouds(const bool local) {
       // the clouds were moved to the rank of their block before (MigrateClouds)
       if (b >= nmbp_) Kokkos::abort("resampling: a cloud in a block of another rank");
       const int k = kblk(b);
-      pid(a,0) = poff(b) + (tj/k)*(bnx1/k) + ti/k;
+      int q = poff(b) + (tj/k)*(bnx1/k) + ti/k;
+      if (psub > 1) q = q*psub + (tj % k)*k + (ti % k);   // its cell in the patch
+      pid(a,0) = q;
     } else {
       const Real xw = SMRCompositeTransfer::WrapPosition(xp, transfer.x1min, transfer.x1max);
       const Real yw = SMRCompositeTransfer::WrapPosition(yp, transfer.x2min, transfer.x2max);
@@ -1007,10 +1015,54 @@ int DustGasDrag::ResampleClouds(const bool local) {
       ctgt(e) = target; cwgt(e) = w; ++e;
     });
   });
+  // Count the pool of every cell slot; per block patch and species one thread
+  // splits the squares holding more than N clouds into quadrants (down to single cells) and maps
+  // every slot to the lower-left slot of its final square (own) with the square's width there (nsz)
+  const int nbase = (bpatch ? poff_h[nmbp] : np1*np2)*nsp;   // geometric patch x species
+  const int nslot = nbase*psub;
+  DvceArray1D<int> nsz("rs_split_size", (psub > 1) ? nslot : 1);
+  int nsplit = 0;
+  if (psub > 1) {
+    DvceArray1D<int> pc("rs_split_count", nslot), own("rs_split_owner", nslot);
+    Kokkos::parallel_for("rs_split_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int a) {Kokkos::atomic_increment(&pc(pid(a,0)));});
+    const int ps = psub;
+    Kokkos::parallel_reduce("rs_split_tree", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbase),
+    KOKKOS_LAMBDA(const int i, int &ns) {
+      const int q = i/nsp, sp = i % nsp;
+      int lo = 0, hi = nmbp;   // the block of patch q
+      while (hi - lo > 1) {
+        const int mid = (lo + hi)/2;
+        if (poff(mid) <= q) lo = mid; else hi = mid;
+      }
+      const int k = kblk(lo);
+      auto idx = [&](const int x, const int y) {return (q*ps + y*k + x)*nsp + sp;};
+      int st[64][3], top = 0;   // squares to look at: lower-left cell and width
+      st[top][0] = 0; st[top][1] = 0; st[top][2] = k; ++top;
+      while (top > 0) {
+        --top;
+        const int x0 = st[top][0], y0 = st[top][1], w = st[top][2];
+        int tot = 0;
+        for (int y=y0; y<y0+w; ++y) for (int x=x0; x<x0+w; ++x) tot += pc(idx(x, y));
+        if (tot > psplit && w >= 2 && top + 4 <= 64) {
+          const int h = w/2;
+          if (w == k) ns += 1;
+          for (int c=0; c<4; ++c) {
+            st[top][0] = x0 + (c & 1)*h; st[top][1] = y0 + (c >> 1)*h; st[top][2] = h; ++top;
+          }
+        } else {
+          for (int y=y0; y<y0+w; ++y) for (int x=x0; x<x0+w; ++x) own(idx(x, y)) = idx(x0, y0);
+          nsz(idx(x0, y0)) = w;
+        }
+      }
+    }, nsplit);
+    Kokkos::parallel_for("rs_split_ids", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int a) {pid(a,0) = own(pid(a,0));});
+  }
   Kokkos::fence();
   const double t_dev = seconds(t0);
   t0 = Clock::now();
-  const int npatch = (bpatch ? poff_h[nmbp] : np1*np2)*nsp;   // geometric patch x species
+  const int npatch = nslot;   // (geometric patch x cell slot) x species
   const double lx = transfer.x1max - transfer.x1min, ly = transfer.x2max - transfer.x2min;
   // per patch: centre and length scale of the centre-of-mass rows (half the patch width; the
   // root patches keep their earlier values)
@@ -1019,7 +1071,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     const Real rx1 = root_dx1, rx2 = root_dx2;
     Kokkos::parallel_for("rs_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
     KOKKOS_LAMBDA(const int qs) {
-      const int q = qs/nsp;   // the geometric patch
+      const int g = qs/nsp, q = g/psub, c = g % psub;   // the geometric patch, cell slot
       if (bpatch) {
         int lo = 0, hi = nmbp;   // the block of patch q: poff(b) <= q < poff(b + 1)
         while (hi - lo > 1) {
@@ -1031,6 +1083,12 @@ int DustGasDrag::ResampleClouds(const bool local) {
         pgeo(qs,0) = lt.box(b,0) + (ip + 0.5)*k*d1;
         pgeo(qs,1) = lt.box(b,1) + (jp + 0.5)*k*d2;
         pgeo(qs,2) = 0.5*k*d1; pgeo(qs,3) = 0.5*k*d2;
+        if (psub > 1 && nsz(qs) > 0) {   // a final square of w cells
+          const int w = nsz(qs), x0 = c % k, y0 = c/k;
+          pgeo(qs,0) = lt.box(b,0) + (ip*k + x0 + 0.5*w)*d1;
+          pgeo(qs,1) = lt.box(b,1) + (jp*k + y0 + 0.5*w)*d2;
+          pgeo(qs,2) = 0.5*w*d1; pgeo(qs,3) = 0.5*w*d2;
+        }
       } else {
         pgeo(qs,0) = x1min + (q % np1 + 0.5)*s*rx1;
         pgeo(qs,1) = x2min + (q/np1 + 0.5)*s*rx2;
@@ -1333,7 +1391,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     std::vector<std::pair<int,int>> big;   // (clouds, patch)
     auto level_of = [&](const int qs) {
       if (!bpatch) return -1;
-      const int q = qs/nsp;
+      const int q = qs/nsp/psub;
       const int b = static_cast<int>(std::upper_bound(poff_h.begin(), poff_h.end(), q) -
                                      poff_h.begin()) - 1;
       return pmy_pack->pmb->mb_lev.h_view(b) - pmesh->root_level;
@@ -1364,13 +1422,17 @@ int DustGasDrag::ResampleClouds(const bool local) {
       if (std::ftell(fs) == 0) {
         std::fprintf(fs, "# bins: ncycle time bin level n_min patches clouds removed steps_zero "
                      "steps_cap patches_reduced n_max\n# top:  ncycle time top level n nb nrow "
-                     "removed steps_zero steps_cap scans\n");
+                     "removed steps_zero steps_cap scans\n# split: ncycle time split "
+                     "patches_split patches_whole_or_split (cloud_resample_patch_split > 0)\n");
       }
       for (const auto &kv : acc) {
         const auto &a = kv.second;
         std::fprintf(fs, "%d %.17g bin %d %d %lld %lld %lld %lld %lld %lld %lld\n", pmesh->ncycle,
                      pmesh->time, kv.first.first, bin_lo[kv.first.second], a[0], a[1], a[2], a[3],
                      a[4], a[5], a[6]);
+      }
+      if (psub > 1) {
+        std::fprintf(fs, "%d %.17g split %d %d\n", pmesh->ncycle, pmesh->time, nsplit, nbase);
       }
       for (int t=0; t<ntop; ++t) {
         const PatchInfo &f = ps[big[t].second];
