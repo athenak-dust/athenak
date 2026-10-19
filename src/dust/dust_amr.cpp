@@ -331,7 +331,9 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   const Real hx = (pm->mesh_size.x1max - x0)/nr1, hy = (pm->mesh_size.x2max - y0)/nr2;
   const Real mean = mtot/((pm->mesh_size.x1max - x0)*(pm->mesh_size.x2max - y0));
   // maximum of rho_d / mean per root cell, then widened by the buffer (periodic)
-  std::vector<Real> rmax(nr1*nr2, 0.0), wide(nr1*nr2, 0.0);
+  // (root map only; map = block uses neither, Codex review)
+  std::vector<Real> rmax(trig_.map_block ? 0 : nr1*nr2, 0.0);
+  std::vector<Real> wide(trig_.map_block ? 0 : nr1*nr2, 0.0);
   Real qmax = 0.0, mfine = 0.0, vfine = 0.0;
   if (!host_f && nmb > 0) {   // the largest value and the mass on finer blocks, on the device
     if (pdust->trig_fine.extent_int(0) != nmb) pdust->trig_fine = DvceArray1D<int>("amr_rho_fine", nmb);
@@ -362,7 +364,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
         const Real q = fh(m, js+j, is+i)/mean;
         const int ri = std::min(nr1-1, static_cast<int>((sz.x1min + (i + 0.5)*sz.dx1 - x0)/hx));
         const int rj = std::min(nr2-1, static_cast<int>((sz.x2min + (j + 0.5)*sz.dx2 - y0)/hy));
-        rmax[rj*nr1 + ri] = std::max(rmax[rj*nr1 + ri], q);
+        if (!trig_.map_block) rmax[rj*nr1 + ri] = std::max(rmax[rj*nr1 + ri], q);
         qmax = std::max(qmax, q);
         if (fine) mfine += fh(m, js+j, is+i)*sz.dx1*sz.dx2;
       }
@@ -372,7 +374,9 @@ void DensityRefinement(MeshBlockPack *pmbp) {
 #if MPI_PARALLEL_ENABLED
   // the root-cell maxima and the totals over all ranks
   if (global_variable::nranks > 1) {
-    MPI_Allreduce(MPI_IN_PLACE, rmax.data(), nr1*nr2, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+    if (!trig_.map_block) {
+      MPI_Allreduce(MPI_IN_PLACE, rmax.data(), nr1*nr2, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+    }
     MPI_Allreduce(MPI_IN_PLACE, &qmax, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
     Real fv[2] = {mfine, vfine};
     MPI_Allreduce(MPI_IN_PLACE, fv, 2, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
@@ -532,9 +536,10 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     auto box = lt.box;
     auto mbsz = mbsize;
     const int bb = trig_.buffer;
-    Kokkos::parallel_for("amr_rho_blocks", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*nslot),
-    KOKKOS_LAMBDA(const int k) {
-      const int m = k/nslot, s = k % nslot;
+    // (block, slot) as a 2-D range: nmb*nslot overflows an int on large meshes (Codex review)
+    Kokkos::parallel_for("amr_rho_blocks",
+    Kokkos::MDRangePolicy<DevExeSpace, Kokkos::Rank<2>>({0, 0}, {nmb, nslot}),
+    KOKKOS_LAMBDA(const int m, const int s) {
       const Real bdx = mbsz.d_view(m).dx1, bdy = mbsz.d_view(m).dx2;
       const Real ex0 = mbsz.d_view(m).x1min - bb*bdx, ex1 = mbsz.d_view(m).x1max + bb*bdx;
       const Real ey0 = mbsz.d_view(m).x2min - bb*bdy, ey1 = mbsz.d_view(m).x2max + bb*bdy;

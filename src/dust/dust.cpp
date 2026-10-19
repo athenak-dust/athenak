@@ -542,10 +542,15 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_resample_patch_cells = pin->GetOrAddInteger("dust", "cloud_resample_patch_cells", 4);   // cap
       // A block patch, or a quadrant of one, holding more than this many pool clouds
       // (of one species) is split into its four quadrants, recursively down to single cells;
-      // 0 = never (block patches only, cloud_resample_patch_cells <= 16).  Rixin: default 1024
-      // where allowed; 0 reproduces the results before 6f9512a9
+      // 0 = never.  Only for block patches whose widths min(cloud_resample_patch 2^level,
+      // cloud_resample_patch_cells) are powers of two (Codex review: the halving loses the
+      // odd row and column otherwise) and at most 16.  Rixin: default 1024 where allowed;
+      // 0 reproduces the results before 6f9512a9
+      auto pow2 = [](const int n) {return n >= 1 && (n & (n - 1)) == 0;};
+      const bool split_ok = cloud_resample_block_patches && cloud_resample_patch_cells <= 16 &&
+                            pow2(cloud_resample_patch) && pow2(cloud_resample_patch_cells);
       cloud_resample_patch_split = pin->GetOrAddInteger("dust", "cloud_resample_patch_split",
-          (cloud_resample_block_patches && cloud_resample_patch_cells <= 16) ? 1024 : 0);
+                                                        split_ok ? 1024 : 0);
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
       // Rixin: the per-patch solves on the device by default (same patches and algorithm;
       // false keeps the host solves); the
@@ -639,14 +644,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       if (cloud_resample && ((!cloud_resample_by_time && cloud_resample_interval < 1) ||
                              cloud_resample_patch < 1 || cloud_resample_patch_split < 0 ||
-                             (cloud_resample_patch_split > 0 && (!cloud_resample_block_patches ||
-                                                                 cloud_resample_patch_cells > 16)) ||
+                             (cloud_resample_patch_split > 0 && !split_ok) ||
                              cloud_gather_order != 2 || cloud_force_local || cloud_force_children ||
                              cloud_deform)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                   << "cloud_resample requires cloud_resample_interval >= 1, cloud_resample_patch >= 1,"
-                  << " cloud_resample_patch_split >= 0 (> 0 only with block patches of at most 16"
-                  << " cells),"
+                  << " cloud_resample_patch_split >= 0 (> 0 only with block patches whose"
+                  << " cloud_resample_patch and cloud_resample_patch_cells <= 16 are powers of two),"
                   << " cloud_gather_order = 2 and none of the force variants" << std::endl;
         std::exit(EXIT_FAILURE);
       }

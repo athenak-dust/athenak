@@ -763,6 +763,8 @@ int DustGasDrag::ResampleClouds(const bool local) {
       for (int l=0; l<lev && k < kc; ++l) k *= 2;
       k = std::min(k, kc);
       if (bnx1 % k != 0 || bnx2 % k != 0) bad = true;
+      // Codex review: the quadrant split halves the width down to one cell
+      if (cloud_resample_patch_split > 0 && (k & (k - 1)) != 0) bad = true;
       kblk_h[b] = k;
       poff_h[b + 1] = poff_h[b] + (bnx1/k)*(bnx2/k);
     }
@@ -770,7 +772,8 @@ int DustGasDrag::ResampleClouds(const bool local) {
   if (bad) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << (bpatch ? "block patches of min(cloud_resample_patch 2^level, "
-                           "cloud_resample_patch_cells) cells must divide the MeshBlock"
+                           "cloud_resample_patch_cells) cells must divide the MeshBlock (and be "
+                           "powers of two with cloud_resample_patch_split > 0)"
                          : "cloud_resample_patch must divide the root grid") << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -1024,6 +1027,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
   int nsplit = 0;
   if (psub > 1) {
     DvceArray1D<int> pc("rs_split_count", nslot), own("rs_split_owner", nslot);
+    Kokkos::deep_copy(own, -1);   // every slot that holds a cloud must be given a patch below
     Kokkos::parallel_for("rs_split_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
     KOKKOS_LAMBDA(const int a) {Kokkos::atomic_increment(&pc(pid(a,0)));});
     const int ps = psub;
@@ -1057,7 +1061,11 @@ int DustGasDrag::ResampleClouds(const bool local) {
       }
     }, nsplit);
     Kokkos::parallel_for("rs_split_ids", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int a) {pid(a,0) = own(pid(a,0));});
+    KOKKOS_LAMBDA(const int a) {
+      const int o = own(pid(a,0));
+      if (o < 0) Kokkos::abort("resampling: a cell slot without a patch");
+      pid(a,0) = o;
+    });
   }
   Kokkos::fence();
   const double t_dev = seconds(t0);
