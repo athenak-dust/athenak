@@ -624,7 +624,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       // The resampling after a regrid only on the blocks the regrid made and their
       // neighbours (the scheduled resampling stays global)
-      cloud_resample_event_local = pin->GetOrAddBoolean("dust", "cloud_resample_event_local", false);
+      // Rixin: default true (false reproduces the earlier runs).  The
+      // scheduled resampling (every cloud_resample_dt_omega) stays global, also when a regrid event
+      // falls on its cycle
+      cloud_resample_event_local = pin->GetOrAddBoolean("dust", "cloud_resample_event_local", true);
       // Rixin: a regrid event that only deleted blocks runs G but no R,
       // unless the scheduled resampling falls on that cycle
       cloud_resample_after_derefine = pin->GetOrAddBoolean("dust",

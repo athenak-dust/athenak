@@ -1828,7 +1828,8 @@ class DustGasDrag {
   int ResampleClouds(const bool local = false);   // returns the number of clouds removed;
                               // local: only clouds anchored in blocks new since the
                               // regrid and their neighbours
-  bool cloud_resample_event_local = false;   // the resampling after a regrid is local
+  bool cloud_resample_event_local = true;    // on by default: the resampling
+                                             // after a regrid is local (the scheduled one global)
   bool cloud_resample_after_derefine = false;   // R after a pure derefinement event
   bool ResampleDue();         // is a resampling due at the start of this cycle?
   void PackGatherField(const DvceArray5D<Real> &vel);   // fills gpack from a velocity array
