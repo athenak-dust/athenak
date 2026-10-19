@@ -401,9 +401,9 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
       tm.team_barrier();
     };
     steps(0, nc);
-    // Any step to zero is read by every thread itself (at most 16 flags, no team
-    // reduction); the scores are formed in parallel, then every thread takes the host's argmax
-    // over the order index o = sg nc + c (the first maximum wins) from them
+    // The at most 2 nc candidates are read by every thread itself (no team
+    // reductions): any step to zero, then the best (sign, vector), the host's argmax over the
+    // order index o = sg nc + c with the first maximum winning
     int anyzero = 0;
     for (int e=0; e<2*nc; ++e) anyzero += ws.zr[e];
     if (!anyzero && ncol > nc) {
@@ -411,16 +411,12 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
       nc = ncol;
       Kokkos::single(Kokkos::PerTeam(tm), [&]() {++ws.cnt[2];});
     }
-    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, 2*nc), [&](const int o) {
-      const int sg = o/nc, c = o%nc, e = 2*c + sg;
-      ws.score[o] = !Kokkos::isfinite(ws.tt[e]) ? -1.0
-                  : Kokkos::fabs(ws.z[static_cast<std::size_t>(ws.kk[e])*ld + c])/ws.zmx[c] + 2.0*ws.zr[e];
-    });
-    tm.team_barrier();
     double best = Kokkos::reduction_identity<double>::max();
     int ob = 2*nc;
     for (int o=0; o<2*nc; ++o) {
-      const double sco = ws.score[o];
+      const int sg = o/nc, c = o%nc, e = 2*c + sg;
+      const double sco = !Kokkos::isfinite(ws.tt[e]) ? -1.0
+          : Kokkos::fabs(ws.z[static_cast<std::size_t>(ws.kk[e])*ld + c])/ws.zmx[c] + 2.0*ws.zr[e];
       if (sco > best) {best = sco; ob = o;}
     }
     const int code = (ob >= 2*nc || !(best > -1.0)) ? -1 : 2*(ob%nc) + ob/nc;
@@ -454,20 +450,18 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
     });
     tm.team_barrier();
     // one pass: drop column bj (the last column moves in) and remove cloud k from the others;
-    // an entry is written only by the thread that reads its source (column nc1 is not written),
-    // and only when it changes (a factor 0 leaves a column in place, as before)
+    // an entry is written only by the thread that reads its source (column nc1 is not written)
     Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n*nc1), [&](const int ec) {
       const int i = ec/nc1, c = ec%nc1;
-      const double f = ws.fac[c];
-      double *zic = ws.z + static_cast<std::size_t>(i)*ld + c;
+      const int src = (c == bj) ? nc1 : c;
+      double zic = ws.z[static_cast<std::size_t>(i)*ld + src];
       if (i == k) {
-        *zic = 0.0;
-      } else if (c == bj) {
-        const double zs = ws.z[static_cast<std::size_t>(i)*ld + nc1];
-        *zic = (f != 0.0) ? zs - f*ws.d[i] : zs;
-      } else if (f != 0.0) {
-        *zic -= f*ws.d[i];
+        zic = 0.0;
+      } else {
+        const double f = ws.fac[c];
+        if (f != 0.0) zic -= f*ws.d[i];
       }
+      ws.z[static_cast<std::size_t>(i)*ld + c] = zic;
     });
     tm.team_barrier();
     --ncol;
