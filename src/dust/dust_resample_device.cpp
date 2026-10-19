@@ -17,6 +17,14 @@
 //! round-off (fused multiply-add, sqrt / hypot of the device library), which the comparison
 //! mode (<dust>/cloud_resample_compare) measures.
 //!
+//! Exception: with <dust>/cloud_resample_qr_rows = true (the default) the QR
+//! update sums each column by row chunks over the team, in another order than the host.  The
+//! device and host solves then agree only to round-off, and the end-point reduction can turn a
+//! round-off difference into another end point of the null space: the kept clouds and their
+//! masses may differ from the host's (both satisfy every constraint to round-off).  Compare
+//! with cloud_resample_compare by tolerance, or set cloud_resample_qr_rows = false to recover
+//! the host's order.
+//!
 //! Workspaces live in global memory, one per team slot, in two buckets of patch sizes (at
 //! most 64 clouds, more than 64) sized from the largest patch of the bucket; the number of
 //! slots is limited by <dust>/cloud_resample_device_mem_mb.  The per-patch sizes (clouds,
@@ -290,7 +298,9 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
       // The update with the rows shared as well.  The dot products of the
       // Householder vector with the columns k+1..n-1 by (column, row chunk) over all threads, the
       // chunk sums added in their order; the rank-one update by matrix element (consecutive
-      // threads on consecutive columns of a row).  Sums in another order than the host's.
+      // threads on consecutive columns of a row).  NOTE: the sums run in another order than the
+      // host's, so this QR (and the solve that follows) matches the host only to round-off, not
+      // bitwise; the order is fixed, so the device result is reproducible.
       const int nc = n - k - 1, nr = m - k - 1;
       if (tau != 0.0 && nc > 0) {
         const int nthr = tm.team_size();
