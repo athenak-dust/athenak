@@ -1630,6 +1630,7 @@ class DustGasDrag {
                                       //     clouds is split into quadrants, down to cells (0: never)
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
   bool cloud_resample_device = true;   // ... the patch solves on the device (default)
+  bool cloud_resample_qr_rows = false; // ... row-parallel QR update on the device
   int cloud_resample_device_mem_mb = 2048;  // ... workspace limit of the device solves
   int cloud_resample_device_mid = 0;   // ... patches of 65..mid clouds in a middle
   int cloud_resample_device_mid_team = 128;   //     bucket with teams of this many threads (0: off)

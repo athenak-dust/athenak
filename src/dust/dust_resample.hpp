@@ -47,6 +47,7 @@ struct DevicePatchProblem {
   // amr_profile only: device clock cycles of the patch solves by stage, summed over
   // the teams (kNStage entries; empty = off)
   DvceArray1D<unsigned long long> stage;
+  bool qr_rows = false;   // the QR update shares the rows as well (cloud_resample_qr_rows)
 };
 // stages: 0 rows and scaling, 1 QR, 2 null vectors, 3 end-point steps, 4 the whole stream
 // (1-3 included), 5 row check, 6 patches timed; StageTotals() sums them over the run (host)
