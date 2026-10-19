@@ -1293,9 +1293,9 @@ inline std::string RankFile(const std::string &name) {
   return (dot == std::string::npos) ? name + sfx : name.substr(0, dot) + sfx + name.substr(dot);
 }
 
-// An append-mode log file opened once per process and kept open.  Opening and
-// closing a file for every line costs milliseconds on a parallel file system (Lustre scratch:
-// about 1.5-3.5 ms; ~4200 such lines in a 290 s pilot segment); callers write and fflush
+// An append-mode log file opened once per process and kept open, instead of an
+// open and close per line (a GB200 test measured about 1 ms per open/close for the sort log; for the
+// trigger and event logs a GB200 test found no difference); callers write and fflush
 inline std::FILE *AppendLog(const std::string &name) {
   static std::map<std::string, std::FILE*> open;
   auto it = open.find(name);
