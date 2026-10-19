@@ -573,8 +573,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // the pilot segment about 3% faster than with 512; before the split 1024 was 3% slower)
       cloud_resample_device_wide_team = pin->GetOrAddInteger("dust", "cloud_resample_device_wide_team", 1024);
       // The device QR update shares the rows among the threads as well (sums in another
-      // order than the host's; false: one thread per column, the host's order)
-      cloud_resample_qr_rows = pin->GetOrAddBoolean("dust", "cloud_resample_qr_rows", false);
+      // order than the host's; false: one thread per column, the host's order).  Default true since
+      // GB200 (QR -35%, resampling -10%, no fallback)
+      cloud_resample_qr_rows = pin->GetOrAddBoolean("dust", "cloud_resample_qr_rows", true);
       // Default <256, 2> (at most 128 registers): on GB200 the two production
       // cloud kernels are 8-16% faster than without a bound (BA 128/256 and the dynamic mesh)
       cloud_launch_bounds = pin->GetOrAddInteger("dust", "cloud_launch_bounds", 1);
