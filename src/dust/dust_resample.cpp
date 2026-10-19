@@ -427,7 +427,7 @@ void DumpResampleState(particles::Particles *ppar, Mesh *pmesh, const char *when
 // one row of cloud_resample_log.txt, with the header in front of the first; written for every
 // pass, also when the pool is too small to resample
 void AppendResampleLog(const char *row) {
-  std::FILE *fp = std::fopen(RankFile("cloud_resample_log.txt").c_str(), "a");
+  std::FILE *fp = AppendLog(RankFile("cloud_resample_log.txt"));
   if (fp == nullptr) return;
   std::fseek(fp, 0, SEEK_END);
   if (std::ftell(fp) == 0) {
@@ -438,7 +438,7 @@ void AppendResampleLog(const char *row) {
                  " device t_dev_order t_dev_sizes t_dev_small t_dev_large t_dev_mid\n");
   }
   std::fputs(row, fp);
-  std::fclose(fp);
+  std::fflush(fp);
 }
 
 }  // namespace
@@ -511,7 +511,7 @@ bool DustGasDrag::ResampleDue() {
   while (nxt > cloud_resample_next + 1 && planned(nxt - 1) > t + eps(planned(nxt - 1))) --nxt;
   const long long skipped = nxt - cloud_resample_next - 1;
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = std::fopen(RankFile("cloud_resample_schedule.txt").c_str(), "a");
+    std::FILE *fp = AppendLog(RankFile("cloud_resample_schedule.txt"));
     if (fp != nullptr) {
       std::fseek(fp, 0, SEEK_END);
       if (std::ftell(fp) == 0) {
@@ -521,7 +521,7 @@ bool DustGasDrag::ResampleDue() {
       std::fprintf(fp, "%lld %.17g %d %.17g %.6e %lld %.17g %.6e %.17g %.17g\n",
                    cloud_resample_next, tk, pmesh->ncycle, t, t - tk, skipped, tprev, pmesh->dt,
                    dt, static_cast<double>(cloud_resample_omega));
-      std::fclose(fp);
+      std::fflush(fp);
     }
   }
   ++cloud_resample_events;
@@ -1416,7 +1416,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
                       [](const std::pair<int,int> &x, const std::pair<int,int> &y) {
                         return x.first > y.first || (x.first == y.first && x.second < y.second);
                       });
-    std::FILE *fs = std::fopen(RankFile("cloud_resample_patch_stats.txt").c_str(), "a");
+    std::FILE *fs = AppendLog(RankFile("cloud_resample_patch_stats.txt"));
     if (fs != nullptr) {
       std::fseek(fs, 0, SEEK_END);
       if (std::ftell(fs) == 0) {
@@ -1440,7 +1440,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
                      level_of(big[t].second), f.n, f.nb, f.nrow, f.n - f.kept, f.steps_zero,
                      f.steps_cap, f.scans);
       }
-      std::fclose(fs);
+      std::fflush(fs);
     }
   }
   ++cloud_resample_pass;

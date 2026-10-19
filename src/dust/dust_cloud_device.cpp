@@ -2899,7 +2899,7 @@ int DustGasDrag::MergeCloudsDevice() {
   cloud_far_release += nrelease;
   cloud_coarsen_dk_grad += dkh(0);
   cloud_coarsen_dk_res += dkh(1);
-  std::FILE *fp = std::fopen(RankFile("cloud_merge_log.txt").c_str(), "a");
+  std::FILE *fp = AppendLog(RankFile("cloud_merge_log.txt"));
   if (fp != nullptr) {
     std::fseek(fp, 0, SEEK_END);
     if (std::ftell(fp) == 0) {
@@ -2941,7 +2941,7 @@ int DustGasDrag::MergeCloudsDevice() {
         static_cast<unsigned long long>(ic(7)), static_cast<unsigned long long>(ic(8)),
         static_cast<unsigned long long>(ic(9)), static_cast<unsigned long long>(ic(10)));
     std::fprintf(fp, "\n");
-    std::fclose(fp);
+    std::fflush(fp);
   }
   if (audit.on) {
     audit.Add2("z_pr", ppar->prtcl_rdata, nrdata, nfinal);

@@ -677,7 +677,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   }
 #endif
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = std::fopen("dust_trigger_log.txt", "a");
+    std::FILE *fp = AppendLog("dust_trigger_log.txt");
     if (fp != nullptr) {
       std::fseek(fp, 0, SEEK_END);
       if (std::ftell(fp) == 0) {
@@ -693,7 +693,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       for (std::size_t l=0; l<perlev.size(); ++l) pl += (l ? "/" : "") + std::to_string(perlev[l]);
       std::fprintf(fp, "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d %s\n", pm->ncycle, pm->time, qmax, nblk,
                    nflag[0], nflag[1], vfine/vbox, mfine/mtot, nlev[0], nlev[1], nlev[2], pl.c_str());
-      std::fclose(fp);
+      std::fflush(fp);
     }
   }
 }
@@ -1013,7 +1013,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   }
 #endif
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = std::fopen("dust_amr_log.txt", "a");
+    std::FILE *fp = AppendLog("dust_amr_log.txt");
     if (fp != nullptr) {
       std::fseek(fp, 0, SEEK_END);
       if (std::ftell(fp) == 0) {
@@ -1022,7 +1022,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       }
       std::fprintf(fp, "%d %d %.17g %d %d %lld %.17g %.3e %.9e %llu\n", amr_regrids, pmesh->ncycle,
                    pmesh->time, nblk, nlev1, nprt, msum, dwmax, dtp, check);
-      std::fclose(fp);
+      std::fflush(fp);
     }
     std::cout << "# dust regrid " << amr_regrids << " cycle=" << pmesh->ncycle << " time="
               << pmesh->time << " blocks=" << nblk << " (above root " << nlev1 << ", created "

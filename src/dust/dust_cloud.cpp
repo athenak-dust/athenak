@@ -781,7 +781,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   }
 #endif
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = std::fopen("regrid_event_log.txt", "a");
+    std::FILE *fp = AppendLog("regrid_event_log.txt");
     if (fp != nullptr) {
       std::fseek(fp, 0, SEEK_END);
       if (std::ftell(fp) == 0) {
@@ -792,7 +792,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
       std::fprintf(fp, "%lld %d %d %.17g %d %d %s %s %d %lld %lld %lld %lld %.4e %.4e\n",
                    amr_event_handled, amr_event_regrid, pmesh->ncycle, pmesh->time, nnew, ndel,
                    kind, why, scheduled ? 1 : 0, nn[0], nn[1], nn[2], nn[3], tt[0], tt[1]);
-      std::fclose(fp);
+      std::fflush(fp);
     }
     std::cout << "# regrid event " << amr_event_handled << ": regrid "
               << amr_event_regrid << ", " << kind << " (created " << nnew << ", deleted " << ndel
@@ -2277,7 +2277,7 @@ int DustGasDrag::MergeClouds() {
   cloud_coarsen_dk_grad += dk_grad;
   cloud_coarsen_dk_res += dk_res;
   // one line per pass: counts, energy removed, conservation and the mass by cloud type
-  std::FILE *fp = std::fopen(RankFile("cloud_merge_log.txt").c_str(), "a");
+  std::FILE *fp = AppendLog(RankFile("cloud_merge_log.txt"));
   if (fp != nullptr) {
     std::fseek(fp, 0, SEEK_END);
     if (std::ftell(fp) == 0) {
@@ -2292,7 +2292,7 @@ int DustGasDrag::MergeClouds() {
                  dk_res,
                  tb[0], ta[0], tb[1], ta[1], tb[2], ta[2], tb[3], ta[3], mlev[0], mlev[1],
                  mlev[2], mlobe, nc_shift, nc_skip);
-    std::fclose(fp);
+    std::fflush(fp);
   }
   return static_cast<int>(nevents);
 }

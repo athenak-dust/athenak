@@ -1293,6 +1293,18 @@ inline std::string RankFile(const std::string &name) {
   return (dot == std::string::npos) ? name + sfx : name.substr(0, dot) + sfx + name.substr(dot);
 }
 
+// An append-mode log file opened once per process and kept open.  Opening and
+// closing a file for every line costs milliseconds on a parallel file system (Lustre scratch:
+// about 3 ms, i.e. ~25 s of a 290 s pilot segment for ~8000 lines); callers write and fflush
+inline std::FILE *AppendLog(const std::string &name) {
+  static std::map<std::string, std::FILE*> open;
+  auto it = open.find(name);
+  if (it != open.end()) return it->second;
+  std::FILE *fp = std::fopen(name.c_str(), "a");
+  if (fp != nullptr) open[name] = fp;
+  return fp;
+}
+
 //----------------------------------------------------------------------------------------
 //! \struct DustHalo
 //! The exchange lists of the dust halo (dust_halo.cpp), cell by cell.  Per
