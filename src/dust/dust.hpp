@@ -1870,13 +1870,20 @@ class DustGasDrag {
   // phases, summed over the run (rank 0's), printed as one DUST_AMR_PROFILE line at the end
   enum ProfPhase {kProfTrigger, kProfAmr, kProfRegridMesh, kProfRebuild, kProfRefineClouds, kProfSplit,
                   kProfEvent, kProfSchedR, kProfSchedG, kProfSort, kProfOrder,
-                  kProfTrigDeposit, kProfTrigCopy, kProfTrigBlocks, kProfN};   // kProfTrig*: trigger parts
+                  kProfTrigDeposit, kProfTrigCopy, kProfTrigBlocks, kProfTrigLog,
+                  kProfN};   // kProfTrig*: trigger parts
   double prof_time[kProfN] = {0.0};
   long long prof_count[kProfN] = {0};
   void CheckUstarLinear(const int stage);
   std::vector<int> leaf_slot_gid;
   DvceArray1D<int> leaf_slot_gid_d, leaf_slot_rank_d;   // gid and rank of every block slot
   DustHalo halo_;
+  // work arrays of the density trigger kept between checks (allocating and freeing
+  // device arrays in every check synchronizes the device); reallocated when a size changes
+  DvceArray2D<Real> trig_f;
+  DvceArray1D<Real> trig_q, trig_area;
+  DvceArray1D<int> trig_bad, trig_fine;
+  DvceArray2D<int> trig_rect;
   void BuildHalo(const std::vector<int> &slot_gid);
   void CheckMultiRank();
   void MigrateClouds();

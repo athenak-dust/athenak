@@ -929,7 +929,7 @@ DustGasDrag::~DustGasDrag() {
     // Rank 0's fenced phase times (s) and calls
     const char *names[kProfN] = {"trigger", "amr_total", "regrid_mesh", "regrid_dust_rebuild", "refine_clouds",
                                  "split", "regrid_event_GR", "scheduled_R", "scheduled_G", "sort", "cell_order",
-                                 "trigger_deposit", "trigger_copy", "trigger_blocks"};
+                                 "trigger_deposit", "trigger_copy", "trigger_blocks", "trigger_log"};
     std::cout << "# DUST_AMR_PROFILE";
     for (int k=0; k<kProfN; ++k) {
       std::cout << " " << names[k] << "=" << std::setprecision(6) << prof_time[k] << "(" << prof_count[k] << ")";

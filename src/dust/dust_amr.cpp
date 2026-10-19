@@ -280,7 +280,15 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   auto lt = pdust->leaf_traversal;   // the actual leaves
   // dust density on the current leaves from the particles at their new positions; several
   // ranks: leaves of the halo blocks too, added back to their owners
-  DvceArray2D<Real> f("amr_rho", 1, std::max(1, lt.nfld*ncells2*ncells1));
+  {
+    const int nf = std::max(1, lt.nfld*ncells2*ncells1);
+    if (pdust->trig_f.extent_int(1) != nf) {
+      pdust->trig_f = DvceArray2D<Real>("amr_rho", 1, nf);   // zero on allocation
+    } else {
+      Kokkos::deep_copy(pdust->trig_f, 0.0);
+    }
+  }
+  auto f = pdust->trig_f;
   par_for("amr_rho_deposit", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
     const Real mass = pr(IPM,p);
     ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
@@ -326,7 +334,8 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   std::vector<Real> rmax(nr1*nr2, 0.0), wide(nr1*nr2, 0.0);
   Real qmax = 0.0, mfine = 0.0, vfine = 0.0;
   if (!host_f && nmb > 0) {   // the largest value and the mass on finer blocks, on the device
-    DvceArray1D<int> fine_d("amr_rho_fine", nmb);
+    if (pdust->trig_fine.extent_int(0) != nmb) pdust->trig_fine = DvceArray1D<int>("amr_rho_fine", nmb);
+    auto fine_d = pdust->trig_fine;
     auto fine_h = Kokkos::create_mirror_view(fine_d);
     for (int m=0; m<nmb; ++m) fine_h(m) = (pm->lloc_eachmb[m + mbs].level > pm->root_level) ? 1 : 0;
     Kokkos::deep_copy(fine_d, fine_h);
@@ -500,14 +509,26 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   decltype(Kokkos::create_mirror_view(DvceArray1D<int>())) bd_h;
   if (dev_blocks) {
     const int nh = nslot - nmb;
-    DvceArray2D<int> rect_d("amr_rho_rect", std::max(1, nh), 4);
+    if (pdust->trig_rect.extent_int(0) != std::max(1, nh)) {
+      pdust->trig_rect = DvceArray2D<int>("amr_rho_rect", std::max(1, nh), 4);
+    }
+    auto rect_d = pdust->trig_rect;
     auto rect_h = Kokkos::create_mirror_view(rect_d);
     for (int h=0; h<nh; ++h) {
       for (int c=0; c<4; ++c) rect_h(h, c) = pdust->halo_.rect[h][c];
     }
     Kokkos::deep_copy(rect_d, rect_h);
-    DvceArray1D<Real> qd("amr_rho_q", std::max(1, nmb)), ad("amr_rho_area", std::max(1, nmb));
-    DvceArray1D<int> bd("amr_rho_bad", std::max(1, nmb));
+    if (pdust->trig_q.extent_int(0) != std::max(1, nmb)) {
+      pdust->trig_q = DvceArray1D<Real>("amr_rho_q", std::max(1, nmb));
+      pdust->trig_area = DvceArray1D<Real>("amr_rho_area", std::max(1, nmb));
+      pdust->trig_bad = DvceArray1D<int>("amr_rho_bad", std::max(1, nmb));
+    } else {
+      Kokkos::deep_copy(pdust->trig_q, 0.0);
+      Kokkos::deep_copy(pdust->trig_area, 0.0);
+      Kokkos::deep_copy(pdust->trig_bad, 0);
+    }
+    auto qd = pdust->trig_q, ad = pdust->trig_area;
+    auto bd = pdust->trig_bad;
     auto box = lt.box;
     auto mbsz = mbsize;
     const int bb = trig_.buffer;
@@ -696,6 +717,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       std::fflush(fp);
     }
   }
+  lap(DustGasDrag::kProfTrigLog);
 }
 
 //----------------------------------------------------------------------------------------
