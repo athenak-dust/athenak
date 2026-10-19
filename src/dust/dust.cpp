@@ -581,6 +581,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Default <256, 2> (at most 128 registers): on GB200 the two production
       // cloud kernels are 8-16% faster than without a bound (BA 128/256 and the dynamic mesh)
       cloud_launch_bounds = pin->GetOrAddInteger("dust", "cloud_launch_bounds", 1);
+      // Experiment: each of the two production cloud kernels as two kernels, the
+      // gather and the deposit (the deposit forms the leaf weights again), for fewer registers
+      cloud_kernel_split = pin->GetOrAddBoolean("dust", "cloud_kernel_split", false);
+      // Experiment: their leaf-weight caches in shared memory (teams of 128)
+      cloud_kernel_shared = pin->GetOrAddBoolean("dust", "cloud_kernel_shared", false);
       cloud_resample_compare = pin->GetOrAddBoolean("dust", "cloud_resample_compare", false);
       // Diagnostic: per resampling, the patches by level and size (clouds, removals,
       // steps) and the largest patches, in cloud_resample_patch_stats.txt
@@ -966,6 +971,9 @@ DustGasDrag::~DustGasDrag() {
               << " qr=" << t[1] << " null=" << t[2] << " steps=" << t[3] << " stream=" << t[4]
               << " stream_rest=" << (t[4] - t[1] - t[2] - t[3]) << " check=" << t[5]
               << " patches=" << t[6] << std::endl;
+    // The basic solution on the pivot columns
+    std::cout << "# DUST_R_BASIS (QR blocks with a null space) blocks=" << t[7] << " feasible=" << t[8]
+              << " cap_only=" << t[9] << " negative=" << t[10] << std::endl;
   }
   if (global_variable::my_rank == 0 &&
       smr_transfer_mode == DustSMRTransfer::refinable_cloud) {

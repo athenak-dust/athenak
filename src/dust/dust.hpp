@@ -1458,6 +1458,36 @@ void CloudParFor(const std::string &name, const int bounds, const int n, const F
   }
 }
 
+// Experiment (<dust>/cloud_kernel_shared): the two cloud kernels as teams of 128
+// threads with the leaf-weight cache in team scratch (shared memory) instead of per-thread local
+// arrays: entry q of thread t at q*128 + t, so that a warp touching the same entry reads
+// consecutive words.  The body is f(p, tt, tw, stride).  ord(k) for k < nidx as in
+// CloudParForOrdered (nidx = 0: identity order).
+template <typename Function>
+void CloudParForShared(const std::string &name, const int n, const DvceArray1D<int> &ord,
+                       const int nidx, const Function &f) {
+  constexpr int K = SMRCompositeTransfer::kCloudWeightCache;
+  using P = Kokkos::TeamPolicy<DevExeSpace, Kokkos::LaunchBounds<128, 4>>;
+  using SI = Kokkos::View<int*, DevExeSpace::scratch_memory_space, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  using SR = Kokkos::View<Real*, DevExeSpace::scratch_memory_space, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  // 128 threads, or fewer where the backend allows fewer (1 on Serial)
+  auto probe = KOKKOS_LAMBDA(const typename P::member_type &) {};
+  const int T = std::max(1, std::min(128, P(1, 1).team_size_max(probe, Kokkos::ParallelForTag())));
+  const int nteam = (n + T - 1)/T;
+  if (nteam == 0) return;
+  const std::size_t bytes = SI::shmem_size(K*T) + SR::shmem_size(K*T);
+  Kokkos::parallel_for(name, P(nteam, T).set_scratch_size(0, Kokkos::PerTeam(bytes)),
+  KOKKOS_LAMBDA(const typename P::member_type &tm) {
+    SR tw(tm.team_scratch(0), K*T);
+    SI tt(tm.team_scratch(0), K*T);
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, T), [&](const int t) {
+      const int k = tm.league_rank()*T + t;
+      if (k >= n) return;
+      f((k < nidx) ? ord(k) : k, tt.data() + t, tw.data() + t, T);
+    });
+  });
+}
+
 // cloud_order_interval: the same kernels over the particles in the order of an
 // index (ord(k) for k < nidx, k itself for the particles appended since the index was built)
 template <typename Function>
@@ -1636,6 +1666,9 @@ class DustGasDrag {
   int cloud_resample_device_mid = 0;   // ... patches of 65..mid clouds in a middle
   int cloud_resample_device_mid_team = 128;   //     bucket with teams of this many threads (0: off)
   int cloud_resample_device_wide_team = 512;  // ... large-bucket team (1024: a 1024-thread kernel)
+  bool cloud_kernel_split = false;    // the two cloud kernels as gather + deposit
+  bool cloud_kernel_shared = false;   // their weight caches in shared memory
+  DvceArray2D<Real> split_buf;        // ... (4, npart): the predictor's deposit values
   int cloud_launch_bounds = 1;        // launch bound of the two
                                       // production cloud kernels (CloudParFor)
   bool cloud_resample_compare = false; // ... diagnostic: host and device on the same pool, compared

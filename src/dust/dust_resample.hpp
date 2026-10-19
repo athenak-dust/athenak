@@ -50,10 +50,13 @@ struct DevicePatchProblem {
   bool qr_rows = false;   // the QR update shares the rows as well (cloud_resample_qr_rows)
 };
 // stages: 0 rows and scaling, 1 QR, 2 null vectors, 3 end-point steps, 4 the whole stream
-// (1-3 included), 5 row check, 6 patches timed; StageTotals() sums them over the run (host)
-constexpr int kNStage = 7;
+// (1-3 included), 5 row check, 6 patches timed; StageTotals() sums them over the run (host).
+// Counts, not cycles: 7 QR blocks with a null space, 8 of them whose basic solution
+// on the pivot columns (the other clouds at zero) lies within 0 <= w <= cap, 9 within the bounds
+// except above a cap, 10 with a negative mass
+constexpr int kNStage = 11;
 inline unsigned long long *StageTotals() {
-  static unsigned long long t[kNStage] = {0, 0, 0, 0, 0, 0, 0};
+  static unsigned long long t[kNStage] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   return t;
 }
 // mid > 64: patches of 65 .. mid clouds form a middle bucket solved with teams of mid_team threads

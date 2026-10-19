@@ -397,6 +397,30 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
     ws.z[static_cast<std::size_t>(ws.perm[r + c])*ld + c] = 1.0;
   });
   tm.team_barrier();
+  if (st.extent(0) > 0) {
+    // Diagnostic (with amr_profile): the basic solution that keeps the r pivot
+    // clouds and puts every other cloud of the block at zero, w_B = w_B - Z_B w_N (the null
+    // vector c moves cloud perm[r + c] alone among the others): within the bounds?
+    auto basic = [&](const int i) {
+      const int pi = ws.perm[i];
+      double v = w[pi];
+      for (int c=0; c<ncol; ++c) v -= ws.z[static_cast<std::size_t>(pi)*ld + c]*w[ws.perm[r + c]];
+      return v;
+    };
+    int nneg = 0, nover = 0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, r), [&](const int i, int &vn) {
+      if (basic(i) < -1.0e-12*u[ws.perm[i]]) ++vn;
+    }, nneg);
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, r), [&](const int i, int &vo) {
+      if (basic(i) > u[ws.perm[i]]*(1.0 + kCapTol)) ++vo;
+    }, nover);
+    if (tm.team_rank() == 0) {
+      Kokkos::atomic_add(&st(7), 1ULL);
+      if (nneg == 0 && nover == 0) Kokkos::atomic_add(&st(8), 1ULL);
+      if (nneg == 0 && nover > 0) Kokkos::atomic_add(&st(9), 1ULL);
+      if (nneg > 0) Kokkos::atomic_add(&st(10), 1ULL);
+    }
+  }
   if (prof) {const long long c1 = Clk(); Kokkos::atomic_add(&st(2), (unsigned long long)(c1 - c0)); c0 = c1;}
   while (ncol > 0) {
     int nc = (kNCand < ncol) ? kNCand : ncol;
