@@ -762,7 +762,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   const int n1 = ppar->nprtcl_thispack;
   const bool scheduled = ResampleDue();
   timer.reset();
-  const int removed = ResampleClouds();
+  const int removed = ResampleClouds(cloud_resample_event_local && !scheduled);
   Kokkos::fence();
   const double t_resample = timer.seconds();
   const int n2 = ppar->nprtcl_thispack;

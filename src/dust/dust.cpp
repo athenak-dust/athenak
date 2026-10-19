@@ -607,6 +607,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         cloud_resample_after_regrid = pin->GetOrAddBoolean("dust", "cloud_resample_after_regrid",
                                                            dflt);
       }
+      // The resampling after a regrid only on the blocks the regrid made and their
+      // neighbours (the scheduled resampling stays global)
+      cloud_resample_event_local = pin->GetOrAddBoolean("dust", "cloud_resample_event_local", false);
       // <dust>/cloud_resample_dump (diagnostic): comma-separated cycles; the
       // resampling of each of them writes the particle table right before and right after
       {

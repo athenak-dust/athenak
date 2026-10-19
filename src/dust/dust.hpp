@@ -1810,7 +1810,10 @@ class DustGasDrag {
   int MergeClouds();
   int MergeCloudsDevice();    // device version of MergeClouds
   void AuditFeedback(DvceArray2D<Real> &fb);   // frozen-gas predictor feedback
-  int ResampleClouds();       // returns the number of clouds removed
+  int ResampleClouds(const bool local = false);   // returns the number of clouds removed;
+                              // local: only clouds anchored in blocks new since the
+                              // regrid and their neighbours
+  bool cloud_resample_event_local = false;   // the resampling after a regrid is local
   bool ResampleDue();         // is a resampling due at the start of this cycle?
   void PackGatherField(const DvceArray5D<Real> &vel);   // fills gpack from a velocity array
   void PackGasGather(const DvceArray5D<Real> &u);       // ... from a conserved state

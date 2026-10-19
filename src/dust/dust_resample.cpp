@@ -34,6 +34,7 @@
 //! cloud_resample_schedule = time at the planned times t0 + k dt; see ResampleDue.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -677,7 +678,7 @@ void DustGasDrag::StressResamplePool() {
   }
 }
 
-int DustGasDrag::ResampleClouds() {
+int DustGasDrag::ResampleClouds(const bool local) {
   using Clock = std::chrono::steady_clock;
   auto seconds = [](const Clock::time_point &a) {
     return std::chrono::duration<double>(Clock::now() - a).count();
@@ -781,6 +782,47 @@ int DustGasDrag::ResampleClouds() {
     Kokkos::deep_copy(kblk, kb);
     Kokkos::deep_copy(poff, po);
   }
+  // local resampling: the blocks of this rank made by the last regrid (no cycle since their
+  // refinement) and every block of this rank whose box touches one of them (any rank, corners and
+  // periodic images included); clouds anchored elsewhere stay out of the pool
+  DvceArray1D<int> rmask("rs_mask", std::max(1, nmbp));
+  int nmask = nmbp;
+  if (local) {
+    auto pmr = pmesh->pmr;
+    const int gids0 = pmy_pack->gids, ntot = pmesh->nmb_total;
+    const Real lx = pmesh->mesh_size.x1max - pmesh->mesh_size.x1min;
+    const Real ly = pmesh->mesh_size.x2max - pmesh->mesh_size.x2min;
+    auto box = [&](const int g, Real b[4]) {
+      const auto &ll = pmesh->lloc_eachmb[g];
+      const int lev = ll.level - pmesh->root_level;
+      const Real w1 = lx/(pmesh->nmb_rootx1 << lev), w2 = ly/(pmesh->nmb_rootx2 << lev);
+      b[0] = pmesh->mesh_size.x1min + ll.lx1*w1; b[1] = b[0] + w1;
+      b[2] = pmesh->mesh_size.x2min + ll.lx2*w2; b[3] = b[2] + w2;
+    };
+    std::vector<std::array<Real, 4>> fresh;
+    for (int g=0; g<ntot; ++g) {
+      if (pmr->ncyc_since_ref(g) == 0) {Real b[4]; box(g, b); fresh.push_back({b[0], b[1], b[2], b[3]});}
+    }
+    auto mh = Kokkos::create_mirror_view(rmask);
+    nmask = 0;
+    for (int m=0; m<nmbp; ++m) {
+      Real b[4]; box(gids0 + m, b);
+      const Real e1 = 1.0e-9*(b[1] - b[0]), e2 = 1.0e-9*(b[3] - b[2]);
+      int on = 0;
+      for (const auto &f : fresh) {
+        for (int oy=-1; oy<=1 && !on; ++oy) {
+          for (int ox=-1; ox<=1 && !on; ++ox) {
+            const Real a0 = f[0] + ox*lx, a1 = f[1] + ox*lx, c0 = f[2] + oy*ly, c1 = f[3] + oy*ly;
+            if (a0 <= b[1] + e1 && b[0] <= a1 + e1 && c0 <= b[3] + e2 && b[2] <= c1 + e2) on = 1;   // touch
+          }
+        }
+        if (on) break;
+      }
+      mh(m) = on; nmask += on;
+    }
+    Kokkos::deep_copy(rmask, mh);
+  }
+  const bool use_mask = local;
   const int np1 = nroot1/s, np2 = nroot2/s;
   const Real eta = cloud_resample_eta;
   const bool skip_cap = cloud_resample_skip_at_cap;
@@ -808,6 +850,10 @@ int DustGasDrag::ResampleClouds() {
     const int code = pi(PLEV,p);
     const int lev = SMRCompositeTransfer::CloudLevel(code);
     if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) {nl += 1.0; return;}
+    if (use_mask) {   // local resampling: only clouds anchored in the marked blocks
+      const int am = lt.Anchor(pi(PGID,p));
+      if (am < 0 || am >= nmbp || rmask(am) == 0) return;
+    }
     const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
     const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
