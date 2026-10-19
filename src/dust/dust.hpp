@@ -1293,9 +1293,9 @@ inline std::string RankFile(const std::string &name) {
   return (dot == std::string::npos) ? name + sfx : name.substr(0, dot) + sfx + name.substr(dot);
 }
 
-// An append-mode log file opened once per process and kept open.  Opening and
-// closing a file for every line costs milliseconds on a parallel file system (Lustre scratch:
-// about 1.5-3.5 ms; ~4200 such lines in a 290 s pilot segment); callers write and fflush
+// An append-mode log file opened once per process and kept open; callers write and
+// call FlushLog.  On a Lustre scratch file system every flushed line cost about 1.6 ms (an
+// append to a shared file), about 4 s of a 290 s pilot segment for the trigger log alone
 inline std::FILE *AppendLog(const std::string &name) {
   static std::map<std::string, std::FILE*> open;
   auto it = open.find(name);
@@ -1303,6 +1303,17 @@ inline std::FILE *AppendLog(const std::string &name) {
   std::FILE *fp = std::fopen(name.c_str(), "a");
   if (fp != nullptr) open[name] = fp;
   return fp;
+}
+// flushes a log at most once per second (a normal exit flushes the rest; an abort may lose the
+// lines of the last second)
+inline void FlushLog(std::FILE *fp) {
+  static std::map<std::FILE*, std::chrono::steady_clock::time_point> last;
+  const auto now = std::chrono::steady_clock::now();
+  auto it = last.find(fp);
+  if (it == last.end() || now - it->second >= std::chrono::seconds(1)) {
+    std::fflush(fp);
+    last[fp] = now;
+  }
 }
 
 //----------------------------------------------------------------------------------------

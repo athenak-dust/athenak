@@ -714,7 +714,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       for (std::size_t l=0; l<perlev.size(); ++l) pl += (l ? "/" : "") + std::to_string(perlev[l]);
       std::fprintf(fp, "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d %s\n", pm->ncycle, pm->time, qmax, nblk,
                    nflag[0], nflag[1], vfine/vbox, mfine/mtot, nlev[0], nlev[1], nlev[2], pl.c_str());
-      std::fflush(fp);
+      FlushLog(fp);
     }
   }
   lap(DustGasDrag::kProfTrigLog);
@@ -1044,7 +1044,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       }
       std::fprintf(fp, "%d %d %.17g %d %d %lld %.17g %.3e %.9e %llu\n", amr_regrids, pmesh->ncycle,
                    pmesh->time, nblk, nlev1, nprt, msum, dwmax, dtp, check);
-      std::fflush(fp);
+      FlushLog(fp);
     }
     std::cout << "# dust regrid " << amr_regrids << " cycle=" << pmesh->ncycle << " time="
               << pmesh->time << " blocks=" << nblk << " (above root " << nlev1 << ", created "

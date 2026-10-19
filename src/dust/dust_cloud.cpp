@@ -792,7 +792,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
       std::fprintf(fp, "%lld %d %d %.17g %d %d %s %s %d %lld %lld %lld %lld %.4e %.4e\n",
                    amr_event_handled, amr_event_regrid, pmesh->ncycle, pmesh->time, nnew, ndel,
                    kind, why, scheduled ? 1 : 0, nn[0], nn[1], nn[2], nn[3], tt[0], tt[1]);
-      std::fflush(fp);
+      FlushLog(fp);
     }
     std::cout << "# regrid event " << amr_event_handled << ": regrid "
               << amr_event_regrid << ", " << kind << " (created " << nnew << ", deleted " << ndel
@@ -2292,7 +2292,7 @@ int DustGasDrag::MergeClouds() {
                  dk_res,
                  tb[0], ta[0], tb[1], ta[1], tb[2], ta[2], tb[3], ta[3], mlev[0], mlev[1],
                  mlev[2], mlobe, nc_shift, nc_skip);
-    std::fflush(fp);
+    FlushLog(fp);
   }
   return static_cast<int>(nevents);
 }

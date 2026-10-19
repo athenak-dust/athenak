@@ -438,7 +438,7 @@ void AppendResampleLog(const char *row) {
                  " device t_dev_order t_dev_sizes t_dev_small t_dev_large t_dev_mid\n");
   }
   std::fputs(row, fp);
-  std::fflush(fp);
+  FlushLog(fp);
 }
 
 }  // namespace
@@ -521,7 +521,7 @@ bool DustGasDrag::ResampleDue() {
       std::fprintf(fp, "%lld %.17g %d %.17g %.6e %lld %.17g %.6e %.17g %.17g\n",
                    cloud_resample_next, tk, pmesh->ncycle, t, t - tk, skipped, tprev, pmesh->dt,
                    dt, static_cast<double>(cloud_resample_omega));
-      std::fflush(fp);
+      FlushLog(fp);
     }
   }
   ++cloud_resample_events;
@@ -1440,7 +1440,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
                      level_of(big[t].second), f.n, f.nb, f.nrow, f.n - f.kept, f.steps_zero,
                      f.steps_cap, f.scans);
       }
-      std::fflush(fs);
+      FlushLog(fs);
     }
   }
   ++cloud_resample_pass;
