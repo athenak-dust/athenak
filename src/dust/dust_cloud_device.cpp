@@ -2941,7 +2941,7 @@ int DustGasDrag::MergeCloudsDevice() {
         static_cast<unsigned long long>(ic(7)), static_cast<unsigned long long>(ic(8)),
         static_cast<unsigned long long>(ic(9)), static_cast<unsigned long long>(ic(10)));
     std::fprintf(fp, "\n");
-    FlushLog(fp);
+    std::fflush(fp);
   }
   if (audit.on) {
     audit.Add2("z_pr", ppar->prtcl_rdata, nrdata, nfinal);
