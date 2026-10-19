@@ -648,6 +648,7 @@ void DustGasDrag::FrameToBlock() {
 
 TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) return TaskStatus::complete;
+  ProfTimer prof_all(prof_time[kProfRefineClouds], prof_count[kProfRefineClouds]);
   if (cloud_particle_dump >= 0 && pmy_pack->pmesh->ncycle == cloud_particle_dump) DumpParticles();
   EnsureNextTag();
   // Diagnostic: cloud_sort_at_start sorts before the split, resampling and merge
@@ -656,7 +657,10 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
       pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
     SortParticles();
   }
-  SplitAndMergeClouds();
+  {
+    ProfTimer pt(prof_time[kProfSplit], prof_count[kProfSplit]);
+    SplitAndMergeClouds();
+  }
   // the merge clock is read once per cycle (MergeDue advances it)
   const bool merge_due = cloud_merge && MergeDue() &&
       (cloud_merge_tstop < 0.0 || pmy_pack->pmesh->time < cloud_merge_tstop);
@@ -666,6 +670,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   }
   if (amr_event_pending) {
     // The cycle after a regrid: merge pass first, then one resampling
+    ProfTimer pt(prof_time[kProfEvent], prof_count[kProfEvent]);
     HandleRegridEvent(merge_due);
   } else {
     // Resampling before the merge pass, so that an audit-only pass of the same cycle
@@ -679,8 +684,14 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
       MigrateClouds();
       CheckHaloReach("split");   // R and G traverse the supports too
     }
-    if (resample_due) ResampleClouds();
-    if (merge_due) MergeClouds();
+    if (resample_due) {
+      ProfTimer pt(prof_time[kProfSchedR], prof_count[kProfSchedR]);
+      ResampleClouds();
+    }
+    if (merge_due) {
+      ProfTimer pt(prof_time[kProfSchedG], prof_count[kProfSchedG]);
+      MergeClouds();
+    }
   }
 #if MPI_PARALLEL_ENABLED
   // the counts of all ranks for the outputs (the split, R and G changed them)
@@ -703,9 +714,13 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   }
   if (!cloud_sort_at_start && cloud_sort_interval > 0 &&
       pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
+    ProfTimer pt(prof_time[kProfSort], prof_count[kProfSort]);
     SortParticles();
   }
-  if (cloud_order_interval > 0) UpdateCloudOrder();
+  if (cloud_order_interval > 0) {
+    ProfTimer pt(prof_time[kProfOrder], prof_count[kProfOrder]);
+    UpdateCloudOrder();
+  }
   return TaskStatus::complete;
 }
 

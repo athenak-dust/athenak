@@ -24,6 +24,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <chrono>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -1343,6 +1344,22 @@ void ForEachCompositeWeight(const SMRCompositeTransfer &t, const LeafTraversal &
 //! \struct DustGasDragTaskIDs
 //  \brief container to hold TaskIDs of all dust+hydro tasks
 
+// fenced timer of one phase (the kernels before are finished first; their time is not counted)
+struct ProfTimer {
+  double &acc;
+  long long &cnt;
+  std::chrono::steady_clock::time_point t0;
+  ProfTimer(double &a, long long &c) : acc(a), cnt(c) {
+    Kokkos::fence();
+    t0 = std::chrono::steady_clock::now();
+  }
+  ~ProfTimer() {
+    Kokkos::fence();
+    acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    ++cnt;
+  }
+};
+
 // the known velocity field of <dust>/test_ustar_linear: each component linear in x1 and x2
 struct UstarLinearField {
   Real x0 = 0.0, y0 = 0.0, lx = 1.0, ly = 1.0;
@@ -1830,6 +1847,12 @@ class DustGasDrag {
   // the buffer of the density trigger (amr_rho_map = block), cells of a block's level: part of the
   // reach of the halo, so that the strips hold the buffer cells (Codex review)
   int halo_trigger_cells = 0;
+  // profile: fenced wall-clock seconds and calls of the AMR and cloud-management
+  // phases, summed over the run (rank 0's), printed as one DUST_AMR_PROFILE line at the end
+  enum ProfPhase {kProfTrigger, kProfAmr, kProfRegridMesh, kProfRebuild, kProfRefineClouds, kProfSplit,
+                  kProfEvent, kProfSchedR, kProfSchedG, kProfSort, kProfOrder, kProfN};
+  double prof_time[kProfN] = {0.0};
+  long long prof_count[kProfN] = {0};
   void CheckUstarLinear(const int stage);
   std::vector<int> leaf_slot_gid;
   DvceArray1D<int> leaf_slot_gid_d, leaf_slot_rank_d;   // gid and rank of every block slot

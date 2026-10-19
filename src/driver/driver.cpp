@@ -449,7 +449,15 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       if (pmesh->pmb_pack->pdust != nullptr) pmesh->pmb_pack->pdust->amr_check_after_output = false;
 
       // AMR
-      if (pmesh->adaptive) {pmesh->pmr->AdaptiveMeshRefinement(this, pin);}
+      if (pmesh->adaptive) {
+        if (pmesh->pmb_pack->pdust != nullptr) {
+          auto *pd = pmesh->pmb_pack->pdust;
+          ProfTimer pt(pd->prof_time[pd->kProfAmr], pd->prof_count[pd->kProfAmr]);
+          pmesh->pmr->AdaptiveMeshRefinement(this, pin);
+        } else {
+          pmesh->pmr->AdaptiveMeshRefinement(this, pin);
+        }
+      }
       // compute new timestep AFTER all Meshblocks refined/derefined
       pmesh->NewTimeStep(tlim);
 

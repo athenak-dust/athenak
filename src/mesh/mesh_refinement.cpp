@@ -162,17 +162,25 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
   // Refine/derefine mesh and evolved data, set boundary conditions/timestep on new mesh
   if (nnew != 0 || ndel != 0) { // at least one (de)refinement flagged
     if (pmy_mesh->pmb_pack->pdust != nullptr) pmy_mesh->pmb_pack->pdust->BeforeRegrid(nnew, ndel);
-    RedistAndRefineMeshBlocks(pin, nnew, ndel);
+    {
+      auto *pd = pmy_mesh->pmb_pack->pdust;   // profile (the counters stay on the pack)
+      double dummy_t = 0.0; long long dummy_c = 0;
+      ProfTimer pt(pd ? pd->prof_time[pd->kProfRegridMesh] : dummy_t,
+                         pd ? pd->prof_count[pd->kProfRegridMesh] : dummy_c);
+      RedistAndRefineMeshBlocks(pin, nnew, ndel);
 
-    // Mark one mesh-topology update event (AMR and any resulting load balancing).
-    pmy_mesh->MarkMeshUpdated();
+      // Mark one mesh-topology update event (AMR and any resulting load balancing).
+      pmy_mesh->MarkMeshUpdated();
 
-    pdriver->InitBoundaryValuesAndPrimitives(pmy_mesh);
+      pdriver->InitBoundaryValuesAndPrimitives(pmy_mesh);
+    }
 
     MeshBlockPack* pmbp = pmy_mesh->pmb_pack;
     // dust on the new mesh: leaf maps, PGID, particle time step.  Done
     // here and not at the next cycle because outputs may follow the last regrid of a run.
     if (pmbp->pdust != nullptr) {
+      auto *pd = pmbp->pdust;
+      ProfTimer pt(pd->prof_time[pd->kProfRebuild], pd->prof_count[pd->kProfRebuild]);
       pmbp->pdust->RebuildAfterRegrid(pdriver, pin);
     }
     if (pmbp->phydro != nullptr) {

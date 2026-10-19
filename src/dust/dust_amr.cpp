@@ -236,6 +236,9 @@ void SetupDensityTrigger(ParameterInput *pin) {
 void DensityRefinement(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
   DustGasDrag *pdust = pmbp->pdust;
+  double dummy_t = 0.0; long long dummy_c = 0;   // for the profile timer
+  ProfTimer prof_timer(pdust ? pdust->prof_time[DustGasDrag::kProfTrigger] : dummy_t,
+                       pdust ? pdust->prof_count[DustGasDrag::kProfTrigger] : dummy_c);
   if (pdust == nullptr || !pdust->UsesCompositeTransfer() || pm->three_d) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "amr_density_trigger needs 2-D refinable-cloud dust" << std::endl;

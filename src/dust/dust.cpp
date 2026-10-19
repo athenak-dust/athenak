@@ -904,6 +904,16 @@ DustGasDrag::~DustGasDrag() {
               << " last_zeta=" << hybrid_last_zeta
               << " last_chi=" << hybrid_last_chi << std::endl;
   }
+  if (global_variable::my_rank == 0 && (prof_count[kProfAmr] > 0 || prof_count[kProfRefineClouds] > 0)) {
+    // Rank 0's fenced phase times (s) and calls
+    const char *names[kProfN] = {"trigger", "amr_total", "regrid_mesh", "regrid_dust_rebuild", "refine_clouds",
+                                 "split", "regrid_event_GR", "scheduled_R", "scheduled_G", "sort", "cell_order"};
+    std::cout << "# DUST_AMR_PROFILE";
+    for (int k=0; k<kProfN; ++k) {
+      std::cout << " " << names[k] << "=" << std::setprecision(6) << prof_time[k] << "(" << prof_count[k] << ")";
+    }
+    std::cout << std::endl;
+  }
   if (global_variable::my_rank == 0 &&
       smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
     std::cout << "# DUST_CLOUD_SUMMARY splits=" << cloud_split_count
