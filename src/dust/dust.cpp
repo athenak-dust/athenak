@@ -581,11 +581,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Default <256, 2> (at most 128 registers): on GB200 the two production
       // cloud kernels are 8-16% faster than without a bound (BA 128/256 and the dynamic mesh)
       cloud_launch_bounds = pin->GetOrAddInteger("dust", "cloud_launch_bounds", 1);
-      // Experiment: each of the two production cloud kernels as two kernels, the
-      // gather and the deposit (the deposit forms the leaf weights again), for fewer registers
-      cloud_kernel_split = pin->GetOrAddBoolean("dust", "cloud_kernel_split", false);
-      // Experiment: their leaf-weight caches in shared memory (teams of 128)
-      cloud_kernel_shared = pin->GetOrAddBoolean("dust", "cloud_kernel_shared", false);
       cloud_resample_compare = pin->GetOrAddBoolean("dust", "cloud_resample_compare", false);
       // Diagnostic: per resampling, the patches by level and size (clouds, removals,
       // steps) and the largest patches, in cloud_resample_patch_stats.txt

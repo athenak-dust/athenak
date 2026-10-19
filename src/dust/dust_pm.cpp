@@ -146,73 +146,8 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         // by five densities in each of the cloud's cells.
         PackGasGather(uold);
         auto gp = gpack;
-        if (cloud_kernel_split) {
-          // cloud_kernel_split: the gather, then the deposit with the leaf weights
-          // formed again (ForEachCloudWeight, as the general path below the cache), so that each
-          // kernel holds fewer live values
-          if (split_buf.extent_int(1) < npart) {
-            split_buf = DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing,
-                                          "dust_split_buf"), 4, npart + npart/4);
-          }
-          auto sb = split_buf;
-          auto pg_body = KOKKOS_LAMBDA(const int p) {
-            Real xp = pr(IPX,p), yp = pr(IPY,p);
-            const int am = lt.Anchor(pi(PGID,p));
-            int lev = pi(PLEV,p);
-            Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-            const int gcode = (gather_level >= 0) ? gather_level :
-                              SMRCompositeTransfer::GatherCode(lev, tmode);
-            lt.ForEachCloudMoment(xp, yp, gcode, am,
-            [&](const int target, const Real w, const Real m1x, const Real m1y) {
-              int ti = target % ncells1;
-              int remainder = target/ncells1;
-              int tj = remainder % ncells2;
-              int tm = remainder/ncells2;
-              // the leaf's block slot may be a halo block: its box from lt
-              Real dx1 = lt.box(tm,2), dx2 = lt.box(tm,3);
-              Real xc = lt.box(tm,0) + (ti - is + 0.5)*dx1;
-              Real yc = lt.box(tm,1) + (tj - js + 0.5)*dx2;
-              Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
-              Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
-              ugx += w*gp(tm,ks,tj,ti,0) + cx*gp(tm,ks,tj,ti,3) + cy*gp(tm,ks,tj,ti,6);
-              ugy += w*gp(tm,ks,tj,ti,1) + cx*gp(tm,ks,tj,ti,4) + cy*gp(tm,ks,tj,ti,7);
-              ugz += w*gp(tm,ks,tj,ti,2) + cx*gp(tm,ks,tj,ti,5) + cy*gp(tm,ks,tj,ti,8);
-            });
-            Real mass_rate = pr(IPM,p)/pr(IPTS,p);
-            sb(0,p) = -dt*mass_rate*(ugx - pr(IPVX,p));
-            sb(1,p) = -dt*mass_rate*(ugy - pr(IPVY,p));
-            sb(2,p) = -dt*mass_rate*(ugz - pr(IPVZ,p));
-            sb(3,p) = mass_rate;
-          };
-          auto pd_body = KOKKOS_LAMBDA(const int p) {
-            const Real xp = pr(IPX,p), yp = pr(IPY,p);
-            const int am = lt.Anchor(pi(PGID,p));
-            const Real gx = sb(0,p), gy = sb(1,p), gz = sb(2,p), mass_rate = sb(3,p);
-            auto add = [&](const int target, const Real w) {
-              int ti = target % ncells1;
-              int remainder = target/ncells1;
-              int tj = remainder % ncells2;
-              int tm = remainder/ncells2;
-              Real inv_volume = 1.0/(lt.box(tm,2)*lt.box(tm,3));
-              DepositAdd(&qdep_(tm,1,ks,tj,ti), inv_volume*w*gx);
-              DepositAdd(&qdep_(tm,2,ks,tj,ti), inv_volume*w*gy);
-              DepositAdd(&qdep_(tm,3,ks,tj,ti), inv_volume*w*gz);
-              DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
-            };
-            lt.ForEachCloudWeight(xp, yp, pi(PLEV,p), am, add);
-          };
-          if (cloud_ord_n > 0) {
-            CloudParForOrdered("dust_pc2_cloud_predictor_gather", cloud_launch_bounds, npart, cloud_ord,
-                               cloud_ord_n, pg_body);
-            CloudParForOrdered("dust_pc2_cloud_predictor_deposit", cloud_launch_bounds, npart, cloud_ord,
-                               cloud_ord_n, pd_body);
-          } else {
-            CloudParFor("dust_pc2_cloud_predictor_gather", cloud_launch_bounds, npart, pg_body);
-            CloudParFor("dust_pc2_cloud_predictor_deposit", cloud_launch_bounds, npart, pd_body);
-          }
-          HaloReverseAdd(qdep, 1, 4);
-          return TaskStatus::complete;
-        }
+        // (a split into gather + deposit kernels and a shared-memory weight
+        // cache were tried and removed, see CloudParFor in dust.hpp)
         auto pred_body = KOKKOS_LAMBDA(const int p) {
           Real xp = pr(IPX,p), yp = pr(IPY,p);
           const int am = lt.Anchor(pi(PGID,p));   // anchor block of the cloud
@@ -264,61 +199,6 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             lt.ForEachCloudWeight(xp, yp, lev, am, add);
           }
         };
-        auto pred_body_sh = KOKKOS_LAMBDA(const int p, int *tt, Real *tw, const int cs) {
-          Real xp = pr(IPX,p), yp = pr(IPY,p);
-          const int am = lt.Anchor(pi(PGID,p));   // anchor block of the cloud
-          int lev = pi(PLEV,p);
-          Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-          // the gather's leaf weights are the deposit's: keep them
-          int nt = 0;   // the cache in shared memory, entry q at q*cs
-          const int gcode = (gather_level >= 0) ? gather_level :
-                            SMRCompositeTransfer::GatherCode(lev, tmode);
-          // same shape for the gather and the deposit (the point flag changes moments only)
-          const bool same = (gcode & ~SMRCompositeTransfer::kCloudGatherPoint) == lev;
-          lt.ForEachCloudMoment(xp, yp, gcode, am,
-          [&](const int target, const Real w, const Real m1x, const Real m1y) {
-            int ti = target % ncells1;
-            int remainder = target/ncells1;
-            int tj = remainder % ncells2;
-            int tm = remainder/ncells2;
-            // the leaf's block slot may be a halo block: its box from lt
-            Real dx1 = lt.box(tm,2), dx2 = lt.box(tm,3);
-            Real xc = lt.box(tm,0) + (ti - is + 0.5)*dx1;
-            Real yc = lt.box(tm,1) + (tj - js + 0.5)*dx2;
-            Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
-            Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
-            ugx += w*gp(tm,ks,tj,ti,0) + cx*gp(tm,ks,tj,ti,3) + cy*gp(tm,ks,tj,ti,6);
-            ugy += w*gp(tm,ks,tj,ti,1) + cx*gp(tm,ks,tj,ti,4) + cy*gp(tm,ks,tj,ti,7);
-            ugz += w*gp(tm,ks,tj,ti,2) + cx*gp(tm,ks,tj,ti,5) + cy*gp(tm,ks,tj,ti,8);
-            if (nt < SMRCompositeTransfer::kCloudWeightCache) {tt[nt*cs] = target; tw[nt*cs] = w;}
-            ++nt;
-          });
-          Real mass_rate = pr(IPM,p)/pr(IPTS,p);
-          Real gx = -dt*mass_rate*(ugx - pr(IPVX,p));
-          Real gy = -dt*mass_rate*(ugy - pr(IPVY,p));
-          Real gz = -dt*mass_rate*(ugz - pr(IPVZ,p));
-          auto add = [&](const int target, const Real w) {
-            int ti = target % ncells1;
-            int remainder = target/ncells1;
-            int tj = remainder % ncells2;
-            int tm = remainder/ncells2;
-            Real inv_volume = 1.0/(lt.box(tm,2)*lt.box(tm,3));
-            DepositAdd(&qdep_(tm,1,ks,tj,ti), inv_volume*w*gx);
-            DepositAdd(&qdep_(tm,2,ks,tj,ti), inv_volume*w*gy);
-            DepositAdd(&qdep_(tm,3,ks,tj,ti), inv_volume*w*gz);
-            DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
-          };
-          if (same && nt <= SMRCompositeTransfer::kCloudWeightCache) {
-            for (int q=0; q<nt; ++q) if (tw[q*cs] != 0.0) add(tt[q*cs], tw[q*cs]);
-          } else {
-            lt.ForEachCloudWeight(xp, yp, lev, am, add);
-          }
-        };
-        if (cloud_kernel_shared) {
-          CloudParForShared("dust_pc2_cloud_predictor_shared", npart, cloud_ord, cloud_ord_n, pred_body_sh);
-          HaloReverseAdd(qdep, 1, 4);
-          return TaskStatus::complete;
-        }
         if (cloud_ord_n > 0) {   // in the order of the cell-sorted index
           CloudParForOrdered("dust_pc2_cloud_predictor_linear", cloud_launch_bounds, npart, cloud_ord,
                              cloud_ord_n, pred_body);
