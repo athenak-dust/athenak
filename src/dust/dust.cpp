@@ -23,6 +23,7 @@
 #include "particles/particles.hpp"
 #include "shearing_box/shearing_box.hpp"
 #include "dust.hpp"
+#include "dust_resample.hpp"
 
 namespace dust {
 //----------------------------------------------------------------------------------------
@@ -949,6 +950,14 @@ DustGasDrag::~DustGasDrag() {
       std::cout << " " << names[k] << "=" << std::setprecision(6) << prof_time[k] << "(" << prof_count[k] << ")";
     }
     std::cout << std::endl;
+  }
+  if (global_variable::my_rank == 0 && resample::StageTotals()[resample::kNStage - 1] > 0) {
+    // Device clock cycles of the patch solves by stage, summed over the teams
+    const unsigned long long *t = resample::StageTotals();
+    std::cout << "# DUST_R_STAGES (device clock cycles, summed over the teams) rows=" << t[0]
+              << " qr=" << t[1] << " null=" << t[2] << " steps=" << t[3] << " stream=" << t[4]
+              << " stream_rest=" << (t[4] - t[1] - t[2] - t[3]) << " check=" << t[5]
+              << " patches=" << t[6] << std::endl;
   }
   if (global_variable::my_rank == 0 &&
       smr_transfer_mode == DustSMRTransfer::refinable_cloud) {

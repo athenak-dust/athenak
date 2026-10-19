@@ -1196,6 +1196,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     Kokkos::sort(key);
     resample::DevicePatchProblem pb;
     pb.npool = npool; pb.npatch = npatch;
+    if (ProfOn()) pb.stage = DvceArray1D<unsigned long long>("rs_stage", resample::kNStage);
     pb.lx = lx; pb.ly = ly; pb.pgeo = pgeo;
     pb.pptr = DvceArray1D<int>("rs_pptr", npatch + 1);
     DvceArray1D<int> sorder(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_sorder"), npool);
@@ -1242,6 +1243,10 @@ int DustGasDrag::ResampleClouds(const bool local) {
                                  cloud_resample_device_mid, cloud_resample_device_mid_team,
                                  cloud_resample_device_wide_team, tim);
     dtim[1] = tim[0]; dtim[2] = tim[1]; dtim[3] = tim[2]; dtim[4] = tim[3]; dtim[5] = tim[4];
+    if (pb.stage.extent(0) > 0) {
+      auto sh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pb.stage);
+      for (int c=0; c<resample::kNStage; ++c) resample::StageTotals()[c] += sh(c);
+    }
     mdev = DvceArray1D<Real>("rs_mnew_dev", npool);
     auto mdv = mdev;
     Kokkos::parallel_for("rs_unsort", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),

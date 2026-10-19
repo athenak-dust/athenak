@@ -281,17 +281,30 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
   return kmax;
 }
 
+// The SM clock for the stage profile (0 off the device)
+KOKKOS_INLINE_FUNCTION
+long long Clk() {
+#if defined(__CUDA_ARCH__)
+  return clock64();
+#else
+  return 0;
+#endif
+}
+
 // end-point reduction of the columns b (m x n, by rows, rows scaled) with masses 0 < w <= u
 // until the moving clouds are independent (host ReduceCap); cnt[0..2] steps to zero, to the
 // cap, scans.  Null vector c is the column c of z (n x ncol0, by rows, leading dimension ncol0).
 KOKKOS_INLINE_FUNCTION
 void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, double *w,
-                   const double *u, const Ws &ws) {
+                   const double *u, const Ws &ws, const DvceArray1D<unsigned long long> &st) {
+  const bool prof = st.extent(0) > 0 && tm.team_rank() == 0;   // stage profile
   int *fixed = ws.fixed;
   Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int i) {fixed[i] = 0;});
   Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, m*n), [&](const int e) {ws.qr[e] = b[e];});
   tm.team_barrier();
+  long long c0 = prof ? Clk() : 0;
   const int r = PivotedQRTeam(tm, ws.qr, m, n, ws.perm, ws.vn1, ws.vn2);
+  if (prof) {const long long c1 = Clk(); Kokkos::atomic_add(&st(1), (unsigned long long)(c1 - c0)); c0 = c1;}
   if (r >= n) return;
   const int ld = n - r;          // leading dimension of z and xs (the initial number of vectors)
   int ncol = ld;
@@ -309,6 +322,7 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
     ws.z[static_cast<std::size_t>(ws.perm[r + c])*ld + c] = 1.0;
   });
   tm.team_barrier();
+  if (prof) {const long long c1 = Clk(); Kokkos::atomic_add(&st(2), (unsigned long long)(c1 - c0)); c0 = c1;}
   while (ncol > 0) {
     int nc = (kNCand < ncol) ? kNCand : ncol;
     // largest steps along -+ the null vectors c0..c1-1 and the largest |entry| of each vector
@@ -427,6 +441,7 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
     });
     tm.team_barrier();
   }
+  if (prof) Kokkos::atomic_add(&st(3), (unsigned long long)(Clk() - c0));
 }
 
 // one patch (host ResamplePatch): rows, bounded end-point reduction as a stream, row check.
@@ -438,6 +453,8 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
                DvceArray1D<double> &outr) {
   const int a0 = pb.pptr(q), a1 = pb.pptr(q + 1), n = a1 - a0;
   const auto &spd = pb.spd;
+  const bool prof = pb.stage.extent(0) > 0 && tm.team_rank() == 0;   // stage profile
+  const long long cstart = prof ? Clk() : 0;
   Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int j) {
     mnew(a0 + j) = spd(a0 + j, JM);
   });
@@ -512,6 +529,8 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
   tm.team_barrier();
   const int rb = (nb < n) ? nb : n;
   const int cap = (2*rb > rb + 32) ? 2*rb : rb + 32;
+  const long long cstream = prof ? Clk() : 0;
+  if (prof) {Kokkos::atomic_add(&pb.stage(0), (unsigned long long)(cstream - cstart)); Kokkos::atomic_add(&pb.stage(6), 1ULL);}
   int nact = 0, nxt = 0;
   while (true) {
     const int take = ((n - nxt) < (cap - nact)) ? (n - nxt) : (cap - nact);
@@ -533,7 +552,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
       ws.ua[i] = spd(a0 + j, JCAP);
     });
     tm.team_barrier();
-    ReduceCapTeam(tm, ws.bact, nb, na, ws.wa, ws.ua, ws);
+    ReduceCapTeam(tm, ws.bact, nb, na, ws.wa, ws.ua, ws, pb.stage);
     tm.team_barrier();
     int nleft = 0;
     Kokkos::single(Kokkos::PerTeam(tm), [&](int &v) {
@@ -553,6 +572,8 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
     tm.team_barrier();
     nact = nleft;
   }
+  const long long ccheck = prof ? Clk() : 0;
+  if (prof) Kokkos::atomic_add(&pb.stage(4), (unsigned long long)(ccheck - cstream));   // incl. 1-3
   // row check on the unscaled rows: |A w - A m| / (|A| m), host order per row
   int bad = 0;   // a sum: a Max reducer starts from the lowest int, not from 0
   Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, n), [&](const int j, int &v) {
@@ -590,6 +611,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
     outr(q) = res;
   });
   tm.team_barrier();
+  if (prof) Kokkos::atomic_add(&pb.stage(5), (unsigned long long)(Clk() - ccheck));
 }
 
 }  // namespace
