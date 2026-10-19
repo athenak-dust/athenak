@@ -739,6 +739,9 @@ struct LeafTraversal {
   bool split_everywhere = false, split_overlap = false;
   DvceArray1D<int> blev;
   DvceArray2D<int> fbox;
+  // (m) the finest level among local block m and its neighbours, i.e. among the
+  // candidates of a query that needs no global search
+  DvceArray1D<int> nbmax;
   // (m, 0..1): width of the ring around block m (finest cells, per direction) that its
   // neighbours certainly hold: the smallest neighbour extent, checked when built (0 if the
   // check fails); a query inside it needs no coverage test
@@ -1164,6 +1167,8 @@ struct LeafTraversal {
     const int r = rdil[lev + 1];
     const bool g = NeedGlobal(m, ia, ib, ja, jb, r);
     if (reach != nullptr) *reach = !g;
+    // no candidate as fine as lev + 1: Meets finds nothing
+    if (!g && m < nmb && lev + 1 > nbmax(m) && ia <= ib && ja <= jb) return false;
     return Meets(m, ia, ib, ja, jb, lev + 1, r, g);
   }
   KOKKOS_INLINE_FUNCTION
@@ -1173,6 +1178,8 @@ struct LeafTraversal {
     const int r = rdil[lev + 1];
     const bool g = NeedGlobal(m, ia, ib, ja, jb, r);
     if (reach != nullptr) *reach = !g;
+    // no candidate as fine as lev + 1: a non-empty box is not covered
+    if (!g && m < nmb && lev + 1 > nbmax(m) && ia <= ib && ja <= jb) return false;
     return Covered(m, ia, ib, ja, jb, lev + 1, r, g);
   }
   // SMRCompositeTransfer::CloudInsideFiner on the actual leaves (anchor block m)

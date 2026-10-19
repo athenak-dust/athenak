@@ -324,6 +324,15 @@ void DustGasDrag::BuildLeafTraversal() {
     }
     Kokkos::deep_copy(lt.blev, blev);
     Kokkos::deep_copy(lt.fbox, fbox);
+    // the finest level among each local block and its neighbours
+    lt.nbmax = DvceArray1D<int>("dust_leaf_nbmax", std::max(1, nmb));
+    auto nbmax = Kokkos::create_mirror_view(lt.nbmax);
+    for (int m=0; m<nmb; ++m) {
+      int mx = blev(m);
+      for (int k=0; k<nnb(m); ++k) mx = std::max(mx, blev(nb(m, k)));
+      nbmax(m) = mx;
+    }
+    Kokkos::deep_copy(lt.nbmax, nbmax);
     // the ring around each block that its neighbours certainly hold.  With s the
     // smallest neighbour extent, every s-cell of the ring (aligned with the block) touches the
     // block, so the leaf next to the block inside it is a neighbour, at least s wide and aligned:
