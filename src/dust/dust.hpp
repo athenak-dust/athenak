@@ -1356,16 +1356,24 @@ void ForEachCompositeWeight(const SMRCompositeTransfer &t, const LeafTraversal &
 //! \struct DustGasDragTaskIDs
 //  \brief container to hold TaskIDs of all dust+hydro tasks
 
+// the phase profile is on only with <dust>/amr_profile = true; off, the timers neither
+// fence nor time (every fence makes the host wait for the device, about eight per cycle)
+inline bool &ProfOn() {
+  static bool on = false;
+  return on;
+}
 // fenced timer of one phase (the kernels before are finished first; their time is not counted)
 struct ProfTimer {
   double &acc;
   long long &cnt;
   std::chrono::steady_clock::time_point t0;
   ProfTimer(double &a, long long &c) : acc(a), cnt(c) {
+    if (!ProfOn()) return;
     Kokkos::fence();
     t0 = std::chrono::steady_clock::now();
   }
   ~ProfTimer() {
+    if (!ProfOn()) return;
     Kokkos::fence();
     acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     ++cnt;

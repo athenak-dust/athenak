@@ -111,6 +111,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     // <dust>/experimental_amr (dust_amr.cpp): adaptive refinement with the
     // refinable-cloud transfer; the dust state is rebuilt after every regrid
     experimental_amr = pin->GetOrAddBoolean("dust", "experimental_amr", false);
+    // The fenced phase profile (DUST_AMR_PROFILE) only on request; its fences make the
+    // host wait for the device several times per cycle
+    ProfOn() = pin->GetOrAddBoolean("dust", "amr_profile", false);
     const bool ranks_ok = (global_variable::nranks == 1) || experimental_mpi;
     if (!(experimental_smr && (!(pmy_pack->pmesh->adaptive) || experimental_amr) &&
           pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic && ranks_ok)) {
@@ -555,7 +558,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Rixin: the per-patch solves on the device by default (same patches and algorithm;
       // false keeps the host solves); the
       // comparison runs both on the same pool and logs the differences (cloud_resample_compare.txt)
-      cloud_resample_device = pin->GetOrAddBoolean("dust", "cloud_resample_device", true);
+      // Rixin: the default follows the build: the device solver when the
+      // default execution space is not a host space (GPU builds), the threaded host solver
+      // otherwise (on a CPU build the host solver was 3.3x faster than the device code)
+      cloud_resample_device = pin->GetOrAddBoolean("dust", "cloud_resample_device",
+          !std::is_same<DevExeSpace, Kokkos::DefaultHostExecutionSpace>::value);
       cloud_resample_device_mem_mb = pin->GetOrAddInteger("dust", "cloud_resample_device_mem_mb", 2048);
       // A middle bucket (65 .. cloud_resample_device_mid clouds; 0: off) of the
       // device solves with narrower teams, several per SM

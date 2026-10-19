@@ -257,9 +257,10 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   // Fenced sub-phases (deposit with the halo sums and totals, copy to the host, the
   // per-block decisions on the host)
   using PClock = std::chrono::steady_clock;
-  Kokkos::fence();
+  if (ProfOn()) Kokkos::fence();
   auto tlap = PClock::now();
-  auto lap = [&](const int k) {
+  auto lap = [&](const int k) {   // (no fence and no time unless amr_profile)
+    if (!ProfOn()) return;
     Kokkos::fence();
     const auto now = PClock::now();
     pdust->prof_time[k] += std::chrono::duration<double>(now - tlap).count();
