@@ -249,6 +249,18 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   // push (particles moved and may have changed owner) and after a restart whose pending mesh
   // check runs before any cycle
   pdust->CheckHaloReach("density trigger");
+  // Fenced sub-phases (deposit with the halo sums and totals, copy to the host, the
+  // per-block decisions on the host)
+  using PClock = std::chrono::steady_clock;
+  Kokkos::fence();
+  auto tlap = PClock::now();
+  auto lap = [&](const int k) {
+    Kokkos::fence();
+    const auto now = PClock::now();
+    pdust->prof_time[k] += std::chrono::duration<double>(now - tlap).count();
+    ++pdust->prof_count[k];
+    tlap = now;
+  };
   particles::Particles *ppar = pmbp->ppart;
   auto &refine_flag = pm->pmr->refine_flag;
   auto &ind = pm->mb_indcs;
@@ -292,7 +304,9 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     MPI_Allreduce(MPI_IN_PLACE, nlev, 3, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
   }
 #endif
+  lap(DustGasDrag::kProfTrigDeposit);
   auto fhf = Kokkos::create_mirror_view_and_copy(HostMemSpace(), f);
+  lap(DustGasDrag::kProfTrigCopy);
   auto fh = [&](const int m, const int j, const int i) {return fhf(0, (m*ncells2 + j)*ncells1 + i);};
   const int nr1 = pm->mesh_indcs.nx1, nr2 = pm->mesh_indcs.nx2;
   const Real x0 = pm->mesh_size.x1min, y0 = pm->mesh_size.x2min;
@@ -327,7 +341,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   }
 #endif
   const int b = trig_.buffer;
-  for (int rj=0; rj<nr2; ++rj) {
+  for (int rj=0; rj<nr2 && !trig_.map_block; ++rj) {   // root map only
     for (int ri=0; ri<nr1; ++ri) {
       Real w = 0.0;
       for (int dj=-b; dj<=b; ++dj) {
@@ -345,6 +359,51 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   const Real lx = pm->mesh_size.x1max - x0, ly = pm->mesh_size.x2max - y0;
   const int nslot = lt.nfld;   // local and halo slots: the deposit f covers these
   auto boxh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), lt.box);
+  // a halo slot holds only the cells it receives (its strip, or the whole block)
+  auto SlotRect = [&](const int s, int r[4]) {
+    r[0] = 0; r[1] = nx1; r[2] = 0; r[3] = nx2;
+    if (s >= nmb) {
+      const auto &rc = pdust->halo_.rect[s - nmb];
+      r[0] = rc[0]; r[1] = rc[1]; r[2] = rc[2]; r[3] = rc[3];
+    }
+  };
+  // The slots binned by the root cells their received cells touch (generous ranges,
+  // wrapped), so that a block looks only at the slots near its widened box instead of all of
+  // them (blocks x slots x 9 images was most of the trigger's time); every slot that overlaps the
+  // widened box through some periodic image is in one of the bins the box touches
+  std::vector<int> bptr, bslot, stamp, cand;
+  auto RootRange = [&](const Real a, const Real c, const Real org, const Real h, const int n,
+                       int &k0, int &k1) {   // root cells [k0, k1] touched by [a, c], unwrapped
+    k0 = static_cast<int>(std::floor((a - org)/h - 1.0e-9));
+    k1 = static_cast<int>(std::ceil((c - org)/h + 1.0e-9)) - 1;
+    if (k1 - k0 >= n) k1 = k0 + n - 1;   // wider than the domain: every cell once
+  };
+  if (trig_.map_block) {
+    std::vector<int> cnt(nr1*nr2 + 1, 0);
+    for (int pass=0; pass<2; ++pass) {
+      if (pass == 1) {
+        bptr.assign(nr1*nr2 + 1, 0);
+        for (int c=0; c<nr1*nr2; ++c) bptr[c + 1] = bptr[c] + cnt[c];
+        bslot.assign(bptr[nr1*nr2], 0);
+        std::fill(cnt.begin(), cnt.end(), 0);
+      }
+      for (int s=0; s<nslot; ++s) {
+        int r[4]; SlotRect(s, r);
+        if (r[1] <= r[0] || r[3] <= r[2]) continue;
+        int i0, i1, j0, j1;
+        RootRange(boxh(s,0) + r[0]*boxh(s,2), boxh(s,0) + r[1]*boxh(s,2), x0, hx, nr1, i0, i1);
+        RootRange(boxh(s,1) + r[2]*boxh(s,3), boxh(s,1) + r[3]*boxh(s,3), y0, hy, nr2, j0, j1);
+        for (int j=j0; j<=j1; ++j) {
+          for (int i=i0; i<=i1; ++i) {
+            const int c = ((j % nr2 + nr2) % nr2)*nr1 + (i % nr1 + nr1) % nr1;
+            if (pass == 1) bslot[bptr[c] + cnt[c]] = s;
+            ++cnt[c];
+          }
+        }
+      }
+    }
+    stamp.assign(nslot, -1);
+  }
   auto BlockValue = [&](const int m, const Real bx0, const Real bx1, const Real by0, const Real by1,
                         const Real bdx, const Real bdy) {
     const Real ex0 = bx0 - trig_.buffer*bdx, ex1 = bx1 + trig_.buffer*bdx;
@@ -352,14 +411,26 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     const Real tol = 1.0e-9*std::min(bdx, bdy);
     Real q = 0.0, area = 0.0;
     int nbad = 0;
-    for (int s=0; s<nslot; ++s) {
-      const Real sdx = boxh(s,2), sdy = boxh(s,3);
-      // a halo slot holds only the cells it receives (its strip, or the whole block)
-      int r0 = 0, r1 = nx1, r2 = 0, r3 = nx2;
-      if (s >= nmb) {
-        const auto &rc = pdust->halo_.rect[s - nmb];
-        r0 = rc[0]; r1 = rc[1]; r2 = rc[2]; r3 = rc[3];
+    // the candidate slots: those binned in the root cells the widened box touches, each once
+    cand.clear();
+    {
+      int i0, i1, j0, j1;
+      RootRange(ex0, ex1, x0, hx, nr1, i0, i1);
+      RootRange(ey0, ey1, y0, hy, nr2, j0, j1);
+      for (int j=j0; j<=j1; ++j) {
+        for (int i=i0; i<=i1; ++i) {
+          const int c = ((j % nr2 + nr2) % nr2)*nr1 + (i % nr1 + nr1) % nr1;
+          for (int e=bptr[c]; e<bptr[c + 1]; ++e) {
+            const int s = bslot[e];
+            if (stamp[s] != m) {stamp[s] = m; cand.push_back(s);}
+          }
+        }
       }
+    }
+    for (const int s : cand) {
+      const Real sdx = boxh(s,2), sdy = boxh(s,3);
+      int rr[4]; SlotRect(s, rr);
+      const int r0 = rr[0], r1 = rr[1], r2 = rr[2], r3 = rr[3];
       for (int oy=-1; oy<=1; ++oy) {
         for (int ox=-1; ox<=1; ++ox) {
           const Real b0 = boxh(s,0) + ox*lx, d0 = boxh(s,1) + oy*ly;
@@ -424,6 +495,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     qblk[m] = q; rawf[m] = flag;
     appf[m] = (pm->pmr->ncyc_since_ref(m + mbs) < pm->pmr->refinement_interval) ? 0 : flag;
   }
+  lap(DustGasDrag::kProfTrigBlocks);
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
   // Audit: per-block lines every check; the pre-regrid state (blocks and particles)

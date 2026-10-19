@@ -1599,7 +1599,7 @@ class DustGasDrag {
   int cloud_resample_patch = 2;        // ... patch size in root cells (root patches)
   bool cloud_resample_block_patches = true;   // patches inside one MeshBlock
   int cloud_resample_patch_cells = 4;  // ... at most this many cells of the block per side
-  int cloud_resample_patch_split = 0;  // ... a patch (or quadrant) with more pool
+  int cloud_resample_patch_split = 1024;   // ... a patch (or quadrant) with more pool
                                       //     clouds is split into quadrants, down to cells (0: never)
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
   bool cloud_resample_device = true;   // ... the patch solves on the device (default)
@@ -1857,7 +1857,8 @@ class DustGasDrag {
   // profile: fenced wall-clock seconds and calls of the AMR and cloud-management
   // phases, summed over the run (rank 0's), printed as one DUST_AMR_PROFILE line at the end
   enum ProfPhase {kProfTrigger, kProfAmr, kProfRegridMesh, kProfRebuild, kProfRefineClouds, kProfSplit,
-                  kProfEvent, kProfSchedR, kProfSchedG, kProfSort, kProfOrder, kProfN};
+                  kProfEvent, kProfSchedR, kProfSchedG, kProfSort, kProfOrder,
+                  kProfTrigDeposit, kProfTrigCopy, kProfTrigBlocks, kProfN};   // kProfTrig*: trigger parts
   double prof_time[kProfN] = {0.0};
   long long prof_count[kProfN] = {0};
   void CheckUstarLinear(const int stage);

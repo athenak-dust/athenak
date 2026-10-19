@@ -542,8 +542,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_resample_patch_cells = pin->GetOrAddInteger("dust", "cloud_resample_patch_cells", 4);   // cap
       // A block patch, or a quadrant of one, holding more than this many pool clouds
       // (of one species) is split into its four quadrants, recursively down to single cells;
-      // 0 = never (block patches only, cloud_resample_patch_cells <= 16)
-      cloud_resample_patch_split = pin->GetOrAddInteger("dust", "cloud_resample_patch_split", 0);
+      // 0 = never (block patches only, cloud_resample_patch_cells <= 16).  Rixin: default 1024
+      // where allowed; 0 reproduces the results before 6f9512a9
+      cloud_resample_patch_split = pin->GetOrAddInteger("dust", "cloud_resample_patch_split",
+          (cloud_resample_block_patches && cloud_resample_patch_cells <= 16) ? 1024 : 0);
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
       // Rixin: the per-patch solves on the device by default (same patches and algorithm;
       // false keeps the host solves); the
@@ -926,7 +928,8 @@ DustGasDrag::~DustGasDrag() {
   if (global_variable::my_rank == 0 && (prof_count[kProfAmr] > 0 || prof_count[kProfRefineClouds] > 0)) {
     // Rank 0's fenced phase times (s) and calls
     const char *names[kProfN] = {"trigger", "amr_total", "regrid_mesh", "regrid_dust_rebuild", "refine_clouds",
-                                 "split", "regrid_event_GR", "scheduled_R", "scheduled_G", "sort", "cell_order"};
+                                 "split", "regrid_event_GR", "scheduled_R", "scheduled_G", "sort", "cell_order",
+                                 "trigger_deposit", "trigger_copy", "trigger_blocks"};
     std::cout << "# DUST_AMR_PROFILE";
     for (int k=0; k<kProfN; ++k) {
       std::cout << " " << names[k] << "=" << std::setprecision(6) << prof_time[k] << "(" << prof_count[k] << ")";
