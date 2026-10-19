@@ -761,8 +761,11 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   const double t_merge = timer.seconds();
   const int n1 = ppar->nprtcl_thispack;
   const bool scheduled = ResampleDue();
+  // Rixin: no extra resampling after a pure derefinement; G has run on
+  // the coarsened region, the scheduled resampling still reaches everything
+  const bool skip_r = !scheduled && nnew == 0 && ndel > 0 && !cloud_resample_after_derefine;
   timer.reset();
-  const int removed = ResampleClouds(cloud_resample_event_local && !scheduled);
+  const int removed = skip_r ? 0 : ResampleClouds(cloud_resample_event_local && !scheduled);
   Kokkos::fence();
   const double t_resample = timer.seconds();
   const int n2 = ppar->nprtcl_thispack;
@@ -795,7 +798,8 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
               << amr_event_regrid << ", " << kind << " (created " << nnew << ", deleted " << ndel
               << "), cycle " << pmesh->ncycle << ", time " << pmesh->time << ": merge pass "
               << why << ", resampling " << (scheduled ? "(the scheduled one of this cycle)"
-                                                      : "(extra)")
+                                                      : (skip_r ? "skipped (derefinement)"
+                                                                : "(extra)"))
               << " removed " << nn[3] << " of " << nn[1] << std::endl;
   }
   amr_event_pending = false;

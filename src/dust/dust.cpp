@@ -555,6 +555,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // cloud kernels are 8-16% faster than without a bound (BA 128/256 and the dynamic mesh)
       cloud_launch_bounds = pin->GetOrAddInteger("dust", "cloud_launch_bounds", 1);
       cloud_resample_compare = pin->GetOrAddBoolean("dust", "cloud_resample_compare", false);
+      // Diagnostic: per resampling, the patches by level and size (clouds, removals,
+      // steps) and the largest patches, in cloud_resample_patch_stats.txt
+      cloud_resample_patch_stats = pin->GetOrAddBoolean("dust", "cloud_resample_patch_stats",
+                                                        false);
       // Diagnostic: production feedback before / after every resampling
       cloud_resample_feedback_check = pin->GetOrAddBoolean("dust", "cloud_resample_feedback_check",
                                                            false);
@@ -610,6 +614,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // The resampling after a regrid only on the blocks the regrid made and their
       // neighbours (the scheduled resampling stays global)
       cloud_resample_event_local = pin->GetOrAddBoolean("dust", "cloud_resample_event_local", false);
+      // Rixin: a regrid event that only deleted blocks runs G but no R,
+      // unless the scheduled resampling falls on that cycle
+      cloud_resample_after_derefine = pin->GetOrAddBoolean("dust",
+                                         "cloud_resample_after_derefine", false);
       // <dust>/cloud_resample_dump (diagnostic): comma-separated cycles; the
       // resampling of each of them writes the particle table right before and right after
       {

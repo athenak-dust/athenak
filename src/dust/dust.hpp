@@ -1608,6 +1608,7 @@ class DustGasDrag {
   int cloud_launch_bounds = 1;        // launch bound of the two
                                       // production cloud kernels (CloudParFor)
   bool cloud_resample_compare = false; // ... diagnostic: host and device on the same pool, compared
+  bool cloud_resample_patch_stats = false;   // diagnostic: patches by level and size
   bool cloud_resample_feedback_check = false;   // ... diagnostic: AuditFeedback before / after
   int cloud_resample_stress = 0;       // ... diagnostic: coincident copies, every N-th
   int cloud_resample_stress_copies = 0;   //     candidate; K copies of the first one
@@ -1814,6 +1815,7 @@ class DustGasDrag {
                               // local: only clouds anchored in blocks new since the
                               // regrid and their neighbours
   bool cloud_resample_event_local = false;   // the resampling after a regrid is local
+  bool cloud_resample_after_derefine = false;   // R after a pure derefinement event
   bool ResampleDue();         // is a resampling due at the start of this cycle?
   void PackGatherField(const DvceArray5D<Real> &vel);   // fills gpack from a velocity array
   void PackGasGather(const DvceArray5D<Real> &u);       // ... from a conserved state

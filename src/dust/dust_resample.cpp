@@ -42,6 +42,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1182,7 +1183,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     // The log row's totals reduced on the device; the per-patch counters go to the
     // host only for the comparison with the host solve
     resample::SummarizePatchesDevice(outi, outr, dsum);
-    if (cloud_resample_compare) {
+    if (cloud_resample_compare || cloud_resample_patch_stats) {
       auto oi = Kokkos::create_mirror_view_and_copy(HostMemSpace(), outi);
       auto orr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), outr);
       dinfos.resize(npatch);
@@ -1323,6 +1324,63 @@ int DustGasDrag::ResampleClouds(const bool local) {
   }
   Kokkos::fence();
   const double t_back = seconds(t0);
+  if (cloud_resample_patch_stats) {
+    // Diagnostic: per level (of the patch's MeshBlock; -1 for root patches) and
+    // patch size, the patches, clouds, removals and steps; and the five largest patches
+    const std::vector<PatchInfo> &ps = cloud_resample_device ? dinfos : infos;
+    const int nbin = 4, bin_lo[4] = {1, 64, 256, 1024};
+    std::map<std::pair<int,int>, std::array<long long,7>> acc;
+    std::vector<std::pair<int,int>> big;   // (clouds, patch)
+    auto level_of = [&](const int qs) {
+      if (!bpatch) return -1;
+      const int q = qs/nsp;
+      const int b = static_cast<int>(std::upper_bound(poff_h.begin(), poff_h.end(), q) -
+                                     poff_h.begin()) - 1;
+      return pmy_pack->pmb->mb_lev.h_view(b) - pmesh->root_level;
+    };
+    for (int qs=0; qs<static_cast<int>(ps.size()); ++qs) {
+      const PatchInfo &f = ps[qs];
+      if (f.n == 0) continue;
+      int bin = 0;
+      while (bin + 1 < nbin && f.n >= bin_lo[bin + 1]) ++bin;
+      auto it = acc.find({level_of(qs), bin});
+      if (it == acc.end()) {
+        it = acc.emplace(std::make_pair(level_of(qs), bin),
+                         std::array<long long,7>{0, 0, 0, 0, 0, 0, 0}).first;
+      }
+      auto &a = it->second;
+      a[0] += 1; a[1] += f.n; a[2] += f.n - f.kept; a[3] += f.steps_zero; a[4] += f.steps_cap;
+      a[5] += (f.kept < f.n) ? 1 : 0; a[6] = std::max<long long>(a[6], f.n);
+      big.emplace_back(f.n, qs);
+    }
+    const int ntop = std::min<int>(5, static_cast<int>(big.size()));
+    std::partial_sort(big.begin(), big.begin() + ntop, big.end(),
+                      [](const std::pair<int,int> &x, const std::pair<int,int> &y) {
+                        return x.first > y.first || (x.first == y.first && x.second < y.second);
+                      });
+    std::FILE *fs = std::fopen(RankFile("cloud_resample_patch_stats.txt").c_str(), "a");
+    if (fs != nullptr) {
+      std::fseek(fs, 0, SEEK_END);
+      if (std::ftell(fs) == 0) {
+        std::fprintf(fs, "# bins: ncycle time bin level n_min patches clouds removed steps_zero "
+                     "steps_cap patches_reduced n_max\n# top:  ncycle time top level n nb nrow "
+                     "removed steps_zero steps_cap scans\n");
+      }
+      for (const auto &kv : acc) {
+        const auto &a = kv.second;
+        std::fprintf(fs, "%d %.17g bin %d %d %lld %lld %lld %lld %lld %lld %lld\n", pmesh->ncycle,
+                     pmesh->time, kv.first.first, bin_lo[kv.first.second], a[0], a[1], a[2], a[3],
+                     a[4], a[5], a[6]);
+      }
+      for (int t=0; t<ntop; ++t) {
+        const PatchInfo &f = ps[big[t].second];
+        std::fprintf(fs, "%d %.17g top %d %d %d %d %d %d %d %d\n", pmesh->ncycle, pmesh->time,
+                     level_of(big[t].second), f.n, f.nb, f.nrow, f.n - f.kept, f.steps_zero,
+                     f.steps_cap, f.scans);
+      }
+      std::fclose(fs);
+    }
+  }
   ++cloud_resample_pass;
   cloud_resample_removed += static_cast<unsigned long long>(nremoved);
   {
