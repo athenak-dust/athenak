@@ -46,7 +46,10 @@ using Member = Policy::member_type;
 using PolicyWide = Kokkos::TeamPolicy<DevExeSpace, Kokkos::LaunchBounds<512, 1>>;
 // with cloud_resample_device_wide_team = 1024: teams of up to 1024 threads
 using PolicyWider = Kokkos::TeamPolicy<DevExeSpace, Kokkos::LaunchBounds<1024, 1>>;
-constexpr int kChunk = 8;   // a step search along one null vector is split in this many chunks
+// a step search along one null vector is split in this many chunks (32 instead of
+// 8, so that 2 x 8 x 32 threads of a 1024-thread team share the scan; the chunks are merged in
+// their order with strict comparisons, so the result does not depend on the number)
+constexpr int kChunk = 32;
 
 // sizes of the per-team workspace of a bucket
 struct WsSize {
