@@ -82,6 +82,9 @@ struct DensityTrigger {
   // level, i.e. a fixed dust mass per cell: a block of level l is refined at rho_refine 2^(dim l)
   // and derefined below rho_derefine 2^(dim (l - 1)); none: the same thresholds on every level
   Real level_factor = 1.0;
+  // With map = block, the block values on the device (default) or on the host; check:
+  // both, every value compared (diagnostic)
+  bool device = true, device_check = false;
 };
 DensityTrigger trig_;
 // Per-block audit of the trigger
@@ -213,6 +216,8 @@ void SetupDensityTrigger(ParameterInput *pin) {
     trig_.level_factor = pin->GetOrAddReal("dust", "amr_rho_level_factor", trig_.level_factor);
     if (!(trig_.level_factor >= 1.0)) fatal("<dust>/amr_rho_level_factor must be >= 1");
   }
+  trig_.device = pin->GetOrAddBoolean("dust", "amr_rho_device", true);
+  trig_.device_check = pin->GetOrAddBoolean("dust", "amr_rho_device_check", false);
   audit_ = pin->GetOrAddBoolean("dust", "amr_trigger_audit", false);
   audit_max_ = pin->GetOrAddInteger("dust", "amr_trigger_audit_max", 40);
   if (!(trig_.rho_derefine >= 0.0 && trig_.rho_derefine < trig_.rho_refine) || trig_.buffer < 0) {
@@ -305,7 +310,12 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   }
 #endif
   lap(DustGasDrag::kProfTrigDeposit);
-  auto fhf = Kokkos::create_mirror_view_and_copy(HostMemSpace(), f);
+  // With map = block on the device the field stays there (the host copy only for the
+  // root map, the host path and the comparison)
+  const bool dev_blocks = trig_.map_block && trig_.device;
+  const bool host_f = !dev_blocks || trig_.device_check;
+  decltype(Kokkos::create_mirror_view_and_copy(HostMemSpace(), f)) fhf;
+  if (host_f) fhf = Kokkos::create_mirror_view_and_copy(HostMemSpace(), f);
   lap(DustGasDrag::kProfTrigCopy);
   auto fh = [&](const int m, const int j, const int i) {return fhf(0, (m*ncells2 + j)*ncells1 + i);};
   const int nr1 = pm->mesh_indcs.nx1, nr2 = pm->mesh_indcs.nx2;
@@ -315,9 +325,29 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   // maximum of rho_d / mean per root cell, then widened by the buffer (periodic)
   std::vector<Real> rmax(nr1*nr2, 0.0), wide(nr1*nr2, 0.0);
   Real qmax = 0.0, mfine = 0.0, vfine = 0.0;
+  if (!host_f && nmb > 0) {   // the largest value and the mass on finer blocks, on the device
+    DvceArray1D<int> fine_d("amr_rho_fine", nmb);
+    auto fine_h = Kokkos::create_mirror_view(fine_d);
+    for (int m=0; m<nmb; ++m) fine_h(m) = (pm->lloc_eachmb[m + mbs].level > pm->root_level) ? 1 : 0;
+    Kokkos::deep_copy(fine_d, fine_h);
+    auto mbsz = mbsize;
+    Real qm = 0.0, mf = 0.0;
+    Kokkos::parallel_reduce("amr_rho_qmax", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*nx2*nx1),
+    KOKKOS_LAMBDA(const int k, Real &qq, Real &mm) {
+      const int m = k/(nx1*nx2), r = k % (nx1*nx2), j = r/nx1, i = r % nx1;
+      const Real v = f(0, (m*ncells2 + js + j)*ncells1 + is + i);
+      qq = Kokkos::fmax(qq, v/mean);
+      if (fine_d(m)) mm += v*mbsz.d_view(m).dx1*mbsz.d_view(m).dx2;
+    }, Kokkos::Max<Real>(qm), mf);
+    qmax = std::max(0.0, qm); mfine = mf;
+  }
   for (int m=0; m<nmb; ++m) {
     const auto &sz = mbsize.h_view(m);
     const bool fine = pm->lloc_eachmb[m + mbs].level > pm->root_level;
+    if (!host_f) {
+      if (fine) vfine += nx1*sz.dx1*nx2*sz.dx2;
+      continue;
+    }
     for (int j=0; j<nx2; ++j) {
       for (int i=0; i<nx1; ++i) {
         const Real q = fh(m, js+j, is+i)/mean;
@@ -358,7 +388,8 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   // ranks)
   const Real lx = pm->mesh_size.x1max - x0, ly = pm->mesh_size.x2max - y0;
   const int nslot = lt.nfld;   // local and halo slots: the deposit f covers these
-  auto boxh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), lt.box);
+  decltype(Kokkos::create_mirror_view_and_copy(HostMemSpace(), lt.box)) boxh;
+  if (trig_.map_block && host_f) boxh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), lt.box);
   // a halo slot holds only the cells it receives (its strip, or the whole block)
   auto SlotRect = [&](const int s, int r[4]) {
     r[0] = 0; r[1] = nx1; r[2] = 0; r[3] = nx2;
@@ -378,7 +409,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     k1 = static_cast<int>(std::ceil((c - org)/h + 1.0e-9)) - 1;
     if (k1 - k0 >= n) k1 = k0 + n - 1;   // wider than the domain: every cell once
   };
-  if (trig_.map_block) {
+  if (trig_.map_block && host_f) {
     std::vector<int> cnt(nr1*nr2 + 1, 0);
     for (int pass=0; pass<2; ++pass) {
       if (pass == 1) {
@@ -462,7 +493,66 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     }
     return q;
   };
-  int nref = 0, nder = 0;
+  // The block values on the device: one thread per (block, slot) pair, the same
+  // tests and cells as BlockValue; per block the largest value (atomic max), the covered area and
+  // the non-finite cells, then only these three numbers per block go to the host
+  decltype(Kokkos::create_mirror_view(DvceArray1D<Real>())) qd_h, ad_h;
+  decltype(Kokkos::create_mirror_view(DvceArray1D<int>())) bd_h;
+  if (dev_blocks) {
+    const int nh = nslot - nmb;
+    DvceArray2D<int> rect_d("amr_rho_rect", std::max(1, nh), 4);
+    auto rect_h = Kokkos::create_mirror_view(rect_d);
+    for (int h=0; h<nh; ++h) {
+      for (int c=0; c<4; ++c) rect_h(h, c) = pdust->halo_.rect[h][c];
+    }
+    Kokkos::deep_copy(rect_d, rect_h);
+    DvceArray1D<Real> qd("amr_rho_q", std::max(1, nmb)), ad("amr_rho_area", std::max(1, nmb));
+    DvceArray1D<int> bd("amr_rho_bad", std::max(1, nmb));
+    auto box = lt.box;
+    auto mbsz = mbsize;
+    const int bb = trig_.buffer;
+    Kokkos::parallel_for("amr_rho_blocks", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*nslot),
+    KOKKOS_LAMBDA(const int k) {
+      const int m = k/nslot, s = k % nslot;
+      const Real bdx = mbsz.d_view(m).dx1, bdy = mbsz.d_view(m).dx2;
+      const Real ex0 = mbsz.d_view(m).x1min - bb*bdx, ex1 = mbsz.d_view(m).x1max + bb*bdx;
+      const Real ey0 = mbsz.d_view(m).x2min - bb*bdy, ey1 = mbsz.d_view(m).x2max + bb*bdy;
+      const Real tol = 1.0e-9*Kokkos::fmin(bdx, bdy);
+      const Real sdx = box(s,2), sdy = box(s,3);
+      int r0 = 0, r1 = nx1, r2 = 0, r3 = nx2;   // a halo slot: the cells it receives
+      if (s >= nmb) {r0 = rect_d(s-nmb,0); r1 = rect_d(s-nmb,1); r2 = rect_d(s-nmb,2); r3 = rect_d(s-nmb,3);}
+      Real q = 0.0, area = 0.0;
+      int nbad = 0;
+      for (int oy=-1; oy<=1; ++oy) {
+        for (int ox=-1; ox<=1; ++ox) {
+          const Real b0 = box(s,0) + ox*lx, d0 = box(s,1) + oy*ly;
+          const Real a0 = b0 + r0*sdx, a1 = b0 + r1*sdx;
+          const Real c0 = d0 + r2*sdy, c1 = d0 + r3*sdy;
+          if (a1 <= ex0 + tol || a0 >= ex1 - tol || c1 <= ey0 + tol || c0 >= ey1 - tol) continue;
+          area += (Kokkos::fmin(a1, ex1) - Kokkos::fmax(a0, ex0))*
+                  (Kokkos::fmin(c1, ey1) - Kokkos::fmax(c0, ey0));
+          const int i0 = Kokkos::max(r0, static_cast<int>(Kokkos::floor((ex0 - b0)/sdx + 1.0e-9)));
+          const int i1 = Kokkos::min(r1, static_cast<int>(Kokkos::ceil((ex1 - b0)/sdx - 1.0e-9)));
+          const int j0 = Kokkos::max(r2, static_cast<int>(Kokkos::floor((ey0 - d0)/sdy + 1.0e-9)));
+          const int j1 = Kokkos::min(r3, static_cast<int>(Kokkos::ceil((ey1 - d0)/sdy - 1.0e-9)));
+          for (int j=j0; j<j1; ++j) {
+            for (int i=i0; i<i1; ++i) {
+              const Real v = f(0, (s*ncells2 + js + j)*ncells1 + is + i);
+              if (!Kokkos::isfinite(v)) {++nbad; continue;}
+              q = Kokkos::fmax(q, v/mean);
+            }
+          }
+        }
+      }
+      if (area > 0.0) Kokkos::atomic_add(&ad(m), area);
+      if (q > 0.0) Kokkos::atomic_max(&qd(m), q);
+      if (nbad > 0) Kokkos::atomic_add(&bd(m), nbad);
+    });
+    qd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), qd);
+    ad_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ad);
+    bd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bd);
+  }
+  int nref = 0, nder = 0, nmis = 0;
   std::vector<Real> qblk(nmb, 0.0);
   std::vector<int> rawf(nmb, 0), appf(nmb, 0);
   for (int m=0; m<nmb; ++m) {
@@ -472,7 +562,29 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     const int j0 = static_cast<int>(std::floor((sz.x2min - y0)/hy + 1.0e-9));
     const int j1 = static_cast<int>(std::ceil((sz.x2max - y0)/hy - 1.0e-9));
     Real q = 0.0;
-    if (trig_.map_block) {
+    if (dev_blocks) {
+      const Real ex0 = sz.x1min - trig_.buffer*sz.dx1, ex1 = sz.x1max + trig_.buffer*sz.dx1;
+      const Real ey0 = sz.x2min - trig_.buffer*sz.dx2, ey1 = sz.x2max + trig_.buffer*sz.dx2;
+      const Real want = (ex1 - ex0)*(ey1 - ey0);   // as in BlockValue
+      if (std::fabs(ad_h(m) - want) > 1.0e-9*want || bd_h(m) > 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "amr_rho_map = block: the buffer of block " << m + mbs << " (" << trig_.buffer
+                  << " cells) is not covered by the local and halo blocks (covered area "
+                  << ad_h(m) << " of " << want << ", " << bd_h(m) << " non-finite cells)" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      q = qd_h(m);
+      if (trig_.device_check) {
+        const Real qh = BlockValue(m, sz.x1min, sz.x1max, sz.x2min, sz.x2max, sz.dx1, sz.dx2);
+        if (qh != q) {
+          if (nmis < 5) {
+            std::cout << "# amr_rho_device_check: block " << m + mbs << " device " << q << " host "
+                      << qh << std::endl;
+          }
+          ++nmis;
+        }
+      }
+    } else if (trig_.map_block) {
       q = BlockValue(m, sz.x1min, sz.x1max, sz.x2min, sz.x2max, sz.dx1, sz.dx2);
     } else {
       for (int rj=j0; rj<j1; ++rj) {
@@ -496,6 +608,12 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     appf[m] = (pm->pmr->ncyc_since_ref(m + mbs) < pm->pmr->refinement_interval) ? 0 : flag;
   }
   lap(DustGasDrag::kProfTrigBlocks);
+  if (nmis > 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "amr_rho_device_check: " << nmis << " block values differ between device and host"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
   // Audit: per-block lines every check; the pre-regrid state (blocks and particles)
