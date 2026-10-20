@@ -374,6 +374,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
             unset += std::string(" ") + c[0] + "=" + c[1] + " (was " + c[2] + ")";
           }
         }
+        if (multilevel && !pin->DoesParameterExist("dust", "experimental_smr_transfer")) {
+          unset += " experimental_smr_transfer=refinable_cloud (was smooth_p2)";
+        }
         if (!unset.empty()) {
           std::cout << "# NOTE (dust): defaults changed on 2026-10-20 apply to:" << unset << std::endl;
         }
@@ -466,7 +469,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", true);
       // The end time of the merge passes (a diagnostic) is
       // gone
-      RemovedKey(pin, "cloud_merge_tstop",
+      // (Codex review of the cleanup: without G the key never acted, any value is accepted)
+      RemovedKey(pin, "cloud_merge_tstop", !cloud_merge ||
                  !pin->DoesParameterExist("dust", "cloud_merge_tstop") ||
                  pin->GetReal("dust", "cloud_merge_tstop") < 0.0,
                  "the end time of the merge passes");
@@ -618,12 +622,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // The patches of cloud_resample_patch^2 root cells (root)
       // are gone
       {
-        RemovedKey(pin, "cloud_resample_patches",
+        // (Codex review of the cleanup: without R the key never acted, root is then accepted)
+        RemovedKey(pin, "cloud_resample_patches", !cloud_resample ||
                    !pin->DoesParameterExist("dust", "cloud_resample_patches") ||
                    pin->GetString("dust", "cloud_resample_patches") != "root",
                    "the resampling on root-cell patches");
         const std::string pm = pin->GetOrAddString("dust", "cloud_resample_patches", "block");
-        if (pm != "block") {
+        if (pm != "block" && !(pm == "root" && !cloud_resample)) {
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                     << "<dust>/cloud_resample_patches must be block" << std::endl;
           std::exit(EXIT_FAILURE);
@@ -720,7 +725,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Clouds at their cap stay out of the pool; false (they stayed
       // in it and could only lose mass) is gone (the restart files written between
       // eec962b0 and 902dd0bd carry false)
-      RemovedKey(pin, "cloud_resample_skip_at_cap",
+      // (Codex review of the cleanup: without R the key never acted, any value is accepted)
+      RemovedKey(pin, "cloud_resample_skip_at_cap", !cloud_resample ||
                  !pin->DoesParameterExist("dust", "cloud_resample_skip_at_cap") ||
                  pin->GetBoolean("dust", "cloud_resample_skip_at_cap"),
                  "keeping the clouds at their cap in the resampling pool");

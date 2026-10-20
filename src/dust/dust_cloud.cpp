@@ -121,19 +121,21 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   {
     // The Morton sort order is gone; linear (default) and
     // random (a test tool) stay
-    RemovedKey(pin, "cloud_sort_order",
+    // (Codex review of the cleanup: without sorting, cloud_sort_interval = 0, the order never
+    // acted; morton is then accepted)
+    RemovedKey(pin, "cloud_sort_order", cloud_sort_interval <= 0 ||
                !pin->DoesParameterExist("dust", "cloud_sort_order") ||
                pin->GetString("dust", "cloud_sort_order") != "morton",
                "the Morton order of the particle sort");
     const std::string so = pin->GetOrAddString("dust", "cloud_sort_order", "linear");
-    if (so != "linear" && so != "random") {
+    if (so != "linear" && so != "random" && !(so == "morton" && cloud_sort_interval <= 0)) {
       std::cout << "### FATAL ERROR: <dust>/cloud_sort_order must be linear or random" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     cloud_sort_random = (so == "random");   // diagnostic: a random permutation
     // The diagnostic sort before the split, R and merge of the cycle
     // is gone; the sort runs after them
-    RemovedKey(pin, "cloud_sort_at_start", KeyFalse(pin, "cloud_sort_at_start"),
+    RemovedKey(pin, "cloud_sort_at_start", cloud_sort_interval <= 0 || KeyFalse(pin, "cloud_sort_at_start"),
                "the sort at the start of the cycle");
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
     // The cell-sorted index is on by default (every 8 cycles) where the two

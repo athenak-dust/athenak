@@ -209,9 +209,8 @@ void SetupDensityTrigger(ParameterInput *pin) {
     // peak density with resolution in the 2048^2 run).  The older
     // amr_rho_level_scaling (none / mass) is folded into it: none is factor 1, mass factor 4 (2-D,
     // the trigger is 2-D only), the same threshold rule.  An input with the old key only gets that
-    // factor (one note); mass next to another factor stops.  none next to a factor is accepted:
-    // it was the default, and the factor always won (every restart file since 2026-10-17 carries
-    // both keys).
+    // factor (one note).  With both keys the factor wins, as before the fold (Codex review of the
+    // cleanup: mass next to factor 2 was a valid input); a note says the alias is ignored.
     Real fsc = 1.0;
     const bool has_sc = pin->DoesParameterExist("dust", "amr_rho_level_scaling");
     const bool has_f = pin->DoesParameterExist("dust", "amr_rho_level_factor");
@@ -222,11 +221,11 @@ void SetupDensityTrigger(ParameterInput *pin) {
       } else if (sc != "none") {
         fatal("<dust>/amr_rho_level_scaling (folded into amr_rho_level_factor) must be none or mass");
       }
-      if (sc == "mass" && has_f && pin->GetReal("dust", "amr_rho_level_factor") != fsc) {
-        fatal("<dust>/amr_rho_level_scaling = mass (amr_rho_level_factor = 4) disagrees with "
-              "amr_rho_level_factor = " + pin->GetString("dust", "amr_rho_level_factor") +
-              "; amr_rho_level_scaling was folded into amr_rho_level_factor on 2026-10-20: set "
-              "only amr_rho_level_factor");
+      if (has_f && pin->GetReal("dust", "amr_rho_level_factor") != fsc &&
+          global_variable::my_rank == 0) {
+        std::cout << "# NOTE (dust): amr_rho_level_scaling = " << sc << " is ignored, the given "
+                  << "amr_rho_level_factor = " << pin->GetString("dust", "amr_rho_level_factor")
+                  << " is used (as before the key was folded into it on 2026-10-20)" << std::endl;
       }
       if (!has_f && global_variable::my_rank == 0) {
         std::cout << "# NOTE (dust): amr_rho_level_scaling = " << sc << " is read as "
