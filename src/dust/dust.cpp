@@ -622,16 +622,20 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 1.5);
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       // Patches inside one MeshBlock of min(cloud_resample_patch 2^level,
-      // cloud_resample_patch_cells)^2 of its cells (block, default) or of cloud_resample_patch^2
-      // root cells (root)
+      // cloud_resample_patch_cells)^2 of its cells (cloud_resample_patches = block).
+      // The patches of cloud_resample_patch^2 root cells (root)
+      // are gone
       {
+        RemovedKey(pin, "cloud_resample_patches",
+                   !pin->DoesParameterExist("dust", "cloud_resample_patches") ||
+                   pin->GetString("dust", "cloud_resample_patches") != "root",
+                   "the resampling on root-cell patches");
         const std::string pm = pin->GetOrAddString("dust", "cloud_resample_patches", "block");
-        if (pm != "block" && pm != "root") {
+        if (pm != "block") {
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                    << "<dust>/cloud_resample_patches must be block or root" << std::endl;
+                    << "<dust>/cloud_resample_patches must be block" << std::endl;
           std::exit(EXIT_FAILURE);
         }
-        cloud_resample_block_patches = (pm == "block");
       }
       cloud_resample_patch_cells = pin->GetOrAddInteger("dust", "cloud_resample_patch_cells", 4);   // cap
       // A block patch, or a quadrant of one, holding more than this many pool clouds
@@ -641,7 +645,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // odd row and column otherwise) and at most 16.  Rixin: default 1024 where allowed;
       // 0 reproduces the results before 6f9512a9
       auto pow2 = [](const int n) {return n >= 1 && (n & (n - 1)) == 0;};
-      const bool split_ok = cloud_resample_block_patches && cloud_resample_patch_cells <= 16 &&
+      const bool split_ok = cloud_resample_patch_cells <= 16 &&
                             pow2(cloud_resample_patch) && pow2(cloud_resample_patch_cells);
       cloud_resample_patch_split = pin->GetOrAddInteger("dust", "cloud_resample_patch_split",
                                                         split_ok ? 1024 : 0);
@@ -698,7 +702,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         std::cout << "# NOTE (dust): cloud_resample_m0 is the root cloud mass of every species "
                   << "(leave it unset for the per-species masses of the initial clouds)" << std::endl;
       }
-      cloud_resample_skip_at_cap = pin->GetOrAddBoolean("dust", "cloud_resample_skip_at_cap", true);
+      // Clouds at their cap stay out of the pool; false (they stayed
+      // in it and could only lose mass) is gone (the restart files written between
+      // eec962b0 and 902dd0bd carry false)
+      RemovedKey(pin, "cloud_resample_skip_at_cap",
+                 !pin->DoesParameterExist("dust", "cloud_resample_skip_at_cap") ||
+                 pin->GetBoolean("dust", "cloud_resample_skip_at_cap"),
+                 "keeping the clouds at their cap in the resampling pool");
       // Resampling after every regrid, default on.  The older key
       // (cloud_resample_after_refine: refine only, default off) maps onto it, so the inputs of
       // earlier runs keep their meaning for "false" (no extra resampling).
@@ -985,9 +995,6 @@ void DustGasDrag::CheckMultiRank() {
   }
   if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_stencil)) {
     bad.push_back("merging other than the device quantum G (tent, X)");
-  }
-  if (cloud_resample && !cloud_resample_block_patches) {
-    bad.push_back("resampling on root patches (cloud_resample_block_patches = false)");
   }
   if (cloud_split_interp || cloud_split_log) bad.push_back("cloud_split_interp / cloud_split_log");
   if (cloud_leaf_check > 0) bad.push_back("cloud_leaf_check");

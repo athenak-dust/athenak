@@ -8,14 +8,14 @@
 //! code instead of the offline reference (rs_lib.py / rs2_lib.py: Domain, rows, prune_cap).
 //! Positions, velocities, shapes and stopping times are kept; only the masses of the plain
 //! clouds change, a cloud whose mass reaches zero is removed.  Per patch (kc x kc
-//! cells of one MeshBlock by default, so that a patch holds about the same number of leaves on
-//! every level; or s x s root cells, cloud_resample_patches = root)
+//! cells of one MeshBlock, so that a patch holds about the same number of leaves on every
+//! level; the s x s root-cell patches, cloud_resample_patches = root, were removed 2026-10-20)
 //! the new masses keep, to round-off, every leaf's deposited mass and momentum, the three
 //! components of the frozen-gas drag feedback of every leaf (AuditFeedback), the centre of
 //! mass and the six velocity second moments of the patch; a mass never exceeds its cap
-//! eta m0 / 4^level.  Clouds above the cap are left alone, and by default
-//! (cloud_resample_skip_at_cap = true) so are the clouds already at the cap; with false they
-//! stay in the pool and may only lose mass, as in the offline reference.
+//! eta m0 / 4^level.  Clouds above the cap are left alone, and so are the clouds already at
+//! the cap (cloud_resample_skip_at_cap = false, which kept them in the pool to lose mass only
+//! as in the offline reference, was removed on 2026-10-20).
 //!
 //! Device: selection of the pool, production gather of the gas velocity, cloud weights as a
 //! CSR list.  Host (std::thread over patches): constraint rows, null-space end-point
@@ -600,7 +600,6 @@ void DustGasDrag::StressResamplePool() {
     Kokkos::deep_copy(m0sp, mh);
   }
   const Real eta = cloud_resample_eta;
-  const bool skip_cap = cloud_resample_skip_at_cap;
   const int every = cloud_resample_stress, kcopy = cloud_resample_stress_copies;
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
   auto pr = ppar->prtcl_rdata;
@@ -620,7 +619,7 @@ void DustGasDrag::StressResamplePool() {
       const int lev = SMRCompositeTransfer::CloudLevel(code);
       const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
       ok = (pr(IPM,p) <= cap*(1.0 + resample::kPoolTol)) &&
-           !(skip_cap && pr(IPM,p) >= cap*(1.0 - resample::kCapTol));
+           !(pr(IPM,p) >= cap*(1.0 - resample::kCapTol));
     }
     if (final) rk(p) = ok ? upd : -1;
     if (ok) ++upd;
@@ -693,7 +692,6 @@ int DustGasDrag::ResampleClouds(const bool local) {
   const int npart = ppar->nprtcl_thispack;
   const auto transfer = smr_transfer;
   const auto lt = leaf_traversal;   // cloud weights on the actual leaves
-  const int nlev = transfer.cloud_nlev;
   // The gas velocity and its differences of every leaf of the current state, the
   // owners' values on the halo blocks, for the gather of the pool (the predictor's packed
   // field).  Before any return: the halo exchange is collective.
@@ -745,17 +743,15 @@ int DustGasDrag::ResampleClouds(const bool local) {
     }
     Kokkos::deep_copy(m0sp, mh);
   }
-  // the patches.  root: s x s root cells; a patch of a block l
-  // levels finer holds 4^l times as many leaves.  block (default): inside one MeshBlock, k x k
-  // of its cells with k = min(s 2^l, kc): the root patches up to the level where they reach
-  // kc x kc cells, never more, so a patch holds at most about (kc + 2)^2 leaves on any level
-  const bool bpatch = cloud_resample_block_patches;
+  // the patches: inside one MeshBlock, k x k of its cells with k = min(s 2^l, kc)
+  // (s x s root cells on the root level, up to the level where they reach kc x kc cells, never
+  // more), so a patch holds at most about (kc + 2)^2 leaves on any level.  (The patches of
+  // s x s root cells on every level, cloud_resample_patches = root, were removed 2026-10-20.)
   const int s = cloud_resample_patch, kc = cloud_resample_patch_cells;
-  const int nroot1 = transfer.nfine1 >> nlev, nroot2 = transfer.nfine2 >> nlev;
   const int nmbp = pmy_pack->nmb_thispack, bnx1 = pmesh->mb_indcs.nx1, bnx2 = pmesh->mb_indcs.nx2;
   std::vector<int> kblk_h, poff_h(nmbp + 1, 0);   // block patches: k per block, patch offsets
-  bool bad = bpatch ? (kc < 1) : (nroot1 % s != 0 || nroot2 % s != 0);
-  if (bpatch && !bad) {
+  bool bad = (kc < 1);
+  if (!bad) {
     kblk_h.resize(nmbp);
     for (int b=0; b<nmbp; ++b) {
       const int lev = pmy_pack->pmb->mb_lev.h_view(b) - pmesh->root_level;
@@ -771,14 +767,13 @@ int DustGasDrag::ResampleClouds(const bool local) {
   }
   if (bad) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << (bpatch ? "block patches of min(cloud_resample_patch 2^level, "
-                           "cloud_resample_patch_cells) cells must divide the MeshBlock (and be "
-                           "powers of two with cloud_resample_patch_split > 0)"
-                         : "cloud_resample_patch must divide the root grid") << std::endl;
+              << "block patches of min(cloud_resample_patch 2^level, "
+                 "cloud_resample_patch_cells) cells must divide the MeshBlock (and be "
+                 "powers of two with cloud_resample_patch_split > 0)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  DvceArray1D<int> kblk("rs_kblk", bpatch ? nmbp : 1), poff("rs_poff", nmbp + 1);
-  if (bpatch) {
+  DvceArray1D<int> kblk("rs_kblk", nmbp), poff("rs_poff", nmbp + 1);
+  {
     auto kb = Kokkos::create_mirror_view(kblk);
     auto po = Kokkos::create_mirror_view(poff);
     for (int b=0; b<nmbp; ++b) kb(b) = kblk_h[b];
@@ -827,15 +822,13 @@ int DustGasDrag::ResampleClouds(const bool local) {
     Kokkos::deep_copy(rmask, mh);
   }
   const bool use_mask = local;
-  const int np1 = nroot1/s, np2 = nroot2/s;
   // With cloud_resample_patch_split = N > 0 every block patch of k x k cells has one
   // slot per cell (kc^2 slots); a patch, or a quadrant of it, whose pool (one species) holds more
   // than N clouds is solved as its four quadrants, recursively down to single cells; each final
   // square is one patch in the slot of its lower-left cell
-  const int psplit = bpatch ? cloud_resample_patch_split : 0;
+  const int psplit = cloud_resample_patch_split;
   const int psub = (psplit > 0) ? kc*kc : 1;
   const Real eta = cloud_resample_eta;
-  const bool skip_cap = cloud_resample_skip_at_cap;
   auto t_all = Clock::now();
   Kokkos::fence();
   auto t0 = Clock::now();
@@ -849,7 +842,6 @@ int DustGasDrag::ResampleClouds(const bool local) {
   DvceArray1D<int> coff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_coff"), npart);
   int npool = 0, nnz = 0;
   double tot_b[2] = {0.0, 0.0}, cnt_b[3] = {0.0, 0.0, 0.0};
-  const Real root_dx1 = transfer.root_dx1, root_dx2 = transfer.root_dx2;
   // cnt: number of (leaf, weight) entries of a pool cloud, -1 for the others; totals before;
   // lobed clouds, plain clouds above the cap, zero-mass slots
   Kokkos::parallel_reduce("rs_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -867,7 +859,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
     const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
-    if (skip_cap && pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
+    if (pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
     int c = 0;
     lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), code, lt.Anchor(pi(PGID,p)),
                           [&](const int, const Real) {++c;});
@@ -950,7 +942,6 @@ int DustGasDrag::ResampleClouds(const bool local) {
   auto gp = gpack;   // PackGasGather above
   const int ncells1 = qdep.extent_int(4), ncells2 = qdep.extent_int(3);
   const int tmode = cloud_transition;
-  const Real x1min = transfer.x1min, x2min = transfer.x2min;
   const int nnz_ = nnz;
   const int nmbp_ = pmy_pack->nmb_thispack;
   Kokkos::parallel_for("rs_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -985,7 +976,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     pd(a,7) = ugx; pd(a,8) = ugy; pd(a,9) = ugz;
     const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
     pd(a,10) = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
-    if (bpatch) {
+    {
       // the leaf that holds the particle: its block and cell
       const int am = lt.Anchor(pi(PGID,p));
       const int t = lt.LeafOwner(xp, yp, am);
@@ -1001,14 +992,6 @@ int DustGasDrag::ResampleClouds(const bool local) {
       int q = poff(b) + (tj/k)*(bnx1/k) + ti/k;
       if (psub > 1) q = q*psub + (tj % k)*k + (ti % k);   // its cell in the patch
       pid(a,0) = q;
-    } else {
-      const Real xw = SMRCompositeTransfer::WrapPosition(xp, transfer.x1min, transfer.x1max);
-      const Real yw = SMRCompositeTransfer::WrapPosition(yp, transfer.x2min, transfer.x2max);
-      int ix = static_cast<int>(floor((xw - x1min)/root_dx1));
-      int iy = static_cast<int>(floor((yw - x2min)/root_dx2));
-      ix = (ix < 0) ? 0 : ((ix >= nroot1) ? nroot1 - 1 : ix);
-      iy = (iy < 0) ? 0 : ((iy >= nroot2) ? nroot2 - 1 : iy);
-      pid(a,0) = (iy/s)*np1 + ix/s;
     }
     pid(a,0) = pid(a,0)*nsp + sp;   // one species per patch
     pid(a,1) = p;
@@ -1021,7 +1004,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
   // Count the pool of every cell slot; per block patch and species one thread
   // splits the squares holding more than N clouds into quadrants (down to single cells) and maps
   // every slot to the lower-left slot of its final square (own) with the square's width there (nsz)
-  const int nbase = (bpatch ? poff_h[nmbp] : np1*np2)*nsp;   // geometric patch x species
+  const int nbase = poff_h[nmbp]*nsp;   // geometric patch x species
   const int nslot = nbase*psub;
   DvceArray1D<int> nsz("rs_split_size", (psub > 1) ? nslot : 1);
   int nsplit = 0;
@@ -1072,38 +1055,28 @@ int DustGasDrag::ResampleClouds(const bool local) {
   t0 = Clock::now();
   const int npatch = nslot;   // (geometric patch x cell slot) x species
   const double lx = transfer.x1max - transfer.x1min, ly = transfer.x2max - transfer.x2min;
-  // per patch: centre and length scale of the centre-of-mass rows (half the patch width; the
-  // root patches keep their earlier values)
+  // per patch: centre and length scale of the centre-of-mass rows (half the patch width)
   DvceArray2D<Real> pgeo(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pgeo"), npatch, 4);
-  {
-    const Real rx1 = root_dx1, rx2 = root_dx2;
-    Kokkos::parallel_for("rs_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-    KOKKOS_LAMBDA(const int qs) {
-      const int g = qs/nsp, q = g/psub, c = g % psub;   // the geometric patch, cell slot
-      if (bpatch) {
-        int lo = 0, hi = nmbp;   // the block of patch q: poff(b) <= q < poff(b + 1)
-        while (hi - lo > 1) {
-          const int mid = (lo + hi)/2;
-          if (poff(mid) <= q) lo = mid; else hi = mid;
-        }
-        const int b = lo, k = kblk(b), r = q - poff(b), nbx = bnx1/k, ip = r % nbx, jp = r/nbx;
-        const Real d1 = lt.box(b,2), d2 = lt.box(b,3);   // = mb_size of local block b
-        pgeo(qs,0) = lt.box(b,0) + (ip + 0.5)*k*d1;
-        pgeo(qs,1) = lt.box(b,1) + (jp + 0.5)*k*d2;
-        pgeo(qs,2) = 0.5*k*d1; pgeo(qs,3) = 0.5*k*d2;
-        if (psub > 1 && nsz(qs) > 0) {   // a final square of w cells
-          const int w = nsz(qs), x0 = c % k, y0 = c/k;
-          pgeo(qs,0) = lt.box(b,0) + (ip*k + x0 + 0.5*w)*d1;
-          pgeo(qs,1) = lt.box(b,1) + (jp*k + y0 + 0.5*w)*d2;
-          pgeo(qs,2) = 0.5*w*d1; pgeo(qs,3) = 0.5*w*d2;
-        }
-      } else {
-        pgeo(qs,0) = x1min + (q % np1 + 0.5)*s*rx1;
-        pgeo(qs,1) = x2min + (q/np1 + 0.5)*s*rx2;
-        pgeo(qs,2) = rx1; pgeo(qs,3) = rx2;
-      }
-    });
-  }
+  Kokkos::parallel_for("rs_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+  KOKKOS_LAMBDA(const int qs) {
+    const int g = qs/nsp, q = g/psub, c = g % psub;   // the geometric patch, cell slot
+    int lo = 0, hi = nmbp;   // the block of patch q: poff(b) <= q < poff(b + 1)
+    while (hi - lo > 1) {
+      const int mid = (lo + hi)/2;
+      if (poff(mid) <= q) lo = mid; else hi = mid;
+    }
+    const int b = lo, k = kblk(b), r = q - poff(b), nbx = bnx1/k, ip = r % nbx, jp = r/nbx;
+    const Real d1 = lt.box(b,2), d2 = lt.box(b,3);   // = mb_size of local block b
+    pgeo(qs,0) = lt.box(b,0) + (ip + 0.5)*k*d1;
+    pgeo(qs,1) = lt.box(b,1) + (jp + 0.5)*k*d2;
+    pgeo(qs,2) = 0.5*k*d1; pgeo(qs,3) = 0.5*k*d2;
+    if (psub > 1 && nsz(qs) > 0) {   // a final square of w cells
+      const int w = nsz(qs), x0 = c % k, y0 = c/k;
+      pgeo(qs,0) = lt.box(b,0) + (ip*k + x0 + 0.5*w)*d1;
+      pgeo(qs,1) = lt.box(b,1) + (jp*k + y0 + 0.5*w)*d2;
+      pgeo(qs,2) = 0.5*w*d1; pgeo(qs,3) = 0.5*w*d2;
+    }
+  });
   // The patch solves on the host (default), on the device, or both on the same
   // pool (cloud_resample_compare: the differences are logged, the device result is used)
   const bool on_dev = cloud_resample_device || cloud_resample_compare;
@@ -1397,14 +1370,13 @@ int DustGasDrag::ResampleClouds(const bool local) {
   Kokkos::fence();
   const double t_back = seconds(t0);
   if (cloud_resample_patch_stats) {
-    // Diagnostic: per level (of the patch's MeshBlock; -1 for root patches) and
+    // Diagnostic: per level (of the patch's MeshBlock) and
     // patch size, the patches, clouds, removals and steps; and the five largest patches
     const std::vector<PatchInfo> &ps = cloud_resample_device ? dinfos : infos;
     const int nbin = 4, bin_lo[4] = {1, 64, 256, 1024};
     std::map<std::pair<int,int>, std::array<long long,7>> acc;
     std::vector<std::pair<int,int>> big;   // (clouds, patch)
     auto level_of = [&](const int qs) {
-      if (!bpatch) return -1;
       const int q = qs/nsp/psub;
       const int b = static_cast<int>(std::upper_bound(poff_h.begin(), poff_h.end(), q) -
                                      poff_h.begin()) - 1;

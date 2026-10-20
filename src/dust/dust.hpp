@@ -1440,8 +1440,8 @@ class DustGasDrag {
   bool cloud_resample = false;         // conservative same-level resampling in the code
   int cloud_resample_interval = 625;   // ... cycles between resamplings
   Real cloud_resample_eta = 2.0;       // ... mass cap eta m0 / 4^level (<= 0: no cap)
-  int cloud_resample_patch = 2;        // ... patch size in root cells (root patches)
-  bool cloud_resample_block_patches = true;   // patches inside one MeshBlock
+  int cloud_resample_patch = 2;        // ... patches inside one MeshBlock, of
+                                       //     this many root cells per side on the root level
   int cloud_resample_patch_cells = 4;  // ... at most this many cells of the block per side
   int cloud_resample_patch_split = 1024;   // ... a patch (or quadrant) with more pool
                                       //     clouds is split into quadrants, down to cells (0: never)
@@ -1466,7 +1466,6 @@ class DustGasDrag {
   void StressResamplePool();
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
   std::vector<int> cloud_resample_dump;     // cycles whose resampling writes the particle table before and after
-  bool cloud_resample_skip_at_cap = true;   // ... clouds at their cap stay out of the pool
   unsigned long long cloud_resample_pass = 0, cloud_resample_removed = 0;
   // resampling at planned physical times t0 + k dt instead of every N cycles
   bool cloud_resample_by_time = false;      // <dust>/cloud_resample_schedule = time
