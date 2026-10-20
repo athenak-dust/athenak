@@ -1693,6 +1693,11 @@ class DustGasDrag {
                                       // lobe 3, gathered as a cloud integral), so a z-normal
                                       // refinement edge has no along-edge width jump
   bool cloud_split_enable = true;     // test only: false = no splitting at all
+  // Instant switch, the OO control on the cloud framework: at the
+  // start of every cycle (and in the initial split) each cloud takes the level of the leaf that
+  // holds its centre; no split, merge or resampling, fixed particle number and masses
+  bool cloud_instant_switch = false;
+  unsigned long long cloud_switch_count = 0;   // level changes made by the instant switch
   bool cloud_split_interp = false;    // P1 split/release: pieces take the node-convention
                                       // (linear, P1) prolongation of displacement and velocity
                                       // from the neighbouring nodes of the particle lattice,
@@ -1841,6 +1846,7 @@ class DustGasDrag {
   void PackRestartState(std::vector<char> &b) const;
   void UnpackRestartState(const char *p, std::size_t nbytes);
   int SplitAndMergeClouds();   // returns the number of clouds split
+  int SwitchCloudsToLeafLevel();   // instant switch; returns the clouds changed
   int MakeTransitionClouds();  // P1 transition clouds at split edges
   int SplitCloudsP1();         // moving-particle P1 split
   int SplitCloudsP1Device();   // device P1 split without the diagnostics

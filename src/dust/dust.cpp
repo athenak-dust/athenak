@@ -399,6 +399,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_split_interp = pin->GetOrAddBoolean("dust", "cloud_split_interp", false);
       // Test switch: false keeps every cloud at its level whatever the mesh
       cloud_split_enable = pin->GetOrAddBoolean("dust", "cloud_split_enable", true);
+      // Instant switch (the OO control on a dynamic mesh), see dust.hpp
+      cloud_instant_switch = pin->GetOrAddBoolean("dust", "cloud_instant_switch", false);
       cloud_merge = pin->GetOrAddBoolean("dust", "cloud_merge", false);
       cloud_merge_buffer = pin->GetOrAddInteger("dust", "cloud_merge_buffer", 2);
       cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha", 0.2);
@@ -807,6 +809,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
     Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
   }
+  if (cloud_instant_switch && (smr_transfer_mode != DustSMRTransfer::refinable_cloud ||
+                               cloud_merge || cloud_resample || !cloud_split_enable)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<dust>/cloud_instant_switch needs experimental_smr_transfer = refinable_cloud, "
+              << "cloud_merge = false, cloud_resample = false and cloud_split_enable = true "
+              << "(it replaces the split)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (pmy_pack->pmesh->adaptive && smr_transfer_mode != DustSMRTransfer::refinable_cloud) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "<dust>/experimental_amr requires experimental_smr_transfer = "
@@ -982,6 +992,8 @@ DustGasDrag::~DustGasDrag() {
               << " merges=" << cloud_merge_count
               << (cloud_p1_split ? " lobe_splits=" + std::to_string(cloud_lobe_split_count)
                                  : std::string())
+              << (cloud_instant_switch ? " instant_switches=" + std::to_string(cloud_switch_count)
+                                       : std::string())
               << (cloud_merge ? " coarsen_events=" + std::to_string(cloud_coarsen_events) +
                   " coarsen_in=" + std::to_string(cloud_coarsen_in) +
                   " coarsen_reject=" + std::to_string(cloud_coarsen_reject) +
