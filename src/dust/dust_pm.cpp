@@ -104,6 +104,8 @@ void DustGasDrag::PackGatherField(const DvceArray5D<Real> &vel) {
 
 TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
+  // The stiffness deposit qdep[4] feeds only the automatic switch's metric
+  const bool rate_dep = NeedsHybridMetric();
 
   if (coupling == DustCoupling::hybrid) {
     // Split-BE deposits Q/P in its fused preparation traversal.  PC2 needs only the
@@ -191,7 +193,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             DepositAdd(&qdep_(tm,1,ks,tj,ti), inv_volume*w*gx);
             DepositAdd(&qdep_(tm,2,ks,tj,ti), inv_volume*w*gy);
             DepositAdd(&qdep_(tm,3,ks,tj,ti), inv_volume*w*gz);
-            DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
+            if (rate_dep) DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
           };
           if (same && nt <= SMRCompositeTransfer::kCloudWeightCache) {
             for (int q=0; q<nt; ++q) if (tw[q] != 0.0) add(tt[q], tw[q]);
@@ -293,7 +295,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
                 DepositAdd(&qdep_(tm,1,ks,tj,ti), -dt*mass_rate*inv_volume*w*(cgx - vpx));
                 DepositAdd(&qdep_(tm,2,ks,tj,ti), -dt*mass_rate*inv_volume*w*(cgy - vpy));
                 DepositAdd(&qdep_(tm,3,ks,tj,ti), -dt*mass_rate*inv_volume*w*(cgz - vpz));
-                DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
+                if (rate_dep) DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
               });
             });
             return;
@@ -315,7 +317,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             DepositAdd(&qdep_(tm,1,ks,tj,ti), -dt*mass_rate*inv_volume*(fx - w*vpx));
             DepositAdd(&qdep_(tm,2,ks,tj,ti), -dt*mass_rate*inv_volume*(fy - w*vpy));
             DepositAdd(&qdep_(tm,3,ks,tj,ti), -dt*mass_rate*inv_volume*(fz - w*vpz));
-            DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
+            if (rate_dep) DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
           });
         });
         return TaskStatus::complete;
@@ -354,7 +356,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
           DepositAdd(&qdep_(tm,1,ks,tj,ti), density_weight*gx);
           DepositAdd(&qdep_(tm,2,ks,tj,ti), density_weight*gy);
           DepositAdd(&qdep_(tm,3,ks,tj,ti), density_weight*gz);
-          DepositAdd(&qdep_(tm,4,ks,tj,ti), density_weight*mass_rate);
+          if (rate_dep) DepositAdd(&qdep_(tm,4,ks,tj,ti), density_weight*mass_rate);
         });
       });
       return TaskStatus::complete;
@@ -408,7 +410,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             DepositAdd(&qdep_(m,1,kk,jj,ii), w*gx);
             DepositAdd(&qdep_(m,2,kk,jj,ii), w*gy);
             DepositAdd(&qdep_(m,3,kk,jj,ii), w*gz);
-            DepositAdd(&qdep_(m,4,kk,jj,ii), w*rate);
+            if (rate_dep) DepositAdd(&qdep_(m,4,kk,jj,ii), w*rate);
           }
         }
       }
