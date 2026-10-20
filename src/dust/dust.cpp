@@ -43,6 +43,16 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     solver_p("dust_solver_p",1,1,1,1,1),
     solver_ap("dust_solver_ap",1,1,1,1,1),
     pmy_pack(ppack) {
+  // The compile-time choices of the dust module, once at start
+  // (DUST_CLOUD_LAUNCH_BOUNDS: dust.hpp; DUST_R_QR_COLUMNS, DUST_R_DIAG: dust_resample.hpp)
+  {
+    static bool told = false;
+    if (!told && global_variable::my_rank == 0) {
+      std::cout << "# DUST_BUILD launch_bounds=" << DUST_CLOUD_LAUNCH_BOUNDS
+                << " r_qr_columns=" << DUST_R_QR_COLUMNS << " r_diag=" << DUST_R_DIAG << std::endl;
+    }
+    told = true;
+  }
   // (1) validate configuration ----------------------------------------------------------
   hydro::Hydro *phyd = pmy_pack->phydro;
   particles::Particles *ppar = pmy_pack->ppart;
