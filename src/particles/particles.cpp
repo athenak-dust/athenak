@@ -93,8 +93,6 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
         // azimuthal velocity lives in IPVZ, matching gas IM3), plus the RK registers
         // (x1,v1), the recorded drag rate R_j, stopping time, and mass
         nrdata = 17;
-        // deformable refinable clouds also carry the velocity gradient (IPGXX...IPGZY)
-        if (pin->GetOrAddBoolean("dust", "cloud_deform", false)) nrdata += 6;
         nidata = 4;   // PGID, PTAG, PSP (species index), PLEV (cloud level)
         break;
       }

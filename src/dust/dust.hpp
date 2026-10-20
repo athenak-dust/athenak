@@ -547,24 +547,6 @@ struct SMRCompositeTransfer {
     return false;
   }
 
-  // The 3^2 children of a level-lev cloud in the exact two-scale identity: level lev+1
-  // clouds at offsets (-1/2, 0, +1/2) of the parent half-width per direction with mass
-  // fractions (1/4, 1/2, 1/4); function(child_x1, child_x2, fraction).
-  template <typename Function>
-  KOKKOS_INLINE_FUNCTION
-  void ForEachChild(const Real particle_x1, const Real particle_x2, const int lev,
-                    const Function &function) const {
-    const Real offset[3] = {-0.5, 0.0, 0.5};
-    const Real fraction[3] = {0.25, 0.5, 0.25};
-    Real h1 = CloudHalfWidth1(lev), h2 = CloudHalfWidth2(lev);
-    for (int b=0; b<3; ++b) {
-      for (int a=0; a<3; ++a) {
-        function(particle_x1 + offset[a]*h1, particle_x2 + offset[b]*h2,
-                 fraction[a]*fraction[b]);
-      }
-    }
-  }
-
   // Encoded active leaf that owns a (wrapped) position; used to assign PGID to
   // particles created by a split or a merge.
   KOKKOS_INLINE_FUNCTION
@@ -1522,15 +1504,9 @@ class DustGasDrag {
   Real cloud_split_slack = 0.02;      // support test shrinks the cloud by this fraction
   Real cloud_merge_tolerance = 0.05;  // coincidence radius in finest-cell units
   int cloud_gather_order = 1;         // 2: gather a linear reconstruction of the leaves
-  bool cloud_force_local = false;     // gas-side drag uses the leaf's own velocity
-  bool cloud_force_children = false;  // clouds overlapping finer leaves deposit the drag
-                                      // as their 3^d two-scale children (kick unchanged)
   int cloud_transition = 0;           // P1 transition clouds at split edges:
                                       // 1 gathers with the child hat, 2 with the lobed
                                       // weights and point-valued reconstructions
-  bool cloud_deform = false;          // deformable clouds: each particle carries dv_i/dx_j,
-                                      // split children take v + G.d, and the drag is
-                                      // deposited with the linear dust velocity field
   int cloud_next_tag = -1;            // next PTAG for created particles (-1 = unset)
   void EnsureNextTag();               // ... largest tag + 1, once
   bool cloud_p1_split = false;        // moving-particle P1 split: edge children

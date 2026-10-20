@@ -396,46 +396,34 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       cloud_split_slack = pin->GetOrAddReal("dust", "cloud_split_slack", 0.02);
       cloud_merge_tolerance = pin->GetOrAddReal("dust", "cloud_merge_tolerance", 0.05);
-      cloud_deform = pin->GetOrAddBoolean("dust", "cloud_deform", false);
-      cloud_force_local = pin->GetOrAddBoolean("dust", "cloud_force_local", false);
-      cloud_force_children = pin->GetOrAddBoolean("dust", "cloud_force_children", false);
+      // The research gather / deposit variants are gone with their
+      // general PC2 kernels: the leaf's own gas velocity in the gas-side drag and the drag
+      // deposited as two-scale children over finer leaves, and the deformable clouds
+      // that carried dv/dx
+      RemovedKey(pin, "cloud_deform", KeyFalse(pin, "cloud_deform"),
+                 "the deformable clouds");
+      RemovedKey(pin, "cloud_force_local", KeyFalse(pin, "cloud_force_local"),
+                 "the gas-side drag with the leaf's own velocity");
+      RemovedKey(pin, "cloud_force_children", KeyFalse(pin, "cloud_force_children"),
+                 "the drag deposited as two-scale children");
       // The fixed gather level (a diagnostic) is gone
       RemovedKey(pin, "cloud_gather_level",
                  !pin->DoesParameterExist("dust", "cloud_gather_level") ||
                  pin->GetInteger("dust", "cloud_gather_level") < 0, "the fixed gather level");
       // Rixin: the production split is the default: the moving P1 split, splitting on
       // the first overlap with finer leaves (cloud_split_overlap, dust_cloud.cpp), with the P1
-      // transition clouds of mode 2 and the linear gather that mode needs.  The research gather
-      // variants (deform, force_local / force_children, a fixed gather level), which exclude
-      // transition clouds, keep the old defaults (no P1 split, no transitions).  Inputs written
+      // transition clouds of mode 2 and the linear gather that mode needs.  Inputs written
       // before 2026-10-17 that leave these keys out get the new values.
-      const bool variant = cloud_deform || cloud_force_local || cloud_force_children;
-      cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", !variant);
+      cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", true);
       cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order",
-                                                (cloud_deform || cloud_p1_split) ? 2 : 1);
+                                                cloud_p1_split ? 2 : 1);
       cloud_transition = pin->GetOrAddInteger("dust", "cloud_transition",
                                               cloud_p1_split ? (cloud_gather_order == 2 ? 2 : 1) : 0);
       if (cloud_transition < 0 || cloud_transition > 2 ||
-          (cloud_transition > 0 && (cloud_deform || cloud_force_local ||
-                                    cloud_force_children)) ||
           (cloud_transition == 2 && cloud_gather_order != 2)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_transition must be 0, 1 or 2; it excludes "
-                  << "deform/force_local/force_children, and 2 requires "
-                  << "cloud_gather_order=2" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-      // The force/deformation experiments and a fixed gather level exist only in the PC2
-      // kernels; the implicit stages (imex2+, and split-BE, which automatic hybrid can enter)
-      // gather with the production cloud weights (piecewise constant or linear).
-      if ((coupling == DustCoupling::imex ||
-           (coupling == DustCoupling::hybrid && hybrid_force_mode != HybridForceMode::pc2)) &&
-          variant) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "IMEX/split-BE refinable_cloud does not support "
-                  << "cloud_force_local, cloud_force_children or cloud_deform; use "
-                  << "coupling=pc2 for these experiments"
-                  << std::endl;
+                  << std::endl << "<dust>/cloud_transition must be 0, 1 or 2, and 2 "
+                  << "requires cloud_gather_order=2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
       // The old-rule lobe release at the exit edge is gone
@@ -751,13 +739,12 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       if (cloud_resample && ((!cloud_resample_by_time && cloud_resample_interval < 1) ||
                              cloud_resample_patch < 1 || cloud_resample_patch_split < 0 ||
                              (cloud_resample_patch_split > 0 && !split_ok) ||
-                             cloud_gather_order != 2 || cloud_force_local || cloud_force_children ||
-                             cloud_deform)) {
+                             cloud_gather_order != 2)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                   << "cloud_resample requires cloud_resample_interval >= 1, cloud_resample_patch >= 1,"
                   << " cloud_resample_patch_split >= 0 (> 0 only with block patches whose"
                   << " cloud_resample_patch and cloud_resample_patch_cells <= 16 are powers of two),"
-                  << " cloud_gather_order = 2 and none of the force variants" << std::endl;
+                  << " cloud_gather_order = 2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
       // Stage C of quantum G (same-level compression in the fine
@@ -775,14 +762,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      if (cloud_merge && (!cloud_p1_split || cloud_split_interp || cloud_deform ||
+      if (cloud_merge && (!cloud_p1_split || cloud_split_interp ||
                           cloud_merge_buffer < 2 ||
                           cloud_merge_alpha <= 0.0 || cloud_merge_interval < 1)) {
-        // lattice-Ai looks nodes up on the root lattice, which merged centroids leave;
-        // deformable clouds carry gradients that a merge would have to combine
+        // lattice-Ai looks nodes up on the root lattice, which merged centroids leave
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<dust>/cloud_merge needs cloud_p1_split, excludes "
-                  << "cloud_split_interp and cloud_deform, and needs cloud_merge_buffer >= 2, "
+                  << "cloud_split_interp, and needs cloud_merge_buffer >= 2, "
                   << "cloud_merge_alpha > 0"
                   << " and cloud_merge_interval >= 1" << std::endl;
         std::exit(EXIT_FAILURE);
@@ -817,13 +803,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       if (cloud_gather_order != 1 && cloud_gather_order != 2) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<dust>/cloud_gather_order must be 1 or 2" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-      if (cloud_deform && (cloud_gather_order != 2 || cloud_force_local ||
-                           cloud_force_children)) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_deform requires cloud_gather_order=2 and "
-                  << "excludes cloud_force_local and cloud_force_children" << std::endl;
         std::exit(EXIT_FAILURE);
       }
     } else {
@@ -987,10 +966,8 @@ void DustGasDrag::CheckMultiRank() {
                   "hybrid_force_mode = pc2)");
   }
   if (drag_solver != DustDragSolver::local) bad.push_back("drag_solver other than local");
-  if (cloud_gather_order != 2 || cloud_force_local || cloud_force_children || cloud_deform ||
-      analytic_gather.on) {
-    bad.push_back("gather variants (cloud_gather_order != 2, force_local/children, deform, "
-                  "analytic_gather)");
+  if (cloud_gather_order != 2 || analytic_gather.on) {
+    bad.push_back("gather variants (cloud_gather_order != 2, analytic_gather)");
   }
   if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_stencil)) {
     bad.push_back("merging other than the device quantum G (tent, X)");

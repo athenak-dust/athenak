@@ -576,14 +576,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       h(IPVX1,p) = h(IPVX,p);
       h(IPVY1,p) = h(IPVY,p);
       h(IPVZ1,p) = h(IPVZ,p);
-      if (ppar->nrdata > IPGZY) {   // deformable clouds: analytic velocity gradient
-        h(IPGXX,p) = -kx*(Vxr*se + Vxi*ce)*cz;
-        h(IPGXY,p) = -kz*(Vxr*ce - Vxi*se)*sz;
-        h(IPGYX,p) = -kx*(Vzr*ce - Vzi*se)*sz;
-        h(IPGYY,p) = -kz*(Vzr*se + Vzi*ce)*cz;
-        h(IPGZX,p) = -kx*(Vpr*se + Vpi*ce)*cz;
-        h(IPGZY,p) = -kz*(Vpr*ce - Vpi*se)*sz;
-      }
     };
     cloud_root_dx1_ = transfer.root_dx1;
     cloud_root_dx2_ = transfer.root_dx2;
@@ -890,14 +882,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     pr(IPRX,p) = 0.0;
     pr(IPRY,p) = 0.0;
     pr(IPRZ,p) = 0.0;
-    if (nrdata > IPGZY) {   // deformable clouds: analytic velocity gradient
-      pr(IPGXX,p) = -kx*(Vxr*se + Vxi*ce)*cz;
-      pr(IPGXY,p) = -kz*(Vxr*ce - Vxi*se)*sz;
-      pr(IPGYX,p) = -kx*(Vzr*ce - Vzi*se)*sz;
-      pr(IPGYY,p) = -kz*(Vzr*se + Vzi*ce)*cz;
-      pr(IPGZX,p) = -kx*(Vpr*se + Vpi*ce)*cz;
-      pr(IPGZY,p) = -kz*(Vpr*ce - Vpi*se)*sz;
-    }
   });
   }
 

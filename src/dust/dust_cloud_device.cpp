@@ -798,7 +798,7 @@ int DustGasDrag::MergeCloudsDevice() {
     audit.Add2("a0_pi", ppar->prtcl_idata, nidata, npart0);
     audit.Compact("a0_c9", ppar->prtcl_rdata, ppar->prtcl_idata, npart0);
     audit.Gas(pmy_pack);
-    if (cloud_gather_order == 2 && !cloud_force_local && !cloud_force_children && !cloud_deform) {
+    if (cloud_gather_order == 2) {
       DvceArray2D<Real> fb;
       AuditFeedback(fb);
       audit.Feedback("fb_a0", fb, pmy_pack);
@@ -2261,7 +2261,7 @@ int DustGasDrag::MergeCloudsDevice() {
   if (audit.on) {
     audit.Add2("z_pr", ppar->prtcl_rdata, nrdata, nfinal);
     audit.Add2("z_pi", ppar->prtcl_idata, nidata, nfinal);
-    if (cloud_gather_order == 2 && !cloud_force_local && !cloud_force_children && !cloud_deform) {
+    if (cloud_gather_order == 2) {
       DvceArray2D<Real> fb;
       AuditFeedback(fb);
       audit.Feedback("fb_z", fb, pmy_pack);

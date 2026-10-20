@@ -105,8 +105,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // times fixed per species: stopping_time_mode = species_fixed); 0 is the control
   {
     const bool prod = coupling == DustCoupling::hybrid &&
-                      hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2 &&
-                      !cloud_force_local && !cloud_force_children && !cloud_deform;
+                      hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2;
     const bool sortdef = prod && (!cloud_merge || cloud_merge_device) &&
                          (!cloud_resample || cloud_resample_device) && cloud_merge_exact_ts &&
                          stopping_time_mode == DustStoppingTimeMode::species_fixed;
@@ -123,12 +122,11 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     cloud_sort_at_start = pin->GetOrAddBoolean("dust", "cloud_sort_at_start", false);
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
     // The cell-sorted index is on by default (every 8 cycles) where the two
-    // production cloud kernels run (hybrid / PC2 coupling, linear gather, no force or deform
-    // variant); 0 turns it off (the control, and the runs before ce92ed4b)
+    // production cloud kernels run (hybrid / PC2 coupling, linear gather); 0 turns it off (the
+    // control, and the runs before ce92ed4b)
     {
       const bool prod = coupling == DustCoupling::hybrid &&
-                        hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2 &&
-                        !cloud_force_local && !cloud_force_children && !cloud_deform;
+                        hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2;
       cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval", prod ? 8 : 0);
     }
   }
@@ -221,11 +219,10 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // sits on uniform coarse gas.  Only the level map of split/merge eligibility changes;
   // deposit and gather keep the leaf owners.
   cloud_split_buffer = pin->GetOrAddInteger("dust", "cloud_split_buffer", 0);
-  if (cloud_split_buffer < 0 || (cloud_split_buffer > 0 &&
-      (!cloud_p1_split || cloud_force_children))) {
+  if (cloud_split_buffer < 0 || (cloud_split_buffer > 0 && !cloud_p1_split)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "<dust>/cloud_split_buffer must be >= 0; a positive buffer requires "
-              << "cloud_p1_split and excludes cloud_force_children" << std::endl;
+              << "cloud_p1_split" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
@@ -349,9 +346,6 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << ", merge tolerance=" << cloud_merge_tolerance << " finest cells"
               << ", max cloud level=" << t.cloud_max_level
               << ", gather order=" << cloud_gather_order
-              << (cloud_force_local ? ", local gas-side drag" : "")
-              << (cloud_force_children ? ", drag deposited as children over finer leaves" : "")
-              << (cloud_deform ? ", deformable clouds (dv/dx carried)" : "")
               << (cloud_transition > 0 ? ", P1 transition clouds (mode " +
                   std::to_string(cloud_transition) + ")" : "")
               << (cloud_p1_split ? ", moving P1 split without merging" : "")
@@ -948,7 +942,6 @@ int DustGasDrag::SplitAndMergeClouds() {
 
   const Real offset[3] = {-0.5, 0.0, 0.5};
   const Real fraction[3] = {0.25, 0.5, 0.25};
-  const bool deform = cloud_deform;
   std::vector<Real> child(nrdata, 0.0);
   unsigned long long merged_here = 0;
   for (int p=0; p<npart; ++p) {
@@ -962,17 +955,8 @@ int DustGasDrag::SplitAndMergeClouds() {
         Real x = wrap1(pr_h(IPX,p) + d1);
         Real y = wrap2(pr_h(IPY,p) + d2);
         Real mass = pr_h(IPM,p)*fraction[a]*fraction[b];
-        // child attributes: the parent's, except that a deformable cloud's children
-        // take the parent's linear velocity field v + G.d at their own centres
+        // child attributes: the parent's
         for (int c=0; c<nrdata; ++c) child[c] = pr_h(c,p);
-        if (deform) {
-          child[IPVX] += pr_h(IPGXX,p)*d1 + pr_h(IPGXY,p)*d2;
-          child[IPVY] += pr_h(IPGYX,p)*d1 + pr_h(IPGYY,p)*d2;
-          child[IPVZ] += pr_h(IPGZX,p)*d1 + pr_h(IPGZY,p)*d2;
-          child[IPVX1] = child[IPVX];
-          child[IPVY1] = child[IPVY];
-          child[IPVZ1] = child[IPVZ];
-        }
         // look for a coincident same-level, same-species particle in the 3x3 bins
         int found = -1;
         int bi = bin1(x), bj = bin2(y);

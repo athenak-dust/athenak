@@ -66,14 +66,13 @@ enum MetricIndex {I00=0, I01=1, I02=2, I03=3, I11=4, I12=5, I13=6, I22=7, I23=8,
 // for dust particles: (IPX1...IPVZ1) store the stage-1 registers of the low-storage RK
 // integrator, (IPRX...IPRZ) the drag rate R_j recorded at each implicit stage, IPTS the
 // stopping time, and IPM the particle mass. PLEV (dust only) is the cloud level of a
-// refinable Lagrangian cloud: its hat cloud has half-width root_dx/2^PLEV. The six
-// columns (IPGXX...IPGZY) hold the dust velocity gradient dv_i/dx_j (i = x,y,z velocity
-// component, j = x1,x2) of a deformable cloud; they exist only with <dust>/cloud_deform.
+// refinable Lagrangian cloud: its hat cloud has half-width root_dx/2^PLEV. (The six
+// columns IPGXX...IPGZY of the deformable clouds went with <dust>/cloud_deform on
+// 2026-10-20.)
 enum ParticlesIndex {PGID=0, PTAG=1, PSP=2, PLEV=3,
                      IPX=0, IPVX=1, IPY=2, IPVY=3, IPZ=4, IPVZ=5,
                      IPX1=6, IPVX1=7, IPY1=8, IPVY1=9, IPZ1=10, IPVZ1=11,
-                     IPRX=12, IPRY=13, IPRZ=14, IPTS=15, IPM=16,
-                     IPGXX=17, IPGXY=18, IPGYX=19, IPGYY=20, IPGZX=21, IPGZY=22};
+                     IPRX=12, IPRY=13, IPRZ=14, IPTS=15, IPM=16};
 
 // integer constants to specify spatial reconstruction methods
 enum ReconstructionMethod {dc, plm, ppm4, ppmx, wenoz};

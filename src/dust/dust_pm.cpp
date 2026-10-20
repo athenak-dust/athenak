@@ -134,14 +134,11 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       int ncells1 = qdep.extent_int(4);
       int ncells2 = qdep.extent_int(3);
       bool linear = (cloud_gather_order == 2) && transfer.cloud_mode;
-      bool flocal = cloud_force_local && transfer.cloud_mode;
-      bool fchild = cloud_force_children && transfer.cloud_mode;
-      bool deform = cloud_deform && transfer.cloud_mode;
       int tmode = cloud_transition;
-      if (linear && !flocal && !fchild && !deform) {
+      if (linear) {
         // Production refinable-cloud predictor: the linear gather and the
-        // cloud-weight deposit only.  Same arithmetic as the general kernel below, kept
-        // separate because the unused variants there cost registers and occupancy.
+        // cloud-weight deposit.  (The general kernel dust_pc2_cloud_predictor with the
+        // force / deformation variants was removed.)
         // The gas velocity of every cell (ghosts included) is formed once; the gather then
         // reads velocities, as the advance does with u*, instead of dividing five momenta
         // by five densities in each of the cloud's cells.
@@ -206,117 +203,6 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
           CloudParFor("dust_pc2_cloud_predictor_linear", cloud_launch_bounds, npart, pred_body);
         }
         HaloReverseAdd(qdep, 1, 4);   // deposits on halo blocks back to their owners
-        return TaskStatus::complete;
-      }
-      if (linear || flocal || fchild || deform) {
-        // Refinable-cloud variants: (linear) the gather integrates a linear
-        // reconstruction of the old gas velocity over the cloud (central slopes over
-        // the block's own cells, ghosts included, moments about the leaf centre);
-        // (flocal) the gas-side drag deposited into a leaf uses the velocity the cloud
-        // sees in that leaf instead of the cloud average, which keeps the total
-        // impulse identical and the exchange antisymmetric per particle; (deform) as
-        // flocal on the gas side, while the dust side is the cloud's linear velocity
-        // field v + G.(x - x_p), whose integral over a leaf is w*v + G.m1 (the first
-        // moments m1 sum to zero over the cloud, so the total impulse is unchanged).
-        par_for("dust_pc2_cloud_predictor",DevExeSpace(),0,(npart-1),
-        KOKKOS_LAMBDA(const int p) {
-          Real xp = pr(IPX,p), yp = pr(IPY,p);
-          const int am = lt.Anchor(pi(PGID,p));   // anchor block of the cloud
-          int lev = pi(PLEV,p);
-          auto leaf_value = [&](const Real px, const Real py,
-                                const int tm, const int tj, const int ti, const Real w,
-                                const Real m1x, const Real m1y,
-                                Real &ux, Real &uy, Real &uz) {
-            Real invrho = 1.0/uold(tm,IDN,ks,tj,ti);
-            ux = w*uold(tm,IM1,ks,tj,ti)*invrho;
-            uy = w*uold(tm,IM2,ks,tj,ti)*invrho;
-            uz = w*uold(tm,IM3,ks,tj,ti)*invrho;
-            if (!linear) return;
-            Real dx1 = mbsize.d_view(tm).dx1, dx2 = mbsize.d_view(tm).dx2;
-            Real xc = mbsize.d_view(tm).x1min + (ti - is + 0.5)*dx1;
-            Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
-            Real cx = 0.5*(m1x + transfer.MinImage1(px - xc)*w)/dx1;
-            Real cy = 0.5*(m1y + transfer.MinImage2(py - yc)*w)/dx2;
-            Real rip = 1.0/uold(tm,IDN,ks,tj,ti+1), rim = 1.0/uold(tm,IDN,ks,tj,ti-1);
-            Real rjp = 1.0/uold(tm,IDN,ks,tj+1,ti), rjm = 1.0/uold(tm,IDN,ks,tj-1,ti);
-            ux += cx*(uold(tm,IM1,ks,tj,ti+1)*rip - uold(tm,IM1,ks,tj,ti-1)*rim)
-                + cy*(uold(tm,IM1,ks,tj+1,ti)*rjp - uold(tm,IM1,ks,tj-1,ti)*rjm);
-            uy += cx*(uold(tm,IM2,ks,tj,ti+1)*rip - uold(tm,IM2,ks,tj,ti-1)*rim)
-                + cy*(uold(tm,IM2,ks,tj+1,ti)*rjp - uold(tm,IM2,ks,tj-1,ti)*rjm);
-            uz += cx*(uold(tm,IM3,ks,tj,ti+1)*rip - uold(tm,IM3,ks,tj,ti-1)*rim)
-                + cy*(uold(tm,IM3,ks,tj+1,ti)*rjp - uold(tm,IM3,ks,tj-1,ti)*rjm);
-          };
-          Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-          lt.ForEachCloudMoment(xp, yp, SMRCompositeTransfer::GatherCode(lev, tmode), am,
-          [&](const int target, const Real w, const Real m1x, const Real m1y) {
-            int ti = target % ncells1;
-            int remainder = target/ncells1;
-            int tj = remainder % ncells2;
-            int tm = remainder/ncells2;
-            Real ux, uy, uz;
-            leaf_value(xp, yp, tm, tj, ti, w, m1x, m1y, ux, uy, uz);
-            ugx += ux; ugy += uy; ugz += uz;
-          });
-          Real mass_rate = pr(IPM,p)/pr(IPTS,p);
-          Real vpx = pr(IPVX,p), vpy = pr(IPVY,p), vpz = pr(IPVZ,p);
-          Real gxx = 0.0, gxy = 0.0, gyx = 0.0, gyy = 0.0, gzx = 0.0, gzy = 0.0;
-          if (deform) {
-            gxx = pr(IPGXX,p); gxy = pr(IPGXY,p);
-            gyx = pr(IPGYX,p); gyy = pr(IPGYY,p);
-            gzx = pr(IPGZX,p); gzy = pr(IPGZY,p);
-          }
-          if (fchild && lt.CloudOverlapsFiner(xp, yp, lev, am)) {
-            // deposit as the 3^2 two-scale children: each child gathers its own mean
-            // gas velocity and spreads (mean - v) with its own weights; the children's
-            // gathers average exactly to the parent's, so the total is unchanged
-            transfer.ForEachChild(xp, yp, lev,
-            [&](const Real cx, const Real cy, const Real fraction) {
-              Real cgx = 0.0, cgy = 0.0, cgz = 0.0;
-              lt.ForEachCloudMoment(cx, cy, lev+1, am,
-              [&](const int target, const Real w, const Real m1x, const Real m1y) {
-                int ti = target % ncells1;
-                int remainder = target/ncells1;
-                int tj = remainder % ncells2;
-                int tm = remainder/ncells2;
-                Real ux, uy, uz;
-                leaf_value(cx, cy, tm, tj, ti, w, m1x, m1y, ux, uy, uz);
-                cgx += ux; cgy += uy; cgz += uz;
-              });
-              lt.ForEachCloudMoment(cx, cy, lev+1, am,
-              [&](const int target, const Real w, const Real m1x, const Real m1y) {
-                int ti = target % ncells1;
-                int remainder = target/ncells1;
-                int tj = remainder % ncells2;
-                int tm = remainder/ncells2;
-                Real inv_volume = fraction/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
-                DepositAdd(&qdep_(tm,1,ks,tj,ti), -dt*mass_rate*inv_volume*w*(cgx - vpx));
-                DepositAdd(&qdep_(tm,2,ks,tj,ti), -dt*mass_rate*inv_volume*w*(cgy - vpy));
-                DepositAdd(&qdep_(tm,3,ks,tj,ti), -dt*mass_rate*inv_volume*w*(cgz - vpz));
-                if (rate_dep) DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
-              });
-            });
-            return;
-          }
-          lt.ForEachCloudMoment(xp, yp, lev, am,
-          [&](const int target, const Real w, const Real m1x, const Real m1y) {
-            int ti = target % ncells1;
-            int remainder = target/ncells1;
-            int tj = remainder % ncells2;
-            int tm = remainder/ncells2;
-            Real fx = w*ugx, fy = w*ugy, fz = w*ugz;
-            if (flocal || deform) leaf_value(xp, yp, tm, tj, ti, w, m1x, m1y, fx, fy, fz);
-            if (deform) {
-              fx -= gxx*m1x + gxy*m1y;
-              fy -= gyx*m1x + gyy*m1y;
-              fz -= gzx*m1x + gzy*m1y;
-            }
-            Real inv_volume = 1.0/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
-            DepositAdd(&qdep_(tm,1,ks,tj,ti), -dt*mass_rate*inv_volume*(fx - w*vpx));
-            DepositAdd(&qdep_(tm,2,ks,tj,ti), -dt*mass_rate*inv_volume*(fy - w*vpy));
-            DepositAdd(&qdep_(tm,3,ks,tj,ti), -dt*mass_rate*inv_volume*(fz - w*vpz));
-            if (rate_dep) DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
-          });
-        });
         return TaskStatus::complete;
       }
       par_for("dust_pc2_composite_predictor",DevExeSpace(),0,(npart-1),
