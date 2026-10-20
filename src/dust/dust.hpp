@@ -21,7 +21,9 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <chrono>
@@ -1244,6 +1246,25 @@ struct DustGasDragTaskIDs {
 };
 
 namespace dust {
+
+// 2026-10-20 cleanup: a key whose option was removed.  An input or
+// restart file that still writes it is accepted when the value asks for the behaviour that
+// remains (keeps: usually the old default); otherwise the run stops instead of silently running
+// another method.  The removed paths still run in the version tagged pre-cleanup-20261020.
+// The guard sits where the key used to be read; block: the input block (<dust> or <problem>).
+inline void RemovedKey(ParameterInput *pin, const char *key, const bool keeps, const char *what,
+                       const char *block = "dust") {
+  if (!pin->DoesParameterExist(block, key) || keeps) return;
+  std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+            << "<" << block << ">/" << key << " = " << pin->GetString(block, key) << ": " << what
+            << " was removed on 2026-10-20 (it runs in the version tagged pre-cleanup-20261020)"
+            << std::endl;
+  std::exit(EXIT_FAILURE);
+}
+// the key is absent or false
+inline bool KeyFalse(ParameterInput *pin, const char *key, const char *block = "dust") {
+  return !pin->DoesParameterExist(block, key) || !pin->GetBoolean(block, key);
+}
 
 // Particle deposits need atomic updates on parallel execution spaces because stencil
 // footprints overlap.  Kokkos::Serial has only one worker, however, so its generic

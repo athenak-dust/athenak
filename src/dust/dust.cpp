@@ -27,23 +27,7 @@
 
 namespace dust {
 
-namespace {
-// 2026-10-20 cleanup: a key whose option was removed.  An input or
-// restart file that still writes it is accepted when the value asks for the behaviour that
-// remains (the old default); otherwise the run stops instead of silently running another method.
-// The removed paths still run in the version tagged pre-cleanup-20261020.
-void RemovedKey(ParameterInput *pin, const char *key, const bool keeps, const char *what) {
-  if (!pin->DoesParameterExist("dust", key) || keeps) return;
-  std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-            << "<dust>/" << key << " = " << pin->GetString("dust", key) << ": " << what
-            << " was removed on 2026-10-20 (it runs in the version tagged pre-cleanup-20261020)"
-            << std::endl;
-  std::exit(EXIT_FAILURE);
-}
-bool KeyFalse(ParameterInput *pin, const char *key) {
-  return !pin->DoesParameterExist("dust", key) || !pin->GetBoolean("dust", key);
-}
-}  // namespace
+// (RemovedKey and KeyFalse, the guards of removed keys: dust.hpp)
 
 //----------------------------------------------------------------------------------------
 // constructor: parses input, validates configuration, allocates deposit fields and
@@ -405,21 +389,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                  "the gas-side drag with the leaf's own velocity");
       RemovedKey(pin, "cloud_force_children", KeyFalse(pin, "cloud_force_children"),
                  "the drag deposited as two-scale children");
-      // The level-native traversal of the finest-grid table (already off by default: the
-      // production kernels use the actual leaves) and its check
-      // are gone; the table itself stays (host split, leaf check, other controls)
-      RemovedKey(pin, "cloud_native_transfer", KeyFalse(pin, "cloud_native_transfer"),
-                 "the level-native traversal");
-      RemovedKey(pin, "cloud_native_check",
-                 !pin->DoesParameterExist("dust", "cloud_native_check") ||
-                 pin->GetInteger("dust", "cloud_native_check") <= 0,
-                 "the check of the level-native traversal");
-      // The Morton order of the storage sort is gone;
-      // linear (default) and random (a test tool) stay (dust_cloud.cpp)
-      RemovedKey(pin, "cloud_sort_order",
-                 !pin->DoesParameterExist("dust", "cloud_sort_order") ||
-                 pin->GetString("dust", "cloud_sort_order") != "morton",
-                 "the Morton order of the particle sort");
       // The fixed gather level (a diagnostic) is gone
       RemovedKey(pin, "cloud_gather_level",
                  !pin->DoesParameterExist("dust", "cloud_gather_level") ||

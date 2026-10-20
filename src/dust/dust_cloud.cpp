@@ -82,6 +82,15 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // (LeafTraversal).  <dust>/cloud_table = auto (default: built when one of its users is set),
   // true or false.  The table supports the root and two levels of refinement; without it the
   // levels are limited by the cloud code (4 bits) only.
+  // The level-native traversal of the table (already off by default; the
+  // production kernels use the actual leaves) and its check are gone; the table
+  // itself stays (host split, host merge, leaf check, other controls)
+  RemovedKey(pin, "cloud_native_transfer", KeyFalse(pin, "cloud_native_transfer"),
+             "the level-native traversal");
+  RemovedKey(pin, "cloud_native_check",
+             !pin->DoesParameterExist("dust", "cloud_native_check") ||
+             pin->GetInteger("dust", "cloud_native_check") <= 0,
+             "the check of the level-native traversal");
   // cloud_leaf_check compares the actual-leaf traversal with the table
   cloud_leaf_check = pin->GetOrAddInteger("dust", "cloud_leaf_check", 0);
   // cloud_particle_dump (diagnostic): at the start of cycle N every rank writes its particles
@@ -110,8 +119,13 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     cloud_sort_interval = pin->GetOrAddInteger("dust", "cloud_sort_interval", sortdef ? 64 : 0);
   }
   {
+    // The Morton sort order is gone; linear (default) and
+    // random (a test tool) stay
+    RemovedKey(pin, "cloud_sort_order",
+               !pin->DoesParameterExist("dust", "cloud_sort_order") ||
+               pin->GetString("dust", "cloud_sort_order") != "morton",
+               "the Morton order of the particle sort");
     const std::string so = pin->GetOrAddString("dust", "cloud_sort_order", "linear");
-    // (morton was removed on 2026-10-20; dust.cpp stops on it)
     if (so != "linear" && so != "random") {
       std::cout << "### FATAL ERROR: <dust>/cloud_sort_order must be linear or random" << std::endl;
       std::exit(EXIT_FAILURE);
