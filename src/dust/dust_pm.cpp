@@ -197,10 +197,10 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
           }
         };
         if (cloud_ord_n > 0) {   // in the order of the cell-sorted index
-          CloudParForOrdered("dust_pc2_cloud_predictor_linear", cloud_launch_bounds, npart, cloud_ord,
+          CloudParForOrdered("dust_pc2_cloud_predictor_linear", npart, cloud_ord,
                              cloud_ord_n, pred_body);
         } else {
-          CloudParFor("dust_pc2_cloud_predictor_linear", cloud_launch_bounds, npart, pred_body);
+          CloudParFor("dust_pc2_cloud_predictor_linear", npart, pred_body);
         }
         HaloReverseAdd(qdep, 1, 4);   // deposits on halo blocks back to their owners
         return TaskStatus::complete;
@@ -347,7 +347,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
     if (cloud && cloud_ord_n > 0 && cloud_ord_n <= npart) {
       // In the order of the cell-sorted index (a permutation of its slots,
       // which the migration of this stage may have refilled)
-      CloudParForOrdered("dust_composite_scatter", cloud_launch_bounds, npart, cloud_ord,
+      CloudParForOrdered("dust_composite_scatter", npart, cloud_ord,
                          cloud_ord_n, scat_body);
     } else {
       par_for("dust_composite_scatter",DevExeSpace(),0,(npart-1), scat_body);
@@ -809,10 +809,10 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
       };
       if (cloud_ord_n > 0 && cloud_ord_n <= npart) {
         // In the order of the cell-sorted index (a permutation of its slots)
-        CloudParForOrdered("dust_cloud_gather_kick", cloud_launch_bounds, npart, cloud_ord,
+        CloudParForOrdered("dust_cloud_gather_kick", npart, cloud_ord,
                            cloud_ord_n, gk_body);
       } else {
-        CloudParFor("dust_cloud_gather_kick", cloud_launch_bounds, npart, gk_body);
+        CloudParFor("dust_cloud_gather_kick", npart, gk_body);
       }
       if (br) HaloReverseAdd(dmom, 0, 3);   // halo deposits back to their owners
       return TaskStatus::complete;

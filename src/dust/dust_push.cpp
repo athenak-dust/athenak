@@ -244,10 +244,10 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
           }
         };
         if (cloud_ord_n > 0) {   // in the order of the cell-sorted index
-          CloudParForOrdered("dust_pc2_advance_linear", cloud_launch_bounds, npart, cloud_ord, cloud_ord_n,
+          CloudParForOrdered("dust_pc2_advance_linear", npart, cloud_ord, cloud_ord_n,
                              adv_body);
         } else {
-          CloudParFor("dust_pc2_advance_linear", cloud_launch_bounds, npart, adv_body);
+          CloudParFor("dust_pc2_advance_linear", npart, adv_body);
         }
         if (br) HaloReverseAdd(dmom, 0, 3);   // halo deposits back to their owners
         return TaskStatus::complete;

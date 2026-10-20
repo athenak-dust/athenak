@@ -1291,33 +1291,38 @@ void DepositAdd(Real *destination, const Real value) {
 // leaf-weight cache in team scratch (shared memory, teams of 128) instead of per-thread local
 // arrays changed nothing measurable (277 s against 280 s).  Both gave results identical to this
 // kernel on the CPU.  ncu: 128 registers, 25% occupancy, waiting on L1 data.
-// The two production cloud kernels over particles 0..n-1 with a
-// launch bound, <dust>/cloud_launch_bounds = 0 none, 1 <256, 2> (at most 128 registers,
-// default: fastest on GB200), 2 <128, 3> (at most 168), 3 <256, 3> (at most 85); occupancy
-// against spills.
+// The cloud kernels over particles 0..n-1 with a launch bound: 0 none, 1
+// <256, 2> (at most 128 registers, default: fastest on GB200), 2 <128, 3> (at most 168), 3
+// <256, 3> (at most 85); occupancy against spills.  Rixin: a
+// compile-time choice, -DDUST_CLOUD_LAUNCH_BOUNDS=n (the run-time key <dust>/cloud_launch_bounds
+// compiled all four variants of every cloud kernel); the key is accepted only with the compiled
+// value (dust.cpp)
+#ifndef DUST_CLOUD_LAUNCH_BOUNDS
+#define DUST_CLOUD_LAUNCH_BOUNDS 1
+#endif
+#if DUST_CLOUD_LAUNCH_BOUNDS == 1
+using CloudPolicy = Kokkos::RangePolicy<DevExeSpace, Kokkos::LaunchBounds<256, 2>>;
+#elif DUST_CLOUD_LAUNCH_BOUNDS == 2
+using CloudPolicy = Kokkos::RangePolicy<DevExeSpace, Kokkos::LaunchBounds<128, 3>>;
+#elif DUST_CLOUD_LAUNCH_BOUNDS == 3
+using CloudPolicy = Kokkos::RangePolicy<DevExeSpace, Kokkos::LaunchBounds<256, 3>>;
+#elif DUST_CLOUD_LAUNCH_BOUNDS == 0
+using CloudPolicy = Kokkos::RangePolicy<DevExeSpace>;
+#else
+#error "DUST_CLOUD_LAUNCH_BOUNDS must be 0, 1, 2 or 3"
+#endif
 template <typename Function>
-void CloudParFor(const std::string &name, const int bounds, const int n, const Function &f) {
-  using LB1 = Kokkos::RangePolicy<DevExeSpace, Kokkos::LaunchBounds<256, 2>>;
-  using LB2 = Kokkos::RangePolicy<DevExeSpace, Kokkos::LaunchBounds<128, 3>>;
-  using LB3 = Kokkos::RangePolicy<DevExeSpace, Kokkos::LaunchBounds<256, 3>>;
-  if (bounds == 1) {
-    Kokkos::parallel_for(name, LB1(0, n), f);
-  } else if (bounds == 2) {
-    Kokkos::parallel_for(name, LB2(0, n), f);
-  } else if (bounds == 3) {
-    Kokkos::parallel_for(name, LB3(0, n), f);
-  } else {
-    Kokkos::parallel_for(name, Kokkos::RangePolicy<DevExeSpace>(0, n), f);
-  }
+void CloudParFor(const std::string &name, const int n, const Function &f) {
+  Kokkos::parallel_for(name, CloudPolicy(0, n), f);
 }
 
 // cloud_order_interval: the same kernels over the particles in the order of an
 // index (ord(k) for k < nidx, k itself for the particles appended since the index was built)
 template <typename Function>
-void CloudParForOrdered(const std::string &name, const int bounds, const int n,
+void CloudParForOrdered(const std::string &name, const int n,
                         const DvceArray1D<int> &ord, const int nidx, const Function &f) {
   auto g = KOKKOS_LAMBDA(const int k) {f((k < nidx) ? ord(k) : k);};
-  CloudParFor(name, bounds, n, g);
+  CloudParFor(name, n, g);
 }
 
 // Shared NGP/CIC/TSC stencil for deposits, matrix-free gathers, and the final kick.
@@ -1473,8 +1478,6 @@ class DustGasDrag {
   int cloud_resample_device_mid = 0;   // ... patches of 65..mid clouds in a middle
   int cloud_resample_device_mid_team = 128;   //     bucket with teams of this many threads (0: off)
   int cloud_resample_device_wide_team = 512;  // ... large-bucket team (1024: a 1024-thread kernel)
-  int cloud_launch_bounds = 1;        // launch bound of the two
-                                      // production cloud kernels (CloudParFor)
   bool cloud_resample_compare = false; // ... diagnostic: host and device on the same pool, compared
   bool cloud_resample_patch_stats = false;   // diagnostic: patches by level and size
   bool cloud_resample_feedback_check = false;   // ... diagnostic: AuditFeedback before / after

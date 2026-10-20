@@ -655,8 +655,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // (QR -35%, resampling -10%, no fallback)
       cloud_resample_qr_rows = pin->GetOrAddBoolean("dust", "cloud_resample_qr_rows", true);
       // Default <256, 2> (at most 128 registers): on GB200 the two production
-      // cloud kernels are 8-16% faster than without a bound (BA 128/256 and the dynamic mesh)
-      cloud_launch_bounds = pin->GetOrAddInteger("dust", "cloud_launch_bounds", 1);
+      // cloud kernels are 8-16% faster than without a bound (BA 128/256 and the dynamic mesh).
+      // Rixin: a compile-time choice (DUST_CLOUD_LAUNCH_BOUNDS, dust.hpp);
+      // an input or restart may only ask for the compiled value
+      if (pin->GetOrAddInteger("dust", "cloud_launch_bounds", DUST_CLOUD_LAUNCH_BOUNDS) !=
+          DUST_CLOUD_LAUNCH_BOUNDS) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "<dust>/cloud_launch_bounds = " << pin->GetString("dust", "cloud_launch_bounds")
+                  << ", but this binary was built with DUST_CLOUD_LAUNCH_BOUNDS = "
+                  << DUST_CLOUD_LAUNCH_BOUNDS << " (the launch bound of the cloud kernels is a "
+                  << "compile-time choice since 2026-10-20: rebuild with "
+                  << "-DDUST_CLOUD_LAUNCH_BOUNDS=<n> in CMAKE_CXX_FLAGS, or drop the key)" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       cloud_resample_compare = pin->GetOrAddBoolean("dust", "cloud_resample_compare", false);
       // Diagnostic: per resampling, the patches by level and size (clouds, removals,
       // steps) and the largest patches, in cloud_resample_patch_stats.txt
