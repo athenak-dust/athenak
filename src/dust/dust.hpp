@@ -76,7 +76,7 @@ enum class HybridForceMode {automatic=0, pc2=1, split_be=2};
 // owner_overlap choice is retained only as a negative control. refinable_cloud gives
 // every particle its own hat cloud: weights are exact integrals of
 // the cloud over active leaf cells, and clouds change size only by the exact B-spline
-// two-scale split (see DustGasDrag::SplitAndMergeClouds).
+// two-scale split (see DustGasDrag::SplitCloudsP1).
 enum class DustSMRTransfer {none=0, owner_overlap=1, smooth_p2=2, refinable_cloud=3};
 
 // Device-copyable description of the smooth composite transfer. Each virtual coarse
@@ -1367,16 +1367,16 @@ class DustGasDrag {
   SMRCompositeTransfer smr_transfer;
   // refinable-cloud controls and counters (SplitAndMergeClouds)
   Real cloud_split_slack = 0.02;      // support test shrinks the cloud by this fraction
-  Real cloud_merge_tolerance = 0.05;  // coincidence radius in finest-cell units
   int cloud_gather_order = 1;         // 2: gather a linear reconstruction of the leaves
   int cloud_transition = 0;           // P1 transition clouds at split edges:
                                       // 1 gathers with the child hat, 2 with the lobed
                                       // weights and point-valued reconstructions
   int cloud_next_tag = -1;            // next PTAG for created particles (-1 = unset)
   void EnsureNextTag();               // ... largest tag + 1, once
-  bool cloud_p1_split = false;        // moving-particle P1 split: edge children
+  bool cloud_p1_split = true;         // moving-particle P1 split: edge children
                                       // separate only where the neighbour parent splits,
-                                      // no merging (requires cloud_transition > 0)
+                                      // no merging (requires cloud_transition > 0); the
+                                      // only split since 2026-10-20 (the old 3x3 one is gone)
   bool cloud_merge = false;           // coarsening: far from finer
                                       // leaves, release lobes and merge fine clouds that are
                                       // indistinguishable at the coarser level
@@ -1554,6 +1554,8 @@ class DustGasDrag {
   };
   AnalyticGather analytic_gather;
   unsigned long long cloud_split_event = 0;
+  // cloud_merge_count: coincident children merged by the old 3x3 split (removed 2026-10-20);
+  // stays 0, kept in the restart record and the summary line
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   unsigned long long cloud_lobe_split_count = 0;
   // the switching metric (the cell feedback stiffness, its reduction and the
@@ -1660,7 +1662,6 @@ class DustGasDrag {
   void UnpackRestartState(const char *p, std::size_t nbytes);
   int SplitAndMergeClouds();   // returns the number of clouds split
   int SwitchCloudsToLeafLevel();   // instant switch; returns the clouds changed
-  int MakeTransitionClouds();  // P1 transition clouds at split edges
   int SplitCloudsP1();         // moving-particle P1 split
   int SplitCloudsP1Device();   // device P1 split without the diagnostics
   TaskStatus RefineClouds(Driver *pdrive, int stage);

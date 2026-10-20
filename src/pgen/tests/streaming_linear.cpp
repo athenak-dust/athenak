@@ -650,7 +650,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     // seed_after_split, no merging, no lobe release; outside the refined region nothing
     // is eligible at run time, so the graded pieces are never split again.
     const int glayers = pin->GetOrAddInteger("problem", "graded_split_layers", -1);
-    int ntrans = 0;
     if (glayers >= 0) {
       auto *pd = pmbp->pdust;
       if (transfer.cloud_nlev != 1 || ppc_int != 1 || !seed_after || !pd->cloud_p1_split ||
@@ -788,7 +787,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       // still finer region (the tag counter is set collectively first)
       pmbp->pdust->EnsureNextTag();
       pmbp->pdust->SplitToLeaves();
-      ntrans = pmbp->pdust->MakeTransitionClouds();
     }
     if (seed_after) {
       auto h2 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
@@ -832,7 +830,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     if (global_variable::my_rank == 0) {
       std::cout << "# refinable_cloud lattice: " << nlattice << " root clouds -> "
                 << ppar->nprtcl_thispack << " particles after the initial split"
-                << " (" << ntrans << " edge children merged into transition clouds)"
                 << (seed_after ? ", seed imprinted after the split" : "") << std::endl;
     }
     // <problem>/merge_replay = snapshot (diagnostic): replace the

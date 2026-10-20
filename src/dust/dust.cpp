@@ -395,7 +395,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         std::exit(EXIT_FAILURE);
       }
       cloud_split_slack = pin->GetOrAddReal("dust", "cloud_split_slack", 0.02);
-      cloud_merge_tolerance = pin->GetOrAddReal("dust", "cloud_merge_tolerance", 0.05);
       // The research gather / deposit variants are gone with their
       // general PC2 kernels: the leaf's own gas velocity in the gas-side drag and the drag
       // deposited as two-scale children over finer leaves, and the deformable clouds
@@ -423,11 +422,18 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // the first overlap with finer leaves (cloud_split_overlap, dust_cloud.cpp), with the P1
       // transition clouds of mode 2 and the linear gather that mode needs.  Inputs written
       // before 2026-10-17 that leave these keys out get the new values.
+      // The old 3x3 two-scale host split (cloud_p1_split = false,
+      // with its coincident-child merging, cloud_merge_tolerance, and the transition
+      // clouds) is gone; the key stays, true is its only value.
+      // cloud_merge_tolerance acted only there and is ignored.
+      RemovedKey(pin, "cloud_p1_split",
+                 !pin->DoesParameterExist("dust", "cloud_p1_split") ||
+                 pin->GetBoolean("dust", "cloud_p1_split"),
+                 "the 3x3 two-scale host split without P1");
       cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", true);
-      cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order",
-                                                cloud_p1_split ? 2 : 1);
+      cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order", 2);
       cloud_transition = pin->GetOrAddInteger("dust", "cloud_transition",
-                                              cloud_p1_split ? (cloud_gather_order == 2 ? 2 : 1) : 0);
+                                              cloud_gather_order == 2 ? 2 : 1);
       if (cloud_transition < 0 || cloud_transition > 2 ||
           (cloud_transition == 2 && cloud_gather_order != 2)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -771,13 +777,12 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      if (cloud_merge && (!cloud_p1_split || cloud_split_interp ||
-                          cloud_merge_buffer < 2 ||
+      if (cloud_merge && (cloud_split_interp || cloud_merge_buffer < 2 ||
                           cloud_merge_alpha <= 0.0 || cloud_merge_interval < 1)) {
         // lattice-Ai looks nodes up on the root lattice, which merged centroids leave
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_merge needs cloud_p1_split, excludes "
-                  << "cloud_split_interp, and needs cloud_merge_buffer >= 2, "
+                  << std::endl << "<dust>/cloud_merge excludes cloud_split_interp and "
+                  << "needs cloud_merge_buffer >= 2, "
                   << "cloud_merge_alpha > 0"
                   << " and cloud_merge_interval >= 1" << std::endl;
         std::exit(EXIT_FAILURE);
@@ -785,10 +790,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // The x1-only presplit of root clouds is gone
       RemovedKey(pin, "cloud_presplit_x1", KeyFalse(pin, "cloud_presplit_x1"),
                  "the x1-only presplit of root clouds");
-      if (cloud_split_interp && (!cloud_p1_split || global_variable::nranks > 1)) {
+      if (cloud_split_interp && global_variable::nranks > 1) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_split_interp requires cloud_p1_split and a "
-                  << "single rank" << std::endl;
+                  << std::endl << "<dust>/cloud_split_interp requires a single rank"
+                  << std::endl;
         std::exit(EXIT_FAILURE);
       }
       if (cloud_split_log_leaves && !cloud_split_log) {
@@ -797,13 +802,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      if (cloud_split_log && (!cloud_p1_split || global_variable::nranks > 1)) {
+      if (cloud_split_log && global_variable::nranks > 1) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_split_log (diagnostic) requires "
-                  << "cloud_p1_split and a single rank" << std::endl;
+                  << std::endl << "<dust>/cloud_split_log (diagnostic) requires a single "
+                  << "rank" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      if (cloud_p1_split && cloud_transition == 0) {
+      if (cloud_transition == 0) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<dust>/cloud_p1_split requires cloud_transition=1 or 2 "
                   << "(the gather used for transition clouds)" << std::endl;
@@ -1056,8 +1061,7 @@ DustGasDrag::~DustGasDrag() {
       smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
     std::cout << "# DUST_CLOUD_SUMMARY splits=" << cloud_split_count
               << " merges=" << cloud_merge_count
-              << (cloud_p1_split ? " lobe_splits=" + std::to_string(cloud_lobe_split_count)
-                                 : std::string())
+              << " lobe_splits=" << cloud_lobe_split_count
               << (cloud_instant_switch ? " instant_switches=" + std::to_string(cloud_switch_count)
                                        : std::string())
               << (cloud_merge ? " coarsen_events=" + std::to_string(cloud_coarsen_events) +
