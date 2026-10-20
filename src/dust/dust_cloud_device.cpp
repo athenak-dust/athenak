@@ -988,6 +988,10 @@ int DustGasDrag::MergeCloudsDevice() {
   const bool lobe_wait = cloud_merge_lobe_wait > 0, lobe_wait_dir = cloud_merge_lobe_wait == 2;
   const bool d3 = cloud_merge_d3;
   const bool absorb = cloud_merge_absorb;
+  // the cell lists of unreleased lobed clouds are read by the tent pass with
+  // cloud_merge_lobe_wait and by the absorption only; quantum G without absorption (production)
+  // does not build them, whatever cloud_merge_lobe_wait says (old inputs and restarts carry 1)
+  const bool lobe_keys = absorb || (cloud_merge_mode != 1 && lobe_wait);
   double absc[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // absorbed n, absorbed mass, incompatible, no recipient, dK
   const int d3_iter = cloud_merge_d3_iter;
   double d3s[2] = {0.0, 0.0};   // D3 diagnostic: row first-moment mismatch^2 before / after
@@ -1018,7 +1022,7 @@ int DustGasDrag::MergeCloudsDevice() {
       const int code = pi(PLEV,p);
       kp(p) = -1; kc(p) = -1; kl(p) = -1;
       if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) {
-        if ((lobe_wait || absorb) && SMRCompositeTransfer::CloudLevel(code) == lev && pr(IPM,p) > 0.0) {
+        if (lobe_keys && SMRCompositeTransfer::CloudLevel(code) == lev && pr(IPM,p) > 0.0) {
           kl(p) = pi(PSP,p)*ncl + mm.Cell(pr(IPX,p), pr(IPY,p), L);
         }
         return;
@@ -1032,7 +1036,7 @@ int DustGasDrag::MergeCloudsDevice() {
     KeyCSR spc, scc, slc;
     BuildKeyCSR(kp, 4*ncl, 0, spc);   // keys sp ncl + cell, at most 4 species
     BuildKeyCSR(kc, 4*ncl, 1, scc);
-    if (lobe_wait || absorb) BuildKeyCSR(kl, 4*ncl, 2, slc);
+    if (lobe_keys) BuildKeyCSR(kl, 4*ncl, 2, slc);
     if (cloud_merge_mode == 1) {
       // ===== quantum mode =====
       // X: exact P1-stencil re-merge (geometric, strict tolerance, velocity bounding box);
