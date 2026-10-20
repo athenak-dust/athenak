@@ -1196,7 +1196,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     Kokkos::sort(key);
     resample::DevicePatchProblem pb;
     pb.npool = npool; pb.npatch = npatch;
-    if (ProfOn()) pb.stage = DvceArray1D<unsigned long long>("rs_stage", resample::kNStage);
+    if (DUST_R_DIAG && ProfOn()) pb.stage = DvceArray1D<unsigned long long>("rs_stage", resample::kNStage);
     pb.qr_rows = cloud_resample_qr_rows;
     pb.lx = lx; pb.ly = ly; pb.pgeo = pgeo;
     pb.pptr = DvceArray1D<int>("rs_pptr", npatch + 1);

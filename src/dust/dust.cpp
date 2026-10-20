@@ -959,10 +959,16 @@ DustGasDrag::~DustGasDrag() {
     }
     std::cout << std::endl;
   }
-  if (global_variable::my_rank == 0 && resample::StageTotals()[resample::kNStage - 1] > 0) {
-    // Device clock cycles of the patch solves by stage, summed over the teams
+  // Codex review: printed once a profiled R has run (the patch count; the last
+  // entry, the negative basic solutions, can stay 0)
+  if (global_variable::my_rank == 0 && ProfOn() && !DUST_R_DIAG && cloud_resample && cloud_resample_device) {
+    std::cout << "# DUST_R_STAGES not compiled (build with -DDUST_R_DIAG=1)" << std::endl;
+  }
+  if (global_variable::my_rank == 0 && resample::StageTotals()[resample::kStagePatches] > 0) {
+    // Device clock cycles of the patch solves by stage, summed over the teams of
+    // rank 0 (CUDA only; 0 on other backends)
     const unsigned long long *t = resample::StageTotals();
-    std::cout << "# DUST_R_STAGES (device clock cycles, summed over the teams) rows=" << t[0]
+    std::cout << "# DUST_R_STAGES (rank 0, device clock cycles, summed over the teams) rows=" << t[0]
               << " qr=" << t[1] << " null=" << t[2] << " steps=" << t[3] << " stream=" << t[4]
               << " stream_rest=" << (t[4] - t[1] - t[2] - t[3]) << " check=" << t[5]
               << " patches=" << t[6] << std::endl;

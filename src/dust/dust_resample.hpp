@@ -14,6 +14,15 @@
 #include <limits>
 #include "athena.hpp"
 
+// The stage clock (DUST_R_STAGES) and the basic-solution check (DUST_R_BASIS) of the
+// device patch solves are compiled only with -DDUST_R_DIAG=1.  Compiled in but switched off they
+// still changed the solve kernels (local CUDA build, sm_89: the small-patch kernel 168 -> 178
+// registers, the 512- and 1024-thread kernels 24 / 32 more stack bytes per thread, 64 more bytes
+// of shared memory each).  With DUST_R_DIAG = 0, amr_profile still times the phases on the host.
+#ifndef DUST_R_DIAG
+#define DUST_R_DIAG 0
+#endif
+
 namespace dust {
 namespace resample {
 
@@ -53,8 +62,15 @@ struct DevicePatchProblem {
 // (1-3 included), 5 row check, 6 patches timed; StageTotals() sums them over the run (host).
 // Counts, not cycles: 7 QR blocks with a null space, 8 of them whose basic solution
 // on the pivot columns (the other clouds at zero) lies within 0 <= w <= cap, 9 within the bounds
-// except above a cap, 10 with a negative mass
+// except above a cap, 10 with a negative mass.
+// Scope (Codex review): the totals are this rank's only (DUST_R_STAGES prints
+// rank 0's, not a sum over ranks); the clock cycles exist only on CUDA (Clk() is 0 elsewhere),
+// the counts 6-10 on every backend.  The time of the basic-solution check (7-10) is outside
+// stages 1-3 and so lands in the stream's rest (4 minus 1-3; before 2026-10-20 it fell into 2).  With amr_profile off these branches do
+// not run, but compiled in they still cost registers and stack: hence DUST_R_DIAG above (the
+// cost is read from the compiler's resource report, not the runtime condition).
 constexpr int kNStage = 11;
+constexpr int kStagePatches = 6;   // the number of timed patches: > 0 once a profiled R has run
 inline unsigned long long *StageTotals() {
   static unsigned long long t[kNStage] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   return t;

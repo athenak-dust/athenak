@@ -13,9 +13,13 @@
 //! forms serially is formed serially by one team thread in the host order (a QR column, a
 //! row of the check, a back substitution, the step search along one null vector), and the
 //! maxima / minima the host takes with strict comparisons break ties by the smallest index.
-//! The device result therefore follows the host's arithmetic order; it can still differ by
-//! round-off (fused multiply-add, sqrt / hypot of the device library), which the comparison
-//! mode (<dust>/cloud_resample_compare) measures.
+//! The device result therefore follows the host's arithmetic order, except the Householder norm
+//! below the QR diagonal, which is a team reduction (its order is Kokkos's and can
+//! depend on the backend and the team size).  It can differ from the host by round-off (that sum,
+//! fused multiply-add, sqrt / hypot of the device library), which the comparison mode
+//! (<dust>/cloud_resample_compare) measures.  Bitwise reproducibility between runs is not
+//! guaranteed on every backend: repeated OpenMP runs already differ (no fallback, row residuals
+//! <= 1e-13; cause not located, and meeting the constraints does not by itself rule out a race).
 //!
 //! Exception: with <dust>/cloud_resample_qr_rows = true (the default) the QR
 //! update sums each column by row chunks over the team, in another order than the host.  The
@@ -300,7 +304,8 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
       // chunk sums added in their order; the rank-one update by matrix element (consecutive
       // threads on consecutive columns of a row).  NOTE: the sums run in another order than the
       // host's, so this QR (and the solve that follows) matches the host only to round-off, not
-      // bitwise; the order is fixed, so the device result is reproducible.
+      // bitwise.  The chunk order is fixed, but the Householder norm above is a team reduction,
+      // so this alone does not make the device result bitwise reproducible on every backend.
       const int nc = n - k - 1, nr = m - k - 1;
       if (tau != 0.0 && nc > 0) {
         const int nthr = tm.team_size();
@@ -372,7 +377,7 @@ KOKKOS_INLINE_FUNCTION
 void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, double *w,
                    const double *u, const Ws &ws, const DvceArray1D<unsigned long long> &st,
                    const bool qrrows) {
-  const bool prof = st.extent(0) > 0 && tm.team_rank() == 0;   // stage profile
+  const bool prof = DUST_R_DIAG && st.extent(0) > 0 && tm.team_rank() == 0;   // stage profile
   int *fixed = ws.fixed;
   Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int i) {fixed[i] = 0;});
   Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, m*n), [&](const int e) {ws.qr[e] = b[e];});
@@ -397,8 +402,9 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
     ws.z[static_cast<std::size_t>(ws.perm[r + c])*ld + c] = 1.0;
   });
   tm.team_barrier();
-  if (st.extent(0) > 0) {
-    // Diagnostic (with amr_profile): the basic solution that keeps the r pivot
+  if (prof) {const long long c1 = Clk(); Kokkos::atomic_add(&st(2), (unsigned long long)(c1 - c0)); c0 = c1;}
+  if (DUST_R_DIAG && st.extent(0) > 0) {
+    // Diagnostic (with amr_profile and DUST_R_DIAG): the basic solution that keeps the r pivot
     // clouds and puts every other cloud of the block at zero, w_B = w_B - Z_B w_N (the null
     // vector c moves cloud perm[r + c] alone among the others): within the bounds?
     auto basic = [&](const int i) {
@@ -420,8 +426,8 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
       if (nneg == 0 && nover > 0) Kokkos::atomic_add(&st(9), 1ULL);
       if (nneg > 0) Kokkos::atomic_add(&st(10), 1ULL);
     }
+    if (prof) c0 = Clk();   // the check's time stays outside stages 1-3 (Codex review)
   }
-  if (prof) {const long long c1 = Clk(); Kokkos::atomic_add(&st(2), (unsigned long long)(c1 - c0)); c0 = c1;}
   while (ncol > 0) {
     int nc = (kNCand < ncol) ? kNCand : ncol;
     // largest steps along -+ the null vectors c0..c1-1 and the largest |entry| of each vector
@@ -552,7 +558,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
                DvceArray1D<double> &outr) {
   const int a0 = pb.pptr(q), a1 = pb.pptr(q + 1), n = a1 - a0;
   const auto &spd = pb.spd;
-  const bool prof = pb.stage.extent(0) > 0 && tm.team_rank() == 0;   // stage profile
+  const bool prof = DUST_R_DIAG && pb.stage.extent(0) > 0 && tm.team_rank() == 0;   // stage profile
   const long long cstart = prof ? Clk() : 0;
   Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int j) {
     mnew(a0 + j) = spd(a0 + j, JM);
