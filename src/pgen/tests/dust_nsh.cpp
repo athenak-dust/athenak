@@ -152,7 +152,6 @@ constexpr int kBAFields = 11;
 // fraction per bin of log10(density / mean), first / last bin = below / above the range.
 bool ba_ppdf_ = false;
 bool ba_fields_write_ = true;
-bool ba_fields_global_test_ = false;   // test: the several-rank writer on one rank
 bool ba_ppdf_header_ = false;
 int ba_ppdf_nref_ = 128;
 constexpr int kPPBins = 1000, kPPScal = 23;
@@ -528,7 +527,7 @@ void WriteBAFieldsGlobal(Mesh *pm) {
 // composite-transfer cloud weights, or canonical TSC on a uniform periodic mesh.
 // Geometry (x, z, dx, dz per active leaf, f64) is written once; fields are f32.
 void WriteBAFields(Mesh *pm) {
-  if (global_variable::nranks > 1 || ba_fields_global_test_) {WriteBAFieldsGlobal(pm); return;}
+  if (global_variable::nranks > 1) {WriteBAFieldsGlobal(pm); return;}
   auto *pack = pm->pmb_pack;
   auto *pdust = pack->pdust;
   auto &ind = pm->mb_indcs;
@@ -834,7 +833,9 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   ba_fields_ = pin->GetOrAddBoolean("problem", "ba_fields", false);
   ba_ppdf_ = pin->GetOrAddBoolean("problem", "ba_ppdf", false);
   ba_fields_write_ = pin->GetOrAddBoolean("problem", "ba_fields_write", true);
-  ba_fields_global_test_ = pin->GetOrAddBoolean("problem", "ba_fields_global_test", false);
+  // The several-rank field writer on one rank (test) is gone
+  dust::RemovedKey(pin, "ba_fields_global_test", dust::KeyFalse(pin, "ba_fields_global_test", "problem"),
+                   "the several-rank field writer on one rank (test)", "problem");
   ba_ppdf_nref_ = pin->GetOrAddInteger("problem", "ba_ppdf_nref", 128);
   if (ba_ppdf_ && !ba_fields_) {
     std::cerr << "ba_ppdf is written with the BA field snapshots: set ba_fields = true"

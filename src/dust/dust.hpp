@@ -1408,7 +1408,6 @@ class DustGasDrag {
   int cloud_merge_interval = 10;      // cycles between coarsening passes
   Real cloud_merge_min_mass = 0.5;    // a merge commits only with >= this fraction of m_ref
   bool cloud_merge_device = false;  // run MergeClouds on the device
-  Real cloud_merge_tstop = -1.0;      // diagnostic: no merge passes after this time
   // merge passes on a physical-time schedule (cloud_merge_schedule = time,
   // cloud_merge_dt_omega) instead of every cloud_merge_interval cycles, and a burst of passes
   // every cloud_merge_burst_interval cycles for cloud_merge_burst_dt_omega / omega0 after each
@@ -1698,7 +1697,6 @@ class DustGasDrag {
   // timing diagnostic: storage order of the particles
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)
   bool cloud_sort_random = false;     // diagnostic: a random permutation instead
-  bool cloud_sort_at_start = false;   // diagnostic: sort before split / R / merge of the cycle
   bool cloud_merge_position_order = false;   // diagnostic: G walk takes pieces by position
   DvceArray2D<Real> sort_spare_r;     // the arrays the reordered particles are written to
   DvceArray2D<int> sort_spare_i;

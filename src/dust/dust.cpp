@@ -248,14 +248,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   adaptive_rtol_max = pin->GetOrAddReal("dust", "drag_adaptive_rtol_max", 1.0e-3);
   adaptive_tref = pin->GetOrAddReal("dust", "drag_adaptive_tref", 1.0);
   adaptive_state_floor = pin->GetOrAddReal("dust", "drag_adaptive_state_floor", 1.0);
-  std::string fail_policy = pin->GetOrAddString("dust", "drag_fail_policy", "abort");
   if (drag_rtol <= 0.0 || drag_atol < 0.0 || drag_iter_max < 1 ||
       drag_diagnostic_interval < 0 || adaptive_order_c <= 0.0 ||
       adaptive_rtol_max <= 0.0 || adaptive_tref <= 0.0 ||
-      adaptive_state_floor <= 0.0 || fail_policy.compare("abort") != 0) {
+      adaptive_state_floor <= 0.0) {
+    // (drag_fail_policy, whose only value was abort, is no longer read)
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "Invalid coupled drag-solver tolerance/iteration policy; "
-              << "only drag_fail_policy=abort is supported" << std::endl;
+              << std::endl << "Invalid coupled drag-solver tolerance/iteration policy"
+              << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (global_variable::my_rank == 0 &&
@@ -455,7 +455,12 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                  "the D3 first-moment matching of the tent merge");
       // Quantum G and several ranks exist only in the Kokkos merge
       cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", true);
-      cloud_merge_tstop = pin->GetOrAddReal("dust", "cloud_merge_tstop", -1.0);
+      // The end time of the merge passes (a diagnostic) is
+      // gone
+      RemovedKey(pin, "cloud_merge_tstop",
+                 !pin->DoesParameterExist("dust", "cloud_merge_tstop") ||
+                 pin->GetReal("dust", "cloud_merge_tstop") < 0.0,
+                 "the end time of the merge passes");
       // Merge schedule in physical time, burst after derefinement
       {
         Real om = 0.0;

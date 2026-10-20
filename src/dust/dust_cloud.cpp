@@ -131,7 +131,10 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
       std::exit(EXIT_FAILURE);
     }
     cloud_sort_random = (so == "random");   // diagnostic: a random permutation
-    cloud_sort_at_start = pin->GetOrAddBoolean("dust", "cloud_sort_at_start", false);
+    // The diagnostic sort before the split, R and merge of the cycle
+    // is gone; the sort runs after them
+    RemovedKey(pin, "cloud_sort_at_start", KeyFalse(pin, "cloud_sort_at_start"),
+               "the sort at the start of the cycle");
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
     // The cell-sorted index is on by default (every 8 cycles) where the two
     // production cloud kernels run (hybrid / PC2 coupling, linear gather); 0 turns it off (the
@@ -552,19 +555,12 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   ProfTimer prof_all(prof_time[kProfRefineClouds], prof_count[kProfRefineClouds]);
   if (cloud_particle_dump >= 0 && pmy_pack->pmesh->ncycle == cloud_particle_dump) DumpParticles();
   EnsureNextTag();
-  // Diagnostic: cloud_sort_at_start sorts before the split, resampling and merge
-  // pass of the cycle (to compare their decisions on one state in two storage orders)
-  if (cloud_sort_at_start && cloud_sort_interval > 0 &&
-      pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
-    SortParticles();
-  }
   {
     ProfTimer pt(prof_time[kProfSplit], prof_count[kProfSplit]);
     SplitAndMergeClouds();
   }
   // the merge clock is read once per cycle (MergeDue advances it)
-  const bool merge_due = cloud_merge && MergeDue() &&
-      (cloud_merge_tstop < 0.0 || pmy_pack->pmesh->time < cloud_merge_tstop);
+  const bool merge_due = cloud_merge && MergeDue();
   if (amr_event_pending && !(cloud_resample && cloud_resample_after_regrid)) {
     amr_event_pending = false;          // no resampling after regrids: nothing to do
     amr_event_nnew = amr_event_ndel = 0;
@@ -610,7 +606,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (cloud_leaf_check > 0 && pmy_pack->pmesh->ncycle % cloud_leaf_check == 0) {
     CheckLeafTraversal();
   }
-  if (!cloud_sort_at_start && cloud_sort_interval > 0 &&
+  if (cloud_sort_interval > 0 &&
       pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
     ProfTimer pt(prof_time[kProfSort], prof_count[kProfSort]);
     SortParticles();
@@ -637,8 +633,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   particles::Particles *ppar = pmy_pack->ppart;
   const int nnew = amr_event_nnew, ndel = amr_event_ndel;
   const char *kind = (nnew > 0 && ndel > 0) ? "mixed" : ((ndel > 0) ? "derefine" : "refine");
-  const bool merge_ok = cloud_merge &&
-      (cloud_merge_tstop < 0.0 || pmesh->time < cloud_merge_tstop);
+  const bool merge_ok = cloud_merge;
   const bool do_merge = merge_due || (merge_ok && ndel > 0);
   const char *why = !do_merge ? "none"
                   : ((merge_due && ndel > 0) ? "due+derefine" : (merge_due ? "due" : "derefine"));
