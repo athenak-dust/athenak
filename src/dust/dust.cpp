@@ -331,8 +331,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     // then exact TSC and the gather/deposit options apply unchanged, which gives uniform
     // reference runs with the same coupling as the mixed-resolution runs.
     bool multilevel = pmy_pack->pmesh->multilevel;
+    // Rixin: the defaults serve production, so a
+    // multilevel mesh defaults to the refinable clouds (was smooth_p2, a control now)
     std::string transfer = pin->GetOrAddString(
-        "dust", "experimental_smr_transfer", multilevel ? "smooth_p2" : "none");
+        "dust", "experimental_smr_transfer", multilevel ? "refinable_cloud" : "none");
     if (transfer.compare("none") == 0 && !multilevel) {
       smr_transfer_mode = DustSMRTransfer::none;
     } else if (transfer.compare("owner_overlap") == 0 && multilevel) {
@@ -394,7 +396,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       cloud_p1_release_exit = pin->GetOrAddBoolean("dust", "cloud_p1_release_exit", false);
       cloud_split_log = pin->GetOrAddBoolean("dust", "cloud_split_log", false);
-      cloud_split_device = pin->GetOrAddBoolean("dust", "cloud_split_device", false);
+      // The Kokkos P1 split on every backend (Codex review; it runs on CPUs
+      // too); the host split needs the finite fine-grid table (few levels, one rank) and stays a
+      // reference, selected explicitly
+      cloud_split_device = pin->GetOrAddBoolean("dust", "cloud_split_device", true);
       cloud_split_log_leaves = pin->GetOrAddBoolean("dust", "cloud_split_log_leaves", false);
       cloud_split_interp = pin->GetOrAddBoolean("dust", "cloud_split_interp", false);
       // Test switch: false keeps every cloud at its level whatever the mesh
@@ -412,7 +417,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_pending_log = pin->GetOrAddBoolean("dust", "cloud_merge_pending_log", false);
       cloud_merge_d3 = pin->GetOrAddBoolean("dust", "cloud_merge_d3", false);
       cloud_merge_d3_iter = pin->GetOrAddInteger("dust", "cloud_merge_d3_iter", 30);
-      cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", false);
+      // Quantum G and several ranks exist only in the Kokkos merge
+      cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", true);
       cloud_merge_tstop = pin->GetOrAddReal("dust", "cloud_merge_tstop", -1.0);
       // Merge schedule in physical time, burst after derefinement
       {
@@ -444,7 +450,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         if (cloud_merge_burst_interval < 1) fatal("cloud_merge_burst_interval must be >= 1");
       }
       {
-        std::string mode = pin->GetOrAddString("dust", "cloud_merge_mode", "tent");
+        // Quantum G by default; tent stays a research control
+        std::string mode = pin->GetOrAddString("dust", "cloud_merge_mode", "quantum");
         if (mode == "tent") cloud_merge_mode = 0;
         else if (mode == "quantum") cloud_merge_mode = 1;
         else {
@@ -452,7 +459,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           std::exit(EXIT_FAILURE);
         }
       }
-      cloud_merge_stencil = pin->GetOrAddBoolean("dust", "cloud_merge_stencil", true);
+      // Stage X (the exact stencil re-merge before G in quantum mode)
+      // off by default, as in production; it stays a research control
+      cloud_merge_stencil = pin->GetOrAddBoolean("dust", "cloud_merge_stencil", false);
       cloud_merge_stencil_tol = pin->GetOrAddReal("dust", "cloud_merge_stencil_tol", 0.02);
       cloud_merge_smax = pin->GetOrAddReal("dust", "cloud_merge_smax", 1.0);
       cloud_merge_K = pin->GetOrAddInteger("dust", "cloud_merge_K", 4);
