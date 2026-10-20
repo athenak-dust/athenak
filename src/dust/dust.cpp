@@ -410,7 +410,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // needs a coarsening channel); tests without it say cloud_merge = false
       cloud_merge = pin->GetOrAddBoolean("dust", "cloud_merge", true);
       cloud_merge_buffer = pin->GetOrAddInteger("dust", "cloud_merge_buffer", 2);
-      cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha", 0.2);
+      // Rixin: production alpha
+      cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha", 0.05);
       cloud_merge_interval = pin->GetOrAddInteger("dust", "cloud_merge_interval", 10);
       cloud_merge_min_mass = pin->GetOrAddReal("dust", "cloud_merge_min_mass", 0.5);
       cloud_merge_nc = pin->GetOrAddBoolean("dust", "cloud_merge_nc", true);
@@ -480,7 +481,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_xprotect = pin->GetOrAddBoolean("dust", "cloud_merge_xprotect", false);
       cloud_absorb_budget = pin->GetOrAddReal("dust", "cloud_absorb_budget", -1.0);
       cloud_absorb_floor = pin->GetOrAddReal("dust", "cloud_absorb_floor", 0.1);
-      cloud_merge_budget = pin->GetOrAddReal("dust", "cloud_merge_budget", -1.0);
+      // Rixin: the production pass budget beta = 0.3 (was -1,
+      // no budget); cloud_merge_budget = -1 switches it off
+      cloud_merge_budget = pin->GetOrAddReal("dust", "cloud_merge_budget", 0.3);
       cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
       cloud_merge_budget_prior = pin->GetOrAddReal("dust", "cloud_merge_budget_prior", 0.0);
       cloud_audit_rejected = pin->GetOrAddBoolean("dust", "cloud_audit_rejected", false);
