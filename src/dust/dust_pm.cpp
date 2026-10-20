@@ -538,7 +538,7 @@ void DustGasDrag::UpdateHybridMetric(Driver *pdrive, int stage) {
   // Only the automatic switch reads the metric; with a fixed mode (coupling = pc2,
   // hybrid_force_mode = pc2 / split_be) the full-mesh reduction and its host wait are skipped
   // and the metric stays "not computed" (hybrid_have_metric = false)
-  if (!NeedsHybridMetric()) return;
+  if (!NeedsHybridMetric()) {InvalidateHybridMetric(); return;}
   hybrid_last_zeta = pmy_pack->pmesh->dt/taus_min;
   hybrid_last_chi = 0.0;
   if (back_reaction) {

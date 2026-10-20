@@ -1761,6 +1761,14 @@ class DustGasDrag {
   bool NeedsHybridMetric() const {
     return coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::automatic;
   }
+  // Codex review: with a fixed mode the cached metric (from a restart written by
+  // an automatic run, say) is marked invalid, so that a later automatic run never starts from it
+  void InvalidateHybridMetric() {
+    hybrid_have_metric = false;
+    hybrid_feedback_rate_max = 0.0;
+    hybrid_last_zeta = 0.0;
+    hybrid_last_chi = 0.0;
+  }
   bool UsesCompositeTransfer() const {
     return (smr_transfer_mode == DustSMRTransfer::smooth_p2 ||
             smr_transfer_mode == DustSMRTransfer::refinable_cloud);

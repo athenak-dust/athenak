@@ -261,6 +261,8 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
     }
     at += 16 + sizeof(n) + static_cast<std::size_t>(n);
   }
+  // a fixed PC2 / split-BE run does not keep the switching metric of the checkpoint
+  if (!NeedsHybridMetric()) InvalidateHybridMetric();
 }
 
 //----------------------------------------------------------------------------------------
