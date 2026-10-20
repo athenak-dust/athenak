@@ -303,6 +303,11 @@ void WriteBAParticlePDF(Mesh *pm, const FieldHost &fh, const PrtclHost &prh, con
     blev[m] = static_cast<int>(std::lround(std::log2(rdx/mbsize.h_view(m).dx1)));
     nlev = std::max(nlev, blev[m]);
   }
+#if MPI_PARALLEL_ENABLED
+  // several ranks (refinable clouds, 2026-10-21): the grids of the whole mesh, from all ranks
+  if (global_variable::nranks > 1)
+    MPI_Allreduce(MPI_IN_PLACE, &nlev, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+#endif
   const int nr1 = ba_ppdf_nref_;
   const int nr2 = static_cast<int>(std::lround(nr1*ly/lx));
   const double hr1 = lx/nr1, hr2 = ly/nr2;
@@ -347,6 +352,18 @@ void WriteBAParticlePDF(Mesh *pm, const FieldHost &fh, const PrtclHost &prh, con
       }
     }
   }
+#if MPI_PARALLEL_ENABLED
+  // every finest cell lies in one leaf of one rank: the others hold zeros there (level 0 in lmap)
+  if (global_variable::nranks > 1) {
+    for (auto &g : grid)
+      MPI_Allreduce(MPI_IN_PLACE, g.data(), static_cast<int>(g.size()), MPI_DOUBLE, MPI_SUM,
+                    MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, lmap.data(), static_cast<int>(lmap.size()), MPI_SIGNED_CHAR, MPI_MAX,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, ref.data(), static_cast<int>(ref.size()), MPI_DOUBLE, MPI_SUM,
+                  MPI_COMM_WORLD);
+  }
+#endif
   FinishBAParticlePDF(pm, grid, lmap, nlev, ref, nr1, nr2, prh, npart, mtot);
 }
 
@@ -520,30 +537,71 @@ void WriteBAFieldsGlobal(Mesh *pm) {
 #endif
 }
 
+#if MPI_PARALLEL_ENABLED
+// Several ranks: rank 0 receives the vectors of all ranks, concatenated in rank order (the
+// other ranks keep theirs).  Rank order is gid order, so the result is the block order of one
+// rank with the same mesh.
+template <typename T>
+void GatherToRoot(std::vector<T> &v, MPI_Datatype type) {
+  const int nr = global_variable::nranks, me = global_variable::my_rank;
+  int n = static_cast<int>(v.size());
+  std::vector<int> cnt(nr, 0), off(nr, 0);
+  MPI_Gather(&n, 1, MPI_INT, cnt.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+  std::vector<T> all;
+  if (me == 0) {
+    long long tot = 0;
+    for (int r=0; r<nr; ++r) {off[r] = static_cast<int>(tot); tot += cnt[r];}
+    if (tot > std::numeric_limits<int>::max()) {
+      std::cerr << "BA fields: too many leaf cells for one MPI_Gatherv" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    all.resize(static_cast<std::size_t>(tot));
+  }
+  MPI_Gatherv(v.data(), n, type, all.data(), cnt.data(), off.data(), type, 0, MPI_COMM_WORLD);
+  if (me == 0) v.swap(all);
+}
+#endif
+
 // Diagnostic only: compact per-leaf field snapshot.  Gas density and
 // momenta, and the dust cloud integral of mass, momentum and the CENTRAL second
 // velocity moments about each leaf's own mean (two passes, so a cold stream gives zero
 // instead of a cancellation residue).  The deposit is the exact one the run uses: the
 // composite-transfer cloud weights, or canonical TSC on a uniform periodic mesh.
 // Geometry (x, z, dx, dz per active leaf, f64) is written once; fields are f32.
+// Several ranks (2026-10-21): refinable clouds with <dust>/experimental_mpi deposit on the leaves
+// of their own and of the halo blocks; the halo parts are added to their owners
+// (and, for the second pass, the owners' mass and momentum sent back), and rank 0 writes the
+// leaves of all ranks in gid order, i.e. the files of one rank with the same mesh.  The
+// canonical TSC deposit of a uniform mesh on several ranks is WriteBAFieldsGlobal.
 void WriteBAFields(Mesh *pm) {
-  if (global_variable::nranks > 1) {WriteBAFieldsGlobal(pm); return;}
   auto *pack = pm->pmb_pack;
   auto *pdust = pack->pdust;
+  const bool composite = pdust->UsesCompositeTransfer();
+  const int nranks = global_variable::nranks;
+  if (nranks > 1 && !composite) {WriteBAFieldsGlobal(pm); return;}
+  if (nranks > 1 && !(pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
+                      pdust->experimental_mpi)) {
+    std::cerr << "BA fields on several ranks: refinable clouds need <dust>/experimental_mpi"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   auto &ind = pm->mb_indcs;
   int nmb = pack->nmb_thispack;
   int is = ind.is, js = ind.js, ks = ind.ks;
   int nx1 = ind.nx1, nx2 = ind.nx2;
   int ncells1 = nx1 + 2*ind.ng, ncells2 = nx2 + 2*ind.ng;
+  const int ncb = ncells1*ncells2;
   auto &pr = pack->ppart->prtcl_rdata;
   auto &pi = pack->ppart->prtcl_idata;
   int npart = pack->ppart->nprtcl_thispack;
   auto &mbsize = pack->pmb->mb_size;
-  DvceArray4D<Real> f("ba_fields", nmb, 7, ncells2, ncells1);
-  Kokkos::deep_copy(DevExeSpace(), f, 0.0);
-  bool composite = pdust->UsesCompositeTransfer();
   auto transfer = pdust->smr_transfer;
   auto lt = pdust->leaf_traversal;   // the actual leaves
+  // the leaf fields of every block slot with fields, flat ((slot*ncells2 + j)*ncells1 + i): the
+  // local blocks, then (several ranks) the halo blocks; f0 mass and momentum, f1 the moments
+  const int nslot = (nranks > 1) ? lt.nfld : nmb;
+  DvceArray2D<Real> f0("ba_fields0", 4, static_cast<std::size_t>(nslot)*ncb);   // zero
+  DvceArray2D<Real> f1("ba_fields1", 3, static_cast<std::size_t>(nslot)*ncb);
   // canonical TSC: global periodic stencil on the uniform root grid -> leaf index
   int n1 = pm->mesh_indcs.nx1, n2 = pm->mesh_indcs.nx2;
   Real gx1 = pm->mesh_size.x1min, gx2 = pm->mesh_size.x2min;
@@ -576,18 +634,20 @@ void WriteBAFields(Mesh *pm) {
       Real v[3] = {pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p)};
       auto add = [&](const int target, const Real w) {
         if (w == 0.0) return;
-        int ti = target % ncells1;
-        int tj = (target/ncells1) % ncells2;
-        int tm = target/(ncells1*ncells2);
-        Real d = mass*w/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
+        int tm = target/ncb;
+        // a halo slot: its box from the leaf traversal (computed as mb_size, dust_leaf.cpp;
+        // smooth_p2 builds no traversal but has no halo)
+        Real area = (tm < nmb) ? mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2
+                               : lt.box(tm,2)*lt.box(tm,3);
+        Real d = mass*w/area;
         if (pass == 0) {
-          dust::DepositAdd(&f(tm,0,tj,ti), d);
-          for (int c=0; c<3; ++c) dust::DepositAdd(&f(tm,1+c,tj,ti), d*v[c]);
+          dust::DepositAdd(&f0(0,target), d);
+          for (int c=0; c<3; ++c) dust::DepositAdd(&f0(1+c,target), d*v[c]);
         } else {
-          Real rho = f(tm,0,tj,ti);
+          Real rho = f0(0,target);
           for (int c=0; c<3; ++c) {
-            Real dv = v[c] - f(tm,1+c,tj,ti)/rho;
-            dust::DepositAdd(&f(tm,4+c,tj,ti), d*dv*dv);
+            Real dv = v[c] - f0(1+c,target)/rho;
+            dust::DepositAdd(&f1(c,target), d*dv*dv);
           }
         }
       };
@@ -608,8 +668,21 @@ void WriteBAFields(Mesh *pm) {
         }
       }
     });
+    // several ranks: the halo parts to their owners; for the second pass the owners' mass and
+    // momentum back to the halo copies (no-ops on one rank)
+    if (pass == 0) {
+      pdust->HaloReverseAddFlat(f0, 4);
+      pdust->HaloForwardFlat(f0, 4);
+    } else {
+      pdust->HaloReverseAddFlat(f1, 3);
+    }
   }
-  auto fh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), f);
+  auto h0 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), f0);
+  auto h1v = Kokkos::create_mirror_view_and_copy(HostMemSpace(), f1);
+  auto fh = [&h0, &h1v, ncb, ncells1](const int m, const int c, const int j, const int i) {
+    const std::size_t k = static_cast<std::size_t>(m)*ncb + static_cast<std::size_t>(j)*ncells1 + i;
+    return static_cast<double>(c < 4 ? h0(c, k) : h1v(c - 4, k));
+  };
   auto gas = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pack->phydro->u0);
   auto prh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
   double mtot = 0.0, mdep = 0.0;
@@ -637,8 +710,19 @@ void WriteBAFields(Mesh *pm) {
       }
     }
   }
+  long long ntot = npart, ncell_tot = ncell;
+#if MPI_PARALLEL_ENABLED
+  if (nranks > 1) {
+    double sums[2] = {mtot, mdep};
+    long long counts[2] = {ntot, ncell_tot};
+    MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, counts, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    mtot = sums[0]; mdep = sums[1]; ntot = counts[0]; ncell_tot = counts[1];
+  }
+#endif
   if (std::fabs(mdep - mtot) > 1.0e-8*mtot) {   // rounding of ~1e7 particles on ~4e6 cells (U2048)
-    std::fprintf(stderr, "BA fields: deposited mass %.17g != particle mass %.17g\n", mdep, mtot);
+    if (global_variable::my_rank == 0)
+      std::fprintf(stderr, "BA fields: deposited mass %.17g != particle mass %.17g\n", mdep, mtot);
     std::exit(EXIT_FAILURE);
   }
   if (ba_ppdf_) WriteBAParticlePDF(pm, fh, prh, npart, mtot);
@@ -647,6 +731,13 @@ void WriteBAFields(Mesh *pm) {
     if (ba_pin_ != nullptr) ba_pin_->SetInteger("problem", "rst_ba_field_number", ba_field_number_);
     return;
   }
+#if MPI_PARALLEL_ENABLED
+  if (nranks > 1) {
+    GatherToRoot(out, MPI_FLOAT);
+    if (first) GatherToRoot(geom, MPI_DOUBLE);
+  }
+#endif
+  const bool root = global_variable::my_rank == 0;
   auto write = [](const std::string &name, const std::string &header, const void *data,
                   std::size_t size, std::size_t count) {
     FILE *file = std::fopen(name.c_str(), "wb");
@@ -660,20 +751,20 @@ void WriteBAFields(Mesh *pm) {
   };
   char line[160];
   if (first) {
-    std::snprintf(line, sizeof(line), "AthenaK BA field geometry v1 f64\n%d\n", ncell);
+    std::snprintf(line, sizeof(line), "AthenaK BA field geometry v1 f64\n%lld\n", ncell_tot);
     char gnum[32] = "";
     if (ba_geom_written_) std::snprintf(gnum, sizeof(gnum), ".%05d", ba_field_number_);
-    write(ba_snapshot_basename_ + gnum + ".bafield.geom", line, geom.data(), sizeof(double),
-          geom.size());
+    if (root) write(ba_snapshot_basename_ + gnum + ".bafield.geom", line, geom.data(),
+                    sizeof(double), geom.size());
     ba_geom_written_ = true;
     ba_geom_seq_ = mesh_seq;
   }
-  std::snprintf(line, sizeof(line), "AthenaK BA fields v1 f32\n%.17g %d %d %d %.17g %d\n",
-                pm->time, pm->ncycle, ncell, kBAFields, mtot, npart);
+  std::snprintf(line, sizeof(line), "AthenaK BA fields v1 f32\n%.17g %d %lld %d %.17g %lld\n",
+                pm->time, pm->ncycle, ncell_tot, kBAFields, mtot, ntot);
   char number[32];
   std::snprintf(number, sizeof(number), ".%05d.baf", ba_field_number_++);
   if (ba_pin_ != nullptr) ba_pin_->SetInteger("problem", "rst_ba_field_number", ba_field_number_);
-  write(ba_snapshot_basename_ + number, line, out.data(), sizeof(float), out.size());
+  if (root) write(ba_snapshot_basename_ + number, line, out.data(), sizeof(float), out.size());
 }
 
 //----------------------------------------------------------------------------------------
@@ -844,14 +935,18 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     std::exit(EXIT_FAILURE);
   }
   ba_history_ = pin->GetOrAddBoolean("problem", "ba_history", false);
-  // several ranks: fields of the canonical TSC deposit on a uniform mesh (WriteBAFieldsGlobal)
-  const bool fields_mpi = dust_active && !pmy_mesh_->multilevel &&
-      pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none && !ba_history_;
+  // several ranks: fields of the canonical TSC deposit on a uniform mesh (WriteBAFieldsGlobal), or
+  // of refinable clouds with <dust>/experimental_mpi (2026-10-21, WriteBAFields); not ba_history
+  const bool fields_mpi = dust_active && !ba_history_ &&
+      ((!pmy_mesh_->multilevel && pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none) ||
+       (pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
+        pmbp->pdust->experimental_mpi));
   if (ba_fields_ || ba_history_) {
     if ((global_variable::nranks != 1 && !fields_mpi) || !dust_active || pmy_mesh_->three_d ||
         !pin->GetOrAddBoolean("problem", "user_hist", false)) {
-      std::cerr << "BA fields/history require 2-D dust, one MPI rank and user_hist=true"
-                << std::endl;
+      std::cerr << "BA fields/history require 2-D dust, user_hist=true and one MPI rank (several "
+                << "ranks: fields only, canonical TSC on a uniform mesh or refinable clouds with "
+                << "<dust>/experimental_mpi)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     ba_snapshot_basename_ = pin->GetString("job", "basename");
