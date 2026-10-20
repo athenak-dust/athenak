@@ -343,6 +343,29 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       smr_transfer_mode = DustSMRTransfer::smooth_p2;
     } else if (transfer.compare("refinable_cloud") == 0) {
       smr_transfer_mode = DustSMRTransfer::refinable_cloud;
+      // The defaults now serve
+      // production.  An input that leaves one of the changed keys out runs the new default; say
+      // so once (a restart file carries every key, so a restarted run prints nothing).  Inputs
+      // written before can be pinned to the old values with
+      // a helper script outside the repository.
+      if (global_variable::my_rank == 0) {
+        const char *changed[][3] = {
+          {"cloud_split_device", "true", "false"}, {"cloud_merge_device", "true", "false"},
+          {"cloud_merge_mode", "quantum", "tent"}, {"cloud_merge_stencil", "false", "true"},
+          {"cloud_merge", "true", "false"}, {"cloud_merge_schedule", "time if omega0", "cycle"},
+          {"cloud_merge_alpha", "0.05", "0.2"}, {"cloud_merge_budget", "0.3", "-1"},
+          {"cloud_resample", "true", "false"}, {"cloud_resample_schedule", "time if omega0", "cycle"},
+          {"cloud_resample_eta", "1.5", "2.0"}};
+        std::string unset;
+        for (const auto &c : changed) {
+          if (!pin->DoesParameterExist("dust", c[0])) {
+            unset += std::string(" ") + c[0] + "=" + c[1] + " (was " + c[2] + ")";
+          }
+        }
+        if (!unset.empty()) {
+          std::cout << "# NOTE (dust): defaults changed on 2026-10-20 apply to:" << unset << std::endl;
+        }
+      }
       if (!multilevel && !(pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic &&
                            global_variable::nranks == 1 &&
                            drag_solver == DustDragSolver::local)) {
