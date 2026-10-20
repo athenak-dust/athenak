@@ -72,15 +72,11 @@ int NewCloudBlock(const LeafTraversal &lt, const Real x, const Real y, const int
 // eligibility on the actual leaves, from the particle's block m.
 KOKKOS_INLINE_FUNCTION
 bool P1Flag(const LeafTraversal &t, const int m, const int code, const Real x, const Real y,
-            const Real slack, const bool presplit, const bool release) {
+            const Real slack) {
   const int lev = SMRCompositeTransfer::CloudLevel(code);
   const int l1 = SMRCompositeTransfer::CloudLobe1(code);
   const int l2 = SMRCompositeTransfer::CloudLobe2(code);
-  if (l1 == 0 && l2 == 0) {
-    if (presplit && lev == 0 && lev < t.nlev) return true;
-    return t.CloudInsideFiner(x, y, lev, slack, m);
-  }
-  if (lev > 0 && release && !t.CloudInsideFiner(x, y, lev - 1, slack, m)) return true;
+  if (l1 == 0 && l2 == 0) return t.CloudInsideFiner(x, y, lev, slack, m);
   if (lev > 0 && t.CloudInsideFiner(x, y, lev - 1, slack, m)) {
     const Real h1 = t.CloudHalfWidth1(lev - 1), h2 = t.CloudHalfWidth2(lev - 1);
     return ((l1 & 1) && t.CloudInsideFiner(x - h1, y, lev - 1, slack, m)) ||
@@ -94,27 +90,25 @@ bool P1Flag(const LeafTraversal &t, const int m, const int code, const Real x, c
 // pieces of a flagged particle along both directions (port of the host event code)
 KOKKOS_INLINE_FUNCTION
 void P1Event(const LeafTraversal &t, const int m, const int code, const Real x, const Real y,
-             const Real slack, const bool presplit, const bool release, DPiece p1[3],
+             const Real slack, DPiece p1[3],
              DPiece p2[3], int &n1, int &n2, int &clev, bool &parent) {
   const int lev = SMRCompositeTransfer::CloudLevel(code);
   const int l1 = SMRCompositeTransfer::CloudLobe1(code);
   const int l2 = SMRCompositeTransfer::CloudLobe2(code);
   if (l1 == 0 && l2 == 0) {
     const Real h1 = t.CloudHalfWidth1(lev), h2 = t.CloudHalfWidth2(lev);
-    const bool px = presplit && lev == 0;
-    n1 = P1Pieces(3, px || t.CloudInsideFiner(x - h1, y, lev, slack, m),
-                  px || t.CloudInsideFiner(x + h1, y, lev, slack, m), p1);
+    n1 = P1Pieces(3, t.CloudInsideFiner(x - h1, y, lev, slack, m),
+                  t.CloudInsideFiner(x + h1, y, lev, slack, m), p1);
     n2 = P1Pieces(3, t.CloudInsideFiner(x, y - h2, lev, slack, m),
                   t.CloudInsideFiner(x, y + h2, lev, slack, m), p2);
     clev = lev + 1;
     parent = true;
   } else {
     const Real h1 = t.CloudHalfWidth1(lev - 1), h2 = t.CloudHalfWidth2(lev - 1);
-    const bool out = release && !t.CloudInsideFiner(x, y, lev - 1, slack, m);
-    n1 = P1Pieces(l1, out || t.CloudInsideFiner(x - h1, y, lev - 1, slack, m),
-                  out || t.CloudInsideFiner(x + h1, y, lev - 1, slack, m), p1);
-    n2 = P1Pieces(l2, out || t.CloudInsideFiner(x, y - h2, lev - 1, slack, m),
-                  out || t.CloudInsideFiner(x, y + h2, lev - 1, slack, m), p2);
+    n1 = P1Pieces(l1, t.CloudInsideFiner(x - h1, y, lev - 1, slack, m),
+                  t.CloudInsideFiner(x + h1, y, lev - 1, slack, m), p1);
+    n2 = P1Pieces(l2, t.CloudInsideFiner(x, y - h2, lev - 1, slack, m),
+                  t.CloudInsideFiner(x, y + h2, lev - 1, slack, m), p2);
     clev = lev;
     parent = false;
   }
@@ -137,8 +131,6 @@ int DustGasDrag::SplitCloudsP1Device() {
   const auto transfer = smr_transfer;
   const auto lt = leaf_traversal;   // the actual leaves
   const Real slack = cloud_split_slack;
-  const bool release = cloud_p1_release_exit;
-  const bool presplit = cloud_presplit_x1;
   const int sh1 = SMRCompositeTransfer::kCloudLobeShift1;
   const int sh2 = SMRCompositeTransfer::kCloudLobeShift2;
   const int gids = pmy_pack->gids;
@@ -161,9 +153,9 @@ int DustGasDrag::SplitCloudsP1Device() {
     const int code = pi(PLEV,p);
     const Real x = pr(IPX,p), y = pr(IPY,p);
     const int m = lt.Anchor(pi(PGID,p));   // anchor block
-    if (!P1Flag(lt, m, code, x, y, slack, presplit, release)) {np(p) = 0; return;}
+    if (!P1Flag(lt, m, code, x, y, slack)) {np(p) = 0; return;}
     DPiece p1[3], p2[3]; int n1, n2, clev; bool parent;
-    P1Event(lt, m, code, x, y, slack, presplit, release, p1, p2, n1, n2, clev, parent);
+    P1Event(lt, m, code, x, y, slack, p1, p2, n1, n2, clev, parent);
     np(p) = n1*n2;
     sf += 1;
     if (parent) sp += 1;
@@ -196,7 +188,7 @@ int DustGasDrag::SplitCloudsP1Device() {
     const int code = piv(PLEV,p);
     const Real x = prv(IPX,p), y = prv(IPY,p), mass = prv(IPM,p);
     DPiece p1[3], p2[3]; int n1, n2, clev; bool parent;
-    P1Event(lt, lt.Anchor(piv(PGID,p)), code, x, y, slack, presplit, release, p1, p2, n1, n2,
+    P1Event(lt, lt.Anchor(piv(PGID,p)), code, x, y, slack, p1, p2, n1, n2,
             clev, parent);
     const Real e1 = transfer.CloudHalfWidth1(clev), e2 = transfer.CloudHalfWidth2(clev);
     // the parent's slot is written last, after the appended pieces have copied it

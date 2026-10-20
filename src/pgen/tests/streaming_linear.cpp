@@ -662,7 +662,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     if (glayers >= 0) {
       auto *pd = pmbp->pdust;
       if (transfer.cloud_nlev != 1 || ppc_int != 1 || !seed_after || !pd->cloud_p1_split ||
-          pd->cloud_merge || pd->cloud_p1_release_exit || !transfer.cloud_split_overlap ||
+          pd->cloud_merge || !transfer.cloud_split_overlap ||
           transfer.cloud_split_everywhere || global_variable::nranks != 1) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<problem>/graded_split_layers requires one refinement "

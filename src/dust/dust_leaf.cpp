@@ -208,7 +208,6 @@ void DustGasDrag::BuildLeafTraversal() {
   lt.ilx = 1.0/lt.lx; lt.ily = 1.0/lt.ly;
   lt.root_dx1 = smr_transfer.root_dx1; lt.root_dx2 = smr_transfer.root_dx2;
   lt.iroot_dx1 = 1.0/lt.root_dx1; lt.iroot_dx2 = 1.0/lt.root_dx2;
-  lt.lobe3_integral = smr_transfer.lobe3_integral;
   lt.box = DvceArray2D<Real>("dust_leaf_box", nall, 6);
   lt.nnb = DvceArray1D<int>("dust_leaf_nnb", nmb);
   lt.nb = DvceArray2D<int>("dust_leaf_nb", nmb, LeafTraversal::kMaxNb);

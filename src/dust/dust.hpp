@@ -124,9 +124,6 @@ struct SMRCompositeTransfer {
   bool cloud_split_everywhere = false; // control: split regardless of the local mesh
   bool cloud_split_overlap = true;     // split once the (shrunk) support touches finer leaves
                                        // instead of once it lies entirely on them
-  bool lobe3_integral = false;         // diagnostic (<dust>/cloud_presplit_x1): a lobe-3
-                                       // direction (parent width) of a transition-2 gather
-                                       // takes the cloud integral like a plain cloud
   Real root_dx1 = 0.0, root_dx2 = 0.0;
   Real fine_dx1 = 0.0, fine_dx2 = 0.0;
   DvceArray2D<int> cloud_target;      // finest virtual cell -> encoded active leaf
@@ -392,11 +389,11 @@ struct SMRCompositeTransfer {
     Real w1[3], w2[3], g1[3], g2[3];
     int n1 = CloudWeights3<kMoments>(x1, CloudHalfWidth1(code), x1min, d1, i0, w1, g1,
                                      CloudLobe1(code),
-                                     point && !(lobe3_integral && CloudLobe1(code) == 3));
+                                     point);
     if (n1 > 3) return false;
     int n2 = CloudWeights3<kMoments>(x2, CloudHalfWidth2(code), x2min, d2, j0, w2, g2,
                                      CloudLobe2(code),
-                                     point && !(lobe3_integral && CloudLobe2(code) == 3));
+                                     point);
     if (n2 > 3) return false;
     int target[3][3];
 #pragma unroll
@@ -509,8 +506,7 @@ struct SMRCompositeTransfer {
     Real w1[kMaxCloudStencil], w2[kMaxCloudStencil];
     Real g1[kMaxCloudStencil], g2[kMaxCloudStencil];
     bool point = (lev & kCloudGatherPoint) != 0;
-    bool point1 = point && !(lobe3_integral && CloudLobe1(lev) == 3);
-    bool point2 = point && !(lobe3_integral && CloudLobe2(lev) == 3);
+    bool point1 = point, point2 = point;
     int n1 = CloudWeightsMoments1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1, g1,
                                    CloudLobe1(lev), point1);
     int n2 = CloudWeightsMoments1D(x2, CloudHalfWidth2(lev), x2min, fine_dx2, j0, w2, g2,
@@ -720,7 +716,6 @@ struct LeafTraversal {
   Real ilx = 0.0, ily = 0.0;           // 1/lx, 1/ly
   Real root_dx1 = 0.0, root_dx2 = 0.0;
   Real iroot_dx1 = 0.0, iroot_dx2 = 0.0;   // 1/root_dx1, 1/root_dx2
-  bool lobe3_integral = false;
   DvceArray2D<Real> box;               // (b, 0..5): x1min, x2min, dx1, dx2, 1/dx1, 1/dx2 of slot b
   DvceArray1D<int> nnb;                // number of neighbours of local block m
   DvceArray2D<int> nb;                 // (m, k): slot of neighbour k (local or halo)
@@ -1009,10 +1004,8 @@ struct LeafTraversal {
     const int lev = T::CloudLevel(code);
     const bool point = kMoments && (code & T::kCloudGatherPoint) != 0;
     const int lb1 = T::CloudLobe1(code), lb2 = T::CloudLobe2(code);
-    const Shape s1 = MakeShape(x1, ldexp(root_dx1, -lev), ldexp(iroot_dx1, lev), lb1,
-                               point && !(lobe3_integral && lb1 == 3));
-    const Shape s2 = MakeShape(x2, ldexp(root_dx2, -lev), ldexp(iroot_dx2, lev), lb2,
-                               point && !(lobe3_integral && lb2 == 3));
+    const Shape s1 = MakeShape(x1, ldexp(root_dx1, -lev), ldexp(iroot_dx1, lev), lb1, point);
+    const Shape s2 = MakeShape(x2, ldexp(root_dx2, -lev), ldexp(iroot_dx2, lev), lb2, point);
     // a support inside the anchor block meets only its cells (the common case)
     const Real ax0 = box(m, 0), ay0 = box(m, 1);
     const bool inside = (s1.lo >= ax0 && s1.hi <= ax0 + nx1*box(m, 2) &&
@@ -1546,8 +1539,6 @@ class DustGasDrag {
   bool cloud_force_local = false;     // gas-side drag uses the leaf's own velocity
   bool cloud_force_children = false;  // clouds overlapping finer leaves deposit the drag
                                       // as their 3^d two-scale children (kick unchanged)
-  int cloud_gather_level = -1;        // diagnostic: >= 0 gathers every cloud with the
-                                      // footprint of that level (deposit keeps the cloud)
   int cloud_transition = 0;           // P1 transition clouds at split edges:
                                       // 1 gathers with the child hat, 2 with the lobed
                                       // weights and point-valued reconstructions
@@ -1559,8 +1550,6 @@ class DustGasDrag {
   bool cloud_p1_split = false;        // moving-particle P1 split: edge children
                                       // separate only where the neighbour parent splits,
                                       // no merging (requires cloud_transition > 0)
-  bool cloud_p1_release_exit = false; // diagnostic: lobed clouds that leave the split
-                                      // region release their lobes (old-rule exit edge)
   bool cloud_merge = false;           // coarsening: far from finer
                                       // leaves, release lobes and merge fine clouds that are
                                       // indistinguishable at the coarser level
@@ -1688,10 +1677,6 @@ class DustGasDrag {
   int cloud_native_check = 0;         // diagnostic: every this many cycles, compare the
                                       // level-native and finest-grid traversals
   DvceArray1D<int> split_np, split_off;  // device split work arrays, kept between cycles
-  bool cloud_presplit_x1 = false;     // diagnostic: every root cloud is
-                                      // split along x1 only (x2 keeps the parent width as
-                                      // lobe 3, gathered as a cloud integral), so a z-normal
-                                      // refinement edge has no along-edge width jump
   bool cloud_split_enable = true;     // test only: false = no splitting at all
   // Instant switch, the OO control on the cloud framework: at the
   // start of every cycle (and in the initial split) each cloud takes the level of the leaf that

@@ -26,6 +26,25 @@
 #include "dust_resample.hpp"
 
 namespace dust {
+
+namespace {
+// 2026-10-20 cleanup: a key whose option was removed.  An input or
+// restart file that still writes it is accepted when the value asks for the behaviour that
+// remains (the old default); otherwise the run stops instead of silently running another method.
+// The removed paths still run in the version tagged pre-cleanup-20261020.
+void RemovedKey(ParameterInput *pin, const char *key, const bool keeps, const char *what) {
+  if (!pin->DoesParameterExist("dust", key) || keeps) return;
+  std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+            << "<dust>/" << key << " = " << pin->GetString("dust", key) << ": " << what
+            << " was removed on 2026-10-20 (it runs in the version tagged pre-cleanup-20261020)"
+            << std::endl;
+  std::exit(EXIT_FAILURE);
+}
+bool KeyFalse(ParameterInput *pin, const char *key) {
+  return !pin->DoesParameterExist("dust", key) || !pin->GetBoolean("dust", key);
+}
+}  // namespace
+
 //----------------------------------------------------------------------------------------
 // constructor: parses input, validates configuration, allocates deposit fields and
 // boundary communication objects
@@ -380,15 +399,17 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_deform = pin->GetOrAddBoolean("dust", "cloud_deform", false);
       cloud_force_local = pin->GetOrAddBoolean("dust", "cloud_force_local", false);
       cloud_force_children = pin->GetOrAddBoolean("dust", "cloud_force_children", false);
-      cloud_gather_level = pin->GetOrAddInteger("dust", "cloud_gather_level", -1);
+      // The fixed gather level (a diagnostic) is gone
+      RemovedKey(pin, "cloud_gather_level",
+                 !pin->DoesParameterExist("dust", "cloud_gather_level") ||
+                 pin->GetInteger("dust", "cloud_gather_level") < 0, "the fixed gather level");
       // Rixin: the production split is the default: the moving P1 split, splitting on
       // the first overlap with finer leaves (cloud_split_overlap, dust_cloud.cpp), with the P1
       // transition clouds of mode 2 and the linear gather that mode needs.  The research gather
       // variants (deform, force_local / force_children, a fixed gather level), which exclude
       // transition clouds, keep the old defaults (no P1 split, no transitions).  Inputs written
       // before 2026-10-17 that leave these keys out get the new values.
-      const bool variant = cloud_deform || cloud_force_local || cloud_force_children ||
-                           cloud_gather_level >= 0;
+      const bool variant = cloud_deform || cloud_force_local || cloud_force_children;
       cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", !variant);
       cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order",
                                                 (cloud_deform || cloud_p1_split) ? 2 : 1);
@@ -396,11 +417,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                                               cloud_p1_split ? (cloud_gather_order == 2 ? 2 : 1) : 0);
       if (cloud_transition < 0 || cloud_transition > 2 ||
           (cloud_transition > 0 && (cloud_deform || cloud_force_local ||
-                                    cloud_force_children || cloud_gather_level >= 0)) ||
+                                    cloud_force_children)) ||
           (cloud_transition == 2 && cloud_gather_order != 2)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<dust>/cloud_transition must be 0, 1 or 2; it excludes "
-                  << "deform/force_local/force_children/gather_level, and 2 requires "
+                  << "deform/force_local/force_children, and 2 requires "
                   << "cloud_gather_order=2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
@@ -412,12 +433,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           variant) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "IMEX/split-BE refinable_cloud does not support "
-                  << "cloud_force_local, cloud_force_children, cloud_deform or "
-                  << "cloud_gather_level; use coupling=pc2 for these experiments"
+                  << "cloud_force_local, cloud_force_children or cloud_deform; use "
+                  << "coupling=pc2 for these experiments"
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      cloud_p1_release_exit = pin->GetOrAddBoolean("dust", "cloud_p1_release_exit", false);
+      // The old-rule lobe release at the exit edge is gone
+      RemovedKey(pin, "cloud_p1_release_exit", KeyFalse(pin, "cloud_p1_release_exit"),
+                 "the lobe release at the exit edge");
       cloud_split_log = pin->GetOrAddBoolean("dust", "cloud_split_log", false);
       // The Kokkos P1 split on every backend (Codex review; it runs on CPUs
       // too); the host split needs the finite fine-grid table (few levels, one rank) and stays a
@@ -752,13 +775,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << " and cloud_merge_interval >= 1" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      cloud_presplit_x1 = pin->GetOrAddBoolean("dust", "cloud_presplit_x1", false);
-      if (cloud_presplit_x1 && !cloud_p1_split) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_presplit_x1 (diagnostic) requires "
-                  << "cloud_p1_split" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
+      // The x1-only presplit of root clouds is gone
+      RemovedKey(pin, "cloud_presplit_x1", KeyFalse(pin, "cloud_presplit_x1"),
+                 "the x1-only presplit of root clouds");
       if (cloud_split_interp && (!cloud_p1_split || global_variable::nranks > 1)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<dust>/cloud_split_interp requires cloud_p1_split and a "
@@ -781,14 +800,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<dust>/cloud_p1_split requires cloud_transition=1 or 2 "
                   << "(the gather used for transition clouds)" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-      if (cloud_gather_level >= 0 && (cloud_deform || cloud_force_local ||
-                                      cloud_force_children)) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_gather_level (diagnostic) requires the "
-                  << "cloud-averaged deposit (no deform/force_local/force_children)"
-                  << std::endl;
         std::exit(EXIT_FAILURE);
       }
       if (cloud_gather_order != 1 && cloud_gather_order != 2) {

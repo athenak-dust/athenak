@@ -137,7 +137,6 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       bool flocal = cloud_force_local && transfer.cloud_mode;
       bool fchild = cloud_force_children && transfer.cloud_mode;
       bool deform = cloud_deform && transfer.cloud_mode;
-      int gather_level = cloud_gather_level;
       int tmode = cloud_transition;
       if (linear && !flocal && !fchild && !deform) {
         // Production refinable-cloud predictor: the linear gather and the
@@ -158,8 +157,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
           // the gather's leaf weights are the deposit's: keep them
           int nt = 0, tt[SMRCompositeTransfer::kCloudWeightCache];
           Real tw[SMRCompositeTransfer::kCloudWeightCache];
-          const int gcode = (gather_level >= 0) ? gather_level :
-                            SMRCompositeTransfer::GatherCode(lev, tmode);
+          const int gcode = SMRCompositeTransfer::GatherCode(lev, tmode);
           // same shape for the gather and the deposit (the point flag changes moments only)
           const bool same = (gcode & ~SMRCompositeTransfer::kCloudGatherPoint) == lev;
           lt.ForEachCloudMoment(xp, yp, gcode, am,
@@ -249,8 +247,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
                 + cy*(uold(tm,IM3,ks,tj+1,ti)*rjp - uold(tm,IM3,ks,tj-1,ti)*rjm);
           };
           Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-          lt.ForEachCloudMoment(xp, yp, (gather_level >= 0) ? gather_level :
-                                      SMRCompositeTransfer::GatherCode(lev, tmode), am,
+          lt.ForEachCloudMoment(xp, yp, SMRCompositeTransfer::GatherCode(lev, tmode), am,
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
             int ti = target % ncells1;
             int remainder = target/ncells1;
@@ -326,7 +323,6 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       KOKKOS_LAMBDA(const int p) {
         Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
         ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p),
-                               (gather_level >= 0) ? gather_level :
                                SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode),
                                lt.Anchor(pi(PGID,p)),
         [&](const int target, const Real particle_weight) {

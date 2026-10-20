@@ -135,14 +135,13 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
       bool flocal = composite_smr && cloud_force_local && transfer.cloud_mode;
       bool fchild = composite_smr && cloud_force_children && transfer.cloud_mode;
       bool deform = composite_smr && cloud_deform && transfer.cloud_mode;
-      int gather_level = cloud_gather_level;
       int tmode = cloud_transition;
       auto ag = analytic_gather;
       Real time0 = pmy_pack->pmesh->time;
-      if (ag.on && !(linear && tmode == 2 && gather_level < 0)) {
+      if (ag.on && !(linear && tmode == 2)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<problem>/analytic_gather requires refinable clouds with "
-                  << "cloud_gather_order = 2, cloud_transition = 2 and no cloud_gather_level"
+                  << "cloud_gather_order = 2 and cloud_transition = 2"
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
@@ -166,8 +165,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
           Real yh = y0 + 0.5*dt*(vy0 - ((is_sbox && three_d) ? qshear_*omega0_*x0 : 0.0));
           Real zh = three_d ? z0 + 0.5*dt*vz0 : z0;
           Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-          int glev = (gather_level >= 0) ? gather_level :
-                     SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode);
+          int glev = SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode);
           // same shape for the gather and the deposit (the point flag changes moments only)
           const bool same = (glev & ~SMRCompositeTransfer::kCloudGatherPoint) == pi(PLEV,p);
           lt.ForEachCloudMoment(xh, yh, glev, am,
@@ -323,8 +321,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
             agrad[2*n+1] += cy*(ustar_(tm,n,ks,tj+1,ti) - ustar_(tm,n,ks,tj-1,ti));
           }
         };
-        int glev = (gather_level >= 0) ? gather_level :
-                   SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode);
+        int glev = SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode);
         if (linear || flocal || fchild || deform) {
           lt.ForEachCloudMoment(xh, yh, glev, am,
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
