@@ -98,8 +98,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // halo (dust_halo.cpp); the supported options in CheckMultiRank
   experimental_mpi = pin->GetOrAddBoolean("dust", "experimental_mpi", false);
   test_ustar_linear = pin->GetOrAddBoolean("dust", "test_ustar_linear", false);
-  if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false) &&
-      pin->GetOrAddString("dust", "amr_rho_map", "block") == "block") {
+  if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {   // (block map: the only one)
     halo_trigger_cells = std::max(0, pin->GetOrAddInteger("dust", "amr_rho_buffer", 2));
   }
   test_ustar_skip_exchange = pin->GetOrAddBoolean("dust", "test_ustar_skip_exchange", false);
