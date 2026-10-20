@@ -1225,20 +1225,6 @@ struct LeafTraversal {
     if (reach != nullptr) *reach = true;
     return !AnyAbove(m, (I - B)*r, (I + B + 1)*r - 1, (J - B)*r, (J + B + 1)*r - 1, L, reach);
   }
-  // the stage C (compression) mask: every finest cell of the window around the level-lev cell
-  // holding (x1, x2), widened by bf = 2 cloud_compress_buffer r, has a dilated level >= lev
-  KOKKOS_INLINE_FUNCTION
-  bool CompressOK(const Real px1, const Real px2, const int lev, const int cbuf, const int m,
-                  bool *reach = nullptr) const {
-    if (reach != nullptr) *reach = true;
-    if (lev < 1) return false;
-    Real x1 = px1, x2 = px2;
-    Frame(m, x1, x2);
-    const int r = 1 << (nlev - lev), bf = 2*cbuf*r;
-    const int I = static_cast<int>(floor((x1 - x1min)/(fine_dx1*r)));
-    const int J = static_cast<int>(floor((x2 - x2min)/(fine_dx2*r)));
-    return AllAbove(m, I*r - bf, I*r + r + bf - 1, J*r - bf, J*r + r + bf - 1, lev - 1, reach);
-  }
 
   // ---- the cloud interface of SMRCompositeTransfer on the actual
   // leaves, with the anchor block m of the cloud (its particle's MeshBlock; a new cloud of a
@@ -1584,15 +1570,12 @@ class DustGasDrag {
   int amr_regrid_nnew = 0, amr_regrid_ndel = 0;  // of the regrid in progress (BeforeRegrid)
   void HandleRegridEvent(const bool merge_due);
   bool cloud_merge_nc = true;         // merge-side node convention
-  bool cloud_merge_absorb = false;    // orphan absorption into existing coarse clouds
   bool cloud_merge_pending_log = false;  // log why designated centres did not commit
-  bool cloud_merge_d3 = false;        // diagnostic: per-pass coarse-row first-moment
-  int cloud_merge_d3_iter = 30;       // matching of the new clouds' x positions (D3), Jacobi iterations
   int cloud_merge_lobe_wait = 0;      // a centre waits while an unreleased lobed cloud is near
                                       // (1: reach H + ell, 2: reach per lobe direction)
   std::vector<Real> cloud_merge_mroot; // per species: root-level cloud mass (set on first pass)
   // quantum mode: stage X exact P1-stencil re-merge, stage G mass-quantum grouping
-  // (cross-level), stage C same-level compression in the fine interior
+  // (cross-level); stage C (same-level compression) was removed on 2026-10-20
   int cloud_merge_mode = 0;           // 0 tent, 1 quantum
   bool cloud_merge_stencil = true;    // quantum: stage X on
   Real cloud_merge_stencil_tol = 0.02;  // stage X offset tolerance (units of the piece half-width)
@@ -1603,16 +1586,14 @@ class DustGasDrag {
   Real cloud_audit_t1 = -1.0;          // [t0, t1]; stages in full when the pass changed anything
   bool cloud_audit_compact = true;     // quiet passes: compact particle + gas snapshot
   bool cloud_merge_xprotect = false;   // stage X's waiting candidates are not
-                                       // walked by G/C or absorbed in the same pass
-  Real cloud_absorb_budget = -1.0;     // > 0, largest leaf change of mass (and
-                                       // momentum) an absorption may make, relative to the leaf
-  Real cloud_absorb_floor = 0.1;       // ... with the leaf mass floored at this fraction of a
-                                       // root cloud mass per root-cell volume
+                                       // walked by G in the same pass
   Real cloud_merge_budget = -1.0;      // > 0, one budget of leaf mass / momentum
-                                       // change for the whole pass (stages G, C, absorption)
+                                       // change for the whole pass (stage G; X with budget_x)
+  Real cloud_absorb_floor = 0.1;       // ... with the leaf mass floored at this fraction of a
+                                       // root cloud mass per root-cell volume (the name is
+                                       // from the absorption budget)
   int cloud_merge_budget_evals = 4;    // ... evaluations per stage before the rest is rejected
-  Real cloud_merge_budget_prior = 0.0; // ... testing only: fraction of the budget already used
-  bool cloud_audit_rejected = false;   // full audit file when G/C groups were budget-rejected
+  bool cloud_audit_rejected = false;   // full audit file when G groups were budget-rejected
   bool cloud_merge_budget_x = false;   // stage X is also decided by the pass budget
   bool cloud_audit_only = false;       // a merge pass writes its entry audit and returns
   bool cloud_resample = false;         // conservative same-level resampling in the code
@@ -1663,11 +1644,6 @@ class DustGasDrag {
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
                                       // neighbourhood is in the merge zone: the outer band is
                                       // left to stage X (found in the LinA tests)
-  bool cloud_compress = false;        // stage C on (quantum mode only)
-  Real cloud_compress_smax = 0.5;     // stage C group extent (units of the piece's own cell)
-  Real cloud_compress_ds = 0.1;       // stage C |dS| budget per direction, fraction of M Var(hat)
-  int cloud_compress_buffer = 4;      // stage C cells: no coarser leaf within this many cells of
-                                      // the next-coarser level
   int cloud_merge_pass = 0;           // pass counter (walk rotation)
   unsigned long long cloud_coarsen_events = 0, cloud_coarsen_in = 0;
   unsigned long long cloud_coarsen_reject = 0, cloud_far_release = 0;

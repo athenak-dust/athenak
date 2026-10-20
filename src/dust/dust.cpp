@@ -462,10 +462,16 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_min_mass = pin->GetOrAddReal("dust", "cloud_merge_min_mass", 0.5);
       cloud_merge_nc = pin->GetOrAddBoolean("dust", "cloud_merge_nc", true);
       cloud_merge_lobe_wait = pin->GetOrAddInteger("dust", "cloud_merge_lobe_wait", 0);
-      cloud_merge_absorb = pin->GetOrAddBoolean("dust", "cloud_merge_absorb", false);
       cloud_merge_pending_log = pin->GetOrAddBoolean("dust", "cloud_merge_pending_log", false);
-      cloud_merge_d3 = pin->GetOrAddBoolean("dust", "cloud_merge_d3", false);
-      cloud_merge_d3_iter = pin->GetOrAddInteger("dust", "cloud_merge_d3_iter", 30);
+      // The absorption of merge residuals (tent orphans;
+      // quantum G residuals) and the D3 row first-moment matching of the tent
+      // merge are gone.  Without merging they did nothing, so any value passes
+      // then.  cloud_merge_d3_iter and cloud_absorb_budget (the absorption's own budget)
+      // acted only through these switches and are ignored.
+      RemovedKey(pin, "cloud_merge_absorb", !cloud_merge || KeyFalse(pin, "cloud_merge_absorb"),
+                 "the absorption of merge residuals");
+      RemovedKey(pin, "cloud_merge_d3", !cloud_merge || KeyFalse(pin, "cloud_merge_d3"),
+                 "the D3 first-moment matching of the tent merge");
       // Quantum G and several ranks exist only in the Kokkos merge
       cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", true);
       cloud_merge_tstop = pin->GetOrAddReal("dust", "cloud_merge_tstop", -1.0);
@@ -525,13 +531,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_audit_t1 = pin->GetOrAddReal("dust", "cloud_audit_t1", -1.0);
       cloud_audit_compact = pin->GetOrAddBoolean("dust", "cloud_audit_compact", true);
       cloud_merge_xprotect = pin->GetOrAddBoolean("dust", "cloud_merge_xprotect", false);
-      cloud_absorb_budget = pin->GetOrAddReal("dust", "cloud_absorb_budget", -1.0);
+      // the mass floor of the pass budget (named after the absorption budget)
       cloud_absorb_floor = pin->GetOrAddReal("dust", "cloud_absorb_floor", 0.1);
       // Rixin: the production pass budget beta = 0.3 (was -1,
       // no budget); cloud_merge_budget = -1 switches it off
       cloud_merge_budget = pin->GetOrAddReal("dust", "cloud_merge_budget", 0.3);
       cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
-      cloud_merge_budget_prior = pin->GetOrAddReal("dust", "cloud_merge_budget_prior", 0.0);
+      // The test offset of the pass budget is gone; it
+      // acted only with quantum G and the pass budget on
+      RemovedKey(pin, "cloud_merge_budget_prior",
+                 !cloud_merge || cloud_merge_mode != 1 || cloud_merge_budget <= 0.0 ||
+                 !pin->DoesParameterExist("dust", "cloud_merge_budget_prior") ||
+                 pin->GetReal("dust", "cloud_merge_budget_prior") == 0.0,
+                 "the budget used in advance (cloud_merge_budget_prior)");
       cloud_audit_rejected = pin->GetOrAddBoolean("dust", "cloud_audit_rejected", false);
       cloud_merge_budget_x = pin->GetOrAddBoolean("dust", "cloud_merge_budget_x", false);
       cloud_audit_only = pin->GetOrAddBoolean("dust", "cloud_audit_only", false);
@@ -748,19 +760,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << " cloud_gather_order = 2 and none of the force variants" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      cloud_compress = pin->GetOrAddBoolean("dust", "cloud_compress", false);
-      cloud_compress_smax = pin->GetOrAddReal("dust", "cloud_compress_smax", 0.5);
-      cloud_compress_ds = pin->GetOrAddReal("dust", "cloud_compress_ds", 0.1);
-      cloud_compress_buffer = pin->GetOrAddInteger("dust", "cloud_compress_buffer", 4);
+      // Stage C of quantum G (same-level compression in the fine
+      // interior) is gone; its sub-keys cloud_compress_smax, cloud_compress_ds and
+      // cloud_compress_buffer acted only through it and are ignored
+      RemovedKey(pin, "cloud_compress", KeyFalse(pin, "cloud_compress"),
+                 "stage C of quantum G");
       // (2026-10-20: quantum is the default mode now, so its requirements apply only when G is on;
       // cloud_merge = false with the default mode is a run without G, not an error)
-      if (((cloud_merge && cloud_merge_mode == 1) || cloud_compress) &&
-          (!cloud_merge || !cloud_merge_device || cloud_merge_mode != 1 || cloud_merge_K < 1 ||
-           cloud_merge_K > 8 || cloud_merge_smax <= 0.0 || cloud_compress_smax <= 0.0 ||
-           cloud_compress_buffer < 1 || cloud_merge_d3)) {
-        std::cout << "### FATAL ERROR: <dust>/cloud_merge_mode = quantum (and cloud_compress) "
-                  << "need cloud_merge, cloud_merge_device, 1 <= cloud_merge_K <= 8, positive "
-                  << "extents, cloud_compress_buffer >= 1 and no cloud_merge_d3" << std::endl;
+      if (cloud_merge && cloud_merge_mode == 1 &&
+          (!cloud_merge_device || cloud_merge_K < 1 || cloud_merge_K > 8 ||
+           cloud_merge_smax <= 0.0)) {
+        std::cout << "### FATAL ERROR: <dust>/cloud_merge_mode = quantum needs "
+                  << "cloud_merge_device, 1 <= cloud_merge_K <= 8 and cloud_merge_smax > 0"
+                  << std::endl;
         std::exit(EXIT_FAILURE);
       }
       if (cloud_merge && (!cloud_p1_split || cloud_split_interp || cloud_deform ||
@@ -980,9 +992,8 @@ void DustGasDrag::CheckMultiRank() {
     bad.push_back("gather variants (cloud_gather_order != 2, force_local/children, deform, "
                   "analytic_gather)");
   }
-  if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_stencil ||
-                      cloud_merge_absorb || cloud_compress)) {
-    bad.push_back("merging other than the device quantum G (tent, X, absorption, compression)");
+  if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_stencil)) {
+    bad.push_back("merging other than the device quantum G (tent, X)");
   }
   if (cloud_resample && !cloud_resample_block_patches) {
     bad.push_back("resampling on root patches (cloud_resample_block_patches = false)");

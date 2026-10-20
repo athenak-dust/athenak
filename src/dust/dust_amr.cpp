@@ -14,7 +14,8 @@
 //! MeshBlocks are renumbered by MeshRefinement; nothing there knows about particles.
 //! RebuildAfterRegrid() is what the dust module does right afterwards:
 //!   - the maps from the virtual finest grid to the active leaves are rebuilt;
-//!   - the cached merge / compress masks are marked stale (rebuilt at their next use);
+//!   - (the merge masks are evaluated on the actual leaves at their use: nothing
+//!     cached to mark stale);
 //!   - every particle's MeshBlock id (PGID) is set again from its position;
 //!   - the particle time step is computed again with the new cell sizes;
 //!   - the regrid is marked as an event (blocks created / deleted): the next cycle runs its
