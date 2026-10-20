@@ -2290,25 +2290,12 @@ int DustGasDrag::MergeCloudsDevice() {
   return static_cast<int>(nevents);
 }
 
-namespace {
-// bits of v (at most 16) spread to the even bit positions (Morton interleave)
-KOKKOS_INLINE_FUNCTION
-std::int64_t SpreadBits(unsigned v) {
-  v &= 0xffffu;
-  v = (v | (v << 8)) & 0x00ff00ffu;
-  v = (v | (v << 4)) & 0x0f0f0f0fu;
-  v = (v | (v << 2)) & 0x33333333u;
-  v = (v | (v << 1)) & 0x55555555u;
-  return static_cast<std::int64_t>(v);
-}
-}  // namespace
-
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::SortParticles
 //! \brief Timing diagnostic: reorders the
-//! particle arrays by (block, cell of the block, old position): the cells of a block row by row,
-//! or in Morton order (cloud_sort_order = morton, square blocks of a power of two), stable
-//! inside a cell.  Every nrdata / nidata column moves; the arrays are swapped with spare arrays
+//! particle arrays by (block, cell of the block, old position): the cells of a block row by row
+//! (the Morton order, cloud_sort_order = morton, was removed on 2026-10-20), stable inside a
+//! cell; cloud_sort_order = random (test) takes a random permutation instead.  Every nrdata / nidata column moves; the arrays are swapped with spare arrays
 //! of the same extent (kept for the next call).  Runs at the start of a cycle (RefineClouds),
 //! where no send list is pending.  The resampling and the merge pass take their candidates in
 //! array order, so their results change with the order (statistically the same).  One line per
@@ -2326,7 +2313,6 @@ void DustGasDrag::SortParticles() {
   const int nx1 = pmy_pack->pmesh->mb_indcs.nx1, nx2 = pmy_pack->pmesh->mb_indcs.nx2;
   const int gids = pmy_pack->gids, nmb = pmy_pack->nmb_thispack;
   auto &mbsize = pmy_pack->pmb->mb_size;
-  const bool morton = cloud_sort_morton && nx1 == nx2 && (nx1 & (nx1 - 1)) == 0 && nx1 <= 65536;
   const bool randomize = cloud_sort_random;
   const int cyc = pmy_pack->pmesh->ncycle;
   const std::int64_t ncell = static_cast<std::int64_t>(nx1)*nx2, np = npart;
@@ -2340,8 +2326,7 @@ void DustGasDrag::SortParticles() {
     int j = static_cast<int>(Kokkos::floor((pr(IPY,p) - mbsize.d_view(m).x2min)/mbsize.d_view(m).dx2));
     i = (i < 0) ? 0 : ((i >= nx1) ? nx1 - 1 : i);
     j = (j < 0) ? 0 : ((j >= nx2) ? nx2 - 1 : j);
-    const std::int64_t cell = morton ? (SpreadBits(i) | (SpreadBits(j) << 1))
-                                     : static_cast<std::int64_t>(j)*nx1 + i;
+    const std::int64_t cell = static_cast<std::int64_t>(j)*nx1 + i;
     if (randomize) {   // (diagnostic) a random permutation instead (splitmix64 of p, cycle)
       std::uint64_t z = static_cast<std::uint64_t>(p) + 0x9E3779B97F4A7C15ull*(static_cast<std::uint64_t>(cyc) + 1);
       z = (z ^ (z >> 30))*0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27))*0x94D049BB133111EBull; z ^= z >> 31;
@@ -2392,7 +2377,7 @@ void DustGasDrag::SortParticles() {
         std::fseek(fp, 0, SEEK_END);
         if (std::ftell(fp) == 0) {
           std::fprintf(fp, "# cloud sort: ncycle time particles moved t_keys t_sort t_move (s, fenced); "
-                       "order %s\n", morton ? "morton" : "linear");
+                       "order linear\n");
         }
       }
     }

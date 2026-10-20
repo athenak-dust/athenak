@@ -1681,7 +1681,6 @@ class DustGasDrag {
   int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
   // timing diagnostic: storage order of the particles
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)
-  bool cloud_sort_morton = false;     // cells of a block in Morton order (else row by row)
   bool cloud_sort_random = false;     // diagnostic: a random permutation instead
   bool cloud_sort_at_start = false;   // diagnostic: sort before split / R / merge of the cycle
   bool cloud_merge_position_order = false;   // diagnostic: G walk takes pieces by position

@@ -414,6 +414,12 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                  !pin->DoesParameterExist("dust", "cloud_native_check") ||
                  pin->GetInteger("dust", "cloud_native_check") <= 0,
                  "the check of the level-native traversal");
+      // The Morton order of the storage sort is gone;
+      // linear (default) and random (a test tool) stay (dust_cloud.cpp)
+      RemovedKey(pin, "cloud_sort_order",
+                 !pin->DoesParameterExist("dust", "cloud_sort_order") ||
+                 pin->GetString("dust", "cloud_sort_order") != "morton",
+                 "the Morton order of the particle sort");
       // The fixed gather level (a diagnostic) is gone
       RemovedKey(pin, "cloud_gather_level",
                  !pin->DoesParameterExist("dust", "cloud_gather_level") ||

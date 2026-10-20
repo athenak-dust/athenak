@@ -96,7 +96,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   cloud_halo_strips = pin->GetOrAddBoolean("dust", "cloud_halo_strips", true);   // Rixin: default true
   cloud_halo_strip_guard = pin->GetOrAddBoolean("dust", "cloud_halo_strip_guard", false);
   // Every cloud_sort_interval cycles (0: never) the particle arrays are reordered
-  // by block, cell in the block (cloud_sort_order = linear or morton) and old position, after
+  // by block, cell in the block (row by row) and old position, after
   // the split, resampling and merge pass of the cycle (SortParticles).
   // Following a Codex review, every 64 cycles by default on the configuration where it was timed and
   // its effect on G checked (production PC2 path, device G and R, cloud_merge_exact_ts, stopping
@@ -111,11 +111,11 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   }
   {
     const std::string so = pin->GetOrAddString("dust", "cloud_sort_order", "linear");
-    if (so != "linear" && so != "morton" && so != "random") {
-      std::cout << "### FATAL ERROR: <dust>/cloud_sort_order must be linear, morton or random" << std::endl;
+    // (morton was removed on 2026-10-20; dust.cpp stops on it)
+    if (so != "linear" && so != "random") {
+      std::cout << "### FATAL ERROR: <dust>/cloud_sort_order must be linear or random" << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    cloud_sort_morton = (so == "morton");
     cloud_sort_random = (so == "random");   // diagnostic: a random permutation
     cloud_sort_at_start = pin->GetOrAddBoolean("dust", "cloud_sort_at_start", false);
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
