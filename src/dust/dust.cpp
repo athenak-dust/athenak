@@ -406,7 +406,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_split_enable = pin->GetOrAddBoolean("dust", "cloud_split_enable", true);
       // Instant switch (the OO control on a dynamic mesh), see dust.hpp
       cloud_instant_switch = pin->GetOrAddBoolean("dust", "cloud_instant_switch", false);
-      cloud_merge = pin->GetOrAddBoolean("dust", "cloud_merge", false);
+      // Rixin: turned G on by default with the refinable clouds (a full AMR
+      // needs a coarsening channel); tests without it say cloud_merge = false
+      cloud_merge = pin->GetOrAddBoolean("dust", "cloud_merge", true);
       cloud_merge_buffer = pin->GetOrAddInteger("dust", "cloud_merge_buffer", 2);
       cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha", 0.2);
       cloud_merge_interval = pin->GetOrAddInteger("dust", "cloud_merge_interval", 10);
@@ -422,11 +424,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_tstop = pin->GetOrAddReal("dust", "cloud_merge_tstop", -1.0);
       // Merge schedule in physical time, burst after derefinement
       {
-        const std::string ms = pin->GetOrAddString("dust", "cloud_merge_schedule", "cycle");
         Real om = 0.0;
         if (pin->DoesBlockExist("shearing_box") && pin->DoesParameterExist("shearing_box", "omega0")) {
           om = pin->GetReal("shearing_box", "omega0");
         }
+        // Rixin: physical time (every cloud_merge_dt_omega = 0.25
+        // / omega0) whenever omega0 is given, cycles otherwise
+        const std::string ms = pin->GetOrAddString("dust", "cloud_merge_schedule",
+                                                   (om > 0.0) ? "time" : "cycle");
         auto fatal = [](const std::string &msg) {
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                     << msg << std::endl;
@@ -435,7 +440,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         if (ms == "time") {
           cloud_merge_by_time = true;
           if (!(om > 0.0)) fatal("cloud_merge_schedule = time needs <shearing_box>/omega0 > 0");
-          cloud_merge_dt = pin->GetReal("dust", "cloud_merge_dt_omega")/om;
+          cloud_merge_dt = pin->GetOrAddReal("dust", "cloud_merge_dt_omega", 0.25)/om;
           if (!(cloud_merge_dt > 0.0)) fatal("cloud_merge_dt_omega must be > 0");
           cloud_merge_t0 = pin->GetOrAddReal("dust", "cloud_merge_t0", 0.0);
         } else if (ms != "cycle") {
@@ -481,7 +486,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_audit_rejected = pin->GetOrAddBoolean("dust", "cloud_audit_rejected", false);
       cloud_merge_budget_x = pin->GetOrAddBoolean("dust", "cloud_merge_budget_x", false);
       cloud_audit_only = pin->GetOrAddBoolean("dust", "cloud_audit_only", false);
-      cloud_resample = pin->GetOrAddBoolean("dust", "cloud_resample", false);
+      // Rixin: turned R on by default with the refinable clouds, with the
+      // production clock below (tests without it say cloud_resample = false)
+      cloud_resample = pin->GetOrAddBoolean("dust", "cloud_resample", true);
       // <dust>/cloud_resample_schedule = cycle (default: every
       // cloud_resample_interval cycles, as before) or time (event k at t0 + k dt, dt from
       // cloud_resample_dt in code time or cloud_resample_dt_omega in units of 1/omega0).  Only
@@ -495,13 +502,20 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         };
         const bool g_int = pin->DoesParameterExist("dust", "cloud_resample_interval");
         const bool g_dt = pin->DoesParameterExist("dust", "cloud_resample_dt");
-        const bool g_dto = pin->DoesParameterExist("dust", "cloud_resample_dt_omega");
+        bool g_dto = pin->DoesParameterExist("dust", "cloud_resample_dt_omega");
         const bool g_t0 = pin->DoesParameterExist("dust", "cloud_resample_t0");
         const bool g_rst = pin->DoesParameterExist("dust", "cloud_resample_schedule_reset");
-        const std::string sched = pin->GetOrAddString("dust", "cloud_resample_schedule", "cycle");
         if (pin->DoesBlockExist("shearing_box") &&
             pin->DoesParameterExist("shearing_box", "omega0")) {
           cloud_resample_omega = pin->GetReal("shearing_box", "omega0");
+        }
+        // Rixin: physical time whenever omega0 is given (every
+        // cloud_resample_dt_omega = 1 / omega0 unless cloud_resample_dt is given), cycles otherwise
+        const std::string sched = pin->GetOrAddString("dust", "cloud_resample_schedule",
+                                                      (cloud_resample_omega > 0.0) ? "time" : "cycle");
+        if (sched == "time" && !g_dt && !g_dto && cloud_resample_omega > 0.0) {
+          pin->GetOrAddReal("dust", "cloud_resample_dt_omega", 1.0);
+          g_dto = true;
         }
         auto ignored = [](const std::string &keys, const std::string &mode) {
           if (global_variable::my_rank == 0) {
@@ -540,7 +554,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       if (!cloud_resample_by_time) {
         cloud_resample_interval = pin->GetOrAddInteger("dust", "cloud_resample_interval", 625);
       }
-      cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 2.0);
+      // Rixin: the production cap factor (was 2.0)
+      cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 1.5);
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       // Patches inside one MeshBlock of min(cloud_resample_patch 2^level,
       // cloud_resample_patch_cells)^2 of its cells (block, default) or of cloud_resample_patch^2
