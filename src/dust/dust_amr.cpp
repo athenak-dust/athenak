@@ -77,9 +77,10 @@ std::vector<SchedPatch> sched_;
 struct DensityTrigger {
   Real rho_refine = 0.0, rho_derefine = 0.0;   // in units of the mean dust density
   int buffer = 0;                               // cells of the block's level
-  // amr_rho_level_scaling = mass: the thresholds grow by 2^dim per
-  // level, i.e. a fixed dust mass per cell: a block of level l is refined at rho_refine 2^(dim l)
-  // and derefined below rho_derefine 2^(dim (l - 1)); none: the same thresholds on every level
+  // The thresholds grow by level_factor per level (amr_rho_level_factor): a
+  // block of level l is refined at rho_refine f^l and derefined below rho_derefine f^(l - 1); 4 is
+  // a fixed dust mass per cell (2-D, the old amr_rho_level_scaling = mass), 1 the same thresholds
+  // on every level
   Real level_factor = 1.0;
   // With map = block, the block values on the device (default) or on the host; check:
   // both, every value compared (diagnostic)
@@ -203,15 +204,37 @@ void SetupDensityTrigger(ParameterInput *pin) {
     if (mp != "block") fatal("<dust>/amr_rho_map must be block");
   }
   {
-    const std::string sc = pin->GetOrAddString("dust", "amr_rho_level_scaling", "none");
-    if (sc == "mass") {
-      trig_.level_factor = 4.0;   // 2-D (the trigger is 2-D only)
-    } else if (sc != "none") {
-      fatal("<dust>/amr_rho_level_scaling must be none or mass");
+    // The thresholds grow by amr_rho_level_factor per level (1:
+    // the same on every level; 4: a fixed dust mass per cell in 2-D; 2 follows the growth of the
+    // peak density with resolution in the 2048^2 run).  The older
+    // amr_rho_level_scaling (none / mass) is folded into it: none is factor 1, mass factor 4 (2-D,
+    // the trigger is 2-D only), the same threshold rule.  An input with the old key only gets that
+    // factor (one note); mass next to another factor stops.  none next to a factor is accepted:
+    // it was the default, and the factor always won (every restart file since 2026-10-17 carries
+    // both keys).
+    Real fsc = 1.0;
+    const bool has_sc = pin->DoesParameterExist("dust", "amr_rho_level_scaling");
+    const bool has_f = pin->DoesParameterExist("dust", "amr_rho_level_factor");
+    if (has_sc) {
+      const std::string sc = pin->GetString("dust", "amr_rho_level_scaling");
+      if (sc == "mass") {
+        fsc = 4.0;
+      } else if (sc != "none") {
+        fatal("<dust>/amr_rho_level_scaling (folded into amr_rho_level_factor) must be none or mass");
+      }
+      if (sc == "mass" && has_f && pin->GetReal("dust", "amr_rho_level_factor") != fsc) {
+        fatal("<dust>/amr_rho_level_scaling = mass (amr_rho_level_factor = 4) disagrees with "
+              "amr_rho_level_factor = " + pin->GetString("dust", "amr_rho_level_factor") +
+              "; amr_rho_level_scaling was folded into amr_rho_level_factor on 2026-10-20: set "
+              "only amr_rho_level_factor");
+      }
+      if (!has_f && global_variable::my_rank == 0) {
+        std::cout << "# NOTE (dust): amr_rho_level_scaling = " << sc << " is read as "
+                  << "amr_rho_level_factor = " << fsc << " (the key was folded into "
+                  << "amr_rho_level_factor on 2026-10-20)" << std::endl;
+      }
     }
-    // Any factor per level; amr_rho_level_factor = 2 follows the
-    // growth of the peak density with resolution in the 2048^2 run.  Default: 4 with mass, else 1
-    trig_.level_factor = pin->GetOrAddReal("dust", "amr_rho_level_factor", trig_.level_factor);
+    trig_.level_factor = pin->GetOrAddReal("dust", "amr_rho_level_factor", fsc);
     if (!(trig_.level_factor >= 1.0)) fatal("<dust>/amr_rho_level_factor must be >= 1");
   }
   trig_.device = pin->GetOrAddBoolean("dust", "amr_rho_device", true);
@@ -589,7 +612,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     }
     const int lev = pm->lloc_eachmb[m + mbs].level;
     int flag = 0;
-    // the thresholds of this block's level (amr_rho_level_scaling)
+    // the thresholds of this block's level (amr_rho_level_factor)
     const int l = lev - pm->root_level;
     const Real fr = std::pow(trig_.level_factor, l);
     const Real fd = (l > 0) ? std::pow(trig_.level_factor, l - 1) : 1.0;
