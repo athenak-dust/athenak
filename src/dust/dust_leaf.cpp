@@ -448,10 +448,10 @@ void DustGasDrag::HaloReach(const int lev, const std::int64_t need, std::int64_t
 //! \fn DustGasDrag::CheckLeafTraversal
 //! \brief Diagnostic (<dust>/cloud_leaf_check = N: every N cycles): for every particle, the
 //! deposit weights (cloud code) and the gather weights and first moments (gather code) of
-//! the actual-leaf traversal against the virtual-finest-grid traversal.  As the native
-//! check (CheckNativeTransfer) it compares two pseudo-random linear functionals of the
-//! per-leaf weights (equal sums mean equal per-leaf totals, with overwhelming probability),
-//! plus the weight sum (1 unless the support leaves the neighbours) and the owning leaf.
+//! the actual-leaf traversal against the virtual-finest-grid traversal.  It compares two
+//! pseudo-random linear functionals of the per-leaf weights (equal sums mean equal per-leaf
+//! totals, with overwhelming probability), plus the weight sum (1 unless the support leaves
+//! the neighbours) and the owning leaf.
 //! One line per check in cloud_leaf_check.txt.
 
 void DustGasDrag::CheckLeafTraversal() {

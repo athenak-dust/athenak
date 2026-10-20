@@ -82,8 +82,6 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // (LeafTraversal).  <dust>/cloud_table = auto (default: built when one of its users is set),
   // true or false.  The table supports the root and two levels of refinement; without it the
   // levels are limited by the cloud code (4 bits) only.
-  const bool native_cfg = pin->GetOrAddBoolean("dust", "cloud_native_transfer", false);
-  cloud_native_check = pin->GetOrAddInteger("dust", "cloud_native_check", 0);
   // cloud_leaf_check compares the actual-leaf traversal with the table
   cloud_leaf_check = pin->GetOrAddInteger("dust", "cloud_leaf_check", 0);
   // cloud_particle_dump (diagnostic): at the start of cycle N every rank writes its particles
@@ -135,8 +133,6 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   std::string users;
   auto user = [&](const bool on, const char *name) {if (on) users += std::string(" ") + name;};
   user(cloud_leaf_check > 0, "cloud_leaf_check");
-  user(cloud_native_check > 0, "cloud_native_check");
-  user(native_cfg, "cloud_native_transfer");
   user(!cloud_p1_split, "cloud_p1_split=false (host split)");
   user(cloud_p1_split && !cloud_split_device, "cloud_split_device=false (host split)");
   user(cloud_split_log, "cloud_split_log (host split)");
@@ -298,45 +294,6 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     Kokkos::deep_copy(t.cloud_level, level);
   }
 
-  // <dust>/cloud_native_transfer: clouds whose support lies
-  // on leaves of one level are traversed on that level's own cells instead of the finest
-  // virtual grid (same integrals up to rounding; see NativeTraversal).  The per-level maps
-  // hold the mesh leaves only, never the split-buffer dilation of cloud_level.
-  // <dust>/cloud_native_check (diagnostic, cycles, default 0) compares both traversals.
-  // Default false: on GB200 the native traversal doubled the time of the two
-  // production cloud kernels of a BA run that is mostly fine clouds (87 s against 33 s for
-  // t = 0-100; 8% slower on an RTX 4080 as well); the integrals are the same to rounding.
-  // Both belong to the table's traversal (read above).
-  t.native = native_cfg && table;
-  if (nlev + 1 > SMRCompositeTransfer::kMaxNativeLevels) t.native = false;
-  if (t.native || cloud_native_check > 0) {
-    int total = 0;
-    for (int l=0; l<=nlev; ++l) {
-      t.native_n1[l] = t.ncoarse1 << l;
-      t.native_n2[l] = t.ncoarse2 << l;
-      t.native_offset[l] = total;
-      total += t.native_n1[l]*t.native_n2[l];
-    }
-    t.native_target = DvceArray1D<int>("dust_native_target", total);
-    std::vector<int> nt(static_cast<std::size_t>(total), -1);
-    for (int m=0; m<nmb; ++m) {
-      const auto &size = mbsize.h_view(m);
-      int lev = mblev.h_view(m) - pmesh->root_level;
-      int i0 = static_cast<int>(std::lround((size.x1min - t.x1min)/size.dx1));
-      int j0 = static_cast<int>(std::lround((size.x2min - t.x2min)/size.dx2));
-      for (int j=0; j<indcs.nx2; ++j) {
-        for (int i=0; i<indcs.nx1; ++i) {
-          nt[static_cast<std::size_t>(t.native_offset[lev]) +
-             static_cast<std::size_t>(j0 + j)*t.native_n1[lev] + (i0 + i)] =
-              EncodeCloudLeaf(m, j + indcs.js, i + indcs.is, ncells2, ncells1);
-        }
-      }
-    }
-    auto nt_h = Kokkos::create_mirror_view(t.native_target);
-    for (int k=0; k<total; ++k) nt_h(k) = nt[static_cast<std::size_t>(k)];
-    Kokkos::deep_copy(t.native_target, nt_h);
-  }
-
   if (global_variable::my_rank == 0 && !cloud_map_announced) {
     cloud_map_announced = true;
     std::cout << "# refinable_cloud map: levels=" << nlev
@@ -353,7 +310,6 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
                   std::to_string(cloud_split_buffer) + " coarse cells" : "")
               << (t.cloud_split_everywhere ? ", split everywhere" : "")
               << (t.cloud_split_overlap ? ", split on first overlap with finer leaves" : "")
-              << (t.native ? ", level-native traversal" : ", finest-grid traversal only")
               << std::endl;
   }
   BuildLeafTraversal();
@@ -371,62 +327,6 @@ void DustGasDrag::RequireCloudTable(const char *what) const {
             << what << " reads the virtual finest-grid table, which was not built: set "
             << "<dust>/cloud_table = true (at most two levels of refinement)" << std::endl;
   std::exit(EXIT_FAILURE);
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::CheckNativeTransfer
-//! \brief Diagnostic (<dust>/cloud_native_check): traverse every particle's cloud with
-//! the level-native path and with the finest virtual grid, and print the largest
-//! per-particle difference of a weight sum and of a moment sum taken against
-//! pseudo-random per-leaf coefficients, and the fraction of particles the native path
-//! takes.  A wrong leaf, weight or moment shows as an O(1) difference; rounding as 1e-16.
-
-void DustGasDrag::CheckNativeTransfer() {
-  RequireCloudTable("cloud_native_check");
-  particles::Particles *ppar = pmy_pack->ppart;
-  auto &pr = ppar->prtcl_rdata;
-  auto &pi = ppar->prtcl_idata;
-  int npart = ppar->nprtcl_thispack;
-  SMRCompositeTransfer on = smr_transfer, off = smr_transfer;
-  on.native = true;
-  off.native = false;
-  int tmode = cloud_transition;
-  Real inv_dx = 1.0/smr_transfer.root_dx1;
-  Real ew = 0.0, em = 0.0;
-  int nnative = 0;
-  Kokkos::parallel_reduce("dust_native_check", Kokkos::RangePolicy<DevExeSpace>(0, npart),
-  KOKKOS_LAMBDA(const int p, Real &dw, Real &dm, int &nn) {
-    auto coef = [](const int target, const Real s) {
-      Real v = sin(static_cast<Real>(target)*12.9898 + s)*43758.5453;
-      return v - floor(v);
-    };
-    Real x1 = pr(IPX,p), x2 = pr(IPY,p);
-    int code = pi(PLEV,p);
-    int gcode = SMRCompositeTransfer::GatherCode(code, tmode);
-    Real sw[2] = {0.0, 0.0}, sm[2] = {0.0, 0.0};
-    for (int k=0; k<2; ++k) {
-      const SMRCompositeTransfer &t = (k == 0) ? on : off;
-      t.ForEachCloudWeight(x1, x2, code, [&](const int target, const Real w) {
-        sw[k] += w*coef(target, 0.3);
-      });
-      t.ForEachCloudMoment(x1, x2, gcode,
-      [&](const int target, const Real w, const Real m1x, const Real m1y) {
-        sm[k] += w*coef(target, 0.3) + inv_dx*(m1x*coef(target, 1.7) + m1y*coef(target, 2.9));
-      });
-    }
-    dw = fmax(dw, fabs(sw[0] - sw[1]));
-    dm = fmax(dm, fabs(sm[0] - sm[1]));
-    Real w1 = SMRCompositeTransfer::WrapPosition(x1, on.x1min, on.x1max);
-    Real w2 = SMRCompositeTransfer::WrapPosition(x2, on.x2min, on.x2max);
-    if (on.NativeTraversal<false>(w1, w2, code, [](const int, const Real) {})) ++nn;
-  }, Kokkos::Max<Real>(ew), Kokkos::Max<Real>(em), Kokkos::Sum<int>(nnative));
-  if (global_variable::my_rank == 0) {
-    std::cout << "# native transfer check cycle " << pmy_pack->pmesh->ncycle
-              << ": particles " << npart << ", native fraction "
-              << (npart > 0 ? static_cast<Real>(nnative)/npart : 0.0)
-              << ", max |d weight sum| " << ew << ", max |d moment sum| " << em
-              << std::endl;
-  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -697,9 +597,6 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   }
 #endif
   CheckHaloReach("refine");   // before this cycle's gathers and deposits
-  if (cloud_native_check > 0 && pmy_pack->pmesh->ncycle % cloud_native_check == 0) {
-    CheckNativeTransfer();
-  }
   if (cloud_leaf_check > 0 && pmy_pack->pmesh->ncycle % cloud_leaf_check == 0) {
     CheckLeafTraversal();
   }

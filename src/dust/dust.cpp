@@ -406,6 +406,15 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                  "the gas-side drag with the leaf's own velocity");
       RemovedKey(pin, "cloud_force_children", KeyFalse(pin, "cloud_force_children"),
                  "the drag deposited as two-scale children");
+      // The level-native traversal of the finest-grid table (already off by default: the
+      // production kernels use the actual leaves) and its check
+      // are gone; the table itself stays (host split, leaf check, other controls)
+      RemovedKey(pin, "cloud_native_transfer", KeyFalse(pin, "cloud_native_transfer"),
+                 "the level-native traversal");
+      RemovedKey(pin, "cloud_native_check",
+                 !pin->DoesParameterExist("dust", "cloud_native_check") ||
+                 pin->GetInteger("dust", "cloud_native_check") <= 0,
+                 "the check of the level-native traversal");
       // The fixed gather level (a diagnostic) is gone
       RemovedKey(pin, "cloud_gather_level",
                  !pin->DoesParameterExist("dust", "cloud_gather_level") ||
@@ -984,7 +993,6 @@ void DustGasDrag::CheckMultiRank() {
       !cloud_resample_dump.empty()) {
     bad.push_back("resampling diagnostics (compare, feedback_check, stress, dump)");
   }
-  if (smr_transfer.native) bad.push_back("the level-native traversal");
   if (!bad.empty()) {
     if (global_variable::my_rank == 0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
