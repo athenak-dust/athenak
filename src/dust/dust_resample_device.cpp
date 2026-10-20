@@ -17,9 +17,13 @@
 //! below the QR diagonal, which is a team reduction (its order is Kokkos's and can
 //! depend on the backend and the team size).  It can differ from the host by round-off (that sum,
 //! fused multiply-add, sqrt / hypot of the device library), which the comparison mode
-//! (<dust>/cloud_resample_compare) measures.  Bitwise reproducibility between runs is not
-//! guaranteed on every backend: repeated OpenMP runs already differ (no fallback, row residuals
-//! <= 1e-13; cause not located, and meeting the constraints does not by itself rule out a race).
+//! (<dust>/cloud_resample_compare) measures.  For a given backend and team size the solve is
+//! bitwise reproducible: Kokkos joins the partial sums of a team reduction in a fixed order (host:
+//! contiguous index blocks joined by team rank; CUDA: a fixed shuffle tree and warp order), and
+//! repeated solves of the same patch problem were identical on OpenMP (teams of 4, also with random
+//! delays injected into the team code) and on a local CUDA GPU (the OpenMP run-to-run investigation; the repeat
+//! diagnostics are on branch dust-r-omp-debug).  Repeated OpenMP *runs* differ because their pools
+//! differ (the atomic deposit makes the whole run non-reproducible), not because of this solver.
 //!
 //! Exception: with <dust>/cloud_resample_qr_rows = true (the default) the QR
 //! update sums each column by row chunks over the team, in another order than the host.  The
@@ -304,8 +308,9 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
       // chunk sums added in their order; the rank-one update by matrix element (consecutive
       // threads on consecutive columns of a row).  NOTE: the sums run in another order than the
       // host's, so this QR (and the solve that follows) matches the host only to round-off, not
-      // bitwise.  The chunk order is fixed, but the Householder norm above is a team reduction,
-      // so this alone does not make the device result bitwise reproducible on every backend.
+      // bitwise.  The chunk order is fixed for a given team size (nch depends on it), as is the
+      // join order of the team-reduced Householder norm above: reproducible for one backend and
+      // team size, different between team sizes and backends (the OpenMP run-to-run investigation).
       const int nc = n - k - 1, nr = m - k - 1;
       if (tau != 0.0 && nc > 0) {
         const int nthr = tm.team_size();
