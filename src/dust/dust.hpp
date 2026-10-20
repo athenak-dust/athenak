@@ -1518,13 +1518,8 @@ class DustGasDrag {
   // holds its centre; no split, merge or resampling, fixed particle number and masses
   bool cloud_instant_switch = false;
   unsigned long long cloud_switch_count = 0;   // level changes made by the instant switch
-  bool cloud_split_interp = false;    // P1 split/release: pieces take the node-convention
-                                      // (linear, P1) prolongation of displacement and velocity
-                                      // from the neighbouring nodes of the particle lattice,
-                                      // positions relative to the centre piece, velocity
-                                      // increments mass-mean-free (single-stream prototype)
   bool cloud_split_device = false;    // P1 split on the device; the split log,
-                                      // cloud_split_interp and split_oracle keep the host path
+                                      // and split_oracle keep the host path
   bool cloud_split_log = false;       // diagnostic: log every P1 split event (parent,
                                       // children, leaf deposit audit) to a text file
   bool cloud_split_log_leaves = false; // diagnostic (with cloud_split_log): per split call,

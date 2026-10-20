@@ -425,7 +425,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // reference, selected explicitly
       cloud_split_device = pin->GetOrAddBoolean("dust", "cloud_split_device", true);
       cloud_split_log_leaves = pin->GetOrAddBoolean("dust", "cloud_split_log_leaves", false);
-      cloud_split_interp = pin->GetOrAddBoolean("dust", "cloud_split_interp", false);
+      // The node-convention prolongation of the host P1 split
+      // (lattice Ai) is gone; the host P1 split, its log and the oracle stay
+      RemovedKey(pin, "cloud_split_interp", KeyFalse(pin, "cloud_split_interp"),
+                 "the node-convention prolongation of the host P1 split");
       // Test switch: false keeps every cloud at its level whatever the mesh
       cloud_split_enable = pin->GetOrAddBoolean("dust", "cloud_split_enable", true);
       // Instant switch (the OO control on a dynamic mesh), see dust.hpp
@@ -762,11 +765,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      if (cloud_merge && (cloud_split_interp || cloud_merge_buffer < 2 ||
+      if (cloud_merge && (cloud_merge_buffer < 2 ||
                           cloud_merge_alpha <= 0.0 || cloud_merge_interval < 1)) {
-        // lattice-Ai looks nodes up on the root lattice, which merged centroids leave
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_merge excludes cloud_split_interp and "
+                  << std::endl << "<dust>/cloud_merge "
                   << "needs cloud_merge_buffer >= 2, "
                   << "cloud_merge_alpha > 0"
                   << " and cloud_merge_interval >= 1" << std::endl;
@@ -775,12 +777,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // The x1-only presplit of root clouds is gone
       RemovedKey(pin, "cloud_presplit_x1", KeyFalse(pin, "cloud_presplit_x1"),
                  "the x1-only presplit of root clouds");
-      if (cloud_split_interp && global_variable::nranks > 1) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_split_interp requires a single rank"
-                  << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
       if (cloud_split_log_leaves && !cloud_split_log) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "<dust>/cloud_split_log_leaves requires cloud_split_log"
@@ -971,7 +967,7 @@ void DustGasDrag::CheckMultiRank() {
   if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_stencil)) {
     bad.push_back("merging other than the device quantum G (tent, X)");
   }
-  if (cloud_split_interp || cloud_split_log) bad.push_back("cloud_split_interp / cloud_split_log");
+  if (cloud_split_log) bad.push_back("cloud_split_log");
   if (cloud_leaf_check > 0) bad.push_back("cloud_leaf_check");
   // the audit is on whenever cloud_audit_t1 > 0 (dust_cloud_device.cpp; cloud_audit_t0 may stay at
   // its default -1): the check follows that condition (flag audit / Codex review)

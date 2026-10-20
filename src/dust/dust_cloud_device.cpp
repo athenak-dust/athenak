@@ -6,7 +6,7 @@
 //! \file dust_cloud_device.cpp
 //! \brief Device (Kokkos) implementation of the moving-particle P1 split of refinable
 //! clouds.  Same rules as the host SplitCloudsP1, without its
-//! diagnostics (split log, cloud_split_interp node lookup, split oracle), which keep the
+//! diagnostics (split log, split oracle), which keep the
 //! host path.  Flag and count the pieces per particle, exclusive scans for the slots and
 //! the new tags, then one fill kernel.  The particle order is the host version's: kept
 //! particles in their order, then the pieces of the flagged particles in theirs.
