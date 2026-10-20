@@ -669,6 +669,18 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         std::exit(EXIT_FAILURE);
       }
       cloud_resample_compare = pin->GetOrAddBoolean("dust", "cloud_resample_compare", false);
+      // Rixin: the column-by-column device QR (qr_rows = false) exists only
+      // in the reference build (-DDUST_R_QR_COLUMNS=1, dust_resample.hpp); without it a run whose
+      // device R solver would take that path stops instead of silently running the row update
+      if (!cloud_resample_qr_rows && !DUST_R_QR_COLUMNS && cloud_resample &&
+          (cloud_resample_device || cloud_resample_compare)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "<dust>/cloud_resample_qr_rows = false (the column-by-column QR of the device "
+                  << "resampling solve) is not compiled in this binary (DUST_R_QR_COLUMNS = 0): "
+                  << "rebuild with -DDUST_R_QR_COLUMNS=1 in CMAKE_CXX_FLAGS (the reference "
+                  << "build), or use the row-parallel update (true, the default)" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       // Diagnostic: per resampling, the patches by level and size (clouds, removals,
       // steps) and the largest patches, in cloud_resample_patch_stats.txt
       cloud_resample_patch_stats = pin->GetOrAddBoolean("dust", "cloud_resample_patch_stats",

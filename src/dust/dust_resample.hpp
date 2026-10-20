@@ -22,6 +22,14 @@
 #ifndef DUST_R_DIAG
 #define DUST_R_DIAG 0
 #endif
+// Rixin: the column-by-column QR update of the device patch solves
+// (<dust>/cloud_resample_qr_rows = false, one thread per column in the host's order, bitwise
+// comparable with the host solver) is compiled only with -DDUST_R_QR_COLUMNS=1 (the reference
+// build); the production build has the row-parallel update only, and an input or
+// restart asking for false stops there (dust.cpp).  The host R solver is not affected.
+#ifndef DUST_R_QR_COLUMNS
+#define DUST_R_QR_COLUMNS 0
+#endif
 
 namespace dust {
 namespace resample {

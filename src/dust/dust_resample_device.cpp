@@ -31,7 +31,7 @@
 //! round-off difference into another end point of the null space: the kept clouds and their
 //! masses may differ from the host's (both satisfy every constraint to round-off).  Compare
 //! with cloud_resample_compare by tolerance, or set cloud_resample_qr_rows = false to recover
-//! the host's order.
+//! the host's order (only in a build with -DDUST_R_QR_COLUMNS=1, dust_resample.hpp).
 //!
 //! Workspaces live in global memory, one per team slot, in two buckets of patch sizes (at
 //! most 64 clouds, more than 64) sized from the largest patch of the bucket; the number of
@@ -277,6 +277,7 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
       Kokkos::single(Kokkos::PerTeam(tm), [&]() {a[static_cast<std::size_t>(k)*n + k] = beta;});
       tm.team_barrier();
     }
+#if DUST_R_QR_COLUMNS
     if (!rows) {
       Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, k + 1, n), [&](const int j) {
         if (tau != 0.0) {
@@ -303,6 +304,10 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
         }
       });
     } else {
+#else
+    (void) rows;   // the row-parallel update only (DUST_R_QR_COLUMNS = 0)
+    {
+#endif
       // The update with the rows shared as well.  The dot products of the
       // Householder vector with the columns k+1..n-1 by (column, row chunk) over all threads, the
       // chunk sums added in their order; the rank-one update by matrix element (consecutive
