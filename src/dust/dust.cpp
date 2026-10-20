@@ -926,7 +926,9 @@ void DustGasDrag::CheckMultiRank() {
   }
   if (cloud_split_interp || cloud_split_log) bad.push_back("cloud_split_interp / cloud_split_log");
   if (cloud_leaf_check > 0) bad.push_back("cloud_leaf_check");
-  if (cloud_audit_t0 >= 0.0) bad.push_back("merge pass audits (cloud_audit_t0)");
+  // the audit is on whenever cloud_audit_t1 > 0 (dust_cloud_device.cpp; cloud_audit_t0 may stay at
+  // its default -1): the check follows that condition (flag audit / Codex review)
+  if (cloud_audit_t1 > 0.0) bad.push_back("merge pass audits (cloud_audit_t1 > 0)");
   if (cloud_resample_compare || cloud_resample_feedback_check || cloud_resample_stress > 0 ||
       !cloud_resample_dump.empty()) {
     bad.push_back("resampling diagnostics (compare, feedback_check, stress, dump)");
