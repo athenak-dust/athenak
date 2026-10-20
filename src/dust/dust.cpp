@@ -954,9 +954,14 @@ DustGasDrag::~DustGasDrag() {
     std::cout << std::setprecision(14)
               << "# DUST_HYBRID_SUMMARY pc2_cycles=" << hybrid_pc2_cycles
               << " split_be_cycles=" << hybrid_split_be_cycles
-              << " pc2_fraction=" << pc2_fraction
-              << " last_zeta=" << hybrid_last_zeta
-              << " last_chi=" << hybrid_last_chi << std::endl;
+              << " pc2_fraction=" << pc2_fraction;
+    // With a fixed mode the switching metric is not computed (not a zero)
+    if (NeedsHybridMetric()) {
+      std::cout << " last_zeta=" << hybrid_last_zeta << " last_chi=" << hybrid_last_chi;
+    } else {
+      std::cout << " metric=not_computed";
+    }
+    std::cout << std::endl;
   }
   if (global_variable::my_rank == 0 && (prof_count[kProfAmr] > 0 || prof_count[kProfRefineClouds] > 0)) {
     // Rank 0's fenced phase times (s) and calls

@@ -533,7 +533,10 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
 //! for the next cycle's hysteretic choice.
 
 void DustGasDrag::UpdateHybridMetric(Driver *pdrive, int stage) {
-  if (coupling != DustCoupling::hybrid) return;
+  // Only the automatic switch reads the metric; with a fixed mode (coupling = pc2,
+  // hybrid_force_mode = pc2 / split_be) the full-mesh reduction and its host wait are skipped
+  // and the metric stays "not computed" (hybrid_have_metric = false)
+  if (!NeedsHybridMetric()) return;
   hybrid_last_zeta = pmy_pack->pmesh->dt/taus_min;
   hybrid_last_chi = 0.0;
   if (back_reaction) {

@@ -1756,6 +1756,11 @@ class DustGasDrag {
   unsigned long long cloud_split_event = 0;
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   unsigned long long cloud_lobe_split_count = 0;
+  // the switching metric (the cell feedback stiffness, its reduction and the
+  // stiffness deposit in qdep[4]) is read only by the automatic PC2 / split-BE switch
+  bool NeedsHybridMetric() const {
+    return coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::automatic;
+  }
   bool UsesCompositeTransfer() const {
     return (smr_transfer_mode == DustSMRTransfer::smooth_p2 ||
             smr_transfer_mode == DustSMRTransfer::refinable_cloud);
