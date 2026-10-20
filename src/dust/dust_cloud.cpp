@@ -145,15 +145,12 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
       cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval", prod ? 8 : 0);
     }
   }
-  const bool graded = pin->DoesParameterExist("problem", "graded_split_layers") &&
-                      pin->GetInteger("problem", "graded_split_layers") >= 0;
   std::string users;
   auto user = [&](const bool on, const char *name) {if (on) users += std::string(" ") + name;};
   user(cloud_leaf_check > 0, "cloud_leaf_check");
   user(!cloud_split_device, "cloud_split_device=false (host split)");
   user(cloud_split_log, "cloud_split_log (host split)");
   user(cloud_merge && !cloud_merge_device, "cloud_merge_device=false (host merge)");
-  user(graded, "problem/graded_split_layers");
   const std::string mode = pin->GetOrAddString("dust", "cloud_table", "auto");
   bool table = !users.empty();
   if (mode == "true") {
