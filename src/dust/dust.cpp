@@ -729,7 +729,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_compress_smax = pin->GetOrAddReal("dust", "cloud_compress_smax", 0.5);
       cloud_compress_ds = pin->GetOrAddReal("dust", "cloud_compress_ds", 0.1);
       cloud_compress_buffer = pin->GetOrAddInteger("dust", "cloud_compress_buffer", 4);
-      if ((cloud_merge_mode == 1 || cloud_compress) &&
+      // (2026-10-20: quantum is the default mode now, so its requirements apply only when G is on;
+      // cloud_merge = false with the default mode is a run without G, not an error)
+      if (((cloud_merge && cloud_merge_mode == 1) || cloud_compress) &&
           (!cloud_merge || !cloud_merge_device || cloud_merge_mode != 1 || cloud_merge_K < 1 ||
            cloud_merge_K > 8 || cloud_merge_smax <= 0.0 || cloud_compress_smax <= 0.0 ||
            cloud_compress_buffer < 1 || cloud_merge_d3)) {
