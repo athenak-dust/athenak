@@ -733,6 +733,7 @@ int DustGasDrag::SwitchCloudsToLeafLevel() {
   int nchange = 0, nbad = 0;
   Kokkos::parallel_reduce("dust_instant_switch", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, int &nc, int &bad) {
+    SMRCompositeTransfer::WrapParticle(pr, p, lt.x1min, lt.x1max, lt.x2min, lt.x2max);
     const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)));
     const int owner = (leaf < 0) ? -1 : leaf/ncell12;
     if (owner < 0 || owner >= nmb) {++bad; return;}

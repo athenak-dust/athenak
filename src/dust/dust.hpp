@@ -166,6 +166,21 @@ struct SMRCompositeTransfer {
     return wrapped;
   }
 
+  // Wrap a particle into [min, max) with its RK position registers, before
+  // its block is set from the position.  The leaf lookups wrap the position themselves; without
+  // writing it back, a particle within round-off of a periodic face (y = -1e-20, or y = ymax after
+  // the +L wrap of the routing rounded up) got the block on the other side while it kept its
+  // position, and the next routing aborted.
+  template <class PR>
+  KOKKOS_INLINE_FUNCTION
+  static void WrapParticle(const PR &pr, const int p, const Real x1min, const Real x1max,
+                           const Real x2min, const Real x2max) {
+    const Real x = pr(IPX,p), y = pr(IPY,p);
+    const Real xw = WrapPosition(x, x1min, x1max), yw = WrapPosition(y, x2min, x2max);
+    if (xw != x) {pr(IPX,p) = xw; pr(IPX1,p) += xw - x;}
+    if (yw != y) {pr(IPY,p) = yw; pr(IPY1,p) += yw - y;}
+  }
+
   KOKKOS_INLINE_FUNCTION
   static void VirtualTSC(const Real x, const Real xmin, const Real xmax, const int ncells,
                          int index[3], Real weight[3]) {

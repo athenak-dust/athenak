@@ -793,6 +793,7 @@ int DustGasDrag::ResetPGIDFromPositions(const char *when) {
   if (npart > 0) {
     Kokkos::parallel_reduce("dust_pgid_reset", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
+      SMRCompositeTransfer::WrapParticle(pr, p, lt.x1min, lt.x1max, lt.x2min, lt.x2max);
       const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)));
       const int owner = (leaf < 0) ? -1 : leaf/ncell12;
       if (owner < 0 || owner >= nmb) {
@@ -844,6 +845,7 @@ int DustGasDrag::RouteToOwnerBlocks(const char *when) {
   if (npart > 0) {
     Kokkos::parallel_reduce("dust_route_owner", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
+      SMRCompositeTransfer::WrapParticle(pr, p, lt.x1min, lt.x1max, lt.x2min, lt.x2max);
       const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)));
       const int slot = (leaf < 0) ? -1 : leaf/ncell12;
       if (slot < 0) {++bad; return;}
@@ -920,6 +922,19 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
   amr_npart_before = pmy_pack->ppart->nprtcl_thispack;
   amr_regrid_nnew = nnew;
   amr_regrid_ndel = ndel;
+  // Positions into the box before the checksum (the rebuild sets the blocks from
+  // the wrapped positions and must find the same particles)
+  if (smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
+      pmy_pack->ppart->nprtcl_thispack > 0) {
+    auto pr = pmy_pack->ppart->prtcl_rdata;
+    const auto &ms = pmy_pack->pmesh->mesh_size;
+    const Real x1a = ms.x1min, x1b = ms.x1max, x2a = ms.x2min, x2b = ms.x2max;
+    Kokkos::parallel_for("dust_wrap_before_regrid",
+                         Kokkos::RangePolicy<>(DevExeSpace(), 0, pmy_pack->ppart->nprtcl_thispack),
+    KOKKOS_LAMBDA(const int p) {
+      SMRCompositeTransfer::WrapParticle(pr, p, x1a, x1b, x2a, x2b);
+    });
+  }
   amr_checksum = ParticleChecksum(pmy_pack->ppart);
   lb_old_counts.clear();
 #if MPI_PARALLEL_ENABLED
@@ -1081,6 +1096,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   if (npart > 0) {
     Kokkos::parallel_reduce("dust_amr_regrid", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, Real &dw, int &bad, double &ms) {
+      SMRCompositeTransfer::WrapParticle(pr, p, lt.x1min, lt.x1max, lt.x2min, lt.x2max);
       const Real xp = pr(IPX,p), yp = pr(IPY,p);
       const int leaf = lt.LeafOwner(xp, yp, lt.Anchor(pi(PGID,p)));   // the old id: a guess only
       const int owner = (leaf < 0) ? -1 : leaf/ncell12;
