@@ -1010,6 +1010,10 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   // deleted, not from the net change of the block count.  A regrid that deleted blocks also
   // starts a burst of merge passes.  Two regrids before one handling (possible
   // only around a restart) make one event with the summed counts.
+  if (!amr_event_pending) {   // the first regrid of the event (cloud_event_dt)
+    amr_event_first_time = pmesh->time;
+    amr_event_first_ncycle = pmesh->ncycle;
+  }
   amr_event_pending = true;
   amr_event_nnew += amr_regrid_nnew;
   amr_event_ndel += amr_regrid_ndel;

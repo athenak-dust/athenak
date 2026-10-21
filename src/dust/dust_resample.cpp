@@ -800,7 +800,10 @@ int DustGasDrag::ResampleClouds(const bool local) {
     };
     std::vector<std::array<Real, 4>> fresh;
     for (int g=0; g<ntot; ++g) {
-      if (pmr->ncyc_since_ref(g) == 0) {Real b[4]; box(g, b); fresh.push_back({b[0], b[1], b[2], b[3]});}
+      // (2026-10-21: every regrid of the event, cloud_event_dt; 0 for one regrid as before)
+      if (pmr->ncyc_since_ref(g) <= amr_event_max_age) {
+        Real b[4]; box(g, b); fresh.push_back({b[0], b[1], b[2], b[3]});
+      }
     }
     auto mh = Kokkos::create_mirror_view(rmask);
     nmask = 0;

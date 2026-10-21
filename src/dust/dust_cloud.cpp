@@ -564,7 +564,13 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
     amr_event_pending = false;          // no resampling after regrids: nothing to do
     amr_event_nnew = amr_event_ndel = 0;
   }
-  if (amr_event_pending) {
+  // 2026-10-21 (scaling): the event may wait cloud_event_dt after its first regrid
+  bool event_now = amr_event_pending;
+  if (event_now && cloud_event_dt > 0.0) {
+    const double t = pmy_pack->pmesh->time;
+    event_now = t >= amr_event_first_time + cloud_event_dt - 1.0e-12*std::fmax(1.0, std::fabs(t));
+  }
+  if (event_now) {
     // The cycle after a regrid: merge pass first, then one resampling
     ProfTimer pt(prof_time[kProfEvent], prof_count[kProfEvent]);
     HandleRegridEvent(merge_due);
@@ -657,7 +663,11 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   // the coarsened region, the scheduled resampling still reaches everything
   const bool skip_r = !scheduled && nnew == 0 && ndel > 0 && !cloud_resample_after_derefine;
   timer.reset();
+  // the blocks changed by every regrid of this event are fresh for the local R
+  amr_event_max_age = (amr_event_first_ncycle >= 0)
+                    ? static_cast<int>(pmesh->ncycle - amr_event_first_ncycle) : 0;
   const int removed = skip_r ? 0 : ResampleClouds(cloud_resample_event_local && !scheduled);
+  amr_event_max_age = 0;
   Kokkos::fence();
   const double t_resample = timer.seconds();
   const int n2 = ppar->nprtcl_thispack;
@@ -696,6 +706,8 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   }
   amr_event_pending = false;
   amr_event_nnew = amr_event_ndel = 0;
+  amr_event_first_time = -1.0e300;
+  amr_event_first_ncycle = -1;
 }
 
 //----------------------------------------------------------------------------------------

@@ -169,6 +169,9 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   const std::int64_t ev[6] = {amr_event_pending ? 1 : 0, amr_event_nnew, amr_event_ndel,
                               amr_event_regrid, amr_event_handled, amr_event_merged};
   PutRecord(b, "regrid_evt", ev, sizeof(ev));
+  // 2026-10-21 (cloud_event_dt): the first regrid of a pending event (time, cycle)
+  const double et[2] = {amr_event_first_time, static_cast<double>(amr_event_first_ncycle)};
+  PutRecord(b, "regrid_evt_t", et, sizeof(et));
 }
 
 void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
@@ -255,6 +258,9 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
       amr_event_nnew = static_cast<int>(v[1]); amr_event_ndel = static_cast<int>(v[2]);
       amr_event_regrid = static_cast<int>(v[3]);
       amr_event_handled = v[4]; amr_event_merged = v[5];
+    } else if (name == "regrid_evt_t") {
+      double v[2]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));
+      amr_event_first_time = v[0]; amr_event_first_ncycle = static_cast<long long>(v[1]);
     } else if (global_variable::my_rank == 0) {
       std::cout << "# WARNING (dust restart): record '" << name << "' is not known to this code "
                 << "and is ignored" << std::endl;

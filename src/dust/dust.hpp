@@ -1430,6 +1430,14 @@ class DustGasDrag {
   // that created (nnew) or deleted (ndel) blocks, whatever the net change of the block count.
   bool cloud_resample_after_regrid = true;
   bool amr_event_pending = false;
+  // For the scaling on several ranks: a regrid event may wait cloud_event_dt (code
+  // time; <dust>/cloud_event_dt_omega / omega0) after the first regrid it covers; the regrids in
+  // between make one event (counts summed, the blocks of all of them fresh for the local R).  0:
+  // the cycle after each regrid, as before.  first_ncycle < 0: none recorded (handle at once).
+  Real cloud_event_dt = 0.0;
+  Real amr_event_first_time = -1.0e300;
+  long long amr_event_first_ncycle = -1;
+  int amr_event_max_age = 0;   // the local R's fresh blocks: cycles since their change <= this
   int amr_event_nnew = 0, amr_event_ndel = 0;  // summed if two regrids precede the handling
   int amr_event_regrid = 0;                    // regrid number (amr_regrids) of the last one
   long long amr_event_handled = 0, amr_event_merged = 0;

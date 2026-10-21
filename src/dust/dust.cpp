@@ -766,6 +766,23 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // scheduled resampling (every cloud_resample_dt_omega) stays global, also when a regrid event
       // falls on its cycle
       cloud_resample_event_local = pin->GetOrAddBoolean("dust", "cloud_resample_event_local", true);
+      {
+        // 2026-10-21 (scaling): regrid events handled together, cloud_event_dt_omega / omega0 after
+        // the first regrid (0: every regrid at the next cycle)
+        const Real edt = pin->GetOrAddReal("dust", "cloud_event_dt_omega", 0.0);
+        if (edt > 0.0) {
+          Real om = 0.0;
+          if (pin->DoesBlockExist("shearing_box") && pin->DoesParameterExist("shearing_box", "omega0")) {
+            om = pin->GetReal("shearing_box", "omega0");
+          }
+          if (!(om > 0.0)) {
+            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                      << "cloud_event_dt_omega needs <shearing_box>/omega0 > 0" << std::endl;
+            std::exit(EXIT_FAILURE);
+          }
+          cloud_event_dt = edt/om;
+        }
+      }
       // Rixin: a regrid event that only deleted blocks runs G but no R,
       // unless the scheduled resampling falls on that cycle
       cloud_resample_after_derefine = pin->GetOrAddBoolean("dust",
