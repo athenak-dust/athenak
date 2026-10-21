@@ -997,13 +997,49 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       Kokkos::Sum<double>(msum));
     }
   } else {
+  // 2026-10-21 (scaling): with amr_profile, the parts of the rebuild and the blocks and particles
+  // of every rank after each regrid (dust_rank_log.txt, rank 0)
+  using RClock = std::chrono::steady_clock;
+  const bool rlog = ProfOn() && global_variable::nranks > 1;
+  auto rnow = [&]() {if (rlog) Kokkos::fence(); return RClock::now();};
+  auto r0 = rnow();
   BuildRefinableCloudTransfer(pin);
+  auto r1 = rnow(), r2 = r1, r3 = r1;
   // Several ranks: the particles follow their blocks to the ranks that hold
   // them on the new mesh (load balancing may move blocks anywhere)
   if (global_variable::nranks > 1) {
     RouteToOwnerBlocks("regrid");
+    r2 = rnow();
     CheckHaloReach("regrid");   // clouds one level behind the new mesh
+    r3 = rnow();
   }
+#if MPI_PARALLEL_ENABLED
+  if (rlog) {
+    const int nr = global_variable::nranks;
+    double tl[3] = {std::chrono::duration<double>(r1 - r0).count(),
+                    std::chrono::duration<double>(r2 - r1).count(),
+                    std::chrono::duration<double>(r3 - r2).count()};
+    MPI_Allreduce(MPI_IN_PLACE, tl, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    int mine[3] = {pmy_pack->nmb_thispack, ppar->nprtcl_thispack, leaf_traversal.nfld - leaf_traversal.nmb};
+    std::vector<int> all(3*nr, 0);
+    MPI_Gather(mine, 3, MPI_INT, all.data(), 3, MPI_INT, 0, MPI_COMM_WORLD);
+    if (global_variable::my_rank == 0) {
+      std::FILE *fp = AppendLog("dust_rank_log.txt");
+      if (fp != nullptr) {
+        std::fseek(fp, 0, SEEK_END);
+        if (std::ftell(fp) == 0) {
+          std::fprintf(fp, "# regrid ncycle time t_transfer_build t_route t_halo_check (s, slowest rank) | "
+                       "per rank: blocks particles halo_blocks\n");
+        }
+        std::fprintf(fp, "%d %d %.10g %.4e %.4e %.4e |", amr_regrids + 1, pmesh->ncycle, pmesh->time,
+                     tl[0], tl[1], tl[2]);
+        for (int r=0; r<nr; ++r) std::fprintf(fp, " %d %d %d", all[3*r], all[3*r + 1], all[3*r + 2]);
+        std::fprintf(fp, "\n");
+        std::fflush(fp);
+      }
+    }
+  }
+#endif
   npart = ppar->nprtcl_thispack;
   // Every regrid is an event, handled at the start of the next cycle after
   // its split (HandleRegridEvent); refine / derefine from the blocks actually created and
