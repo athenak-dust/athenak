@@ -370,7 +370,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           {"cloud_merge", "true", "false"}, {"cloud_merge_schedule", "time if omega0", "cycle"},
           {"cloud_merge_alpha", "0.05", "0.2"}, {"cloud_merge_budget", "0.3", "-1"},
           {"cloud_resample", "true", "false"}, {"cloud_resample_schedule", "time if omega0", "cycle"},
-          {"cloud_resample_eta", "1.5", "2.0"}};
+          {"cloud_resample_eta", "1.5", "2.0"},
+          // Rixin: chose G and R on their schedules only, both every 0.25 / omega0
+          {"cloud_resample_after_regrid", "false", "true"},
+          {"cloud_resample_dt_omega", "0.25 if omega0", "1"}};
         std::string unset;
         for (const auto &c : changed) {
           if (!pin->DoesParameterExist("dust", c[0])) {
@@ -381,7 +384,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           unset += " experimental_smr_transfer=refinable_cloud (was smooth_p2)";
         }
         if (!unset.empty()) {
-          std::cout << "# NOTE (dust): defaults changed on 2026-10-20 apply to:" << unset << std::endl;
+          std::cout << "# NOTE (dust): defaults changed on 2026-10-20 / 21 apply to:" << unset << std::endl;
         }
       }
       if (!multilevel && !(pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic &&
@@ -576,8 +579,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         // cloud_resample_dt_omega = 1 / omega0 unless cloud_resample_dt is given), cycles otherwise
         const std::string sched = pin->GetOrAddString("dust", "cloud_resample_schedule",
                                                       (cloud_resample_omega > 0.0) ? "time" : "cycle");
+        // Rixin: every 0.25 / omega0 (was 1), with no resampling after the
+        // regrids: G and R on their schedules only
         if (sched == "time" && !g_dt && !g_dto && cloud_resample_omega > 0.0) {
-          pin->GetOrAddReal("dust", "cloud_resample_dt_omega", 1.0);
+          pin->GetOrAddReal("dust", "cloud_resample_dt_omega", 0.25);
           g_dto = true;
         }
         auto ignored = [](const std::string &keys, const std::string &mode) {
@@ -749,7 +754,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                     << (pin->GetBoolean("dust", "cloud_resample_after_regrid") ? "true" : "false")
                     << " is used; the old key cloud_resample_after_refine is ignored" << std::endl;
         }
-        bool dflt = true;
+        // Rixin: default false (was true): no G or R after the regrids, the
+        // scheduled ones (G and R every 0.25 / omega0) cover them; a regrid every ~40 cycles made the
+        // per-regrid R latency-bound and the largest single cost on several GPUs
+        bool dflt = false;
         if (has_old && !has_new) {
           dflt = pin->GetBoolean("dust", "cloud_resample_after_refine");
           if (global_variable::my_rank == 0) {

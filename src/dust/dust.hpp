@@ -1437,9 +1437,9 @@ class DustGasDrag {
   bool MergeDue();
   // One resampling after every regrid, once the particle work of that regrid
   // is done (the split of the next cycle and, with merging on, the first merge pass of a
-  // derefinement); on by default in dynamic-mesh runs with resampling.  An event is a regrid
+  // derefinement); off by default since 2026-10-21 (on before).  An event is a regrid
   // that created (nnew) or deleted (ndel) blocks, whatever the net change of the block count.
-  bool cloud_resample_after_regrid = true;
+  bool cloud_resample_after_regrid = false;   // Rixin: default false
   bool amr_event_pending = false;
   // For the scaling on several ranks: a regrid event may wait cloud_event_dt (code
   // time; <dust>/cloud_event_dt_omega / omega0) after the first regrid it covers; the regrids in
