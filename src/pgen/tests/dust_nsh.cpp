@@ -37,6 +37,8 @@
 // C++ headers
 #include <algorithm>
 #include <cmath>
+#include <complex>
+#include <iomanip>
 #include <cstdint>
 #include <cstdio>     // fopen(), fprintf()
 #include <unistd.h>   // truncate()
@@ -72,6 +74,9 @@ int ba_snapshot_number_ = 0;
 ParameterInput *ba_pin_ = nullptr;
 bool ba_ppdf_resume_ = false;
 Real ba_snapshot_dt_ = 40.0;
+// 2026-10-21: the schedule index of the next snapshot / field frame (due at dt*index), equal to
+// the file number unless a restart changed the interval (ScheduleIndex)
+int ba_snapshot_k_ = 0, ba_field_k_ = 0;
 std::string ba_snapshot_basename_;
 
 // Diagnostic only: the v2 LinA layout retains the exact particle masses and P1
@@ -807,6 +812,100 @@ Real HashUniform01(std::uint64_t key) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn ScheduleIndex
+//! \brief 2026-10-21: the schedule index of the next BA output after a restart at time t.  The
+//! stored file number is kept when it fits the interval (dt*(number-1) <= t < dt*number); a
+//! restart with another interval (e.g. ba_field_dt on the command line) continues the numbering
+//! and starts the schedule at the next multiple of the new interval after t (before, the
+//! schedule was dt*number: a smaller interval wrote one frame per history call until it caught
+//! up, a larger one wrote none for a long time).
+
+int ScheduleIndex(const int number, const Real dt, const Real t) {
+  const bool fits = (dt*number + 1.0e-10 > t) && (dt*(number - 1) <= t + 1.0e-10);
+  return fits ? number : static_cast<int>(std::floor((t + 1.0e-10)/dt)) + 1;
+}
+
+//----------------------------------------------------------------------------------------
+//! \struct RootPlacement
+//! \brief The position of root parent q (cloud_root_random): mode 0 the
+//! independent random draw (the original hash), 1 a square lattice (ppc = n^2, cell-centred
+//! offsets), 2 a generic arrangement for problems along x1: x1 offsets (k + 1/2)/ppc in the root
+//! cell, x2 offsets frac((k + 1/2) phi) (phi the golden ratio), the same in every root cell, so
+//! that for any integer ppc each x1 sub-lattice is a full shift family of the mesh (a uniform
+//! TSC / hat deposit on the root level).  With kwv != 0 the x1 position is displaced by the
+//! eigenmode displacement Re[xi_s exp(i k x0)] (dust_test = wave).
+
+struct RootPlacement {
+  int mode = 0, ppc = 1, nside = 1, nc1 = 1, nspec = 1;
+  std::uint64_t seed = 0;
+  Real x1min = 0.0, x2min = 0.0, lx = 1.0, ly = 1.0, hx = 1.0, hy = 1.0;
+  Real kwv = 0.0;
+  Real xir[4] = {0.0, 0.0, 0.0, 0.0}, xii[4] = {0.0, 0.0, 0.0, 0.0};
+  Real dvr[4] = {0.0, 0.0, 0.0, 0.0}, dvi[4] = {0.0, 0.0, 0.0, 0.0};
+  KOKKOS_INLINE_FUNCTION void Base(const int q, Real &x, Real &y) const {
+    if (mode == 0) {
+      std::uint64_t key = static_cast<std::uint64_t>(q) + seed*UINT64_C(0x9e3779b97f4a7c15);
+      x = x1min + HashUniform01(key + UINT64_C(0x632be59bd9b4e019))*lx;
+      y = x2min + HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7))*ly;
+      return;
+    }
+    const int c = q/ppc, k = q - c*ppc;
+    const int ci = c % nc1, cj = c/nc1;
+    Real fx, fy;
+    if (mode == 1) {
+      fx = (static_cast<Real>(k % nside) + 0.5)/nside;
+      fy = (static_cast<Real>(k/nside) + 0.5)/nside;
+    } else {
+      fx = (static_cast<Real>(k) + 0.5)/ppc;
+      const Real g = (static_cast<Real>(k) + 0.5)*0.6180339887498949;
+      fy = g - Kokkos::floor(g);
+    }
+    x = x1min + (ci + fx)*hx;
+    y = x2min + (cj + fy)*hy;
+  }
+  // the position (displaced, wrapped into the box) and the x1 velocity of the eigenmode
+  KOKKOS_INLINE_FUNCTION void operator()(const int q, Real &x, Real &y, Real &vx) const {
+    Real x0;
+    Base(q, x0, y);
+    x = x0; vx = 0.0;
+    if (kwv != 0.0) {
+      const int s = q % nspec;
+      const Real c = Kokkos::cos(kwv*x0), sn = Kokkos::sin(kwv*x0);
+      x = x0 + xir[s]*c - xii[s]*sn;
+      vx = dvr[s]*c - dvi[s]*sn;
+      x -= lx*Kokkos::floor((x - x1min)/lx);
+    }
+  }
+};
+
+//----------------------------------------------------------------------------------------
+//! \fn DustTestOmega
+//! \brief dust_test = wave: the right-travelling damped root of the dusty-wave dispersion
+//! relation omega^2 (1 + sum_s eps_s/(1 - i omega t_s)) = k^2 cs^2 (as dusty_wave.cpp).
+
+std::complex<Real> DustTestOmega(const Real kwv, const Real cs, const std::vector<Real> &eps,
+                                 const std::vector<Real> &ts) {
+  const std::complex<Real> iunit(0.0, 1.0);
+  Real epstot = 0.0;
+  for (const Real e : eps) epstot += e;
+  std::complex<Real> omega(kwv*cs/std::sqrt(1.0 + epstot), 0.0);
+  for (int it=0; it<100; ++it) {
+    std::complex<Real> ssum(0.0, 0.0), dsum(0.0, 0.0);
+    for (std::size_t s=0; s<eps.size(); ++s) {
+      const std::complex<Real> den = 1.0 - iunit*omega*ts[s];
+      ssum += eps[s]/den;
+      dsum += eps[s]*iunit*ts[s]/(den*den);
+    }
+    const std::complex<Real> f = omega*omega*(1.0 + ssum) - SQR(kwv*cs);
+    const std::complex<Real> fp = 2.0*omega*(1.0 + ssum) + omega*omega*dsum;
+    const std::complex<Real> d = f/fp;
+    omega -= d;
+    if (std::abs(d) < 1.0e-15*std::abs(omega)) break;
+  }
+  return omega;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn SolveNSH
 //! \brief Solves the (2+2N)x(2+2N) linear system for the multi-species NSH drift
 //! equilibrium by Gaussian elimination with partial pivoting. Unknown ordering:
@@ -1031,10 +1130,16 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     if (ba_snapshots_) {
       ba_snapshot_number_ = pin->GetOrAddInteger("problem", "rst_ba_snapshot_number",
           static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_snapshot_dt_)));
+      ba_snapshot_k_ = ScheduleIndex(ba_snapshot_number_, ba_snapshot_dt_, pmy_mesh_->time);
     }
     if (ba_fields_) {
       ba_field_number_ = pin->GetOrAddInteger("problem", "rst_ba_field_number",
           static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_field_dt_)));
+      ba_field_k_ = ScheduleIndex(ba_field_number_, ba_field_dt_, pmy_mesh_->time);
+      if (ba_field_k_ != ba_field_number_ && global_variable::my_rank == 0) {
+        std::cout << "# BA fields: the interval changed at the restart: frames numbered from "
+                  << ba_field_number_ << ", next at t = " << ba_field_dt_*ba_field_k_ << std::endl;
+      }
       ba_ppdf_resume_ = ba_ppdf_;
       // on a mesh that may have changed, the first frame after the restart writes its own
       // (numbered) geometry file instead of replacing the one of frame zero
@@ -1054,21 +1159,51 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
               << "NSH test requires a <hydro> block" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (!(pin->DoesBlockExist("shearing_box"))) {
+  // <problem>/dust_test = damping | wave, the one-dimensional drag tests without
+  // rotation on the root parents (cloud_root_random): the deceleration of uniform dust moving at
+  // <problem>/dust_test_v0 through gas at rest, or the damped dusty sound wave (amp, wave_n
+  // wavelengths along x1); <problem>/root_placement = random | lattice | generic
+  const std::string dust_test = pin->GetOrAddString("problem", "dust_test", "none");
+  const bool dtest = (dust_test != "none");
+  if (dtest && dust_test != "damping" && dust_test != "wave") {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<problem>/dust_test must be none, damping or wave" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (dtest && (!dust_active || !cloud_root_random || pmy_mesh_->three_d ||
+                pin->DoesBlockExist("shearing_box"))) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<problem>/dust_test needs 2-D dust with cloud_root_random and no <shearing_box>"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (!dtest && !(pin->DoesBlockExist("shearing_box"))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "NSH test requires a <shearing_box> block" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
-  Real omega0, qshear, etavk;
+  Real omega0 = 0.0, qshear = 0.0, etavk = 0.0;
   std::vector<Real> eps, taus;
-  ReadNSHParams(pin, pmbp, omega0, qshear, etavk, eps, taus);
+  if (dtest) {
+    const int ns = pmbp->pdust->nspecies;
+    eps.resize(ns); taus.resize(ns);
+    const bool has_eps = pin->DoesParameterExist("problem", "eps_1");
+    for (int s=0; s<ns; ++s) {
+      eps[s] = has_eps ? pin->GetReal("problem", "eps_" + std::to_string(s+1))
+                       : pmbp->pdust->dust_to_gas/static_cast<Real>(ns);
+      taus[s] = pmbp->pdust->taus.h_view(s);
+    }
+    pgen_final_func = nullptr;   // no NSH equilibrium to check
+  } else {
+    ReadNSHParams(pin, pmbp, omega0, qshear, etavk, eps, taus);
+  }
   int nspec = static_cast<int>(eps.size());
   Real ax = 2.0*omega0*etavk;
 
   // the radial forcing must be applied to the gas by the standard const_accel source
   // term (so that dust particles do not feel it); verify the input file sets it up
-  {
+  if (!dtest) {
     bool ok = pin->GetOrAddBoolean("hydro_srcterms","const_accel",false);
     Real val = ok ? pin->GetReal("hydro_srcterms","const_accel_val") : 0.0;
     int dir = ok ? pin->GetInteger("hydro_srcterms","const_accel_dir") : 0;
@@ -1082,10 +1217,17 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   }
 
   // equilibrium drift velocities
-  Real ugx, ugp;
-  std::vector<Real> vx, vp;
-  SolveNSH(omega0, qshear, ax, eps, taus, ugx, ugp, vx, vp);
-  if (global_variable::my_rank == 0) {
+  Real ugx = 0.0, ugp = 0.0;
+  std::vector<Real> vx(nspec, 0.0), vp(nspec, 0.0);
+  if (dtest) {
+    if (dust_test == "damping") {
+      const Real v0 = pin->GetOrAddReal("problem", "dust_test_v0", 0.1);
+      for (int s=0; s<nspec; ++s) vx[s] = v0;
+    }
+  } else {
+    SolveNSH(omega0, qshear, ax, eps, taus, ugx, ugp, vx, vp);
+  }
+  if (global_variable::my_rank == 0 && !dtest) {
     if (dust_active) {
       std::cout << "# NSH equilibrium: u_gx=" << ugx << " u_gphi=" << ugp << std::endl;
       for (int s=0; s<nspec; ++s) {
@@ -1116,6 +1258,47 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     u0(m,IM2,k,j,i) = three_d ? rho0*ugp : 0.0;
     u0(m,IM3,k,j,i) = three_d ? 0.0 : rho0*ugp;
   });
+  // dust_test = wave: the gas part of the eigenmode (velocity normalisation, as dusty_wave.cpp)
+  RootPlacement place;
+  if (dust_test == "wave") {
+    if (nspec > 4) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "dust_test = wave: at most 4 species" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const Real amp = pin->GetOrAddReal("problem", "amp", 1.0e-6);
+    const int nwave = pin->GetOrAddInteger("problem", "wave_n", 1);
+    const Real cs = pmbp->phydro->peos->eos_data.iso_cs;
+    const Real kwv = 2.0*M_PI*nwave/(pmy_mesh_->mesh_size.x1max - pmy_mesh_->mesh_size.x1min);
+    const std::complex<Real> iunit(0.0, 1.0);
+    const std::complex<Real> omega = DustTestOmega(kwv, cs, eps, taus);
+    const std::complex<Real> du = amp*cs, drho = (kwv/omega)*rho0*du;
+    place.kwv = kwv;
+    for (int s=0; s<nspec; ++s) {
+      const std::complex<Real> dv = du/(1.0 - iunit*omega*taus[s]);
+      const std::complex<Real> xi = iunit*dv/omega;   // displacement: d(xi)/dt = dv
+      place.xir[s] = xi.real(); place.xii[s] = xi.imag();
+      place.dvr[s] = dv.real(); place.dvi[s] = dv.imag();
+    }
+    if (global_variable::my_rank == 0) {
+      std::cout << std::setprecision(15) << "# dust_test wave: k = " << kwv << ", omega = "
+                << omega.real() << " " << omega.imag() << " i, |drho| = " << std::abs(drho)
+                << std::endl;
+    }
+    const Real drr = drho.real(), dri = drho.imag(), dur = du.real(), dui = du.imag();
+    const int is0 = indcs.is, nx1 = indcs.nx1;
+    auto &mbs = pmbp->pmb->mb_size;
+    par_for("dust_test_gas", DevExeSpace(),0,(nmb-1),0,(n3-1),0,(n2-1),0,(n1-1),
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real x = CellCenterX(i - is0, nx1, mbs.d_view(m).x1min, mbs.d_view(m).x1max);
+      const Real c = cos(kwv*x), sn = sin(kwv*x);
+      const Real rho = rho0 + drr*c - dri*sn, v = dur*c - dui*sn;
+      u0(m,IDN,k,j,i) = rho;
+      u0(m,IM1,k,j,i) = rho*v;
+      u0(m,IM2,k,j,i) = 0.0;
+      u0(m,IM3,k,j,i) = 0.0;
+    });
+  }
 
   // There are no particle or dust modules to initialize in the dust-free equilibrium.
   if (!dust_active) return;
@@ -1180,17 +1363,32 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     }
     int ncells1 = pmbp->pdust->qdep.extent_int(4);
     int ncells2 = pmbp->pdust->qdep.extent_int(3);
+    {
+      const std::string rp = pin->GetOrAddString("problem", "root_placement", "random");
+      place.mode = (rp == "lattice") ? 1 : ((rp == "generic") ? 2 : 0);
+      place.ppc = static_cast<int>(ppc);
+      place.nside = static_cast<int>(std::lround(std::sqrt(ppc)));
+      if ((rp != "random" && rp != "lattice" && rp != "generic") ||
+          (place.mode == 1 && place.nside*place.nside != place.ppc)) {
+        std::cerr << "<problem>/root_placement must be random, lattice (ppc a square) or "
+                  << "generic" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      place.nc1 = transfer.ncoarse1;
+      place.nspec = nspec;
+      place.seed = random_seed;
+      place.x1min = transfer.x1min; place.x2min = transfer.x2min;
+      place.lx = transfer.x1max - transfer.x1min;
+      place.ly = transfer.x2max - transfer.x2min;
+      place.hx = transfer.root_dx1; place.hy = transfer.root_dx2;
+    }
     // the parents of this rank: those whose leaf is in one of its blocks, in
     // the order of their global index p, which stays the tag (one rank: all of them)
     const int nlocal_mb = nmb;
     DvceArray1D<int> pslot("nsh_root_slot", nparent);
     par_for("nsh_cloud_root_owner", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int p) {
-      std::uint64_t key = static_cast<std::uint64_t>(p)
-                        + random_seed*UINT64_C(0x9e3779b97f4a7c15);
-      Real x = transfer.x1min + HashUniform01(key + UINT64_C(0x632be59bd9b4e019))
-                             *(transfer.x1max-transfer.x1min);
-      Real y = transfer.x2min + HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7))
-                             *(transfer.x2max-transfer.x2min);
+      Real x, y, vw;
+      place(p, x, y, vw);
       int m = 0;
       if (canonical_root) {
         for (int b=0; b<nmb; ++b) {
@@ -1226,12 +1424,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     KOKKOS_LAMBDA(const int q) {
       const int p = pnew(q);
       if (p < 0) return;
-      std::uint64_t key = static_cast<std::uint64_t>(q)
-                        + random_seed*UINT64_C(0x9e3779b97f4a7c15);
-      Real x = transfer.x1min + HashUniform01(key + UINT64_C(0x632be59bd9b4e019))
-                             *(transfer.x1max-transfer.x1min);
-      Real y = transfer.x2min + HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7))
-                             *(transfer.x2max-transfer.x2min);
+      Real x, y, vw;
+      place(q, x, y, vw);
       const int m = pslot(q);
       pi0(PGID,p) = gids0+m;
       pi0(PTAG,p) = q;
@@ -1242,7 +1436,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       pr0(IPY,p) = y; pr0(IPY1,p) = y;
       pr0(IPTS,p) = taus_.d_view(q % nspec);
       pr0(IPM,p) = spdat.d_view(q % nspec,2)*mass_unit;
-      pr0(IPVX,p) = spdat.d_view(q % nspec,0);
+      pr0(IPVX,p) = spdat.d_view(q % nspec,0) + vw;
       pr0(IPVZ,p) = spdat.d_view(q % nspec,1);
       pr0(IPVX1,p) = pr0(IPVX,p);
       pr0(IPVZ1,p) = pr0(IPVZ,p);
@@ -1376,10 +1570,12 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // (numbering from zero would write one file per history call until it caught up)
     if (ba_fields_) {
       ba_field_number_ = static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_field_dt_));
+      ba_field_k_ = ba_field_number_;
     }
     if (ba_snapshots_) {
       ba_snapshot_number_ =
           static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_snapshot_dt_));
+      ba_snapshot_k_ = ba_snapshot_number_;
     }
   }
   return;
@@ -1570,9 +1766,13 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     pdata->hdata[h+13] = static_cast<Real>(npart);   // the arrays may hold headroom (in-place split)
     pdata->nhist = h + 14;
   }
-  if (ba_snapshots_ && pm->time + 1.0e-10 >= ba_snapshot_dt_*ba_snapshot_number_)
+  if (ba_snapshots_ && pm->time + 1.0e-10 >= ba_snapshot_dt_*ba_snapshot_k_) {
     WriteBASnapshot(pm);
-  if (ba_fields_ && pm->time + 1.0e-10 >= ba_field_dt_*ba_field_number_)
+    ++ba_snapshot_k_;
+  }
+  if (ba_fields_ && pm->time + 1.0e-10 >= ba_field_dt_*ba_field_k_) {
     WriteBAFields(pm);
+    ++ba_field_k_;
+  }
   return;
 }
