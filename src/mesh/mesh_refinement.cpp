@@ -493,6 +493,10 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   new_nmb_eachrank = new int[global_variable::nranks];
 
   for (int i=0; i<new_nmb; i++) {new_cost_eachmb[i] = 1.0;}
+  // dust (2026-10-21): the clouds of each block in the cost (<dust>/load_balance_cloud_weight)
+  if (pm->pmb_pack->pdust != nullptr) {
+    pm->pmb_pack->pdust->RegridCosts(newtoold, new_lloc_eachmb, new_nmb, new_cost_eachmb);
+  }
   pm->LoadBalance(new_cost_eachmb, new_rank_eachmb, new_gids_eachrank, new_nmb_eachrank,
                   new_nmb_total);
   if (new_nmb_eachrank[global_variable::my_rank] > pm->nmb_maxperrank) {

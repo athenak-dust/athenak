@@ -1657,6 +1657,14 @@ class DustGasDrag {
   // experimental dynamic mesh (dust_amr.cpp): rebuild the leaf maps, mark
   // the cached masks stale, set PGID from the positions and the particle time step again
   void BeforeRegrid(int nnew, int ndel);  // particle count and checksum before the mesh changes
+  // For the scaling on several ranks: <dust>/load_balance_cloud_weight w > 0 gives the
+  // new blocks of a regrid the cost 1 + w * clouds / (mean clouds per block) in AthenaK's load
+  // balance (otherwise every block costs 1).  The clouds of every old block are counted in
+  // BeforeRegrid (all ranks); RegridCosts maps them to the new blocks (a refined block passes 1/4
+  // of its clouds to each child, a derefined parent takes the sum of its children).
+  Real lb_cloud_weight = 0.0;
+  std::vector<float> lb_old_counts;
+  void RegridCosts(const int *newtoold, const LogicalLocation *new_lloc, const int new_nmb, float *cost);
   int ResetPGIDFromPositions(const char *when);  // refinable clouds
   void RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin);
   // The old owner_overlap transfer on a dynamic mesh (dust_amr.cpp).  The

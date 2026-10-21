@@ -907,6 +907,61 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
   amr_regrid_nnew = nnew;
   amr_regrid_ndel = ndel;
   amr_checksum = ParticleChecksum(pmy_pack->ppart);
+  lb_old_counts.clear();
+#if MPI_PARALLEL_ENABLED
+  // the clouds of every block of the old mesh for the cost-weighted load balance (RegridCosts)
+  if (lb_cloud_weight > 0.0 && global_variable::nranks > 1) {
+    Mesh *pm = pmy_pack->pmesh;
+    const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
+    const int npart = pmy_pack->ppart->nprtcl_thispack;
+    DvceArray1D<int> cnt("dust_lb_counts", std::max(1, nmb));
+    auto pi = pmy_pack->ppart->prtcl_idata;
+    if (npart > 0) {
+      par_for("dust_lb_count", DevExeSpace(), 0, npart - 1, KOKKOS_LAMBDA(const int p) {
+        const int m = pi(PGID,p) - gids;
+        if (m >= 0 && m < nmb) Kokkos::atomic_add(&cnt(m), 1);
+      });
+    }
+    auto ch = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cnt);
+    std::vector<float> mine(nmb);
+    for (int m=0; m<nmb; ++m) mine[m] = static_cast<float>(ch(m));
+    lb_old_counts.assign(pm->nmb_total, 0.0f);
+    MPI_Allgatherv(mine.data(), nmb, MPI_FLOAT, lb_old_counts.data(), pm->nmb_eachrank,
+                   pm->gids_eachrank, MPI_FLOAT, MPI_COMM_WORLD);
+  }
+#endif
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::RegridCosts
+//! \brief Called by MeshRefinement::RedistAndRefineMeshBlocks before the load balance of a
+//! regrid (several ranks, <dust>/load_balance_cloud_weight > 0): the cost of every new block,
+//! 1 + w * clouds / mean, with the clouds of the old blocks (BeforeRegrid): an unchanged block
+//! keeps its count, a refined block gives 1/4 (2-D) to each child, a derefined parent takes the
+//! sum of its children.  The old mesh (lloc_eachmb) is still in place when it is called.
+
+void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_lloc,
+                              const int new_nmb, float *cost) {
+  Mesh *pm = pmy_pack->pmesh;
+  if (lb_cloud_weight <= 0.0 || lb_old_counts.empty()) return;
+  const int nleaf = pm->three_d ? 8 : (pm->two_d ? 4 : 2);
+  std::vector<double> c(new_nmb, 0.0);
+  double tot = 0.0;
+  for (int n=0; n<new_nmb; ++n) {
+    const int o = newtoold[n];
+    const int lo = pm->lloc_eachmb[o].level, ln = new_lloc[n].level;
+    if (ln == lo) {
+      c[n] = lb_old_counts[o];
+    } else if (ln > lo) {
+      c[n] = lb_old_counts[o]/static_cast<double>(nleaf);
+    } else {
+      for (int k=0; k<nleaf && o + k < pm->nmb_total; ++k) c[n] += lb_old_counts[o + k];
+    }
+    tot += c[n];
+  }
+  const double mean = tot/std::max(1, new_nmb);
+  if (mean <= 0.0) return;
+  for (int n=0; n<new_nmb; ++n) cost[n] = static_cast<float>(1.0 + lb_cloud_weight*c[n]/mean);
 }
 
 //----------------------------------------------------------------------------------------
