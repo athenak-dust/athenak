@@ -909,10 +909,12 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
               << "(it replaces the split)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (pmy_pack->pmesh->adaptive && smr_transfer_mode != DustSMRTransfer::refinable_cloud) {
+  // The old owner_overlap transfer also runs on a dynamic mesh (one rank)
+  if (pmy_pack->pmesh->adaptive && smr_transfer_mode != DustSMRTransfer::refinable_cloud &&
+      !(smr_transfer_mode == DustSMRTransfer::owner_overlap && global_variable::nranks == 1)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "<dust>/experimental_amr requires experimental_smr_transfer = "
-              << "refinable_cloud" << std::endl;
+              << "refinable_cloud (or owner_overlap on one rank)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
@@ -983,6 +985,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // shear-periodic remap of the u* radial ghost zones (3D shearing box only)
   if (shear_x1 && pmy_pack->pmesh->three_d) {
     psbox_us = new ShearingBoxCC(pmy_pack, pin, 3);
+  }
+  // owner_overlap on a dynamic mesh: the block boxes and the block table of the
+  // initial mesh (the exchanges above built their remaps)
+  if (pmy_pack->pmesh->adaptive && smr_transfer_mode == DustSMRTransfer::owner_overlap) {
+    BuildOwnerOverlapMesh(false);
   }
 }
 

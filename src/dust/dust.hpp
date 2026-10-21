@@ -1659,6 +1659,17 @@ class DustGasDrag {
   void BeforeRegrid(int nnew, int ndel);  // particle count and checksum before the mesh changes
   int ResetPGIDFromPositions(const char *when);  // refinable clouds
   void RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin);
+  // The old owner_overlap transfer on a dynamic mesh (dust_amr.cpp).  The
+  // block boxes (leaf_traversal: boxes only, read by the density trigger), the finest-block table
+  // of the block of a position and the ghost-to-leaf remaps of the deposit exchanges, for the
+  // current mesh; the block of every particle from its position; the TSC deposit on the owner
+  // blocks with its ghost parts added to the leaves they overlap (density, and with moments the
+  // momentum and the raw second moments: 7 components), checked against the particle mass
+  void BuildOwnerOverlapMesh(const bool remap);
+  int ResetPGIDOwnerOverlap(const char *when);
+  void OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments);
+  DvceArray2D<int> oo_block_map;
+  DvceArray5D<Real> oo_rho;
   unsigned long long amr_checksum = 0ULL;
   int amr_npart_before = -1;
   // Dynamic-mesh state across a restart.  The driver sets

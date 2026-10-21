@@ -41,6 +41,13 @@
 //! derefinement.
 //! The sibling, 2:1 and refinement_interval rules of MeshRefinement apply as usual.  Each
 //! check writes a line to dust_trigger_log.txt.
+//!
+//! For the comparison with the old transfer, the old owner_overlap
+//! transfer also runs on the dynamic mesh, one rank.  Point particles, TSC on the block that
+//! holds them, ghost deposits added by volume to the leaves they overlap (the remap of
+//! MeshBoundaryValuesDep, rebuilt after every regrid); after a regrid the block of every
+//! particle is set from its position (BuildOwnerOverlapMesh, ResetPGIDOwnerOverlap).  The
+//! density trigger uses that deposit (OwnerOverlapDeposit) with the same block values.
 
 #include <algorithm>
 #include <cmath>
@@ -263,9 +270,13 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   double dummy_t = 0.0; long long dummy_c = 0;   // for the profile timer
   ProfTimer prof_timer(pdust ? pdust->prof_time[DustGasDrag::kProfTrigger] : dummy_t,
                        pdust ? pdust->prof_count[DustGasDrag::kProfTrigger] : dummy_c);
-  if (pdust == nullptr || !pdust->UsesCompositeTransfer() || pm->three_d) {
+  // The old owner_overlap transfer has its own deposit (TSC on the owner blocks, the
+  // ghost parts added to the leaves they overlap); the block values below are the same
+  const bool oo = (pdust != nullptr) &&
+                  pdust->smr_transfer_mode == DustSMRTransfer::owner_overlap;
+  if (pdust == nullptr || !(pdust->UsesCompositeTransfer() || oo) || pm->three_d) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "amr_density_trigger needs 2-D refinable-cloud dust" << std::endl;
+              << "amr_density_trigger needs 2-D refinable-cloud or owner_overlap dust" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   // several ranks (Codex review): the deposit below traverses the supports, so
@@ -309,6 +320,15 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     }
   }
   auto f = pdust->trig_f;
+  if (oo) {   // one rank, no halo (nfld = nmb): the leaf densities in the same flat layout
+    pdust->OwnerOverlapDeposit(pdust->oo_rho, false);
+    auto rho = pdust->oo_rho;
+    const int ks = ind.ks;
+    par_for("amr_rho_oo_copy", DevExeSpace(), 0, nmb*ncells2*ncells1 - 1, KOKKOS_LAMBDA(const int k) {
+      const int m = k/(ncells2*ncells1), r = k % (ncells2*ncells1);
+      f(0,k) = rho(m,0,ks,r/ncells1,r % ncells1);
+    });
+  } else {
   par_for("amr_rho_deposit", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
     const Real mass = pr(IPM,p);
     ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
@@ -323,6 +343,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   // (the strips hold every cell within the reach of the local blocks, at least 3 cells of the
   // root level and 6 of any finer level, checked below)
   if (trig_.buffer > 0) pdust->HaloForwardFlat(f, 1);
+  }
   Real mtot = 0.0;
   int nlev[3] = {0, 0, 0};   // clouds at the root level, finer plain, lobed
   Kokkos::parallel_reduce("amr_rho_totals", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -896,15 +917,31 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
 //! over the leaves add up to one and point into existing blocks.
 
 void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
-  if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) {
+  const bool oo = (smr_transfer_mode == DustSMRTransfer::owner_overlap);
+  if (smr_transfer_mode != DustSMRTransfer::refinable_cloud && !oo) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "dust on a dynamic mesh needs experimental_smr_transfer = refinable_cloud"
-              << std::endl;
+              << "dust on a dynamic mesh needs experimental_smr_transfer = refinable_cloud "
+              << "(or owner_overlap)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   Mesh *pmesh = pmy_pack->pmesh;
   particles::Particles *ppar = pmy_pack->ppart;
-
+  Real dwmax = 0.0;
+  double msum = 0.0;
+  const int nmb = pmy_pack->nmb_thispack;
+  int npart = ppar->nprtcl_thispack;
+  if (oo) {
+    // The old owner_overlap path: point particles, nothing to split or merge; the boxes,
+    // the block table, the deposit remaps and the block of every particle on the new mesh
+    BuildOwnerOverlapMesh(true);
+    ResetPGIDOwnerOverlap(nullptr);
+    auto pr = ppar->prtcl_rdata;
+    if (npart > 0) {
+      Kokkos::parallel_reduce("dust_oo_regrid_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p, double &ms) {ms += static_cast<double>(pr(IPM,p));},
+      Kokkos::Sum<double>(msum));
+    }
+  } else {
   BuildRefinableCloudTransfer(pin);
   // Several ranks: the particles follow their blocks to the ranks that hold
   // them on the new mesh (load balancing may move blocks anywhere)
@@ -912,7 +949,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     RouteToOwnerBlocks("regrid");
     CheckHaloReach("regrid");   // clouds one level behind the new mesh
   }
-  const int npart = ppar->nprtcl_thispack;
+  npart = ppar->nprtcl_thispack;
   // Every regrid is an event, handled at the start of the next cycle after
   // its split (HandleRegridEvent); refine / derefine from the blocks actually created and
   // deleted, not from the net change of the block count.  A regrid that deleted blocks also
@@ -931,11 +968,8 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   auto pi = ppar->prtcl_idata;
   auto &indcs = pmesh->mb_indcs;
   const int ncell12 = (indcs.nx1 + 2*indcs.ng)*(indcs.nx2 + 2*indcs.ng);
-  const int nmb = pmy_pack->nmb_thispack;
   const int gids = pmy_pack->gids;
-  Real dwmax = 0.0;
   int nbad = 0;
-  double msum = 0.0;
   if (npart > 0) {
     Kokkos::parallel_reduce("dust_amr_regrid", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, Real &dw, int &bad, double &ms) {
@@ -984,6 +1018,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     }
     std::exit(EXIT_FAILURE);
   }
+  }   // refinable clouds
 
   // nothing but PGID may have changed since BeforeRegrid (several ranks: over all ranks; the
   // checksum is a sum over the particles)
@@ -1050,6 +1085,207 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   }
   // The leaf traversal also right after a regrid (old clouds on the new mesh)
   if (cloud_leaf_check > 0) CheckLeafTraversal();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::BuildOwnerOverlapMesh
+//! \brief The old owner_overlap transfer on a dynamic mesh, one rank.
+//! For the current mesh (after the constructor and after every regrid): the block boxes in
+//! leaf_traversal (boxes only: nfld = nall = nmb; the density trigger reads them), the table of
+//! the block of every finest-level block cell (the block of a position), and, with remap, the
+//! ghost-to-leaf maps of the deposit exchanges again (MeshBoundaryValuesDep::BuildLocalSMRMap).
+
+void DustGasDrag::BuildOwnerOverlapMesh(const bool remap) {
+  Mesh *pm = pmy_pack->pmesh;
+  auto &indcs = pm->mb_indcs;
+  const int nmb = pmy_pack->nmb_thispack;
+  const int gids = pmy_pack->gids;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  if (global_variable::nranks != 1) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "owner_overlap on a dynamic mesh: one MPI rank only" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  auto &lt = leaf_traversal;
+  lt.nmb = nmb; lt.gids = gids; lt.nfld = nmb; lt.nall = nmb;
+  lt.nx1 = indcs.nx1; lt.nx2 = indcs.nx2; lt.is = indcs.is; lt.js = indcs.js;
+  lt.ncells1 = indcs.nx1 + 2*indcs.ng; lt.ncells2 = indcs.nx2 + 2*indcs.ng;
+  lt.box = DvceArray2D<Real>("dust_oo_box", std::max(1, nmb), 6);
+  auto box = Kokkos::create_mirror_view(lt.box);
+  for (int m=0; m<nmb; ++m) {
+    const auto &sz = mbsize.h_view(m);
+    box(m,0) = sz.x1min; box(m,1) = sz.x2min; box(m,2) = sz.dx1; box(m,3) = sz.dx2;
+    box(m,4) = 1.0/sz.dx1; box(m,5) = 1.0/sz.dx2;
+  }
+  Kokkos::deep_copy(lt.box, box);
+  halo_.rect.clear();
+  // the finest-level block grid: every block covers 2^(nl - its level) cells per direction
+  const int nl = pm->max_level - pm->root_level;
+  const int nbx = pm->nmb_rootx1 << nl, nby = pm->nmb_rootx2 << nl;
+  if (oo_block_map.extent_int(0) != nby || oo_block_map.extent_int(1) != nbx) {
+    oo_block_map = DvceArray2D<int>("dust_oo_block_map", nby, nbx);
+  }
+  auto map = Kokkos::create_mirror_view(oo_block_map);
+  Kokkos::deep_copy(map, -1);
+  int nbad = 0;
+  for (int m=0; m<nmb; ++m) {
+    const LogicalLocation &ll = pm->lloc_eachmb[gids + m];
+    const int sh = nl - (ll.level - pm->root_level);
+    if (sh < 0) {++nbad; continue;}
+    const int a0 = static_cast<int>(ll.lx1) << sh, b0 = static_cast<int>(ll.lx2) << sh;
+    for (int b=b0; b<b0 + (1 << sh); ++b) {
+      for (int a=a0; a<a0 + (1 << sh); ++a) {
+        if (a < 0 || a >= nbx || b < 0 || b >= nby || map(b,a) >= 0) {++nbad; continue;}
+        map(b,a) = m;
+      }
+    }
+  }
+  for (int b=0; b<nby; ++b) for (int a=0; a<nbx; ++a) if (map(b,a) < 0) ++nbad;
+  if (nbad > 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "owner_overlap block table: " << nbad << " cells without exactly one block"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  Kokkos::deep_copy(oo_block_map, map);
+  if (remap) {
+    pbval_qp->BuildLocalSMRMap();
+    pbval_dm->BuildLocalSMRMap();
+    if (pbval_solver_add != nullptr) pbval_solver_add->BuildLocalSMRMap();
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::ResetPGIDOwnerOverlap
+//! \brief The MeshBlock id of every particle from the block table (BuildOwnerOverlapMesh)
+//! at its position (periodic image in the box; the position itself is not changed).  Returns
+//! how many ids changed; prints it unless when is nullptr.
+
+int DustGasDrag::ResetPGIDOwnerOverlap(const char *when) {
+  Mesh *pm = pmy_pack->pmesh;
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  auto map = oo_block_map;
+  const int nbx = map.extent_int(1), nby = map.extent_int(0);
+  const Real x1min = pm->mesh_size.x1min, x2min = pm->mesh_size.x2min;
+  const Real lx = pm->mesh_size.x1max - x1min, ly = pm->mesh_size.x2max - x2min;
+  const int gids = pmy_pack->gids, nmb = pmy_pack->nmb_thispack;
+  int nchanged = 0, nbad = 0;
+  if (npart > 0) {
+    Kokkos::parallel_reduce("dust_oo_pgid", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
+      Real x = pr(IPX,p) - x1min, y = pr(IPY,p) - x2min;
+      x -= lx*Kokkos::floor(x/lx); y -= ly*Kokkos::floor(y/ly);
+      const int ix = Kokkos::min(nbx - 1, Kokkos::max(0, static_cast<int>(x*(nbx/lx))));
+      const int iy = Kokkos::min(nby - 1, Kokkos::max(0, static_cast<int>(y*(nby/ly))));
+      const int m = map(iy, ix);
+      if (m < 0 || m >= nmb) {++bad; return;}
+      if (pi(PGID,p) != gids + m) {pi(PGID,p) = gids + m; ++changed;}
+    }, Kokkos::Sum<int>(nchanged), Kokkos::Sum<int>(nbad));
+  }
+  if (nbad > 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << nbad << " particles have no owning MeshBlock (owner_overlap)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (when != nullptr && global_variable::my_rank == 0) {
+    std::cout << "# dust (owner_overlap): MeshBlock ids set from the positions at the " << when << ": "
+              << nchanged << " of " << npart << " changed" << std::endl;
+  }
+  return nchanged;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::OwnerOverlapDeposit
+//! \brief The leaf fields of the old owner_overlap transfer.  Every particle deposits
+//! with the coupling's stencil (PMWeights, <dust>/deposit) on its own block, ghost cells
+//! included; the ghost parts are then added to the leaf cells they overlap, by volume, with the
+//! remap of the coupling's deposit exchange (MeshBoundaryValuesDep::RemapLocalSMRDeposit).
+//! Component 0: the dust density; with moments also 1-3 the momentum density and 4-6 the raw
+//! second moments sum(rho v_c^2) (the central moments are formed by the caller).  The ghost
+//! cells keep their own deposits (not read).  Stops if the dust mass on the leaves differs from
+//! the particle mass (relative 1e-9): checks the remap of the current mesh at every use.
+
+void DustGasDrag::OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments) {
+  Mesh *pm = pmy_pack->pmesh;
+  auto &indcs = pm->mb_indcs;
+  const int nmb = pmy_pack->nmb_thispack;
+  const int nvar = moments ? 7 : 1;
+  const int ncells1 = indcs.nx1 + 2*indcs.ng, ncells2 = indcs.nx2 + 2*indcs.ng;
+  if (!pbval_dm->LocalSMRRemap()) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "owner_overlap leaf deposit needs the static/dynamic SMR remap" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (a.extent_int(0) != nmb || a.extent_int(1) != nvar || a.extent_int(3) != ncells2 ||
+      a.extent_int(4) != ncells1) {
+    a = DvceArray5D<Real>("dust_oo_deposit", nmb, nvar, 1, ncells2, ncells1);   // zero
+  } else {
+    Kokkos::deep_copy(DevExeSpace(), a, 0.0);
+  }
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  const int is = indcs.is, js = indcs.js, ks = indcs.ks, nx1 = indcs.nx1, nx2 = indcs.nx2;
+  const int gids = pmy_pack->gids;
+  const int scheme = static_cast<int>(deposit);
+  auto a_ = a;
+  int nbad = 0;
+  double mpart = 0.0;
+  if (npart > 0) {
+    Kokkos::parallel_reduce("dust_oo_deposit", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &bad, double &mp) {
+      const int m = pi(PGID,p) - gids;
+      if (m < 0 || m >= nmb) {++bad; return;}
+      int ip, jp;
+      Real wx[3], wy[3];
+      PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is, scheme, ip, wx);
+      PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js, scheme, jp, wy);
+      if (ip < 1 || ip > ncells1 - 2 || jp < 1 || jp > ncells2 - 2) {++bad; return;}
+      const Real d = pr(IPM,p)/(mbsize.d_view(m).dx1*mbsize.d_view(m).dx2);
+      const Real v[3] = {pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p)};
+      mp += static_cast<double>(pr(IPM,p));
+      for (int b=0; b<3; ++b) {
+        for (int c=0; c<3; ++c) {
+          const Real w = wy[b]*wx[c];
+          if (w == 0.0) continue;
+          const int jj = jp + b - 1, ii = ip + c - 1;
+          DepositAdd(&a_(m,0,ks,jj,ii), w*d);
+          if (moments) {
+            for (int q=0; q<3; ++q) {
+              DepositAdd(&a_(m,1+q,ks,jj,ii), w*d*v[q]);
+              DepositAdd(&a_(m,4+q,ks,jj,ii), w*d*v[q]*v[q]);
+            }
+          }
+        }
+      }
+    }, Kokkos::Sum<int>(nbad), Kokkos::Sum<double>(mpart));
+  }
+  if (nbad > 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "owner_overlap leaf deposit: " << nbad << " particles outside their block's "
+              << "stencil" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  pbval_dm->RemapLocalSMRDeposit(a);
+  double mleaf = 0.0;
+  Kokkos::parallel_reduce("dust_oo_deposit_mass",
+  Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*nx2*nx1),
+  KOKKOS_LAMBDA(const int k, double &ml) {
+    const int m = k/(nx1*nx2), r = k % (nx1*nx2);
+    ml += static_cast<double>(a_(m,0,ks,js + r/nx1,is + r % nx1))*
+          mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+  }, Kokkos::Sum<double>(mleaf));
+  if (!(std::fabs(mleaf - mpart) <= 1.0e-9*mpart)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "owner_overlap leaf deposit: dust mass on the leaves " << mleaf
+              << " != particle mass " << mpart << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 }
 
 }  // namespace dust

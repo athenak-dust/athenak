@@ -606,8 +606,12 @@ void WriteBAFields(Mesh *pm) {
   int n1 = pm->mesh_indcs.nx1, n2 = pm->mesh_indcs.nx2;
   Real gx1 = pm->mesh_size.x1min, gx2 = pm->mesh_size.x2min;
   Real h1 = (pm->mesh_size.x1max - gx1)/n1, h2 = (pm->mesh_size.x2max - gx2)/n2;
-  DualArray2D<int> tgt("ba_tsc_target", composite ? 1 : n2, composite ? 1 : n1);
-  if (!composite) {
+  // the old owner_overlap transfer on a multilevel mesh: its own leaf deposit (TSC on the
+  // owner blocks, the ghost parts added to the leaves they overlap); one pass, the central
+  // moments from the raw ones (a ghost cell feeds leaves with different means)
+  const bool oo = pdust->smr_transfer_mode == DustSMRTransfer::owner_overlap && pm->multilevel;
+  DualArray2D<int> tgt("ba_tsc_target", (composite || oo) ? 1 : n2, (composite || oo) ? 1 : n1);
+  if (!composite && !oo) {
     if (pm->multilevel || pdust->deposit != DustDeposit::tsc) {
       std::cerr << "BA fields: canonical deposit requires TSC on a uniform mesh (static SMR with "
                 << "owner_overlap: no leaf deposit to write; with coupling = pc2 the run does not "
@@ -627,8 +631,22 @@ void WriteBAFields(Mesh *pm) {
     tgt.template sync<DevExeSpace>();
   }
   auto tgt_ = tgt.d_view;
+  if (oo) {
+    DvceArray5D<Real> g;
+    pdust->OwnerOverlapDeposit(g, true);
+    par_for("ba_fields_oo", DevExeSpace(), 0, nmb*ncb - 1, KOKKOS_LAMBDA(const int k) {
+      const int m = k/ncb, r = k % ncb, j = r/ncells1, i = r % ncells1;
+      const Real rho = g(m,0,ks,j,i);
+      f0(0,k) = rho;
+      for (int c=0; c<3; ++c) {
+        const Real mom = g(m,1+c,ks,j,i);
+        f0(1+c,k) = mom;
+        f1(c,k) = (rho > 0.0) ? g(m,4+c,ks,j,i) - mom*mom/rho : 0.0;
+      }
+    });
+  }
   // pass 0: mass and momentum; pass 1: central second moments about the leaf mean
-  for (int pass=0; pass<2; ++pass) {
+  for (int pass=0; pass<2 && !oo; ++pass) {
     par_for("ba_fields_deposit", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
       Real mass = pr(IPM,p);
       Real v[3] = {pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p)};
@@ -959,8 +977,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   }
   // canonical_root: the same root parents with the standard deposit on a uniform mesh,
   // so a uniform control shares the parent positions of a refinable-cloud run
+  // also the old owner_overlap transfer on any mesh (point particles, each in the block
+  // that holds it), so that it starts from the parents of the refinable-cloud runs
   bool canonical_root = cloud_root_random && dust_active &&
-      pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none && !pmy_mesh_->multilevel;
+      ((pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none && !pmy_mesh_->multilevel) ||
+       pmbp->pdust->smr_transfer_mode == DustSMRTransfer::owner_overlap);
   // several ranks: refinable clouds with <dust>/experimental_mpi; every rank
   // draws the same parents and keeps those in its blocks
   const bool ranks_ok = (global_variable::nranks == 1) ||
@@ -969,8 +990,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       !(pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud ||
         canonical_root) || pmy_mesh_->three_d)) {
     std::cerr << "cloud_root_random requires single-rank (or <dust>/experimental_mpi) 2-D "
-              << "dust with refinable_cloud transfer, or the canonical deposit on a uniform "
-              << "mesh" << std::endl;
+              << "dust with refinable_cloud transfer, or (one rank) the canonical deposit on a "
+              << "uniform mesh or the owner_overlap transfer" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (dust_active) {

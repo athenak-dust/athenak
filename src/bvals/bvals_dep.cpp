@@ -75,101 +75,112 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
 
 //----------------------------------------------------------------------------------------
 //! \fn void MeshBoundaryValuesDep::BuildLocalSMRMap()
-//! \brief Precompute the active-leaf destinations of every local ghost cell.
+//! \brief Precompute the active-leaf destinations of every local ghost cell
+//! on the device; only the block itself and its neighbours (each once) are
+//! searched instead of every block, so that a dynamic mesh can rebuild the map after each
+//! regrid; per target block only the cells near the ghost cell are tested.  The overlaps, the
+//! tests and the weights are those of the former full search, so the map is the same (the
+//! order of the targets of a ghost cell may differ, which does not change any sum).
 
 void MeshBoundaryValuesDep::BuildLocalSMRMap() {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
-  int nmb = pmy_pack->nmb_thispack;
-  int ncells1 = indcs.nx1 + 2*indcs.ng;
-  int ncells2 = indcs.nx2 + 2*indcs.ng;
-  int ncells3 = 1;
-  smr_target_count_ = DualArray4D<int>("dep_smr_count", nmb, ncells3,
-                                       ncells2, ncells1);
-  smr_target_index_ = DualArray5D<int>("dep_smr_index", nmb, ncells3,
-                                       ncells2, ncells1, max_smr_targets_);
-  smr_target_weight_ = DualArray5D<Real>("dep_smr_weight", nmb, ncells3,
-                                         ncells2, ncells1, max_smr_targets_);
-  Kokkos::deep_copy(smr_target_count_.h_view, 0);
-  Kokkos::deep_copy(smr_target_index_.h_view, -1);
-  Kokkos::deep_copy(smr_target_weight_.h_view, 0.0);
-
+  const int nmb = pmy_pack->nmb_thispack;
+  const int ncells1 = indcs.nx1 + 2*indcs.ng;
+  const int ncells2 = indcs.nx2 + 2*indcs.ng;
+  const int ncells3 = 1;
+  const int is = indcs.is, ie = indcs.ie, js = indcs.js, je = indcs.je, ks = indcs.ks;
+  const int nx1 = indcs.nx1, nx2 = indcs.nx2;
+  if (smr_target_count_.extent_int(0) != nmb) {
+    smr_target_count_ = DvceArray4D<int>("dep_smr_count", nmb, ncells3, ncells2, ncells1);
+    smr_target_index_ = DvceArray5D<int>("dep_smr_index", nmb, ncells3, ncells2, ncells1,
+                                         max_smr_targets_);
+    smr_target_weight_ = DvceArray5D<Real>("dep_smr_weight", nmb, ncells3, ncells2, ncells1,
+                                           max_smr_targets_);
+  }
+  auto count = smr_target_count_;
+  auto index = smr_target_index_;
+  auto weight = smr_target_weight_;
   auto &mbsize = pmy_pack->pmb->mb_size;
+  auto &nghbr = pmy_pack->pmb->nghbr;
+  const int nnghbr = pmy_pack->pmb->nnghbr;
+  const int gids = pmy_pack->gids;
   auto &meshsize = pmy_pack->pmesh->mesh_size;
-  Real lxmesh = meshsize.x1max - meshsize.x1min;
-  Real lymesh = meshsize.x2max - meshsize.x2min;
-
-  for (int m=0; m<nmb; ++m) {
-    const auto &src = mbsize.h_view(m);
-    for (int j=0; j<ncells2; ++j) {
-      for (int i=0; i<ncells1; ++i) {
-        bool active = (i >= indcs.is && i <= indcs.ie &&
-                       j >= indcs.js && j <= indcs.je);
-        if (active) continue;
-
-        Real xlo = src.x1min + static_cast<Real>(i - indcs.is)*src.dx1;
-        Real xhi = xlo + src.dx1;
-        Real ylo = src.x2min + static_cast<Real>(j - indcs.js)*src.dx2;
-        Real yhi = ylo + src.dx2;
-        while (0.5*(xlo + xhi) < meshsize.x1min) {xlo += lxmesh; xhi += lxmesh;}
-        while (0.5*(xlo + xhi) >= meshsize.x1max) {xlo -= lxmesh; xhi -= lxmesh;}
-        while (0.5*(ylo + yhi) < meshsize.x2min) {ylo += lymesh; yhi += lymesh;}
-        while (0.5*(ylo + yhi) >= meshsize.x2max) {ylo -= lymesh; yhi -= lymesh;}
-
-        int ntarget = 0;
-        Real overlap_sum = 0.0;
-        for (int tm=0; tm<nmb; ++tm) {
-          const auto &dst = mbsize.h_view(tm);
-          if (xhi <= dst.x1min || xlo >= dst.x1max ||
-              yhi <= dst.x2min || ylo >= dst.x2max) continue;
-          for (int tj=0; tj<indcs.nx2; ++tj) {
-            Real tylo = dst.x2min + static_cast<Real>(tj)*dst.dx2;
-            Real tyhi = tylo + dst.dx2;
-            Real oy = std::max(0.0, std::min(yhi, tyhi) - std::max(ylo, tylo));
-            if (oy == 0.0) continue;
-            for (int ti=0; ti<indcs.nx1; ++ti) {
-              Real txlo = dst.x1min + static_cast<Real>(ti)*dst.dx1;
-              Real txhi = txlo + dst.dx1;
-              Real ox = std::max(0.0, std::min(xhi, txhi) - std::max(xlo, txlo));
-              Real overlap = ox*oy;
-              Real overlap_tol = 1.0e-12*std::min(src.dx1*src.dx2,
-                                                  dst.dx1*dst.dx2);
-              if (overlap <= overlap_tol) continue;
-              if (ntarget >= max_smr_targets_) {
-                std::cout << "### FATAL ERROR in " << __FILE__ << " at line "
-                          << __LINE__ << std::endl
-                          << "Static-SMR deposit cell overlaps too many leaves" << std::endl;
-                std::exit(EXIT_FAILURE);
-              }
-              int tk = indcs.ks;
-              int tj_full = tj + indcs.js;
-              int ti_full = ti + indcs.is;
-              int encoded = (((tm*ncells3 + tk)*ncells2 + tj_full)*ncells1 + ti_full);
-              smr_target_index_.h_view(m,0,j,i,ntarget) = encoded;
-              smr_target_weight_.h_view(m,0,j,i,ntarget) =
-                  overlap/(dst.dx1*dst.dx2);
-              overlap_sum += overlap;
-              ++ntarget;
-            }
-          }
+  const Real x1min = meshsize.x1min, x1max = meshsize.x1max;
+  const Real x2min = meshsize.x2min, x2max = meshsize.x2max;
+  const Real lxmesh = x1max - x1min, lymesh = x2max - x2min;
+  constexpr int ntmax = max_smr_targets_;
+  int nmany = 0, nuncovered = 0, nremote = 0;
+  Kokkos::parallel_reduce("DepSMRMap",
+  Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*ncells2*ncells1),
+  KOKKOS_LAMBDA(const int idx, int &many, int &uncovered, int &remote) {
+    const int m = idx/(ncells2*ncells1);
+    const int r = idx - m*(ncells2*ncells1);
+    const int j = r/ncells1, i = r - j*ncells1;
+    if (i >= is && i <= ie && j >= js && j <= je) {count(m,0,j,i) = 0; return;}
+    const Real sdx1 = mbsize.d_view(m).dx1, sdx2 = mbsize.d_view(m).dx2;
+    Real xlo = mbsize.d_view(m).x1min + static_cast<Real>(i - is)*sdx1;
+    Real xhi = xlo + sdx1;
+    Real ylo = mbsize.d_view(m).x2min + static_cast<Real>(j - js)*sdx2;
+    Real yhi = ylo + sdx2;
+    while (0.5*(xlo + xhi) < x1min) {xlo += lxmesh; xhi += lxmesh;}
+    while (0.5*(xlo + xhi) >= x1max) {xlo -= lxmesh; xhi -= lxmesh;}
+    while (0.5*(ylo + yhi) < x2min) {ylo += lymesh; yhi += lymesh;}
+    while (0.5*(ylo + yhi) >= x2max) {ylo -= lymesh; yhi -= lymesh;}
+    int ntarget = 0;
+    Real overlap_sum = 0.0;
+    for (int n=-1; n<nnghbr; ++n) {   // the block itself, then each neighbour once
+      int tm = m;
+      if (n >= 0) {
+        const int g = nghbr.d_view(m,n).gid;
+        if (g < 0 || g == gids + m) continue;
+        bool seen = false;
+        for (int q=0; q<n; ++q) {
+          if (nghbr.d_view(m,q).gid == g) {seen = true; break;}
         }
-        Real source_volume = src.dx1*src.dx2;
-        if (std::abs(overlap_sum - source_volume) > 1.0e-10*source_volume) {
-          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                    << std::endl << "Static-SMR deposit map does not cover ghost cell: "
-                    << "overlap/source=" << overlap_sum/source_volume << std::endl;
-          std::exit(EXIT_FAILURE);
+        if (seen) continue;
+        tm = g - gids;
+        if (tm < 0 || tm >= nmb) {++remote; continue;}   // on another rank: not supported
+      }
+      const Real dx1min = mbsize.d_view(tm).x1min, dx1max = mbsize.d_view(tm).x1max;
+      const Real dx2min = mbsize.d_view(tm).x2min, dx2max = mbsize.d_view(tm).x2max;
+      const Real ddx1 = mbsize.d_view(tm).dx1, ddx2 = mbsize.d_view(tm).dx2;
+      if (xhi <= dx1min || xlo >= dx1max || yhi <= dx2min || ylo >= dx2max) continue;
+      // the target cells near the ghost cell (one cell of margin; the tests below decide)
+      const int tj0 = Kokkos::max(0, static_cast<int>(Kokkos::floor((ylo - dx2min)/ddx2)) - 1);
+      const int tj1 = Kokkos::min(nx2 - 1, static_cast<int>(Kokkos::floor((yhi - dx2min)/ddx2)) + 1);
+      const int ti0 = Kokkos::max(0, static_cast<int>(Kokkos::floor((xlo - dx1min)/ddx1)) - 1);
+      const int ti1 = Kokkos::min(nx1 - 1, static_cast<int>(Kokkos::floor((xhi - dx1min)/ddx1)) + 1);
+      for (int tj=tj0; tj<=tj1; ++tj) {
+        Real tylo = dx2min + static_cast<Real>(tj)*ddx2;
+        Real tyhi = tylo + ddx2;
+        Real oy = Kokkos::fmax(0.0, Kokkos::fmin(yhi, tyhi) - Kokkos::fmax(ylo, tylo));
+        if (oy == 0.0) continue;
+        for (int ti=ti0; ti<=ti1; ++ti) {
+          Real txlo = dx1min + static_cast<Real>(ti)*ddx1;
+          Real txhi = txlo + ddx1;
+          Real ox = Kokkos::fmax(0.0, Kokkos::fmin(xhi, txhi) - Kokkos::fmax(xlo, txlo));
+          Real overlap = ox*oy;
+          Real overlap_tol = 1.0e-12*Kokkos::fmin(sdx1*sdx2, ddx1*ddx2);
+          if (overlap <= overlap_tol) continue;
+          if (ntarget >= ntmax) {++many; continue;}
+          index(m,0,j,i,ntarget) = (((tm*ncells3 + ks)*ncells2 + tj + js)*ncells1 + ti + is);
+          weight(m,0,j,i,ntarget) = overlap/(ddx1*ddx2);
+          overlap_sum += overlap;
+          ++ntarget;
         }
-        smr_target_count_.h_view(m,0,j,i) = ntarget;
       }
     }
+    const Real source_volume = sdx1*sdx2;
+    if (Kokkos::fabs(overlap_sum - source_volume) > 1.0e-10*source_volume) ++uncovered;
+    count(m,0,j,i) = ntarget;
+  }, Kokkos::Sum<int>(nmany), Kokkos::Sum<int>(nuncovered), Kokkos::Sum<int>(nremote));
+  if (nmany > 0 || nuncovered > 0 || nremote > 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "Static-SMR deposit map: " << nmany << " ghost cells overlap too many leaves, "
+              << nuncovered << " are not covered by the block and its neighbours, " << nremote
+              << " neighbours lie on another rank" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
-
-  smr_target_count_.template modify<HostMemSpace>();
-  smr_target_count_.template sync<DevExeSpace>();
-  smr_target_index_.template modify<HostMemSpace>();
-  smr_target_index_.template sync<DevExeSpace>();
-  smr_target_weight_.template modify<HostMemSpace>();
-  smr_target_weight_.template sync<DevExeSpace>();
 }
 
 //----------------------------------------------------------------------------------------
@@ -183,9 +194,9 @@ TaskStatus MeshBoundaryValuesDep::RemapLocalSMRDeposit(DvceArray5D<Real> &a) {
   int ncells2 = a.extent_int(3);
   int ncells1 = a.extent_int(4);
   int ncell = nmb*ncells3*ncells2*ncells1;
-  auto &counts = smr_target_count_;
-  auto &targets = smr_target_index_;
-  auto &weights = smr_target_weight_;
+  auto counts = smr_target_count_;
+  auto targets = smr_target_index_;
+  auto weights = smr_target_weight_;
 
   Kokkos::parallel_for("DepSMRRemap", Kokkos::RangePolicy<>(DevExeSpace(),0,ncell),
   KOKKOS_LAMBDA(const int idx) {
@@ -195,16 +206,16 @@ TaskStatus MeshBoundaryValuesDep::RemapLocalSMRDeposit(DvceArray5D<Real> &a) {
     remainder -= k*(ncells2*ncells1);
     int j = remainder/ncells1;
     int i = remainder - j*ncells1;
-    int count = counts.d_view(m,k,j,i);
+    int count = counts(m,k,j,i);
     for (int t=0; t<count; ++t) {
-      int encoded = targets.d_view(m,k,j,i,t);
+      int encoded = targets(m,k,j,i,t);
       int ti = encoded % ncells1;
       encoded /= ncells1;
       int tj = encoded % ncells2;
       encoded /= ncells2;
       int tk = encoded % ncells3;
       int tm = encoded/ncells3;
-      Real weight = weights.d_view(m,k,j,i,t);
+      Real weight = weights(m,k,j,i,t);
       for (int v=0; v<nvar; ++v) {
         Kokkos::atomic_add(&a(tm,v,tk,tj,ti), weight*a(m,v,k,j,i));
       }
