@@ -131,8 +131,19 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
 
     // only update particle GID if it has crossed MeshBlock boundary
     if ((abs(ix) + abs(iy) + abs(iz)) != 0) {
-      bool cross_in  = shear_x1 && (x1 < meshsize.x1min);
-      bool cross_out = shear_x1 && (x1 > meshsize.x1max);
+      // 2026-10-21: the particle crossed a Mesh boundary when its block offset points out of
+      // the Mesh (a block on that edge), the same rounding as the destination block above.  A
+      // position test (x < xmin) disagrees with it within round-off of the boundary: a particle
+      // at y = -1e-18 has iy = 0 (it stays in its row), but crossing in x only it was wrapped to
+      // y = ymax while routed to the neighbor in its own row (the next step then aborted)
+      const bool lo1 = (ix < 0) && (mbsize.d_view(m).x1min < meshsize.x1min + 0.5*lx);
+      const bool hi1 = (ix > 0) && (mbsize.d_view(m).x1max > meshsize.x1max - 0.5*lx);
+      const bool lo2 = (iy < 0) && (mbsize.d_view(m).x2min < meshsize.x2min + 0.5*ly);
+      const bool hi2 = (iy > 0) && (mbsize.d_view(m).x2max > meshsize.x2max - 0.5*ly);
+      const bool lo3 = (iz < 0) && (mbsize.d_view(m).x3min < meshsize.x3min + 0.5*lz);
+      const bool hi3 = (iz > 0) && (mbsize.d_view(m).x3max > meshsize.x3max - 0.5*lz);
+      bool cross_in  = shear_x1 && lo1;
+      bool cross_out = shear_x1 && hi1;
       if (cross_in || cross_out) {
         // shear-periodic radial crossing: wrap x, shift y azimuthally by the (folded)
         // shear offset with no velocity change (velocities are shear-relative), wrap
@@ -149,10 +160,10 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
         pr(IPY,p) = ynew;
         if (has_reg) {pr(IPY1,p) += dy;}
         Real lzm = (meshsize.x3max - meshsize.x3min);
-        if (x3 < meshsize.x3min) {
+        if (lo3) {
           pr(IPZ,p) += lzm;
           if (has_reg) {pr(IPZ1,p) += lzm;}
-        } else if (x3 > meshsize.x3max) {
+        } else if (hi3) {
           pr(IPZ,p) -= lzm;
           if (has_reg) {pr(IPZ1,p) -= lzm;}
         }
@@ -266,27 +277,28 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
       }
       UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
 
-      // reset x,y,z positions if particle crosses Mesh boundary using periodic BCs
+      // reset x,y,z positions if particle crosses Mesh boundary using periodic BCs (decided by
+      // the block offsets, lo1/hi1 etc. above, as the destination block)
       // RK position registers must be shifted with the position so the low-storage
       // combination (gam0*x + gam1*x1) stays in a single periodic image
-      if (x1 < meshsize.x1min) {
+      if (lo1) {
         pr(IPX,p) += (meshsize.x1max - meshsize.x1min);
         if (has_reg) {pr(IPX1,p) += (meshsize.x1max - meshsize.x1min);}
-      } else if (x1 > meshsize.x1max) {
+      } else if (hi1) {
         pr(IPX,p) -= (meshsize.x1max - meshsize.x1min);
         if (has_reg) {pr(IPX1,p) -= (meshsize.x1max - meshsize.x1min);}
       }
-      if (x2 < meshsize.x2min) {
+      if (lo2) {
         pr(IPY,p) += (meshsize.x2max - meshsize.x2min);
         if (has_reg) {pr(IPY1,p) += (meshsize.x2max - meshsize.x2min);}
-      } else if (x2 > meshsize.x2max) {
+      } else if (hi2) {
         pr(IPY,p) -= (meshsize.x2max - meshsize.x2min);
         if (has_reg) {pr(IPY1,p) -= (meshsize.x2max - meshsize.x2min);}
       }
-      if (x3 < meshsize.x3min) {
+      if (lo3) {
         pr(IPZ,p) += (meshsize.x3max - meshsize.x3min);
         if (has_reg) {pr(IPZ1,p) += (meshsize.x3max - meshsize.x3min);}
-      } else if (x3 > meshsize.x3max) {
+      } else if (hi3) {
         pr(IPZ,p) -= (meshsize.x3max - meshsize.x3min);
         if (has_reg) {pr(IPZ1,p) -= (meshsize.x3max - meshsize.x3min);}
       }
