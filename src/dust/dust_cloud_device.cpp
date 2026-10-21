@@ -2217,8 +2217,7 @@ int DustGasDrag::MergeCloudsDevice() {
   cloud_coarsen_dk_res += dkh(1);
   std::FILE *fp = AppendLog(RankFile("cloud_merge_log.txt"));
   if (fp != nullptr) {
-    std::fseek(fp, 0, SEEK_END);
-    if (std::ftell(fp) == 0) {
+    if (LogEmpty(fp)) {
       std::fprintf(fp, "# ncycle time npart_before npart_after far_releases commits"
                    " contributions rejected(tolerance/min mass) pending dK_grad dK_res M_b M_a"
                    " PX_b PX_a PY_b PY_a PZ_b PZ_a m_level0 m_level1 m_level2 m_lobed"

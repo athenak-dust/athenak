@@ -429,8 +429,7 @@ void DumpResampleState(particles::Particles *ppar, Mesh *pmesh, const char *when
 void AppendResampleLog(const char *row) {
   std::FILE *fp = AppendLog(RankFile("cloud_resample_log.txt"));
   if (fp == nullptr) return;
-  std::fseek(fp, 0, SEEK_END);
-  if (std::ftell(fp) == 0) {
+  if (LogEmpty(fp)) {
     std::fprintf(fp, "# ncycle time npart_before npart_after pool above_cap lobed patches"
                  " patches_reduced kept at_cap fallback max_res_accepted steps_zero steps_cap scans"
                  " M_b M_a PX_b PX_a t_total t_device t_copy t_sort t_host_wall t_host_cpu t_back"
@@ -513,8 +512,7 @@ bool DustGasDrag::ResampleDue() {
   if (global_variable::my_rank == 0) {
     std::FILE *fp = AppendLog(RankFile("cloud_resample_schedule.txt"));
     if (fp != nullptr) {
-      std::fseek(fp, 0, SEEK_END);
-      if (std::ftell(fp) == 0) {
+      if (LogEmpty(fp)) {
         std::fprintf(fp, "# event planned_time ncycle time delay skipped time_prev_cycle dt_cycle"
                      " interval omega0\n");
       }
@@ -1407,8 +1405,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
                       });
     std::FILE *fs = AppendLog(RankFile("cloud_resample_patch_stats.txt"));
     if (fs != nullptr) {
-      std::fseek(fs, 0, SEEK_END);
-      if (std::ftell(fs) == 0) {
+      if (LogEmpty(fs)) {
         std::fprintf(fs, "# bins: ncycle time bin level n_min patches clouds removed steps_zero "
                      "steps_cap patches_reduced n_max\n# top:  ncycle time top level n nb nrow "
                      "removed steps_zero steps_cap scans\n# split: ncycle time split "

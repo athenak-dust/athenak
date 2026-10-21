@@ -716,23 +716,21 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   }
 #endif
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = AppendLog("dust_trigger_log.txt");
-    if (fp != nullptr) {
-      std::fseek(fp, 0, SEEK_END);
-      if (std::ftell(fp) == 0) {
-        std::fprintf(fp, "# ncycle time max_rho/mean blocks flag_refine flag_derefine fine_volume_share "
-                     "fine_dust_mass_share clouds_root clouds_finer_plain clouds_lobed "
-                     "blocks_per_level(0/1/...)\n");
-      }
-      const Real vbox = (pm->mesh_size.x1max - x0)*(pm->mesh_size.x2max - y0);
-      // the blocks of every level, from the global block list
-      std::vector<int> perlev(pm->max_level - pm->root_level + 1, 0);
-      for (int g=0; g<pm->nmb_total; ++g) ++perlev[pm->lloc_eachmb[g].level - pm->root_level];
-      std::string pl;
-      for (std::size_t l=0; l<perlev.size(); ++l) pl += (l ? "/" : "") + std::to_string(perlev[l]);
-      std::fprintf(fp, "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d %s\n", pm->ncycle, pm->time, qmax, nblk,
-                   nflag[0], nflag[1], vfine/vbox, mfine/mtot, nlev[0], nlev[1], nlev[2], pl.c_str());
-      std::fflush(fp);
+    // Rixin: the line of this check, written only if the mesh changes after it (BeforeRegrid)
+    // and for the first check of the run; the state between two regrids is that of the last line
+    const Real vbox = (pm->mesh_size.x1max - x0)*(pm->mesh_size.x2max - y0);
+    // the blocks of every level, from the global block list
+    std::vector<int> perlev(pm->max_level - pm->root_level + 1, 0);
+    for (int g=0; g<pm->nmb_total; ++g) ++perlev[pm->lloc_eachmb[g].level - pm->root_level];
+    std::string pl;
+    for (std::size_t l=0; l<perlev.size(); ++l) pl += (l ? "/" : "") + std::to_string(perlev[l]);
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d %s\n", pm->ncycle, pm->time,
+                  qmax, nblk, nflag[0], nflag[1], vfine/vbox, mfine/mtot, nlev[0], nlev[1], nlev[2], pl.c_str());
+    pdust->trig_log_line = buf;
+    if (pdust->trig_log_first) {
+      pdust->trig_log_first = false;
+      pdust->WriteTriggerLog();
     }
   }
   lap(DustGasDrag::kProfTrigLog);
@@ -902,7 +900,23 @@ int DustGasDrag::RouteToOwnerBlocks(const char *when) {
 //! \brief Called by MeshRefinement::AdaptiveMeshRefinement before the mesh changes: the
 //! particle count and checksum that RebuildAfterRegrid must find again.
 
+void DustGasDrag::WriteTriggerLog() {
+  if (global_variable::my_rank != 0 || trig_log_line.empty()) return;
+  std::FILE *fp = AppendLog("dust_trigger_log.txt");
+  if (fp == nullptr) return;
+  if (LogEmpty(fp)) {
+    std::fprintf(fp, "# ncycle time max_rho/mean blocks flag_refine flag_derefine fine_volume_share "
+                 "fine_dust_mass_share clouds_root clouds_finer_plain clouds_lobed "
+                 "blocks_per_level(0/1/...); since 2026-10-21 a line only for the check before each "
+                 "regrid (and the first check)\n");
+  }
+  std::fputs(trig_log_line.c_str(), fp);
+  std::fflush(fp);
+  trig_log_line.clear();
+}
+
 void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
+  WriteTriggerLog();   // the check that led to this regrid (2026-10-21)
   amr_npart_before = pmy_pack->ppart->nprtcl_thispack;
   amr_regrid_nnew = nnew;
   amr_regrid_ndel = ndel;
@@ -1026,8 +1040,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     if (global_variable::my_rank == 0) {
       std::FILE *fp = AppendLog("dust_rank_log.txt");
       if (fp != nullptr) {
-        std::fseek(fp, 0, SEEK_END);
-        if (std::ftell(fp) == 0) {
+        if (LogEmpty(fp)) {
           std::fprintf(fp, "# regrid ncycle time t_transfer_build t_route t_halo_check (s, slowest rank) | "
                        "per rank: blocks particles halo_blocks\n");
         }
@@ -1164,8 +1177,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   if (global_variable::my_rank == 0) {
     std::FILE *fp = AppendLog("dust_amr_log.txt");
     if (fp != nullptr) {
-      std::fseek(fp, 0, SEEK_END);
-      if (std::ftell(fp) == 0) {
+      if (LogEmpty(fp)) {
         std::fprintf(fp, "# regrid ncycle time blocks blocks_above_root particles particle_mass "
                      "max|sum_w-1| dt_particles checksum\n");
       }

@@ -685,8 +685,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   if (global_variable::my_rank == 0) {
     std::FILE *fp = AppendLog("regrid_event_log.txt");
     if (fp != nullptr) {
-      std::fseek(fp, 0, SEEK_END);
-      if (std::ftell(fp) == 0) {
+      if (LogEmpty(fp)) {
         std::fprintf(fp, "# event regrid ncycle time created deleted kind merge_pass "
                      "with_scheduled_resampling npart_before npart_after_merge "
                      "npart_after_resampling removed t_merge t_resampling\n");
@@ -1769,8 +1768,7 @@ int DustGasDrag::MergeClouds() {
   // one line per pass: counts, energy removed, conservation and the mass by cloud type
   std::FILE *fp = AppendLog(RankFile("cloud_merge_log.txt"));
   if (fp != nullptr) {
-    std::fseek(fp, 0, SEEK_END);
-    if (std::ftell(fp) == 0) {
+    if (LogEmpty(fp)) {
       std::fprintf(fp, "# ncycle time npart_before npart_after far_releases commits"
                    " contributions rejected(tolerance/min mass) pending dK_grad dK_res M_b M_a"
                    " PX_b PX_a PY_b PY_a PZ_b PZ_a m_level0 m_level1 m_level2 m_lobed"

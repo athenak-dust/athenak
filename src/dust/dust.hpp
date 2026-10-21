@@ -1140,6 +1140,17 @@ inline std::FILE *AppendLog(const std::string &name) {
   return fp;
 }
 
+// 2026-10-21: whether a log kept open by AppendLog is empty (its header still to write), asked
+// once per file: on a Lustre scratch file system the position query at the end of the file costs
+// about 0.9 ms per call (fprintf + fflush about 1 us), which made every logged line ~1 ms
+inline bool LogEmpty(std::FILE *fp) {
+  static std::map<std::FILE*, bool> asked;
+  if (asked.count(fp) != 0) return false;
+  asked[fp] = true;
+  std::fseek(fp, 0, SEEK_END);
+  return std::ftell(fp) == 0;
+}
+
 //----------------------------------------------------------------------------------------
 //! \struct DustHalo
 //! The exchange lists of the dust halo (dust_halo.cpp), cell by cell.  Per
@@ -1766,6 +1777,11 @@ class DustGasDrag {
   // work arrays of the density trigger kept between checks (allocating and freeing
   // device arrays in every check synchronizes the device); reallocated when a size changes
   DvceArray2D<Real> trig_f;
+  // Rixin: dust_trigger_log.txt gets the line of a check only when the mesh changes after
+  // it (BeforeRegrid writes the pending line) and the first check of the run
+  std::string trig_log_line;
+  bool trig_log_first = true;
+  void WriteTriggerLog();   // the pending line, rank 0 (dust_amr.cpp)
   DvceArray1D<Real> trig_q, trig_area;
   DvceArray1D<int> trig_bad, trig_fine;
   DvceArray2D<int> trig_rect;
