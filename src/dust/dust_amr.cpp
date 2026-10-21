@@ -1158,8 +1158,8 @@ void DustGasDrag::BuildOwnerOverlapMesh(const bool remap) {
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ResetPGIDOwnerOverlap
 //! \brief The MeshBlock id of every particle from the block table (BuildOwnerOverlapMesh)
-//! at its position (periodic image in the box; the position itself is not changed).  Returns
-//! how many ids changed; prints it unless when is nullptr.
+//! at its position (the position is not changed, nor wrapped).  Returns how many ids changed;
+//! prints it unless when is nullptr.
 
 int DustGasDrag::ResetPGIDOwnerOverlap(const char *when) {
   Mesh *pm = pmy_pack->pmesh;
@@ -1176,10 +1176,15 @@ int DustGasDrag::ResetPGIDOwnerOverlap(const char *when) {
   if (npart > 0) {
     Kokkos::parallel_reduce("dust_oo_pgid", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
-      Real x = pr(IPX,p) - x1min, y = pr(IPY,p) - x2min;
-      x -= lx*Kokkos::floor(x/lx); y -= ly*Kokkos::floor(y/ly);
-      const int ix = Kokkos::min(nbx - 1, Kokkos::max(0, static_cast<int>(x*(nbx/lx))));
-      const int iy = Kokkos::min(nby - 1, Kokkos::max(0, static_cast<int>(y*(nby/ly))));
+      // the image of the position itself (Codex review): a point in the box is never
+      // wrapped (x - x1min can round to lx at the upper face, which a wrap would send to the other
+      // side of the box); the rounded table index is clamped instead, so the block is the one
+      // next to the point.  A point more than a table cell outside the box is an error.
+      int ix = static_cast<int>(Kokkos::floor((pr(IPX,p) - x1min)*(nbx/lx)));
+      int iy = static_cast<int>(Kokkos::floor((pr(IPY,p) - x2min)*(nby/ly)));
+      if (ix < -1 || ix > nbx || iy < -1 || iy > nby) {++bad; return;}
+      ix = Kokkos::min(nbx - 1, Kokkos::max(0, ix));
+      iy = Kokkos::min(nby - 1, Kokkos::max(0, iy));
       const int m = map(iy, ix);
       if (m < 0 || m >= nmb) {++bad; return;}
       if (pi(PGID,p) != gids + m) {pi(PGID,p) = gids + m; ++changed;}
