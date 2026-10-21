@@ -1670,7 +1670,7 @@ class DustGasDrag {
   // balance (otherwise every block costs 1).  The clouds of every old block are counted in
   // BeforeRegrid (all ranks); RegridCosts maps them to the new blocks (a refined block passes 1/4
   // of its clouds to each child, a derefined parent takes the sum of its children).
-  Real lb_cloud_weight = 0.0;
+  Real lb_cloud_weight = 4.0;   // Rixin: default 4
   std::vector<float> lb_old_counts;
   void RegridCosts(const int *newtoold, const LogicalLocation *new_lloc, const int new_nmb, float *cost);
   int ResetPGIDFromPositions(const char *when);  // refinable clouds
