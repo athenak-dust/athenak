@@ -181,7 +181,17 @@ Mesh::Mesh(ParameterInput *pin) :
   // boundaries are ordinary periodic boundaries. Permit that narrow configuration
   // only as part of the explicitly enabled experimental static-SMR dust test. In
   // particular, a non-dust input retains the original fail-closed behavior.
-  if (multilevel && pin->DoesBlockExist("shearing_box")) {
+  // S1: <shearing_box>/experimental_smr admits static refinement of a 3-D
+  // shearing box whose MeshBlocks at the shear-periodic x1 faces are all on one level and whose
+  // x2 neighbours are always on the same level (refinement in bands of x1); ShearingBox and
+  // OrbitalAdvection check both (the shear exchange and the orbital advection are same-level)
+  const bool sbox_smr = multilevel && pin->DoesBlockExist("shearing_box") && !adaptive &&
+      three_d && pin->GetOrAddBoolean("shearing_box", "experimental_smr", false);
+  if (sbox_smr && global_variable::my_rank == 0) {
+    std::cout << "# WARNING (mesh): experimental static SMR of the 3-D shearing box (x1-face "
+              << "MeshBlocks on one level, levels constant along x2)" << std::endl;
+  }
+  if (multilevel && pin->DoesBlockExist("shearing_box") && !sbox_smr) {
     bool experimental_dust_smr = pin->DoesBlockExist("dust") &&
         pin->GetOrAddBoolean("dust", "experimental_static_smr", false);
     // <dust>/experimental_amr also admits adaptive refinement, with the

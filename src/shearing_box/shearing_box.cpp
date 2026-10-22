@@ -7,6 +7,8 @@
 //! \brief constructor for ShearingBox abstract base class, and utility functions
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -65,6 +67,31 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   // sync with device
   x1bndry_mbgid.template modify<HostMemSpace>();
   x1bndry_mbgid.template sync<DevExeSpace>();
+
+  // (S1) with mesh refinement every MeshBlock at a shear-periodic x1 face
+  // must be on one level: the exchange below shifts data between blocks of one face at one level
+  // (FindTargetMB looks for the shifted block at the sender's level)
+  {
+    Mesh *pm = ppack->pmesh;
+    if (pm->multilevel && pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
+      int lev = -1;
+      bool same = true;
+      for (int g=0; g<pm->nmb_total; ++g) {
+        const auto &ll = pm->lloc_eachmb[g];
+        const std::int32_t nx = pm->nmb_rootx1 << (ll.level - pm->root_level);
+        if (ll.lx1 == 0 || ll.lx1 == nx - 1) {
+          if (lev < 0) lev = ll.level;
+          else if (ll.level != lev) same = false;
+        }
+      }
+      if (!same) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "Shearing box with mesh refinement (experimental_smr): every MeshBlock at "
+                  << "the x1 faces must be on one level" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+    }
+  }
 
 
 #if MPI_PARALLEL_ENABLED

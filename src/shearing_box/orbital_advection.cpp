@@ -40,6 +40,26 @@ OrbitalAdvection::OrbitalAdvection(MeshBlockPack *ppack, ParameterInput *pin) :
   Real xmax = fabs(ppack->pmesh->mesh_size.x1max);
   maxjshift = static_cast<int>((ppack->pmesh->cfl_no)*std::max(xmin,xmax)) + 1;
 
+  // S1: the remap exchanges with the x2-face neighbours at the same level;
+  // with mesh refinement check that every neighbour in x2 is on the level of its block
+  // (only in 3-D, where the orbital advection runs; the 2-D r-z dust runs never call it)
+  if (ppack->pmesh->multilevel && ppack->pmesh->three_d) {
+    auto &nghbr = ppack->pmb->nghbr;
+    auto &lev = ppack->pmb->mb_lev;
+    bool ok = true;
+    for (int m=0; m<ppack->nmb_thispack; ++m) {
+      for (int n : {8, 12}) {
+        if (nghbr.h_view(m,n).gid >= 0 && nghbr.h_view(m,n).lev != lev.h_view(m)) ok = false;
+      }
+    }
+    if (!ok) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "Orbital advection with mesh refinement: every MeshBlock's x2 neighbours "
+                << "must be on its level (refine in bands of x1)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+
 #if MPI_PARALLEL_ENABLED
   // For orbital advection, communication is only with x2-face neighbors
   // initialize vectors of MPI request in 2 elements of fixed length arrays
