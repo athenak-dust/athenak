@@ -85,6 +85,7 @@ class ShearingBox {
   // check that the levels are constant along x2 (the exchange is between blocks of one level)
   void BuildBoundaryLists();
   void CheckLevelsAlongX2() const;
+  void CheckSupportedSetup() const;   // block widths, periodic x3
   // function to find target MB offset by shear.  Returns GID and rank
   void FindTargetMB(const int igid, const int jshift, int &gid, int &rank);
   // function to find index in x1bndry array of MB with input GID

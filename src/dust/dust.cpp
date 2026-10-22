@@ -365,6 +365,15 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // a helper script outside the repository.
       // Rixin: one key for the three quiet-state switches (their defaults)
       cloud_quiet_protection = pin->GetOrAddBoolean("dust", "cloud_quiet_protection", false);
+      // Codex review: the three keys it sets enter the parameter list (and so the
+      // restart header) only when given: a restart can then switch the flag on.  Restart files
+      // written before 2026-10-22 hold all three; the WARNING below names them.
+      auto quiet_bool = [pin](const char *key, bool def) {
+        return pin->DoesParameterExist("dust", key) ? pin->GetBoolean("dust", key) : def;
+      };
+      auto quiet_real = [pin](const char *key, Real def) {
+        return pin->DoesParameterExist("dust", key) ? pin->GetReal("dust", key) : def;
+      };
       if (global_variable::my_rank == 0) {
         const char *changed[][3] = {
           {"cloud_split_device", "true", "false"}, {"cloud_merge_device", "true", "false"},
@@ -527,8 +536,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       // Stage X (the exact stencil re-merge before G in quantum mode)
       // off by default, as in production; it stays a research control
-      cloud_merge_stencil = pin->GetOrAddBoolean("dust", "cloud_merge_stencil",
-                                                 cloud_quiet_protection);
+      cloud_merge_stencil = quiet_bool("cloud_merge_stencil", cloud_quiet_protection);
       cloud_merge_stencil_tol = pin->GetOrAddReal("dust", "cloud_merge_stencil_tol", 0.02);
       cloud_merge_smax = pin->GetOrAddReal("dust", "cloud_merge_smax", 1.0);
       cloud_merge_K = pin->GetOrAddInteger("dust", "cloud_merge_K", 4);
@@ -546,8 +554,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // no budget); cloud_merge_budget = -1 switches it off
       cloud_merge_budget = pin->GetOrAddReal("dust", "cloud_merge_budget", 0.3);
       // The structure-relative budget (0 = off, as before)
-      cloud_merge_budget_kappa = pin->GetOrAddReal("dust", "cloud_merge_budget_kappa",
-                                                   cloud_quiet_protection ? 1.0 : 0.0);
+      cloud_merge_budget_kappa = quiet_real("cloud_merge_budget_kappa",
+                                            cloud_quiet_protection ? 1.0 : 0.0);
       cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
       // The test offset of the pass budget is gone; it
       // acted only with quantum G and the pass budget on
@@ -632,13 +640,26 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Rixin: the production cap factor (was 2.0)
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 1.5);
       // Resampling leaves cold patches alone (0 = off, as before)
-      cloud_resample_cold_alpha = pin->GetOrAddReal("dust", "cloud_resample_cold_alpha",
-                                                    cloud_quiet_protection ? 0.05 : 0.0);
+      cloud_resample_cold_alpha = quiet_real("cloud_resample_cold_alpha",
+                                             cloud_quiet_protection ? 0.05 : 0.0);
       if (cloud_quiet_protection && global_variable::my_rank == 0) {
         std::cout << "# NOTE (dust): cloud_quiet_protection: stage X " << cloud_merge_stencil
                   << ", cloud_resample_cold_alpha " << cloud_resample_cold_alpha
                   << ", cloud_merge_budget_kappa " << cloud_merge_budget_kappa
                   << std::endl;
+        // Codex review: explicit sub-keys win, and a restart file written before
+        // 2026-10-22 without the flag holds all three at their off values: say which stay off
+        std::string off;
+        if (!cloud_merge_stencil) off += " cloud_merge_stencil=false";
+        if (cloud_resample_cold_alpha <= 0.0) off += " cloud_resample_cold_alpha<=0";
+        if (cloud_merge_budget_kappa <= 0.0) off += " cloud_merge_budget_kappa<=0";
+        if (!off.empty()) {
+          std::cout << "# WARNING (dust): cloud_quiet_protection is on, but" << off
+                    << " is set in the input or the restart file and stays off; set these "
+                    << "keys explicitly (on a restart file written before 2026-10-22 by a run "
+                    << "without the flag: all three)"
+                    << std::endl;
+        }
       }
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       // Patches inside one MeshBlock of min(cloud_resample_patch 2^level,

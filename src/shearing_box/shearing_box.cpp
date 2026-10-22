@@ -37,6 +37,7 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
 
   BuildBoundaryLists();
   CheckLevelsAlongX2();
+  CheckSupportedSetup();
 
 #if MPI_PARALLEL_ENABLED
   // create unique communicators for shearing box
@@ -121,6 +122,42 @@ void ShearingBox::CheckLevelsAlongX2() const {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "Shearing box with mesh refinement (experimental_smr): every MeshBlock's x2 "
               << "neighbours must be on its level (refine in columns along x2)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void ShearingBox::CheckSupportedSetup()
+//! \brief Setup checks (Codex review): Pieces splits a block's x2 rows into at most
+//! three pieces, which needs nx2 >= 2 ng; the coarse arrays (3-D with refinement) have half the
+//! rows and the same ng, so there the fine blocks need nx2 >= 4 ng.  The coarse arrays get no
+//! physical boundary values (generic AthenaK refinement): with refinement in 3-D the x3
+//! boundaries must be periodic until a coarse physical-boundary fill exists.
+
+void ShearingBox::CheckSupportedSetup() const {
+  Mesh *pm = pmy_pack->pmesh;
+  if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) return;
+  const auto &indcs = pm->mb_indcs;
+  const int ng = indcs.ng;
+  if (indcs.nx2 < 2*ng) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "Shearing box: meshblock/nx2 = " << indcs.nx2 << " must be at least 2*nghost"
+              << " = " << 2*ng << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (!(pm->multilevel && pm->three_d)) return;
+  if (indcs.cnx2 < 2*ng) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "Shearing box with mesh refinement: the coarse arrays are sheared too, so "
+              << "meshblock/nx2 = " << indcs.nx2 << " must be at least 4*nghost = " << 4*ng
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (pm->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "Shearing box with mesh refinement in 3-D needs periodic x3 boundaries: "
+              << "the coarse arrays get no physical boundary values, and the prolongation "
+              << "next to an x3 boundary reads them" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 }
