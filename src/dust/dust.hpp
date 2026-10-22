@@ -1488,6 +1488,9 @@ class DustGasDrag {
   bool cloud_merge_xprotect = false;   // stage X's waiting candidates are not
                                        // walked by G in the same pass
   Real cloud_merge_budget = -1.0;      // > 0, one budget of leaf mass / momentum
+  // kappa > 0: the budget of a leaf is min(beta, kappa s), s the largest dust
+  // density difference to its four neighbour leaves relative to its own (structure-relative); 0 = off
+  Real cloud_merge_budget_kappa = 0.0;
                                        // change for the whole pass (stage G; X with budget_x)
   Real cloud_absorb_floor = 0.1;       // ... with the leaf mass floored at this fraction of a
                                        // root cloud mass per root-cell volume (the name is

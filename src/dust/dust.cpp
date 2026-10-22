@@ -541,6 +541,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Rixin: the production pass budget beta = 0.3 (was -1,
       // no budget); cloud_merge_budget = -1 switches it off
       cloud_merge_budget = pin->GetOrAddReal("dust", "cloud_merge_budget", 0.3);
+      // The structure-relative budget (0 = off, as before)
+      cloud_merge_budget_kappa = pin->GetOrAddReal("dust", "cloud_merge_budget_kappa", 0.0);
       cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
       // The test offset of the pass budget is gone; it
       // acted only with quantum G and the pass budget on
@@ -1043,6 +1045,9 @@ void DustGasDrag::CheckMultiRank() {
   if (drag_solver != DustDragSolver::local) bad.push_back("drag_solver other than local");
   if (cloud_gather_order != 2 || analytic_gather.on) {
     bad.push_back("gather variants (cloud_gather_order != 2, analytic_gather)");
+  }
+  if (cloud_merge && cloud_merge_budget_kappa > 0.0) {
+    bad.push_back("cloud_merge_budget_kappa (the neighbour leaves of the halo are not exchanged)");
   }
   if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_stencil)) {
     bad.push_back("merging other than the device quantum G (tent, X)");

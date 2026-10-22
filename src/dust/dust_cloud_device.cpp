@@ -959,6 +959,46 @@ int DustGasDrag::MergeCloudsDevice() {
   // root cloud mass of the species (species 0 may have none, e.g. eps_1 = 0)
   Real mroot_floor = 0.0;
   for (int sp=0; sp<nsp; ++sp) mroot_floor = std::max(mroot_floor, mrootsp[sp]);
+  // cloud_merge_budget_kappa > 0: the budget of leaf t is
+  // max(min(beta, kappa s_t), 1e-12), s_t = max over its four neighbour leaves (the leaves at one
+  // cell width beside its centre, of any level) of |rho_n - rho_t| / max(rho_t, floor), with the
+  // dust densities at the entry of the pass.  A lossy merge may change a leaf by at most the
+  // structure it resolves: none on a quiet state (LinA, a dusty wave), as before where the dust
+  // has structure of order one (BA's clumps and outflows); exact merges (round-off) still pass.
+  const Real bkappa = cloud_merge_budget_kappa;
+  DvceArray1D<Real> lbeta("budget_lbeta", (pbud && bkappa > 0.0) ? nbt : 1);
+  if (pbud && bkappa > 0.0) {
+    const Real beta = cloud_merge_budget;
+    const int n1 = qdep.extent_int(4), n2 = qdep.extent_int(3);
+    const int is_ = pmy_pack->pmesh->mb_indcs.is, ie_ = pmy_pack->pmesh->mb_indcs.ie;
+    const int js_ = pmy_pack->pmesh->mb_indcs.js, je_ = pmy_pack->pmesh->mb_indcs.je;
+    const Real rfloor = cloud_absorb_floor*mroot_floor/(transfer.root_dx1*transfer.root_dx2);
+    const auto ltb = lt;
+    const auto tr = transfer;
+    Kokkos::parallel_for("budget_structure", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+    KOKKOS_LAMBDA(const int t) {
+      lbeta(t) = beta;
+      const int b = t/(n1*n2), r = t % (n1*n2), j = r/n1, i = r % n1;
+      if (i < is_ || i > ie_ || j < js_ || j > je_) return;
+      const Real dx = ltb.box(b,2), dy = ltb.box(b,3);
+      const Real xc = ltb.box(b,0) + (i - is_ + 0.5)*dx, yc = ltb.box(b,1) + (j - js_ + 0.5)*dy;
+      const Real rho = lent(0,t)/(dx*dy);
+      const Real den = Kokkos::fmax(rho, rfloor);
+      Real s = 0.0;
+      for (int d=0; d<4; ++d) {
+        const Real x = SMRCompositeTransfer::WrapPosition(xc + ((d == 0) ? dx : ((d == 1) ? -dx : 0.0)),
+                                                          tr.x1min, tr.x1max);
+        const Real y = SMRCompositeTransfer::WrapPosition(yc + ((d == 2) ? dy : ((d == 3) ? -dy : 0.0)),
+                                                          tr.x2min, tr.x2max);
+        const int tn = ltb.LeafOwner(x, y, b);
+        if (tn < 0) continue;
+        const int bn = tn/(n1*n2);
+        const Real rn = lent(0,tn)/(ltb.box(bn,2)*ltb.box(bn,3));
+        s = Kokkos::fmax(s, Kokkos::fabs(rn - rho)/den);
+      }
+      lbeta(t) = Kokkos::fmax(Kokkos::fmin(beta, bkappa*s), 1.0e-12);
+    });
+  }
 
   // counters: 0 commits, 1 contributions, 2 rejected, 3 pending, 4 nc shifts, 5 nc skipped
   // 6..10 (pending log): not ready (mask), lobe wait, over limit, tolerance, min mass
@@ -1190,7 +1230,8 @@ int DustGasDrag::MergeCloudsDevice() {
                   const int tb_ = t/xn12;
                   const Real vol = xmbsz.d_view(tb_).dx1*xmbsz.d_view(tb_).dx2;
                   Real rp = 0.0;
-                  const Real rm = BudgetRatio(beta, xfloor*vol, xvmin, lent(0,t), lent(1,t), lent(2,t),
+                  const Real rm = BudgetRatio((bkappa > 0.0) ? lbeta(t) : beta, xfloor*vol, xvmin,
+                      lent(0,t), lent(1,t), lent(2,t),
                       lent(3,t), lcum(0,t) + ldelx(0,t), lcum(1,t) + ldelx(1,t), lcum(2,t) + ldelx(2,t),
                       lcum(3,t) + ldelx(3,t), rp);
                   bad = (rm > 1.0 || rp > 1.0) ? 1 : 0;
@@ -1607,7 +1648,8 @@ int DustGasDrag::MergeCloudsDevice() {
                 const int tb_ = t/gb_n12;
                 const Real vol = lt.box(tb_,2)*lt.box(tb_,3);
                 Real rp = 0.0;
-                const Real rm = BudgetRatio(beta, gb_floor*vol, gb_vmin, lent(0,t), lent(1,t), lent(2,t),
+                const Real rm = BudgetRatio((bkappa > 0.0) ? lbeta(t) : beta, gb_floor*vol, gb_vmin,
+                    lent(0,t), lent(1,t), lent(2,t),
                     lent(3,t), lcum(0,t) + ldelg(0,t), lcum(1,t) + ldelg(1,t), lcum(2,t) + ldelg(2,t),
                     lcum(3,t) + ldelg(3,t), rp);
                 bad = (rm > 1.0 || rp > 1.0) ? 1 : 0;
