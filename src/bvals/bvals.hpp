@@ -134,6 +134,10 @@ class MeshBlockPack;
 
 class MeshBoundaryValues {
  public:
+  // S1': no flux correction across the shear-periodic x1 boundaries (the
+  // neighbour of the unsheared periodic topology is not the sheared one; the uniform shearing box
+  // does no flux correction there either).  Set by Hydro with mesh refinement in 3-D.
+  bool skip_shear_x1_flux=false;
   MeshBoundaryValues(MeshBlockPack *ppack, ParameterInput *pin, bool z4c);
   virtual ~MeshBoundaryValues();
 

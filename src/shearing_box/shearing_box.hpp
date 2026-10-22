@@ -9,6 +9,8 @@
 //! \brief definitions for classes that implement shearing box abstract base and derived
 //! classes (for CC and FC variables).
 
+#include <utility>
+
 #include "athena.hpp"
 #include "parameter_input.hpp"
 #include "tasklist/task_list.hpp"
@@ -63,6 +65,12 @@ class ShearingBox {
   // data buffers for shearing box BCs.  Only two x1-faces get sheared
   // Use separate variables for ix1/ox1 since number of MBs on each face can be different
   ShearingBoxBoundaryBuffer sendbuf[2], recvbuf[2];
+  // (S1') with mesh refinement the same exchange also shifts the x1 ghost
+  // zones of the coarse arrays: a fine x1-face block whose partner across the boundary (or a
+  // diagonal neighbour there) is coarser gets those ghost cells by prolongation from its coarse
+  // array, after the shear exchange; its coarse array must be sheared first
+  bool coarse_on = false;
+  ShearingBoxBoundaryBuffer csendbuf[2], crecvbuf[2];
 
 #if MPI_PARALLEL_ENABLED
   // unique MPI communicator for shearing box
@@ -73,6 +81,10 @@ class ShearingBox {
   TaskStatus InitRecv(Real time);
   TaskStatus ClearRecv();
   TaskStatus ClearSend();
+  // the lists of x1-face MeshBlocks and the MPI requests, again after a regrid; and the
+  // check that the levels are constant along x2 (the exchange is between blocks of one level)
+  void BuildBoundaryLists();
+  void CheckLevelsAlongX2() const;
   // function to find target MB offset by shear.  Returns GID and rank
   void FindTargetMB(const int igid, const int jshift, int &gid, int &rank);
   // function to find index in x1bndry array of MB with input GID
@@ -87,6 +99,23 @@ class ShearingBox {
   // must use pointer to MBPack and not parent physics module since parent can be one of
   // many types (Hydro, MHD, Radiation, etc.)
   MeshBlockPack *pmy_pack;
+  // geometry of one exchange: the MeshBlock arrays (coarse = false) or the coarse
+  // arrays; rows js..je of x2, rows kl..ku of x3 (with ghosts in 3-D), first outer ghost column
+  // ie+1, active x2 cells nx2, all x2 cells nj, cell size factor, MPI buffer id offset
+  struct ShearSet {int js, je, kl, ku, ie, nx2, nj; Real dxfac; int tagbase;};
+  ShearSet Set(const bool coarse) const;
+  // the pieces of the integer shift of boundary block m of face n: their number (2 or 3), rows of
+  // the send buffer (jsrc) and of the receive buffer (jdst), and the block offset of the target
+  // of each piece (its sender, seen from the receiving block, is at the negated offset)
+  int Pieces(const int n, const int m, const ShearSet &st, std::pair<int,int> jsrc[3],
+             std::pair<int,int> jdst[3], int jsh[3]) const;
+  bool PostRecvs(const bool coarse);
+  bool TestRecvs(const bool coarse, bool &done);
+  bool WaitRecvs(const bool coarse);
+  bool WaitSends(const bool coarse);
+  void AllocateRequests();
+  void FreeRequests();
+  int nreq_[2] = {0, 0};   // length of the request arrays (3 per boundary block)
 };
 
 //----------------------------------------------------------------------------------------
@@ -100,12 +129,24 @@ class ShearingBoxCC : public ShearingBox {
   // functions to communicate CC data with shearing box BCs
   TaskStatus PackAndSendCC(DvceArray5D<Real> &a, ReconstructionMethod rcon);
   TaskStatus RecvAndUnpackCC(DvceArray5D<Real> &a);
+  // the same for the coarse arrays (mesh refinement)
+  TaskStatus PackAndSendCoarseCC(DvceArray5D<Real> &ca, ReconstructionMethod rcon);
+  TaskStatus RecvAndUnpackCoarseCC(DvceArray5D<Real> &ca);
+  // buffers for the current lists of x1-face blocks (after BuildBoundaryLists)
+  void AllocateBuffers();
   // shearing box source terms for Hydro CC variables
   void SourceTermsCC(const DvceArray5D<Real> &w0, const EOS_Data &eos_data,
                      const Real bdt, DvceArray5D<Real> &u0);
   // shearing box source terms for MHD CC variables
   void SourceTermsCC(const DvceArray5D<Real> &w0, const DvceArray5D<Real> &bcc0,
                      const EOS_Data &eos_data, const Real bdt, DvceArray5D<Real> &u0);
+
+  // (public: CUDA does not allow extended device lambdas in private member functions)
+  TaskStatus PackAndSend(DvceArray5D<Real> &a, ReconstructionMethod rcon, const bool coarse);
+  TaskStatus RecvAndUnpack(DvceArray5D<Real> &a, const bool coarse);
+
+ private:
+  int nvar_;
 };
 
 //----------------------------------------------------------------------------------------

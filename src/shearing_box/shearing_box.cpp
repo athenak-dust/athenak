@@ -11,9 +11,11 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "athena.hpp"
+#include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
 #include "hydro/hydro.hpp"
@@ -33,15 +35,38 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   omega0 = pin->GetReal("shearing_box","omega0");
   is_stratified = pin->GetOrAddBoolean("shearing_box","stratified",false);
 
+  BuildBoundaryLists();
+  CheckLevelsAlongX2();
+
+#if MPI_PARALLEL_ENABLED
+  // create unique communicators for shearing box
+  MPI_Comm_dup(MPI_COMM_WORLD, &comm_sbox);
+#endif
+}
+
+//----------------------------------------------------------------------------------------
+// ShearingBox base class destructor
+
+ShearingBox::~ShearingBox() {
+  FreeRequests();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void ShearingBox::BuildBoundaryLists()
+//! \brief GIDs of the MeshBlocks of this rank at the ix1/ox1 shearing-box boundaries and the
+//! MPI requests (each boundary block exchanges with up to 3 blocks).  Called by the
+//! constructor and again after every regrid.
+
+void ShearingBox::BuildBoundaryLists() {
   // Create vector with GID of every MBs on this rank at ix1/ox1 shearing-box boundaries
   std::vector<int> tmp_ix1bndry_gid, tmp_ox1bndry_gid;
-  auto &mbbcs = ppack->pmb->mb_bcs;
-  for (int m=0; m<(ppack->nmb_thispack); ++m) {
+  auto &mbbcs = pmy_pack->pmb->mb_bcs;
+  for (int m=0; m<(pmy_pack->nmb_thispack); ++m) {
     if (mbbcs.h_view(m,BoundaryFace::inner_x1) == BoundaryFlag::shear_periodic) {
-      tmp_ix1bndry_gid.push_back(m + ppack->gids);
+      tmp_ix1bndry_gid.push_back(m + pmy_pack->gids);
     }
     if (mbbcs.h_view(m,BoundaryFace::outer_x1) == BoundaryFlag::shear_periodic) {
-      tmp_ox1bndry_gid.push_back(m + ppack->gids);
+      tmp_ox1bndry_gid.push_back(m + pmy_pack->gids);
     }
   }
   // number of MBs at ix1/ox1 boundaries is size of vectors
@@ -68,64 +93,172 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   x1bndry_mbgid.template modify<HostMemSpace>();
   x1bndry_mbgid.template sync<DevExeSpace>();
 
-  // (S1) with mesh refinement every MeshBlock at a shear-periodic x1 face
-  // must be on one level: the exchange below shifts data between blocks of one face at one level
-  // (FindTargetMB looks for the shifted block at the sender's level)
-  {
-    Mesh *pm = ppack->pmesh;
-    if (pm->multilevel && pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
-      int lev = -1;
-      bool same = true;
-      for (int g=0; g<pm->nmb_total; ++g) {
-        const auto &ll = pm->lloc_eachmb[g];
-        const std::int32_t nx = pm->nmb_rootx1 << (ll.level - pm->root_level);
-        if (ll.lx1 == 0 || ll.lx1 == nx - 1) {
-          if (lev < 0) lev = ll.level;
-          else if (ll.level != lev) same = false;
-        }
-      }
-      if (!same) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "Shearing box with mesh refinement (experimental_smr): every MeshBlock at "
-                  << "the x1 faces must be on one level" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
+  FreeRequests();
+  AllocateRequests();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void ShearingBox::CheckLevelsAlongX2()
+//! \brief With mesh refinement in 3-D (S1') the shear exchange (and the
+//! orbital advection) shifts data between MeshBlocks of one level: FindTargetMB looks for the
+//! shifted block at the sender's level and x3 location.  Every MeshBlock's x2 neighbours must
+//! be on its level (refinement in columns along x2).  Coarser partners across the x1 boundary
+//! are allowed: their data reach the fine block's coarse array, which is sheared as well.
+
+void ShearingBox::CheckLevelsAlongX2() const {
+  Mesh *pm = pmy_pack->pmesh;
+  if (!(pm->multilevel && pm->three_d &&
+        pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic)) return;
+  auto &nghbr = pmy_pack->pmb->nghbr;
+  auto &lev = pmy_pack->pmb->mb_lev;
+  bool ok = true;
+  for (int m=0; m<pmy_pack->nmb_thispack; ++m) {
+    for (int n : {8, 12}) {
+      if (nghbr.h_view(m,n).gid >= 0 && nghbr.h_view(m,n).lev != lev.h_view(m)) ok = false;
     }
   }
+  if (!ok) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "Shearing box with mesh refinement (experimental_smr): every MeshBlock's x2 "
+              << "neighbours must be on its level (refine in columns along x2)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+}
 
+//----------------------------------------------------------------------------------------
+//! \fn void ShearingBox::AllocateRequests(), FreeRequests()
+//! \brief MPI requests of the fine and the coarse exchange: 3 per boundary block and face
 
+void ShearingBox::AllocateRequests() {
 #if MPI_PARALLEL_ENABLED
-  // initialize vectors of MPI requests for ix1/ox1 boundaries in fixed length arrays
-  // each MB on x1-face can communicate with up to 3 nghbrs
   for (int n=0; n<2; ++n) {
-    if (nmb_x1bndry(n) > 0) {
-      sendbuf[n].vars_req = new MPI_Request[3*nmb_x1bndry(n)];
-      recvbuf[n].vars_req = new MPI_Request[3*nmb_x1bndry(n)];
-      for (int m=0; m<nmb_x1bndry(n); ++m) {
-        for (int l=0; l<3; ++l) {
-          sendbuf[n].vars_req[3*m + l] = MPI_REQUEST_NULL;
-          recvbuf[n].vars_req[3*m + l] = MPI_REQUEST_NULL;
-        }
-      }
+    nreq_[n] = 3*nmb_x1bndry(n);
+    if (nreq_[n] == 0) continue;
+    sendbuf[n].vars_req = new MPI_Request[nreq_[n]];
+    recvbuf[n].vars_req = new MPI_Request[nreq_[n]];
+    csendbuf[n].vars_req = new MPI_Request[nreq_[n]];
+    crecvbuf[n].vars_req = new MPI_Request[nreq_[n]];
+    for (int r=0; r<nreq_[n]; ++r) {
+      sendbuf[n].vars_req[r] = MPI_REQUEST_NULL;
+      recvbuf[n].vars_req[r] = MPI_REQUEST_NULL;
+      csendbuf[n].vars_req[r] = MPI_REQUEST_NULL;
+      crecvbuf[n].vars_req[r] = MPI_REQUEST_NULL;
     }
   }
-  // create unique communicators for shearing box
-  MPI_Comm_dup(MPI_COMM_WORLD, &comm_sbox);
+#endif
+}
+
+void ShearingBox::FreeRequests() {
+#if MPI_PARALLEL_ENABLED
+  for (int n=0; n<2; ++n) {
+    if (nreq_[n] > 0) {
+      delete [] sendbuf[n].vars_req;
+      delete [] recvbuf[n].vars_req;
+      delete [] csendbuf[n].vars_req;
+      delete [] crecvbuf[n].vars_req;
+    }
+    nreq_[n] = 0;
+  }
 #endif
 }
 
 //----------------------------------------------------------------------------------------
-// ShearingBox base class destructor
+//! \fn ShearingBox::Set()
+//! \brief Index ranges of one exchange: the MeshBlock arrays or the coarse arrays
 
-ShearingBox::~ShearingBox() {
-#if MPI_PARALLEL_ENABLED
-  for (int n=0; n<2; ++n) {
-    if (nmb_x1bndry(n) > 0) {
-      delete [] sendbuf[n].vars_req;
-      delete [] recvbuf[n].vars_req;
-    }
+ShearingBox::ShearSet ShearingBox::Set(const bool coarse) const {
+  const auto &indcs = pmy_pack->pmesh->mb_indcs;
+  ShearSet st;
+  const int ng = indcs.ng;
+  if (!coarse) {
+    st.js = indcs.js; st.je = indcs.je; st.kl = indcs.ks; st.ku = indcs.ke;
+    st.ie = indcs.ie; st.nx2 = indcs.nx2; st.dxfac = 1.0; st.tagbase = 0;
+  } else {
+    st.js = indcs.cjs; st.je = indcs.cje; st.kl = indcs.cks; st.ku = indcs.cke;
+    st.ie = indcs.cie; st.nx2 = indcs.cnx2; st.dxfac = 2.0; st.tagbase = 8;
   }
-#endif
+  if (pmy_pack->pmesh->three_d) {st.kl -= ng; st.ku += ng;}
+  st.nj = st.nx2 + 2*ng;
+  return st;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn int ShearingBox::Pieces()
+//! \brief The integer shift of boundary block m of face n, broken into pieces as in the original
+//! algorithm (case 1 and 3: the integer shift jr < ng or jr >= nx2-ng, three target blocks;
+//! case 2: two).  Rows jsrc of the send buffer go to rows jdst of the receive buffer of the block
+//! at offset jsh in x2 (the receive of block m from its sender at offset -jsh lands in the same
+//! rows jdst).
+
+int ShearingBox::Pieces(const int n, const int m, const ShearSet &st,
+                        std::pair<int,int> jsrc[3], std::pair<int,int> jdst[3],
+                        int jsh[3]) const {
+  const int ng = pmy_pack->pmesh->mb_indcs.ng;
+  const int js = st.js, je = st.je, nx2 = st.nx2;
+  const int mm = x1bndry_mbgid.h_view(n,m) - pmy_pack->gids;
+  // Find integer and fractional number of grids over which offset extends.
+  // This assumes every grid has same number of cells in x2-direction!
+  const int joffset =
+      static_cast<int>(yshear/(st.dxfac*(pmy_pack->pmb->mb_size.h_view(mm).dx2)));
+  const int ji = joffset/nx2;
+  const int jr = joffset - ji*nx2;
+  if (jr < ng) {               //--- CASE 1 (in my nomenclature)
+    if (n==0) {
+      jsrc[0] = std::make_pair(js,js+ng-jr);
+      jsrc[1] = std::make_pair(js,je+1);
+      jsrc[2] = std::make_pair(je-(ng-1)-jr,je+1);
+      jdst[0] = std::make_pair(je+1+jr,je+ng+1);
+      jdst[1] = std::make_pair(js+jr,je+jr+1);
+      jdst[2] = std::make_pair(js-ng,js+jr);
+    } else {
+      jsrc[0] = std::make_pair(js,js+ng+jr);
+      jsrc[1] = std::make_pair(js,je+1);
+      jsrc[2] = std::make_pair(je-(ng-1)+jr,je+1);
+      jdst[0] = std::make_pair(je+1-jr,je+ng+1);
+      jdst[1] = std::make_pair(js-jr,je-jr+1);
+      jdst[2] = std::make_pair(js-ng,js-jr);
+    }
+    // ix1 boundary: send to (target-1) through (target+1)
+    // ox1 boundary: send to (target-1) through (target+1)
+    for (int l=0; l<3; ++l) {jsh[l] = (n==0) ? (ji+l-1) : (l-1-ji);}
+    return 3;
+  } else if (jr < (nx2-ng)) {  //--- CASE 2
+    if (n==0) {
+      jsrc[0] = std::make_pair(js,je+ng-jr+1);
+      jsrc[1] = std::make_pair(je-(ng-1)-jr,je+1);
+      jdst[0] = std::make_pair(js+jr,je+ng+1);
+      jdst[1] = std::make_pair(js-ng,js+jr);
+    } else {
+      jsrc[0] = std::make_pair(js,js+ng+jr);
+      jsrc[1] = std::make_pair(js-ng+jr,je+1);
+      jdst[0] = std::make_pair(je-jr+1,je+ng+1);
+      jdst[1] = std::make_pair(js-ng,je-jr+1);
+    }
+    // ix1 boundary: send to (target  ) through (target+1)
+    // ox1 boundary: send to (target-1) through (target  )
+    for (int l=0; l<2; ++l) {jsh[l] = (n==0) ? (ji+l) : (l-1-ji);}
+    return 2;
+  }
+  //--- CASE 3
+  if (n==0) {
+    jsrc[0] = std::make_pair(js,js+ng+(nx2-jr));
+    jsrc[1] = std::make_pair(js,je+1);
+    jsrc[2] = std::make_pair(je-(ng-1)+(nx2-jr),je+1);
+    jdst[0] = std::make_pair(je+1-(nx2-jr),je+ng+1);
+    jdst[1] = std::make_pair(js-(nx2-jr),je-(nx2-jr)+1);
+    jdst[2] = std::make_pair(js-ng,js-(nx2-jr));
+  } else {
+    jsrc[0] = std::make_pair(js,js+ng-(nx2-jr));
+    jsrc[1] = std::make_pair(js,je+1);
+    jsrc[2] = std::make_pair(je-(ng-1)-(nx2-jr),je+1);
+    jdst[0] = std::make_pair(je+1+(nx2-jr),je+ng+1);
+    jdst[1] = std::make_pair(js+(nx2-jr),je+(nx2-jr)+1);
+    jdst[2] = std::make_pair(js-ng,js+(nx2-jr));
+  }
+  // ix1 boundary: send to (target  ) through (target+2)
+  // ox1 boundary: send to (target-2) through (target  )
+  for (int l=0; l<3; ++l) {jsh[l] = (n==0) ? (ji+l) : (l-2-ji);}
+  return 3;
 }
 
 //----------------------------------------------------------------------------------------

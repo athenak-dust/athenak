@@ -185,11 +185,20 @@ Mesh::Mesh(ParameterInput *pin) :
   // shearing box whose MeshBlocks at the shear-periodic x1 faces are all on one level and whose
   // x2 neighbours are always on the same level (refinement in bands of x1); ShearingBox and
   // OrbitalAdvection check both (the shear exchange and the orbital advection are same-level)
-  const bool sbox_smr = multilevel && pin->DoesBlockExist("shearing_box") && !adaptive &&
-      three_d && pin->GetOrAddBoolean("shearing_box", "experimental_smr", false);
+  // S1': also adaptive refinement (one decision per column along x2,
+  // MeshRefinement::CheckForRefinement); hydro only for now (no MHD, dust or particles)
+  const bool sbox_smr = multilevel && pin->DoesBlockExist("shearing_box") && three_d &&
+      pin->GetOrAddBoolean("shearing_box", "experimental_smr", false);
+  if (sbox_smr && (pin->DoesBlockExist("mhd") || pin->DoesBlockExist("dust") ||
+                   pin->DoesBlockExist("particles"))) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<shearing_box>/experimental_smr: hydro only for now (no MHD, dust or "
+              << "particles)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (sbox_smr && global_variable::my_rank == 0) {
-    std::cout << "# WARNING (mesh): experimental static SMR of the 3-D shearing box (x1-face "
-              << "MeshBlocks on one level, levels constant along x2)" << std::endl;
+    std::cout << "# WARNING (mesh): experimental " << (adaptive ? "adaptive" : "static")
+              << " refinement of the 3-D shearing box (levels constant along x2)" << std::endl;
   }
   if (multilevel && pin->DoesBlockExist("shearing_box") && !sbox_smr) {
     bool experimental_dust_smr = pin->DoesBlockExist("dust") &&

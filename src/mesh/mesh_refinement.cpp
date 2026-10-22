@@ -17,6 +17,8 @@
 #include <cmath>     // abs
 #include <algorithm> // sort
 #include <utility>   // pair
+#include <map>
+#include <tuple>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -26,6 +28,7 @@
 #include "refinement_criteria.hpp"
 
 #include "hydro/hydro.hpp"
+#include "shearing_box/shearing_box.hpp"
 #include "dust/dust.hpp"
 #include "mhd/mhd.hpp"
 #include "radiation/radiation.hpp"
@@ -68,6 +71,8 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
       prolong_prims = pin->GetBoolean("mesh_refinement", "prolong_primitives");
     }
     prolong_amp_eps = pin->GetOrAddReal("mesh_refinement", "prolong_amplitude_eps", 0.0);
+    sbox_columns = pm->adaptive && pm->three_d && pin->DoesBlockExist("shearing_box") &&
+                   pin->GetOrAddBoolean("shearing_box", "experimental_smr", false);
     if (prolong_amp_eps > 0.0) {
       if (pm->adaptive || prolong_prims) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -172,6 +177,16 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
       // Mark one mesh-topology update event (AMR and any resulting load balancing).
       pmy_mesh->MarkMeshUpdated();
 
+      // S1': the shearing box lists of x1-face blocks, its buffers and the level check
+      // on the new mesh, before the boundary values are exchanged again
+      if (pmy_mesh->pmb_pack->phydro != nullptr &&
+          pmy_mesh->pmb_pack->phydro->psbox_u != nullptr) {
+        auto *ps = pmy_mesh->pmb_pack->phydro->psbox_u;
+        ps->BuildBoundaryLists();
+        ps->AllocateBuffers();
+        ps->CheckLevelsAlongX2();
+      }
+
       pdriver->InitBoundaryValuesAndPrimitives(pmy_mesh);
     }
 
@@ -275,6 +290,26 @@ void MeshRefinement::CheckForRefinement(MeshBlockPack* pmbp) {
                    MPI_INT, refine_flag.h_view.data(), pmy_mesh->nmb_eachrank,
                    pmy_mesh->gids_eachrank, MPI_INT, MPI_COMM_WORLD);
 #endif
+  // 3-D shearing box (S1'): one decision per column along x2 (the same
+  // level and lx1, lx3): refine if any block of the column asks for it, derefine only if all do.
+  // The 2:1 and sibling rules that follow are the same for every x2 position, so the levels stay
+  // constant along x2 (the shear exchange and the orbital advection are same-level)
+  if (sbox_columns) {
+    std::map<std::tuple<int, std::int32_t, std::int32_t>, std::pair<int, int>> col;
+    for (int g=0; g<(pmy_mesh->nmb_total); ++g) {
+      const auto &ll = pmy_mesh->lloc_eachmb[g];
+      auto key = std::make_tuple(ll.level, ll.lx1, ll.lx3);
+      auto it = col.find(key);
+      if (it == col.end()) it = col.emplace(key, std::make_pair(0, 1)).first;
+      if (refine_flag.h_view(g) > 0) it->second.first = 1;
+      if (refine_flag.h_view(g) >= 0) it->second.second = 0;
+    }
+    for (int g=0; g<(pmy_mesh->nmb_total); ++g) {
+      const auto &ll = pmy_mesh->lloc_eachmb[g];
+      const auto &c = col[std::make_tuple(ll.level, ll.lx1, ll.lx3)];
+      refine_flag.h_view(g) = c.first ? 1 : (c.second ? -1 : 0);
+    }
+  }
   // sync host array with device
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();

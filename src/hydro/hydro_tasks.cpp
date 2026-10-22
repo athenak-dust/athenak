@@ -329,6 +329,8 @@ TaskStatus Hydro::SendU_Shr(Driver *pdrive, int stage) {
     // only execute if (3D OR 2d_r_phi)
     if (pmy_pack->pmesh->three_d || psbox_u->shearing_box_r_phi) {
       tstat = psbox_u->PackAndSendCC(u0, recon_method);
+      // the coarse arrays, before the prolongation of the fine x1 ghost zones
+      if (psbox_u->coarse_on) {tstat = psbox_u->PackAndSendCoarseCC(coarse_u0, recon_method);}
     }
   }
   return tstat;
@@ -345,6 +347,9 @@ TaskStatus Hydro::RecvU_Shr(Driver *pdrive, int stage) {
     // only execute if (3D OR 2d_r_phi)
     if (pmy_pack->pmesh->three_d || psbox_u->shearing_box_r_phi) {
       tstat = psbox_u->RecvAndUnpackCC(u0);
+      if (tstat == TaskStatus::complete && psbox_u->coarse_on) {
+        tstat = psbox_u->RecvAndUnpackCoarseCC(coarse_u0);
+      }
     }
   }
   return tstat;

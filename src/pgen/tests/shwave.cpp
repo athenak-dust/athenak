@@ -22,12 +22,16 @@
 #include <sstream>    // stringstream
 #include <stdexcept>  // runtime_error
 #include <string>     // c_str()
+#include <vector>
+#include <algorithm>
 
 // Athena++ headers
 #include "athena.hpp"
+#include "globals.hpp"
 #include "parameter_input.hpp"
 #include "coordinates/cell_locations.hpp"
 #include "mesh/mesh.hpp"
+#include "mesh/mesh_refinement.hpp"
 #include "eos/eos.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
@@ -39,6 +43,12 @@
 
 // User-defined history function (only used for compressible Hydro and MHD cases)
 void ShwaveHistory(HistoryData *pdata, Mesh *pm);
+// (S1') scheduled refinement bands (whole x2) for adaptive shearing-box tests
+void ShwaveBands(MeshBlockPack *pmbp);
+namespace {
+struct ShwaveBand {Real t0, t1, x1a, x1b, x3a, x3b; int level;};
+std::vector<ShwaveBand> shw_bands;
+}
 
 //----------------------------------------------------------------------------------------
 //! \struct ShwaveTestVariables
@@ -64,6 +74,23 @@ void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
   Real p0 = pin->GetOrAddReal("problem", "p0",1.0);
   Real amp = pin->GetReal("problem", "amp");
   int ipert = pin->GetInteger("problem", "ipert");
+
+  // (S1') <problem>/band_n bands of refinement for tests of the adaptive
+  // shearing box (experimental_smr): bandK_t0, _t1, _x1min, _x1max, _x3min, _x3max, _level; a
+  // block whose centre is inside an active band is wanted at its level (whole x2)
+  shw_bands.clear();
+  const int nband = pin->GetOrAddInteger("problem", "band_n", 0);
+  for (int b=1; b<=nband; ++b) {
+    const std::string k = "band" + std::to_string(b) + "_";
+    ShwaveBand bd;
+    bd.t0 = pin->GetReal("problem", k + "t0"); bd.t1 = pin->GetReal("problem", k + "t1");
+    bd.x1a = pin->GetReal("problem", k + "x1min"); bd.x1b = pin->GetReal("problem", k + "x1max");
+    bd.x3a = pin->GetOrAddReal("problem", k + "x3min", pmy_mesh_->mesh_size.x3min);
+    bd.x3b = pin->GetOrAddReal("problem", k + "x3max", pmy_mesh_->mesh_size.x3max);
+    bd.level = pin->GetOrAddInteger("problem", k + "level", 1);
+    shw_bands.push_back(bd);
+  }
+  if (pmy_mesh_->adaptive && nband > 0) user_ref_func = ShwaveBands;
 
   // box size and wavenumbers
   auto &msize = pmy_mesh_->mesh_size;
@@ -425,4 +452,35 @@ void ShwaveHistory(HistoryData *pdata, Mesh *pm) {
     pdata->hdata[n] = sum_this_mb.the_array[n];
   }
   return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void ShwaveBands()
+//! \brief Refinement request of the bands (S1'): refine a block whose centre
+//! lies in an active band below its level, derefine one outside every active band (or above the
+//! level they want).  The request does not depend on x2, as the shearing box requires.
+
+void ShwaveBands(MeshBlockPack *pmbp) {
+  Mesh *pm = pmbp->pmesh;
+  auto &refine_flag = pm->pmr->refine_flag;
+  auto &indcs = pm->mb_indcs;
+  auto &size = pmbp->pmb->mb_size;
+  const int nmb = pmbp->nmb_thispack;
+  const int mbs = pm->gids_eachrank[global_variable::my_rank];
+  for (int m=0; m<nmb; ++m) {
+    const auto &sz = size.h_view(m);
+    const Real xc = sz.x1min + 0.5*indcs.nx1*sz.dx1;
+    const Real zc = sz.x3min + 0.5*indcs.nx3*sz.dx3;
+    int want = 0;
+    for (const auto &b : shw_bands) {
+      if (pm->time >= b.t0 && pm->time < b.t1 && xc > b.x1a && xc < b.x1b && zc > b.x3a &&
+          zc < b.x3b) {
+        want = std::max(want, b.level);
+      }
+    }
+    const int lev = pm->lloc_eachmb[m + mbs].level - pm->root_level;
+    refine_flag.h_view(m + mbs) = (want > lev) ? 1 : ((want < lev) ? -1 : 0);
+  }
+  refine_flag.template modify<HostMemSpace>();
+  refine_flag.template sync<DevExeSpace>();
 }
