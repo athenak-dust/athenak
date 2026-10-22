@@ -363,6 +363,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // so once (a restart file carries every key, so a restarted run prints nothing).  Inputs
       // written before can be pinned to the old values with
       // a helper script outside the repository.
+      // Rixin: one key for the three quiet-state switches (their defaults)
+      cloud_quiet_protection = pin->GetOrAddBoolean("dust", "cloud_quiet_protection", false);
       if (global_variable::my_rank == 0) {
         const char *changed[][3] = {
           {"cloud_split_device", "true", "false"}, {"cloud_merge_device", "true", "false"},
@@ -376,6 +378,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           {"cloud_resample_dt_omega", "0.25 if omega0", "1"}};
         std::string unset;
         for (const auto &c : changed) {
+          if (cloud_quiet_protection && std::string(c[0]) == "cloud_merge_stencil") continue;
           if (!pin->DoesParameterExist("dust", c[0])) {
             unset += std::string(" ") + c[0] + "=" + c[1] + " (was " + c[2] + ")";
           }
@@ -524,7 +527,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       // Stage X (the exact stencil re-merge before G in quantum mode)
       // off by default, as in production; it stays a research control
-      cloud_merge_stencil = pin->GetOrAddBoolean("dust", "cloud_merge_stencil", false);
+      cloud_merge_stencil = pin->GetOrAddBoolean("dust", "cloud_merge_stencil",
+                                                 cloud_quiet_protection);
       cloud_merge_stencil_tol = pin->GetOrAddReal("dust", "cloud_merge_stencil_tol", 0.02);
       cloud_merge_smax = pin->GetOrAddReal("dust", "cloud_merge_smax", 1.0);
       cloud_merge_K = pin->GetOrAddInteger("dust", "cloud_merge_K", 4);
@@ -542,7 +546,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // no budget); cloud_merge_budget = -1 switches it off
       cloud_merge_budget = pin->GetOrAddReal("dust", "cloud_merge_budget", 0.3);
       // The structure-relative budget (0 = off, as before)
-      cloud_merge_budget_kappa = pin->GetOrAddReal("dust", "cloud_merge_budget_kappa", 0.0);
+      cloud_merge_budget_kappa = pin->GetOrAddReal("dust", "cloud_merge_budget_kappa",
+                                                   cloud_quiet_protection ? 1.0 : 0.0);
       cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
       // The test offset of the pass budget is gone; it
       // acted only with quantum G and the pass budget on
@@ -627,7 +632,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Rixin: the production cap factor (was 2.0)
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 1.5);
       // Resampling leaves cold patches alone (0 = off, as before)
-      cloud_resample_cold_alpha = pin->GetOrAddReal("dust", "cloud_resample_cold_alpha", 0.0);
+      cloud_resample_cold_alpha = pin->GetOrAddReal("dust", "cloud_resample_cold_alpha",
+                                                    cloud_quiet_protection ? 0.05 : 0.0);
+      if (cloud_quiet_protection && global_variable::my_rank == 0) {
+        std::cout << "# NOTE (dust): cloud_quiet_protection: stage X " << cloud_merge_stencil
+                  << ", cloud_resample_cold_alpha " << cloud_resample_cold_alpha
+                  << ", cloud_merge_budget_kappa " << cloud_merge_budget_kappa
+                  << std::endl;
+      }
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       // Patches inside one MeshBlock of min(cloud_resample_patch 2^level,
       // cloud_resample_patch_cells)^2 of its cells (cloud_resample_patches = block).
@@ -1046,11 +1058,14 @@ void DustGasDrag::CheckMultiRank() {
   if (cloud_gather_order != 2 || analytic_gather.on) {
     bad.push_back("gather variants (cloud_gather_order != 2, analytic_gather)");
   }
-  if (cloud_merge && cloud_merge_budget_kappa > 0.0) {
-    bad.push_back("cloud_merge_budget_kappa (the neighbour leaves of the halo are not exchanged)");
+  // Stage X and the structure-relative budget on several ranks (X merges
+  // the families whose nine members are on this rank; the budget's neighbour leaves come from
+  // the halo); X under the pass budget (cloud_merge_budget_x) has no exchange yet
+  if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device)) {
+    bad.push_back("merging other than the device quantum G (tent)");
   }
-  if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_stencil)) {
-    bad.push_back("merging other than the device quantum G (tent, X)");
+  if (cloud_merge && cloud_merge_stencil && cloud_merge_budget_x) {
+    bad.push_back("stage X under the pass budget (cloud_merge_budget_x)");
   }
   if (cloud_split_log) bad.push_back("cloud_split_log");
   if (cloud_leaf_check > 0) bad.push_back("cloud_leaf_check");

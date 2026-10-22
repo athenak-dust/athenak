@@ -975,14 +975,23 @@ int DustGasDrag::MergeCloudsDevice() {
     const Real rfloor = cloud_absorb_floor*mroot_floor/(transfer.root_dx1*transfer.root_dx2);
     const auto ltb = lt;
     const auto tr = transfer;
+    const int nown_ = nown;
+    // the leaf masses with the owners' totals also on the halo leaves (several
+    // ranks: lent holds this rank's share there; one rank: a copy)
+    DvceArray2D<Real> lmass("budget_lmass", 1, nbt);
+    Kokkos::parallel_for("budget_lmass", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+    KOKKOS_LAMBDA(const int t) {lmass(0,t) = lent(0,t);});
+    HaloForwardFlat(lmass, 1);
     Kokkos::parallel_for("budget_structure", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
     KOKKOS_LAMBDA(const int t) {
       lbeta(t) = beta;
+      // only this rank's leaves are judged (the halo leaves keep beta; their owner decides)
+      if (t >= nown_) return;
       const int b = t/(n1*n2), r = t % (n1*n2), j = r/n1, i = r % n1;
       if (i < is_ || i > ie_ || j < js_ || j > je_) return;
       const Real dx = ltb.box(b,2), dy = ltb.box(b,3);
       const Real xc = ltb.box(b,0) + (i - is_ + 0.5)*dx, yc = ltb.box(b,1) + (j - js_ + 0.5)*dy;
-      const Real rho = lent(0,t)/(dx*dy);
+      const Real rho = lmass(0,t)/(dx*dy);
       const Real den = Kokkos::fmax(rho, rfloor);
       Real s = 0.0;
       for (int d=0; d<4; ++d) {
@@ -993,7 +1002,7 @@ int DustGasDrag::MergeCloudsDevice() {
         const int tn = ltb.LeafOwner(x, y, b);
         if (tn < 0) continue;
         const int bn = tn/(n1*n2);
-        const Real rn = lent(0,tn)/(ltb.box(bn,2)*ltb.box(bn,3));
+        const Real rn = lmass(0,tn)/(ltb.box(bn,2)*ltb.box(bn,3));
         s = Kokkos::fmax(s, Kokkos::fabs(rn - rho)/den);
       }
       lbeta(t) = Kokkos::fmax(Kokkos::fmin(beta, bkappa*s), 1.0e-12);

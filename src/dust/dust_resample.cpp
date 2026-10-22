@@ -908,6 +908,8 @@ int DustGasDrag::ResampleClouds(const bool local) {
   }
   // cnt: number of (leaf, weight) entries of a pool cloud, -1 for the others; totals before;
   // lobed clouds, plain clouds above the cap, zero-mass slots
+  const int qdep_n1 = qdep.extent_int(4), qdep_n2 = qdep.extent_int(3);
+  const bool multirank = (global_variable::nranks > 1);
   Kokkos::parallel_reduce("rs_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, double &mt, double &px, double &nl, double &nf, double &nz,
                 double &ncold) {
@@ -926,6 +928,13 @@ int DustGasDrag::ResampleClouds(const bool local) {
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
     if (pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
     if (calpha > 0.0 && cq(p) >= 0 && ccold(cq(p)) == 1) {ncold += 1.0; return;}   // cold patch
+    // A cloud whose leaf is on a block of another rank stays out (several
+    // ranks; a position within round-off of a periodic face can be routed to this rank's block while
+    // its leaf lookup takes the periodic image on the other side, owned elsewhere)
+    if (multirank) {
+      const int tl = lt.LeafOwner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)));
+      if (tl < 0 || tl/(qdep_n1*qdep_n2) >= nmbp) return;
+    }
     int c = 0;
     lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), code, lt.Anchor(pi(PGID,p)),
                           [&](const int, const Real) {++c;});
@@ -1054,7 +1063,12 @@ int DustGasDrag::ResampleClouds(const bool local) {
         tj = r/ncells1 - js; ti = r % ncells1 - is;
       }
       // the clouds were moved to the rank of their block before (MigrateClouds)
-      if (b >= nmbp_) Kokkos::abort("resampling: a cloud in a block of another rank");
+      if (b >= nmbp_) {
+        Kokkos::printf("resampling: cloud p=%d tag=%d x=%.17g y=%.17g PGID=%d anchor=%d leaf=%d "
+                       "block=%d of %d (code %d, m=%.6e)\n", p, pi(PTAG,p), xp, yp, pi(PGID,p), am,
+                       t, b, nmbp_, code, pr(IPM,p));
+        Kokkos::abort("resampling: a cloud in a block of another rank");
+      }
       const int k = kblk(b);
       int q = poff(b) + (tj/k)*(bnx1/k) + ti/k;
       if (psub > 1) q = q*psub + (tj % k)*k + (ti % k);   // its cell in the patch

@@ -1491,6 +1491,10 @@ class DustGasDrag {
   // kappa > 0: the budget of a leaf is min(beta, kappa s), s the largest dust
   // density difference to its four neighbour leaves relative to its own (structure-relative); 0 = off
   Real cloud_merge_budget_kappa = 0.0;
+  // Rixin: <dust>/cloud_quiet_protection = true turns the three quiet-state
+  // switches on by default (stage X, the cold-patch gate of R, the structure-relative G budget);
+  // a key given in the input wins.  Off by default.
+  bool cloud_quiet_protection = false;
                                        // change for the whole pass (stage G; X with budget_x)
   Real cloud_absorb_floor = 0.1;       // ... with the leaf mass floored at this fraction of a
                                        // root cloud mass per root-cell volume (the name is
