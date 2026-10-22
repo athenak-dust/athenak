@@ -1499,6 +1499,10 @@ class DustGasDrag {
   bool cloud_resample = false;         // conservative same-level resampling in the code
   int cloud_resample_interval = 625;   // ... cycles between resamplings
   Real cloud_resample_eta = 2.0;       // ... mass cap eta m0 / 4^level (<= 0: no cap)
+  // alpha > 0 keeps cold patches out of the pool: every velocity component
+  // spans at most alpha H / tau over the patch (H its cell size, tau = min(ts, 1/omega)); 0 = off
+  Real cloud_resample_cold_alpha = 0.0;
+  unsigned long long cloud_resample_cold_skips = 0;   // clouds kept out as cold (cumulative)
   int cloud_resample_patch = 2;        // ... patches inside one MeshBlock, of
                                        //     this many root cells per side on the root level
   int cloud_resample_patch_cells = 4;  // ... at most this many cells of the block per side

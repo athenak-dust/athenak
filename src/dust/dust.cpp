@@ -624,6 +624,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       // Rixin: the production cap factor (was 2.0)
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 1.5);
+      // Resampling leaves cold patches alone (0 = off, as before)
+      cloud_resample_cold_alpha = pin->GetOrAddReal("dust", "cloud_resample_cold_alpha", 0.0);
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       // Patches inside one MeshBlock of min(cloud_resample_patch 2^level,
       // cloud_resample_patch_cells)^2 of its cells (cloud_resample_patches = block).
@@ -1117,6 +1119,8 @@ DustGasDrag::~DustGasDrag() {
       smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
     std::cout << "# DUST_CLOUD_SUMMARY splits=" << cloud_split_count
               << " merges=" << cloud_merge_count
+              << (cloud_resample_cold_alpha > 0.0 ? " resample_cold_skips=" +
+                  std::to_string(cloud_resample_cold_skips) : std::string())
               << " lobe_splits=" << cloud_lobe_split_count
               << (cloud_instant_switch ? " instant_switches=" + std::to_string(cloud_switch_count)
                                        : std::string())

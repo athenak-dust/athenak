@@ -843,10 +843,74 @@ int DustGasDrag::ResampleClouds(const bool local) {
   DvceArray1D<int> coff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_coff"), npart);
   int npool = 0, nnz = 0;
   double tot_b[2] = {0.0, 0.0}, cnt_b[3] = {0.0, 0.0, 0.0};
+  // With cloud_resample_cold_alpha > 0 a block patch (one species) is cold when
+  // every velocity component of its candidate clouds spans at most alpha H / tau (H the cell size of
+  // its block, tau = min(ts, 1/omega), the velocity tolerance of stage X).  Resampling keeps the
+  // leaf masses at the moment of the pass but replaces a lattice (or intact P1 families) by unequal
+  // masses, whose deposit is no longer uniform once the clouds move (aliasing): a quiet state is
+  // left alone; stage X restores its families exactly where they leave the finer leaves.
+  const Real calpha = cloud_resample_cold_alpha, comega = cloud_resample_omega;
+  const int nqs = (calpha > 0.0) ? std::max(1, poff_h[nmbp]*nsp) : 1;
+  DvceArray2D<Real> crange("rs_cold_range", nqs, 6);
+  DvceArray1D<int> ccold("rs_cold", nqs);
+  DvceArray1D<int> cq("rs_cold_q", (calpha > 0.0) ? std::max(1, npart) : 1);
+  double cnt_cold = 0.0;
+  if (calpha > 0.0) {
+    Kokkos::parallel_for("rs_cold_init", Kokkos::RangePolicy<>(DevExeSpace(), 0, nqs),
+    KOKKOS_LAMBDA(const int q) {
+      for (int c=0; c<3; ++c) {crange(q,c) = 1.0e300; crange(q,3+c) = -1.0e300;}
+      ccold(q) = 1;
+    });
+    const int js_ = pmesh->mb_indcs.js, is_ = pmesh->mb_indcs.is;
+    const int nc1 = qdep.extent_int(4), nc2 = qdep.extent_int(3);
+    auto prc = ppar->prtcl_rdata;
+    auto pic = ppar->prtcl_idata;
+    // the candidates (the pool tests of rs_flag below) and their block patch
+    Kokkos::parallel_for("rs_cold_q", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      cq(p) = -1;
+      if (prc(IPM,p) <= 0.0) return;
+      const int code = pic(PLEV,p);
+      if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) return;
+      const int am = lt.Anchor(pic(PGID,p));
+      if (use_mask && (am < 0 || am >= nmbp || rmask(am) == 0)) return;
+      const int lev = SMRCompositeTransfer::CloudLevel(code);
+      const int sp = (pic(PSP,p) >= 0 && pic(PSP,p) < nsp) ? pic(PSP,p) : 0;
+      const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
+      if (!(prc(IPM,p) <= cap*(1.0 + kPoolTol)) || prc(IPM,p) >= cap*(1.0 - kCapTol)) return;
+      const int t = lt.LeafOwner(prc(IPX,p), prc(IPY,p), am);
+      if (t < 0) return;
+      const int b = t/(nc1*nc2);
+      if (b >= nmbp) return;
+      const int r = t % (nc1*nc2);
+      const int tj = r/nc1 - js_, ti = r % nc1 - is_;
+      const int k = kblk(b);
+      const int qs = (poff(b) + (tj/k)*(bnx1/k) + ti/k)*nsp + sp;
+      cq(p) = qs;
+      const Real v[3] = {prc(IPVX,p), prc(IPVY,p), prc(IPVZ,p)};
+      for (int c=0; c<3; ++c) {
+        Kokkos::atomic_min(&crange(qs,c), v[c]);
+        Kokkos::atomic_max(&crange(qs,3+c), v[c]);
+      }
+    });
+    Kokkos::parallel_for("rs_cold_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      const int qs = cq(p);
+      if (qs < 0) return;
+      const Real ts = prc(IPTS,p);
+      const Real tau = (comega > 0.0) ? Kokkos::fmin(ts, 1.0/comega) : ts;
+      const int b = lt.LeafOwner(prc(IPX,p), prc(IPY,p), lt.Anchor(pic(PGID,p)))/(nc1*nc2);
+      const Real tolv = calpha*lt.box(b,2)/tau;
+      for (int c=0; c<3; ++c) {
+        if (crange(qs,3+c) - crange(qs,c) > tolv) {Kokkos::atomic_store(&ccold(qs), 0); return;}
+      }
+    });
+  }
   // cnt: number of (leaf, weight) entries of a pool cloud, -1 for the others; totals before;
   // lobed clouds, plain clouds above the cap, zero-mass slots
   Kokkos::parallel_reduce("rs_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, double &mt, double &px, double &nl, double &nf, double &nz) {
+  KOKKOS_LAMBDA(const int p, double &mt, double &px, double &nl, double &nf, double &nz,
+                double &ncold) {
     cnt(p) = -1;
     if (pr(IPM,p) <= 0.0) {nz += 1.0; return;}
     mt += pr(IPM,p); px += pr(IPM,p)*pr(IPVX,p);
@@ -861,11 +925,13 @@ int DustGasDrag::ResampleClouds(const bool local) {
     const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
     if (pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
+    if (calpha > 0.0 && cq(p) >= 0 && ccold(cq(p)) == 1) {ncold += 1.0; return;}   // cold patch
     int c = 0;
     lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), code, lt.Anchor(pi(PGID,p)),
                           [&](const int, const Real) {++c;});
     cnt(p) = c;
-  }, tot_b[0], tot_b[1], cnt_b[0], cnt_b[1], cnt_b[2]);
+  }, tot_b[0], tot_b[1], cnt_b[0], cnt_b[1], cnt_b[2], cnt_cold);
+  cloud_resample_cold_skips += static_cast<unsigned long long>(cnt_cold);
   Kokkos::parallel_scan("rs_slot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
     if (final) slot(p) = (cnt(p) >= 0) ? upd : -1;
