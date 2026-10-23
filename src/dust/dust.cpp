@@ -158,8 +158,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // Physical x3 faces in 3-D (a stratified box, S3c): particles reflect or leave
   // (<dust>/particle_x3_bc), ghost deposits beyond the faces fold back (or are dropped,
   // <dust>/x3_ghost_deposit); the PC2 gather reads the gas ghost cells of the gas boundary
-  // conditions.  imex and the automatic hybrid read u* ghost cells, which have no x3 boundary
-  // values yet.
+  // conditions, imex and the automatic hybrid the u* ghost cells.
   const bool x3_phys = pmy_pack->pmesh->three_d &&
       pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic;
   if (!(pmy_pack->pmesh->strictly_periodic)) {
@@ -174,12 +173,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                 << "directions (or shear-periodic x1 and / or physical x3 faces in 3D)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    if (x3_phys && !pc2_only) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "3-D dust with physical x3 faces needs <dust>/coupling = pc2"
-                << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
+    // imex and the automatic hybrid read u*, which gets x3 boundary values
+    // (DustGasDrag::UstarX3BCs); every coupling is allowed
     // S3a: the ghost deposits across the shear-periodic faces are moved
     // to the opposite face with the shear offset (DepRemapPlan); the u* ghost fill is remapped
   }

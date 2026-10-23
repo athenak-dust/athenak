@@ -329,10 +329,7 @@ TaskStatus DustGasDrag::RecvUstar(Driver *pdrive, int stage) {
   TaskStatus status = pbval_us->RecvAndUnpackCC(ustar, cdummy);
   // with a shearing box the prolongation comes after the shear of the coarse array
   // (RecvUstarShr), as for the gas (RecvU -> shear -> Prolongate)
-  if (status == TaskStatus::complete && pmy_pack->pmesh->multilevel && psbox_us == nullptr) {
-    pbval_us->FillCoarseInBndryCC(ustar, cdummy);
-    pbval_us->ProlongateCC(ustar, cdummy);
-  }
+  if (status == TaskStatus::complete && psbox_us == nullptr) FinishUstarGhosts();
   return status;
 }
 
@@ -360,11 +357,8 @@ TaskStatus DustGasDrag::RecvUstarShr(Driver *pdrive, int stage) {
   TaskStatus tstat = psbox_us->RecvAndUnpackCC(ustar);
   if (tstat == TaskStatus::complete && psbox_us->coarse_on) {
     tstat = psbox_us->RecvAndUnpackCoarseCC(cdummy);
-    if (tstat == TaskStatus::complete) {
-      pbval_us->FillCoarseInBndryCC(ustar, cdummy);
-      pbval_us->ProlongateCC(ustar, cdummy);
-    }
   }
+  if (tstat == TaskStatus::complete) FinishUstarGhosts();
   return tstat;
 }
 
@@ -470,6 +464,50 @@ TaskStatus DustGasDrag::RemoveOutflowParticles(Driver *pdrive, int stage) {
               << std::endl;
   }
   return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::FinishUstarGhosts, UstarX3BCs
+//! \brief The end of the u* ghost fill (after the exchange, and the shear with a
+//! shearing box): with refinement the physical x3 boundary values of the coarse array, then its
+//! fill and the prolongation; last the physical x3 boundary values of u* itself (after the
+//! prolongation, so the corners beyond an x3 face see prolongated values).  At a reflecting x3
+//! face the ghost cells mirror the active cells with v_z negated, at any other physical face they
+//! copy the boundary cell (zero gradient).  Nothing changes with periodic x3.
+
+void DustGasDrag::FinishUstarGhosts() {
+  if (pmy_pack->pmesh->multilevel) {
+    UstarX3BCs(cdummy, true);
+    pbval_us->FillCoarseInBndryCC(ustar, cdummy);
+    pbval_us->ProlongateCC(ustar, cdummy);
+  }
+  UstarX3BCs(ustar, false);
+}
+
+void DustGasDrag::UstarX3BCs(DvceArray5D<Real> &a, const bool coarse) {
+  Mesh *pm = pmy_pack->pmesh;
+  if (!pm->three_d || pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic) return;
+  const auto &ind = pm->mb_indcs;
+  const int ng = ind.ng;
+  const int ks = coarse ? ind.cks : ind.ks, ke = coarse ? ind.cke : ind.ke;
+  const int n1 = a.extent_int(4), n2 = a.extent_int(3);
+  const int nmb = pmy_pack->nmb_thispack;
+  auto &bcs = pmy_pack->pmb->mb_bcs;
+  const bool refl_in = (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::reflect);
+  const bool refl_out = (pm->mesh_bcs[BoundaryFace::outer_x3] == BoundaryFlag::reflect);
+  par_for("dust_ustar_x3bc", DevExeSpace(), 0, nmb-1, 0, ng-1, 0, n2-1, 0, n1-1,
+  KOKKOS_LAMBDA(const int m, const int g, const int j, const int i) {
+    const BoundaryFlag bi = bcs.d_view(m, BoundaryFace::inner_x3);
+    const BoundaryFlag bo = bcs.d_view(m, BoundaryFace::outer_x3);
+    if (bi != BoundaryFlag::block && bi != BoundaryFlag::periodic) {
+      const int kg = ks - 1 - g, kc = refl_in ? (ks + g) : ks;
+      for (int v=0; v<3; ++v) a(m,v,kg,j,i) = (refl_in && v == 2) ? -a(m,v,kc,j,i) : a(m,v,kc,j,i);
+    }
+    if (bo != BoundaryFlag::block && bo != BoundaryFlag::periodic) {
+      const int kg = ke + 1 + g, kc = refl_out ? (ke - g) : ke;
+      for (int v=0; v<3; ++v) a(m,v,kg,j,i) = (refl_out && v == 2) ? -a(m,v,kc,j,i) : a(m,v,kc,j,i);
+    }
+  });
 }
 
 } // namespace dust
