@@ -245,9 +245,70 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
 //  the ordinary copy exchange). The experimental single-rank static-SMR path remaps
 //  ghost-cell densities by geometric overlap and receiving-cell volume.
 
+//----------------------------------------------------------------------------------------
+//! \struct DepRemapMap
+//! \brief S3a: one part of the general deposit remap: the ghost
+//! deposits added to the overlapping active cells of the blocks of this rank, as a list per
+//! target cell (CSR, sorted by source block gid and source cell: the sums are independent of
+//! the rank layout), and the source ghost cells this rank sends to every other rank.
+
+struct DepRemapMap {
+  int nseg = 0, nent = 0;
+  DvceArray1D<int> seg_tgt;    // target cell m*ncell + cell (active cell of a block here)
+  DvceArray1D<int> seg_ptr;    // nseg+1 offsets into the entries
+  DvceArray1D<int> ent_src;    // >= 0: local source cell m*ncell + cell; < 0: -(recv entry+1)
+  DvceArray1D<Real> ent_w;     // overlap volume / target cell volume
+  int nsend = 0, nrecv = 0;
+  DvceArray1D<int> send_cell;  // local source cells packed for the other ranks (by rank)
+  std::vector<int> send_rank, send_off, send_cnt;   // per peer rank: offset, count (entries)
+  std::vector<int> recv_rank, recv_off, recv_cnt;
+};
+
+//----------------------------------------------------------------------------------------
+//! \class DepRemapPlan
+//! \brief S3a: the additive ghost-deposit exchange of a 3-D mesh with
+//! any levels (static or adaptive refinement), multi-rank, and shear-periodic x1 faces.  Every
+//! ghost cell deposit goes to the active cells it overlaps (volume overlap in the integer cell
+//! units of the finest level: exact, conservative); ghost cells beyond a shear-periodic x1 face
+//! go to the opposite face shifted in x2 by the shear offset (the particles' convention,
+//! bvals_part.cpp).  Built on the host from the global block list (no finest-grid table): the
+//! static part once per mesh, the shear part at every stage.  Shared by the deposit exchanges.
+
+class DepRemapPlan {
+ public:
+  DepRemapPlan(MeshBlockPack *pp, bool shear_x1, Real qshear, Real omega0);
+  void BuildStatic();              // after construction and after every regrid
+  void UpdateShear(Real time);     // the shear part for the offset at time (no-op without shear)
+  bool Shear() const {return shear_x1_;}
+  DepRemapMap stat, shr;
+  int build_seq = 0;               // increases with every BuildStatic
+  Real shear_time = -1.0;
+  // Public because CUDA extended lambdas cannot be enclosed by a private member.
+  void BuildPart(const int part, const double shR, DepRemapMap &map);
+
+ private:
+  MeshBlockPack *pmy_pack;
+  bool shear_x1_;
+  Real qshear_, omega0_;
+  std::vector<int> face_gids_[2];  // blocks at the inner / outer x1 face (all ranks)
+};
+
 class MeshBoundaryValuesDep : public MeshBoundaryValues {
  public:
   MeshBoundaryValuesDep(MeshBlockPack *ppack, ParameterInput *pin);
+  ~MeshBoundaryValuesDep();
+
+  // The general 3-D path: the dust module creates the plan and gives it to its
+  // deposit exchanges; then these replace InitRecv / ClearSend / ClearRecv of the base class
+  void SetGeneralPlan(DepRemapPlan *p) {plan_ = p;}
+  bool General() const {return plan_ != nullptr;}
+  TaskStatus InitRecvDep(const int nvar);
+  TaskStatus ClearSendDep();
+  TaskStatus ClearRecvDep();
+  // Public because CUDA extended lambdas cannot be enclosed by a private member.
+  void GeneralPack(DvceArray5D<Real> &a, const DepRemapMap &map, DvceArray1D<Real> &buf);
+  void GeneralApply(DvceArray5D<Real> &a, const DepRemapMap &map,
+                    const DvceArray1D<Real> &buf);
 
   //functions
   void InitSendIndices(MeshBoundaryBuffer &b,int o1,int o2,int o3,int f1,int f2) override;
@@ -268,6 +329,14 @@ class MeshBoundaryValuesDep : public MeshBoundaryValues {
   static constexpr int max_smr_targets_ = 8;
   bool local_smr_remap_ = false;
   bool local_smr_direct_ = false;
+  // General path: buffers and requests of this exchange (static, shear part)
+  DepRemapPlan *plan_ = nullptr;
+  int gen_nvar_ = 0;
+  DvceArray1D<Real> gsbuf_[2], grbuf_[2];   // device buffers given to MPI (as the base class)
+#if MPI_PARALLEL_ENABLED
+  MPI_Comm comm_dep_;
+  std::vector<MPI_Request> gsreq_, grreq_;
+#endif
   DvceArray4D<int> smr_target_count_;
   DvceArray5D<int> smr_target_index_;
   DvceArray5D<Real> smr_target_weight_;
@@ -356,6 +425,7 @@ class ParticlesBoundaryValues {
   int nmb_sp_x2=1, nmb_sp_x3=1;        // root-grid MeshBlock counts in x2/x3
   DualArray3D<int> sgid_map;           // destination GID:  (side, lx3, lx2)
   DualArray3D<int> srank_map;          // destination rank: (side, lx3, lx2)
+  void BuildShearMaps();               // also after every regrid
 
   // Data needed to count number of messages and particles to send between ranks
   int nsends; // number of MPI sends to neighboring ranks on this rank
