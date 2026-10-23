@@ -37,7 +37,9 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
 
   BuildBoundaryLists();
   CheckLevelsAlongX2();
-  CheckSupportedSetup();
+  // MeshRefinement is built after the physics: read its key here
+  CheckSupportedSetup(!pin->DoesParameterExist("mesh_refinement", "coarse_physical_bcs") ||
+                      pin->GetBoolean("mesh_refinement", "coarse_physical_bcs"));
 
 #if MPI_PARALLEL_ENABLED
   // create unique communicators for shearing box
@@ -130,11 +132,10 @@ void ShearingBox::CheckLevelsAlongX2() const {
 //! \fn void ShearingBox::CheckSupportedSetup()
 //! \brief Setup checks (Codex review): Pieces splits a block's x2 rows into at most
 //! three pieces, which needs nx2 >= 2 ng; the coarse arrays (3-D with refinement) have half the
-//! rows and the same ng, so there the fine blocks need nx2 >= 4 ng.  The coarse arrays get no
-//! physical boundary values (generic AthenaK refinement): with refinement in 3-D the x3
-//! boundaries must be periodic until a coarse physical-boundary fill exists.
+//! rows and the same ng, so there the fine blocks need nx2 >= 4 ng.  Non-periodic x3 needs the
+//! physical boundary values of the coarse arrays (on by default).
 
-void ShearingBox::CheckSupportedSetup() const {
+void ShearingBox::CheckSupportedSetup(const bool coarse_bcs) const {
   Mesh *pm = pmy_pack->pmesh;
   if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) return;
   const auto &indcs = pm->mb_indcs;
@@ -153,12 +154,13 @@ void ShearingBox::CheckSupportedSetup() const {
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (pm->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Shearing box with mesh refinement in 3-D needs periodic x3 boundaries: "
-              << "the coarse arrays get no physical boundary values, and the prolongation "
-              << "next to an x3 boundary reads them" << std::endl;
-    std::exit(EXIT_FAILURE);
+  // the coarse arrays get physical boundary values in Hydro::Prolongate
+  if (pm->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
+      !coarse_bcs && global_variable::my_rank == 0) {
+    std::cout << "# WARNING: shearing box with mesh refinement in 3-D and non-periodic x3 "
+              << "without <mesh_refinement>/coarse_physical_bcs (control only): the "
+              << "prolongation next to the x3 faces reads unset coarse cells"
+              << std::endl;
   }
 }
 

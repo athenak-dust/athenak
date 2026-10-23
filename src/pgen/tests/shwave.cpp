@@ -171,6 +171,12 @@ void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
       user_hist_func = ShwaveHistory;
 
       auto sv = shw_var;
+      // <problem>/zmode_amp adds the density mode
+      // d0 (1 + zmode_amp cos(2 pi (z - x3min) / Lz)), mirror-symmetric about both x3 faces
+      // (a standing sound wave: reflecting and periodic x3 give the same solution)
+      const Real zamp = pin->GetOrAddReal("problem", "zmode_amp", 0.0);
+      const Real zmin = pmy_mesh_->mesh_size.x3min;
+      const Real zlen = pmy_mesh_->mesh_size.x3max - zmin;
       par_for("shwave3", DevExeSpace(), 0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
       KOKKOS_LAMBDA(int m, int k, int j, int i) {
         Real &x1min = size.d_view(m).x1min;
@@ -183,12 +189,17 @@ void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
 
         Real rvx = amp*cos(sv.kx*x1v + sv.ky*x2v);
         Real rvy = amp*(sv.ky/sv.kx)*cos(sv.kx*x1v + sv.ky*x2v);
-        u0(m,IDN,k,j,i) = d0;
-        u0(m,IM1,k,j,i) = -d0*rvx;
-        u0(m,IM2,k,j,i) = -d0*rvy;
+        Real d = d0;
+        if (zamp != 0.0) {
+          Real x3v = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min, size.d_view(m).x3max);
+          d = d0*(1.0 + zamp*cos(2.0*M_PI*(x3v - zmin)/zlen));
+        }
+        u0(m,IDN,k,j,i) = d;
+        u0(m,IM1,k,j,i) = -d*rvx;
+        u0(m,IM2,k,j,i) = -d*rvy;
         u0(m,IM3,k,j,i) = 0.0;
         if (eos.is_ideal) {
-          u0(m,IEN,k,j,i) = p0/gm1 + 0.5*d0*(SQR(rvx) + SQR(rvy));
+          u0(m,IEN,k,j,i) = p0/gm1 + 0.5*d*(SQR(rvx) + SQR(rvy));
         }
       });
     }

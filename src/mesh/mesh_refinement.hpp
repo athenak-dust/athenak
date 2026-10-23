@@ -53,6 +53,9 @@ class MeshRefinement {
   int ncyc_check_amr;        // # of cycles between checking mesh for ref/derefinement
   int refinement_interval;   // # of cycles between allowing successive ref/derefinement
   bool prolong_prims;        // flag to enable prolongation of primitive vars
+  // physical boundary values on the coarse arrays before the ghost
+  // prolongation (<mesh_refinement>/coarse_physical_bcs, default true; false = AthenaK before)
+  bool coarse_physical_bcs = true;
   // 3-D shearing box with experimental_smr (S1'): one refinement decision
   // per column along x2 (level, lx1, lx3), so that the levels stay constant along x2
   bool sbox_columns = false;
