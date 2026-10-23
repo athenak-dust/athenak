@@ -118,6 +118,7 @@ class ShearingBox {
   // rank and direction, in an order both sides derive from the pieces themselves.
   struct ShearCand {int gid, rank, level; std::int32_t lx2, lx3;};
   std::vector<std::vector<ShearCand>> cand_[2];   // [face of the local block][local m]
+  std::vector<std::vector<int>> candsort_[2];      // their indices sorted by (level, lx3, lx2)
   void BuildCandidates();
   // remote pieces of one exchange: entries {dir (0 receive, 1 send), peer, k1..k5, size};
   // fills offset[i] per piece and the message lists (rank, offset, size, send)

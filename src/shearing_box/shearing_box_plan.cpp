@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -32,6 +33,7 @@ void ShearingBox::BuildCandidates() {
   const int gids = pmy_pack->gids;
   for (int f=0; f<2; ++f) {
     cand_[f].assign(nmb, std::vector<ShearCand>());
+    candsort_[f].assign(nmb, std::vector<int>());
   }
   if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) return;
   const int root = pm->root_level;
@@ -77,6 +79,19 @@ void ShearingBox::BuildCandidates() {
       if (hit) {
         cand_[l.f][l.m].push_back({g, pm->rank_eachmb[g], ll.level, ll.lx2, ll.lx3});
       }
+    }
+  }
+  // lookup index by (level, lx3, lx2) for the plans
+  for (int f=0; f<2; ++f) {
+    candsort_[f].assign(nmb, std::vector<int>());
+    for (int m=0; m<nmb; ++m) {
+      const auto &cv = cand_[f][m];
+      auto &cs = candsort_[f][m];
+      cs.resize(cv.size());
+      for (size_t i=0; i<cv.size(); ++i) cs[i] = static_cast<int>(i);
+      std::sort(cs.begin(), cs.end(), [&cv](int a, int b) {
+        return std::make_tuple(cv[a].level, cv[a].lx3, cv[a].lx2) <
+               std::make_tuple(cv[b].level, cv[b].lx3, cv[b].lx2);});
     }
   }
 }

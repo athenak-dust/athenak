@@ -59,7 +59,7 @@ void ShearingBoxCC::PlanFluxMatch() {
   const Real ly = pm->mesh_size.x2max - pm->mesh_size.x2min;
   const int nbuf = nx2 + 6;
   auto nxl = [pm, root](int l) {return pm->nmb_rootx1 << (l - root);};
-  std::vector<std::vector<int>> pcs;
+  std::vector<std::array<int, kNField>> pcs;
   std::vector<std::pair<int, int>> rl;
   std::vector<Real> reps;
   bool bad = false;
@@ -68,8 +68,7 @@ void ShearingBoxCC::PlanFluxMatch() {
   // candidates (or, on the sending side, is the sending block itself); keep(sg) selects the
   // pieces to record
   auto walk = [&](int rg, int l, std::int32_t lx2, std::int32_t lx3, int f, int ls, int ridx,
-                  const std::function<const ShearCand*(int, std::int32_t, std::int32_t)> &find,
-                  const std::function<bool(int)> &keep, Real &eps_out) {
+                  const auto &find, const auto &keep, Real &eps_out) {
     const int fo = 1 - f;
     const int rb = (ls == l) ? nx2 : nx2/2;
     const long long ny = static_cast<long long>(pm->nmb_rootx2 << (l - root))*nx2;
@@ -95,7 +94,7 @@ void ShearingBoxCC::PlanFluxMatch() {
         }
         if (keep(sc->gid)) {
           const int nkp = (ls == l) ? nk : nk/2;
-          std::vector<int> p(kNField, 0);
+          std::array<int, kNField> p{};
           p[kRGid] = rg; p[kSGid] = sc->gid; p[kSFace] = fo; p[kR0] = r0; p[kLen] = len;
           p[kDst] = dst; p[kKofs] = (ls == l) ? 0 : zh*(nk/2); p[kNk] = nkp;
           p[kRestr] = (ls != l) ? 1 : 0; p[kQ] = npc; p[kRIdx] = ridx;
@@ -117,11 +116,15 @@ void ShearingBoxCC::PlanFluxMatch() {
     const int l = ll.level;
     for (int f=0; f<2; ++f) {
       if (ll.lx1 != ((f == 0) ? 0 : nxl(l) - 1)) continue;
-      std::map<std::tuple<int, std::int32_t, std::int32_t>, const ShearCand*> cm;
-      for (const ShearCand &c : cand_[f][m]) cm[std::make_tuple(c.level, c.lx2, c.lx3)] = &c;
-      auto find = [&cm](int lev, std::int32_t j, std::int32_t k) -> const ShearCand* {
-        auto it = cm.find(std::make_tuple(lev, j, k));
-        return (it == cm.end()) ? nullptr : it->second;
+      const auto &cv = cand_[f][m];
+      const auto &cs = candsort_[f][m];
+      auto find = [&cv, &cs](int lev, std::int32_t j, std::int32_t k) -> const ShearCand* {
+        auto it = std::lower_bound(cs.begin(), cs.end(), 0, [&](int a, int) {
+          const ShearCand &c = cv[a];
+          return std::make_tuple(c.level, c.lx3, c.lx2) < std::make_tuple(lev, k, j);});
+        if (it == cs.end()) return nullptr;
+        const ShearCand &c = cv[*it];
+        return (c.level == lev && c.lx3 == k && c.lx2 == j) ? &c : nullptr;
       };
       int lo = -1;
       if (find(l, ll.lx2, ll.lx3) != nullptr) {
@@ -432,7 +435,7 @@ void ShearingBoxCC::PlanFluxPair() {
   const int nmb = pmy_pack->nmb_thispack;
   const Real ly = pm->mesh_size.x2max - pm->mesh_size.x2min;
   auto nxl = [pm, root](int l) {return pm->nmb_rootx1 << (l - root);};
-  std::vector<std::vector<int>> pcs;
+  std::vector<std::array<int, kQNField>> pcs;
   std::vector<Real> fr;
   bool bad = false;
   // the pieces of (receiving block y on face fy, authoritative block x), the same
@@ -474,7 +477,7 @@ void ShearingBoxCC::PlanFluxPair() {
         const int r0 = std::max(0, static_cast<int>(std::floor(lo/static_cast<Real>(f2))));
         const int r1 = std::min(nx2, static_cast<int>(std::ceil(hi/static_cast<Real>(f2))));
         if (r1 <= r0) continue;
-        std::vector<int> p(kQNField, 0);
+        std::array<int, kQNField> p{};
         p[kQRGid] = y.gid; p[kQRIdx] = (ridx >= 0) ? 1 : -1; p[kQRFace] = fy;
         p[kQSGid] = x.gid; p[kQSLoc] = (x.rank == my_rank) ? 1 : 0; p[kQSFace] = 1 - fy;
         p[kQD] = d;

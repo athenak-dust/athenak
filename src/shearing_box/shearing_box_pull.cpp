@@ -90,7 +90,7 @@ void ShearingBox::PlanPull() {
   };
   bool bad = false;
   int maxny = 1, maxnz = 1;
-  std::vector<std::vector<int>> pcs;
+  std::vector<std::array<int, kPNField>> pcs;
   // the pieces of (receiver r, sending block s), in the same order on both sides
   auto pieces = [&](const Recv &r, const ShearCand &s, int ridx) {
     const int lr = r.lr;
@@ -128,7 +128,7 @@ void ShearingBox::PlanPull() {
           bad = true;
           continue;
         }
-        std::vector<int> p(kPNField, 0);
+        std::array<int, kPNField> p{};
         p[kPRGid] = r.gid; p[kPRType] = r.type; p[kPRFace] = r.f; p[kPRIdx] = ridx;
         p[kPSGid] = s.gid; p[kPSLoc] = (s.rank == my_rank) ? 1 : 0; p[kPSFace] = 1 - r.f;
         p[kPD] = d;
