@@ -724,7 +724,8 @@ void DustGasDrag::EnsureRootCloudMass() {
       KOKKOS_LAMBDA(const int p, Real &a, Real &b) {
         const int code = pi(PLEV,p);
         if (pi(PSP,p) != sp || SMRCompositeTransfer::CloudLobe1(code) ||
-            SMRCompositeTransfer::CloudLobe2(code)) return;
+            SMRCompositeTransfer::CloudLobe2(code) ||
+            SMRCompositeTransfer::CloudLobe3(code)) return;   // (x3 lobe: 0 in 2-D)
         const int l = SMRCompositeTransfer::CloudLevel(code);
         if (l == 0 && pr(IPM,p) > a) a = pr(IPM,p);
         if (l == 1 && pr(IPM,p) > b) b = pr(IPM,p);
@@ -734,7 +735,8 @@ void DustGasDrag::EnsureRootCloudMass() {
       MPI_Allreduce(MPI_IN_PLACE, mm, 2, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
       m0 = mm[0]; m1 = mm[1];
 #endif
-      cloud_merge_mroot[sp] = (m0 > 0.0) ? m0 : 4.0*m1;
+      // a level-1 cloud carries 1/4 of a root cloud in 2-D, 1/8 in 3-D
+      cloud_merge_mroot[sp] = (m0 > 0.0) ? m0 : (clouds3d ? 8.0 : 4.0)*m1;
     }
   }
 }
@@ -2515,6 +2517,803 @@ void DustGasDrag::UpdateCloudOrder() {
                    npart, static_cast<unsigned long long>(cloud_ord_builds), t.seconds());
     }
   }
+}
+
+//========================================================================================
+// The production merge pass for 3-D refinable clouds
+//========================================================================================
+
+namespace {
+
+// sign * (mass, momentum) of the live clouds 0..n-1 of (r, i) on the 3-D leaves
+void BudgetDeposit3D(const LeafTraversal3D &lt, const DvceArray2D<Real> &r,
+                     const DvceArray2D<int> &i, const int n, const Real sign,
+                     DvceArray2D<Real> &f) {
+  if (n <= 0) return;
+  auto f_ = f;
+  auto tr = lt;
+  Kokkos::parallel_for("budget_deposit3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, n),
+  KOKKOS_LAMBDA(const int p) {
+    if (r(IPM,p) <= 0.0) return;
+    const Real m = sign*r(IPM,p);
+    const Real v1 = r(IPVX,p), v2 = r(IPVY,p), v3 = r(IPVZ,p);
+    tr.ForEachCloudWeight(r(IPX,p), r(IPY,p), r(IPZ,p), i(PLEV,p), tr.Anchor(i(PGID,p)),
+    [&](const int t, const Real w) {
+      Kokkos::atomic_add(&f_(0,t), m*w); Kokkos::atomic_add(&f_(1,t), m*w*v1);
+      Kokkos::atomic_add(&f_(2,t), m*w*v2); Kokkos::atomic_add(&f_(3,t), m*w*v3);
+    });
+  });
+}
+
+// the level-L cell of a position and the merge-cell mask on the 3-D leaves (MergeMask in 3-D)
+struct MergeMask3D {
+  LeafTraversal3D lt;
+  int B = 0;
+  static constexpr int kL = SMRCompositeTransfer::kCloudLevelMask + 1;
+  int n1[kL], n2[kL], n3[kL];
+  Real dx1[kL], dx2[kL], dx3[kL];
+  Real x1min, x2min, x3min, x1max, x2max, x3max;
+  KOKKOS_INLINE_FUNCTION
+  void Index(const Real x, const Real y, const Real z, const int L, int &I, int &J, int &K) const {
+    using T = SMRCompositeTransfer;
+    I = T::WrapIndex(static_cast<int>(Kokkos::floor((T::WrapPosition(x, x1min, x1max) - x1min)/
+                                                     dx1[L])), n1[L]);
+    J = T::WrapIndex(static_cast<int>(Kokkos::floor((T::WrapPosition(y, x2min, x2max) - x2min)/
+                                                     dx2[L])), n2[L]);
+    K = T::WrapIndex(static_cast<int>(Kokkos::floor((T::WrapPosition(z, x3min, x3max) - x3min)/
+                                                     dx3[L])), n3[L]);
+  }
+  KOKKOS_INLINE_FUNCTION
+  std::int64_t Cell(const Real x, const Real y, const Real z, const int L) const {
+    int I, J, K;
+    Index(x, y, z, L, I, J, K);
+    return (static_cast<std::int64_t>(K)*n2[L] + J)*n1[L] + I;
+  }
+  KOKKOS_INLINE_FUNCTION
+  bool In(const Real x, const Real y, const Real z, const int L, const int m) const {
+    return lt.MergeOK(x, y, z, L, B, m);
+  }
+};
+
+}  // namespace
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::MergeCloudsDevice3D
+//! \brief The production merge pass (quantum mode) for 3-D refinable clouds,
+//! the rules of MergeCloudsDevice along three directions: (1) far-field release of lobed level-l
+//! clouds in merge cells of level l - 1; per level lev (L = lev - 1): (X, with
+//! cloud_merge_stencil) the exact re-merge of complete P1 families (27 members, masses
+//! m_c / 2^(|a|+|b|+|c|)) into level-L clouds; (G) the mass-quantum walk of the plain level-lev
+//! pieces of the deep merge zone in each level-L cell (4 x 4 x 4 sub-cells, Morton order rotated
+//! by the pass number) into level-L clouds of the quantum m_root / 8^L, position and velocity
+//! bounding boxes, K open groups; the pass budget (with the structure-relative beta over the
+//! six neighbour leaves) accepts or rejects whole groups; the compaction.
+//! One rank (stage 2); no audit, no stage-X budget, no X protection.  Returns the merges.
+
+int DustGasDrag::MergeCloudsDevice3D() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  Mesh *pmesh = pmy_pack->pmesh;
+  const int npart0 = ppar->nprtcl_thispack;
+  const auto lt = leaf_traversal3d;
+  const int nlev = lt.nlev;
+  if (nlev == 0 || npart0 == 0) return 0;
+  using T = SMRCompositeTransfer;
+  const int nrdata = ppar->nrdata, nidata = ppar->nidata;
+  const int gids = pmy_pack->gids;
+  const int ncell123 = lt.ncells1*lt.ncells2*lt.ncells3;
+  EnsureNextTag();
+  MergeMask3D mm;
+  mm.lt = lt;
+  mm.B = cloud_merge_buffer;
+  mm.x1min = lt.x1min; mm.x2min = lt.x2min; mm.x3min = lt.x3min;
+  mm.x1max = lt.x1max; mm.x2max = lt.x2max; mm.x3max = lt.x3max;
+  const int nc1 = pmesh->mesh_indcs.nx1, nc2 = pmesh->mesh_indcs.nx2, nc3 = pmesh->mesh_indcs.nx3;
+  for (int L=0; L<nlev; ++L) {
+    mm.dx1[L] = lt.root_dx1/static_cast<Real>(1 << L);
+    mm.dx2[L] = lt.root_dx2/static_cast<Real>(1 << L);
+    mm.dx3[L] = lt.root_dx3/static_cast<Real>(1 << L);
+    mm.n1[L] = nc1 << L; mm.n2[L] = nc2 << L; mm.n3[L] = nc3 << L;
+  }
+  Kokkos::Timer tpass;
+  // totals before
+  Real tb[4] = {0.0, 0.0, 0.0, 0.0};
+  {
+    auto pr = ppar->prtcl_rdata;
+    Kokkos::parallel_reduce("merge3d_tot_b", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart0),
+    KOKKOS_LAMBDA(const int p, Real &a, Real &b, Real &c, Real &d) {
+      const Real m = pr(IPM,p);
+      a += m; b += m*pr(IPVX,p); c += m*pr(IPVY,p); d += m*pr(IPVZ,p);
+    }, tb[0], tb[1], tb[2], tb[3]);
+  }
+  // the pass budget: lent the entry leaf fields, lcum the change so far
+  const bool pbud = cloud_merge_budget > 0.0;
+  const int nbt = pbud ? lt.nmb*ncell123 : 1;
+  DvceArray2D<Real> lent("budget3d_lent", 4, nbt), lcum("budget3d_lcum", 4, nbt);
+  if (pbud) BudgetDeposit3D(lt, ppar->prtcl_rdata, ppar->prtcl_idata, npart0, 1.0, lent);
+  bool bdirty = false;
+  double gcb[4] = {0.0, 0.0, 0.0, 0.0};   // rejected groups, pieces, mass; evaluations
+  double bcap = 0.0;
+
+  // (1) far-field release of lobed level-l clouds in merge cells of level l-1
+  int nrelease = 0;
+  {
+    auto pr = ppar->prtcl_rdata;
+    auto pi = ppar->prtcl_idata;
+    const int npart = ppar->nprtcl_thispack;
+    DvceArray1D<int> np(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rel3d_np"), npart);
+    Kokkos::parallel_reduce("rel3d_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &sum) {
+      const int code = pi(PLEV,p);
+      const int lev = T::CloudLevel(code);
+      const int l1 = T::CloudLobe1(code), l2 = T::CloudLobe2(code), l3 = T::CloudLobe3(code);
+      if ((l1 == 0 && l2 == 0 && l3 == 0) || lev == 0 ||
+          !mm.In(pr(IPX,p), pr(IPY,p), pr(IPZ,p), lev - 1, lt.Anchor(pi(PGID,p)))) {
+        np(p) = 0; return;
+      }
+      DPiece a[3], b[3], c[3];
+      np(p) = ReleasePieces(l1, a)*ReleasePieces(l2, b)*ReleasePieces(l3, c);
+      sum += 1;
+    }, Kokkos::Sum<int>(nrelease));
+    if (nrelease > 0) {
+      DvceArray1D<int> off(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rel3d_off"), npart);
+      DvceArray1D<int> toff("rel3d_toff", npart);
+      int nnew = 0, ntags = 0;
+      Kokkos::parallel_scan("rel3d_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+        if (final) off(p) = upd;
+        upd += (np(p) == 0) ? 1 : np(p);
+      }, nnew);
+      Kokkos::parallel_scan("rel3d_tscan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+        if (final) toff(p) = upd;
+        upd += (np(p) > 0) ? np(p) - 1 : 0;
+      }, ntags);
+      DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"),
+                            nrdata, nnew);
+      DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"),
+                           nidata, nnew);
+      const int tag0 = cloud_next_tag, tstride = global_variable::nranks;
+      Kokkos::parallel_for("rel3d_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p) {
+        const int s0 = off(p);
+        if (np(p) == 0) {
+          for (int c=0; c<nrdata; ++c) prn(c,s0) = pr(c,p);
+          for (int c=0; c<nidata; ++c) pin(c,s0) = pi(c,p);
+          return;
+        }
+        const int code = pi(PLEV,p);
+        const int lev = T::CloudLevel(code);
+        DPiece a[3], b[3], cc[3];
+        const int n1 = ReleasePieces(T::CloudLobe1(code), a);
+        const int n2 = ReleasePieces(T::CloudLobe2(code), b);
+        const int n3 = ReleasePieces(T::CloudLobe3(code), cc);
+        const Real e1 = lt.CloudHalfWidth1(lev), e2 = lt.CloudHalfWidth2(lev);
+        const Real e3 = lt.CloudHalfWidth3(lev);
+        int k = 0;
+        for (int jc=0; jc<n3; ++jc) {
+          for (int jb=0; jb<n2; ++jb) {
+            for (int ja=0; ja<n1; ++ja) {
+              const int s = s0 + k;
+              const Real cx = T::WrapPosition(pr(IPX,p) + a[ja].off*e1, lt.x1min, lt.x1max);
+              const Real cy = T::WrapPosition(pr(IPY,p) + b[jb].off*e2, lt.x2min, lt.x2max);
+              const Real cz = T::WrapPosition(pr(IPZ,p) + cc[jc].off*e3, lt.x3min, lt.x3max);
+              for (int c=0; c<nrdata; ++c) prn(c,s) = pr(c,p);
+              for (int c=0; c<nidata; ++c) pin(c,s) = pi(c,p);
+              prn(IPX,s) = cx; prn(IPX1,s) = cx; prn(IPY,s) = cy; prn(IPY1,s) = cy;
+              prn(IPZ,s) = cz; prn(IPZ1,s) = cz;
+              prn(IPM,s) = pr(IPM,p)*a[ja].frac*b[jb].frac*cc[jc].frac;
+              pin(PLEV,s) = lev;
+              const int leaf = lt.LeafOwner(cx, cy, cz, lt.Anchor(pin(PGID,s)));
+              const int blk = (leaf < 0) ? lt.Anchor(pin(PGID,s)) : leaf/ncell123;
+              pin(PGID,s) = gids + ((blk < lt.nmb) ? blk : lt.Anchor(pin(PGID,s)));
+              if (k > 0) pin(PTAG,s) = tag0 + (toff(p) + k - 1)*tstride;
+              ++k;
+            }
+          }
+        }
+      });
+      ppar->prtcl_rdata = prn;
+      ppar->prtcl_idata = pin;
+      ppar->nprtcl_thispack = nnew;
+      cloud_next_tag += ntags*global_variable::nranks;
+      bdirty = true;
+    }
+  }
+  EnsureRootCloudMass();
+  const int nsp = static_cast<int>(cloud_merge_mroot.size());
+  if (nsp > 4) {
+    std::cout << "### FATAL ERROR: MergeCloudsDevice3D supports at most 4 species" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  Real mrootsp[4] = {0.0, 0.0, 0.0, 0.0};
+  Real mroot_floor = 0.0;
+  for (int sp=0; sp<nsp; ++sp) {
+    mrootsp[sp] = cloud_merge_mroot[sp];
+    mroot_floor = std::max(mroot_floor, mrootsp[sp]);
+  }
+  const Real rvol = lt.root_dx1*lt.root_dx2*lt.root_dx3;
+  // the structure-relative budget: s_t = max over the six neighbour leaves
+  const Real bkappa = cloud_merge_budget_kappa;
+  DvceArray1D<Real> lbeta("budget3d_lbeta", (pbud && bkappa > 0.0) ? nbt : 1);
+  if (pbud && bkappa > 0.0) {
+    const Real beta = cloud_merge_budget;
+    const int is_ = lt.is, js_ = lt.js, ks_ = lt.ks;
+    const int ie_ = lt.is + lt.nx1 - 1, je_ = lt.js + lt.nx2 - 1, ke_ = lt.ks + lt.nx3 - 1;
+    const Real rfloor = cloud_absorb_floor*mroot_floor/rvol;
+    Kokkos::parallel_for("budget3d_structure", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+    KOKKOS_LAMBDA(const int t) {
+      lbeta(t) = beta;
+      int b, k, j, i;
+      lt.Decode(t, b, k, j, i);
+      if (i < is_ || i > ie_ || j < js_ || j > je_ || k < ks_ || k > ke_) return;
+      const Real dx = lt.box(b,3), dy = lt.box(b,4), dz = lt.box(b,5);
+      const Real xc = lt.box(b,0) + (i - is_ + 0.5)*dx, yc = lt.box(b,1) + (j - js_ + 0.5)*dy;
+      const Real zc = lt.box(b,2) + (k - ks_ + 0.5)*dz;
+      const Real rho = lent(0,t)/(dx*dy*dz);
+      const Real den = Kokkos::fmax(rho, rfloor);
+      Real s = 0.0;
+      for (int d=0; d<6; ++d) {
+        const Real x = T::WrapPosition(xc + ((d == 0) ? dx : ((d == 1) ? -dx : 0.0)),
+                                       lt.x1min, lt.x1max);
+        const Real y = T::WrapPosition(yc + ((d == 2) ? dy : ((d == 3) ? -dy : 0.0)),
+                                       lt.x2min, lt.x2max);
+        const Real z = T::WrapPosition(zc + ((d == 4) ? dz : ((d == 5) ? -dz : 0.0)),
+                                       lt.x3min, lt.x3max);
+        const int tn = lt.LeafOwner(x, y, z, b);
+        if (tn < 0) continue;
+        const int bn = tn/ncell123;
+        const Real rn = lent(0,tn)/(lt.box(bn,3)*lt.box(bn,4)*lt.box(bn,5));
+        s = Kokkos::fmax(s, Kokkos::fabs(rn - rho)/den);
+      }
+      lbeta(t) = Kokkos::fmax(Kokkos::fmin(beta, bkappa*s), 1.0e-12);
+    });
+  }
+  const Real omega = is_shearing_box ? omega0 : 0.0;
+  const Real alpha = cloud_merge_alpha, fmin = cloud_merge_min_mass;
+  const bool exact_ts = cloud_merge_exact_ts;
+  double qtot[8] = {0.0};   // X families, mass; G groups, pieces, mass; deferred, residual pieces
+  for (int lev=1; lev<=nlev; ++lev) {
+    const int L = lev - 1;
+    auto pr = ppar->prtcl_rdata;
+    auto pi = ppar->prtcl_idata;
+    const int npart = ppar->nprtcl_thispack;
+    const Real H1 = mm.dx1[L], H2 = mm.dx2[L], H3 = mm.dx3[L];
+    const Real H = Kokkos::min(H1, Kokkos::min(H2, H3));
+    const Real ell1 = lt.CloudHalfWidth1(lev), ell2 = lt.CloudHalfWidth2(lev);
+    const Real ell3 = lt.CloudHalfWidth3(lev);
+    const int m1 = mm.n1[L], m2 = mm.n2[L], m3 = mm.n3[L];
+    const std::int64_t ncl = static_cast<std::int64_t>(m1)*m2*m3;
+    // plain level-lev pieces with mass, by species and level-L cell
+    DvceArray1D<std::int64_t> kp(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge3d_kp"),
+                                 npart);
+    Kokkos::parallel_for("merge3d_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      const int code = pi(PLEV,p);
+      kp(p) = -1;
+      if (T::CloudLobe1(code) || T::CloudLobe2(code) || T::CloudLobe3(code)) return;
+      if (T::CloudLevel(code) != lev || pr(IPM,p) <= 0.0) return;
+      kp(p) = pi(PSP,p)*ncl + mm.Cell(pr(IPX,p), pr(IPY,p), pr(IPZ,p), L);
+    });
+    KeyCSR spc;
+    BuildKeyCSR(kp, 4*ncl, 0, spc);
+    const int nmax = (npart > 0) ? npart : 1;
+    DvceArray2D<Real> nr("q3_nr", nrdata, nmax);
+    DvceArray2D<int> ni("q3_ni", nidata, nmax);
+    DvceArray1D<int> nkind("q3_nkind", nmax);            // 0 X, 1 G
+    DvceArray2D<double> acc("q3_acc", 4, nmax);          // m, m dx, m dy, m dz (G, about ref)
+    DvceArray2D<Real> aref("q3_ref", 3, nmax);          // the reference point of a G cloud
+    DvceArray1D<int> nnew("q3_nnew", 1);
+    DvceArray1D<double> qc("q3_counters", 8);
+    const int K = cloud_merge_K;
+    const int rot = cloud_merge_pass % 64, rev = (cloud_merge_pass/64) % 2;
+    // ---- stage X: complete P1 families (27 members) back into their level-L parent
+    if (cloud_merge_stencil) {
+      DvceArray1D<int> owner("q3_owner", npart);
+      Kokkos::deep_copy(owner, -1);
+      const Real dtol = cloud_merge_stencil_tol;
+      Kokkos::parallel_for("q3_stencil", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int c) {
+        if (kp(c) < 0 || pr(IPM,c) <= 0.0) return;
+        const Real xc0 = pr(IPX,c), yc0 = pr(IPY,c), zc0 = pr(IPZ,c);
+        const Real mc = pr(IPM,c), ts = pr(IPTS,c);
+        if (!mm.In(xc0, yc0, zc0, L, lt.Anchor(pi(PGID,c)))) return;
+        const int sp = pi(PSP,c);
+        const Real tau = (omega > 0.0) ? Kokkos::fmin(ts, 1.0/omega) : ts;
+        const Real tolv = alpha*H/tau;
+        int mem[27]; int nm = 0; mem[nm++] = c;
+        Real vlo[3] = {pr(IPVX,c), pr(IPVY,c), pr(IPVZ,c)};
+        Real vhi[3] = {vlo[0], vlo[1], vlo[2]};
+        for (int e=-1; e<=1; ++e) {
+          for (int b=-1; b<=1; ++b) {
+            for (int a=-1; a<=1; ++a) {
+              if (a == 0 && b == 0 && e == 0) continue;
+              const Real w = mc/static_cast<Real>((a != 0 ? 2 : 1)*(b != 0 ? 2 : 1)*
+                                                  (e != 0 ? 2 : 1));
+              const Real tx = xc0 + a*ell1, ty = yc0 + b*ell2, tz = zc0 + e*ell3;
+              const std::int64_t key = sp*ncl + mm.Cell(tx, ty, tz, L);
+              int best = -1; Real bd = 1.0e30;
+              for (int k=spc.First(key), ke=spc.Last(key); k<ke; ++k) {
+                const int q = spc.list(k);
+                if (q == c || pr(IPM,q) <= 0.0 || owner(q) >= 0) continue;
+                if (Kokkos::fabs(pr(IPM,q) - w) > 1.0e-6*w || pr(IPTS,q) != ts) continue;
+                const Real dx = Kokkos::fabs(T::MinImage(pr(IPX,q) - tx, lt.lx));
+                const Real dy = Kokkos::fabs(T::MinImage(pr(IPY,q) - ty, lt.ly));
+                const Real dz = Kokkos::fabs(T::MinImage(pr(IPZ,q) - tz, lt.lz));
+                if (dx > dtol*ell1 || dy > dtol*ell2 || dz > dtol*ell3) continue;
+                if (!mm.In(pr(IPX,q), pr(IPY,q), pr(IPZ,q), L, lt.Anchor(pi(PGID,q)))) continue;
+                const Real d = Kokkos::fmax(dx/ell1, Kokkos::fmax(dy/ell2, dz/ell3));
+                if (d < bd) {bd = d; best = q;}
+              }
+              if (best < 0) return;
+              mem[nm++] = best;
+              const Real v[3] = {pr(IPVX,best), pr(IPVY,best), pr(IPVZ,best)};
+              for (int d=0; d<3; ++d) {
+                vlo[d] = Kokkos::fmin(vlo[d], v[d]); vhi[d] = Kokkos::fmax(vhi[d], v[d]);
+                if (vhi[d] - vlo[d] > tolv) return;
+              }
+            }
+          }
+        }
+        for (int k=0; k<27; ++k) {   // claim; roll back on a conflict (retried next pass)
+          if (Kokkos::atomic_compare_exchange(&owner(mem[k]), -1, c) != -1) {
+            for (int j=0; j<k; ++j) Kokkos::atomic_exchange(&owner(mem[j]), -1);
+            return;
+          }
+        }
+        const int knew = Kokkos::atomic_fetch_add(&nnew(0), 1);
+        double M = 0.0, sx = 0.0, sy = 0.0, sz = 0.0;
+        for (int q=0; q<nrdata; ++q) nr(q,knew) = 0.0;
+        for (int k=0; k<27; ++k) {
+          const int t = mem[k]; const Real m = pr(IPM,t);
+          M += m;
+          sx += m*T::MinImage(pr(IPX,t) - xc0, lt.lx);
+          sy += m*T::MinImage(pr(IPY,t) - yc0, lt.ly);
+          sz += m*T::MinImage(pr(IPZ,t) - zc0, lt.lz);
+          for (int q=0; q<nrdata; ++q) nr(q,knew) += m*pr(q,t);
+        }
+        for (int q=0; q<nrdata; ++q) nr(q,knew) /= M;
+        if (exact_ts) nr(IPTS,knew) = ts;
+        const Real px = T::WrapPosition(xc0 + sx/M, lt.x1min, lt.x1max);
+        const Real py = T::WrapPosition(yc0 + sy/M, lt.x2min, lt.x2max);
+        const Real pz = T::WrapPosition(zc0 + sz/M, lt.x3min, lt.x3max);
+        nr(IPM,knew) = M;
+        nr(IPX,knew) = px; nr(IPX1,knew) = px; nr(IPY,knew) = py; nr(IPY1,knew) = py;
+        nr(IPZ,knew) = pz; nr(IPZ1,knew) = pz;
+        for (int q=0; q<nidata; ++q) ni(q,knew) = pi(q,c);
+        ni(PLEV,knew) = L;
+        const int leaf = lt.LeafOwner(px, py, pz, lt.Anchor(pi(PGID,c)));
+        const int blk = (leaf < 0) ? lt.Anchor(pi(PGID,c)) : leaf/ncell123;
+        ni(PGID,knew) = gids + ((blk < lt.nmb) ? blk : lt.Anchor(pi(PGID,c)));
+        nkind(knew) = 0;
+        for (int k=0; k<27; ++k) pr(IPM,mem[k]) = 0.0;
+        Kokkos::atomic_add(&qc(0), 1.0);
+        Kokkos::atomic_add(&qc(1), M);
+      });
+    }
+    // ---- the leaf change made so far in this pass (release, stage X, coarser levels)
+    const Real gb_floor = cloud_absorb_floor*mroot_floor/rvol;
+    const Real gb_vmin = alpha*H*((omega > 0.0) ? omega : 0.0);
+    if (pbud) {
+      int nx_now = 0;
+      Kokkos::deep_copy(nx_now, Kokkos::subview(nnew, 0));
+      if (nx_now > 0) bdirty = true;
+      Kokkos::deep_copy(lcum, 0.0);
+      if (bdirty) {
+        BudgetDeposit3D(lt, pr, pi, npart, 1.0, lcum);
+        BudgetDeposit3D(lt, nr, ni, nx_now, 1.0, lcum);
+        Kokkos::parallel_for("budget3d_cum", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+        KOKKOS_LAMBDA(const int t) {
+          for (int c=0; c<4; ++c) lcum(c,t) -= lent(c,t);
+        });
+      }
+    }
+    DvceArray1D<int> krej("q3_krej", nmax);
+    DvceArray2D<Real> ldelg("q3_ldel", 4, nbt);
+    DvceArray1D<int> lviolg("q3_lviol", nbt);
+    // ---- stage G: the cell walk.  Pieces at level lev in level-L merge cells -> level-L clouds
+    DvceArray1D<int> gid("q3_gid", npart), gknew("q3_gknew", nmax);
+    DvceArray1D<int> ngroup("q3_ngroup", 1);
+    Kokkos::deep_copy(gid, -1);
+    Kokkos::deep_copy(gknew, -1);
+    DvceArray1D<std::int64_t> kq("q3_key", npart);
+    int k0 = 0;
+    Kokkos::deep_copy(k0, Kokkos::subview(nnew, 0));
+    {
+      const Real smax1 = cloud_merge_smax*H1, smax2 = cloud_merge_smax*H2;
+      const Real smax3 = cloud_merge_smax*H3;
+      const Real qden = static_cast<Real>(std::int64_t(1) << (3*L));
+      const int glag = cloud_merge_g_lag;
+      Kokkos::parallel_for("q3_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p) {
+        kq(p) = -1;
+        if (kp(p) < 0 || pr(IPM,p) <= 0.0) return;
+        const Real x = T::WrapPosition(pr(IPX,p), lt.x1min, lt.x1max);
+        const Real y = T::WrapPosition(pr(IPY,p), lt.x2min, lt.x2max);
+        const Real z = T::WrapPosition(pr(IPZ,p), lt.x3min, lt.x3max);
+        const Real u = (x - lt.x1min)/H1, v = (y - lt.x2min)/H2, w = (z - lt.x3min)/H3;
+        const int I = T::WrapIndex(static_cast<int>(Kokkos::floor(u)), m1);
+        const int J = T::WrapIndex(static_cast<int>(Kokkos::floor(v)), m2);
+        const int Kc = T::WrapIndex(static_cast<int>(Kokkos::floor(w)), m3);
+        const int am = lt.Anchor(pi(PGID,p));
+        if (!mm.In(x, y, z, L, am)) return;
+        for (int dk=-glag; dk<=glag; ++dk) {   // deep zone only: the outer band is stage X's
+          for (int dj=-glag; dj<=glag; ++dj) {
+            for (int di=-glag; di<=glag; ++di) {
+              const Real xn = lt.x1min + (T::WrapIndex(I + di, m1) + 0.5)*H1;
+              const Real yn = lt.x2min + (T::WrapIndex(J + dj, m2) + 0.5)*H2;
+              const Real zn = lt.x3min + (T::WrapIndex(Kc + dk, m3) + 0.5)*H3;
+              if (!mm.In(xn, yn, zn, L, am)) return;
+            }
+          }
+        }
+        const int si = Kokkos::min(3, static_cast<int>(Kokkos::floor(4.0*(u - Kokkos::floor(u)))));
+        const int sj = Kokkos::min(3, static_cast<int>(Kokkos::floor(4.0*(v - Kokkos::floor(v)))));
+        const int sk = Kokkos::min(3, static_cast<int>(Kokkos::floor(4.0*(w - Kokkos::floor(w)))));
+        // Morton order of the 4 x 4 x 4 sub-cells
+        const int sub = ((sk >> 1) << 5) | ((sj >> 1) << 4) | ((si >> 1) << 3) |
+                        ((sk & 1) << 2) | ((sj & 1) << 1) | (si & 1);
+        kq(p) = ((pi(PSP,p)*ncl + (static_cast<std::int64_t>(Kc)*m2 + J)*m1 + I) << 6) + sub;
+      });
+      KeyCSR qsc;
+      BuildKeyCSR(kq, (4*ncl) << 6, 3, qsc);
+      DvceArray1D<int> cfirst(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q3_cfirst"),
+                              qsc.nu + 1);
+      int ncell = 0;
+      {
+        auto uk = qsc.ukey; const int nu = qsc.nu;
+        Kokkos::parallel_scan("q3_cells", Kokkos::RangePolicy<>(DevExeSpace(), 0, nu),
+        KOKKOS_LAMBDA(const int u, int &upd, const bool final) {
+          const bool first = (u == 0) || ((uk(u) >> 6) != (uk(u - 1) >> 6));
+          if (first && final) cfirst(upd) = u;
+          if (first) ++upd;
+          if (final && u == nu - 1) cfirst(upd) = nu;
+        }, ncell);
+      }
+      Kokkos::parallel_for("q3_walk", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
+      KOKKOS_LAMBDA(const int ic) {
+        const int u0 = cfirst(ic), u1 = cfirst(ic + 1);
+        const std::int64_t kcell = qsc.ukey(u0) >> 6;
+        const int sp = static_cast<int>(kcell/ncl);
+        const std::int64_t cell = kcell % ncl;
+        const int I = static_cast<int>(cell % m1), J = static_cast<int>((cell/m1) % m2);
+        const int Kc = static_cast<int>(cell/(static_cast<std::int64_t>(m1)*m2));
+        const Real mq = mrootsp[sp]/qden;
+        const Real xcc = lt.x1min + (I + 0.5)*H1, ycc = lt.x2min + (J + 0.5)*H2;
+        const Real zcc = lt.x3min + (Kc + 0.5)*H3;
+        Real gM[8], vlo[8][3], vhi[8][3];
+        Real xlo[8], xhi[8], ylo[8], yhi[8], zlo[8], zhi[8], gts[8];
+        int gg[8], gfirst[8], gn[8], nopen = 0;
+        auto commit = [&](const int j) {
+          const int knew = Kokkos::atomic_fetch_add(&nnew(0), 1);
+          gknew(gg[j]) = knew;
+          for (int q=0; q<nidata; ++q) ni(q,knew) = pi(q,gfirst[j]);
+          ni(PLEV,knew) = L;
+          nkind(knew) = 1;
+          if (exact_ts) nr(IPTS,knew) = gts[j];
+          aref(0,knew) = xcc; aref(1,knew) = ycc; aref(2,knew) = zcc;
+          Kokkos::atomic_add(&qc(2), 1.0);
+          Kokkos::atomic_add(&qc(3), static_cast<double>(gn[j]));
+          Kokkos::atomic_add(&qc(4), static_cast<double>(gM[j]));
+        };
+        for (int s=0; s<64; ++s) {
+          const int sub = rev ? (rot + 64 - s) % 64 : (rot + s) % 64;
+          int kb = 0, ke = 0;
+          for (int u=u0; u<u1; ++u) {
+            if ((qsc.ukey(u) & 63) == sub) {kb = qsc.start(u); ke = qsc.start(u + 1); break;}
+          }
+          for (int k=kb; k<ke; ++k) {
+            const int p = qsc.list(k);
+            const Real m = pr(IPM,p);
+            if (m <= 0.0) continue;
+            const Real dx = T::MinImage(pr(IPX,p) - xcc, lt.lx);
+            const Real dy = T::MinImage(pr(IPY,p) - ycc, lt.ly);
+            const Real dz = T::MinImage(pr(IPZ,p) - zcc, lt.lz);
+            const Real v[3] = {pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p)};
+            const Real ts = pr(IPTS,p);
+            const Real tau = (omega > 0.0) ? Kokkos::fmin(ts, 1.0/omega) : ts;
+            const Real tolv = alpha*H/tau;
+            int j = -1;
+            for (int o=0; o<nopen && j<0; ++o) {
+              if (gts[o] != ts) continue;
+              bool ok = (Kokkos::fmax(xhi[o], dx) - Kokkos::fmin(xlo[o], dx) <= smax1) &&
+                        (Kokkos::fmax(yhi[o], dy) - Kokkos::fmin(ylo[o], dy) <= smax2) &&
+                        (Kokkos::fmax(zhi[o], dz) - Kokkos::fmin(zlo[o], dz) <= smax3);
+              for (int d=0; d<3 && ok; ++d) {
+                ok = Kokkos::fmax(vhi[o][d], v[d]) - Kokkos::fmin(vlo[o][d], v[d]) <= tolv;
+              }
+              if (ok) j = o;
+            }
+            if (j < 0) {
+              if (nopen == K || nopen == 8) {Kokkos::atomic_add(&qc(5), 1.0); continue;}
+              j = nopen++;
+              gg[j] = Kokkos::atomic_fetch_add(&ngroup(0), 1);
+              gM[j] = 0.0; gn[j] = 0;
+              xlo[j] = xhi[j] = dx; ylo[j] = yhi[j] = dy; zlo[j] = zhi[j] = dz;
+              gts[j] = ts; gfirst[j] = p;
+              for (int d=0; d<3; ++d) {vlo[j][d] = vhi[j][d] = v[d];}
+            }
+            gid(p) = gg[j];
+            gM[j] += m; ++gn[j];
+            xlo[j] = Kokkos::fmin(xlo[j], dx); xhi[j] = Kokkos::fmax(xhi[j], dx);
+            ylo[j] = Kokkos::fmin(ylo[j], dy); yhi[j] = Kokkos::fmax(yhi[j], dy);
+            zlo[j] = Kokkos::fmin(zlo[j], dz); zhi[j] = Kokkos::fmax(zhi[j], dz);
+            for (int d=0; d<3; ++d) {
+              vlo[j][d] = Kokkos::fmin(vlo[j][d], v[d]); vhi[j][d] = Kokkos::fmax(vhi[j][d], v[d]);
+            }
+            if (gM[j] >= mq*(1.0 - 1.0e-12)) {
+              commit(j);
+              --nopen;
+              if (j != nopen) {
+                gM[j] = gM[nopen]; xlo[j] = xlo[nopen]; xhi[j] = xhi[nopen];
+                ylo[j] = ylo[nopen]; yhi[j] = yhi[nopen]; zlo[j] = zlo[nopen];
+                zhi[j] = zhi[nopen]; gts[j] = gts[nopen]; gg[j] = gg[nopen];
+                gfirst[j] = gfirst[nopen]; gn[j] = gn[nopen];
+                for (int d=0; d<3; ++d) {vlo[j][d] = vlo[nopen][d]; vhi[j][d] = vhi[nopen][d];}
+              }
+            }
+          }
+        }
+        for (int o=0; o<nopen; ++o) {
+          if (gM[o] >= fmin*mq) commit(o);
+          if (gknew(gg[o]) < 0) Kokkos::atomic_add(&qc(6), static_cast<double>(gn[o]));
+        }
+      });
+      // the members of committed groups into their new clouds (the pieces are used up below)
+      Kokkos::parallel_for("q3_accumulate", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p) {
+        if (kq(p) < 0) return;
+        const int g = gid(p);
+        if (g < 0) return;
+        const int k = gknew(g);
+        if (k < 0) return;
+        const Real m = pr(IPM,p);
+        Kokkos::atomic_add(&acc(0,k), static_cast<double>(m));
+        Kokkos::atomic_add(&acc(1,k), static_cast<double>(m*T::MinImage(pr(IPX,p) - aref(0,k), lt.lx)));
+        Kokkos::atomic_add(&acc(2,k), static_cast<double>(m*T::MinImage(pr(IPY,p) - aref(1,k), lt.ly)));
+        Kokkos::atomic_add(&acc(3,k), static_cast<double>(m*T::MinImage(pr(IPZ,p) - aref(2,k), lt.lz)));
+        for (int q=0; q<nrdata; ++q) {
+          if (q == IPM || q == IPX || q == IPY || q == IPZ || q == IPX1 || q == IPY1 ||
+              q == IPZ1) continue;
+          if (exact_ts && q == IPTS) continue;
+          Kokkos::atomic_add(&nr(q,k), m*pr(q,p));
+        }
+        if (!pbud) pr(IPM,p) = 0.0;
+      });
+      int k1 = k0;
+      Kokkos::deep_copy(k1, Kokkos::subview(nnew, 0));
+      if (k1 > k0) {
+        Kokkos::parallel_for("q3_finalize_state", Kokkos::RangePolicy<>(DevExeSpace(), k0, k1),
+        KOKKOS_LAMBDA(const int k) {
+          const double M = acc(0,k);
+          for (int q=0; q<nrdata; ++q) {
+            if (q == IPM || q == IPX || q == IPY || q == IPZ || q == IPX1 || q == IPY1 ||
+                q == IPZ1) continue;
+            if (exact_ts && q == IPTS) continue;
+            nr(q,k) /= M;
+          }
+          const Real px = T::WrapPosition(aref(0,k) + acc(1,k)/M, lt.x1min, lt.x1max);
+          const Real py = T::WrapPosition(aref(1,k) + acc(2,k)/M, lt.x2min, lt.x2max);
+          const Real pz = T::WrapPosition(aref(2,k) + acc(3,k)/M, lt.x3min, lt.x3max);
+          nr(IPM,k) = M;
+          nr(IPX,k) = px; nr(IPX1,k) = px; nr(IPY,k) = py; nr(IPY1,k) = py;
+          nr(IPZ,k) = pz; nr(IPZ1,k) = pz;
+          const int a = lt.Anchor(ni(PGID,k));
+          const int leaf = lt.LeafOwner(px, py, pz, a);
+          const int blk = (leaf < 0) ? a : leaf/ncell123;
+          ni(PGID,k) = gids + ((blk < lt.nmb) ? blk : a);
+        });
+      }
+      // ---- accept or reject the proposed groups by the pass budget
+      if (pbud && k1 > k0) {
+        const Real beta = cloud_merge_budget;
+        const int maxev = cloud_merge_budget_evals;
+        int nev = 0;
+        for (;;) {
+          ++nev;
+          Kokkos::deep_copy(ldelg, 0.0);
+          Kokkos::parallel_for("q3b_members", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+          KOKKOS_LAMBDA(const int p) {
+            if (kq(p) < 0 || gid(p) < 0) return;
+            const int k = gknew(gid(p));
+            if (k < 0 || krej(k)) return;
+            const Real m = pr(IPM,p);
+            const Real v1 = pr(IPVX,p), v2 = pr(IPVY,p), v3 = pr(IPVZ,p);
+            lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p),
+                                  lt.Anchor(pi(PGID,p)), [&](const int t, const Real w) {
+              Kokkos::atomic_add(&ldelg(0,t), -m*w); Kokkos::atomic_add(&ldelg(1,t), -m*w*v1);
+              Kokkos::atomic_add(&ldelg(2,t), -m*w*v2); Kokkos::atomic_add(&ldelg(3,t), -m*w*v3);
+            });
+          });
+          Kokkos::parallel_for("q3b_new", Kokkos::RangePolicy<>(DevExeSpace(), k0, k1),
+          KOKKOS_LAMBDA(const int k) {
+            if (krej(k)) return;
+            const Real m = nr(IPM,k);
+            const Real v1 = nr(IPVX,k), v2 = nr(IPVY,k), v3 = nr(IPVZ,k);
+            lt.ForEachCloudWeight(nr(IPX,k), nr(IPY,k), nr(IPZ,k), ni(PLEV,k),
+                                  lt.Anchor(ni(PGID,k)), [&](const int t, const Real w) {
+              Kokkos::atomic_add(&ldelg(0,t), m*w); Kokkos::atomic_add(&ldelg(1,t), m*w*v1);
+              Kokkos::atomic_add(&ldelg(2,t), m*w*v2); Kokkos::atomic_add(&ldelg(3,t), m*w*v3);
+            });
+          });
+          int nviol = 0;
+          Kokkos::parallel_reduce("q3b_viol", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+          KOKKOS_LAMBDA(const int t, int &sum) {
+            int bad = 0;
+            if (ldelg(0,t) != 0.0 || ldelg(1,t) != 0.0 || ldelg(2,t) != 0.0 || ldelg(3,t) != 0.0) {
+              const int tb_ = t/ncell123;
+              const Real vol = lt.box(tb_,3)*lt.box(tb_,4)*lt.box(tb_,5);
+              Real rp = 0.0;
+              const Real rm = BudgetRatio((bkappa > 0.0) ? lbeta(t) : beta, gb_floor*vol, gb_vmin,
+                  lent(0,t), lent(1,t), lent(2,t), lent(3,t),
+                  lcum(0,t) + ldelg(0,t), lcum(1,t) + ldelg(1,t), lcum(2,t) + ldelg(2,t),
+                  lcum(3,t) + ldelg(3,t), rp);
+              bad = (rm > 1.0 || rp > 1.0) ? 1 : 0;
+            }
+            lviolg(t) = bad;
+            sum += bad;
+          }, nviol);
+          if (nviol == 0) break;
+          if (nev >= maxev) {
+            Kokkos::parallel_for("q3b_rej_all", Kokkos::RangePolicy<>(DevExeSpace(), k0, k1),
+            KOKKOS_LAMBDA(const int k) {krej(k) = 1;});
+            Kokkos::deep_copy(ldelg, 0.0);
+            bcap += 1.0;
+            break;
+          }
+          Kokkos::parallel_for("q3b_rej_new", Kokkos::RangePolicy<>(DevExeSpace(), k0, k1),
+          KOKKOS_LAMBDA(const int k) {
+            if (krej(k)) return;
+            int bad = 0;
+            lt.ForEachCloudWeight(nr(IPX,k), nr(IPY,k), nr(IPZ,k), ni(PLEV,k),
+                                  lt.Anchor(ni(PGID,k)), [&](const int t, const Real w) {
+              if (w != 0.0 && lviolg(t)) bad = 1;
+            });
+            if (bad) krej(k) = 1;
+          });
+          Kokkos::parallel_for("q3b_rej_members", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+          KOKKOS_LAMBDA(const int p) {
+            if (kq(p) < 0 || gid(p) < 0) return;
+            const int k = gknew(gid(p));
+            if (k < 0 || krej(k)) return;
+            int bad = 0;
+            lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p),
+                                  lt.Anchor(pi(PGID,p)), [&](const int t, const Real w) {
+              if (w != 0.0 && lviolg(t)) bad = 1;
+            });
+            if (bad) Kokkos::atomic_exchange(&krej(k), 1);
+          });
+        }
+        double rp_ = 0.0, rm_ = 0.0, rg_ = 0.0;
+        Kokkos::parallel_reduce("q3b_apply", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+        KOKKOS_LAMBDA(const int p, double &n, double &m) {
+          if (kq(p) < 0 || gid(p) < 0) return;
+          const int k = gknew(gid(p));
+          if (k < 0) return;
+          if (krej(k)) {n += 1.0; m += pr(IPM,p); return;}
+          pr(IPM,p) = 0.0;
+        }, rp_, rm_);
+        Kokkos::parallel_reduce("q3b_dead", Kokkos::RangePolicy<>(DevExeSpace(), k0, k1),
+        KOKKOS_LAMBDA(const int k, double &n) {
+          if (krej(k)) {nr(IPM,k) = 0.0; n += 1.0;}
+        }, rg_);
+        Kokkos::parallel_for("budget3d_advance", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+        KOKKOS_LAMBDA(const int t) {
+          for (int c=0; c<4; ++c) lcum(c,t) += ldelg(c,t);
+        });
+        gcb[0] += rg_; gcb[1] += rp_; gcb[2] += rm_; gcb[3] += nev;
+        if (rg_ < static_cast<double>(k1 - k0)) bdirty = true;
+      }
+    }
+    auto qch = Kokkos::create_mirror_view_and_copy(HostMemSpace(), qc);
+    for (int c=0; c<8; ++c) qtot[c] += qch(c);
+    int ncommit = 0;
+    Kokkos::deep_copy(ncommit, Kokkos::subview(nnew, 0));
+    // compaction: drop the used-up pieces, append the new clouds that are kept
+    DvceArray1D<int> koff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q3_koff"), npart);
+    int nkeep = 0;
+    Kokkos::parallel_scan("q3_kscan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+      if (final) koff(p) = upd;
+      upd += (pr(IPM,p) > 0.0) ? 1 : 0;
+    }, nkeep);
+    DvceArray1D<int> noff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q3_noff"),
+                          ncommit > 0 ? ncommit : 1);
+    int nlive = 0;
+    if (ncommit > 0) {
+      Kokkos::parallel_scan("q3_nscan", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncommit),
+      KOKKOS_LAMBDA(const int k, int &upd, const bool final) {
+        if (final) noff(k) = upd;
+        upd += (nr(IPM,k) > 0.0) ? 1 : 0;
+      }, nlive);
+    }
+    if (nkeep == npart && nlive == 0) continue;
+    bdirty = true;
+    const int ntot = nkeep + nlive;
+    DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"),
+                          nrdata, ntot);
+    DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"),
+                         nidata, ntot);
+    Kokkos::parallel_for("q3_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      if (pr(IPM,p) <= 0.0) return;
+      const int s = koff(p);
+      for (int c=0; c<nrdata; ++c) prn(c,s) = pr(c,p);
+      for (int c=0; c<nidata; ++c) pin(c,s) = pi(c,p);
+    });
+    Kokkos::parallel_for("q3_append", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncommit),
+    KOKKOS_LAMBDA(const int k) {
+      if (nr(IPM,k) <= 0.0) return;
+      const int s = nkeep + noff(k);
+      for (int c=0; c<nrdata; ++c) prn(c,s) = nr(c,k);
+      for (int c=0; c<nidata; ++c) pin(c,s) = ni(c,k);
+    });
+    ppar->prtcl_rdata = prn;
+    ppar->prtcl_idata = pin;
+    ppar->nprtcl_thispack = ntot;
+  }
+  // totals after, the final state against the entry reference, the log
+  const int nfinal = ppar->nprtcl_thispack;
+  Real ta[4] = {0.0, 0.0, 0.0, 0.0};
+  {
+    auto pr = ppar->prtcl_rdata;
+    Kokkos::parallel_reduce("merge3d_tot_a", Kokkos::RangePolicy<>(DevExeSpace(), 0, nfinal),
+    KOKKOS_LAMBDA(const int p, Real &a, Real &b, Real &c, Real &d) {
+      const Real m = pr(IPM,p);
+      a += m; b += m*pr(IPVX,p); c += m*pr(IPVY,p); d += m*pr(IPVZ,p);
+    }, ta[0], ta[1], ta[2], ta[3]);
+  }
+  double bend[3] = {0.0, 0.0, 0.0};
+  if (pbud) {
+    DvceArray2D<Real> lfin("budget3d_lfin", 4, nbt);
+    BudgetDeposit3D(lt, ppar->prtcl_rdata, ppar->prtcl_idata, nfinal, 1.0, lfin);
+    const Real beta = cloud_merge_budget;
+    const Real bfloor = cloud_absorb_floor*mroot_floor/rvol;
+    const Real Hf = Kokkos::min(mm.dx1[nlev-1], Kokkos::min(mm.dx2[nlev-1], mm.dx3[nlev-1]));
+    const Real bvmin = alpha*Hf*((omega > 0.0) ? omega : 0.0);
+    double rmx = 0.0, rpx = 0.0, nover = 0.0;
+    Kokkos::parallel_reduce("budget3d_end", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+    KOKKOS_LAMBDA(const int t, double &a, double &b, double &c) {
+      const int tb_ = t/ncell123;
+      const Real vol = lt.box(tb_,3)*lt.box(tb_,4)*lt.box(tb_,5);
+      const Real bt = (bkappa > 0.0) ? lbeta(t) : beta;
+      Real rp = 0.0;
+      const Real rm = BudgetRatio(bt, bfloor*vol, bvmin, lent(0,t), lent(1,t), lent(2,t),
+          lent(3,t), lfin(0,t) - lent(0,t), lfin(1,t) - lent(1,t), lfin(2,t) - lent(2,t),
+          lfin(3,t) - lent(3,t), rp);
+      if (rm > a) a = rm;
+      if (rp > b) b = rp;
+      if (rm > 1.0 + 1.0e-9 || rp > 1.0 + 1.0e-9) c += 1.0;
+    }, Kokkos::Max<double>(rmx), Kokkos::Max<double>(rpx), nover);
+    bend[0] = rmx; bend[1] = rpx; bend[2] = nover;
+  }
+  Kokkos::fence();
+  const double tpass_s = tpass.seconds();
+  pmesh->nprtcl_thisrank = nfinal;
+  pmesh->nprtcl_eachrank[global_variable::my_rank] = nfinal;
+  pmesh->nprtcl_total = nfinal;
+  ++cloud_merge_pass;
+  const unsigned long long nevents = static_cast<unsigned long long>(qtot[0] + qtot[2] - gcb[0]);
+  cloud_coarsen_events += nevents;
+  cloud_coarsen_in += static_cast<unsigned long long>(27.0*qtot[0] + qtot[3] - gcb[1]);
+  cloud_far_release += nrelease;
+  std::FILE *fp = AppendLog("cloud_merge_log3d.txt");
+  if (fp != nullptr) {
+    if (LogEmpty(fp)) {
+      std::fprintf(fp, "# 3-D merge pass. ncycle time npart_before npart_after "
+                   "far_releases X_families X_mass G_groups G_pieces G_mass G_deferred G_residual "
+                   "G_rejected G_rejected_pieces G_rejected_mass budget_evals budget_capped "
+                   "end_max_dm end_max_dp end_leaves_over M_b M_a PX_b PX_a PY_b PY_a PZ_b PZ_a "
+                   "t_pass\n");
+    }
+    std::fprintf(fp, "%d %.17g %d %d %d %.0f %.9e %.0f %.0f %.9e %.0f %.0f %.0f %.0f %.9e %.0f "
+                 "%.0f %.6e %.6e %.0f %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.4e\n",
+                 pmesh->ncycle, pmesh->time, npart0, nfinal, nrelease, qtot[0], qtot[1],
+                 qtot[2] - gcb[0], qtot[3] - gcb[1], qtot[4] - gcb[2], qtot[5], qtot[6],
+                 gcb[0], gcb[1], gcb[2], gcb[3], bcap, bend[0], bend[1], bend[2], tb[0], ta[0],
+                 tb[1], ta[1], tb[2], ta[2], tb[3], ta[3], tpass_s);
+    std::fflush(fp);
+  }
+  return static_cast<int>(nevents);
 }
 
 }  // namespace dust

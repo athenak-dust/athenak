@@ -1795,6 +1795,7 @@ class DustGasDrag {
   void CheckClouds3D();   // the restrictions of 3-D stage 1
   void WrapParticles3D();
   int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
+  int MergeCloudsDevice3D();   // 3-D stage 2b (dust_cloud_device.cpp)
   int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
   // timing diagnostic: storage order of the particles
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)

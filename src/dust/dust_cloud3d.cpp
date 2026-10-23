@@ -154,7 +154,12 @@ void DustGasDrag::CheckClouds3D() {
   if (cloud_gather_order != 2 || analytic_gather.on) {
     bad.push_back("gather variants (cloud_gather_order != 2, analytic_gather)");
   }
-  if (cloud_merge) bad.push_back("G (cloud_merge = true)");
+  // G (stage 2b): the device quantum pass with the pass budget (MergeCloudsDevice3D)
+  if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_budget_x ||
+                      cloud_merge_xprotect || cloud_audit_t1 > 0.0 || cloud_audit_only)) {
+    bad.push_back("merging other than the device quantum G (no stage-X budget, X protection, "
+                  "audits)");
+  }
   if (cloud_resample) bad.push_back("R (cloud_resample = true)");
   if (!cloud_split_device || cloud_split_log || split_oracle) bad.push_back("the host split");
   if (cloud_instant_switch) bad.push_back("cloud_instant_switch");
