@@ -377,6 +377,7 @@ TaskStatus ShearingBoxCC::ClearFluxMatch() {
 void ShearingBoxCC::PlanFluxPair() {
   nqpiece = 0;
   Mesh *pm = pmy_pack->pmesh;
+  const bool zper = (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic);
   auto &indcs = pm->mb_indcs;
   const int nx2 = indcs.nx2, nx3 = indcs.nx3;
   const int root = pm->root_level;
@@ -428,7 +429,8 @@ void ShearingBoxCC::PlanFluxPair() {
       const long long yy0 = static_cast<long long>(yl.lx2)*nx2*f2;
       const long long yx0 = static_cast<long long>(xl.lx2)*nx2 + dint;
       const long long spany = static_cast<long long>(nx2)*f2, spanz = static_cast<long long>(nx3)*f2;
-      for (long long kz=-2; kz<=2; ++kz) {
+      for (long long kz=(zper ? -2 : 0); kz<=(zper ? 2 : 0); ++kz) {   // (S2c) images only in a
+                                                                      // periodic x3
         const long long bz = zx0 + kz*nzx - zy0;
         if (!(bz < spanz && bz + nx3 > 0)) continue;
         const int k0 = static_cast<int>(std::max(0LL, bz/f2));

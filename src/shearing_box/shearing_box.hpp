@@ -85,6 +85,7 @@ class ShearingBox {
   // senders and remapped by the receiver (ShearingBox::PlanPull, ShearingBoxCC::PullSend/
   // PullRecv), instead of the two-step exchange between blocks of one level.
   bool face_levels = false;
+  bool pull_ghost_valid = false;   // (S2c) x1 ghosts hold collected values (not after a regrid)
   int nvar_pull = 0;
   ReconstructionMethod rcon_pull = ReconstructionMethod::plm;
   enum PullField {kPRGid, kPRType, kPRFace, kPRIdx, kPSGid, kPSLoc, kPSFace, kPD,

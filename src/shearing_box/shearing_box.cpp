@@ -36,14 +36,16 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   is_stratified = pin->GetOrAddBoolean("shearing_box","stratified",false);
   // (S2b) blocks on the x1 faces may change level along x2
   face_levels = pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", false);
-  // what the collected ghost zones do not cover yet: the pull assumes periodic x3, and
-  // the dust u* shear (psbox_us) and particle routing still use the column exchange
-  if (face_levels &&
-      (ppack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic ||
-       pin->DoesBlockExist("dust") || pin->DoesBlockExist("particles"))) {
+  // (S2c) non-periodic x3 needs the coarse-array physical
+  // boundaries for the corners the collected ghost zones leave to them; dust
+  // (u* through the same collection, deposits through the general remap, particle routing by the
+  // face-block table) is covered
+  if (face_levels && ppack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
+      pin->DoesBlockExist("mesh_refinement") &&
+      !pin->GetOrAddBoolean("mesh_refinement", "coarse_physical_bcs", true)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<shearing_box>/experimental_face_levels supports hydro with periodic x3 only "
-              << "(no dust or particles yet)" << std::endl;
+              << "<shearing_box>/experimental_face_levels with non-periodic x3 needs "
+              << "<mesh_refinement>/coarse_physical_bcs = true" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
@@ -74,6 +76,7 @@ ShearingBox::~ShearingBox() {
 //! constructor and again after every regrid.
 
 void ShearingBox::BuildBoundaryLists() {
+  pull_ghost_valid = false;   // new or moved blocks: x1 ghosts not collected yet
   // Create vector with GID of every MBs on this rank at ix1/ox1 shearing-box boundaries
   std::vector<int> tmp_ix1bndry_gid, tmp_ox1bndry_gid;
   auto &mbbcs = pmy_pack->pmb->mb_bcs;

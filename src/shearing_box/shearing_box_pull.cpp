@@ -58,6 +58,7 @@ void ShearingBox::PlanPull() {
   const int gids = pmy_pack->gids;
   const Real ly = pm->mesh_size.x2max - pm->mesh_size.x2min;
   auto nxl = [pm, root](int l) {return pm->nmb_rootx1 << (l - root);};
+  const bool zper = (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic);
   // the blocks on each face (gid order)
   std::vector<int> face[2];
   for (int g=0; g<pm->nmb_total; ++g) {
@@ -130,7 +131,10 @@ void ShearingBox::PlanPull() {
         sz1 = sz0 + (static_cast<long long>(nx3) << (-d));
       }
       const long long kya = FloorDiv(y0 - sy1, ny_l) + 1, kyb = FloorDiv(y1 - 1 - sy0, ny_l);
-      const long long kza = FloorDiv(z0 - sz1, nz_l) + 1, kzb = FloorDiv(z1 - 1 - sz0, nz_l);
+      long long kza = FloorDiv(z0 - sz1, nz_l) + 1, kzb = FloorDiv(z1 - 1 - sz0, nz_l);
+      // (S2c) non-periodic x3: no images; the x3 ghost rows beyond the boundary are
+      // left to the physical boundary conditions (they run after this exchange)
+      if (!zper) {kza = std::max(kza, 0LL); kzb = std::min(kzb, 0LL);}
       for (long long ky=kya; ky<=kyb; ++ky) {
         const long long a0 = std::max(y0, sy0 + ky*ny_l), a1 = std::min(y1, sy1 + ky*ny_l);
         if (a1 <= a0) continue;
@@ -295,6 +299,7 @@ TaskStatus ShearingBoxCC::PullSend(DvceArray5D<Real> &a) {
   auto pb = pbuf;
   auto sf = psendflat;
   const int nymax = npymax, nzmax = npzmax;
+  const bool xslope = pull_ghost_valid;   // the face column's x slope
   par_for("shr-pull-pack", DevExeSpace(), 0, nppiece-1, 0, nv*ng-1, 0, nzmax-1, 0, nymax-1,
   KOKKOS_LAMBDA(const int n, const int vd, const int zz, const int yy) {
     if (pp.d_view(n,kPSLoc) == 0) return;
@@ -331,8 +336,10 @@ TaskStatus ShearingBoxCC::PullSend(DvceArray5D<Real> &a) {
       const Real my = 4.0*PROLONG_CC_SLOPE(dl, dr);
       dl = u0 - a(m, v, kp-1, jp, ip); dr = a(m, v, kp+1, jp, ip) - u0;
       const Real mz = 4.0*PROLONG_CC_SLOPE(dl, dr);
-      Real mx = 0.0;          // the face column: no slope (its x1 ghosts are being exchanged)
-      if (cd > 0) {
+      // the face column: its x1 ghosts hold the last collected values (one stage old), except
+      // right after a regrid (no slope then)
+      Real mx = 0.0;
+      if (cd > 0 || xslope) {
         dl = u0 - a(m, v, kp, jp, ip-1); dr = a(m, v, kp, jp, ip+1) - u0;
         mx = 4.0*PROLONG_CC_SLOPE(dl, dr);
       }
@@ -405,6 +412,7 @@ TaskStatus ShearingBoxCC::PullRecv(DvceArray5D<Real> &a, const bool coarse) {
     }
 #endif
   }
+  if (!coarse) pull_ghost_valid = true;   // after this the x1 ghosts hold collected values
   if (nprecv == 0) return TaskStatus::complete;
   const int type = coarse ? 1 : 0;
   const int nyr = coarse ? indcs.cnx2 : indcs.nx2;
