@@ -17,9 +17,11 @@
 //! mass and momentum leave one face exactly as they enter the other (up to round-off).
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <tuple>
@@ -53,96 +55,144 @@ void ShearingBoxCC::PlanFluxMatch() {
   const int root = pm->root_level;
   const int my_rank = global_variable::my_rank;
   const int gids = pmy_pack->gids;
+  const int nmb = pmy_pack->nmb_thispack;
   const Real ly = pm->mesh_size.x2max - pm->mesh_size.x2min;
   const int nbuf = nx2 + 6;
-  std::map<std::tuple<int, int, int, int>, int> loc;
-  for (int g=0; g<pm->nmb_total; ++g) {
-    const auto &ll = pm->lloc_eachmb[g];
-    loc[std::make_tuple(ll.level, ll.lx1, ll.lx2, ll.lx3)] = g;
-  }
-  auto find = [&loc](int l, int i, int j, int k) {
-    auto it = loc.find(std::make_tuple(l, i, j, k));
-    return (it == loc.end()) ? -1 : it->second;
-  };
   auto nxl = [pm, root](int l) {return pm->nmb_rootx1 << (l - root);};
-  std::vector<std::vector<int>> pcs;
+  std::vector<std::array<int, kNField>> pcs;
   std::vector<std::pair<int, int>> rl;
   std::vector<Real> reps;
-  int soff = 0, roff = 0;
   bool bad = false;
-  for (int g=0; g<pm->nmb_total; ++g) {
-    const auto &ll = pm->lloc_eachmb[g];
+  // the walk of receiver r (level l, face f) over its rows shifted back, with
+  // sources at level ls; find(level, lx2, lx3) looks up the opposite-face block among r's
+  // candidates (or, on the sending side, is the sending block itself); keep(sg) selects the
+  // pieces to record
+  auto walk = [&](int rg, int l, std::int32_t lx2, std::int32_t lx3, int f, int ls, int ridx,
+                  const auto &find, const auto &keep, Real &eps_out) {
+    const int fo = 1 - f;
+    const int rb = (ls == l) ? nx2 : nx2/2;
+    const long long ny = static_cast<long long>(pm->nmb_rootx2 << (l - root))*nx2;
+    const Real q = ((f == 0) ? yshear : -yshear)/(ly/static_cast<Real>(ny));
+    const Real fl = std::floor(q);
+    eps_out = q - fl;
+    long long joff = static_cast<long long>(fl) % ny;
+    if (joff < 0) joff += ny;
+    long long pos = static_cast<long long>(lx2)*nx2 - joff - 3;
+    int dst = 0, npc = 0;
+    while (dst < nbuf) {
+      const long long gr = ((pos % ny) + ny) % ny;
+      const int by = static_cast<int>(gr/rb);
+      const int r0 = static_cast<int>(gr - static_cast<long long>(by)*rb);
+      const int len = std::min(rb - r0, nbuf - dst);
+      const int nzh = (ls == l) ? 1 : 2;
+      for (int zh=0; zh<nzh; ++zh) {
+        const ShearCand *sc = find(ls, by, (ls == l) ? lx3 : 2*lx3 + zh);
+        if (sc == nullptr) {
+          if (ridx >= 0) bad = true;   // the receiving side must find every source
+          npc++;
+          continue;
+        }
+        if (keep(sc->gid)) {
+          const int nkp = (ls == l) ? nk : nk/2;
+          std::array<int, kNField> p{};
+          p[kRGid] = rg; p[kSGid] = sc->gid; p[kSFace] = fo; p[kR0] = r0; p[kLen] = len;
+          p[kDst] = dst; p[kKofs] = (ls == l) ? 0 : zh*(nk/2); p[kNk] = nkp;
+          p[kRestr] = (ls != l) ? 1 : 0; p[kQ] = npc; p[kRIdx] = ridx;
+          p[kSLoc] = (sc->rank == my_rank) ? 1 : 0;
+          p[kRRank] = pm->rank_eachmb[rg]; p[kSRank] = sc->rank;
+          p[kOff] = -1;
+          pcs.push_back(p);
+        }
+        npc++;
+      }
+      pos += len;
+      dst += len;
+    }
+  };
+  // receivers of this rank: the old rule (the opposite level at the block's own position;
+  // the finer side, equal levels: the outer face, is authoritative)
+  for (int m=0; m<nmb; ++m) {
+    const auto &ll = pm->lloc_eachmb[gids + m];
     const int l = ll.level;
     for (int f=0; f<2; ++f) {
       if (ll.lx1 != ((f == 0) ? 0 : nxl(l) - 1)) continue;
-      const int fo = 1 - f;
+      const auto &cv = cand_[f][m];
+      const auto &cs = candsort_[f][m];
+      auto find = [&cv, &cs](int lev, std::int32_t j, std::int32_t k) -> const ShearCand* {
+        auto it = std::lower_bound(cs.begin(), cs.end(), 0, [&](int a, int) {
+          const ShearCand &c = cv[a];
+          return std::make_tuple(c.level, c.lx3, c.lx2) < std::make_tuple(lev, k, j);});
+        if (it == cs.end()) return nullptr;
+        const ShearCand &c = cv[*it];
+        return (c.level == lev && c.lx3 == k && c.lx2 == j) ? &c : nullptr;
+      };
       int lo = -1;
-      if (find(l, (fo == 0) ? 0 : nxl(l) - 1, ll.lx2, ll.lx3) >= 0) {
+      if (find(l, ll.lx2, ll.lx3) != nullptr) {
         lo = l;
-      } else if (l > root &&
-                 find(l-1, (fo == 0) ? 0 : nxl(l-1) - 1, ll.lx2 >> 1, ll.lx3 >> 1) >= 0) {
+      } else if (l > root && find(l-1, ll.lx2 >> 1, ll.lx3 >> 1) != nullptr) {
         lo = l - 1;
-      } else if (find(l+1, (fo == 0) ? 0 : nxl(l+1) - 1, 2*ll.lx2, 2*ll.lx3) >= 0) {
+      } else if (find(l+1, 2*ll.lx2, 2*ll.lx3) != nullptr) {
         lo = l + 1;
       }
       if (lo < 0) {bad = true; continue;}
       if (!((lo > l) || (lo == l && f == 0))) continue;   // authoritative side: sends
-      const bool rloc = (pm->rank_eachmb[g] == my_rank);
-      const int ls = lo;
-      const int rb = (ls == l) ? nx2 : nx2/2;
-      const long long ny = static_cast<long long>(pm->nmb_rootx2 << (l - root))*nx2;
-      const Real q = ((f == 0) ? yshear : -yshear)/(ly/static_cast<Real>(ny));
-      const Real fl = std::floor(q);
-      const Real eps = q - fl;
-      long long joff = static_cast<long long>(fl) % ny;
-      if (joff < 0) joff += ny;
-      int ridx = -1;
-      if (rloc) {
-        ridx = static_cast<int>(rl.size());
-        rl.emplace_back(g - gids, f);
-        reps.push_back(eps);
+      Real eps;
+      const int ridx = static_cast<int>(rl.size());
+      walk(gids + m, l, ll.lx2, ll.lx3, f, lo, ridx, find, [](int) {return true;}, eps);
+      rl.emplace_back(m, f);
+      reps.push_back(eps);
+    }
+  }
+  // senders of this rank for receivers on other ranks: a receiving block r on the opposite
+  // face whose x3 range this block's overlaps; its sources are at this block's level when
+  // this block is the finer side there, or the outer face at equal levels
+  for (int m=0; m<nmb; ++m) {
+    const auto &ll = pm->lloc_eachmb[gids + m];
+    const ShearCand self{gids + m, my_rank, ll.level, ll.lx2, ll.lx3};
+    for (int f=0; f<2; ++f) {
+      if (ll.lx1 != ((f == 0) ? 0 : nxl(ll.level) - 1)) continue;
+      for (const ShearCand &rc : cand_[f][m]) {
+        if (rc.rank == my_rank) continue;
+        const int l = rc.level, fr = 1 - f;
+        int lo = -1;
+        if (ll.level == l && ll.lx3 == rc.lx3) lo = l;
+        if (ll.level == l + 1 && (ll.lx3 >> 1) == rc.lx3) lo = l + 1;
+        if (lo < 0) continue;   // not overlapping, or this block is the coarser side
+        if (!((lo > l) || (lo == l && fr == 0))) continue;
+        auto find = [&self](int lev, std::int32_t j, std::int32_t k) -> const ShearCand* {
+          return (lev == self.level && j == self.lx2 && k == self.lx3) ? &self : nullptr;
+        };
+        Real eps;
+        walk(rc.gid, l, rc.lx2, rc.lx3, fr, lo, -1, find,
+             [&self](int g) {return g == self.gid;}, eps);
       }
-      long long pos = static_cast<long long>(ll.lx2)*nx2 - joff - 3;
-      int dst = 0, npc = 0;
-      while (dst < nbuf) {
-        const long long gr = ((pos % ny) + ny) % ny;
-        const int by = static_cast<int>(gr/rb);
-        const int r0 = static_cast<int>(gr - static_cast<long long>(by)*rb);
-        const int len = std::min(rb - r0, nbuf - dst);
-        const int nzh = (ls == l) ? 1 : 2;
-        for (int zh=0; zh<nzh; ++zh) {
-          const int sg = find(ls, (fo == 0) ? 0 : nxl(ls) - 1, by,
-                              (ls == l) ? ll.lx3 : 2*ll.lx3 + zh);
-          if (sg < 0) {bad = true; continue;}
-          const bool sloc = (pm->rank_eachmb[sg] == my_rank);
-          const int nkp = (ls == l) ? nk : nk/2;
-          if (rloc || sloc) {
-            std::vector<int> p(kNField, 0);
-            p[kRGid] = g; p[kSGid] = sg; p[kSFace] = fo; p[kR0] = r0; p[kLen] = len;
-            p[kDst] = dst; p[kKofs] = (ls == l) ? 0 : zh*(nk/2); p[kNk] = nkp;
-            p[kRestr] = (ls != l) ? 1 : 0; p[kQ] = npc; p[kRIdx] = ridx;
-            p[kSLoc] = sloc ? 1 : 0;
-            p[kRRank] = pm->rank_eachmb[g]; p[kSRank] = pm->rank_eachmb[sg];
-            const int size = nvar_*nkp*len;
-            p[kOff] = -1;
-            if (rloc && !sloc) {p[kOff] = roff; roff += size;}
-            if (sloc && !rloc) {p[kOff] = soff; soff += size;}
-            pcs.push_back(p);
-          }
-          npc++;
-        }
-        pos += len;
-        dst += len;
-      }
-      if (npc > 22) bad = true;    // MPI tags 40 + piece
     }
   }
   if (bad) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "shear flux matching: unexpected face levels or too many pieces"
-              << std::endl;
+              << "shear flux matching: unexpected face levels" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  // one message per peer rank and direction
+  std::vector<std::array<long long, 8>> key;
+  std::vector<int> rem;
+  for (int n=0; n<static_cast<int>(pcs.size()); ++n) {
+    const auto &p = pcs[n];
+    const bool rloc = (p[kRIdx] >= 0), sloc = (p[kSLoc] == 1);
+    if (rloc == sloc) continue;
+    key.push_back({rloc ? 0LL : 1LL, rloc ? p[kSRank] : p[kRRank], p[kRGid], p[kSGid], p[kQ],
+                   0, 0, static_cast<long long>(nvar_)*p[kNk]*p[kLen]});
+    rem.push_back(n);
+  }
+  std::vector<int> offset;
+  int soff = 0, roff = 0;
+#if MPI_PARALLEL_ENABLED
+  LayoutPeerMessages(key, offset, fmsg_rank, fmsg_off, fmsg_size, fmsg_send, soff, roff);
+#else
+  std::vector<int> mr, mo, ms, md;
+  LayoutPeerMessages(key, offset, mr, mo, ms, md, soff, roff);
+#endif
+  for (int i=0; i<static_cast<int>(rem.size()); ++i) pcs[rem[i]][kOff] = offset[i];
   nfpiece = static_cast<int>(pcs.size());
   nfrecv = static_cast<int>(rl.size());
   if (static_cast<int>(fpiece.extent(0)) < std::max(1, nfpiece)) {
@@ -177,21 +227,48 @@ void ShearingBoxCC::PlanFluxMatch() {
     Kokkos::realloc(frecvflat, std::max(1, roff));
   }
 #if MPI_PARALLEL_ENABLED
-  if (nfreq_ < nfpiece) {
+  const int nmsg = static_cast<int>(fmsg_rank.size());
+  if (nfreq_ < nmsg) {
     delete [] fsreq_; delete [] frreq_;
-    nfreq_ = std::max(16, 2*nfpiece);
+    nfreq_ = std::max(16, 2*nmsg);
     fsreq_ = new MPI_Request[nfreq_];
     frreq_ = new MPI_Request[nfreq_];
   }
   for (int n=0; n<nfreq_; ++n) {fsreq_[n] = MPI_REQUEST_NULL; frreq_[n] = MPI_REQUEST_NULL;}
-  bool no_errors = true;
+  // one message per piece here (not per peer): on two GB200 nodes the merged
+  // messages made the band case 6% slower (large messages between nodes); tag (receiver lid,
+  // 40 + its piece number in the receiver's walk), as before S2d
+  fmsg_rank.clear(); fmsg_off.clear(); fmsg_size.clear(); fmsg_send.clear(); fmsg_tag.clear();
   for (int n=0; n<nfpiece; ++n) {
     const auto &p = pcs[n];
-    if (p[kRIdx] < 0 || p[kSLoc] == 1) continue;   // receive only: local receiver, remote sender
-    const int size = nvar_*p[kNk]*p[kLen];
-    const int tag = CreateBvals_MPI_Tag(p[kRGid] - gids, 40 + p[kQ]);
-    if (MPI_Irecv(frecvflat.data() + p[kOff], size, MPI_ATHENA_REAL, p[kSRank], tag,
-                  comm_sbox, &(frreq_[n])) != MPI_SUCCESS) {
+    const bool rloc = (p[kRIdx] >= 0), sloc = (p[kSLoc] == 1);
+    if (rloc == sloc) continue;
+    fmsg_rank.push_back(rloc ? p[kSRank] : p[kRRank]);
+    fmsg_off.push_back(p[kOff]);
+    fmsg_size.push_back(nvar_*p[kNk]*p[kLen]);
+    fmsg_send.push_back(rloc ? 0 : 1);
+    const int lid = p[kRGid] - pm->gids_eachrank[p[kRRank]];
+    fmsg_tag.push_back(CreateBvals_MPI_Tag(lid, 40 + p[kQ]));
+    if (p[kQ] > 22) bad = true;
+  }
+  if (bad) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "shear flux matching: too many pieces for the MPI tags" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const int nmsg1 = static_cast<int>(fmsg_rank.size());
+  if (nfreq_ < nmsg1) {
+    delete [] fsreq_; delete [] frreq_;
+    nfreq_ = std::max(16, 2*nmsg1);
+    fsreq_ = new MPI_Request[nfreq_];
+    frreq_ = new MPI_Request[nfreq_];
+    for (int r=0; r<nfreq_; ++r) {fsreq_[r] = MPI_REQUEST_NULL; frreq_[r] = MPI_REQUEST_NULL;}
+  }
+  bool no_errors = true;
+  for (int n=0; n<nmsg1; ++n) {
+    if (fmsg_send[n] == 1) continue;
+    if (MPI_Irecv(frecvflat.data() + fmsg_off[n], fmsg_size[n], MPI_ATHENA_REAL, fmsg_rank[n],
+                  fmsg_tag[n], comm_sbox, &(frreq_[n])) != MPI_SUCCESS) {
       no_errors = false;
     }
   }
@@ -246,15 +323,10 @@ TaskStatus ShearingBoxCC::SendFluxMatch(DvceFaceFld5D<Real> &flx) {
 #if MPI_PARALLEL_ENABLED
   Kokkos::fence();
   bool no_errors = true;
-  Mesh *pm = pmy_pack->pmesh;
-  for (int n=0; n<nfpiece; ++n) {
-    if (fpiece.h_view(n,kSLoc) == 0 || fpiece.h_view(n,kRIdx) >= 0) continue;
-    const int rrank = fpiece.h_view(n,kRRank);
-    const int size = nvar_*fpiece.h_view(n,kNk)*fpiece.h_view(n,kLen);
-    const int lid = fpiece.h_view(n,kRGid) - pm->gids_eachrank[rrank];
-    const int tag = CreateBvals_MPI_Tag(lid, 40 + fpiece.h_view(n,kQ));
-    if (MPI_Isend(fsendflat.data() + fpiece.h_view(n,kOff), size, MPI_ATHENA_REAL, rrank,
-                  tag, comm_sbox, &(fsreq_[n])) != MPI_SUCCESS) {
+  for (size_t n=0; n<fmsg_rank.size(); ++n) {   // one message per peer
+    if (fmsg_send[n] == 0) continue;
+    if (MPI_Isend(fsendflat.data() + fmsg_off[n], fmsg_size[n], MPI_ATHENA_REAL, fmsg_rank[n],
+                  fmsg_tag[n], comm_sbox, &(fsreq_[n])) != MPI_SUCCESS) {
       no_errors = false;
     }
   }
@@ -283,7 +355,7 @@ TaskStatus ShearingBoxCC::RecvFluxMatch(DvceFaceFld5D<Real> &flx, Reconstruction
   auto fb = fbuf;
 #if MPI_PARALLEL_ENABLED
   bool done = true, no_errors = true;
-  for (int n=0; n<nfpiece; ++n) {
+  for (size_t n=0; n<fmsg_rank.size(); ++n) {
     int test;
     if (MPI_Test(&(frreq_[n]), &test, MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
     if (!(static_cast<bool>(test))) done = false;
@@ -388,85 +460,82 @@ void ShearingBoxCC::PlanFluxPair() {
   const int nx2 = indcs.nx2, nx3 = indcs.nx3;
   const int root = pm->root_level;
   const int my_rank = global_variable::my_rank;
+  const int gids = pmy_pack->gids;
+  const int nmb = pmy_pack->nmb_thispack;
   const Real ly = pm->mesh_size.x2max - pm->mesh_size.x2min;
   auto nxl = [pm, root](int l) {return pm->nmb_rootx1 << (l - root);};
-  std::vector<int> face[2];
-  for (int g=0; g<pm->nmb_total; ++g) {
-    const auto &ll = pm->lloc_eachmb[g];
-    if (ll.lx1 == 0) face[0].push_back(g);
-    if (ll.lx1 == nxl(ll.level) - 1) face[1].push_back(g);
-  }
-  std::vector<std::vector<int>> pcs;
+  std::vector<std::array<int, kQNField>> pcs;
   std::vector<Real> fr;
-  std::map<std::pair<int, int>, std::vector<int>> bypair;   // (Y gid, X gid) -> piece ids
-  std::vector<std::pair<int, int>> pair_order;
   bool bad = false;
-  // receivers in gid order, then face
-  std::vector<std::pair<int, int>> ys;
-  for (int f=0; f<2; ++f) for (int g : face[f]) ys.emplace_back(g, f);
-  std::stable_sort(ys.begin(), ys.end(),
-                   [](const std::pair<int, int> &a, const std::pair<int, int> &b) {
-                     return a.first < b.first;});
-  int cur = -1;
-  std::map<int, int> pair_of;
-  for (const auto &yf : ys) {
-    const int yg = yf.first, fy = yf.second;
-    if (yg != cur) {cur = yg; pair_of.clear();}
-    const auto &yl = pm->lloc_eachmb[yg];
-    const bool rloc = (pm->rank_eachmb[yg] == my_rank);
-    for (int xg : face[1 - fy]) {
-      const auto &xl = pm->lloc_eachmb[xg];
-      const int d = xl.level - yl.level;
-      if (d < 0 || (d == 0 && fy == 1)) continue;   // Y is authoritative there
-      const long long f2 = 1LL << d;
-      if ((nx2 % f2) != 0 || (nx3 % f2) != 0) {bad = true; continue;}
-      const long long nyx = static_cast<long long>(pm->nmb_rootx2)*nx2 << (xl.level - root);
-      const long long nzx = static_cast<long long>(pm->nmb_rootx3)*nx3 << (xl.level - root);
-      // x3: X k row kx sits at kx + bz in Y's frame (X cells); Y spans [0, nx3 f2)
-      const long long zy0 = static_cast<long long>(yl.lx3)*nx3*f2;
-      const long long zx0 = static_cast<long long>(xl.lx3)*nx3;
-      // y: shift of X's rows in Y's frame, in X cells
-      const Real sig = yshear/(ly/static_cast<Real>(nyx));
-      const Real del = (fy == 0) ? sig : -sig;
-      const Real dfl = std::floor(del);
-      const Real dfr = del - dfl;
-      long long dint = static_cast<long long>(dfl) % nyx;
-      if (dint < 0) dint += nyx;
-      const long long yy0 = static_cast<long long>(yl.lx2)*nx2*f2;
-      const long long yx0 = static_cast<long long>(xl.lx2)*nx2 + dint;
-      const long long spany = static_cast<long long>(nx2)*f2, spanz = static_cast<long long>(nx3)*f2;
-      for (long long kz=(zper ? -2 : 0); kz<=(zper ? 2 : 0); ++kz) {   // (S2c) images only in a
+  // the pieces of (receiving block y on face fy, authoritative block x), the same
+  // function on both sides; ridx >= 0: y is local
+  auto pieces = [&](const ShearCand &y, int fy, const ShearCand &x, int ridx) {
+    const int d = x.level - y.level;
+    if (d < 0 || (d == 0 && fy == 1)) return;   // y is authoritative there
+    const long long f2 = 1LL << d;
+    if ((nx2 % f2) != 0 || (nx3 % f2) != 0) {bad = true; return;}
+    const long long nyx = static_cast<long long>(pm->nmb_rootx2)*nx2 << (x.level - root);
+    const long long nzx = static_cast<long long>(pm->nmb_rootx3)*nx3 << (x.level - root);
+    // x3: x's k row kx sits at kx + bz in y's frame (x cells); y spans [0, nx3 f2)
+    const long long zy0 = static_cast<long long>(y.lx3)*nx3*f2;
+    const long long zx0 = static_cast<long long>(x.lx3)*nx3;
+    // x2: shift of x's rows in y's frame, in x cells
+    const Real sig = yshear/(ly/static_cast<Real>(nyx));
+    const Real del = (fy == 0) ? sig : -sig;
+    const Real dfl = std::floor(del);
+    const Real dfr = del - dfl;
+    long long dint = static_cast<long long>(dfl) % nyx;
+    if (dint < 0) dint += nyx;
+    const long long yy0 = static_cast<long long>(y.lx2)*nx2*f2;
+    const long long yx0 = static_cast<long long>(x.lx2)*nx2 + dint;
+    const long long spany = static_cast<long long>(nx2)*f2;
+    const long long spanz = static_cast<long long>(nx3)*f2;
+    int seq = 0;
+    for (long long kz=(zper ? -2 : 0); kz<=(zper ? 2 : 0); ++kz) {   // (S2c) images only in a
                                                                       // periodic x3
-        const long long bz = zx0 + kz*nzx - zy0;
-        if (!(bz < spanz && bz + nx3 > 0)) continue;
-        const int k0 = static_cast<int>(std::max(0LL, bz/f2));
-        const int k1 = static_cast<int>(std::min(static_cast<long long>(nx3),
-                                                 (bz + nx3 + f2 - 1)/f2));
-        if (k1 <= k0) continue;
-        for (long long ky=-2; ky<=2; ++ky) {
-          const long long by = yx0 + ky*nyx - yy0;    // X row 0 at [by + dfr, by + dfr + 1)
-          const Real lo = static_cast<Real>(by) + dfr, hi = lo + nx2;
-          if (!(lo < static_cast<Real>(spany) && hi > 0.0)) continue;
-          const int r0 = std::max(0, static_cast<int>(std::floor(lo/static_cast<Real>(f2))));
-          const int r1 = std::min(nx2, static_cast<int>(std::ceil(hi/static_cast<Real>(f2))));
-          if (r1 <= r0) continue;
-          if (pair_of.find(xg) == pair_of.end()) {
-            pair_of.emplace(xg, static_cast<int>(pair_of.size()));
-          }
-          const bool sloc = (pm->rank_eachmb[xg] == my_rank);
-          if (!(rloc || sloc)) continue;
-          std::vector<int> p(kQNField, 0);
-          p[kQRGid] = yg; p[kQRIdx] = rloc ? 1 : -1; p[kQRFace] = fy;
-          p[kQSGid] = xg; p[kQSLoc] = sloc ? 1 : 0; p[kQSFace] = 1 - fy; p[kQD] = d;
-          p[kQR0] = r0; p[kQNy] = r1 - r0; p[kQK0] = k0; p[kQNz] = k1 - k0;
-          p[kQBase] = static_cast<int>(by); p[kQBaseZ] = static_cast<int>(bz);
-          p[kQOff] = -1; p[kQPair] = pair_of[xg];
-          auto key = std::make_pair(yg, xg);
-          if (bypair.find(key) == bypair.end()) pair_order.push_back(key);
-          bypair[key].push_back(static_cast<int>(pcs.size()));
-          pcs.push_back(p);
-          fr.push_back(dfr);
-        }
+      const long long bz = zx0 + kz*nzx - zy0;
+      if (!(bz < spanz && bz + nx3 > 0)) continue;
+      const int k0 = static_cast<int>(std::max(0LL, bz/f2));
+      const int k1 = static_cast<int>(std::min(static_cast<long long>(nx3),
+                                               (bz + nx3 + f2 - 1)/f2));
+      if (k1 <= k0) continue;
+      for (long long ky=-2; ky<=2; ++ky) {
+        const long long by = yx0 + ky*nyx - yy0;    // x row 0 at [by + dfr, by + dfr + 1)
+        const Real lo = static_cast<Real>(by) + dfr, hi = lo + nx2;
+        if (!(lo < static_cast<Real>(spany) && hi > 0.0)) continue;
+        const int r0 = std::max(0, static_cast<int>(std::floor(lo/static_cast<Real>(f2))));
+        const int r1 = std::min(nx2, static_cast<int>(std::ceil(hi/static_cast<Real>(f2))));
+        if (r1 <= r0) continue;
+        std::array<int, kQNField> p{};
+        p[kQRGid] = y.gid; p[kQRIdx] = (ridx >= 0) ? 1 : -1; p[kQRFace] = fy;
+        p[kQSGid] = x.gid; p[kQSLoc] = (x.rank == my_rank) ? 1 : 0; p[kQSFace] = 1 - fy;
+        p[kQD] = d;
+        p[kQR0] = r0; p[kQNy] = r1 - r0; p[kQK0] = k0; p[kQNz] = k1 - k0;
+        p[kQBase] = static_cast<int>(by); p[kQBaseZ] = static_cast<int>(bz);
+        p[kQOff] = -1; p[kQPair] = seq++;
+        pcs.push_back(p);
+        fr.push_back(dfr);
+      }
+    }
+  };
+  // receiving blocks of this rank (in gid order, then face), every authoritative candidate
+  for (int m=0; m<nmb; ++m) {
+    const auto &ll = pm->lloc_eachmb[gids + m];
+    const ShearCand self{gids + m, my_rank, ll.level, ll.lx2, ll.lx3};
+    for (int f=0; f<2; ++f) {
+      if (ll.lx1 != ((f == 0) ? 0 : nxl(ll.level) - 1)) continue;
+      for (const ShearCand &x : cand_[f][m]) pieces(self, f, x, m);
+    }
+  }
+  // authoritative blocks of this rank for receiving blocks on other ranks
+  for (int m=0; m<nmb; ++m) {
+    const auto &ll = pm->lloc_eachmb[gids + m];
+    const ShearCand self{gids + m, my_rank, ll.level, ll.lx2, ll.lx3};
+    for (int f=0; f<2; ++f) {
+      if (ll.lx1 != ((f == 0) ? 0 : nxl(ll.level) - 1)) continue;
+      for (const ShearCand &y : cand_[f][m]) {
+        if (y.rank == my_rank) continue;
+        pieces(y, 1 - f, self, -1);
       }
     }
   }
@@ -476,48 +545,40 @@ void ShearingBoxCC::PlanFluxPair() {
               << "block size" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // flat buffers per message (pieces of one pair are contiguous)
-  std::vector<int> order;
+  // one message per peer rank and direction
+  std::vector<std::array<long long, 8>> key;
+  std::vector<int> rem;
+  for (int n=0; n<static_cast<int>(pcs.size()); ++n) {
+    const auto &p = pcs[n];
+    const bool rloc = (p[kQRIdx] >= 0), sloc = (p[kQSLoc] == 1);
+    if (rloc == sloc) continue;
+    const int peer = rloc ? pm->rank_eachmb[p[kQSGid]] : pm->rank_eachmb[p[kQRGid]];
+    key.push_back({rloc ? 0LL : 1LL, peer, p[kQRGid], p[kQRFace], p[kQSGid], p[kQPair], 0,
+                   static_cast<long long>(nvar_ + 1)*p[kQNz]*p[kQNy]});
+    rem.push_back(n);
+  }
+  std::vector<int> offset;
   int soff = 0, roff = 0;
 #if MPI_PARALLEL_ENABLED
-  qmsg_rank.clear(); qmsg_off.clear(); qmsg_size.clear(); qmsg_tag.clear(); qmsg_send.clear();
+  LayoutPeerMessages(key, offset, qmsg_rank, qmsg_off, qmsg_size, qmsg_send, soff, roff);
+#else
+  std::vector<int> mr, mo, ms, md;
+  LayoutPeerMessages(key, offset, mr, mo, ms, md, soff, roff);
 #endif
-  for (const auto &key : pair_order) {
-    const auto &ids = bypair[key];
-    const bool rloc = (pm->rank_eachmb[key.first] == my_rank);
-    const bool sloc = (pm->rank_eachmb[key.second] == my_rank);
-    if (rloc != sloc) {
-      int &off = rloc ? roff : soff;
-      const int start = off;
-      for (int id : ids) {
-        pcs[id][kQOff] = off;
-        off += (nvar_ + 1)*pcs[id][kQNz]*pcs[id][kQNy];
-      }
-#if MPI_PARALLEL_ENABLED
-      qmsg_rank.push_back(rloc ? pm->rank_eachmb[key.second] : pm->rank_eachmb[key.first]);
-      qmsg_off.push_back(start);
-      qmsg_size.push_back(off - start);
-      const int lid = key.first - pm->gids_eachrank[pm->rank_eachmb[key.first]];
-      qmsg_tag.push_back(CreateBvals_MPI_Tag(lid, pcs[ids[0]][kQPair]));
-      qmsg_send.push_back(sloc ? 1 : 0);
-#endif
-    }
-    for (int id : ids) order.push_back(id);
-  }
-  nqpiece = static_cast<int>(order.size());
+  for (int i=0; i<static_cast<int>(rem.size()); ++i) pcs[rem[i]][kQOff] = offset[i];
+  nqpiece = static_cast<int>(pcs.size());
   if (static_cast<int>(qpiece.extent(0)) < std::max(1, nqpiece)) {
     Kokkos::realloc(qpiece, std::max(1, nqpiece), static_cast<int>(kQNField));
     Kokkos::realloc(qfrac, std::max(1, nqpiece));
   }
   for (int n=0; n<nqpiece; ++n) {
-    for (int c=0; c<kQNField; ++c) qpiece.h_view(n,c) = pcs[order[n]][c];
-    qfrac.h_view(n) = fr[order[n]];
+    for (int c=0; c<kQNField; ++c) qpiece.h_view(n,c) = pcs[n][c];
+    qfrac.h_view(n) = fr[n];
   }
   qpiece.template modify<HostMemSpace>();
   qpiece.template sync<DevExeSpace>();
   qfrac.template modify<HostMemSpace>();
   qfrac.template sync<DevExeSpace>();
-  const int nmb = pmy_pack->nmb_thispack;
   if (static_cast<int>(qacc.extent(0)) < std::max(1, nmb) ||
       static_cast<int>(qacc.extent(2)) != nvar_ + 1) {
     Kokkos::realloc(qacc, std::max(1, nmb), 2, nvar_ + 1, nx3, nx2);
@@ -537,6 +598,7 @@ void ShearingBoxCC::PlanFluxPair() {
     qrreq_ = new MPI_Request[nqreq_];
   }
   for (int n=0; n<nqreq_; ++n) {qsreq_[n] = MPI_REQUEST_NULL; qrreq_[n] = MPI_REQUEST_NULL;}
+  qmsg_tag.assign(nmsg, 0);
   bool no_errors = true;
   for (int n=0; n<nmsg; ++n) {
     if (qmsg_send[n] == 1) continue;

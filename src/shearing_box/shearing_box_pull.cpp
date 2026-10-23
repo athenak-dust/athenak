@@ -21,6 +21,7 @@
 //! per (receiving block, sending block) pair.
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -63,115 +64,111 @@ void ShearingBox::PlanPull() {
   const int root = pm->root_level;
   const int my_rank = global_variable::my_rank;
   const int gids = pmy_pack->gids;
+  const int nmb = pmy_pack->nmb_thispack;
   const Real ly = pm->mesh_size.x2max - pm->mesh_size.x2min;
   auto nxl = [pm, root](int l) {return pm->nmb_rootx1 << (l - root);};
   const bool zper = (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic);
-  // the blocks on each face (gid order)
-  std::vector<int> face[2];
-  for (int g=0; g<pm->nmb_total; ++g) {
-    const auto &ll = pm->lloc_eachmb[g];
-    if (ll.lx1 == 0) face[0].push_back(g);
-    if (ll.lx1 == nxl(ll.level) - 1) face[1].push_back(g);
-  }
-  struct Recv {int gid, type, f, lr, ny, nz, j0, k0;};
-  std::vector<Recv> recvs;
-  for (int f=0; f<2; ++f) {
-    for (int g : face[f]) {
-      const auto &ll = pm->lloc_eachmb[g];
-      recvs.push_back({g, 0, f, ll.level, nx2, nx3, ll.lx2*nx2, ll.lx3*nx3});
-      if (coarse_on && ll.level > root) {
-        recvs.push_back({g, 1, f, ll.level - 1, nx2/2, nx3/2, ll.lx2*(nx2/2),
-                         ll.lx3*(nx3/2)});
-      }
-    }
-  }
-  // receivers ordered by block, then face and type (the order of the pairs of a block)
-  std::stable_sort(recvs.begin(), recvs.end(),
-                   [](const Recv &a, const Recv &b) {return a.gid < b.gid;});
-  std::vector<std::vector<int>> pcs;
-  std::vector<std::tuple<int, int, int>> rl;   // local receivers (m, type, face)
-  std::vector<Real> reps;
+  // a receiver: the x1 ghosts of a face block (type 0) or of its coarse array
+  // (type 1); the same function on the receiving and on the sending rank
+  struct Recv {int gid, type, f, lr, ny, nz; long long j0, k0, joff; Real eps;};
+  auto make_recv = [&](int gid, int level, std::int32_t lx2, std::int32_t lx3, int type,
+                       int f) {
+    Recv r;
+    r.gid = gid; r.type = type; r.f = f;
+    r.lr = (type == 0) ? level : level - 1;
+    r.ny = (type == 0) ? nx2 : nx2/2;
+    r.nz = (type == 0) ? nx3 : nx3/2;
+    r.j0 = static_cast<long long>(lx2)*r.ny;
+    r.k0 = static_cast<long long>(lx3)*r.nz;
+    const long long ny_l = static_cast<long long>(pm->nmb_rootx2)*nx2 << (r.lr - root);
+    const Real q = ((f == 0) ? yshear : -yshear)/(ly/static_cast<Real>(ny_l));
+    const Real fl = std::floor(q);
+    r.eps = q - fl;
+    r.joff = static_cast<long long>(fl) % ny_l;
+    if (r.joff < 0) r.joff += ny_l;
+    return r;
+  };
   bool bad = false;
   int maxny = 1, maxnz = 1;
-#if MPI_PARALLEL_ENABLED
-  pmsg_rank.clear(); pmsg_off.clear(); pmsg_size.clear(); pmsg_tag.clear(); pmsg_send.clear();
-#endif
-  // per receiving block: map from sending block to its pair index (MPI tag)
-  int cur_gid = -1;
-  std::map<int, int> pair_of;
-  // pieces are first collected per (receiving block, sending block) pair to keep the flat
-  // buffers contiguous per message
-  std::map<std::pair<int, int>, std::vector<std::vector<int>>> bypair;
-  std::vector<std::pair<int, int>> pair_order;
-  for (const auto &r : recvs) {
-    if (r.gid != cur_gid) {cur_gid = r.gid; pair_of.clear();}
-    const bool rloc = (pm->rank_eachmb[r.gid] == my_rank);
+  std::vector<std::array<int, kPNField>> pcs;
+  // the pieces of (receiver r, sending block s), in the same order on both sides
+  auto pieces = [&](const Recv &r, const ShearCand &s, int ridx) {
     const int lr = r.lr;
     const long long ny_l = static_cast<long long>(pm->nmb_rootx2)*nx2 << (lr - root);
     const long long nz_l = static_cast<long long>(pm->nmb_rootx3)*nx3 << (lr - root);
-    const Real q = ((r.f == 0) ? yshear : -yshear)/(ly/static_cast<Real>(ny_l));
-    const Real fl = std::floor(q);
-    const Real eps = q - fl;
-    long long joff = static_cast<long long>(fl) % ny_l;
-    if (joff < 0) joff += ny_l;
-    int ridx = -1;
-    if (rloc) {
-      ridx = static_cast<int>(rl.size());
-      rl.emplace_back(r.gid - gids, r.type, r.f);
-      reps.push_back(eps);
-    }
     const int nyb = r.ny + 2*ng + 6, nzb = r.nz + 2*ng;
     maxny = std::max(maxny, nyb); maxnz = std::max(maxnz, nzb);
-    const long long y0 = r.j0 - ng - joff - 3, y1 = y0 + nyb;
+    const long long y0 = r.j0 - ng - r.joff - 3, y1 = y0 + nyb;
     const long long z0 = r.k0 - ng, z1 = z0 + nzb;
-    for (int sg : face[1 - r.f]) {
-      const auto &sl = pm->lloc_eachmb[sg];
-      const int d = sl.level - lr;
-      long long sy0, sy1, sz0, sz1;
-      if (d >= 0) {
-        sy0 = static_cast<long long>(sl.lx2)*(nx2 >> d); sy1 = sy0 + (nx2 >> d);
-        sz0 = static_cast<long long>(sl.lx3)*(nx3 >> d); sz1 = sz0 + (nx3 >> d);
-      } else {
-        sy0 = static_cast<long long>(sl.lx2)*(static_cast<long long>(nx2) << (-d));
-        sy1 = sy0 + (static_cast<long long>(nx2) << (-d));
-        sz0 = static_cast<long long>(sl.lx3)*(static_cast<long long>(nx3) << (-d));
-        sz1 = sz0 + (static_cast<long long>(nx3) << (-d));
+    const int d = s.level - lr;
+    long long sy0, sy1, sz0, sz1;
+    if (d >= 0) {
+      sy0 = static_cast<long long>(s.lx2)*(nx2 >> d); sy1 = sy0 + (nx2 >> d);
+      sz0 = static_cast<long long>(s.lx3)*(nx3 >> d); sz1 = sz0 + (nx3 >> d);
+    } else {
+      sy0 = static_cast<long long>(s.lx2)*(static_cast<long long>(nx2) << (-d));
+      sy1 = sy0 + (static_cast<long long>(nx2) << (-d));
+      sz0 = static_cast<long long>(s.lx3)*(static_cast<long long>(nx3) << (-d));
+      sz1 = sz0 + (static_cast<long long>(nx3) << (-d));
+    }
+    long long kya = FloorDiv(y0 - sy1, ny_l) + 1, kyb = FloorDiv(y1 - 1 - sy0, ny_l);
+    long long kza = FloorDiv(z0 - sz1, nz_l) + 1, kzb = FloorDiv(z1 - 1 - sz0, nz_l);
+    // (S2c) non-periodic x3: no images; the x3 ghost rows beyond the boundary are
+    // left to the physical boundary conditions (they run after this exchange)
+    if (!zper) {kza = std::max(kza, 0LL); kzb = std::min(kzb, 0LL);}
+    int seq = 0;
+    for (long long ky=kya; ky<=kyb; ++ky) {
+      const long long a0 = std::max(y0, sy0 + ky*ny_l), a1 = std::min(y1, sy1 + ky*ny_l);
+      if (a1 <= a0) continue;
+      for (long long kz=kza; kz<=kzb; ++kz) {
+        const long long b0 = std::max(z0, sz0 + kz*nz_l), b1 = std::min(z1, sz1 + kz*nz_l);
+        if (b1 <= b0) continue;
+        if (d >= 0 && ((nx2 % (1 << d)) != 0 || (nx3 % (1 << d)) != 0 ||
+                       ng*(1 << d) > nx1)) {
+          bad = true;
+          continue;
+        }
+        std::array<int, kPNField> p{};
+        p[kPRGid] = r.gid; p[kPRType] = r.type; p[kPRFace] = r.f; p[kPRIdx] = ridx;
+        p[kPSGid] = s.gid; p[kPSLoc] = (s.rank == my_rank) ? 1 : 0; p[kPSFace] = 1 - r.f;
+        p[kPD] = d;
+        p[kPY0] = static_cast<int>(a0 - y0); p[kPNy] = static_cast<int>(a1 - a0);
+        p[kPYS] = static_cast<int>(a0 - (sy0 + ky*ny_l));
+        p[kPZ0] = static_cast<int>(b0 - z0); p[kPNz] = static_cast<int>(b1 - b0);
+        p[kPZS] = static_cast<int>(b0 - (sz0 + kz*nz_l));
+        p[kPOff] = -1; p[kPSeq] = seq++;
+        pcs.push_back(p);
       }
-      const long long kya = FloorDiv(y0 - sy1, ny_l) + 1, kyb = FloorDiv(y1 - 1 - sy0, ny_l);
-      long long kza = FloorDiv(z0 - sz1, nz_l) + 1, kzb = FloorDiv(z1 - 1 - sz0, nz_l);
-      // (S2c) non-periodic x3: no images; the x3 ghost rows beyond the boundary are
-      // left to the physical boundary conditions (they run after this exchange)
-      if (!zper) {kza = std::max(kza, 0LL); kzb = std::min(kzb, 0LL);}
-      for (long long ky=kya; ky<=kyb; ++ky) {
-        const long long a0 = std::max(y0, sy0 + ky*ny_l), a1 = std::min(y1, sy1 + ky*ny_l);
-        if (a1 <= a0) continue;
-        for (long long kz=kza; kz<=kzb; ++kz) {
-          const long long b0 = std::max(z0, sz0 + kz*nz_l), b1 = std::min(z1, sz1 + kz*nz_l);
-          if (b1 <= b0) continue;
-          if (d >= 0 && ((nx2 % (1 << d)) != 0 || (nx3 % (1 << d)) != 0 ||
-                         ng*(1 << d) > nx1)) {
-            bad = true;
-            continue;
-          }
-          // the pair index (MPI tag) counts every sending block of the receiving block,
-          // local or not, so that both sides derive the same number
-          if (pair_of.find(sg) == pair_of.end()) {
-            pair_of.emplace(sg, static_cast<int>(pair_of.size()));
-          }
-          const bool sloc = (pm->rank_eachmb[sg] == my_rank);
-          if (!(rloc || sloc)) continue;
-          std::vector<int> p(kPNField, 0);
-          p[kPRGid] = r.gid; p[kPRType] = r.type; p[kPRFace] = r.f; p[kPRIdx] = ridx;
-          p[kPSGid] = sg; p[kPSLoc] = sloc ? 1 : 0; p[kPSFace] = 1 - r.f; p[kPD] = d;
-          p[kPY0] = static_cast<int>(a0 - y0); p[kPNy] = static_cast<int>(a1 - a0);
-          p[kPYS] = static_cast<int>(a0 - (sy0 + ky*ny_l));
-          p[kPZ0] = static_cast<int>(b0 - z0); p[kPNz] = static_cast<int>(b1 - b0);
-          p[kPZS] = static_cast<int>(b0 - (sz0 + kz*nz_l));
-          p[kPOff] = -1;
-          p[kPPair] = pair_of[sg];
-          auto key = std::make_pair(r.gid, sg);
-          if (bypair.find(key) == bypair.end()) pair_order.push_back(key);
-          bypair[key].push_back(p);
+    }
+  };
+  // receivers of this rank (every candidate: local or remote sender)
+  std::vector<std::tuple<int, int, int>> rl;   // local receivers (m, type, face)
+  std::vector<Real> reps;
+  for (int m=0; m<nmb; ++m) {
+    const auto &ll = pm->lloc_eachmb[gids + m];
+    for (int f=0; f<2; ++f) {
+      if (ll.lx1 != ((f == 0) ? 0 : nxl(ll.level) - 1)) continue;
+      for (int type=0; type<2; ++type) {
+        if (type == 1 && !(coarse_on && ll.level > root)) continue;
+        const Recv r = make_recv(gids + m, ll.level, ll.lx2, ll.lx3, type, f);
+        const int ridx = static_cast<int>(rl.size());
+        rl.emplace_back(m, type, f);
+        reps.push_back(r.eps);
+        for (const ShearCand &s : cand_[f][m]) pieces(r, s, ridx);
+      }
+    }
+  }
+  // senders of this rank for receivers on other ranks
+  for (int m=0; m<nmb; ++m) {
+    const auto &ll = pm->lloc_eachmb[gids + m];
+    const ShearCand self{gids + m, my_rank, ll.level, ll.lx2, ll.lx3};
+    for (int f=0; f<2; ++f) {
+      if (ll.lx1 != ((f == 0) ? 0 : nxl(ll.level) - 1)) continue;
+      for (const ShearCand &rc : cand_[f][m]) {
+        if (rc.rank == my_rank) continue;
+        for (int type=0; type<2; ++type) {
+          if (type == 1 && !(coarse_on && rc.level > root)) continue;
+          pieces(make_recv(rc.gid, rc.level, rc.lx2, rc.lx3, type, 1 - f), self, -1);
         }
       }
     }
@@ -183,32 +180,27 @@ void ShearingBox::PlanPull() {
               << "by 2^d)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // flat offsets, one message per pair with a remote side
-  int soff = 0, roff = 0;
-  {
-    for (const auto &key : pair_order) {
-      auto &v = bypair[key];
-      const int pidx = v[0][kPPair];
-      const bool rloc = (pm->rank_eachmb[key.first] == my_rank);
-      const bool sloc = (pm->rank_eachmb[key.second] == my_rank);
-      int size = 0;
-      for (auto &p : v) size += nvar_pull*ng*p[kPNz]*p[kPNy];
-      if (rloc != sloc) {
-        int &off = rloc ? roff : soff;
-        const int start = off;
-        for (auto &p : v) {p[kPOff] = off; off += nvar_pull*ng*p[kPNz]*p[kPNy];}
-#if MPI_PARALLEL_ENABLED
-        pmsg_rank.push_back(rloc ? pm->rank_eachmb[key.second] : pm->rank_eachmb[key.first]);
-        pmsg_off.push_back(start);
-        pmsg_size.push_back(size);
-        const int lid = key.first - pm->gids_eachrank[pm->rank_eachmb[key.first]];
-        pmsg_tag.push_back(CreateBvals_MPI_Tag(lid, pidx));
-        pmsg_send.push_back(sloc ? 1 : 0);
-#endif
-      }
-      for (auto &p : v) pcs.push_back(p);
-    }
+  // one message per peer rank and direction
+  std::vector<std::array<long long, 8>> key;
+  std::vector<int> rem;
+  for (int n=0; n<static_cast<int>(pcs.size()); ++n) {
+    const auto &p = pcs[n];
+    const bool rloc = (p[kPRIdx] >= 0), sloc = (p[kPSLoc] == 1);
+    if (rloc == sloc) continue;
+    const int peer = rloc ? pm->rank_eachmb[p[kPSGid]] : pm->rank_eachmb[p[kPRGid]];
+    key.push_back({rloc ? 0LL : 1LL, peer, p[kPRGid], p[kPRType], p[kPRFace], p[kPSGid],
+                   p[kPSeq], static_cast<long long>(nvar_pull)*ng*p[kPNz]*p[kPNy]});
+    rem.push_back(n);
   }
+  std::vector<int> offset;
+  int soff = 0, roff = 0;
+#if MPI_PARALLEL_ENABLED
+  LayoutPeerMessages(key, offset, pmsg_rank, pmsg_off, pmsg_size, pmsg_send, soff, roff);
+#else
+  std::vector<int> mr, mo, ms, md;
+  LayoutPeerMessages(key, offset, mr, mo, ms, md, soff, roff);
+#endif
+  for (int i=0; i<static_cast<int>(rem.size()); ++i) pcs[rem[i]][kPOff] = offset[i];
   nppiece = static_cast<int>(pcs.size());
   nprecv = static_cast<int>(rl.size());
   npymax = maxny; npzmax = maxnz;
@@ -254,16 +246,9 @@ void ShearingBox::PlanPull() {
     prreq_ = new MPI_Request[npreq_];
   }
   for (int n=0; n<npreq_; ++n) {psreq_[n] = MPI_REQUEST_NULL; prreq_[n] = MPI_REQUEST_NULL;}
-  int *tag_ub = nullptr, flag = 0;
-  MPI_Comm_get_attr(comm_pull, MPI_TAG_UB, &tag_ub, &flag);
+  pmsg_tag.assign(nmsg, 0);   // one message per (peer, direction): the order identifies it
   bool no_errors = true;
   for (int n=0; n<nmsg; ++n) {
-    if (flag && pmsg_tag[n] > *tag_ub) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "shearing box (experimental_face_levels): MPI tag above MPI_TAG_UB"
-                << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
     if (pmsg_send[n] == 1) continue;
     if (MPI_Irecv(precvflat.data() + pmsg_off[n], pmsg_size[n], MPI_ATHENA_REAL,
                   pmsg_rank[n], pmsg_tag[n], comm_pull, &(prreq_[n])) != MPI_SUCCESS) {

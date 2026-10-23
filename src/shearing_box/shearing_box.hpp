@@ -9,6 +9,8 @@
 //! \brief definitions for classes that implement shearing box abstract base and derived
 //! classes (for CC and FC variables).
 
+#include <array>
+#include <cstdint>
 #include <utility>
 
 #include <vector>
@@ -93,7 +95,7 @@ class ShearingBox {
   int nvar_pull = 0;
   ReconstructionMethod rcon_pull = ReconstructionMethod::plm;
   enum PullField {kPRGid, kPRType, kPRFace, kPRIdx, kPSGid, kPSLoc, kPSFace, kPD,
-                  kPY0, kPNy, kPYS, kPZ0, kPNz, kPZS, kPOff, kPPair, kPNField};
+                  kPY0, kPNy, kPYS, kPZ0, kPNz, kPZS, kPOff, kPSeq, kPNField};
   DualArray2D<int> ppiece;      // pieces with a local sender or receiver
   int nppiece = 0, npymax = 1, npzmax = 1;
   DualArray2D<int> precv;       // local receivers: (m, type 0 fine / 1 coarse, face)
@@ -109,6 +111,21 @@ class ShearingBox {
 #endif
   void PlanPull();              // with the current yshear; posts the receives
   bool WaitPull();
+  // Block-local plans (S2d).  Per regrid, every local block on an x1
+  // face keeps the blocks of the opposite face that overlap it in x3 (with a ghost margin): the
+  // only candidates of its shear exchanges, whatever the shift.  Per stage each rank plans only
+  // the pieces it sends or receives; the pieces with a remote side go in one message per peer
+  // rank and direction, in an order both sides derive from the pieces themselves.
+  struct ShearCand {int gid, rank, level; std::int32_t lx2, lx3;};
+  std::vector<std::vector<ShearCand>> cand_[2];   // [face of the local block][local m]
+  std::vector<std::vector<int>> candsort_[2];      // their indices sorted by (level, lx3, lx2)
+  void BuildCandidates();
+  // remote pieces of one exchange: entries {dir (0 receive, 1 send), peer, k1..k5, size};
+  // fills offset[i] per piece and the message lists (rank, offset, size, send)
+  static void LayoutPeerMessages(const std::vector<std::array<long long, 8>> &key,
+                                 std::vector<int> &offset, std::vector<int> &mrank,
+                                 std::vector<int> &moff, std::vector<int> &msize,
+                                 std::vector<int> &msend, int &soff, int &roff);
 
   // functions
   TaskStatus InitRecv(Real time);
@@ -200,6 +217,7 @@ class ShearingBoxCC : public ShearingBox {
 #if MPI_PARALLEL_ENABLED
   MPI_Request *fsreq_ = nullptr, *frreq_ = nullptr;
   int nfreq_ = 0;
+  std::vector<int> fmsg_rank, fmsg_off, fmsg_size, fmsg_send, fmsg_tag;   // one per message
 #endif
   void PlanFluxMatch();                     // with the current yshear (InitRecv)
   TaskStatus SendFluxMatch(DvceFaceFld5D<Real> &flx);

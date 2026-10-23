@@ -85,6 +85,7 @@ void Hydro::AssembleHydroTasks(std::map<std::string, std::shared_ptr<TaskList>> 
 //! initialize all boundary receive status flags to waiting (with or without MPI).
 
 TaskStatus Hydro::InitRecv(Driver *pdrive, int stage) {
+  flux_unpacked = false;   // RecvFlux unpacks the flux correction once per stage
   // post receives for U
   TaskStatus tstat = pbval_u->InitRecv(nhydro+nscalars);
   if (tstat != TaskStatus::complete) return tstat;
@@ -230,11 +231,16 @@ TaskStatus Hydro::SendFlux(Driver *pdrive, int stage) {
 TaskStatus Hydro::RecvFlux(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
   // Only execute BoundaryValues function with SMR/SMR
-  if (pmy_pack->pmesh->multilevel) {
+  // once per stage: while the shear flux matching below is still waiting this task
+  // is called again, and the unpack must not run each time (on several nodes it did, thousands
+  // of extra kernels)
+  if (pmy_pack->pmesh->multilevel && !flux_unpacked) {
     tstat = pbval_u->RecvAndUnpackFluxCC(uflx);
+    if (tstat != TaskStatus::complete) return tstat;
   }
+  flux_unpacked = true;
   // the shear flux matching (after the flux correction: different faces)
-  if (tstat == TaskStatus::complete && psbox_u != nullptr && psbox_u->flux_on) {
+  if (psbox_u != nullptr && psbox_u->flux_on) {
     tstat = psbox_u->RecvFluxMatch(uflx, recon_method);
   }
   return tstat;

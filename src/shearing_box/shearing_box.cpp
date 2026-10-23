@@ -84,6 +84,7 @@ ShearingBox::~ShearingBox() {
 
 void ShearingBox::BuildBoundaryLists() {
   pull_ghost_valid = false;   // new or moved blocks: x1 ghosts not collected yet
+  BuildCandidates();
   // Create vector with GID of every MBs on this rank at ix1/ox1 shearing-box boundaries
   std::vector<int> tmp_ix1bndry_gid, tmp_ox1bndry_gid;
   auto &mbbcs = pmy_pack->pmb->mb_bcs;

@@ -116,6 +116,7 @@ class Hydro {
 
   // container to hold names of TaskIDs
   HydroTaskIDs id;
+  bool flux_unpacked = false;   // the flux correction of this stage is unpacked
 
   // functions...
   void AssembleHydroTasks(std::map<std::string, std::shared_ptr<TaskList>> tl);
