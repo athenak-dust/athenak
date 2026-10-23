@@ -178,6 +178,9 @@ void DustGasDrag::CheckClouds3D() {
                   "feedback check, patch statistics, position order)");
   }
   if (!cloud_split_device || cloud_split_log || split_oracle) bad.push_back("the host split");
+  if (pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic) {
+    bad.push_back("physical x3 faces (the leaf traversal is periodic in x3)");
+  }
   if (cloud_instant_switch) bad.push_back("cloud_instant_switch");
   if (cloud_sort_interval > 0 || cloud_order_interval > 0) {
     bad.push_back("the particle sort or order index (cloud_sort_interval, cloud_order_interval)");

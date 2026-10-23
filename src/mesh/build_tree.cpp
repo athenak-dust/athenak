@@ -228,7 +228,9 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
     }
     // 3-D shearing box (S2): the 2:1 rule may refine single blocks on the
     // shear-periodic x1 faces; refine the rest of their columns along x2
-    if (three_d && mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
+    if (three_d && mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic &&
+        !(pin->DoesBlockExist("shearing_box") &&
+          pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", false))) {
       int nnew = 0;
       ptree->RefineShearFaceColumns(nnew);
     }

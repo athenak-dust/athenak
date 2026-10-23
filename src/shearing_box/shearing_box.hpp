@@ -11,6 +11,8 @@
 
 #include <utility>
 
+#include <vector>
+
 #include "athena.hpp"
 #include "parameter_input.hpp"
 #include "tasklist/task_list.hpp"
@@ -76,6 +78,33 @@ class ShearingBox {
   // unique MPI communicator for shearing box
   MPI_Comm comm_sbox;
 #endif
+
+  // (S2b) <shearing_box>/experimental_face_levels: the blocks on the x1
+  // faces may change level along x2.  The x1 ghost zones (and those of the coarse arrays) are
+  // then collected by each face block from the opposite face, converted to its level by the
+  // senders and remapped by the receiver (ShearingBox::PlanPull, ShearingBoxCC::PullSend/
+  // PullRecv), instead of the two-step exchange between blocks of one level.
+  bool face_levels = false;
+  bool pull_ghost_valid = false;   // (S2c) x1 ghosts hold collected values (not after a regrid)
+  int nvar_pull = 0;
+  ReconstructionMethod rcon_pull = ReconstructionMethod::plm;
+  enum PullField {kPRGid, kPRType, kPRFace, kPRIdx, kPSGid, kPSLoc, kPSFace, kPD,
+                  kPY0, kPNy, kPYS, kPZ0, kPNz, kPZS, kPOff, kPPair, kPNField};
+  DualArray2D<int> ppiece;      // pieces with a local sender or receiver
+  int nppiece = 0, npymax = 1, npzmax = 1;
+  DualArray2D<int> precv;       // local receivers: (m, type 0 fine / 1 coarse, face)
+  DualArray1D<Real> precv_eps;  // fraction of the shift of each receiver
+  int nprecv = 0;
+  DvceArray5D<Real> pbuf;       // (receiver, v, z rows, depth, y rows)
+  DvceArray1D<Real> psendflat, precvflat;
+#if MPI_PARALLEL_ENABLED
+  MPI_Comm comm_pull;
+  MPI_Request *psreq_ = nullptr, *prreq_ = nullptr;
+  int npreq_ = 0;
+  std::vector<int> pmsg_rank, pmsg_off, pmsg_size, pmsg_tag, pmsg_send;   // one per message
+#endif
+  void PlanPull();              // with the current yshear; posts the receives
+  bool WaitPull();
 
   // functions
   TaskStatus InitRecv(Real time);
@@ -172,6 +201,27 @@ class ShearingBoxCC : public ShearingBox {
   TaskStatus SendFluxMatch(DvceFaceFld5D<Real> &flx);
   TaskStatus RecvFluxMatch(DvceFaceFld5D<Real> &flx, ReconstructionMethod rcon);
   TaskStatus ClearFluxMatch();
+  // face levels: flux matching by overlapping cell pairs (finer side, equal:
+  // outer); a block may receive on parts of its face and send on others
+  enum FluxPairField {kQRGid, kQRIdx, kQRFace, kQSGid, kQSLoc, kQSFace, kQD, kQR0, kQNy,
+                      kQK0, kQNz, kQBase, kQBaseZ, kQOff, kQPair, kQNField};
+  DualArray2D<int> qpiece;
+  DualArray1D<Real> qfrac;      // fractional part of the shift of each piece (sender cells)
+  int nqpiece = 0;
+  DvceArray5D<Real> qacc;       // (m, face, nvar+1, k, j): sum of contributions, last = fraction
+  DvceArray1D<Real> qsendflat, qrecvflat;
+#if MPI_PARALLEL_ENABLED
+  MPI_Comm comm_qflx;
+  MPI_Request *qsreq_ = nullptr, *qrreq_ = nullptr;
+  int nqreq_ = 0;
+  std::vector<int> qmsg_rank, qmsg_off, qmsg_size, qmsg_tag, qmsg_send;
+#endif
+  void PlanFluxPair();
+  TaskStatus SendFluxPair(DvceFaceFld5D<Real> &flx);
+  TaskStatus RecvFluxPair(DvceFaceFld5D<Real> &flx);
+  // the collected ghost zones
+  TaskStatus PullSend(DvceArray5D<Real> &a);
+  TaskStatus PullRecv(DvceArray5D<Real> &a, const bool coarse);
 
  private:
   int nvar_;

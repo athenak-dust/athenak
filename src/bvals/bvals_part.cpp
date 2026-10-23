@@ -94,9 +94,37 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
   // accessing the sendlist member through `this`) leaves a host pointer in a CUDA
   // lambda and fails as soon as an inter-rank particle is appended or packed.
   auto psendl = sendlist.d_view;
+  // (S3c) the physical x3 faces: reflect or outflow (see bvals.hpp)
+  const int x3bc = x3bc_dust;
+  auto x3rem = x3_removed.d_view;
+  const Real z3a = meshsize.x3min, z3b = meshsize.x3max;
   par_for("part_update",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     int mylevel = mblev.d_view(m);
+    if (x3bc != 0 && (pr(IPZ,p) < z3a || pr(IPZ,p) >= z3b)) {
+      const bool lo = (pr(IPZ,p) < z3a);
+      if (x3bc == 1) {   // reflect: mirror the position (and the RK register) and the velocity
+        const Real zf = lo ? z3a : z3b;
+        Real z = 2.0*zf - pr(IPZ,p);
+        if (z >= z3b) z = z3b - 1.0e-12*(z3b - z3a);
+        if (z < z3a) z = z3a;
+        pr(IPZ,p) = z;
+        pr(IPVZ,p) = -pr(IPVZ,p);
+        if (has_reg) {pr(IPZ1,p) = 2.0*zf - pr(IPZ1,p); pr(IPVZ1,p) = -pr(IPVZ1,p);}
+      } else {           // outflow: record the mass, park the (now massless) particle at rest
+        Kokkos::atomic_add(&x3rem(0), pr(IPM,p));
+        Kokkos::atomic_add(&x3rem(1), 1.0);
+        pr(IPM,p) = 0.0;
+        const Real dz = mbsize.d_view(m).dx3;
+        const Real z = lo ? (mbsize.d_view(m).x3min + 0.5*dz) : (mbsize.d_view(m).x3max - 0.5*dz);
+        pr(IPZ,p) = z;
+        pr(IPVX,p) = 0.0; pr(IPVY,p) = 0.0; pr(IPVZ,p) = 0.0;
+        if (has_reg) {
+          pr(IPX1,p) = pr(IPX,p); pr(IPY1,p) = pr(IPY,p); pr(IPZ1,p) = z;
+          pr(IPVX1,p) = 0.0; pr(IPVY1,p) = 0.0; pr(IPVZ1,p) = 0.0;
+        }
+      }
+    }
     Real x1 = pr(IPX,p);
     Real x2 = pr(IPY,p);
     Real x3 = pr(IPZ,p);

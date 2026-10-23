@@ -74,8 +74,10 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
     }
     prolong_amp_eps = pin->GetOrAddReal("mesh_refinement", "prolong_amplitude_eps", 0.0);
     coarse_physical_bcs = pin->GetOrAddBoolean("mesh_refinement", "coarse_physical_bcs", true);
+    // (no columns with <shearing_box>/experimental_face_levels)
     sbox_columns = pm->adaptive && pm->three_d && pin->DoesBlockExist("shearing_box") &&
-                   pin->GetOrAddBoolean("shearing_box", "experimental_smr", false);
+                   pin->GetOrAddBoolean("shearing_box", "experimental_smr", false) &&
+                   !pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", false);
     if (prolong_amp_eps > 0.0) {
       if (pm->adaptive || prolong_prims) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__

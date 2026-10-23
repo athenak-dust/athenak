@@ -315,12 +315,26 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
   auto recvoff = recv_agg_offset_;
 #endif
 
+  // (S2c) with the collected shearing-box ghost zones the x1 ghosts across a
+  // shear-periodic face are not unpacked: they keep the last collected (sheared) values, which
+  // the next collection uses for its x slopes
+  const bool skip_shr = skip_shear_x1_prol && pmy_pack->pmesh->three_d;
+  auto &mbbcs = pmy_pack->pmb->mb_bcs;
+
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
   Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr*nvar), Kokkos::AUTO);
   Kokkos::parallel_for("RecvBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
     const int m = (tmember.league_rank())/(nnghbr*nvar);
     const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
     const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+    if (skip_shr) {
+      const int ox = ShearSlotOx1(n);
+      if ((ox == -1 && mbbcs.d_view(m,BoundaryFace::inner_x1) == BoundaryFlag::shear_periodic)
+          || (ox == 1 &&
+              mbbcs.d_view(m,BoundaryFace::outer_x1) == BoundaryFlag::shear_periodic)) {
+        return;
+      }
+    }
 
     // only unpack buffers when neighbor exists
     if (nghbr.d_view(m,n).gid >= 0) {

@@ -40,6 +40,7 @@ void ShearingBoxCC::PlanFluxMatch() {
   nfpiece = 0;
   nfrecv = 0;
   if (!flux_on) return;
+  if (face_levels) {PlanFluxPair(); return;}
   Mesh *pm = pmy_pack->pmesh;
   auto &indcs = pm->mb_indcs;
   const int nx2 = indcs.nx2, nk = indcs.nx3;
@@ -202,6 +203,7 @@ void ShearingBoxCC::PlanFluxMatch() {
 //! receivers, or packed and sent
 
 TaskStatus ShearingBoxCC::SendFluxMatch(DvceFaceFld5D<Real> &flx) {
+  if (flux_on && face_levels) return SendFluxPair(flx);
   if (!flux_on || nfpiece == 0) return TaskStatus::complete;
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   const int is = indcs.is, ie = indcs.ie, js = indcs.js, ks = indcs.ks;
@@ -265,6 +267,7 @@ TaskStatus ShearingBoxCC::SendFluxMatch(DvceFaceFld5D<Real> &flx) {
 //! of the local receivers
 
 TaskStatus ShearingBoxCC::RecvFluxMatch(DvceFaceFld5D<Real> &flx, ReconstructionMethod rcon) {
+  if (flux_on && face_levels) return RecvFluxPair(flx);
   if (!flux_on || nfpiece == 0) return TaskStatus::complete;
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   const int is = indcs.is, ie = indcs.ie, js = indcs.js, ks = indcs.ks;
@@ -346,6 +349,10 @@ TaskStatus ShearingBoxCC::ClearFluxMatch() {
 #if MPI_PARALLEL_ENABLED
   if (!flux_on) return TaskStatus::complete;
   bool no_errors = true;
+  for (int n=0; n<nqreq_; ++n) {
+    if (MPI_Wait(&(qsreq_[n]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
+    if (MPI_Wait(&(qrreq_[n]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
+  }
   for (int n=0; n<nfreq_; ++n) {
     if (MPI_Wait(&(fsreq_[n]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
     if (MPI_Wait(&(frreq_[n]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
@@ -356,5 +363,320 @@ TaskStatus ShearingBoxCC::ClearFluxMatch() {
     std::exit(EXIT_FAILURE);
   }
 #endif
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void ShearingBoxCC::PlanFluxPair()
+//! \brief Face levels: for every block Y on a face and every block X on the
+//! opposite face that overlaps it after the shear shift and is authoritative there (finer, or
+//! the same level and on the outer face), a piece: the rows / x3 rows of Y it covers, the
+//! offsets that place X's rows in Y's frame (in X cells: X row jl occupies [jl + base + frac,
+//! jl + base + frac + 1) and Y row r occupies [r 2^d, (r+1) 2^d)), and the MPI message.
+
+void ShearingBoxCC::PlanFluxPair() {
+  nqpiece = 0;
+  Mesh *pm = pmy_pack->pmesh;
+  const bool zper = (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic);
+  auto &indcs = pm->mb_indcs;
+  const int nx2 = indcs.nx2, nx3 = indcs.nx3;
+  const int root = pm->root_level;
+  const int my_rank = global_variable::my_rank;
+  const Real ly = pm->mesh_size.x2max - pm->mesh_size.x2min;
+  auto nxl = [pm, root](int l) {return pm->nmb_rootx1 << (l - root);};
+  std::vector<int> face[2];
+  for (int g=0; g<pm->nmb_total; ++g) {
+    const auto &ll = pm->lloc_eachmb[g];
+    if (ll.lx1 == 0) face[0].push_back(g);
+    if (ll.lx1 == nxl(ll.level) - 1) face[1].push_back(g);
+  }
+  std::vector<std::vector<int>> pcs;
+  std::vector<Real> fr;
+  std::map<std::pair<int, int>, std::vector<int>> bypair;   // (Y gid, X gid) -> piece ids
+  std::vector<std::pair<int, int>> pair_order;
+  bool bad = false;
+  // receivers in gid order, then face
+  std::vector<std::pair<int, int>> ys;
+  for (int f=0; f<2; ++f) for (int g : face[f]) ys.emplace_back(g, f);
+  std::stable_sort(ys.begin(), ys.end(),
+                   [](const std::pair<int, int> &a, const std::pair<int, int> &b) {
+                     return a.first < b.first;});
+  int cur = -1;
+  std::map<int, int> pair_of;
+  for (const auto &yf : ys) {
+    const int yg = yf.first, fy = yf.second;
+    if (yg != cur) {cur = yg; pair_of.clear();}
+    const auto &yl = pm->lloc_eachmb[yg];
+    const bool rloc = (pm->rank_eachmb[yg] == my_rank);
+    for (int xg : face[1 - fy]) {
+      const auto &xl = pm->lloc_eachmb[xg];
+      const int d = xl.level - yl.level;
+      if (d < 0 || (d == 0 && fy == 1)) continue;   // Y is authoritative there
+      const long long f2 = 1LL << d;
+      if ((nx2 % f2) != 0 || (nx3 % f2) != 0) {bad = true; continue;}
+      const long long nyx = static_cast<long long>(pm->nmb_rootx2)*nx2 << (xl.level - root);
+      const long long nzx = static_cast<long long>(pm->nmb_rootx3)*nx3 << (xl.level - root);
+      // x3: X k row kx sits at kx + bz in Y's frame (X cells); Y spans [0, nx3 f2)
+      const long long zy0 = static_cast<long long>(yl.lx3)*nx3*f2;
+      const long long zx0 = static_cast<long long>(xl.lx3)*nx3;
+      // y: shift of X's rows in Y's frame, in X cells
+      const Real sig = yshear/(ly/static_cast<Real>(nyx));
+      const Real del = (fy == 0) ? sig : -sig;
+      const Real dfl = std::floor(del);
+      const Real dfr = del - dfl;
+      long long dint = static_cast<long long>(dfl) % nyx;
+      if (dint < 0) dint += nyx;
+      const long long yy0 = static_cast<long long>(yl.lx2)*nx2*f2;
+      const long long yx0 = static_cast<long long>(xl.lx2)*nx2 + dint;
+      const long long spany = static_cast<long long>(nx2)*f2, spanz = static_cast<long long>(nx3)*f2;
+      for (long long kz=(zper ? -2 : 0); kz<=(zper ? 2 : 0); ++kz) {   // (S2c) images only in a
+                                                                      // periodic x3
+        const long long bz = zx0 + kz*nzx - zy0;
+        if (!(bz < spanz && bz + nx3 > 0)) continue;
+        const int k0 = static_cast<int>(std::max(0LL, bz/f2));
+        const int k1 = static_cast<int>(std::min(static_cast<long long>(nx3),
+                                                 (bz + nx3 + f2 - 1)/f2));
+        if (k1 <= k0) continue;
+        for (long long ky=-2; ky<=2; ++ky) {
+          const long long by = yx0 + ky*nyx - yy0;    // X row 0 at [by + dfr, by + dfr + 1)
+          const Real lo = static_cast<Real>(by) + dfr, hi = lo + nx2;
+          if (!(lo < static_cast<Real>(spany) && hi > 0.0)) continue;
+          const int r0 = std::max(0, static_cast<int>(std::floor(lo/static_cast<Real>(f2))));
+          const int r1 = std::min(nx2, static_cast<int>(std::ceil(hi/static_cast<Real>(f2))));
+          if (r1 <= r0) continue;
+          if (pair_of.find(xg) == pair_of.end()) {
+            pair_of.emplace(xg, static_cast<int>(pair_of.size()));
+          }
+          const bool sloc = (pm->rank_eachmb[xg] == my_rank);
+          if (!(rloc || sloc)) continue;
+          std::vector<int> p(kQNField, 0);
+          p[kQRGid] = yg; p[kQRIdx] = rloc ? 1 : -1; p[kQRFace] = fy;
+          p[kQSGid] = xg; p[kQSLoc] = sloc ? 1 : 0; p[kQSFace] = 1 - fy; p[kQD] = d;
+          p[kQR0] = r0; p[kQNy] = r1 - r0; p[kQK0] = k0; p[kQNz] = k1 - k0;
+          p[kQBase] = static_cast<int>(by); p[kQBaseZ] = static_cast<int>(bz);
+          p[kQOff] = -1; p[kQPair] = pair_of[xg];
+          auto key = std::make_pair(yg, xg);
+          if (bypair.find(key) == bypair.end()) pair_order.push_back(key);
+          bypair[key].push_back(static_cast<int>(pcs.size()));
+          pcs.push_back(p);
+          fr.push_back(dfr);
+        }
+      }
+    }
+  }
+  if (bad) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "shear flux matching (face levels): level difference too large for the "
+              << "block size" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  // flat buffers per message (pieces of one pair are contiguous)
+  std::vector<int> order;
+  int soff = 0, roff = 0;
+#if MPI_PARALLEL_ENABLED
+  qmsg_rank.clear(); qmsg_off.clear(); qmsg_size.clear(); qmsg_tag.clear(); qmsg_send.clear();
+#endif
+  for (const auto &key : pair_order) {
+    const auto &ids = bypair[key];
+    const bool rloc = (pm->rank_eachmb[key.first] == my_rank);
+    const bool sloc = (pm->rank_eachmb[key.second] == my_rank);
+    if (rloc != sloc) {
+      int &off = rloc ? roff : soff;
+      const int start = off;
+      for (int id : ids) {
+        pcs[id][kQOff] = off;
+        off += (nvar_ + 1)*pcs[id][kQNz]*pcs[id][kQNy];
+      }
+#if MPI_PARALLEL_ENABLED
+      qmsg_rank.push_back(rloc ? pm->rank_eachmb[key.second] : pm->rank_eachmb[key.first]);
+      qmsg_off.push_back(start);
+      qmsg_size.push_back(off - start);
+      const int lid = key.first - pm->gids_eachrank[pm->rank_eachmb[key.first]];
+      qmsg_tag.push_back(CreateBvals_MPI_Tag(lid, pcs[ids[0]][kQPair]));
+      qmsg_send.push_back(sloc ? 1 : 0);
+#endif
+    }
+    for (int id : ids) order.push_back(id);
+  }
+  nqpiece = static_cast<int>(order.size());
+  if (static_cast<int>(qpiece.extent(0)) < std::max(1, nqpiece)) {
+    Kokkos::realloc(qpiece, std::max(1, nqpiece), static_cast<int>(kQNField));
+    Kokkos::realloc(qfrac, std::max(1, nqpiece));
+  }
+  for (int n=0; n<nqpiece; ++n) {
+    for (int c=0; c<kQNField; ++c) qpiece.h_view(n,c) = pcs[order[n]][c];
+    qfrac.h_view(n) = fr[order[n]];
+  }
+  qpiece.template modify<HostMemSpace>();
+  qpiece.template sync<DevExeSpace>();
+  qfrac.template modify<HostMemSpace>();
+  qfrac.template sync<DevExeSpace>();
+  const int nmb = pmy_pack->nmb_thispack;
+  if (static_cast<int>(qacc.extent(0)) < std::max(1, nmb) ||
+      static_cast<int>(qacc.extent(2)) != nvar_ + 1) {
+    Kokkos::realloc(qacc, std::max(1, nmb), 2, nvar_ + 1, nx3, nx2);
+  }
+  if (static_cast<int>(qsendflat.extent(0)) < std::max(1, soff)) {
+    Kokkos::realloc(qsendflat, std::max(1, soff));
+  }
+  if (static_cast<int>(qrecvflat.extent(0)) < std::max(1, roff)) {
+    Kokkos::realloc(qrecvflat, std::max(1, roff));
+  }
+#if MPI_PARALLEL_ENABLED
+  const int nmsg = static_cast<int>(qmsg_rank.size());
+  if (nqreq_ < nmsg) {
+    delete [] qsreq_; delete [] qrreq_;
+    nqreq_ = std::max(16, 2*nmsg);
+    qsreq_ = new MPI_Request[nqreq_];
+    qrreq_ = new MPI_Request[nqreq_];
+  }
+  for (int n=0; n<nqreq_; ++n) {qsreq_[n] = MPI_REQUEST_NULL; qrreq_[n] = MPI_REQUEST_NULL;}
+  bool no_errors = true;
+  for (int n=0; n<nmsg; ++n) {
+    if (qmsg_send[n] == 1) continue;
+    if (MPI_Irecv(qrecvflat.data() + qmsg_off[n], qmsg_size[n], MPI_ATHENA_REAL, qmsg_rank[n],
+                  qmsg_tag[n], comm_qflx, &(qrreq_[n])) != MPI_SUCCESS) {
+      no_errors = false;
+    }
+  }
+  if (!no_errors) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "MPI error in posting receives (flux pairs)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+#endif
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus ShearingBoxCC::SendFluxPair()
+//! \brief The authoritative blocks integrate their x1 face fluxes (piecewise linear in x2,
+//! limited, none at the block's own first and last rows) over each receiving cell; the sums
+//! and the covered fraction go to the receiver's accumulators or to the flat buffer.
+
+TaskStatus ShearingBoxCC::SendFluxPair(DvceFaceFld5D<Real> &flx) {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int is = indcs.is, ie = indcs.ie, js = indcs.js, ks = indcs.ks;
+  const int nx2 = indcs.nx2, nx3 = indcs.nx3;
+  const int gids = pmy_pack->gids;
+  const int nv = nvar_;
+  Kokkos::deep_copy(DevExeSpace(), qacc, 0.0);
+  if (nqpiece == 0) return TaskStatus::complete;
+  auto qp = qpiece;
+  auto qf = qfrac;
+  auto acc = qacc;
+  auto sf = qsendflat;
+  auto f1 = flx.x1f;
+  par_for("shr-qflx-pack", DevExeSpace(), 0, nqpiece-1, 0, nv, 0, nx3-1, 0, nx2-1,
+  KOKKOS_LAMBDA(const int n, const int vv, const int kk, const int rr) {
+    if (qp.d_view(n,kQSLoc) == 0) return;
+    const int ny = qp.d_view(n,kQNy), nz = qp.d_view(n,kQNz);
+    if (rr >= ny || kk >= nz) return;
+    const int r = qp.d_view(n,kQR0) + rr, k = qp.d_view(n,kQK0) + kk;
+    const int f2 = 1 << qp.d_view(n,kQD);
+    const int mx = qp.d_view(n,kQSGid) - gids;
+    const int ix = (qp.d_view(n,kQSFace) == 0) ? is : (ie + 1);
+    const Real base = static_cast<Real>(qp.d_view(n,kQBase)) + qf.d_view(n);
+    const int bz = qp.d_view(n,kQBaseZ);
+    const Real ylo = static_cast<Real>(r*f2), yhi = static_cast<Real>((r + 1)*f2);
+    const int jlo = Kokkos::max(0, static_cast<int>(floor(ylo - base)) - 1);
+    const int jhi = Kokkos::min(nx2 - 1, static_cast<int>(ceil(yhi - base)));
+    const int kxlo = Kokkos::max(0, k*f2 - bz);
+    const int kxhi = Kokkos::min(nx3 - 1, (k + 1)*f2 - 1 - bz);
+    Real sum = 0.0;
+    for (int kx=kxlo; kx<=kxhi; ++kx) {
+      for (int jl=jlo; jl<=jhi; ++jl) {
+        const Real c0 = base + jl;
+        const Real lo = fmax(c0, ylo), hi = fmin(c0 + 1.0, yhi);
+        if (hi <= lo) continue;
+        if (vv == nv) {
+          sum += hi - lo;
+        } else {
+          const Real fc = f1(mx, vv, ks+kx, js+jl, ix);
+          Real slope = 0.0;
+          if (jl > 0 && jl < nx2 - 1) {
+            const Real dql = fc - f1(mx, vv, ks+kx, js+jl-1, ix);
+            const Real dqr = f1(mx, vv, ks+kx, js+jl+1, ix) - fc;
+            if (dql*dqr > 0.0) slope = 2.0*dql*dqr/(dql + dqr);
+          }
+          sum += (hi - lo)*(fc + slope*(0.5*(lo + hi) - (c0 + 0.5)));
+        }
+      }
+    }
+    const Real val = sum/static_cast<Real>(f2*f2);
+    if (qp.d_view(n,kQRIdx) >= 0) {
+      Kokkos::atomic_add(&acc(qp.d_view(n,kQRGid) - gids, qp.d_view(n,kQRFace), vv, k, r), val);
+    } else {
+      sf(qp.d_view(n,kQOff) + (vv*nz + kk)*ny + rr) = val;
+    }
+  });
+#if MPI_PARALLEL_ENABLED
+  Kokkos::fence();
+  bool no_errors = true;
+  for (size_t n=0; n<qmsg_rank.size(); ++n) {
+    if (qmsg_send[n] == 0) continue;
+    if (MPI_Isend(qsendflat.data() + qmsg_off[n], qmsg_size[n], MPI_ATHENA_REAL, qmsg_rank[n],
+                  qmsg_tag[n], comm_qflx, &(qsreq_[n])) != MPI_SUCCESS) {
+      no_errors = false;
+    }
+  }
+  if (!no_errors) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "MPI error in posting sends (flux pairs)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+#endif
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus ShearingBoxCC::RecvFluxPair()
+//! \brief Sums from other ranks, then every face cell: F = F_own (1 - covered) + received
+
+TaskStatus ShearingBoxCC::RecvFluxPair(DvceFaceFld5D<Real> &flx) {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int is = indcs.is, ie = indcs.ie, js = indcs.js, ks = indcs.ks;
+  const int nx2 = indcs.nx2, nx3 = indcs.nx3;
+  const int gids = pmy_pack->gids;
+  const int nv = nvar_;
+  auto qp = qpiece;
+  auto acc = qacc;
+#if MPI_PARALLEL_ENABLED
+  bool done = true, no_errors = true;
+  for (size_t n=0; n<qmsg_rank.size(); ++n) {
+    int test;
+    if (MPI_Test(&(qrreq_[n]), &test, MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
+    if (!(static_cast<bool>(test))) done = false;
+  }
+  if (!no_errors) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "MPI error in testing receives (flux pairs)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (!done) return TaskStatus::incomplete;
+  if (nqpiece > 0) {
+    auto rf = qrecvflat;
+    par_for("shr-qflx-unpk", DevExeSpace(), 0, nqpiece-1, 0, nv, 0, nx3-1, 0, nx2-1,
+    KOKKOS_LAMBDA(const int n, const int vv, const int kk, const int rr) {
+      if (qp.d_view(n,kQSLoc) == 1 || qp.d_view(n,kQRIdx) < 0) return;
+      const int ny = qp.d_view(n,kQNy), nz = qp.d_view(n,kQNz);
+      if (rr >= ny || kk >= nz) return;
+      Kokkos::atomic_add(&acc(qp.d_view(n,kQRGid) - gids, qp.d_view(n,kQRFace), vv,
+                              qp.d_view(n,kQK0) + kk, qp.d_view(n,kQR0) + rr),
+                         rf(qp.d_view(n,kQOff) + (vv*nz + kk)*ny + rr));
+    });
+  }
+#endif
+  const int nmb = pmy_pack->nmb_thispack;
+  auto f1 = flx.x1f;
+  auto &mbbcs = pmy_pack->pmb->mb_bcs;
+  par_for("shr-qflx-apply", DevExeSpace(), 0, nmb-1, 0, 1, 0, nv-1, 0, nx3-1, 0, nx2-1,
+  KOKKOS_LAMBDA(const int m, const int f, const int v, const int k, const int j) {
+    const auto face = (f == 0) ? BoundaryFace::inner_x1 : BoundaryFace::outer_x1;
+    if (mbbcs.d_view(m,face) != BoundaryFlag::shear_periodic) return;
+    const Real cov = acc(m, f, nv, k, j);
+    if (cov <= 0.0) return;
+    const int ix = (f == 0) ? is : (ie + 1);
+    f1(m, v, ks+k, js+j, ix) = f1(m, v, ks+k, js+j, ix)*(1.0 - cov) + acc(m, f, v, k, j);
+  });
   return TaskStatus::complete;
 }

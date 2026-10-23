@@ -480,6 +480,7 @@ TaskStatus MeshBoundaryValuesDep::RecvAndSumDeposit(DvceArray5D<Real> &a) {
     }
     if (!done) return TaskStatus::incomplete;
 #endif
+    GeneralDropRecord(a, plan_->stat);   // dropped ghost deposits beyond an x3 face
     GeneralApply(a, plan_->stat, grbuf_[0]);
     GeneralApply(a, plan_->shr, grbuf_[1]);
     return TaskStatus::complete;

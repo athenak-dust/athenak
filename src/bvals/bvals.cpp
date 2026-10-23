@@ -9,6 +9,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <utility>
 #include <algorithm> // max
 #include <map>
@@ -447,6 +448,7 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
     send_count("send_count",1),
     sgid_map("sgid_map",1,1,1),
     srank_map("srank_map",1,1,1),
+    x3_removed("x3_removed",2),
 #if MPI_PARALLEL_ENABLED
     prtcl_rsendbuf("rsend",1),
     prtcl_rrecvbuf("rrecv",1),
@@ -472,6 +474,25 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
   shear_periodic_x1 =
       (pp->particle_type == ParticleType::dust) &&
       (pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic);
+  // dust at non-periodic x3 faces of a 3-D mesh (stage S3c): <dust>/particle_x3_bc
+  // (default reflect at a reflecting gas boundary, outflow otherwise)
+  if (pp->particle_type == ParticleType::dust && pmesh->three_d &&
+      pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic) {
+    const bool gas_reflect = (pmesh->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::reflect);
+    const std::string b = pin->GetOrAddString("dust", "particle_x3_bc",
+                                              gas_reflect ? "reflect" : "outflow");
+    if (b == "reflect") {
+      x3bc_dust = 1;
+    } else if (b == "outflow") {
+      x3bc_dust = 2;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<dust>/particle_x3_bc must be reflect or outflow" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+  Kokkos::deep_copy(x3_removed.h_view, 0.0);
+  Kokkos::deep_copy(x3_removed.d_view, 0.0);
   if (shear_periodic_x1) {
     qshear_sp = pin->GetReal("shearing_box","qshear");
     omega0_sp = pin->GetReal("shearing_box","omega0");

@@ -158,6 +158,9 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
         pin->GetOrAddBoolean("shearing_box", "experimental_shear_flux_skip", true)) {
       pbval_u->skip_shear_x1_flux = true;
     }
+    // collected ghost zones: AthenaK's prolongation and restriction stay out of the
+    // slots across the shear-periodic faces
+    if (psbox_u->face_levels) pbval_u->skip_shear_x1_prol = true;
     // matching of the x1 fluxes across the shear-periodic boundary;
     // default on with mesh refinement (the face columns can differ in level), off on a uniform
     // mesh (the results there stay those of AthenaK; true makes it conservative too)

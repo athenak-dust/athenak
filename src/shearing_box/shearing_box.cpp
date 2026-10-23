@@ -34,6 +34,20 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   qshear = pin->GetReal("shearing_box","qshear");
   omega0 = pin->GetReal("shearing_box","omega0");
   is_stratified = pin->GetOrAddBoolean("shearing_box","stratified",false);
+  // (S2b) blocks on the x1 faces may change level along x2
+  face_levels = pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", false);
+  // (S2c) non-periodic x3 needs the coarse-array physical
+  // boundaries for the corners the collected ghost zones leave to them; dust
+  // (u* through the same collection, deposits through the general remap, particle routing by the
+  // face-block table) is covered
+  if (face_levels && ppack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
+      pin->DoesBlockExist("mesh_refinement") &&
+      !pin->GetOrAddBoolean("mesh_refinement", "coarse_physical_bcs", true)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<shearing_box>/experimental_face_levels with non-periodic x3 needs "
+              << "<mesh_refinement>/coarse_physical_bcs = true" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 
   BuildBoundaryLists();
   CheckLevelsAlongX2();
@@ -44,6 +58,7 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
 #if MPI_PARALLEL_ENABLED
   // create unique communicators for shearing box
   MPI_Comm_dup(MPI_COMM_WORLD, &comm_sbox);
+  MPI_Comm_dup(MPI_COMM_WORLD, &comm_pull);
 #endif
 }
 
@@ -61,6 +76,7 @@ ShearingBox::~ShearingBox() {
 //! constructor and again after every regrid.
 
 void ShearingBox::BuildBoundaryLists() {
+  pull_ghost_valid = false;   // new or moved blocks: x1 ghosts not collected yet
   // Create vector with GID of every MBs on this rank at ix1/ox1 shearing-box boundaries
   std::vector<int> tmp_ix1bndry_gid, tmp_ox1bndry_gid;
   auto &mbbcs = pmy_pack->pmb->mb_bcs;
@@ -109,6 +125,7 @@ void ShearingBox::BuildBoundaryLists() {
 //! are allowed: their data reach the fine block's coarse array, which is sheared as well.
 
 void ShearingBox::CheckLevelsAlongX2() const {
+  if (face_levels) return;   // the collected ghost zones need no uniform columns
   Mesh *pm = pmy_pack->pmesh;
   if (!(pm->multilevel && pm->three_d &&
         pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic)) return;

@@ -467,9 +467,88 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
 //! \fn dust::DensityRefinement
 //! \brief Refinement request from the deposited dust density (see the file header).
 
+//----------------------------------------------------------------------------------------
+//! \fn dust::DensityRefinement3DPoint
+//! \brief The dust-density request in 3-D (point particles, owner_overlap or a
+//! uniform root): the particle mass of every block on its own cells (NGP), the largest rho_d /
+//! mean of the block (mean over the whole mesh) against amr_rho_refine / amr_rho_derefine, times
+//! amr_rho_level_factor^level as in 2-D.  No buffer: the 2:1 rule and the shear-face columns of
+//! the mesh refinement do the rest.
+
+void DensityRefinement3DPoint(MeshBlockPack *pmbp) {
+  Mesh *pm = pmbp->pmesh;
+  particles::Particles *ppar = pmbp->ppart;
+  auto &refine_flag = pm->pmr->refine_flag;
+  auto &ind = pm->mb_indcs;
+  const int nmb = pmbp->nmb_thispack, mbs = pm->gids_eachrank[global_variable::my_rank];
+  const int nx1 = ind.nx1, nx2 = ind.nx2, nx3 = ind.nx3;
+  const int npart = ppar->nprtcl_thispack, gids = pmbp->gids;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  auto &mbsize = pmbp->pmb->mb_size;
+  DvceArray4D<Real> rho("amr_rho3d", std::max(1, nmb), nx3, nx2, nx1);
+  Real mtot = 0.0;
+  if (npart > 0) {
+    Kokkos::parallel_reduce("amr_rho3d_dep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, Real &ms) {
+      const int m = pi(PGID,p) - gids;
+      const auto &sz = mbsize.d_view(m);
+      int i = static_cast<int>(Kokkos::floor((pr(IPX,p) - sz.x1min)/sz.dx1));
+      int j = static_cast<int>(Kokkos::floor((pr(IPY,p) - sz.x2min)/sz.dx2));
+      int k = static_cast<int>(Kokkos::floor((pr(IPZ,p) - sz.x3min)/sz.dx3));
+      i = Kokkos::min(nx1 - 1, Kokkos::max(0, i));
+      j = Kokkos::min(nx2 - 1, Kokkos::max(0, j));
+      k = Kokkos::min(nx3 - 1, Kokkos::max(0, k));
+      Kokkos::atomic_add(&rho(m,k,j,i), pr(IPM,p)/(sz.dx1*sz.dx2*sz.dx3));
+      ms += pr(IPM,p);
+    }, Kokkos::Sum<Real>(mtot));
+  }
+  DvceArray1D<Real> bmax("amr_rho3d_bmax", std::max(1, nmb));
+  const int ncell = nx1*nx2*nx3;
+  Kokkos::parallel_for("amr_rho3d_max", Kokkos::TeamPolicy<>(DevExeSpace(), std::max(1, nmb),
+                                                            Kokkos::AUTO),
+  KOKKOS_LAMBDA(const TeamMember_t &tm) {
+    const int m = tm.league_rank();
+    if (m >= nmb) return;
+    Real mx = 0.0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, ncell), [&](const int c, Real &q) {
+      const int k = c/(nx2*nx1), r = c - k*nx2*nx1, j = r/nx1, i = r - j*nx1;
+      q = Kokkos::fmax(q, rho(m,k,j,i));
+    }, Kokkos::Max<Real>(mx));
+    Kokkos::single(Kokkos::PerTeam(tm), [&]() {bmax(m) = mx;});
+  });
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  const auto &ms = pm->mesh_size;
+  const Real mean = mtot/((ms.x1max - ms.x1min)*(ms.x2max - ms.x2min)*(ms.x3max - ms.x3min));
+  auto bh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bmax);
+  int nflag[2] = {0, 0};   // (counts, for a log)
+  for (int m=0; m<nmb; ++m) {
+    const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
+    const Real q = (mean > 0.0) ? bh(m)/mean : 0.0;
+    const Real fr = std::pow(trig_.level_factor, l);
+    const Real fd = (l > 0) ? std::pow(trig_.level_factor, l - 1) : 1.0;
+    int flag = 0;
+    if (q >= trig_.rho_refine*fr) flag = 1;
+    else if (l > 0 && q < trig_.rho_derefine*fd) flag = -1;
+    refine_flag.h_view(m + mbs) = flag;
+    if (flag > 0) ++nflag[0];
+    if (flag < 0) ++nflag[1];
+  }
+  refine_flag.template modify<HostMemSpace>();
+  refine_flag.template sync<DevExeSpace>();
+  (void) nflag;
+}
+
 void DensityRefinement(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
   DustGasDrag *pdust = pmbp->pdust;
+  // 3-D point particles here; 3-D refinable clouds below
+  if (pm->three_d && !(pdust != nullptr && pdust->Clouds3D())) {
+    DensityRefinement3DPoint(pmbp);
+    return;
+  }
   double dummy_t = 0.0; long long dummy_c = 0;   // for the profile timer
   ProfTimer prof_timer(pdust ? pdust->prof_time[DustGasDrag::kProfTrigger] : dummy_t,
                        pdust ? pdust->prof_count[DustGasDrag::kProfTrigger] : dummy_c);
@@ -477,7 +556,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   // ghost parts added to the leaves they overlap); the block values below are the same
   const bool oo = (pdust != nullptr) &&
                   pdust->smr_transfer_mode == DustSMRTransfer::owner_overlap;
-  // 3-D refinable clouds have their own (one rank)
+  // 3-D refinable clouds have their own (exact leaf deposit, halo on several ranks)
   if (pdust != nullptr && pdust->Clouds3D()) {
     DensityRefinement3D(pmbp);
     return;

@@ -14,6 +14,7 @@
 //! the explicit gas update and the boundary communication tail.
 
 #include <chrono>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <string>
@@ -42,7 +43,10 @@ void DustGasDrag::AssembleDustGasDragTasks(
   Hydro *phyd = pmy_pack->phydro;
 
   // assemble "before_timeintegrator" task list
-  id.gswitch = tl["before_timeintegrator"]->AddTask(&DustGasDrag::GammaSwitch,this,none);
+  // remove the particles that left through an outflow x3 face in the last cycle (no-op otherwise)
+  id.x3out   = tl["before_timeintegrator"]->AddTask(&DustGasDrag::RemoveOutflowParticles, this,
+                                                    none);
+  id.gswitch = tl["before_timeintegrator"]->AddTask(&DustGasDrag::GammaSwitch,this,id.x3out);
   // refinable clouds: split particles whose cloud lies on finer leaves before the cycle
   id.cloud   = tl["before_timeintegrator"]->AddTask(&DustGasDrag::RefineClouds, this,
                                                     id.gswitch);
@@ -57,6 +61,8 @@ void DustGasDrag::AssembleDustGasDragTasks(
   id.h_flux    = tl["stagen"]->AddTask(&Hydro::Fluxes, phyd, id.first2);
   id.h_sendf   = tl["stagen"]->AddTask(&Hydro::SendFlux, phyd, id.h_flux);
   id.h_recvf   = tl["stagen"]->AddTask(&Hydro::RecvFlux, phyd, id.h_sendf);
+  // the x1 flux matching across the shear-periodic boundary runs inside
+  // Hydro::SendFlux / RecvFlux, the orbital-advection flux correction inside RecvU_OA / RestrictU
   id.h_rkupdt  = tl["stagen"]->AddTask(&Hydro::RKUpdate, phyd, id.h_recvf);
   id.h_srctrms = tl["stagen"]->AddTask(&Hydro::HydroSrcTerms, phyd, id.h_rkupdt);
   // gas drag-rate history (stage 2 only); must precede the implicit solve
@@ -321,10 +327,7 @@ TaskStatus DustGasDrag::RecvUstar(Driver *pdrive, int stage) {
   TaskStatus status = pbval_us->RecvAndUnpackCC(ustar, cdummy);
   // with a shearing box the prolongation comes after the shear of the coarse array
   // (RecvUstarShr), as for the gas (RecvU -> shear -> Prolongate)
-  if (status == TaskStatus::complete && pmy_pack->pmesh->multilevel && psbox_us == nullptr) {
-    pbval_us->FillCoarseInBndryCC(ustar, cdummy);
-    pbval_us->ProlongateCC(ustar, cdummy);
-  }
+  if (status == TaskStatus::complete && psbox_us == nullptr) FinishUstarGhosts();
   return status;
 }
 
@@ -352,11 +355,8 @@ TaskStatus DustGasDrag::RecvUstarShr(Driver *pdrive, int stage) {
   TaskStatus tstat = psbox_us->RecvAndUnpackCC(ustar);
   if (tstat == TaskStatus::complete && psbox_us->coarse_on) {
     tstat = psbox_us->RecvAndUnpackCoarseCC(cdummy);
-    if (tstat == TaskStatus::complete) {
-      pbval_us->FillCoarseInBndryCC(ustar, cdummy);
-      pbval_us->ProlongateCC(ustar, cdummy);
-    }
   }
+  if (tstat == TaskStatus::complete) FinishUstarGhosts();
   return tstat;
 }
 
@@ -404,6 +404,108 @@ TaskStatus DustGasDrag::ClearDep(Driver *pdrive, int stage) {
     tstat = psbox_us->ClearRecv();
   }
   return tstat;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::RemoveOutflowParticles
+//! \brief The particles that left through an outflow x3 face were given zero
+//! mass and parked at rest in their block by the particle routing (bvals_part.cpp); here, before
+//! the cycle (no exchange in flight), they are removed and the mass and count are added to the
+//! run totals (logged on rank 0, sums over the ranks, when any left).
+
+TaskStatus DustGasDrag::RemoveOutflowParticles(Driver *pdrive, int stage) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto *pb = ppar->pbval_part;
+  if (pb->x3bc_dust != 2) return TaskStatus::complete;
+  Kokkos::deep_copy(pb->x3_removed.h_view, pb->x3_removed.d_view);
+  double rm[2] = {pb->x3_removed.h_view(0), pb->x3_removed.h_view(1)};
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, rm, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  if (rm[1] == 0.0) return TaskStatus::complete;
+  const int npart = ppar->nprtcl_thispack;
+  if (pb->x3_removed.h_view(1) > 0.0) {
+    auto pr = ppar->prtcl_rdata;
+    auto pi = ppar->prtcl_idata;
+    const int nrdata = ppar->nrdata, nidata = ppar->nidata;
+    DvceArray1D<int> koff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "x3o_koff"), npart);
+    int nkeep = 0;
+    Kokkos::parallel_scan("x3o_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+      if (final) koff(p) = upd;
+      upd += (pr(IPM,p) > 0.0) ? 1 : 0;
+    }, nkeep);
+    DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata,
+                          std::max(1, nkeep));
+    DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata,
+                         std::max(1, nkeep));
+    Kokkos::parallel_for("x3o_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      if (pr(IPM,p) <= 0.0) return;
+      const int k = koff(p);
+      for (int c=0; c<nrdata; ++c) prn(c,k) = pr(c,p);
+      for (int c=0; c<nidata; ++c) pin(c,k) = pi(c,p);
+    });
+    ppar->prtcl_rdata = prn;
+    ppar->prtcl_idata = pin;
+    ppar->nprtcl_thispack = nkeep;
+    pmy_pack->pmesh->nprtcl_thisrank = nkeep;
+    pmy_pack->pmesh->nprtcl_eachrank[global_variable::my_rank] = nkeep;
+  }
+  x3_outflow_mass += rm[0];
+  x3_outflow_count += static_cast<long long>(rm[1] + 0.5);
+  Kokkos::deep_copy(pb->x3_removed.d_view, 0.0);
+  if (global_variable::my_rank == 0) {
+    std::cout << std::setprecision(17) << "# dust x3 outflow: cycle " << pmy_pack->pmesh->ncycle << " removed "
+              << static_cast<long long>(rm[1] + 0.5) << " particles, mass " << rm[0]
+              << "; total " << x3_outflow_count << " particles, mass " << x3_outflow_mass
+              << std::endl;
+  }
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::FinishUstarGhosts, UstarX3BCs
+//! \brief The end of the u* ghost fill (after the exchange, and the shear with a
+//! shearing box): with refinement the physical x3 boundary values of the coarse array, then its
+//! fill and the prolongation; last the physical x3 boundary values of u* itself (after the
+//! prolongation, so the corners beyond an x3 face see prolongated values).  At a reflecting x3
+//! face the ghost cells mirror the active cells with v_z negated, at any other physical face they
+//! copy the boundary cell (zero gradient).  Nothing changes with periodic x3.
+
+void DustGasDrag::FinishUstarGhosts() {
+  if (pmy_pack->pmesh->multilevel) {
+    UstarX3BCs(cdummy, true);
+    pbval_us->FillCoarseInBndryCC(ustar, cdummy);
+    pbval_us->ProlongateCC(ustar, cdummy);
+  }
+  UstarX3BCs(ustar, false);
+}
+
+void DustGasDrag::UstarX3BCs(DvceArray5D<Real> &a, const bool coarse) {
+  Mesh *pm = pmy_pack->pmesh;
+  if (!pm->three_d || pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic) return;
+  const auto &ind = pm->mb_indcs;
+  const int ng = ind.ng;
+  const int ks = coarse ? ind.cks : ind.ks, ke = coarse ? ind.cke : ind.ke;
+  const int n1 = a.extent_int(4), n2 = a.extent_int(3);
+  const int nmb = pmy_pack->nmb_thispack;
+  auto &bcs = pmy_pack->pmb->mb_bcs;
+  const bool refl_in = (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::reflect);
+  const bool refl_out = (pm->mesh_bcs[BoundaryFace::outer_x3] == BoundaryFlag::reflect);
+  par_for("dust_ustar_x3bc", DevExeSpace(), 0, nmb-1, 0, ng-1, 0, n2-1, 0, n1-1,
+  KOKKOS_LAMBDA(const int m, const int g, const int j, const int i) {
+    const BoundaryFlag bi = bcs.d_view(m, BoundaryFace::inner_x3);
+    const BoundaryFlag bo = bcs.d_view(m, BoundaryFace::outer_x3);
+    if (bi != BoundaryFlag::block && bi != BoundaryFlag::periodic) {
+      const int kg = ks - 1 - g, kc = refl_in ? (ks + g) : ks;
+      for (int v=0; v<3; ++v) a(m,v,kg,j,i) = (refl_in && v == 2) ? -a(m,v,kc,j,i) : a(m,v,kc,j,i);
+    }
+    if (bo != BoundaryFlag::block && bo != BoundaryFlag::periodic) {
+      const int kg = ke + 1 + g, kc = refl_out ? (ke - g) : ke;
+      for (int v=0; v<3; ++v) a(m,v,kg,j,i) = (refl_out && v == 2) ? -a(m,v,kc,j,i) : a(m,v,kc,j,i);
+    }
+  });
 }
 
 } // namespace dust
