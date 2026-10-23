@@ -1254,12 +1254,13 @@ struct UstarLinearField {
 
 struct DustGasDragTaskIDs {
   // "before_timeintegrator" tasks
-  TaskID gswitch, cloud;
+  TaskID gswitch, cloud, x3out;
   // "before_stagen" tasks
   TaskID h_irecv, irecvd;
   // "stagen" tasks
   TaskID first2;
   TaskID h_flux, h_sendf, h_recvf, h_rkupdt, h_srctrms;
+  TaskID h_sendf_shr, h_recvf_shr, h_sendf_oa, h_recvf_oa;   // S2a
   TaskID gatwid, push;
   TaskID p_newgid, p_cnt, p_irecv, p_sendp, p_recvp;
   TaskID scat, sendd, recvd, solve, sendus, recvus, sendus_shr, recvus_shr;
@@ -1755,6 +1756,10 @@ class DustGasDrag {
   int SplitCloudsP1();         // moving-particle P1 split
   int SplitCloudsP1Device();   // device P1 split without the diagnostics
   TaskStatus RefineClouds(Driver *pdrive, int stage);
+  // S3c: remove the particles that left through an outflow x3 face (zero mass), log
+  TaskStatus RemoveOutflowParticles(Driver *pdrive, int stage);
+  double x3_outflow_mass = 0.0;    // cumulative over the run (this rank)
+  long long x3_outflow_count = 0;
   int MergeClouds();
   int MergeCloudsDevice();    // device version of MergeClouds
   void AuditFeedback(DvceArray2D<Real> &fb);   // frozen-gas predictor feedback

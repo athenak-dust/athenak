@@ -138,9 +138,12 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         pin->GetString("dust", "experimental_smr_transfer") == "owner_overlap";
     const bool sh3 = pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] ==
                      BoundaryFlag::shear_periodic;
+    // and with physical x3 faces
+    const bool x3p = pmy_pack->pmesh->three_d &&
+        pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic;
     if (!(experimental_smr && (!(pmy_pack->pmesh->adaptive) || experimental_amr) && ranks_ok &&
           ((pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic) ||
-           (oo3d && (pmy_pack->pmesh->strictly_periodic || sh3))))) {
+           (oo3d && (pmy_pack->pmesh->strictly_periodic || sh3 || x3p))))) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Dust drag does not support SMR/AMR. The current "
                 << "experimental exception requires explicit opt-in, static 2-D SMR, "
@@ -152,12 +155,29 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   bool shear_x1 = (pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] ==
                    BoundaryFlag::shear_periodic);
+  // Physical x3 faces in 3-D (a stratified box, S3c): particles reflect or leave
+  // (<dust>/particle_x3_bc), ghost deposits beyond the faces fold back (or are dropped,
+  // <dust>/x3_ghost_deposit); the PC2 gather reads the gas ghost cells of the gas boundary
+  // conditions.  imex and the automatic hybrid read u* ghost cells, which have no x3 boundary
+  // values yet.
+  const bool x3_phys = pmy_pack->pmesh->three_d &&
+      pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic;
   if (!(pmy_pack->pmesh->strictly_periodic)) {
-    // only exception: 3D shearing box with shear-periodic x1 (and periodic x2/x3)
-    if (!(shear_x1 && pmy_pack->pmesh->three_d)) {
+    // exceptions: 3D shearing box with shear-periodic x1 (and periodic x2), 3-D with physical
+    // x3 faces (x1 periodic or shear-periodic, x2 periodic)
+    const auto &mbc = pmy_pack->pmesh->mesh_bcs;
+    const bool x1ok = shear_x1 || mbc[BoundaryFace::inner_x1] == BoundaryFlag::periodic;
+    const bool x2ok = mbc[BoundaryFace::inner_x2] == BoundaryFlag::periodic;
+    if (!(pmy_pack->pmesh->three_d && x1ok && x2ok && (shear_x1 || x3_phys))) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Dust drag requires periodic boundaries in all "
-                << "directions (or shear-periodic x1 in 3D)" << std::endl;
+                << "directions (or shear-periodic x1 and / or physical x3 faces in 3D)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (x3_phys && !pc2_only) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "3-D dust with physical x3 faces needs <dust>/coupling = pc2"
+                << std::endl;
       std::exit(EXIT_FAILURE);
     }
     // S3a: the ghost deposits across the shear-periodic faces are moved
@@ -1081,7 +1101,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // S3a: in 3-D with refinement or with shear-periodic x1 faces the ghost
   // deposits go through the general remap (any levels, several ranks, the shear offset)
   // (<dust>/test_general_deposit: also on a uniform periodic 3-D mesh; a test control)
-  if (pmy_pack->pmesh->three_d && (pmy_pack->pmesh->multilevel || shear_x1 ||
+  if (pmy_pack->pmesh->three_d && (pmy_pack->pmesh->multilevel || shear_x1 || x3_phys ||
                                    pin->GetOrAddBoolean("dust", "test_general_deposit", false))) {
     if (drag_solver != DustDragSolver::local ||
         !(smr_transfer_mode == DustSMRTransfer::owner_overlap ||
@@ -1100,9 +1120,21 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    dep_plan = new DepRemapPlan(pmy_pack, shear_x1, qshear, omega0);
+    // Ghost deposits beyond physical x3 faces: fold back (default) or drop
+    int x3mode = 0;
+    if (x3_phys) {
+      const std::string xd = pin->GetOrAddString("dust", "x3_ghost_deposit", "fold");
+      if (xd != "fold" && xd != "drop") {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "<dust>/x3_ghost_deposit must be fold or drop" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      x3mode = (xd == "fold") ? 1 : 2;
+    }
+    dep_plan = new DepRemapPlan(pmy_pack, shear_x1, qshear, omega0, x3mode);
     pbval_qp->SetGeneralPlan(dep_plan);
     pbval_dm->SetGeneralPlan(dep_plan);
+    if (x3mode == 2) pbval_dm->dropped_sum.assign(3, 0.0);   // the record from the start
   }
   // owner_overlap on a dynamic mesh: the block boxes and the block table of the
   // initial mesh (the exchanges above built their remaps); 2-D only
