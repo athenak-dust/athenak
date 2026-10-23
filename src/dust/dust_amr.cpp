@@ -50,6 +50,7 @@
 //! density trigger uses that deposit (OwnerOverlapDeposit) with the same block values.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -268,20 +269,21 @@ void SetupDensityTrigger(ParameterInput *pin) {
 
 //----------------------------------------------------------------------------------------
 //! \fn dust::DensityRefinement3D
-//! \brief Stage 2a: the density trigger with 3-D refinable clouds, one rank.  The dust
-//! density on the leaves (DepositCloudDensity3D); per block the largest rho_d/mean over the leaf
-//! cells that overlap the block widened by amr_rho_buffer cells of its level (all blocks, every
-//! periodic image; the widened box must be covered); the thresholds and the log line as in 2-D.
+//! \brief Stage 2a: the density trigger with 3-D refinable clouds.  The dust density on
+//! the leaves (DepositCloudDensity3D); per block the largest rho_d/mean over the leaf cells that
+//! overlap the block widened by amr_rho_buffer cells of its level (the slots with leaf fields,
+//! every periodic image; the widened box must be covered); the thresholds and the log line as
+//! in 2-D.  Several ranks (stage 3): the halo slots, each with the cells it receives.
 
 void DensityRefinement3D(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
   DustGasDrag *pd = pmbp->pdust;
-  if (global_variable::nranks != 1) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "amr_density_trigger with 3-D clouds: one MPI rank only" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
+  // several ranks (stage 3): the deposit traverses the supports, so the reach of the
+  // halo is checked first; the deposit adds the halo parts to their owners, and with a buffer the
+  // owners' sums go back to the halo slots
+  pd->CheckHaloReach("density trigger");
   pd->DepositCloudDensity3D(pd->trig_f3);
+  if (trig_.buffer > 0) pd->HaloForward5D(pd->trig_f3, 0, 1);
   auto f = pd->trig_f3;
   particles::Particles *ppar = pmbp->ppart;
   const int npart = ppar->nprtcl_thispack;
@@ -295,6 +297,12 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     const int code = pi(PLEV,p);
     if (code > 15) ++nl; else if ((code & 15) == 0) ++n0; else ++n1;
   }, mtot, nlev[0], nlev[1], nlev[2]);
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, nlev, 3, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
   const auto &ms = pm->mesh_size;
   const Real lx = ms.x1max - ms.x1min, ly = ms.x2max - ms.x2min, lz = ms.x3max - ms.x3min;
   const Real vbox = lx*ly*lz;
@@ -306,34 +314,60 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
   DvceArray1D<Real> qd("amr_rho3d_q", std::max(1, nmb)), ad("amr_rho3d_vol", std::max(1, nmb));
   DvceArray1D<int> bd("amr_rho3d_bad", std::max(1, nmb));
   const int bb = trig_.buffer;
+  // the slots with leaf fields (this rank's blocks and the halo blocks; one rank: the blocks) and
+  // the box of cells each holds (a halo slot: what it receives, its strip or the whole block)
+  const auto lt3 = pd->leaf_traversal3d;
+  const int nslot = lt3.nfld;
+  DvceArray2D<int> srect("amr_rho3d_rect", std::max(1, nslot), 6);
+  {
+    auto rh = Kokkos::create_mirror_view(srect);
+    for (int b=0; b<nslot; ++b) {
+      const std::array<int, 6> full = {0, nx1, 0, nx2, 0, nx3};
+      const auto &c = (b < nmb) ? full : pd->halo_.rect[b - nmb];
+      for (int q=0; q<6; ++q) rh(b, q) = c[q];
+    }
+    Kokkos::deep_copy(srect, rh);
+  }
   Kokkos::parallel_for("amr_rho3d_blocks",
-  Kokkos::MDRangePolicy<DevExeSpace, Kokkos::Rank<2>>({0, 0}, {nmb, nmb}),
+  Kokkos::MDRangePolicy<DevExeSpace, Kokkos::Rank<2>>({0, 0}, {nmb, nslot}),
   KOKKOS_LAMBDA(const int m, const int s) {
     const auto &bm = mbsz.d_view(m);
     const Real ex0 = bm.x1min - bb*bm.dx1, ex1 = bm.x1max + bb*bm.dx1;
     const Real ey0 = bm.x2min - bb*bm.dx2, ey1 = bm.x2max + bb*bm.dx2;
     const Real ez0 = bm.x3min - bb*bm.dx3, ez1 = bm.x3max + bb*bm.dx3;
     const Real tol = 1.0e-9*Kokkos::fmin(bm.dx1, Kokkos::fmin(bm.dx2, bm.dx3));
-    const auto &bs = mbsz.d_view(s);
+    // the received box of slot s
+    const Real sdx1 = lt3.box(s,3), sdx2 = lt3.box(s,4), sdx3 = lt3.box(s,5);
+    const Real sx0 = lt3.box(s,0) + srect(s,0)*sdx1, sx1 = lt3.box(s,0) + srect(s,1)*sdx1;
+    const Real sy0 = lt3.box(s,1) + srect(s,2)*sdx2, sy1 = lt3.box(s,1) + srect(s,3)*sdx2;
+    const Real sz0 = lt3.box(s,2) + srect(s,4)*sdx3, sz1 = lt3.box(s,2) + srect(s,5)*sdx3;
     Real q = 0.0, vol = 0.0;
     int nbad = 0;
     for (int oz=-1; oz<=1; ++oz) {
       for (int oy=-1; oy<=1; ++oy) {
         for (int ox=-1; ox<=1; ++ox) {
-          const Real a0 = bs.x1min + ox*lx, a1 = bs.x1max + ox*lx;
-          const Real c0 = bs.x2min + oy*ly, c1 = bs.x2max + oy*ly;
-          const Real e0 = bs.x3min + oz*lz, e1 = bs.x3max + oz*lz;
+          const Real a0 = sx0 + ox*lx, a1 = sx1 + ox*lx;
+          const Real c0 = sy0 + oy*ly, c1 = sy1 + oy*ly;
+          const Real e0 = sz0 + oz*lz, e1 = sz1 + oz*lz;
           if (a1 <= ex0 + tol || a0 >= ex1 - tol || c1 <= ey0 + tol || c0 >= ey1 - tol ||
               e1 <= ez0 + tol || e0 >= ez1 - tol) continue;
           vol += (Kokkos::fmin(a1, ex1) - Kokkos::fmax(a0, ex0))*
                  (Kokkos::fmin(c1, ey1) - Kokkos::fmax(c0, ey0))*
                  (Kokkos::fmin(e1, ez1) - Kokkos::fmax(e0, ez0));
-          const int i0 = Kokkos::max(0, static_cast<int>(Kokkos::floor((ex0 - a0)/bs.dx1 + 1.0e-9)));
-          const int i1 = Kokkos::min(nx1, static_cast<int>(Kokkos::ceil((ex1 - a0)/bs.dx1 - 1.0e-9)));
-          const int j0 = Kokkos::max(0, static_cast<int>(Kokkos::floor((ey0 - c0)/bs.dx2 + 1.0e-9)));
-          const int j1 = Kokkos::min(nx2, static_cast<int>(Kokkos::ceil((ey1 - c0)/bs.dx2 - 1.0e-9)));
-          const int k0 = Kokkos::max(0, static_cast<int>(Kokkos::floor((ez0 - e0)/bs.dx3 + 1.0e-9)));
-          const int k1 = Kokkos::min(nx3, static_cast<int>(Kokkos::ceil((ez1 - e0)/bs.dx3 - 1.0e-9)));
+          // the cells of slot s (indices from its left face) in the widened box
+          const Real b0 = lt3.box(s,0) + ox*lx, d0 = lt3.box(s,1) + oy*ly, f0 = lt3.box(s,2) + oz*lz;
+          const int i0 = Kokkos::max(srect(s,0),
+                                     static_cast<int>(Kokkos::floor((ex0 - b0)/sdx1 + 1.0e-9)));
+          const int i1 = Kokkos::min(srect(s,1),
+                                     static_cast<int>(Kokkos::ceil((ex1 - b0)/sdx1 - 1.0e-9)));
+          const int j0 = Kokkos::max(srect(s,2),
+                                     static_cast<int>(Kokkos::floor((ey0 - d0)/sdx2 + 1.0e-9)));
+          const int j1 = Kokkos::min(srect(s,3),
+                                     static_cast<int>(Kokkos::ceil((ey1 - d0)/sdx2 - 1.0e-9)));
+          const int k0 = Kokkos::max(srect(s,4),
+                                     static_cast<int>(Kokkos::floor((ez0 - f0)/sdx3 + 1.0e-9)));
+          const int k1 = Kokkos::min(srect(s,5),
+                                     static_cast<int>(Kokkos::ceil((ez1 - f0)/sdx3 - 1.0e-9)));
           for (int k=k0; k<k1; ++k) {
             for (int j=j0; j<j1; ++j) {
               for (int i=i0; i<i1; ++i) {
@@ -371,6 +405,18 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     }, Kokkos::Max<Real>(qm), mf);
     qmax = qm; mfine = mf;
   }
+  for (int m=0; m<nmb; ++m) {
+    const auto &sz = mbsz.h_view(m);
+    if (pm->lloc_eachmb[m + mbs].level > pm->root_level) vfine += nx1*sz.dx1*nx2*sz.dx2*nx3*sz.dx3;
+  }
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {   // the totals over all ranks
+    MPI_Allreduce(MPI_IN_PLACE, &qmax, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+    Real fv[2] = {mfine, vfine};
+    MPI_Allreduce(MPI_IN_PLACE, fv, 2, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+    mfine = fv[0]; vfine = fv[1];
+  }
+#endif
   auto &refine_flag = pm->pmr->refine_flag;
   int nref = 0, nder = 0;
   for (int m=0; m<nmb; ++m) {
@@ -385,7 +431,6 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     }
     const int lev = pm->lloc_eachmb[m + mbs].level;
     const int l = lev - pm->root_level;
-    if (l > 0) vfine += nx1*sz.dx1*nx2*sz.dx2*nx3*sz.dx3;
     const Real fr = std::pow(trig_.level_factor, l);
     const Real fdr = (l > 0) ? std::pow(trig_.level_factor, l - 1) : 1.0;
     int flag = 0;
@@ -994,6 +1039,7 @@ int DustGasDrag::ResetPGIDFromPositions(const char *when) {
 //! rank's particles changed.
 
 int DustGasDrag::RouteToOwnerBlocks(const char *when) {
+  if (clouds3d) return RouteToOwnerBlocks3D(when);
   particles::Particles *ppar = pmy_pack->ppart;
   auto *pb = ppar->pbval_part;
   const int npart = ppar->nprtcl_thispack;
@@ -1438,7 +1484,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
                     std::chrono::duration<double>(r2 - r1).count(),
                     std::chrono::duration<double>(r3 - r2).count()};
     MPI_Allreduce(MPI_IN_PLACE, tl, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    int mine[3] = {pmy_pack->nmb_thispack, ppar->nprtcl_thispack, leaf_traversal.nfld - leaf_traversal.nmb};
+    int mine[3] = {pmy_pack->nmb_thispack, ppar->nprtcl_thispack, halo_.hslot1 - halo_.hslot0};
     std::vector<int> all(3*nr, 0);
     MPI_Gather(mine, 3, MPI_INT, all.data(), 3, MPI_INT, 0, MPI_COMM_WORLD);
     if (global_variable::my_rank == 0) {

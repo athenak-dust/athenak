@@ -1183,6 +1183,10 @@ inline bool LogEmpty(std::FILE *fp) {
 //! part that the clouds of the receiving rank can reach).  One rank: no peers.
 struct DustHalo {
   int nx1 = 0, nx2 = 0, is = 0, js = 0, ncells1 = 0, ncells2 = 0;
+  // 3-D clouds: flat leaf index ((slot ncells3 + k) ncells2 + j) ncells1 + i; 2-D:
+  // nx3 = ncells3 = 1, ks = 0 (the flat index has no k)
+  bool three = false;
+  int nx3 = 1, ks = 0, ncells3 = 1;
   int hslot0 = 0, hslot1 = 0;          // the halo slots [hslot0, hslot1)
   int npeer = 0;
   unsigned long long builds = 0;
@@ -1194,9 +1198,10 @@ struct DustHalo {
   DvceArray1D<int> scell, rcell;
   DvceArray1D<Real> sbuf, rbuf;
   long long nblk_send = 0, nblk_recv = 0;   // blocks in the lists (for the log)
-  // the rectangle [i0, i1) x [j0, j1) (interior cell indices) of every halo slot that this rank
-  // receives, by halo slot (slot - nmb); and the guard of the strips (test)
-  std::vector<std::array<int, 4>> rect;
+  // the rectangle [i0, i1) x [j0, j1) x [k0, k1) (interior cell indices; 2-D: k0 = 0, k1 = 1) of
+  // every halo slot that this rank receives, by halo slot (slot - nmb); and the guard of the
+  // strips (test)
+  std::vector<std::array<int, 6>> rect;
   DvceArray2D<int> rect_d;
   bool guard = false;
 #if MPI_PARALLEL_ENABLED
@@ -1795,6 +1800,9 @@ class DustGasDrag {
   void CheckClouds3D();   // the restrictions of 3-D stage 1
   void WrapParticles3D();
   int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
+  void FrameToBlock3D();                       // 3-D stage 3 (several ranks)
+  bool CheckHaloReach3D(const char *when);
+  int RouteToOwnerBlocks3D(const char *when);
   int MergeCloudsDevice3D();   // 3-D stage 2b (dust_cloud_device.cpp)
   int ResampleClouds3D(const bool local);   // 3-D stage 2c (dust_resample.cpp)
   int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
@@ -1878,6 +1886,7 @@ class DustGasDrag {
   void DumpParticles();
   void HaloForwardPack(DvceArray5D<Real> &gp);
   void HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int nc);
+  void HaloForward5D(DvceArray5D<Real> &f, const int c0, const int nc);
   void HaloForwardFlat(DvceArray2D<Real> &f, const int nc);
   void HaloReverseAddFlat(DvceArray2D<Real> &f, const int nc);
   void HaloForwardFlags(DvceArray1D<int> &f);

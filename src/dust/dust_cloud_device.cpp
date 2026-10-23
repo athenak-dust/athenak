@@ -2596,7 +2596,9 @@ int DustGasDrag::MergeCloudsDevice3D() {
   const int npart0 = ppar->nprtcl_thispack;
   const auto lt = leaf_traversal3d;
   const int nlev = lt.nlev;
-  if (nlev == 0 || npart0 == 0) return 0;
+  // several ranks: the budget exchanges are collective, so a rank without
+  // particles runs the pass too; it stops only when no rank has any
+  if (nlev == 0 || SumRanks(npart0) == 0) return 0;
   using T = SMRCompositeTransfer;
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
   const int gids = pmy_pack->gids;
@@ -2626,10 +2628,15 @@ int DustGasDrag::MergeCloudsDevice3D() {
     }, tb[0], tb[1], tb[2], tb[3]);
   }
   // the pass budget: lent the entry leaf fields, lcum the change so far
+  // leaves of the halo blocks included (several ranks); only the owner of a leaf judges it
   const bool pbud = cloud_merge_budget > 0.0;
-  const int nbt = pbud ? lt.nmb*ncell123 : 1;
+  const int nbt = pbud ? lt.nfld*ncell123 : 1;
+  const int nown = pbud ? lt.nmb*ncell123 : 1;
   DvceArray2D<Real> lent("budget3d_lent", 4, nbt), lcum("budget3d_lcum", 4, nbt);
-  if (pbud) BudgetDeposit3D(lt, ppar->prtcl_rdata, ppar->prtcl_idata, npart0, 1.0, lent);
+  if (pbud) {
+    BudgetDeposit3D(lt, ppar->prtcl_rdata, ppar->prtcl_idata, npart0, 1.0, lent);
+    HaloReverseAddFlat(lent, 4);   // the owners' leaves hold every rank's clouds
+  }
   bool bdirty = false;
   double gcb[4] = {0.0, 0.0, 0.0, 0.0};   // rejected groups, pieces, mass; evaluations
   double bcap = 0.0;
@@ -2740,16 +2747,23 @@ int DustGasDrag::MergeCloudsDevice3D() {
     const int is_ = lt.is, js_ = lt.js, ks_ = lt.ks;
     const int ie_ = lt.is + lt.nx1 - 1, je_ = lt.js + lt.nx2 - 1, ke_ = lt.ks + lt.nx3 - 1;
     const Real rfloor = cloud_absorb_floor*mroot_floor/rvol;
+    // the leaf masses with the owners' totals also on the halo leaves (one rank: a copy)
+    DvceArray2D<Real> lmass("budget3d_lmass", 1, nbt);
+    Kokkos::parallel_for("budget3d_lmass", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+    KOKKOS_LAMBDA(const int t) {lmass(0,t) = lent(0,t);});
+    HaloForwardFlat(lmass, 1);
+    const int nown_ = nown;
     Kokkos::parallel_for("budget3d_structure", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
     KOKKOS_LAMBDA(const int t) {
       lbeta(t) = beta;
+      if (t >= nown_) return;   // the halo leaves keep beta; their owner decides
       int b, k, j, i;
       lt.Decode(t, b, k, j, i);
       if (i < is_ || i > ie_ || j < js_ || j > je_ || k < ks_ || k > ke_) return;
       const Real dx = lt.box(b,3), dy = lt.box(b,4), dz = lt.box(b,5);
       const Real xc = lt.box(b,0) + (i - is_ + 0.5)*dx, yc = lt.box(b,1) + (j - js_ + 0.5)*dy;
       const Real zc = lt.box(b,2) + (k - ks_ + 0.5)*dz;
-      const Real rho = lent(0,t)/(dx*dy*dz);
+      const Real rho = lmass(0,t)/(dx*dy*dz);
       const Real den = Kokkos::fmax(rho, rfloor);
       Real s = 0.0;
       for (int d=0; d<6; ++d) {
@@ -2762,7 +2776,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
         const int tn = lt.LeafOwner(x, y, z, b);
         if (tn < 0) continue;
         const int bn = tn/ncell123;
-        const Real rn = lent(0,tn)/(lt.box(bn,3)*lt.box(bn,4)*lt.box(bn,5));
+        const Real rn = lmass(0,tn)/(lt.box(bn,3)*lt.box(bn,4)*lt.box(bn,5));
         s = Kokkos::fmax(s, Kokkos::fabs(rn - rho)/den);
       }
       lbeta(t) = Kokkos::fmax(Kokkos::fmin(beta, bkappa*s), 1.0e-12);
@@ -2898,9 +2912,10 @@ int DustGasDrag::MergeCloudsDevice3D() {
       Kokkos::deep_copy(nx_now, Kokkos::subview(nnew, 0));
       if (nx_now > 0) bdirty = true;
       Kokkos::deep_copy(lcum, 0.0);
-      if (bdirty) {
+      if (AnyRank(bdirty)) {
         BudgetDeposit3D(lt, pr, pi, npart, 1.0, lcum);
         BudgetDeposit3D(lt, nr, ni, nx_now, 1.0, lcum);
+        HaloReverseAddFlat(lcum, 4);
         Kokkos::parallel_for("budget3d_cum", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
         KOKKOS_LAMBDA(const int t) {
           for (int c=0; c<4; ++c) lcum(c,t) -= lent(c,t);
@@ -3104,7 +3119,9 @@ int DustGasDrag::MergeCloudsDevice3D() {
         });
       }
       // ---- accept or reject the proposed groups by the pass budget
-      if (pbud && k1 > k0) {
+      // several ranks: proposals on any rank are evaluated on all of them (their leaves may be
+      // touched by a neighbour's proposals)
+      if (pbud && AnyRank(k1 > k0)) {
         const Real beta = cloud_merge_budget;
         const int maxev = cloud_merge_budget_evals;
         int nev = 0;
@@ -3135,8 +3152,9 @@ int DustGasDrag::MergeCloudsDevice3D() {
               Kokkos::atomic_add(&ldelg(2,t), m*w*v2); Kokkos::atomic_add(&ldelg(3,t), m*w*v3);
             });
           });
+          HaloReverseAddFlat(ldelg, 4);   // the owners judge their leaves
           int nviol = 0;
-          Kokkos::parallel_reduce("q3b_viol", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+          Kokkos::parallel_reduce("q3b_viol", Kokkos::RangePolicy<>(DevExeSpace(), 0, nown),
           KOKKOS_LAMBDA(const int t, int &sum) {
             int bad = 0;
             if (ldelg(0,t) != 0.0 || ldelg(1,t) != 0.0 || ldelg(2,t) != 0.0 || ldelg(3,t) != 0.0) {
@@ -3152,6 +3170,8 @@ int DustGasDrag::MergeCloudsDevice3D() {
             lviolg(t) = bad;
             sum += bad;
           }, nviol);
+          HaloForwardFlags(lviolg);                       // the owners' verdicts on the halo
+          nviol = static_cast<int>(SumRanks(nviol));      // the same number of rounds everywhere
           if (nviol == 0) break;
           if (nev >= maxev) {
             Kokkos::parallel_for("q3b_rej_all", Kokkos::RangePolicy<>(DevExeSpace(), k0, k1),
@@ -3266,12 +3286,13 @@ int DustGasDrag::MergeCloudsDevice3D() {
   if (pbud) {
     DvceArray2D<Real> lfin("budget3d_lfin", 4, nbt);
     BudgetDeposit3D(lt, ppar->prtcl_rdata, ppar->prtcl_idata, nfinal, 1.0, lfin);
+    HaloReverseAddFlat(lfin, 4);   // statistics over this rank's leaves
     const Real beta = cloud_merge_budget;
     const Real bfloor = cloud_absorb_floor*mroot_floor/rvol;
     const Real Hf = Kokkos::min(mm.dx1[nlev-1], Kokkos::min(mm.dx2[nlev-1], mm.dx3[nlev-1]));
     const Real bvmin = alpha*Hf*((omega > 0.0) ? omega : 0.0);
     double rmx = 0.0, rpx = 0.0, nover = 0.0;
-    Kokkos::parallel_reduce("budget3d_end", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbt),
+    Kokkos::parallel_reduce("budget3d_end", Kokkos::RangePolicy<>(DevExeSpace(), 0, nown),
     KOKKOS_LAMBDA(const int t, double &a, double &b, double &c) {
       const int tb_ = t/ncell123;
       const Real vol = lt.box(tb_,3)*lt.box(tb_,4)*lt.box(tb_,5);
@@ -3296,7 +3317,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
   cloud_coarsen_events += nevents;
   cloud_coarsen_in += static_cast<unsigned long long>(27.0*qtot[0] + qtot[3] - gcb[1]);
   cloud_far_release += nrelease;
-  std::FILE *fp = AppendLog("cloud_merge_log3d.txt");
+  std::FILE *fp = AppendLog(RankFile("cloud_merge_log3d.txt"));   // one per rank
   if (fp != nullptr) {
     if (LogEmpty(fp)) {
       std::fprintf(fp, "# 3-D merge pass. ncycle time npart_before npart_after "

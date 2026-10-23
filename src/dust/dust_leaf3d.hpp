@@ -16,7 +16,7 @@
 //!
 //! Leaf cells are encoded ((b*ncells3 + k)*ncells2 + j)*ncells1 + i with b the block slot.
 //! Block slots as in 2-D: [0, nmb) the blocks of this rank, [nmb, nfld) halo
-//! blocks, [nfld, nall) every other block.  Stage 1 (one rank): nfld = nall = nmb.
+//! blocks, [nfld, nall) every other block.  One rank: nfld = nall = nmb.
 
 struct LeafTraversal3D {
   static constexpr int kMaxNb = 64;    // distinct neighbours of a 3-D block (56 at most)

@@ -484,6 +484,7 @@ int DustGasDrag::SplitToLeaves() {
 
 bool DustGasDrag::CheckHaloReach(const char *when) {
   if (global_variable::nranks == 1) return false;
+  if (clouds3d) return CheckHaloReach3D(when);
   particles::Particles *ppar = pmy_pack->ppart;
   const int npart = ppar->nprtcl_thispack;
   const int nmb = pmy_pack->nmb_thispack;
@@ -547,6 +548,7 @@ bool DustGasDrag::CheckHaloReach(const char *when) {
 
 void DustGasDrag::FrameToBlock() {
   if (global_variable::nranks == 1) return;
+  if (clouds3d) {FrameToBlock3D(); return;}
   {
     auto pr = pmy_pack->ppart->prtcl_rdata;
     auto pi = pmy_pack->ppart->prtcl_idata;

@@ -163,7 +163,7 @@ void DustGasDrag::BuildLeafTraversal() {
   const int nfld = static_cast<int>(slot_gid.size());
   // the rectangle of every halo slot: the reachable cells with cloud_halo_strips, else (and for
   // a block without one, which the reach always gives) the whole block
-  halo_.rect.assign(nfld - nmb, {0, indcs.nx1, 0, indcs.nx2});
+  halo_.rect.assign(nfld - nmb, {0, indcs.nx1, 0, indcs.nx2, 0, 1});
   if (cloud_halo_strips) {
     for (int b=nmb; b<nfld; ++b) {
       auto it = hrect.find(slot_gid[b]);
@@ -171,7 +171,7 @@ void DustGasDrag::BuildLeafTraversal() {
         auto c = it->second;
         c[0] = std::max(0, c[0]); c[1] = std::min(indcs.nx1, c[1]);
         c[2] = std::max(0, c[2]); c[3] = std::min(indcs.nx2, c[3]);
-        if (c[0] < c[1] && c[2] < c[3]) halo_.rect[b - nmb] = c;
+        if (c[0] < c[1] && c[2] < c[3]) halo_.rect[b - nmb] = {c[0], c[1], c[2], c[3], 0, 1};
       }
     }
   }

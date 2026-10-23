@@ -1753,6 +1753,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       }
     });
   }
+  const bool multirank = (global_variable::nranks > 1);
   Kokkos::parallel_reduce("rs3_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, double &mt, double &px, double &nl, double &nf, double &nz,
                 double &ncold) {
@@ -1769,6 +1770,13 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
     if (pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}
     if (calpha > 0.0 && cq(p) >= 0 && ccold(cq(p)) == 1) {ncold += 1.0; return;}
+    // several ranks (as in 2-D): a cloud whose leaf is on a block of another rank stays
+    // out (a position within round-off of a periodic face routed to this rank's block while its
+    // leaf lookup takes the image on the other side)
+    if (multirank) {
+      const int tl = lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), lt.Anchor(pi(PGID,p)));
+      if (tl < 0 || tl/ncell123 >= nmbp) return;
+    }
     int c = 0;
     lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), code, lt.Anchor(pi(PGID,p)),
                           [&](const int, const Real) {++c;});

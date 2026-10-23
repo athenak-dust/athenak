@@ -38,57 +38,70 @@ namespace dust {
 
 namespace {
 
-// accessors of the three layouts of the leaf fields: (block, component, k, j, i),
-// (block, k, j, i, component) and (component, flat leaf index)
+// accessors of the layouts of the leaf fields by flat leaf index t: (block, component, k, j, i),
+// (block, k, j, i, component) and (component, t).  2-D: t = (m ncells2 + j) ncells1 + i at the
+// single k = ks; 3-D: t = ((m ncells3 + k) ncells2 + j) ncells1 + i
 struct Acc5D {
   DvceArray5D<Real> f;
-  int c0 = 0, ks = 0;
-  KOKKOS_INLINE_FUNCTION Real get(const int c, const int m, const int j, const int i) const {
-    return f(m, c0 + c, ks, j, i);
+  int c0 = 0, ks = 0, nc1 = 1, n12 = 1;
+  KOKKOS_INLINE_FUNCTION Real &at(const int c, const int t) const {
+    const int m = t/n12, r = t - m*n12;
+    return f(m, c0 + c, ks, r/nc1, r % nc1);
   }
-  KOKKOS_INLINE_FUNCTION void set(const int c, const int m, const int j, const int i,
-                                  const Real v) const {f(m, c0 + c, ks, j, i) = v;}
-  KOKKOS_INLINE_FUNCTION void add(const int c, const int m, const int j, const int i,
-                                  const Real v) const {f(m, c0 + c, ks, j, i) += v;}
+  KOKKOS_INLINE_FUNCTION Real get(const int c, const int t) const {return at(c, t);}
+  KOKKOS_INLINE_FUNCTION void set(const int c, const int t, const Real v) const {at(c, t) = v;}
+  KOKKOS_INLINE_FUNCTION void add(const int c, const int t, const Real v) const {at(c, t) += v;}
+};
+struct Acc5D3 {
+  DvceArray5D<Real> f;
+  int c0 = 0, nc1 = 1, n12 = 1, n123 = 1;
+  KOKKOS_INLINE_FUNCTION Real &at(const int c, const int t) const {
+    const int m = t/n123, r = t - m*n123, k = r/n12, q = r - k*n12;
+    return f(m, c0 + c, k, q/nc1, q % nc1);
+  }
+  KOKKOS_INLINE_FUNCTION Real get(const int c, const int t) const {return at(c, t);}
+  KOKKOS_INLINE_FUNCTION void set(const int c, const int t, const Real v) const {at(c, t) = v;}
+  KOKKOS_INLINE_FUNCTION void add(const int c, const int t, const Real v) const {at(c, t) += v;}
 };
 struct AccPack {
   DvceArray5D<Real> f;
-  int ks = 0;
-  KOKKOS_INLINE_FUNCTION Real get(const int c, const int m, const int j, const int i) const {
-    return f(m, ks, j, i, c);
+  int ks = 0, nc1 = 1, n12 = 1;
+  KOKKOS_INLINE_FUNCTION Real &at(const int c, const int t) const {
+    const int m = t/n12, r = t - m*n12;
+    return f(m, ks, r/nc1, r % nc1, c);
   }
-  KOKKOS_INLINE_FUNCTION void set(const int c, const int m, const int j, const int i,
-                                  const Real v) const {f(m, ks, j, i, c) = v;}
-  KOKKOS_INLINE_FUNCTION void add(const int c, const int m, const int j, const int i,
-                                  const Real v) const {f(m, ks, j, i, c) += v;}
+  KOKKOS_INLINE_FUNCTION Real get(const int c, const int t) const {return at(c, t);}
+  KOKKOS_INLINE_FUNCTION void set(const int c, const int t, const Real v) const {at(c, t) = v;}
+  KOKKOS_INLINE_FUNCTION void add(const int c, const int t, const Real v) const {at(c, t) += v;}
+};
+struct AccPack3 {
+  DvceArray5D<Real> f;
+  int nc1 = 1, n12 = 1, n123 = 1;
+  KOKKOS_INLINE_FUNCTION Real &at(const int c, const int t) const {
+    const int m = t/n123, r = t - m*n123, k = r/n12, q = r - k*n12;
+    return f(m, k, q/nc1, q % nc1, c);
+  }
+  KOKKOS_INLINE_FUNCTION Real get(const int c, const int t) const {return at(c, t);}
+  KOKKOS_INLINE_FUNCTION void set(const int c, const int t, const Real v) const {at(c, t) = v;}
+  KOKKOS_INLINE_FUNCTION void add(const int c, const int t, const Real v) const {at(c, t) += v;}
 };
 struct AccFlat {
   DvceArray2D<Real> f;
-  int ncells1 = 0, ncells2 = 0;
-  KOKKOS_INLINE_FUNCTION int T(const int m, const int j, const int i) const {
-    return (m*ncells2 + j)*ncells1 + i;
-  }
-  KOKKOS_INLINE_FUNCTION Real get(const int c, const int m, const int j, const int i) const {
-    return f(c, T(m, j, i));
-  }
-  KOKKOS_INLINE_FUNCTION void set(const int c, const int m, const int j, const int i,
-                                  const Real v) const {f(c, T(m, j, i)) = v;}
-  KOKKOS_INLINE_FUNCTION void add(const int c, const int m, const int j, const int i,
-                                  const Real v) const {f(c, T(m, j, i)) += v;}
+  KOKKOS_INLINE_FUNCTION Real get(const int c, const int t) const {return f(c, t);}
+  KOKKOS_INLINE_FUNCTION void set(const int c, const int t, const Real v) const {f(c, t) = v;}
+  KOKKOS_INLINE_FUNCTION void add(const int c, const int t, const Real v) const {f(c, t) += v;}
 };
 struct AccFlatInt {
   DvceArray1D<int> f;
-  int ncells1 = 0, ncells2 = 0;
-  KOKKOS_INLINE_FUNCTION int T(const int m, const int j, const int i) const {
-    return (m*ncells2 + j)*ncells1 + i;
+  KOKKOS_INLINE_FUNCTION Real get(const int, const int t) const {
+    return static_cast<Real>(f(t));
   }
-  KOKKOS_INLINE_FUNCTION Real get(const int, const int m, const int j, const int i) const {
-    return static_cast<Real>(f(T(m, j, i)));
+  KOKKOS_INLINE_FUNCTION void set(const int, const int t, const Real v) const {
+    f(t) = static_cast<int>(v);
   }
-  KOKKOS_INLINE_FUNCTION void set(const int, const int m, const int j, const int i,
-                                  const Real v) const {f(T(m, j, i)) = static_cast<int>(v);}
-  KOKKOS_INLINE_FUNCTION void add(const int, const int m, const int j, const int i,
-                                  const Real v) const {f(T(m, j, i)) += static_cast<int>(v);}
+  KOKKOS_INLINE_FUNCTION void add(const int, const int t, const Real v) const {
+    f(t) += static_cast<int>(v);
+  }
 };
 
 // copy (forward: owner -> halo slots) or add back (reverse: halo slots -> owner) nc components
@@ -107,7 +120,7 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc, con
   Clock::time_point tc = Clock::now();
   Kokkos::fence();                     // the kernels before the exchange (their time, not MPI)
   ts[0] += since(tc);
-  const int nc1 = h.ncells1, nc2 = h.ncells2, n12 = h.ncells1*h.ncells2;
+  const int nc1 = h.ncells1, nc2 = h.ncells2;
   // forward: send the owner list, receive into the halo slots; reverse: the other way
   const std::vector<int> &out_off = reverse ? h.roff : h.soff;
   const std::vector<int> &in_off = reverse ? h.soff : h.roff;
@@ -121,15 +134,18 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc, con
   // the strip guard (test): before the reverse copy, nothing may lie outside the strips of the
   // halo slots; before the forward copy, the halo slots hold NaN where nothing is received
   const int nh = h.hslot1 - h.hslot0, hs0 = h.hslot0, nx1 = h.nx1, nx2 = h.nx2, is = h.is, js = h.js;
+  const int nx3 = h.nx3, ks = h.ks, nc3 = h.ncells3, nxc = nx1*nx2*nx3;
   if (h.guard && nh > 0) {
     auto rect = h.rect_d;
     if (reverse) {
       int nbad = 0;
-      Kokkos::parallel_reduce("dust_halo_guard", Kokkos::RangePolicy<>(DevExeSpace(), 0, nh*nx2*nx1*nc),
+      Kokkos::parallel_reduce("dust_halo_guard", Kokkos::RangePolicy<>(DevExeSpace(), 0, nh*nxc*nc),
       KOKKOS_LAMBDA(const int q, int &bad) {
-        const int i = q % nx1, j = (q/nx1) % nx2, c = (q/(nx1*nx2)) % nc, e = q/(nx1*nx2*nc);
-        const bool in = (i >= rect(e,0) && i < rect(e,1) && j >= rect(e,2) && j < rect(e,3));
-        if (!in && acc.get(c, hs0 + e, js + j, is + i) != 0.0) ++bad;
+        const int i = q % nx1, j = (q/nx1) % nx2, k = (q/(nx1*nx2)) % nx3, c = (q/nxc) % nc;
+        const int e = q/(nxc*nc);
+        const bool in = (i >= rect(e,0) && i < rect(e,1) && j >= rect(e,2) && j < rect(e,3) &&
+                         k >= rect(e,4) && k < rect(e,5));
+        if (!in && acc.get(c, (((hs0 + e)*nc3 + ks + k)*nc2 + js + j)*nc1 + is + i) != 0.0) ++bad;
       }, nbad);
       if (nbad > 0) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -139,10 +155,11 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc, con
       }
     } else if (can_nan) {
       const Real qnan = std::numeric_limits<Real>::quiet_NaN();
-      Kokkos::parallel_for("dust_halo_nan", Kokkos::RangePolicy<>(DevExeSpace(), 0, nh*nx2*nx1*nc),
+      Kokkos::parallel_for("dust_halo_nan", Kokkos::RangePolicy<>(DevExeSpace(), 0, nh*nxc*nc),
       KOKKOS_LAMBDA(const int q) {
-        const int i = q % nx1, j = (q/nx1) % nx2, c = (q/(nx1*nx2)) % nc, e = q/(nx1*nx2*nc);
-        acc.set(c, hs0 + e, js + j, is + i, qnan);
+        const int i = q % nx1, j = (q/nx1) % nx2, k = (q/(nx1*nx2)) % nx3, c = (q/nxc) % nc;
+        const int e = q/(nxc*nc);
+        acc.set(c, (((hs0 + e)*nc3 + ks + k)*nc2 + js + j)*nc1 + is + i, qnan);
       });
     }
   }
@@ -160,9 +177,7 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc, con
   if (nout > 0) {
     Kokkos::parallel_for("dust_halo_pack", Kokkos::RangePolicy<>(DevExeSpace(), 0, nout*nc),
     KOKKOS_LAMBDA(const int q) {
-      const int c = q % nc, t = out_cell(q/nc);
-      const int m = t/n12, r = t - m*n12;
-      sbuf(q) = acc.get(c, m, r/nc1, r % nc1);
+      sbuf(q) = acc.get(q % nc, out_cell(q/nc));
     });
     Kokkos::fence();
   }
@@ -181,9 +196,7 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc, con
     if (nin > 0) {
       Kokkos::parallel_for("dust_halo_unpack", Kokkos::RangePolicy<>(DevExeSpace(), 0, nin*nc),
       KOKKOS_LAMBDA(const int q) {
-        const int c = q % nc, t = in_cell(q/nc);
-        const int m = t/n12, r = t - m*n12;
-        acc.set(c, m, r/nc1, r % nc1, rbuf(q));
+        acc.set(q % nc, in_cell(q/nc), rbuf(q));
       });
     }
   } else {
@@ -193,9 +206,7 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc, con
       if (q1 == q0) continue;
       Kokkos::parallel_for("dust_halo_add", Kokkos::RangePolicy<>(DevExeSpace(), q0, q1),
       KOKKOS_LAMBDA(const int q) {
-        const int c = q % nc, t = in_cell(q/nc);
-        const int m = t/n12, r = t - m*n12;
-        acc.add(c, m, r/nc1, r % nc1, rbuf(q));
+        acc.add(q % nc, in_cell(q/nc), rbuf(q));
       });
     }
   }
@@ -224,10 +235,21 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc, con
 void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
   Mesh *pm = pmy_pack->pmesh;
   auto &h = halo_;
-  const auto &lt = leaf_traversal;
-  h.nx1 = lt.nx1; h.nx2 = lt.nx2; h.is = lt.is; h.js = lt.js;
-  h.ncells1 = lt.ncells1; h.ncells2 = lt.ncells2;
-  h.hslot0 = lt.nmb; h.hslot1 = lt.nfld;
+  // the slot geometry: the 2-D leaf traversal or the 3-D one
+  int nmb = 0, nfld = 0, gids = 0;
+  h.three = clouds3d;
+  if (h.three) {
+    const auto &l3 = leaf_traversal3d;
+    h.nx1 = l3.nx1; h.nx2 = l3.nx2; h.nx3 = l3.nx3; h.is = l3.is; h.js = l3.js; h.ks = l3.ks;
+    h.ncells1 = l3.ncells1; h.ncells2 = l3.ncells2; h.ncells3 = l3.ncells3;
+    nmb = l3.nmb; nfld = l3.nfld; gids = l3.gids;
+  } else {
+    const auto &lt = leaf_traversal;
+    h.nx1 = lt.nx1; h.nx2 = lt.nx2; h.nx3 = 1; h.is = lt.is; h.js = lt.js; h.ks = 0;
+    h.ncells1 = lt.ncells1; h.ncells2 = lt.ncells2; h.ncells3 = 1;
+    nmb = lt.nmb; nfld = lt.nfld; gids = lt.gids;
+  }
+  h.hslot0 = nmb; h.hslot1 = nfld;
   h.guard = cloud_halo_strip_guard;
   h.peer.clear(); h.soff.assign(1, 0); h.roff.assign(1, 0); h.npeer = 0;
   h.nblk_send = h.nblk_recv = 0;
@@ -237,12 +259,14 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
     MPI_Comm_dup(MPI_COMM_WORLD, &h.comm);
     h.comm_set = true;
   }
-  const int nmb = lt.nmb, nfld = lt.nfld, gids = lt.gids;
   const int myrank = global_variable::my_rank, nranks = global_variable::nranks;
-  const int nc1 = lt.ncells1, nc2 = lt.ncells2, is = lt.is, js = lt.js;
-  auto flat = [&](const int b, const int j, const int i) {return (b*nc2 + js + j)*nc1 + is + i;};
+  const int nc1 = h.ncells1, nc2 = h.ncells2, nc3 = h.ncells3, is = h.is, js = h.js, ks = h.ks;
+  auto flat = [&](const int b, const int k, const int j, const int i) {
+    return ((b*nc3 + ks + k)*nc2 + js + j)*nc1 + is + i;
+  };
   // what this rank needs, by owner (halo slots are in ascending gid, so is each list): gid and
-  // rectangle, five ints per block
+  // box of cells, seven ints per block
+  constexpr int kReq = 7;
   std::vector<std::vector<int>> want(nranks), wslot(nranks);
   for (int b=nmb; b<nfld; ++b) {
     const int r = pm->rank_eachmb[slot_gid[b]];
@@ -252,7 +276,7 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
       std::exit(EXIT_FAILURE);
     }
     const auto &c = h.rect[b - nmb];
-    want[r].insert(want[r].end(), {slot_gid[b], c[0], c[1], c[2], c[3]});
+    want[r].insert(want[r].end(), {slot_gid[b], c[0], c[1], c[2], c[3], c[4], c[5]});
     wslot[r].push_back(b);
   }
   std::vector<int> nwant(nranks), ngive(nranks), sdisp(nranks + 1, 0), rdisp(nranks + 1, 0);
@@ -267,23 +291,28 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
   for (int r=0; r<nranks; ++r) {
     if (nwant[r] == 0 && ngive[r] == 0) continue;
     h.peer.push_back(r);
-    for (int k=rdisp[r]; k<rdisp[r + 1]; k+=5) {
-      const int g = gflat[k];
-      const int i0 = gflat[k + 1], i1 = gflat[k + 2], j0 = gflat[k + 3], j1 = gflat[k + 4];
-      if (g < gids || g >= gids + nmb || i0 < 0 || i1 > lt.nx1 || j0 < 0 || j1 > lt.nx2 ||
-          i0 >= i1 || j0 >= j1) {
+    for (int q=rdisp[r]; q<rdisp[r + 1]; q+=kReq) {
+      const int g = gflat[q];
+      const int i0 = gflat[q + 1], i1 = gflat[q + 2], j0 = gflat[q + 3], j1 = gflat[q + 4];
+      const int k0 = gflat[q + 5], k1 = gflat[q + 6];
+      if (g < gids || g >= gids + nmb || i0 < 0 || i1 > h.nx1 || j0 < 0 || j1 > h.nx2 ||
+          k0 < 0 || k1 > h.nx3 || i0 >= i1 || j0 >= j1 || k0 >= k1) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                   << "dust halo: rank " << r << " asks rank " << myrank << " for block " << g
-                  << " cells [" << i0 << ", " << i1 << ") x [" << j0 << ", " << j1 << ")"
-                  << std::endl;
+                  << " cells [" << i0 << ", " << i1 << ") x [" << j0 << ", " << j1 << ") x ["
+                  << k0 << ", " << k1 << ")" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      for (int j=j0; j<j1; ++j) for (int i=i0; i<i1; ++i) sh.push_back(flat(g - gids, j, i));
+      for (int k=k0; k<k1; ++k) {
+        for (int j=j0; j<j1; ++j) for (int i=i0; i<i1; ++i) sh.push_back(flat(g - gids, k, j, i));
+      }
       ++h.nblk_send;
     }
     for (const int b : wslot[r]) {
       const auto &c = h.rect[b - nmb];
-      for (int j=c[2]; j<c[3]; ++j) for (int i=c[0]; i<c[1]; ++i) rh.push_back(flat(b, j, i));
+      for (int k=c[4]; k<c[5]; ++k) {
+        for (int j=c[2]; j<c[3]; ++j) for (int i=c[0]; i<c[1]; ++i) rh.push_back(flat(b, k, j, i));
+      }
       ++h.nblk_recv;
     }
     h.soff.push_back(static_cast<int>(sh.size()));
@@ -299,13 +328,13 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
   Kokkos::deep_copy(h.scell, sb);
   Kokkos::deep_copy(h.rcell, rb);
   const int nh = std::max(nfld - nmb, 1);
-  h.rect_d = DvceArray2D<int>("dust_halo_rect", nh, 4);
+  h.rect_d = DvceArray2D<int>("dust_halo_rect", nh, 6);
   auto rr = Kokkos::create_mirror_view(h.rect_d);
-  for (int b=nmb; b<nfld; ++b) for (int q=0; q<4; ++q) rr(b - nmb, q) = h.rect[b - nmb][q];
+  for (int b=nmb; b<nfld; ++b) for (int q=0; q<6; ++q) rr(b - nmb, q) = h.rect[b - nmb][q];
   Kokkos::deep_copy(h.rect_d, rr);
   ++h.builds;
 #else
-  (void)pm; (void)slot_gid;
+  (void)pm; (void)slot_gid; (void)gids;
 #endif
 }
 
@@ -317,37 +346,61 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
 
 void DustGasDrag::HaloForwardPack(DvceArray5D<Real> &gp) {
   if (halo_.npeer == 0) return;
-  AccPack a; a.f = gp; a.ks = pmy_pack->pmesh->mb_indcs.ks;
+  const int nc1 = halo_.ncells1, n12 = halo_.ncells1*halo_.ncells2;
+  if (halo_.three) {   // 3-D: gpack3 (12 components)
+    AccPack3 a; a.f = gp; a.nc1 = nc1; a.n12 = n12; a.n123 = n12*halo_.ncells3;
+    Exchange(halo_, gp.extent_int(4), false, a, true);
+    return;
+  }
+  AccPack a; a.f = gp; a.ks = pmy_pack->pmesh->mb_indcs.ks; a.nc1 = nc1; a.n12 = n12;
   Exchange(halo_, gp.extent_int(4), false, a, true);
 }
 
 void DustGasDrag::HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int nc) {
   if (halo_.npeer == 0) return;
-  Acc5D a; a.f = f; a.c0 = c0; a.ks = pmy_pack->pmesh->mb_indcs.ks;
+  const int nc1 = halo_.ncells1, n12 = halo_.ncells1*halo_.ncells2;
+  if (halo_.three) {
+    Acc5D3 a; a.f = f; a.c0 = c0; a.nc1 = nc1; a.n12 = n12; a.n123 = n12*halo_.ncells3;
+    Exchange(halo_, nc, true, a, true);
+    return;
+  }
+  Acc5D a; a.f = f; a.c0 = c0; a.ks = pmy_pack->pmesh->mb_indcs.ks; a.nc1 = nc1; a.n12 = n12;
   Exchange(halo_, nc, true, a, true);
+}
+
+void DustGasDrag::HaloForward5D(DvceArray5D<Real> &f, const int c0, const int nc) {
+  if (halo_.npeer == 0) return;
+  const int nc1 = halo_.ncells1, n12 = halo_.ncells1*halo_.ncells2;
+  if (halo_.three) {
+    Acc5D3 a; a.f = f; a.c0 = c0; a.nc1 = nc1; a.n12 = n12; a.n123 = n12*halo_.ncells3;
+    Exchange(halo_, nc, false, a, true);
+    return;
+  }
+  Acc5D a; a.f = f; a.c0 = c0; a.ks = pmy_pack->pmesh->mb_indcs.ks; a.nc1 = nc1; a.n12 = n12;
+  Exchange(halo_, nc, false, a, true);
 }
 
 void DustGasDrag::HaloForwardFlat(DvceArray2D<Real> &f, const int nc) {
   if (halo_.npeer == 0) return;
-  AccFlat a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
+  AccFlat a; a.f = f;
   Exchange(halo_, nc, false, a, true);
 }
 
 void DustGasDrag::HaloReverseAddFlat(DvceArray2D<Real> &f, const int nc) {
   if (halo_.npeer == 0) return;
-  AccFlat a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
+  AccFlat a; a.f = f;
   Exchange(halo_, nc, true, a, true);
 }
 
 void DustGasDrag::HaloForwardFlags(DvceArray1D<int> &f) {
   if (halo_.npeer == 0) return;
-  AccFlatInt a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
+  AccFlatInt a; a.f = f;
   Exchange(halo_, 1, false, a, false);
 }
 
 void DustGasDrag::HaloReverseAddFlags(DvceArray1D<int> &f) {
   if (halo_.npeer == 0) return;
-  AccFlatInt a; a.f = f; a.ncells1 = leaf_traversal.ncells1; a.ncells2 = leaf_traversal.ncells2;
+  AccFlatInt a; a.f = f;
   Exchange(halo_, 1, true, a, false);
 }
 

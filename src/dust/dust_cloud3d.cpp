@@ -15,16 +15,22 @@
 //! Stage 1: one rank, static mesh, split only.
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "athena.hpp"
+#if MPI_PARALLEL_ENABLED
+#include <mpi.h>
+#endif
 #include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
@@ -146,7 +152,10 @@ void DustGasDrag::CheckClouds3D() {
     std::exit(EXIT_FAILURE);
   }
   std::vector<std::string> bad;
-  if (global_variable::nranks != 1) bad.push_back("several MPI ranks");
+  // several ranks (stage 3): <dust>/experimental_mpi and the options of CheckMultiRank
+  if (global_variable::nranks != 1 && !experimental_mpi) {
+    bad.push_back("several MPI ranks without <dust>/experimental_mpi");
+  }
   if (!(coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2)) {
     bad.push_back("a coupling other than PC2 (coupling = pc2)");
   }
@@ -175,14 +184,15 @@ void DustGasDrag::CheckClouds3D() {
   }
   if (!bad.empty()) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "3-D refinable clouds (stage 1) do not support:";
+              << "3-D refinable clouds do not support:";
     for (const auto &b : bad) std::cout << " [" << b << "]";
     std::cout << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (global_variable::my_rank == 0) {
-    std::cout << "# NOTE (dust): 3-D refinable clouds (one rank, PC2; static or "
-              << "adaptive mesh)" << std::endl;
+    std::cout << "# NOTE (dust): 3-D refinable clouds (PC2; static or adaptive mesh; "
+              << global_variable::nranks << " MPI rank" << (global_variable::nranks > 1 ? "s" : "")
+              << ")" << std::endl;
   }
 }
 
@@ -192,7 +202,7 @@ void DustGasDrag::CheckClouds3D() {
 //! every block (from the logical locations, as AthenaK computes mb_size), the distinct adjacent
 //! blocks of every block with the periodic shift that places each next to it (from the 56
 //! neighbour slots), the ring its neighbours certainly hold, and the index of logical
-//! locations.  Stage 1: one rank (every block is local).
+//! locations; several ranks (stage 3): the halo slots and the exchange lists (BuildHalo).
 
 void DustGasDrag::BuildLeafTraversal3D() {
   Mesh *pm = pmy_pack->pmesh;
@@ -207,16 +217,165 @@ void DustGasDrag::BuildLeafTraversal3D() {
               << "3-D leaf traversal: 3-D meshes only (56 neighbour slots)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (global_variable::nranks != 1 || pm->nmb_total != nmb) {
+  const auto &t = smr_transfer;
+  // block slots (stage 3): the blocks of this rank (slot = gid - gids), then
+  // the blocks of other ranks that a cloud of this rank can reach (halo, ascending gid: the
+  // neighbours, and every block within the reach of a block of this rank, HaloReach), then all
+  // other blocks; with the box of cells of each halo block that the clouds can reach (strips)
+  const int ntot = pm->nmb_total;
+  std::vector<int> slot_of(ntot, -1), slot_gid;
+  slot_gid.reserve(ntot);
+  for (int m=0; m<nmb; ++m) {slot_of[gids + m] = m; slot_gid.push_back(gids + m);}
+  std::unordered_map<int, std::array<int, 6>> hrect;
+  {
+    std::vector<int> h;
+    for (int m=0; m<nmb; ++m) {
+      for (int n=0; n<nslot; ++n) {
+        const int g = nghbr.h_view(m, n).gid;
+        if (g >= 0 && slot_of[g] < 0) h.push_back(g);
+      }
+    }
+    if (global_variable::nranks > 1) {
+      const int nl = t.cloud_nlev;
+      if (halo_need_seq_ != pm->GetAMRLoadBalanceUpdateSeq() ||
+          static_cast<int>(halo_need_.size()) != nmb) {
+        halo_need_.assign(nmb, 0);
+        halo_need_seq_ = pm->GetAMRLoadBalanceUpdateSeq();
+      }
+      halo_reach_.assign(nmb, 0);
+      halo_allow_.assign(nmb, 0);
+      for (int m=0; m<nmb; ++m) {
+        const int lev = pm->lloc_eachmb[gids + m].level - pm->root_level;
+        HaloReach(lev, halo_need_[m], halo_reach_[m], halo_allow_[m]);
+      }
+      const int nbr[3] = {pm->nmb_rootx1, pm->nmb_rootx2, pm->nmb_rootx3};
+      const int nxb[3] = {indcs.nx1, indcs.nx2, indcs.nx3};
+      std::int64_t bw[3], nf[3];   // root block width, domain (finest cells)
+      for (int d=0; d<3; ++d) {
+        bw[d] = static_cast<std::int64_t>(nxb[d]) << nl;
+        nf[d] = bw[d]*nbr[d];
+      }
+      auto fb = [&](const int g, std::int64_t b[6]) {
+        const LogicalLocation &ll = pm->lloc_eachmb[g];
+        const int sh = nl - (ll.level - pm->root_level);
+        const std::int64_t lx[3] = {ll.lx1, ll.lx2, ll.lx3};
+        for (int d=0; d<3; ++d) {
+          b[2*d] = lx[d]*nxb[d] << sh;
+          b[2*d + 1] = b[2*d] + (static_cast<std::int64_t>(nxb[d]) << sh);
+        }
+      };
+      std::vector<std::vector<int>> bucket(static_cast<std::size_t>(nbr[0])*nbr[1]*nbr[2]);
+      for (int g=0; g<ntot; ++g) {
+        const LogicalLocation &ll = pm->lloc_eachmb[g];
+        const int lev = ll.level - pm->root_level;
+        bucket[(static_cast<std::size_t>(ll.lx3 >> lev)*nbr[1] + (ll.lx2 >> lev))*nbr[0] +
+               (ll.lx1 >> lev)].push_back(g);
+      }
+      auto overlap = [](std::int64_t a0, std::int64_t a1, std::int64_t c0, std::int64_t c1,
+                        std::int64_t n) {
+        for (int s=-1; s<=1; ++s) {
+          if (a0 + s*n < c1 && c0 < a1 + s*n) return true;
+        }
+        return false;
+      };
+      for (int m=0; m<nmb; ++m) {
+        std::int64_t mb[6];
+        fb(gids + m, mb);
+        const std::int64_t rf = halo_reach_[m];   // finest cells
+        int kk[3], bb[3];
+        for (int d=0; d<3; ++d) {
+          kk[d] = static_cast<int>((rf + bw[d] - 1)/bw[d]);
+          bb[d] = static_cast<int>(mb[2*d]/bw[d]);
+        }
+        for (int dz=-kk[2]; dz<=kk[2]; ++dz) {
+          for (int dy=-kk[1]; dy<=kk[1]; ++dy) {
+            for (int dx=-kk[0]; dx<=kk[0]; ++dx) {
+              const int cx = ((bb[0] + dx) % nbr[0] + nbr[0]) % nbr[0];
+              const int cy = ((bb[1] + dy) % nbr[1] + nbr[1]) % nbr[1];
+              const int cz = ((bb[2] + dz) % nbr[2] + nbr[2]) % nbr[2];
+              for (const int g : bucket[(static_cast<std::size_t>(cz)*nbr[1] + cy)*nbr[0] + cx]) {
+                if (slot_of[g] >= 0) continue;
+                std::int64_t gb[6];
+                fb(g, gb);
+                bool in = true;
+                for (int d=0; d<3 && in; ++d) {
+                  in = overlap(gb[2*d], gb[2*d + 1], mb[2*d] - rf, mb[2*d + 1] + rf, nf[d]);
+                }
+                if (!in) continue;
+                h.push_back(g);
+                // the part of g within the reach (every periodic image), in g's cells
+                const LogicalLocation &gl = pm->lloc_eachmb[g];
+                const std::int64_t ratio =
+                    static_cast<std::int64_t>(1) << (nl - (gl.level - pm->root_level));
+                std::array<int, 6> c;
+                for (int d=0; d<3; ++d) {
+                  std::int64_t r0 = gb[2*d + 1], r1 = gb[2*d];   // empty
+                  for (int sft=-1; sft<=1; ++sft) {
+                    const std::int64_t a0 = std::max(gb[2*d], mb[2*d] - rf - sft*nf[d]);
+                    const std::int64_t a1 = std::min(gb[2*d + 1], mb[2*d + 1] + rf - sft*nf[d]);
+                    if (a0 < a1) {r0 = std::min(r0, a0); r1 = std::max(r1, a1);}
+                  }
+                  c[2*d] = static_cast<int>((r0 - gb[2*d])/ratio);
+                  c[2*d + 1] = static_cast<int>((r1 - gb[2*d] + ratio - 1)/ratio);
+                }
+                auto it = hrect.find(g);
+                if (it == hrect.end()) {
+                  hrect[g] = c;
+                } else {
+                  for (int d=0; d<3; ++d) {
+                    it->second[2*d] = std::min(it->second[2*d], c[2*d]);
+                    it->second[2*d + 1] = std::max(it->second[2*d + 1], c[2*d + 1]);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    std::sort(h.begin(), h.end());
+    h.erase(std::unique(h.begin(), h.end()), h.end());
+    for (const int g : h) {slot_of[g] = static_cast<int>(slot_gid.size()); slot_gid.push_back(g);}
+  }
+  const int nfld = static_cast<int>(slot_gid.size());
+  halo_.rect.assign(nfld - nmb, {0, indcs.nx1, 0, indcs.nx2, 0, indcs.nx3});
+  if (cloud_halo_strips) {
+    const int nxb[3] = {indcs.nx1, indcs.nx2, indcs.nx3};
+    for (int b=nmb; b<nfld; ++b) {
+      auto it = hrect.find(slot_gid[b]);
+      if (it == hrect.end()) continue;
+      auto c = it->second;
+      bool ok = true;
+      for (int d=0; d<3; ++d) {
+        c[2*d] = std::max(0, c[2*d]); c[2*d + 1] = std::min(nxb[d], c[2*d + 1]);
+        ok = ok && c[2*d] < c[2*d + 1];
+      }
+      if (ok) halo_.rect[b - nmb] = c;
+    }
+  }
+  for (int g=0; g<ntot; ++g) {
+    if (slot_of[g] < 0) {slot_of[g] = static_cast<int>(slot_gid.size()); slot_gid.push_back(g);}
+  }
+  const int nall = static_cast<int>(slot_gid.size());
+  if (global_variable::nranks == 1 && (nfld != nmb || nall != nmb)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "3-D refinable clouds: one MPI rank only (stage 1)" << std::endl;
+              << "3-D leaf traversal: one rank but " << nfld - nmb << " halo and " << nall - nfld
+              << " other blocks" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  const int nall = nmb;
+  leaf_slot_gid = slot_gid;
+  {
+    leaf_slot_gid_d = DvceArray1D<int>("dust_slot_gid", nall);
+    leaf_slot_rank_d = DvceArray1D<int>("dust_slot_rank", nall);
+    auto gh = Kokkos::create_mirror_view(leaf_slot_gid_d);
+    auto rh = Kokkos::create_mirror_view(leaf_slot_rank_d);
+    for (int b=0; b<nall; ++b) {gh(b) = slot_gid[b]; rh(b) = pm->rank_eachmb[slot_gid[b]];}
+    Kokkos::deep_copy(leaf_slot_gid_d, gh);
+    Kokkos::deep_copy(leaf_slot_rank_d, rh);
+  }
   auto &lt = leaf_traversal3d;
-  const auto &t = smr_transfer;
   const auto &ms = pm->mesh_size;
-  lt.nmb = nmb; lt.nfld = nall; lt.nall = nall; lt.gids = gids;
+  lt.nmb = nmb; lt.nfld = nfld; lt.nall = nall; lt.gids = gids;
   lt.nx1 = indcs.nx1; lt.nx2 = indcs.nx2; lt.nx3 = indcs.nx3;
   lt.is = indcs.is; lt.js = indcs.js; lt.ks = indcs.ks;
   lt.ncells1 = indcs.nx1 + 2*indcs.ng; lt.ncells2 = indcs.nx2 + 2*indcs.ng;
@@ -258,7 +417,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
   auto fbox = Kokkos::create_mirror_view(lt.fbox);
   std::vector<Real> bmax1(nall), bmax2(nall), bmax3(nall);
   for (int b=0; b<nall; ++b) {
-    const LogicalLocation &ll = pm->lloc_eachmb[gids + b];
+    const LogicalLocation &ll = pm->lloc_eachmb[slot_gid[b]];
     const int dl = ll.level - pm->root_level;
     const std::int32_t n1 = pm->nmb_rootx1 << dl, n2 = pm->nmb_rootx2 << dl;
     const std::int32_t n3 = pm->nmb_rootx3 << dl;
@@ -275,13 +434,15 @@ void DustGasDrag::BuildLeafTraversal3D() {
     box(b, 3) = dx1; box(b, 4) = dx2; box(b, 5) = dx3;
     box(b, 6) = 1.0/dx1; box(b, 7) = 1.0/dx2; box(b, 8) = 1.0/dx3;
     bmax1[b] = x1b; bmax2[b] = x2b; bmax3[b] = x3b;
-    const auto &sz = mbsize.h_view(b);
-    if (sz.x1min != x1a || sz.x2min != x2a || sz.x3min != x3a || sz.dx1 != dx1 ||
-        sz.dx2 != dx2 || sz.dx3 != dx3) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "3-D leaf traversal: the box of block " << gids + b << " from its logical "
-                << "location differs from mb_size" << std::endl;
-      std::exit(EXIT_FAILURE);
+    if (b < nmb) {
+      const auto &sz = mbsize.h_view(b);
+      if (sz.x1min != x1a || sz.x2min != x2a || sz.x3min != x3a || sz.dx1 != dx1 ||
+          sz.dx2 != dx2 || sz.dx3 != dx3) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "3-D leaf traversal: the box of block " << gids + b << " from its logical "
+                  << "location differs from mb_size" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
     }
     const int ratio = 1 << (lt.nlev - dl);
     blev(b) = dl;
@@ -293,7 +454,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
         std::lround((x2a - lt.x2min)/lt.fine_dx2) != fbox(b, 2) ||
         std::lround((x3a - lt.x3min)/lt.fine_dx3) != fbox(b, 4)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "3-D leaf traversal: block " << gids + b << " (level " << dl
+                << "3-D leaf traversal: block " << slot_gid[b] << " (level " << dl
                 << ") does not fit the finest grid of " << lt.nlev << " levels" << std::endl;
       std::exit(EXIT_FAILURE);
     }
@@ -323,7 +484,13 @@ void DustGasDrag::BuildLeafTraversal3D() {
     for (int n=0; n<nslot; ++n) {
       const int g = nghbr.h_view(m, n).gid;
       if (g < 0) continue;
-      const int b = g - gids;
+      const int b = slot_of[g];
+      if (b >= nfld) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "3-D leaf traversal: neighbour " << g << " of block " << gids + m
+                  << " has no halo slot" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       int s[3];
       const Real bmin_b[3] = {box(b, 0), box(b, 1), box(b, 2)};
       const Real bmin_m[3] = {box(m, 0), box(m, 1), box(m, 2)};
@@ -433,12 +600,31 @@ void DustGasDrag::BuildLeafTraversal3D() {
   Kokkos::deep_copy(lt.fbox, fbox);
   Kokkos::deep_copy(lt.nbmax, nbmax);
   Kokkos::deep_copy(lt.safe, safe);
+  // the leaf fields written or read on halo blocks hold nfld blocks
+  if (qdep.extent_int(0) < nfld) {
+    Kokkos::realloc(qdep, nfld, qdep.extent(1), qdep.extent(2), qdep.extent(3), qdep.extent(4));
+    Kokkos::deep_copy(qdep, 0.0);
+  }
+  if (dmom.extent_int(0) < nfld) {
+    Kokkos::realloc(dmom, nfld, dmom.extent(1), dmom.extent(2), dmom.extent(3), dmom.extent(4));
+    Kokkos::deep_copy(dmom, 0.0);
+  }
+  BuildHalo(slot_gid);
+  halo_allow_d_ = DvceArray1D<std::int64_t>("dust_halo_allow", std::max(nmb, 1));
+  if (global_variable::nranks > 1) {
+    auto ah = Kokkos::create_mirror_view(halo_allow_d_);
+    for (int m=0; m<nmb; ++m) ah(m) = halo_allow_[m];
+    Kokkos::deep_copy(halo_allow_d_, ah);
+  }
   if (global_variable::my_rank == 0) {
     int mxnb = 0;
     for (int m=0; m<nmb; ++m) mxnb = std::max(mxnb, nnb(m));
-    std::cout << "# 3-D leaf traversal: " << nmb << " blocks, levels " << lt.nlev
-              << ", finest grid " << lt.nfine1 << "x" << lt.nfine2 << "x" << lt.nfine3
-              << ", at most " << mxnb << " neighbours"
+    std::cout << "# 3-D leaf traversal: " << nmb << " blocks";
+    if (global_variable::nranks > 1) {
+      std::cout << " on rank 0 (" << nfld - nmb << " halo, " << ntot << " in all)";
+    }
+    std::cout << ", levels " << lt.nlev << ", finest grid " << lt.nfine1 << "x" << lt.nfine2
+              << "x" << lt.nfine3 << ", at most " << mxnb << " neighbours"
               << (nunsafe > 0 ? ", " + std::to_string(nunsafe) + " blocks without a certain ring"
                               : "") << std::endl;
   }
@@ -508,6 +694,168 @@ int DustGasDrag::ResetBlocks3D(const char *when, const bool check, Real &dwmax, 
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::FrameToBlock3D, CheckHaloReach3D, RouteToOwnerBlocks3D
+//! \brief Stage 3: several ranks, the 2-D multi-rank functions with a third
+//! direction.  FrameToBlock3D: a particle in the periodic image next to the block it keeps
+//! (positions and RK position registers), so that the particle exchange sees a step of one
+//! block.  CheckHaloReach3D: how far each cloud's support (two half-widths on a lobed side)
+//! extends beyond its block, against the block's allowance; where it exceeds it the block's reach
+//! is widened and every rank rebuilds the leaf traversal and the halo.  RouteToOwnerBlocks3D:
+//! every particle to the block (and rank) that holds its position.
+
+void DustGasDrag::FrameToBlock3D() {
+  auto pr = pmy_pack->ppart->prtcl_rdata;
+  auto pi = pmy_pack->ppart->prtcl_idata;
+  const auto lt = leaf_traversal3d;
+  const int npart = pmy_pack->ppart->nprtcl_thispack;
+  if (npart == 0) return;
+  Kokkos::parallel_for("dust_migrate_frame3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    const int m = lt.Anchor(pi(PGID,p));
+    const Real cx = lt.box(m,0) + 0.5*lt.nx1*lt.box(m,3);
+    const Real cy = lt.box(m,1) + 0.5*lt.nx2*lt.box(m,4);
+    const Real cz = lt.box(m,2) + 0.5*lt.nx3*lt.box(m,5);
+    const Real sx = lt.lx*round((pr(IPX,p) - cx)*lt.ilx);
+    const Real sy = lt.ly*round((pr(IPY,p) - cy)*lt.ily);
+    const Real sz = lt.lz*round((pr(IPZ,p) - cz)*lt.ilz);
+    if (sx != 0.0) {pr(IPX,p) -= sx; pr(IPX1,p) -= sx;}
+    if (sy != 0.0) {pr(IPY,p) -= sy; pr(IPY1,p) -= sy;}
+    if (sz != 0.0) {pr(IPZ,p) -= sz; pr(IPZ1,p) -= sz;}
+  });
+}
+
+bool DustGasDrag::CheckHaloReach3D(const char *when) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  const int nmb = pmy_pack->nmb_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  const auto lt = leaf_traversal3d;
+  auto allow = halo_allow_d_;
+  DvceArray1D<std::int64_t> need("dust_halo_need3d", std::max(nmb, 1));
+  int nover = 0;
+  if (npart > 0) {
+    Kokkos::parallel_reduce("dust_halo_reach3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &cnt) {
+      using T = SMRCompositeTransfer;
+      const int m = lt.Anchor(pi(PGID,p));
+      Real x = pr(IPX,p), y = pr(IPY,p), z = pr(IPZ,p);
+      lt.Frame(m, x, y, z);
+      const int code = pi(PLEV,p);
+      const int lev = T::CloudLevel(code);
+      const Real e1 = (T::CloudLobe1(code) ? 2.0 : 1.0)*lt.CloudHalfWidth1(lev);
+      const Real e2 = (T::CloudLobe2(code) ? 2.0 : 1.0)*lt.CloudHalfWidth2(lev);
+      const Real e3 = (T::CloudLobe3(code) ? 2.0 : 1.0)*lt.CloudHalfWidth3(lev);
+      const Real bx0 = lt.box(m,0), bx1 = bx0 + lt.nx1*lt.box(m,3);
+      const Real by0 = lt.box(m,1), by1 = by0 + lt.nx2*lt.box(m,4);
+      const Real bz0 = lt.box(m,2), bz1 = bz0 + lt.nx3*lt.box(m,5);
+      const Real o1 = Kokkos::fmax(0.0, Kokkos::fmax(bx0 - (x - e1), (x + e1) - bx1));
+      const Real o2 = Kokkos::fmax(0.0, Kokkos::fmax(by0 - (y - e2), (y + e2) - by1));
+      const Real o3 = Kokkos::fmax(0.0, Kokkos::fmax(bz0 - (z - e3), (z + e3) - bz1));
+      const std::int64_t d = static_cast<std::int64_t>(
+          Kokkos::fmax(Kokkos::ceil(o1/lt.fine_dx1),
+                       Kokkos::fmax(Kokkos::ceil(o2/lt.fine_dx2), Kokkos::ceil(o3/lt.fine_dx3))));
+      if (d > allow(m)) {
+        const std::int64_t margin = static_cast<std::int64_t>(1) << (lt.nlev - lt.blev(m));
+        Kokkos::atomic_max(&need(m), d + margin);
+        ++cnt;
+      }
+    }, Kokkos::Sum<int>(nover));
+  }
+  long long tot = nover;
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &tot, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  if (tot == 0) return false;
+  auto nh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), need);
+  int nwide = 0;
+  for (int m=0; m<nmb; ++m) {
+    if (nh(m) > halo_need_[m]) {halo_need_[m] = nh(m); ++nwide;}
+  }
+  halo_widenings_ += static_cast<unsigned long long>(nwide);
+  const int nhalo_before = leaf_traversal3d.nfld - leaf_traversal3d.nmb;
+  BuildLeafTraversal3D();
+  if (global_variable::my_rank == 0) {
+    std::cout << "# dust halo (3-D): " << tot << " clouds reached beyond the halo ("
+              << when << ", cycle " << pmy_pack->pmesh->ncycle << "); rank 0 widened " << nwide
+              << " blocks, halo blocks " << nhalo_before << " -> "
+              << leaf_traversal3d.nfld - leaf_traversal3d.nmb << std::endl;
+  }
+  return true;
+}
+
+int DustGasDrag::RouteToOwnerBlocks3D(const char *when) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto *pb = ppar->pbval_part;
+  int nchanged = 0, nbad = 0;
+#if MPI_PARALLEL_ENABLED
+  WrapParticles3D();
+  const int npart = ppar->nprtcl_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  const auto lt = leaf_traversal3d;
+  const int ncell123 = lt.ncells1*lt.ncells2*lt.ncells3;
+  const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
+  auto sgid = leaf_slot_gid_d;
+  auto srank = leaf_slot_rank_d;
+  if (pb->sendlist.extent_int(0) < std::max(npart, 1)) Kokkos::realloc(pb->sendlist, std::max(npart, 1));
+  Kokkos::deep_copy(pb->send_count.d_view, 0);
+  auto psendl = pb->sendlist.d_view;
+  int *pcounter = pb->send_count.d_view.data();
+  if (npart > 0) {
+    Kokkos::parallel_reduce("dust_route_owner3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
+      const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), lt.Anchor(pi(PGID,p)));
+      const int slot = (leaf < 0) ? -1 : leaf/ncell123;
+      if (slot < 0) {++bad; return;}
+      const int g = (slot < nmb) ? gids + slot : sgid(slot);
+      if (pi(PGID,p) != g) {pi(PGID,p) = g; ++changed;}
+      if (slot >= nmb) {
+        const int k = Kokkos::atomic_fetch_add(pcounter, 1);
+        psendl(k).prtcl_indx = p;
+        psendl(k).dest_gid = g;
+        psendl(k).dest_rank = srank(slot);
+      }
+    }, Kokkos::Sum<int>(nchanged), Kokkos::Sum<int>(nbad));
+  }
+  if (nbad > 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << nbad << " particles have no owning MeshBlock (" << (when ? when : "split")
+              << ", 3-D)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  Kokkos::deep_copy(pb->send_count.h_view, pb->send_count.d_view);
+  pb->nprtcl_send = pb->send_count.h_view(0);
+  if (pb->nprtcl_send > 0) {
+    auto d = Kokkos::subview(pb->sendlist.d_view, std::make_pair(0, pb->nprtcl_send));
+    auto h = Kokkos::subview(pb->sendlist.h_view, std::make_pair(0, pb->nprtcl_send));
+    Kokkos::deep_copy(h, d);
+  }
+  const int nsent = pb->nprtcl_send;
+  pb->CountSendsAndRecvs();
+  pb->InitPrtclRecv();
+  pb->PackAndSendPrtcls();
+  while (pb->RecvAndUnpackPrtcls() != TaskStatus::complete) {}
+  pb->ClearPrtclSend();
+  pb->ClearPrtclRecv();
+  Mesh *pm = pmy_pack->pmesh;
+  long long tot = 0;
+  for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
+  pm->nprtcl_total = static_cast<int>(tot);
+  long long sums[2] = {nchanged, nsent};
+  MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  if (global_variable::my_rank == 0 && when != nullptr) {   // nullptr: quiet (SplitToLeaves)
+    std::cout << "# dust (3-D): MeshBlock ids set from the positions at the " << when
+              << ": " << sums[0] << " of " << tot << " changed, " << sums[1]
+              << " sent to other ranks" << std::endl;
+  }
+#else
+  (void)pb; (void)nbad; (void)when;
+#endif
+  return nchanged;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::CheckLeafTraversal3D
 //! \brief Checks nsample clouds (random positions, levels, lobes, gather point flags and
 //! anchor blocks) against a brute-force integration: every finest cell under the support is
@@ -518,7 +866,12 @@ int DustGasDrag::ResetBlocks3D(const char *when, const bool check, Real &dwmax, 
 
 void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
   const auto lt = leaf_traversal3d;
-  const int nleaf = lt.nmb*lt.ncells3*lt.ncells2*lt.ncells1;
+  // several ranks (stage 3): the leaves with fields (this rank's blocks and the halo); the clouds
+  // then sit in their anchor block, at the levels the halo reach covers (HaloReach)
+  const bool multi = global_variable::nranks > 1;
+  const int nleaf = lt.nfld*lt.ncells3*lt.ncells2*lt.ncells1;
+  auto blev_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), lt.blev);
+  auto box_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), lt.box);
   DvceArray2D<Real> d("dust_leaf3d_check", nleaf, 4);
   DvceArray1D<Real> res("dust_leaf3d_check_res", 4);
   double maxw = 0.0, maxm = 0.0, maxsum = 0.0;
@@ -527,10 +880,18 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
   const std::uint64_t seed = static_cast<std::uint64_t>(pmy_pack->pmesh->ncycle) + 12345;
   for (int s=0; s<nsample; ++s) {
     const std::uint64_t key = seed*UINT64_C(1000003) + static_cast<std::uint64_t>(s)*7919;
-    const Real px = lt.x1min + Uniform01(key + 1)*lt.lx;
-    const Real py = lt.x2min + Uniform01(key + 2)*lt.ly;
-    const Real pz = lt.x3min + Uniform01(key + 3)*lt.lz;
-    const int lev = std::min(lt.nlev, static_cast<int>(Uniform01(key + 4)*(lt.nlev + 1)));
+    const int anchor = std::min(lt.nmb - 1, static_cast<int>(Uniform01(key + 10)*lt.nmb));
+    Real px = lt.x1min + Uniform01(key + 1)*lt.lx;
+    Real py = lt.x2min + Uniform01(key + 2)*lt.ly;
+    Real pz = lt.x3min + Uniform01(key + 3)*lt.lz;
+    int lmin = 0;
+    if (multi) {
+      px = box_h(anchor,0) + Uniform01(key + 1)*lt.nx1*box_h(anchor,3);
+      py = box_h(anchor,1) + Uniform01(key + 2)*lt.nx2*box_h(anchor,4);
+      pz = box_h(anchor,2) + Uniform01(key + 3)*lt.nx3*box_h(anchor,5);
+      lmin = std::max(0, blev_h(anchor) - 1);
+    }
+    const int lev = std::min(lt.nlev, lmin + static_cast<int>(Uniform01(key + 4)*(lt.nlev + 1 - lmin)));
     int code = lev;
     if (lev >= 1 && Uniform01(key + 5) < 0.5) {
       code |= (static_cast<int>(Uniform01(key + 6)*4) & 3) << SMRCompositeTransfer::kCloudLobeShift1;
@@ -538,7 +899,6 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
       code |= (static_cast<int>(Uniform01(key + 8)*4) & 3) << SMRCompositeTransfer::kCloudLobeShift3;
     }
     if (Uniform01(key + 9) < 0.3) code |= SMRCompositeTransfer::kCloudGatherPoint;
-    const int anchor = std::min(lt.nmb - 1, static_cast<int>(Uniform01(key + 10)*lt.nmb));
     Kokkos::deep_copy(d, 0.0);
     Kokkos::parallel_for("dust_leaf3d_check", Kokkos::RangePolicy<>(DevExeSpace(), 0, 1),
     KOKKOS_LAMBDA(const int) {
@@ -579,7 +939,7 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
             LT::Cell<true>(s1, LT::FaceAt<true>(s1, lt.x1min + i*lt.fine_dx1),
                            LT::FaceAt<true>(s1, lt.x1min + (i + 1)*lt.fine_dx1), w1, g1);
             const int t = lt.Locate(i, j, k);
-            if (t < 0) {res(1) = 1.0e30; continue;}
+            if (t < 0 || t >= nleaf) {res(1) = 1.0e30; continue;}
             d(t, 0) -= w1*w2*w3; d(t, 1) -= g1*w2*w3; d(t, 2) -= w1*g2*w3; d(t, 3) -= w1*w2*g3;
           }
         }
@@ -618,10 +978,20 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
     if (rh(2) != 0.0) ++nelig_bad;
     if (rh(3) != 0.0) ++nglobal;
   }
+#if MPI_PARALLEL_ENABLED
+  if (multi) {
+    double mx[3] = {maxw, maxm, maxsum};
+    int ni[2] = {nelig_bad, nglobal};
+    MPI_Allreduce(MPI_IN_PLACE, mx, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, ni, 2, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    maxw = mx[0]; maxm = mx[1]; maxsum = mx[2]; nelig_bad = ni[0]; nglobal = ni[1];
+  }
+#endif
   const bool ok = (maxw <= 1.0e-13 && maxm <= 1.0e-13 && maxsum <= 1.0e-13 && nelig_bad == 0);
   if (global_variable::my_rank == 0) {
     std::cout << "# 3-D leaf traversal check, cycle " << pmy_pack->pmesh->ncycle
-              << ": " << nsample << " clouds, max |weight - brute| " << maxw
+              << ": " << nsample << " clouds" << (multi ? " per rank" : "")
+              << ", max |weight - brute| " << maxw
               << ", max |moment - brute|/half-width " << maxm << ", max |sum - 1| " << maxsum
               << ", eligibility mismatches " << nelig_bad << ", global searches " << nglobal
               << (ok ? " OK" : " FAILED") << std::endl;
@@ -738,11 +1108,13 @@ int DustGasDrag::SplitCloudsP1Device3D() {
 //! 3-D); from a conserved state: the velocity of every cell first (PackGasGather in 3-D).
 
 void DustGasDrag::PackGatherField3D(const DvceArray5D<Real> &vel) {
+  // room for the halo slots (their values come from HaloForwardPack)
   const int nmb = pmy_pack->nmb_thispack, nk = vel.extent_int(2);
   const int nj = vel.extent_int(3), ni = vel.extent_int(4);
-  if (gpack3.extent_int(0) != std::max(nmb, vel.extent_int(0)) || gpack3.extent_int(1) != nk ||
+  const int nslot = std::max(std::max(nmb, vel.extent_int(0)), leaf_traversal3d.nfld);
+  if (gpack3.extent_int(0) != nslot || gpack3.extent_int(1) != nk ||
       gpack3.extent_int(2) != nj || gpack3.extent_int(3) != ni) {
-    Kokkos::realloc(gpack3, std::max(nmb, vel.extent_int(0)), nk, nj, ni, 12);
+    Kokkos::realloc(gpack3, nslot, nk, nj, ni, 12);
   }
   auto gp = gpack3;
   auto v = vel;
@@ -755,6 +1127,7 @@ void DustGasDrag::PackGatherField3D(const DvceArray5D<Real> &vel) {
       gp(m,k,j,i,9+c) = v(m,c,k+1,j,i) - v(m,c,k-1,j,i);
     }
   });
+  HaloForwardPack(gpack3);   // the owners' values on the halo blocks
 }
 
 void DustGasDrag::PackGasGather3D(const DvceArray5D<Real> &u) {
@@ -842,6 +1215,7 @@ void DustGasDrag::CloudPredictor3D(const bool rate_dep) {
     }
   };
   CloudParFor("dust_pc2_cloud3d_predictor", npart, body);
+  HaloReverseAdd(qdep, 1, 4);   // deposits on halo blocks back to their owners
 }
 
 //----------------------------------------------------------------------------------------
@@ -947,12 +1321,15 @@ void DustGasDrag::CloudAdvance3D() {
     }
   };
   CloudParFor("dust_pc2_cloud3d_advance", npart, body);
+  if (br) HaloReverseAdd(dmom, 0, 3);   // deposits on halo blocks back to their owners
 }
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::DepositCloudDensity3D
 //! \brief Dust density (component 0) and momentum density (1-3) of the clouds on the leaves of
-//! this rank (diagnostics; f is (re)allocated to the size of qdep with 4 components).
+//! this rank (diagnostics; f is (re)allocated to the size of qdep with 4 components).  Several
+//! ranks: the deposits on halo blocks are added to their owners (the halo slots keep this rank's
+//! share).
 
 void DustGasDrag::DepositCloudDensity3D(DvceArray5D<Real> &f) {
   if (f.extent_int(0) != qdep.extent_int(0) || f.extent_int(1) != 4 ||
@@ -981,6 +1358,7 @@ void DustGasDrag::DepositCloudDensity3D(DvceArray5D<Real> &f) {
       DepositAdd(&ff(tb,3,tk,tj,ti), d*vz);
     });
   });
+  HaloReverseAdd(f, 0, 4);   // several ranks: the owners hold every rank's clouds
 }
 
 }  // namespace dust

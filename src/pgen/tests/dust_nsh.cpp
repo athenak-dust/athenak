@@ -1151,8 +1151,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   const bool ranks_ok = (global_variable::nranks == 1) ||
       (dust_active && pmbp->pdust->experimental_mpi && !canonical_root);
   // 3-D with refinable clouds (<dust>/experimental_3d) or the canonical deposit
-  const bool root3d_ok = dust_active && global_variable::nranks == 1 &&
-      (pmbp->pdust->Clouds3D() || canonical_root);
+  // (several ranks: the clouds only, ranks_ok)
+  const bool root3d_ok = dust_active && (pmbp->pdust->Clouds3D() || canonical_root);
   if (cloud_root_random && (!ranks_ok || !dust_active ||
       !(pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud ||
         canonical_root) || (pmy_mesh_->three_d && !root3d_ok))) {
@@ -1464,21 +1464,14 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     place.x1min = ms.x1min; place.x2min = ms.x2min; place.x3min = ms.x3min;
     place.lx = ms.x1max - ms.x1min; place.ly = ms.x2max - ms.x2min; place.lz = ms.x3max - ms.x3min;
     place.hx = place.lx/nc1; place.hy = place.ly/nc2; place.hz = place.lz/nc3;
-    Kokkos::realloc(pr, ppar->nrdata, nparent);
-    Kokkos::realloc(pi, ppar->nidata, nparent);
-    ppar->nprtcl_thispack = nparent;
-    pmy_mesh_->nprtcl_thisrank = nparent;
-    pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = nparent;
-    pmy_mesh_->nprtcl_total = nparent;
-    auto pr0 = ppar->prtcl_rdata;
-    auto pi0 = ppar->prtcl_idata;
-    auto gids0 = pmbp->gids;
-    const int nrdata = ppar->nrdata;
+    // the parents of this rank (several ranks): every rank draws all of them and
+    // keeps those whose leaf is in one of its blocks, in the order of their global index q,
+    // which stays the tag (one rank: all of them)
     const auto lt3 = pmbp->pdust->leaf_traversal3d;
     const bool canon = canonical_root;
     const int ncell123 = (indcs.nx1 + 2*indcs.ng)*(indcs.nx2 + 2*indcs.ng)*(indcs.nx3 + 2*indcs.ng);
-    const Real mass_unit = place.hx*place.hy*place.hz;
-    par_for("nsh_cloud_root3d", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int q) {
+    DvceArray1D<int> pslot("nsh_root3d_slot", nparent);
+    par_for("nsh_cloud_root3d_owner", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int q) {
       Real x, y, z, vw;
       place(q, x, y, z, vw);
       int m = 0;
@@ -1492,28 +1485,61 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
         const int leaf = lt3.LeafOwner(x, y, z, 0);
         m = (leaf < 0) ? 0 : leaf/ncell123;
       }
-      const int sp = q % nspec;
-      pi0(PGID,q) = gids0 + m;
-      pi0(PTAG,q) = q;
-      pi0(PSP,q) = sp;
-      pi0(PLEV,q) = 0;
-      for (int c=0; c<nrdata; ++c) pr0(c,q) = 0.0;
-      pr0(IPX,q) = x; pr0(IPX1,q) = x;
-      pr0(IPY,q) = y; pr0(IPY1,q) = y;
-      pr0(IPZ,q) = z; pr0(IPZ1,q) = z;
-      pr0(IPTS,q) = taus_.d_view(sp);
-      pr0(IPM,q) = spdat.d_view(sp,2)*mass_unit;
-      pr0(IPVX,q) = spdat.d_view(sp,0) + vw;
-      pr0(IPVY,q) = spdat.d_view(sp,1);
-      pr0(IPVX1,q) = pr0(IPVX,q);
-      pr0(IPVY1,q) = pr0(IPVY,q);
+      pslot(q) = m;
     });
+    DvceArray1D<int> pnew("nsh_root3d_new", nparent);
+    int nkeep = 0;
+    Kokkos::parallel_scan("nsh_root3d_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, nparent),
+    KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
+      const bool keep = (pslot(q) < nmb);
+      if (final) pnew(q) = keep ? upd : -1;
+      if (keep) ++upd;
+    }, nkeep);
+    Kokkos::realloc(pr, ppar->nrdata, nkeep);
+    Kokkos::realloc(pi, ppar->nidata, nkeep);
+    ppar->nprtcl_thispack = nkeep;
+    pmy_mesh_->nprtcl_thisrank = nkeep;
+    pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = nkeep;
+    pmy_mesh_->nprtcl_total = nparent;
+    auto pr0 = ppar->prtcl_rdata;
+    auto pi0 = ppar->prtcl_idata;
+    auto gids0 = pmbp->gids;
+    const int nrdata = ppar->nrdata;
+    const Real mass_unit = place.hx*place.hy*place.hz;
+    par_for("nsh_cloud_root3d", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int q) {
+      const int p = pnew(q);
+      if (p < 0) return;
+      Real x, y, z, vw;
+      place(q, x, y, z, vw);
+      const int sp = q % nspec;
+      pi0(PGID,p) = gids0 + pslot(q);
+      pi0(PTAG,p) = q;
+      pi0(PSP,p) = sp;
+      pi0(PLEV,p) = 0;
+      for (int c=0; c<nrdata; ++c) pr0(c,p) = 0.0;
+      pr0(IPX,p) = x; pr0(IPX1,p) = x;
+      pr0(IPY,p) = y; pr0(IPY1,p) = y;
+      pr0(IPZ,p) = z; pr0(IPZ1,p) = z;
+      pr0(IPTS,p) = taus_.d_view(sp);
+      pr0(IPM,p) = spdat.d_view(sp,2)*mass_unit;
+      pr0(IPVX,p) = spdat.d_view(sp,0) + vw;
+      pr0(IPVY,p) = spdat.d_view(sp,1);
+      pr0(IPVX1,p) = pr0(IPVX,p);
+      pr0(IPVY1,p) = pr0(IPVY,p);
+    });
+    // the tag counter is set collectively before the splits
     if (!canonical_root) {
       pmbp->pdust->EnsureNextTag();
       pmbp->pdust->SplitToLeaves();
     }
-    std::cout << "# 3-D root " << (canonical_root ? "particles (canonical): " : "clouds: ")
-              << nparent << " parents -> " << ppar->nprtcl_thispack << " particles" << std::endl;
+    long long nnow = ppar->nprtcl_thispack;
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &nnow, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+#endif
+    if (global_variable::my_rank == 0) {
+      std::cout << "# 3-D root " << (canonical_root ? "particles (canonical): " : "clouds: ")
+                << nparent << " parents -> " << nnow << " particles" << std::endl;
+    }
   } else if (cloud_root_random) {
     // Four particles per ROOT cell, placed independently over the whole box.
     // Refinement changes the cloud shape through the exact P1 split, never the
@@ -2029,6 +2055,14 @@ void DustTest3DErrors(Mesh *pm, Real out[7]) {
     Kokkos::atomic_add(&col(key,1), vol*rd);
     Kokkos::atomic_add(&col(key,2), vol);
   }, Kokkos::Sum<Real>(vtot), Kokkos::Sum<Real>(eg), Kokkos::Sum<Real>(eu), Kokkos::Sum<Real>(ed));
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {   // the column sums of all ranks
+    auto ch = Kokkos::create_mirror_view_and_copy(HostMemSpace(), col);
+    MPI_Allreduce(MPI_IN_PLACE, ch.data(), static_cast<int>(ch.size()), MPI_ATHENA_REAL, MPI_SUM,
+                  MPI_COMM_WORLD);
+    Kokkos::deep_copy(col, ch);
+  }
+#endif
   Real yg = 0.0, yd = 0.0;
   Kokkos::parallel_reduce("dtest3d_err2", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
   KOKKOS_LAMBDA(const int q, Real &p_, Real &yg_, Real &yd_, Real &ml_) {
@@ -2050,6 +2084,14 @@ void DustTest3DErrors(Mesh *pm, Real out[7]) {
   Kokkos::parallel_reduce("dtest3d_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0,
                           pmbp->ppart->nprtcl_thispack),
   KOKKOS_LAMBDA(const int p, Real &a) {a += pr(IPM,p);}, Kokkos::Sum<Real>(mpart));
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {   // the sums of all ranks (every rank gets the same out)
+    Real sums[10] = {vtot, eg, eu, ed, ep, yg, yd, mleaf, mpart, 0.0};
+    MPI_Allreduce(MPI_IN_PLACE, sums, 9, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+    vtot = sums[0]; eg = sums[1]; eu = sums[2]; ed = sums[3]; ep = sums[4]; yg = sums[5];
+    yd = sums[6]; mleaf = sums[7]; mpart = sums[8];
+  }
+#endif
   if (c.wave) {
     const Real ag = std::hypot(c.dgr, c.dgi), au = std::hypot(c.dur, c.dui);
     const Real ad = std::hypot(c.ddr, c.ddi);
@@ -2141,7 +2183,9 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     const char *labels[7] = {"e_rhog", "e_ux", "e_rhod", "e_uperp", "y_rhog", "y_rhod", "dmass"};
     Real v[7];
     DustTest3DErrors(pm, v);
-    for (int c=0; c<7; ++c) {pdata->label[h+c] = labels[c]; pdata->hdata[h+c] = v[c];}
+    // the history adds the ranks: the values once, from rank 0
+    const Real f = (global_variable::my_rank == 0) ? 1.0 : 0.0;
+    for (int c=0; c<7; ++c) {pdata->label[h+c] = labels[c]; pdata->hdata[h+c] = f*v[c];}
     pdata->nhist = h + 7;
   }
   if (ba_snapshots_ && pm->time + 1.0e-10 >= ba_snapshot_dt_*ba_snapshot_k_) {

@@ -1157,7 +1157,8 @@ void DustGasDrag::CheckMultiRank() {
     bad.push_back("stage X under the pass budget (cloud_merge_budget_x)");
   }
   if (cloud_split_log) bad.push_back("cloud_split_log");
-  if (cloud_leaf_check > 0) bad.push_back("cloud_leaf_check");
+  // The 3-D check runs on several ranks (CheckLeafTraversal3D)
+  if (cloud_leaf_check > 0 && !clouds3d) bad.push_back("cloud_leaf_check");
   // the audit is on whenever cloud_audit_t1 > 0 (dust_cloud_device.cpp; cloud_audit_t0 may stay at
   // its default -1): the check follows that condition (flag audit / Codex review)
   if (cloud_audit_t1 > 0.0) bad.push_back("merge pass audits (cloud_audit_t1 > 0)");
@@ -1254,7 +1255,7 @@ DustGasDrag::~DustGasDrag() {
               << t[0] << " pack=" << t[1] << " mpi=" << t[2] << " unpack=" << t[3]
               << " | halo reverse (" << halo_.nexch[1] << "): kernels_before=" << t[4] << " pack="
               << t[5] << " mpi=" << t[6] << " add=" << t[7] << " | halo widenings " << halo_widenings_
-              << ", halo blocks " << leaf_traversal.nfld - leaf_traversal.nmb << ", cells sent "
+              << ", halo blocks " << halo_.hslot1 - halo_.hslot0 << ", cells sent "
               << (halo_.soff.empty() ? 0 : halo_.soff.back()) << " received "
               << (halo_.roff.empty() ? 0 : halo_.roff.back())
               << (cloud_halo_strips ? " (strips)" : " (whole blocks)") << std::endl;

@@ -454,7 +454,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
         const Real y0 = size.x2min + (j + 0.5)*hy;
         const Real z0 = size.x3min + (kk + lshiftz + (kp + 0.5)/static_cast<Real>(npar1d))*hz;
         hi(PGID,p) = pmbp->gids + m;
-        hi(PTAG,p) = p;
+        hi(PTAG,p) = p*global_variable::nranks + global_variable::my_rank;   // unique over ranks
         hi(PSP,p) = 0;
         hi(PLEV,p) = 0;
         for (int col=0; col<ppar->nrdata; ++col) hr(col,p) = 0.0;
@@ -476,6 +476,14 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     pmy_mesh_->nprtcl_thisrank = nlattice;
     pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = nlattice;
     pmy_mesh_->nprtcl_total = nlattice;
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      MPI_Allgather(&nlattice, 1, MPI_INT, pmy_mesh_->nprtcl_eachrank, 1, MPI_INT, MPI_COMM_WORLD);
+      int tot = 0;
+      for (int r=0; r<global_variable::nranks; ++r) tot += pmy_mesh_->nprtcl_eachrank[r];
+      pmy_mesh_->nprtcl_total = tot;
+    }
+#endif
     pmbp->pdust->EnsureNextTag();
     pmbp->pdust->SplitToLeaves();
     if (seed_after) {
@@ -491,6 +499,8 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
         if (z < msz.x3min) z += len3;
         if (z >= msz.x3max) z -= len3;
         h2(IPX,p) = x; h2(IPX1,p) = x; h2(IPZ,p) = z; h2(IPZ1,p) = z;
+        // several ranks: the block (and rank) from the position below (RouteToOwnerBlocks)
+        if (global_variable::nranks > 1) continue;
         int owner = -1;
         for (int m=0; m<nmb3 && owner<0; ++m) {
           const auto &size = msz3.h_view(m);
@@ -507,10 +517,16 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       }
       Kokkos::deep_copy(ppar->prtcl_rdata, h2);
       Kokkos::deep_copy(ppar->prtcl_idata, i2);
+      if (global_variable::nranks > 1) pmbp->pdust->ResetPGIDFromPositions("seed_after_split");
     }
+    long long nroot = nlattice, nsplit = ppar->nprtcl_thispack;
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &nroot, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &nsplit, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+#endif
     if (global_variable::my_rank == 0) {
-      std::cout << "# refinable_cloud lattice (3-D): " << nlattice << " root clouds -> "
-                << ppar->nprtcl_thispack << " particles after the initial split"
+      std::cout << "# refinable_cloud lattice (3-D): " << nroot << " root clouds -> "
+                << nsplit << " particles after the initial split"
                 << (seed_after ? ", seed imprinted after the split" : "") << std::endl;
     }
     const Real vmax3 = std::max({fabs(vnx), fabs(vnp), 1.0e-30});
