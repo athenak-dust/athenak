@@ -189,8 +189,12 @@ Mesh::Mesh(ParameterInput *pin) :
   // MeshRefinement::CheckForRefinement); hydro only for now (no MHD, dust or particles)
   const bool sbox_smr = multilevel && pin->DoesBlockExist("shearing_box") && three_d &&
       pin->GetOrAddBoolean("shearing_box", "experimental_smr", false);
-  if (sbox_smr && (pin->DoesBlockExist("mhd") || pin->DoesBlockExist("dust") ||
-                   pin->DoesBlockExist("particles"))) {
+  // S3b: 3-D refinable clouds (<dust>/experimental_3d) are admitted too
+  const bool dust3d = pin->DoesBlockExist("dust") &&
+      pin->GetOrAddBoolean("dust", "experimental_3d", false);
+  if (sbox_smr && (pin->DoesBlockExist("mhd") ||
+                   ((pin->DoesBlockExist("dust") || pin->DoesBlockExist("particles")) &&
+                    !dust3d))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "<shearing_box>/experimental_smr: hydro only for now (no MHD, dust or "
               << "particles)" << std::endl;

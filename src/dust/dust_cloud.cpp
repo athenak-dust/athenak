@@ -113,7 +113,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   {
     const bool prod = coupling == DustCoupling::hybrid &&
                       hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2;
-    const bool sortdef = prod && (!cloud_merge || cloud_merge_device) &&
+    // Not in 3-D yet (the sort keys are 2-D cells)
+    const bool sortdef = prod && !clouds3d && (!cloud_merge || cloud_merge_device) &&
                          (!cloud_resample || cloud_resample_device) && cloud_merge_exact_ts &&
                          stopping_time_mode == DustStoppingTimeMode::species_fixed;
     cloud_sort_interval = pin->GetOrAddInteger("dust", "cloud_sort_interval", sortdef ? 64 : 0);
@@ -144,7 +145,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     {
       const bool prod = coupling == DustCoupling::hybrid &&
                         hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2;
-      cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval", prod ? 8 : 0);
+      cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval",
+                                                  (prod && !clouds3d) ? 8 : 0);
     }
   }
   std::string users;
@@ -169,6 +171,13 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << "<dust>/cloud_table must be auto, true or false" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  // No finest-grid table in 3-D (CheckClouds3D stops the paths that need it)
+  if (clouds3d && mode == "true") {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<dust>/cloud_table = true: no finest-grid table in 3-D" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (clouds3d) table = false;
   if (nlev_mesh < 0 || nvirt < 0 || (table && nlev > 2) ||
       nlev > SMRCompositeTransfer::kCloudLevelMask) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -214,9 +223,18 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     Real off2 = (size.x2min - t.x2min)/t.fine_dx2;
     int fi0 = static_cast<int>(std::lround(off1));
     int fj0 = static_cast<int>(std::lround(off2));
+    // The third direction in 3-D
+    bool bad3 = false;
+    if (clouds3d) {
+      const Real fdx3 = (pmesh->mesh_size.x3max - pmesh->mesh_size.x3min)/
+                        static_cast<Real>(pmesh->mesh_indcs.nx3 << nlev);
+      const Real off3 = (size.x3min - pmesh->mesh_size.x3min)/fdx3;
+      bad3 = std::abs(off3 - std::lround(off3)) > 1.0e-8 ||
+             std::abs(size.dx3 - ratio*fdx3) > 1.0e-12*size.dx3;
+    }
     if (lev < 0 || lev > nlev || std::abs(off1 - fi0) > 1.0e-8 || std::abs(off2 - fj0) > 1.0e-8 ||
         std::abs(size.dx1 - ratio*t.fine_dx1) > 1.0e-12*size.dx1 ||
-        std::abs(size.dx2 - ratio*t.fine_dx2) > 1.0e-12*size.dx2) {
+        std::abs(size.dx2 - ratio*t.fine_dx2) > 1.0e-12*size.dx2 || bad3) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "MeshBlock " << m << " is not aligned with the finest "
                 << "virtual grid" << std::endl;
@@ -324,7 +342,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << (t.cloud_split_overlap ? ", split on first overlap with finer leaves" : "")
               << std::endl;
   }
-  BuildLeafTraversal();
+  if (clouds3d) {BuildLeafTraversal3D();} else {BuildLeafTraversal();}
 }
 
 //----------------------------------------------------------------------------------------
@@ -609,7 +627,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
 #endif
   CheckHaloReach("refine");   // before this cycle's gathers and deposits
   if (cloud_leaf_check > 0 && pmy_pack->pmesh->ncycle % cloud_leaf_check == 0) {
-    CheckLeafTraversal();
+    if (clouds3d) {CheckLeafTraversal3D(256);} else {CheckLeafTraversal();}
   }
   if (cloud_sort_interval > 0 &&
       pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
@@ -780,7 +798,7 @@ int DustGasDrag::SplitAndMergeClouds() {
 
 int DustGasDrag::SplitCloudsP1() {
   if (cloud_split_device && !cloud_split_log && !split_oracle) {
-    return SplitCloudsP1Device();
+    return clouds3d ? SplitCloudsP1Device3D() : SplitCloudsP1Device();
   }
   RequireCloudTable("the host P1 split (cloud_split_device = false, cloud_split_log or a "
                     "split oracle)");

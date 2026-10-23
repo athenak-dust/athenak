@@ -50,6 +50,7 @@ add_executable(
         dust/dust_resample.cpp
         dust/dust_resample_device.cpp
         dust/dust_leaf.cpp
+        dust/dust_cloud3d.cpp
         dust/dust_halo.cpp
         dust/dust_amr.cpp
         dust/dust_restart.cpp

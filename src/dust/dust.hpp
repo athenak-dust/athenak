@@ -103,8 +103,12 @@ struct SMRCompositeTransfer {
   static constexpr int kCloudLobeShift2 = 4;
   static constexpr int kCloudLobeShift1 = 6;
   static constexpr int kCloudGatherPoint = 256;
+  // 3-D refinable clouds: bits 9-10 the x3 lobe; 2-D codes never set them
+  static constexpr int kCloudLobeShift3 = 9;
   KOKKOS_INLINE_FUNCTION
   static int CloudLevel(const int code) {return code & kCloudLevelMask;}
+  KOKKOS_INLINE_FUNCTION
+  static int CloudLobe3(const int code) {return (code >> kCloudLobeShift3) & 3;}
   KOKKOS_INLINE_FUNCTION
   static int CloudLobe1(const int code) {return (code >> kCloudLobeShift1) & 3;}
   KOKKOS_INLINE_FUNCTION
@@ -1134,6 +1138,9 @@ struct LeafTraversal {
   int LeafOwner(const Real x1, const Real x2, const int m) const {return Owner(x1, x2, m);}
 };
 
+// the 3-D leaf traversal (LeafTraversal3D)
+#include "dust_leaf3d.hpp"
+
 // the name of a per-rank log file: unchanged on one rank, name.rNNNN.ext on several
 inline std::string RankFile(const std::string &name) {
   if (global_variable::nranks == 1) return name;
@@ -1760,6 +1767,23 @@ class DustGasDrag {
   void PackGasGather(const DvceArray5D<Real> &u);       // ... from a conserved state
   // block-local traversal of the actual leaves (dust_leaf.cpp)
   LeafTraversal leaf_traversal;
+  // S3b: 3-D refinable clouds (<dust>/experimental_3d): the 3-D leaf traversal, the
+  // packed gather field (velocity and its central differences in x1, x2, x3: 12 numbers per
+  // cell) and the 3-D paths (dust_cloud3d.cpp)
+  bool experimental_3d = false;
+  LeafTraversal3D leaf_traversal3d;
+  DvceArray5D<Real> gpack3;
+  bool clouds3d = false;               // experimental_3d on a 3-D mesh (set by the constructor)
+  bool Clouds3D() const {return clouds3d;}
+  void BuildLeafTraversal3D();
+  void CheckLeafTraversal3D(const int nsample);
+  int SplitCloudsP1Device3D();
+  void PackGatherField3D(const DvceArray5D<Real> &vel);
+  void PackGasGather3D(const DvceArray5D<Real> &u);
+  void CloudPredictor3D(const bool rate_dep);
+  void CloudAdvance3D();
+  void DepositCloudDensity3D(DvceArray5D<Real> &f);
+  void CheckClouds3D();   // the restrictions of 3-D stage 1
   int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
   // timing diagnostic: storage order of the particles
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)

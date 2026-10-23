@@ -876,7 +876,72 @@ struct RootPlacement {
       x -= lx*Kokkos::floor((x - x1min)/lx);
     }
   }
+  // 3-D refinable clouds: root cells nc1 x nc2 x nc3; mode 1 a cubic lattice (ppc = n^3),
+  // mode 2 x1 offsets (k + 1/2)/ppc and the R2 sequence frac((k + 1/2) g1), frac((k + 1/2) g2) in
+  // x2, x3 (g1, g2 the inverse plastic number and its square), mode 0 an independent random draw
+  int nc2 = 1;
+  Real x3min = 0.0, lz = 1.0, hz = 1.0;
+  KOKKOS_INLINE_FUNCTION void Base3(const int q, Real &x, Real &y, Real &z) const {
+    if (mode == 0) {
+      std::uint64_t key = static_cast<std::uint64_t>(q) + seed*UINT64_C(0x9e3779b97f4a7c15);
+      x = x1min + HashUniform01(key + UINT64_C(0x632be59bd9b4e019))*lx;
+      y = x2min + HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7))*ly;
+      z = x3min + HashUniform01(key + UINT64_C(0x58f38ded6f7c55b5))*lz;
+      return;
+    }
+    const int c = q/ppc, k = q - c*ppc;
+    const int ci = c % nc1, cj = (c/nc1) % nc2, ck = c/(nc1*nc2);
+    Real fx, fy, fz;
+    if (mode == 1) {
+      fx = (static_cast<Real>(k % nside) + 0.5)/nside;
+      fy = (static_cast<Real>((k/nside) % nside) + 0.5)/nside;
+      fz = (static_cast<Real>(k/(nside*nside)) + 0.5)/nside;
+    } else {
+      fx = (static_cast<Real>(k) + 0.5)/ppc;
+      const Real g1 = (static_cast<Real>(k) + 0.5)*0.7548776662466927;
+      const Real g2 = (static_cast<Real>(k) + 0.5)*0.5698402909980532;
+      fy = g1 - Kokkos::floor(g1);
+      fz = g2 - Kokkos::floor(g2);
+    }
+    x = x1min + (ci + fx)*hx;
+    y = x2min + (cj + fy)*hy;
+    z = x3min + (ck + fz)*hz;
+  }
+  KOKKOS_INLINE_FUNCTION void operator()(const int q, Real &x, Real &y, Real &z,
+                                         Real &vx) const {
+    Real x0;
+    Base3(q, x0, y, z);
+    x = x0; vx = 0.0;
+    if (kwv != 0.0) {
+      const int s = q % nspec;
+      const Real c = Kokkos::cos(kwv*x0), sn = Kokkos::sin(kwv*x0);
+      x = x0 + xir[s]*c - xii[s]*sn;
+      vx = dvr[s]*c - dvi[s]*sn;
+      x -= lx*Kokkos::floor((x - x1min)/lx);
+    }
+  }
 };
+
+// the drag tests in 3-D (dust_test with 3-D refinable clouds): the parameters of the
+// exact solution for the errors that DustNSHHistory computes in the code
+struct DustTest3D {
+  bool on = false, wave = false;
+  Real rho0 = 1.0, eps = 1.0, ts = 1.0, v0 = 0.0;
+  Real kwv = 0.0, wr = 0.0, wi = 0.0;
+  Real dgr = 0.0, dgi = 0.0, dur = 0.0, dui = 0.0, ddr = 0.0, ddi = 0.0;   // drho_g, du, drho_d
+};
+DustTest3D dtest3d_;
+KOKKOS_INLINE_FUNCTION
+void DTest3DCell(const int q, const int nx1, const int nx2, const int nx3, const int is,
+                 const int js, const int ks, int &m, int &k, int &j, int &i) {
+  i = q % nx1;
+  int r = q/nx1;
+  j = r % nx2;
+  r /= nx2;
+  k = r % nx3;
+  m = r/nx3;
+  i += is; j += js; k += ks;
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn DustTestOmega
@@ -1085,9 +1150,12 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   // draws the same parents and keeps those in its blocks
   const bool ranks_ok = (global_variable::nranks == 1) ||
       (dust_active && pmbp->pdust->experimental_mpi && !canonical_root);
+  // 3-D with refinable clouds (<dust>/experimental_3d) or the canonical deposit
+  const bool root3d_ok = dust_active && global_variable::nranks == 1 &&
+      (pmbp->pdust->Clouds3D() || canonical_root);
   if (cloud_root_random && (!ranks_ok || !dust_active ||
       !(pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud ||
-        canonical_root) || pmy_mesh_->three_d)) {
+        canonical_root) || (pmy_mesh_->three_d && !root3d_ok))) {
     std::cerr << "cloud_root_random requires single-rank (or <dust>/experimental_mpi) 2-D "
               << "dust with refinable_cloud transfer, or (one rank) the canonical deposit on a "
               << "uniform mesh or the owner_overlap transfer" << std::endl;
@@ -1170,7 +1238,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
               << "<problem>/dust_test must be none, damping or wave" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (dtest && (!dust_active || !cloud_root_random || pmy_mesh_->three_d ||
+  if (dtest && (!dust_active || !cloud_root_random || (pmy_mesh_->three_d && !root3d_ok) ||
                 pin->DoesBlockExist("shearing_box"))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "<problem>/dust_test needs 2-D dust with cloud_root_random and no <shearing_box>"
@@ -1280,6 +1348,15 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       place.xir[s] = xi.real(); place.xii[s] = xi.imag();
       place.dvr[s] = dv.real(); place.dvi[s] = dv.imag();
     }
+    if (three_d && nspec == 1) {   // the exact solution for the 3-D history errors
+      const std::complex<Real> dv = du/(1.0 - iunit*omega*taus[0]);
+      const std::complex<Real> drd = (kwv/omega)*eps[0]*rho0*dv;
+      dtest3d_.wave = true;
+      dtest3d_.kwv = kwv; dtest3d_.wr = omega.real(); dtest3d_.wi = omega.imag();
+      dtest3d_.dgr = drho.real(); dtest3d_.dgi = drho.imag();
+      dtest3d_.dur = du.real(); dtest3d_.dui = du.imag();
+      dtest3d_.ddr = drd.real(); dtest3d_.ddi = drd.imag();
+    }
     if (global_variable::my_rank == 0) {
       std::cout << std::setprecision(15) << "# dust_test wave: k = " << kwv << ", omega = "
                 << omega.real() << " " << omega.imag() << " i, |drho| = " << std::abs(drho)
@@ -1340,7 +1417,88 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   spdat.template modify<HostMemSpace>();
   spdat.template sync<DevExeSpace>();
 
-  if (cloud_root_random) {
+  if (dtest && three_d && nspec == 1) {   // the 3-D history errors (DustNSHHistory)
+    dtest3d_.on = true;
+    dtest3d_.rho0 = rho0; dtest3d_.eps = eps[0]; dtest3d_.ts = taus[0];
+    dtest3d_.v0 = (dust_test == "damping") ? pin->GetOrAddReal("problem", "dust_test_v0", 0.1)
+                                          : 0.0;
+  }
+  if (cloud_root_random && three_d) {
+    // the root parents in 3-D (refinable clouds with <dust>/experimental_3d, or the
+    // canonical deposit on a uniform mesh), one rank: random, lattice (ppc = n^3) or generic
+    const auto &ms = pmy_mesh_->mesh_size;
+    const auto &mi = pmy_mesh_->mesh_indcs;
+    const int nc1 = mi.nx1, nc2 = mi.nx2, nc3 = mi.nx3;
+    const int nparent = static_cast<int>(ppc)*nc1*nc2*nc3;
+    if (ppc != static_cast<Real>(static_cast<int>(ppc)) || nparent <= 0) {
+      std::cerr << "cloud_root_random requires positive integer root ppc" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const std::string rp = pin->GetOrAddString("problem", "root_placement", "random");
+    place.mode = (rp == "lattice") ? 1 : ((rp == "generic") ? 2 : 0);
+    place.ppc = static_cast<int>(ppc);
+    place.nside = static_cast<int>(std::lround(std::cbrt(ppc)));
+    if ((rp != "random" && rp != "lattice" && rp != "generic") ||
+        (place.mode == 1 && place.nside*place.nside*place.nside != place.ppc)) {
+      std::cerr << "<problem>/root_placement must be random, lattice (ppc a cube) or generic"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    place.nc1 = nc1; place.nc2 = nc2; place.nspec = nspec; place.seed = random_seed;
+    place.x1min = ms.x1min; place.x2min = ms.x2min; place.x3min = ms.x3min;
+    place.lx = ms.x1max - ms.x1min; place.ly = ms.x2max - ms.x2min; place.lz = ms.x3max - ms.x3min;
+    place.hx = place.lx/nc1; place.hy = place.ly/nc2; place.hz = place.lz/nc3;
+    Kokkos::realloc(pr, ppar->nrdata, nparent);
+    Kokkos::realloc(pi, ppar->nidata, nparent);
+    ppar->nprtcl_thispack = nparent;
+    pmy_mesh_->nprtcl_thisrank = nparent;
+    pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = nparent;
+    pmy_mesh_->nprtcl_total = nparent;
+    auto pr0 = ppar->prtcl_rdata;
+    auto pi0 = ppar->prtcl_idata;
+    auto gids0 = pmbp->gids;
+    const int nrdata = ppar->nrdata;
+    const auto lt3 = pmbp->pdust->leaf_traversal3d;
+    const bool canon = canonical_root;
+    const int ncell123 = (indcs.nx1 + 2*indcs.ng)*(indcs.nx2 + 2*indcs.ng)*(indcs.nx3 + 2*indcs.ng);
+    const Real mass_unit = place.hx*place.hy*place.hz;
+    par_for("nsh_cloud_root3d", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int q) {
+      Real x, y, z, vw;
+      place(q, x, y, z, vw);
+      int m = 0;
+      if (canon) {
+        for (int b=0; b<nmb; ++b) {
+          if (x >= mbsize.d_view(b).x1min && x < mbsize.d_view(b).x1max &&
+              y >= mbsize.d_view(b).x2min && y < mbsize.d_view(b).x2max &&
+              z >= mbsize.d_view(b).x3min && z < mbsize.d_view(b).x3max) m = b;
+        }
+      } else {
+        const int leaf = lt3.LeafOwner(x, y, z, 0);
+        m = (leaf < 0) ? 0 : leaf/ncell123;
+      }
+      const int sp = q % nspec;
+      pi0(PGID,q) = gids0 + m;
+      pi0(PTAG,q) = q;
+      pi0(PSP,q) = sp;
+      pi0(PLEV,q) = 0;
+      for (int c=0; c<nrdata; ++c) pr0(c,q) = 0.0;
+      pr0(IPX,q) = x; pr0(IPX1,q) = x;
+      pr0(IPY,q) = y; pr0(IPY1,q) = y;
+      pr0(IPZ,q) = z; pr0(IPZ1,q) = z;
+      pr0(IPTS,q) = taus_.d_view(sp);
+      pr0(IPM,q) = spdat.d_view(sp,2)*mass_unit;
+      pr0(IPVX,q) = spdat.d_view(sp,0) + vw;
+      pr0(IPVY,q) = spdat.d_view(sp,1);
+      pr0(IPVX1,q) = pr0(IPVX,q);
+      pr0(IPVY1,q) = pr0(IPVY,q);
+    });
+    if (!canonical_root) {
+      pmbp->pdust->EnsureNextTag();
+      pmbp->pdust->SplitToLeaves();
+    }
+    std::cout << "# 3-D root " << (canonical_root ? "particles (canonical): " : "clouds: ")
+              << nparent << " parents -> " << ppar->nprtcl_thispack << " particles" << std::endl;
+  } else if (cloud_root_random) {
     // Four particles per ROOT cell, placed independently over the whole box.
     // Refinement changes the cloud shape through the exact P1 split, never the
     // prescribed parent mass. This is a warm Poisson seed, not a quiet lattice.
@@ -1694,6 +1852,104 @@ void DustNSHErrors(ParameterInput *pin, Mesh *pm) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustTest3DErrors
+//! \brief The errors of the 3-D drag tests, with the definitions of dtest_metrics.py
+//! computed in the code (leaf cells, volume weighted).  damping: rms(rho_g - rho0),
+//! rms(u_x - u(t)), rms(rho_d/(eps rho0) - 1), rms|u_perp|; wave: L1 errors over the amplitudes
+//! (gas and dust density as cell averages, u_x at the cell centre) and rms|u_perp|/|du|.  Both:
+//! the rms deviation of rho_g and rho_d from their x-column means (the part that is not one-
+//! dimensional; over the amplitudes for the wave, rho_d over eps rho0 for damping) and the dust
+//! mass on the leaves over the particle mass, minus one.  Dust entries are -1 without clouds.
+
+void DustTest3DErrors(Mesh *pm, Real out[7]) {
+  auto *pmbp = pm->pmb_pack;
+  auto *pd = pmbp->pdust;
+  const DustTest3D c = dtest3d_;
+  const bool clouds = pd->Clouds3D();
+  DvceArray5D<Real> fd;
+  if (clouds) pd->DepositCloudDensity3D(fd);
+  auto u0 = pmbp->phydro->u0;
+  const auto &indcs = pm->mb_indcs;
+  const int is = indcs.is, js = indcs.js, ks = indcs.ks;
+  const int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
+  auto mbsize = pmbp->pmb->mb_size;
+  auto mblev = pmbp->pmb->mb_lev;
+  const int root = pm->root_level;
+  const int nlev = pm->max_level - pm->root_level;
+  const int nf1 = pm->mesh_indcs.nx1 << nlev;
+  const Real xmin = pm->mesh_size.x1min;
+  DvceArray2D<Real> col("dtest3d_col", (nlev + 1)*nf1, 4);
+  const int nmb = pmbp->nmb_thispack;
+  const int ncell = nmb*nx3*nx2*nx1;
+  const Real t = pm->time;
+  const Real eps_rho = c.eps*c.rho0;
+  const Real vcm = c.eps*c.v0/(1.0 + c.eps);
+  const Real uexact = vcm*(1.0 - std::exp(-t*(1.0 + c.eps)/c.ts));
+  const Real grow = std::exp(c.wi*t);
+  Real vtot = 0.0, eg = 0.0, eu = 0.0, ed = 0.0, ep = 0.0, mleaf = 0.0;
+  Kokkos::parallel_reduce("dtest3d_err", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
+  KOKKOS_LAMBDA(const int q, Real &v_, Real &g_, Real &u_, Real &d_) {
+    int m, k, j, i;
+    DTest3DCell(q, nx1, nx2, nx3, is, js, ks, m, k, j, i);
+    const Real dx = mbsize.d_view(m).dx1;
+    const Real vol = dx*mbsize.d_view(m).dx2*mbsize.d_view(m).dx3;
+    const Real rg = u0(m,IDN,k,j,i), ux = u0(m,IM1,k,j,i)/rg;
+    const Real rd = clouds ? fd(m,0,k,j,i) : 0.0;
+    const Real x = CellCenterX(i - is, nx1, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max);
+    v_ += vol;
+    if (c.wave) {
+      const Real ph = c.kwv*x - c.wr*t, cp = grow*cos(ph), sp = grow*sin(ph);
+      const Real sinc = sin(0.5*c.kwv*dx)/(0.5*c.kwv*dx);
+      g_ += vol*fabs(rg - (c.rho0 + (c.dgr*cp - c.dgi*sp)*sinc));
+      u_ += vol*fabs(ux - (c.dur*cp - c.dui*sp));
+      d_ += vol*fabs(rd - (eps_rho + (c.ddr*cp - c.ddi*sp)*sinc));
+    } else {
+      g_ += vol*SQR(rg - c.rho0);
+      u_ += vol*SQR(ux - uexact);
+      d_ += vol*SQR(rd/eps_rho - 1.0);
+    }
+    const int l = mblev.d_view(m) - root;
+    const int ix = static_cast<int>(floor((x - xmin)/dx));
+    const int key = l*nf1 + ix;
+    Kokkos::atomic_add(&col(key,0), vol*rg);
+    Kokkos::atomic_add(&col(key,1), vol*rd);
+    Kokkos::atomic_add(&col(key,2), vol);
+  }, Kokkos::Sum<Real>(vtot), Kokkos::Sum<Real>(eg), Kokkos::Sum<Real>(eu), Kokkos::Sum<Real>(ed));
+  Real yg = 0.0, yd = 0.0;
+  Kokkos::parallel_reduce("dtest3d_err2", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
+  KOKKOS_LAMBDA(const int q, Real &p_, Real &yg_, Real &yd_, Real &ml_) {
+    int m, k, j, i;
+    DTest3DCell(q, nx1, nx2, nx3, is, js, ks, m, k, j, i);
+    const Real dx = mbsize.d_view(m).dx1;
+    const Real vol = dx*mbsize.d_view(m).dx2*mbsize.d_view(m).dx3;
+    const Real rg = u0(m,IDN,k,j,i);
+    const Real rd = clouds ? fd(m,0,k,j,i) : 0.0;
+    p_ += vol*(SQR(u0(m,IM2,k,j,i)) + SQR(u0(m,IM3,k,j,i)))/SQR(rg);
+    const Real x = CellCenterX(i - is, nx1, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max);
+    const int key = (mblev.d_view(m) - root)*nf1 + static_cast<int>(floor((x - xmin)/dx));
+    yg_ += vol*SQR(rg - col(key,0)/col(key,2));
+    yd_ += vol*SQR(rd - col(key,1)/col(key,2));
+    ml_ += vol*rd;
+  }, Kokkos::Sum<Real>(ep), Kokkos::Sum<Real>(yg), Kokkos::Sum<Real>(yd), Kokkos::Sum<Real>(mleaf));
+  auto &pr = pmbp->ppart->prtcl_rdata;
+  Real mpart = 0.0;
+  Kokkos::parallel_reduce("dtest3d_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0,
+                          pmbp->ppart->nprtcl_thispack),
+  KOKKOS_LAMBDA(const int p, Real &a) {a += pr(IPM,p);}, Kokkos::Sum<Real>(mpart));
+  if (c.wave) {
+    const Real ag = std::hypot(c.dgr, c.dgi), au = std::hypot(c.dur, c.dui);
+    const Real ad = std::hypot(c.ddr, c.ddi);
+    out[0] = eg/vtot/ag; out[1] = eu/vtot/au; out[2] = ed/vtot/ad;
+    out[3] = std::sqrt(ep/vtot)/au; out[4] = std::sqrt(yg/vtot)/ag; out[5] = std::sqrt(yd/vtot)/ad;
+  } else {
+    out[0] = std::sqrt(eg/vtot); out[1] = std::sqrt(eu/vtot); out[2] = std::sqrt(ed/vtot);
+    out[3] = std::sqrt(ep/vtot); out[4] = std::sqrt(yg/vtot); out[5] = std::sqrt(yd/vtot)/eps_rho;
+  }
+  out[6] = (mpart > 0.0) ? mleaf/mpart - 1.0 : 0.0;
+  if (!clouds) {out[2] = -1.0; out[5] = -1.0; out[6] = -1.0;}
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn void DustNSHHistory()
 //! \brief User history output: per-species sums of the radial and azimuthal dust drift
 //! velocities and particle counts (summed over ranks; divide sums by counts for means).
@@ -1765,6 +2021,14 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     pdata->hdata[h+12] = static_cast<Real>(pd->cloud_far_release);
     pdata->hdata[h+13] = static_cast<Real>(npart);   // the arrays may hold headroom (in-place split)
     pdata->nhist = h + 14;
+  }
+  if (dtest3d_.on) {   // the 3-D drag-test errors
+    const int h = pdata->nhist;
+    const char *labels[7] = {"e_rhog", "e_ux", "e_rhod", "e_uperp", "y_rhog", "y_rhod", "dmass"};
+    Real v[7];
+    DustTest3DErrors(pm, v);
+    for (int c=0; c<7; ++c) {pdata->label[h+c] = labels[c]; pdata->hdata[h+c] = v[c];}
+    pdata->nhist = h + 7;
   }
   if (ba_snapshots_ && pm->time + 1.0e-10 >= ba_snapshot_dt_*ba_snapshot_k_) {
     WriteBASnapshot(pm);
