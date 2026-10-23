@@ -423,6 +423,16 @@ TaskStatus Hydro::ApplyPhysicalBCs(Driver *pdrive, int stage) {
 TaskStatus Hydro::Prolongate(Driver *pdrive, int stage) {
   if (pmy_pack->pmesh->multilevel) {  // only prolongate with SMR/AMR
     pbval_u->FillCoarseInBndryCC(u0, coarse_u0);
+    // Physical boundary values of the coarse arrays.  AthenaK left them
+    // unset, and the prolongation next to a physical boundary reads them for its slopes (a
+    // finer block beside a coarser one along a physical face, e.g. x3 of a stratified disc)
+    Mesh *pm = pmy_pack->pmesh;
+    if (!pm->strictly_periodic && pm->pmr->coarse_physical_bcs) {
+      pbval_u->HydroBCs(pmy_pack, pbval_u->u_in, coarse_u0, true);
+      if (pm->pgen->user_bcs && pm->pgen->user_bcs_coarse_func != nullptr) {
+        (pm->pgen->user_bcs_coarse_func)(pm);
+      }
+    }
     if (pmy_pack->pmesh->pmr->prolong_prims) {
       pbval_u->ConsToPrimCoarseBndry(coarse_u0, coarse_w0);
       pbval_u->ProlongateCC(w0, coarse_w0);

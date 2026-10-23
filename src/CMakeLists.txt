@@ -16,6 +16,7 @@ add_executable(
         bvals/buffs_fc.cpp
         bvals/bvals_cc.cpp
         bvals/bvals_dep.cpp
+        bvals/bvals_dep_general.cpp
         bvals/bvals_fc.cpp
         bvals/bvals_part.cpp
         bvals/bvals_tasks.cpp

@@ -18,26 +18,31 @@
 //! \!fn void BoundaryValues::HydroBCs()
 //! \brief Apply physical boundary conditions for all Hydro variables at faces of MB which
 //! are at the edge of the computational domain
+//! With coarse = true they are applied to the coarse arrays (coarse_u0) with
+//! the coarse indices, for the prolongation next to a physical boundary.
 
 void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
-                                  DvceArray5D<Real> u0) {
+                                  DvceArray5D<Real> u0, const bool coarse) {
   // loop over all MeshBlocks in this MeshBlockPack
   auto &pm = ppack->pmesh;
   auto &indcs = ppack->pmesh->mb_indcs;
   int &ng = indcs.ng;
   auto &mb_bcs = ppack->pmb->mb_bcs;
 
-  int n1 = indcs.nx1 + 2*ng;
-  int n2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng) : 1;
-  int n3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng) : 1;
+  int n1 = (coarse ? indcs.cnx1 : indcs.nx1) + 2*ng;
+  int n2 = (indcs.nx2 > 1)? ((coarse ? indcs.cnx2 : indcs.nx2) + 2*ng) : 1;
+  int n3 = (indcs.nx3 > 1)? ((coarse ? indcs.cnx3 : indcs.nx3) + 2*ng) : 1;
   int nvar = u0.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
   int nmb = ppack->nmb_thispack;
+  // faces with user BCs: the pgen fills the MeshBlock arrays; on the coarse
+  // arrays they get zero gradient here (a pgen may refill them with user_bcs_coarse_func)
+  const bool cuser = coarse;
 
   // only apply BCs if not (periodic) or (shear_periodic)
   if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::periodic &&
       pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) {
-    int &is = indcs.is;
-    int &ie = indcs.ie;
+    const int is = coarse ? indcs.cis : indcs.is;
+    const int ie = coarse ? indcs.cie : indcs.ie;
     par_for("hydrobc_x1", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n3-1),0,(n2-1),
     KOKKOS_LAMBDA(int m, int n, int k, int j) {
       // apply physical boundaries to inner_x1
@@ -51,6 +56,9 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
             }
           }
           break;
+        case BoundaryFlag::user:   // coarse arrays: zero gradient (pgen may refill)
+          if (!cuser) break;
+          [[fallthrough]];
         case BoundaryFlag::outflow:
           for (int i=0; i<ng; ++i) {
             u0(m,n,k,j,is-i-1) = u0(m,n,k,j,is);
@@ -90,6 +98,9 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
             }
           }
           break;
+        case BoundaryFlag::user:   // coarse arrays: zero gradient (pgen may refill)
+          if (!cuser) break;
+          [[fallthrough]];
         case BoundaryFlag::outflow:
           for (int i=0; i<ng; ++i) {
             u0(m,n,k,j,ie+i+1) = u0(m,n,k,j,ie);
@@ -124,8 +135,8 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
 
   // only apply BCs if not periodic
   if (pm->mesh_bcs[BoundaryFace::inner_x2] != BoundaryFlag::periodic) {
-    int &js = indcs.js;
-    int &je = indcs.je;
+    const int js = coarse ? indcs.cjs : indcs.js;
+    const int je = coarse ? indcs.cje : indcs.je;
     par_for("hydrobc_x2", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n3-1),0,(n1-1),
     KOKKOS_LAMBDA(int m, int n, int k, int i) {
       // apply physical boundaries to inner_x2
@@ -139,6 +150,9 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
             }
           }
           break;
+        case BoundaryFlag::user:   // coarse arrays: zero gradient (pgen may refill)
+          if (!cuser) break;
+          [[fallthrough]];
         case BoundaryFlag::outflow:
           for (int j=0; j<ng; ++j) {
             u0(m,n,k,js-j-1,i) = u0(m,n,k,js,i);
@@ -178,6 +192,9 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
             }
           }
           break;
+        case BoundaryFlag::user:   // coarse arrays: zero gradient (pgen may refill)
+          if (!cuser) break;
+          [[fallthrough]];
         case BoundaryFlag::outflow:
           for (int j=0; j<ng; ++j) {
             u0(m,n,k,je+j+1,i) = u0(m,n,k,je,i);
@@ -211,8 +228,8 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
 
   // only apply BCs if not periodic
   if (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic) return;
-  int &ks = indcs.ks;
-  int &ke = indcs.ke;
+  const int ks = coarse ? indcs.cks : indcs.ks;
+  const int ke = coarse ? indcs.cke : indcs.ke;
   par_for("hydrobc_x3", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n2-1),0,(n1-1),
   KOKKOS_LAMBDA(int m, int n, int j, int i) {
     // apply physical boundaries to inner_x3
@@ -226,6 +243,9 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
           }
         }
         break;
+      case BoundaryFlag::user:   // coarse arrays: zero gradient (pgen may refill)
+        if (!cuser) break;
+        [[fallthrough]];
       case BoundaryFlag::outflow:
         for (int k=0; k<ng; ++k) {
           u0(m,n,ks-k-1,j,i) = u0(m,n,ks,j,i);
@@ -265,6 +285,9 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
           }
         }
         break;
+      case BoundaryFlag::user:   // coarse arrays: zero gradient (pgen may refill)
+        if (!cuser) break;
+        [[fallthrough]];
       case BoundaryFlag::outflow:
         for (int k=0; k<ng; ++k) {
           u0(m,n,ke+k+1,j,i) = u0(m,n,ke,j,i);

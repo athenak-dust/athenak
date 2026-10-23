@@ -243,8 +243,13 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
   // exchanges return at once (bvals_dep.cpp, local_smr_direct_): posting their receives would
   // leave them waiting for sends that never come on several ranks
   const bool direct = UsesCompositeTransfer() && pmy_pack->pmesh->multilevel;
+  // the shear part of the general deposit remap for this stage (the offset the
+  // particles use when they cross the radial faces, bvals_part.cpp)
+  if (dep_plan != nullptr && back_reaction && (use_qp || use_dmom)) {
+    dep_plan->UpdateShear(pmy_pack->pmesh->time);
+  }
   if (back_reaction && use_qp && !direct) {
-    tstat = pbval_qp->InitRecv(5);
+    tstat = pbval_qp->InitRecvDep(5);
     if (tstat != TaskStatus::complete) return tstat;
   }
   if (use_ustar && UstarGhosts()) {
@@ -252,7 +257,7 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
     if (tstat != TaskStatus::complete) return tstat;
   }
   if (back_reaction && use_dmom && !direct) {
-    tstat = pbval_dm->InitRecv(3);
+    tstat = pbval_dm->InitRecvDep(3);
     if (tstat != TaskStatus::complete) return tstat;
   }
   if (psbox_us != nullptr && use_ustar) {
@@ -311,7 +316,9 @@ TaskStatus DustGasDrag::RecvUstar(Driver *pdrive, int stage) {
     return TaskStatus::complete;                       // read leaf cells only
   }
   TaskStatus status = pbval_us->RecvAndUnpackCC(ustar, cdummy);
-  if (status == TaskStatus::complete && pmy_pack->pmesh->multilevel) {
+  // with a shearing box the prolongation comes after the shear of the coarse array
+  // (RecvUstarShr), as for the gas (RecvU -> shear -> Prolongate)
+  if (status == TaskStatus::complete && pmy_pack->pmesh->multilevel && psbox_us == nullptr) {
     pbval_us->FillCoarseInBndryCC(ustar, cdummy);
     pbval_us->ProlongateCC(ustar, cdummy);
   }
@@ -325,7 +332,11 @@ TaskStatus DustGasDrag::SendUstarShr(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage) || !use || psbox_us == nullptr) {
     return TaskStatus::complete;
   }
-  return psbox_us->PackAndSendCC(ustar, ReconstructionMethod::plm);
+  TaskStatus tstat = psbox_us->PackAndSendCC(ustar, ReconstructionMethod::plm);
+  if (tstat == TaskStatus::complete && psbox_us->coarse_on) {
+    tstat = psbox_us->PackAndSendCoarseCC(cdummy, ReconstructionMethod::plm);
+  }
+  return tstat;
 }
 
 TaskStatus DustGasDrag::RecvUstarShr(Driver *pdrive, int stage) {
@@ -335,7 +346,15 @@ TaskStatus DustGasDrag::RecvUstarShr(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage) || !use || psbox_us == nullptr) {
     return TaskStatus::complete;
   }
-  return psbox_us->RecvAndUnpackCC(ustar);
+  TaskStatus tstat = psbox_us->RecvAndUnpackCC(ustar);
+  if (tstat == TaskStatus::complete && psbox_us->coarse_on) {
+    tstat = psbox_us->RecvAndUnpackCoarseCC(cdummy);
+    if (tstat == TaskStatus::complete) {
+      pbval_us->FillCoarseInBndryCC(ustar, cdummy);
+      pbval_us->ProlongateCC(ustar, cdummy);
+    }
+  }
+  return tstat;
 }
 
 TaskStatus DustGasDrag::SendPMBR(Driver *pdrive, int stage) {
@@ -364,17 +383,17 @@ TaskStatus DustGasDrag::RecvPMBR(Driver *pdrive, int stage) {
 
 TaskStatus DustGasDrag::ClearDep(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
-  TaskStatus tstat = pbval_qp->ClearSend();
+  TaskStatus tstat = pbval_qp->ClearSendDep();
   if (tstat != TaskStatus::complete) return tstat;
-  tstat = pbval_qp->ClearRecv();
+  tstat = pbval_qp->ClearRecvDep();
   if (tstat != TaskStatus::complete) return tstat;
   tstat = pbval_us->ClearSend();
   if (tstat != TaskStatus::complete) return tstat;
   tstat = pbval_us->ClearRecv();
   if (tstat != TaskStatus::complete) return tstat;
-  tstat = pbval_dm->ClearSend();
+  tstat = pbval_dm->ClearSendDep();
   if (tstat != TaskStatus::complete) return tstat;
-  tstat = pbval_dm->ClearRecv();
+  tstat = pbval_dm->ClearRecvDep();
   if (tstat != TaskStatus::complete) return tstat;
   if (psbox_us != nullptr) {
     tstat = psbox_us->ClearSend();

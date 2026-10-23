@@ -50,6 +50,9 @@ class ProblemGenerator {
   ProblemFinalizeFnPtr pgen_final_func=nullptr;
   // function pointer for user-enrolled BCs.  Called in ApplyPhysicalBCs in task list
   UserBoundaryFnPtr user_bcs_func=nullptr;
+  // Optional: user BCs on the coarse arrays (coarse_u0, coarse indices) before the
+  // ghost prolongation; without it user faces of the coarse arrays get zero gradient
+  UserBoundaryFnPtr user_bcs_coarse_func=nullptr;
   UserSrctermFnPtr user_srcs_func=nullptr;
   UserRefinementFnPtr user_ref_func=nullptr;
   UserHistoryFnPtr user_hist_func=nullptr;

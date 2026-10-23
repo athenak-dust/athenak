@@ -255,10 +255,21 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (pmy_mesh_->three_d || pmbp->pdust->nspecies != 1) {
+  // also a 3-D shearing box (x1 radial, x2 azimuthal, x3 vertical),
+  // the mode independent of x2, with the lattice (point particles; no clouds and none of the 2-D
+  // diagnostics below)
+  const bool lina3d = pmy_mesh_->three_d;
+  if (pmbp->pdust->nspecies != 1 ||
+      (lina3d && (pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud ||
+                  pin->GetOrAddBoolean("problem", "prescribed_gas", false) ||
+                  pin->GetOrAddBoolean("problem", "split_oracle", false) ||
+                  pin->GetOrAddBoolean("problem", "analytic_gather", false) ||
+                  pin->GetOrAddBoolean("problem", "double_precision_snapshots", false) ||
+                  pin->GetOrAddBoolean("problem", "kx0_filter", false) ||
+                  pin->GetOrAddReal("problem", "boost_vx", 0.0) != 0.0))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Streaming test requires 2D r-z geometry and a single dust species"
-              << std::endl;
+              << "Streaming test requires a single dust species; in 3-D the lattice without "
+              << "clouds and without the 2-D diagnostics" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
@@ -340,10 +351,12 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   int nx1 = indcs.nx1, nx2 = indcs.nx2;
   auto &u0 = pmbp->phydro->u0;
   auto &mbsize = pmbp->pmb->mb_size;
+  const int nx3g = indcs.nx3;
   par_for("stream_gas", DevExeSpace(),0,(nmb-1),ks,ke,js,je,is,ie,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     Real x = CellCenterX(i-is, nx1, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max);
-    Real z = CellCenterX(j-js, nx2, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max);
+    Real z = lina3d ? CellCenterX(k-ks, nx3g, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max)
+                    : CellCenterX(j-js, nx2, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max);
     Real ce = cos(kx*x), se = sin(kx*x);
     Real cz = cos(kz*z), sz = sin(kz*z);
     Real rho = rho0 + (Agr*ce - Agi*se)*cz;
@@ -352,8 +365,8 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     Real uz  =      - (Uzr*se + Uzi*ce)*sz;
     u0(m,IDN,k,j,i) = rho;
     u0(m,IM1,k,j,i) = rho*ux;
-    u0(m,IM2,k,j,i) = rho*uz;   // vertical (x2) component
-    u0(m,IM3,k,j,i) = rho*up;   // azimuthal component
+    u0(m,IM2,k,j,i) = lina3d ? rho*up : rho*uz;   // 2-D: vertical (x2); 3-D: azimuthal
+    u0(m,IM3,k,j,i) = lina3d ? rho*uz : rho*up;
   });
 
   // Diagnostic prescribed gas: the gas is the analytic
@@ -721,6 +734,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     int jp = sub / npar1d;
     int i = c % lnx1;
     int j = (c/lnx1) % lnx2;
+    int k = c/(lnx1*lnx2);   // (3-D) the vertical index; the sub-lattice is in x1-x3
     Real dx1 = mbsize.d_view(m).dx1;
     Real dx2 = mbsize.d_view(m).dx2;
     // subcell quiet-start position: cell left edge + (ip+1/2) dx/Npar
@@ -728,20 +742,28 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
               + (static_cast<Real>(ip) + 0.5)/static_cast<Real>(npar1d))*dx1;
     Real z0 = mbsize.d_view(m).x2min + (static_cast<Real>(j) + lshiftz
               + (static_cast<Real>(jp) + 0.5)/static_cast<Real>(npar1d))*dx2;
+    Real y0 = 0.0;
+    if (lina3d) {
+      y0 = mbsize.d_view(m).x2min + (static_cast<Real>(j) + 0.5)*dx2;
+      z0 = mbsize.d_view(m).x3min + (static_cast<Real>(k) + lshiftz
+           + (static_cast<Real>(jp) + 0.5)/static_cast<Real>(npar1d))*mbsize.d_view(m).dx3;
+    }
     Real ce = cos(kx*x0), se = sin(kx*x0);
     Real cz = cos(kz*z0), sz = sin(kz*z0);
     // radial displacement imprinting drho_p = Apr*cos(kx x)*cos(kz z)
     pr(IPX,p) = x0 - (Apr/(kx*rhop0))*se*cz;
-    pr(IPY,p) = z0;
-    pr(IPZ,p) = 0.0;
+    pr(IPY,p) = lina3d ? y0 : z0;
+    pr(IPZ,p) = lina3d ? z0 : 0.0;
     pi(PSP,p) = 0;
     pi(PLEV,p) = 0;
     pr(IPTS,p) = taus0;
     Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+    if (lina3d) vol *= mbsize.d_view(m).dx3;
     pr(IPM,p) = eps*rho0*vol/ppc;
     pr(IPVX,p) = vnx + (Vxr*ce - Vxi*se)*cz;
-    pr(IPVY,p) =     - (Vzr*se + Vzi*ce)*sz;   // vertical (x2) component
-    pr(IPVZ,p) = vnp + (Vpr*ce - Vpi*se)*cz;   // azimuthal component
+    const Real vvert = -(Vzr*se + Vzi*ce)*sz, vazim = vnp + (Vpr*ce - Vpi*se)*cz;
+    pr(IPVY,p) = lina3d ? vazim : vvert;   // 2-D: vertical (x2); 3-D: azimuthal (x2)
+    pr(IPVZ,p) = lina3d ? vvert : vazim;
     pr(IPRX,p) = 0.0;
     pr(IPRY,p) = 0.0;
     pr(IPRZ,p) = 0.0;
@@ -786,9 +808,10 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
   bool cloud = cloud_mode_;
   Real hx = cloud_root_dx1_, hz = cloud_root_dx2_;
   Real pre = 0.0, pim = 0.0;
+  const bool h3d = pm->three_d;   // the vertical direction is x3 in 3-D
   Kokkos::parallel_reduce("stream_hp",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
   KOKKOS_LAMBDA(const int &p, Real &re_, Real &im_) {
-    Real w = pr(IPM,p)*cos(kz*pr(IPY,p));
+    Real w = pr(IPM,p)*cos(kz*(h3d ? pr(IPZ,p) : pr(IPY,p)));
     int lobe1 = 0;
     Real cxr = 0.0, cxi = 0.0;
     if (cloud) {
@@ -854,8 +877,10 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
     k += ks;
     j += js;
     Real x = CellCenterX(i-is, nx1, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max);
-    Real z = CellCenterX(j-js, nx2, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max);
+    Real z = h3d ? CellCenterX(k-ks, nx3, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max)
+                 : CellCenterX(j-js, nx2, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max);
     Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+    if (h3d) vol *= mbsize.d_view(m).dx3;
     Real wc = vol*cos(kz*z);
     Real drho = u0(m,IDN,k,j,i) - rho0;
     gr_ += drho*wc*cos(kx*x);
