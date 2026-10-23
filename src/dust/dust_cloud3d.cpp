@@ -147,7 +147,6 @@ void DustGasDrag::CheckClouds3D() {
   }
   std::vector<std::string> bad;
   if (global_variable::nranks != 1) bad.push_back("several MPI ranks");
-  if (pmy_pack->pmesh->adaptive) bad.push_back("an adaptive mesh");
   if (!(coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2)) {
     bad.push_back("a coupling other than PC2 (coupling = pc2)");
   }
@@ -170,8 +169,8 @@ void DustGasDrag::CheckClouds3D() {
     std::exit(EXIT_FAILURE);
   }
   if (global_variable::my_rank == 0) {
-    std::cout << "# NOTE (dust): 3-D refinable clouds (stage 1: one rank, static mesh, "
-              << "split only, PC2)" << std::endl;
+    std::cout << "# NOTE (dust): 3-D refinable clouds (one rank, PC2; static or "
+              << "adaptive mesh)" << std::endl;
   }
 }
 
@@ -431,6 +430,69 @@ void DustGasDrag::BuildLeafTraversal3D() {
               << (nunsafe > 0 ? ", " + std::to_string(nunsafe) + " blocks without a certain ring"
                               : "") << std::endl;
   }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::WrapParticles3D, ResetBlocks3D
+//! \brief Stage 2a: every position (with its RK register) into the box; then the
+//! block of every cloud from its position on the current mesh (LeafOwner on the 3-D leaves) and,
+//! with check, the sum of its weights over the leaves (largest |sum - 1| in dwmax) and the
+//! particle mass.  Returns how many block ids changed; stops on a particle without a block of
+//! this rank or with weights outside the blocks.
+
+void DustGasDrag::WrapParticles3D() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  if (npart == 0) return;
+  auto pr = ppar->prtcl_rdata;
+  const auto &ms = pmy_pack->pmesh->mesh_size;
+  const Real x1a = ms.x1min, x1b = ms.x1max, x2a = ms.x2min, x2b = ms.x2max;
+  const Real x3a = ms.x3min, x3b = ms.x3max;
+  Kokkos::parallel_for("dust_wrap3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    SMRCompositeTransfer::WrapParticle(pr, p, x1a, x1b, x2a, x2b);
+    const Real z = pr(IPZ,p), zw = SMRCompositeTransfer::WrapPosition(z, x3a, x3b);
+    if (zw != z) {pr(IPZ,p) = zw; pr(IPZ1,p) += zw - z;}
+  });
+}
+
+int DustGasDrag::ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  dwmax = 0.0; msum = 0.0;
+  if (npart == 0) return 0;
+  WrapParticles3D();
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  const auto lt = leaf_traversal3d;
+  const int ncell123 = lt.ncells1*lt.ncells2*lt.ncells3;
+  const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
+  int nchanged = 0, nbad = 0;
+  Kokkos::parallel_reduce("dust_reset_blocks3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p, int &changed, int &bad, Real &dw, double &ms) {
+    const Real x = pr(IPX,p), y = pr(IPY,p), z = pr(IPZ,p);
+    const int leaf = lt.LeafOwner(x, y, z, lt.Anchor(pi(PGID,p)));   // the old id: a guess
+    const int owner = (leaf < 0) ? -1 : leaf/ncell123;
+    if (owner < 0 || owner >= nmb) {++bad; return;}
+    if (pi(PGID,p) != gids + owner) {pi(PGID,p) = gids + owner; ++changed;}
+    ms += static_cast<double>(pr(IPM,p));
+    if (!check) return;
+    int out = 0;
+    const Real sw = lt.ForEach<false>(x, y, z, pi(PLEV,p), owner,
+                                      [&](const int t, const Real) {
+      if (t < 0 || t/ncell123 >= lt.nfld) ++out;
+    });
+    dw = Kokkos::fmax(dw, Kokkos::fabs(sw - 1.0));
+    bad += out;
+  }, Kokkos::Sum<int>(nchanged), Kokkos::Sum<int>(nbad), Kokkos::Max<Real>(dwmax),
+     Kokkos::Sum<double>(msum));
+  if (nbad > 0 || dwmax > 1.0e-10) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "3-D clouds (" << when << "): " << nbad << " particles without a block or with "
+              << "weights outside the blocks, largest |sum of weights - 1| = " << dwmax << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  return nchanged;
 }
 
 //----------------------------------------------------------------------------------------

@@ -1793,6 +1793,8 @@ class DustGasDrag {
   void CloudAdvance3D();
   void DepositCloudDensity3D(DvceArray5D<Real> &f);
   void CheckClouds3D();   // the restrictions of 3-D stage 1
+  void WrapParticles3D();
+  int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
   int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
   // timing diagnostic: storage order of the particles
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)
@@ -1836,6 +1838,7 @@ class DustGasDrag {
   // work arrays of the density trigger kept between checks (allocating and freeing
   // device arrays in every check synchronizes the device); reallocated when a size changes
   DvceArray2D<Real> trig_f;
+  DvceArray5D<Real> trig_f3;          // the 3-D leaf densities of the trigger
   // Rixin: dust_trigger_log.txt gets the line of a check only when the mesh changes after
   // it (BeforeRegrid writes the pending line) and the first check of the run
   std::string trig_log_line;
