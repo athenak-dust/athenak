@@ -1757,6 +1757,10 @@ class DustGasDrag {
   TaskStatus RefineClouds(Driver *pdrive, int stage);
   // S3c: remove the particles that left through an outflow x3 face (zero mass), log
   TaskStatus RemoveOutflowParticles(Driver *pdrive, int stage);
+  // the end of the u* ghost fill: coarse x3 boundary values, prolongation, fine x3
+  // boundary values (physical x3 faces)
+  void FinishUstarGhosts();
+  void UstarX3BCs(DvceArray5D<Real> &a, const bool coarse);
   double x3_outflow_mass = 0.0;    // cumulative over the run (this rank)
   long long x3_outflow_count = 0;
   int MergeClouds();
