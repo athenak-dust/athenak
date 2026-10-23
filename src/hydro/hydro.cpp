@@ -158,6 +158,14 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
         pin->GetOrAddBoolean("shearing_box", "experimental_shear_flux_skip", true)) {
       pbval_u->skip_shear_x1_flux = true;
     }
+    // matching of the x1 fluxes across the shear-periodic boundary;
+    // default on with mesh refinement (the face columns can differ in level), off on a uniform
+    // mesh (the results there stay those of AthenaK; true makes it conservative too)
+    if (ppack->pmesh->three_d &&
+        ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
+      psbox_u->flux_on = pin->GetOrAddBoolean("shearing_box", "flux_correct",
+                                              ppack->pmesh->multilevel);
+    }
   } else {
     porb_u = nullptr;
     psbox_u = nullptr;

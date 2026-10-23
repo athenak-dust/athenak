@@ -171,6 +171,7 @@ add_executable(
         shearing_box/shearing_box.cpp
         shearing_box/shearing_box_cc.cpp
         shearing_box/shearing_box_fc.cpp
+        shearing_box/shearing_box_flux.cpp
         shearing_box/shearing_box_srcterms.cpp
         shearing_box/shearing_box_tasks.cpp
 

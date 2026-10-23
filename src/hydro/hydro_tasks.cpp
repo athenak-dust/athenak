@@ -56,7 +56,9 @@ void Hydro::AssembleHydroTasks(std::map<std::string, std::shared_ptr<TaskList>> 
   id.flux      = tl["stagen"]->AddTask(&Hydro::Fluxes,this,id.copyu);
   id.sendf     = tl["stagen"]->AddTask(&Hydro::SendFlux, this, id.flux);
   id.recvf     = tl["stagen"]->AddTask(&Hydro::RecvFlux, this, id.sendf);
-  id.rkupdt    = tl["stagen"]->AddTask(&Hydro::RKUpdate, this, id.recvf);
+  id.sendf_shr = tl["stagen"]->AddTask(&Hydro::SendFlx_Shr, this, id.recvf);
+  id.recvf_shr = tl["stagen"]->AddTask(&Hydro::RecvFlx_Shr, this, id.sendf_shr);
+  id.rkupdt    = tl["stagen"]->AddTask(&Hydro::RKUpdate, this, id.recvf_shr);
   id.srctrms   = tl["stagen"]->AddTask(&Hydro::HydroSrcTerms, this, id.rkupdt);
   id.sendu_oa  = tl["stagen"]->AddTask(&Hydro::SendU_OA, this, id.srctrms);
   id.recvu_oa  = tl["stagen"]->AddTask(&Hydro::RecvU_OA, this, id.sendu_oa);
@@ -118,6 +120,8 @@ TaskStatus Hydro::InitRecv(Driver *pdrive, int stage) {
         time += pmy_pack->pmesh->dt;
       }
       tstat = psbox_u->InitRecv(time);
+      // the pieces of the shear flux matching with this yshear; posts its receives
+      if (stage >= 0 && psbox_u->flux_on) psbox_u->PlanFluxMatch();
     }
   }
 
@@ -289,6 +293,21 @@ TaskStatus Hydro::RecvU_OA(Driver *pdrive, int stage) {
     }
   }
   return tstat;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskList Hydro::SendFlx_Shr, RecvFlx_Shr
+//! \brief Matching of the x1 fluxes across the shear-periodic boundary (every stage,
+//! after the flux correction of the mesh refinement, before the update)
+
+TaskStatus Hydro::SendFlx_Shr(Driver *pdrive, int stage) {
+  if (psbox_u == nullptr || !psbox_u->flux_on) return TaskStatus::complete;
+  return psbox_u->SendFluxMatch(uflx);
+}
+
+TaskStatus Hydro::RecvFlx_Shr(Driver *pdrive, int stage) {
+  if (psbox_u == nullptr || !psbox_u->flux_on) return TaskStatus::complete;
+  return psbox_u->RecvFluxMatch(uflx, recon_method);
 }
 
 //----------------------------------------------------------------------------------------
@@ -473,6 +492,11 @@ TaskStatus Hydro::ClearSend(Driver *pdrive, int stage) {
     if (((stage >= 0) || (stage == -4)) &&
         (pmy_pack->pmesh->three_d || psbox_u->shearing_box_r_phi)) {
       tstat = psbox_u->ClearSend();
+      if (tstat != TaskStatus::complete) return tstat;
+    }
+    // the shear flux matching of this stage
+    if (stage >= 0 && psbox_u->flux_on) {
+      tstat = psbox_u->ClearFluxMatch();
       if (tstat != TaskStatus::complete) return tstat;
     }
   }
