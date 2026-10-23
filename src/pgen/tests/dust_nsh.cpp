@@ -1583,6 +1583,13 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     const Real mass_unit = place.hx*place.hy*place.hz;
     // the y-modulated NSH dust (dust_ymode_amp), the mass of each parent
     const Real yamp = dtest3d_.ymode ? dtest3d_.yamp : 0.0, ky = dtest3d_.ky;
+    // <problem>/stratified_dust on the root parents (masses times
+    // exp(-z^2/2 Hp^2), dust_vz0 added to vz), before the split
+    const bool strat = pin->GetOrAddBoolean("problem", "stratified_dust", false) &&
+                       pin->GetOrAddBoolean("shearing_box", "stratified", false);
+    const Real shp = strat ? pin->GetOrAddReal("problem", "dust_hp",
+                                               pmbp->phydro->peos->eos_data.iso_cs/omega0) : 1.0;
+    const Real svz0 = strat ? pin->GetOrAddReal("problem", "dust_vz0", 0.0) : 0.0;
     par_for("nsh_cloud_root3d", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int q) {
       const int p = pnew(q);
       if (p < 0) return;
@@ -1603,7 +1610,15 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       pr0(IPVY,p) = spdat.d_view(sp,1);
       pr0(IPVX1,p) = pr0(IPVX,p);
       pr0(IPVY1,p) = pr0(IPVY,p);
+      if (strat) {
+        pr0(IPM,p) *= exp(-0.5*z*z/(shp*shp));
+        pr0(IPVZ,p) = svz0; pr0(IPVZ1,p) = svz0;
+      }
     });
+    if (strat && global_variable::my_rank == 0) {
+      std::cout << "# stratified dust (3-D root clouds): Hp = " << shp << ", vz0 = " << svz0
+                << std::endl;
+    }
     // the tag counter is set collectively before the splits
     if (!canonical_root) {
       pmbp->pdust->EnsureNextTag();
@@ -1882,7 +1897,9 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   // isothermal hydrostatic gas rho0 exp(-z^2/2H^2), H = cs/omega0, the velocities of the set-up
   // above (NSH, zero for etavk = 0), dust masses times exp(-z^2/2 Hp^2) (<problem>/dust_hp,
   // default H: the dust-to-gas ratio of the set-up everywhere), <problem>/dust_vz0 added to vz
-  if (pin->GetOrAddBoolean("problem", "stratified_dust", false)) {
+  // (the 3-D root clouds got it in their set-up)
+  if (pin->GetOrAddBoolean("problem", "stratified_dust", false) &&
+      !(cloud_root_random && three_d && pmbp->pdust->Clouds3D())) {
     if (!three_d || !pin->GetOrAddBoolean("shearing_box", "stratified", false) || cloud_root_random) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "stratified_dust: 3-D, <shearing_box>/stratified = true, lattice or random "

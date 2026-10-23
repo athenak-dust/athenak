@@ -178,8 +178,12 @@ void DustGasDrag::CheckClouds3D() {
                   "feedback check, patch statistics, position order)");
   }
   if (!cloud_split_device || cloud_split_log || split_oracle) bad.push_back("the host split");
-  if (pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic) {
-    bad.push_back("physical x3 faces (the leaf traversal is periodic in x3)");
+  // (physical x3 faces: the supports fold back at the faces; x3_ghost_deposit = drop
+  // is refused by the constructor)
+  if (pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
+      pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::reflect &&
+      pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::outflow) {
+    bad.push_back("x3 faces other than periodic, reflect or outflow");
   }
   if (cloud_instant_switch) bad.push_back("cloud_instant_switch");
   if (cloud_sort_interval > 0 || cloud_order_interval > 0) {
@@ -221,6 +225,8 @@ void DustGasDrag::BuildLeafTraversal3D() {
     std::exit(EXIT_FAILURE);
   }
   const auto &t = smr_transfer;
+  // Physical x3 faces (no periodic image in x3)
+  const bool zper = pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic;
   // block slots (stage 3): the blocks of this rank (slot = gid - gids), then
   // the blocks of other ranks that a cloud of this rank can reach (halo, ascending gid: the
   // neighbours, and every block within the reach of a block of this rank, HaloReach), then all
@@ -275,8 +281,8 @@ void DustGasDrag::BuildLeafTraversal3D() {
                (ll.lx1 >> lev)].push_back(g);
       }
       auto overlap = [](std::int64_t a0, std::int64_t a1, std::int64_t c0, std::int64_t c1,
-                        std::int64_t n) {
-        for (int s=-1; s<=1; ++s) {
+                        std::int64_t n, const bool per = true) {
+        for (int s=(per ? -1 : 0); s<=(per ? 1 : 0); ++s) {
           if (a0 + s*n < c1 && c0 < a1 + s*n) return true;
         }
         return false;
@@ -295,6 +301,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
             for (int dx=-kk[0]; dx<=kk[0]; ++dx) {
               const int cx = ((bb[0] + dx) % nbr[0] + nbr[0]) % nbr[0];
               const int cy = ((bb[1] + dy) % nbr[1] + nbr[1]) % nbr[1];
+              if (!zper && (bb[2] + dz < 0 || bb[2] + dz >= nbr[2])) continue;
               const int cz = ((bb[2] + dz) % nbr[2] + nbr[2]) % nbr[2];
               for (const int g : bucket[(static_cast<std::size_t>(cz)*nbr[1] + cy)*nbr[0] + cx]) {
                 if (slot_of[g] >= 0) continue;
@@ -302,7 +309,8 @@ void DustGasDrag::BuildLeafTraversal3D() {
                 fb(g, gb);
                 bool in = true;
                 for (int d=0; d<3 && in; ++d) {
-                  in = overlap(gb[2*d], gb[2*d + 1], mb[2*d] - rf, mb[2*d + 1] + rf, nf[d]);
+                  in = overlap(gb[2*d], gb[2*d + 1], mb[2*d] - rf, mb[2*d + 1] + rf, nf[d],
+                               d < 2 || zper);
                 }
                 if (!in) continue;
                 h.push_back(g);
@@ -313,7 +321,8 @@ void DustGasDrag::BuildLeafTraversal3D() {
                 std::array<int, 6> c;
                 for (int d=0; d<3; ++d) {
                   std::int64_t r0 = gb[2*d + 1], r1 = gb[2*d];   // empty
-                  for (int sft=-1; sft<=1; ++sft) {
+                  const int sm = (d < 2 || zper) ? 1 : 0;
+                  for (int sft=-sm; sft<=sm; ++sft) {
                     const std::int64_t a0 = std::max(gb[2*d], mb[2*d] - rf - sft*nf[d]);
                     const std::int64_t a1 = std::min(gb[2*d + 1], mb[2*d + 1] + rf - sft*nf[d]);
                     if (a0 < a1) {r0 = std::min(r0, a0); r1 = std::max(r1, a1);}
@@ -346,13 +355,13 @@ void DustGasDrag::BuildLeafTraversal3D() {
               std::int64_t gb[6];
               fb(g, gb);
               const bool nearx = (side == 1) ? (gb[0] < rf) : (gb[1] > nf[0] - rf);
-              if (!nearx || !overlap(gb[4], gb[5], mb[4] - rf, mb[5] + rf, nf[2])) continue;
+              if (!nearx || !overlap(gb[4], gb[5], mb[4] - rf, mb[5] + rf, nf[2], zper)) continue;
               h.push_back(g);
               const LogicalLocation &gl = pm->lloc_eachmb[g];
               const std::int64_t ratio =
                   static_cast<std::int64_t>(1) << (nl - (gl.level - pm->root_level));
               std::int64_t r0 = gb[5], r1 = gb[4];
-              for (int sft=-1; sft<=1; ++sft) {
+              for (int sft=(zper ? -1 : 0); sft<=(zper ? 1 : 0); ++sft) {
                 const std::int64_t a0 = std::max(gb[4], mb[4] - rf - sft*nf[2]);
                 const std::int64_t a1 = std::min(gb[5], mb[5] + rf - sft*nf[2]);
                 if (a0 < a1) {r0 = std::min(r0, a0); r1 = std::max(r1, a1);}
@@ -599,6 +608,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
       for (int cy=y0 - s2; ok && cy<y1 + s2; cy+=s2) {
         for (int cx=x0 - s1; ok && cx<x1 + s1; cx+=s1) {
           if (cx >= x0 && cx < x1 && cy >= y0 && cy < y1 && cz >= z0 && cz < z1) continue;
+          if (!zper && (cz < 0 || cz >= lt.nfine3)) continue;   // (beyond a physical x3 face)
           bool held = false;
           for (int k=0; k<nnb(m) && !held; ++k) {
             const int b = nb(m, k);
@@ -659,6 +669,8 @@ void DustGasDrag::BuildLeafTraversal3D() {
   // boxes of all slots, the slots near each x1 face, the reach of each local block (the halo's
   // on several ranks, the level rule on one)
   lt.shear = shear3d;
+  lt.x3per = zper;
+  lt.x3bc = zper ? 0 : pmy_pack->ppart->pbval_part->x3bc_dust;
   shear3d_lists_ok_ = false;
   shear3d_fbox_.clear(); shear3d_face_[0].clear(); shear3d_face_[1].clear();
   shear3d_reach_.assign(nmb, 0);
@@ -749,7 +761,7 @@ void DustGasDrag::UpdateShear3D(const Real time) {
           const double by0 = fb[b][2] - static_cast<double>(sy)*nf2;
           const double by1 = fb[b][3] - static_cast<double>(sy)*nf2;
           if (!(by0 < y1 && y0 < by1)) continue;
-          for (int sz=-1; sz<=1; ++sz) {
+          for (int sz=(lt.x3per ? -1 : 0); sz<=(lt.x3per ? 1 : 0); ++sz) {
             const int bz0 = fb[b][4] - sz*nf3, bz1 = fb[b][5] - sz*nf3;
             if (!(bz0 < z1 && z0 < bz1)) continue;
             if (b >= lt.nfld) {
@@ -794,6 +806,7 @@ void DustGasDrag::WrapParticles3D() {
   // Across a shear-periodic x1 face y moves by n ysh (with its register)
   const bool sh = leaf_traversal3d.shear;
   const Real ysh = leaf_traversal3d.ysh, ilx = 1.0/(x1b - x1a);
+  const bool zper = pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic;
   Kokkos::parallel_for("dust_wrap3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     if (sh) {
@@ -805,6 +818,7 @@ void DustGasDrag::WrapParticles3D() {
       }
     }
     SMRCompositeTransfer::WrapParticle(pr, p, x1a, x1b, x2a, x2b);
+    if (!zper) return;   // (physical x3 faces: the particle routing reflects or removes)
     const Real z = pr(IPZ,p), zw = SMRCompositeTransfer::WrapPosition(z, x3a, x3b);
     if (zw != z) {pr(IPZ,p) = zw; pr(IPZ1,p) += zw - z;}
   });
@@ -893,7 +907,7 @@ void DustGasDrag::FrameToBlock3D(const Real tpos) {
         if (sh) {pr(IPY,p) += n1*ysp; pr(IPY1,p) += n1*ysp;}
       }
       const Real sy = lt.ly*round((pr(IPY,p) - cy)*lt.ily);
-      const Real sz = lt.lz*round((pr(IPZ,p) - cz)*lt.ilz);
+      const Real sz = lt.x3per ? lt.lz*round((pr(IPZ,p) - cz)*lt.ilz) : 0.0;
       if (sy != 0.0) {pr(IPY,p) -= sy; pr(IPY1,p) -= sy;}
       if (sz != 0.0) {pr(IPZ,p) -= sz; pr(IPZ1,p) -= sz;}
     }
@@ -1079,6 +1093,11 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
       const Real u = 2.0*lt.root_dx1*Uniform01(key + 1);
       px = (Uniform01(key + 12) < 0.5) ? lt.x1min + u : lt.x1max - u;
     }
+    // (physical x3 faces: a third of the clouds within two root cells of one)
+    if (!lt.x3per && !multi && Uniform01(key + 15) < 1.0/3.0) {
+      const Real u = 2.0*lt.root_dx3*Uniform01(key + 3);
+      pz = (Uniform01(key + 16) < 0.5) ? lt.x3min + u : lt.x3max - u;
+    }
     if (multi) {
       px = box_h(anchor0,0) + Uniform01(key + 1)*lt.nx1*box_h(anchor0,3);
       py = box_h(anchor0,1) + Uniform01(key + 2)*lt.nx2*box_h(anchor0,4);
@@ -1134,24 +1153,34 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
       const bool point = (code & T::kCloudGatherPoint) != 0;
       const LT::Shape s1a = LT::MakeShape(px, ldexp(lt.root_dx1, -lv), ldexp(lt.iroot_dx1, lv),
                                           T::CloudLobe1(code), point);
-      const int npart = (lt.shear && (s1a.lo < lt.x1min || s1a.hi > lt.x1max)) ? 2 : 1;
+      const LT::Shape s3a = LT::MakeShape(pz, ldexp(lt.root_dx3, -lv), ldexp(lt.iroot_dx3, lv),
+                                          T::CloudLobe3(code), point);
+      const int npx = (lt.shear && (s1a.lo < lt.x1min || s1a.hi > lt.x1max)) ? 2 : 1;
       const Real sgn = (s1a.hi > lt.x1max) ? 1.0 : -1.0;
-      for (int part=0; part<npart; ++part) {
-      const Real qx = (part == 0) ? px : px - sgn*lt.lx;
-      const Real qy = (part == 0) ? py : py + sgn*lt.ysh;
+      // (physical x3 faces: the part beyond a face mirrored back)
+      const int npz = (!lt.x3per && (s3a.lo < lt.x3min || s3a.hi > lt.x3max)) ? 2 : 1;
+      const Real zf = (s3a.hi > lt.x3max) ? lt.x3max : lt.x3min;
+      for (int part=0; part<npx*npz; ++part) {
+      const int pxp = part % npx, pzp = part/npx;
+      const Real qx = (pxp == 0) ? px : px - sgn*lt.lx;
+      const Real qy = (pxp == 0) ? py : py + sgn*lt.ysh;
+      const Real qz = (pzp == 0) ? pz : 2.0*zf - pz;
+      const int l3 = (pzp == 0) ? T::CloudLobe3(code)
+                                : LeafTraversal3D::MirrorLobe(T::CloudLobe3(code));
       const LT::Shape s1 = LT::MakeShape(qx, ldexp(lt.root_dx1, -lv), ldexp(lt.iroot_dx1, lv),
                                          T::CloudLobe1(code), point);
       const LT::Shape s2 = LT::MakeShape(qy, ldexp(lt.root_dx2, -lv), ldexp(lt.iroot_dx2, lv),
                                          T::CloudLobe2(code), point);
-      const LT::Shape s3 = LT::MakeShape(pz, ldexp(lt.root_dx3, -lv), ldexp(lt.iroot_dx3, lv),
-                                         T::CloudLobe3(code), point);
+      const LT::Shape s3 = LT::MakeShape(qz, ldexp(lt.root_dx3, -lv), ldexp(lt.iroot_dx3, lv),
+                                         l3, point);
       int ia = static_cast<int>(floor((s1.lo - lt.x1min)/lt.fine_dx1));
       int ib = static_cast<int>(ceil((s1.hi - lt.x1min)/lt.fine_dx1)) - 1;
-      if (npart == 2) {ia = (ia < 0) ? 0 : ia; ib = (ib > lt.nfine1 - 1) ? lt.nfine1 - 1 : ib;}
+      if (npx == 2) {ia = (ia < 0) ? 0 : ia; ib = (ib > lt.nfine1 - 1) ? lt.nfine1 - 1 : ib;}
       const int ja = static_cast<int>(floor((s2.lo - lt.x2min)/lt.fine_dx2));
       const int jb = static_cast<int>(ceil((s2.hi - lt.x2min)/lt.fine_dx2)) - 1;
-      const int ka = static_cast<int>(floor((s3.lo - lt.x3min)/lt.fine_dx3));
-      const int kb = static_cast<int>(ceil((s3.hi - lt.x3min)/lt.fine_dx3)) - 1;
+      int ka = static_cast<int>(floor((s3.lo - lt.x3min)/lt.fine_dx3));
+      int kb = static_cast<int>(ceil((s3.hi - lt.x3min)/lt.fine_dx3)) - 1;
+      lt.ClipZ(ka, kb);
       for (int k=ka; k<=kb; ++k) {
         Real w3, g3;
         LT::Cell<true>(s3, LT::FaceAt<true>(s3, lt.x3min + k*lt.fine_dx3),
@@ -1172,7 +1201,7 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
             d(t, 0) -= w;
             d(t, 1) -= g1*w2*w3 + T::MinImage(qx - xc, lt.lx)*w;
             d(t, 2) -= w1*g2*w3 + T::MinImage(qy - yc, lt.ly)*w;
-            d(t, 3) -= w1*w2*g3 + T::MinImage(pz - zc, lt.lz)*w;
+            d(t, 3) -= w1*w2*g3 + T::MinImage(qz - zc, lt.lz)*w;
           }
         }
       }
@@ -1321,7 +1350,9 @@ int DustGasDrag::SplitCloudsP1Device3D() {
       const int a = k % n1, b = (k/n1) % n2, c = k/n12;
       const int s = (k == 0) ? p : npart + tagoff(p) + k - 1;
       Real cx = x + p1[a].off*e1, cy = y + p2[b].off*e2, cz = z + p3[c].off*e3;
-      lt.WrapPos(cx, cy, cz);   // (shear-periodic x1: y moves with an x wrap)
+      // (shear-periodic x1: y moves with an x wrap; a physical x3 face: a piece
+      // beyond it is mirrored back with its x3 lobe swapped)
+      const int zmir = lt.WrapPos(cx, cy, cz);
       if (k > 0) {
         for (int q=0; q<nrdata; ++q) prv(q,s) = prv(q,p);
         for (int q=0; q<nidata; ++q) piv(q,s) = piv(q,p);
@@ -1331,7 +1362,11 @@ int DustGasDrag::SplitCloudsP1Device3D() {
       prv(IPY,s) = cy; prv(IPY1,s) = cy;
       prv(IPZ,s) = cz; prv(IPZ1,s) = cz;
       prv(IPM,s) = mass*p1[a].frac*p2[b].frac*p3[c].frac;
-      piv(PLEV,s) = clev | (p1[a].lobe << sh1) | (p2[b].lobe << sh2) | (p3[c].lobe << sh3);
+      piv(PLEV,s) = clev | (p1[a].lobe << sh1) | (p2[b].lobe << sh2) |
+                    ((zmir ? LeafTraversal3D::MirrorLobe(p3[c].lobe) : p3[c].lobe) << sh3);
+      if (zmir && lt.x3bc == 1) {   // a reflecting face: the velocity mirrored too
+        prv(IPVZ,s) = -prv(IPVZ,s); prv(IPVZ1,s) = -prv(IPVZ1,s);
+      }
       piv(PGID,s) = gids + NewCloudBlock3(lt, cx, cy, cz, lt.Anchor(piv(PGID,s)), ncell123);
     }
   });
