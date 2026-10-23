@@ -29,6 +29,10 @@
 
 ShearingBoxCC::ShearingBoxCC(MeshBlockPack *pp, ParameterInput *pin, int nvar) :
     ShearingBox(pp, pin), nvar_(nvar) {
+  nvar_pull = nvar;
+#if MPI_PARALLEL_ENABLED
+  MPI_Comm_dup(MPI_COMM_WORLD, &comm_qflx);   // flux pairs
+#endif
   AllocateBuffers();
 }
 
@@ -62,11 +66,13 @@ void ShearingBoxCC::AllocateBuffers() {
 //! Called on the physics_bcs task after purely periodic BC communication is finished.
 
 TaskStatus ShearingBoxCC::PackAndSendCC(DvceArray5D<Real> &a, ReconstructionMethod rcon) {
+  if (face_levels) {rcon_pull = rcon; return PullSend(a);}
   return PackAndSend(a, rcon, false);
 }
 
 TaskStatus ShearingBoxCC::PackAndSendCoarseCC(DvceArray5D<Real> &ca,
                                               ReconstructionMethod rcon) {
+  if (face_levels) return TaskStatus::complete;   // PullSend serves both
   return PackAndSend(ca, rcon, true);
 }
 
@@ -196,10 +202,12 @@ TaskStatus ShearingBoxCC::PackAndSend(DvceArray5D<Real> &a, ReconstructionMethod
 //! PackAndSendCC() function
 
 TaskStatus ShearingBoxCC::RecvAndUnpackCC(DvceArray5D<Real> &a) {
+  if (face_levels) return PullRecv(a, false);
   return RecvAndUnpack(a, false);
 }
 
 TaskStatus ShearingBoxCC::RecvAndUnpackCoarseCC(DvceArray5D<Real> &ca) {
+  if (face_levels) return PullRecv(ca, true);
   return RecvAndUnpack(ca, true);
 }
 

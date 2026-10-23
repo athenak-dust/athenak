@@ -54,6 +54,8 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
   // coarser level and the other the same level is filled properly.
   // (Only needed in multidimensions)
 
+  const bool skip_shr = skip_shear_x1_prol && three_d;
+  auto &mbbcs = pmy_pack->pmb->mb_bcs;
   if (multi_d) {
     auto &cis = indcs.cis;
     auto &cjs = indcs.cjs;
@@ -65,6 +67,15 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
       const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
       const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
 
+      // not through a shear-periodic x1 face when the shearing box collects them
+      if (skip_shr) {
+        const int ox = ShearSlotOx1(n);
+        if ((ox == -1 && mbbcs.d_view(m,BoundaryFace::inner_x1) == BoundaryFlag::shear_periodic)
+            || (ox == 1 &&
+                mbbcs.d_view(m,BoundaryFace::outer_x1) == BoundaryFlag::shear_periodic)) {
+          return;
+        }
+      }
       // only restrict when neighbor exists and is at SAME level
       if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev == mblev.d_view(m))) {
         // loop over indices for receives at same level, but convert loop limits to
@@ -156,6 +167,8 @@ void MeshBoundaryValuesCC::ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> 
   DvceArray1D<int64_t> amp_cnt;
   if (amp_eps > 0.0) amp_cnt = pmy_pack->pmesh->pmr->prolong_amp_count;
   auto& prolong_4th = pmy_pack->pmesh->pmr->weights.prolong_4th;
+  const bool skip_shr = skip_shear_x1_prol && three_d;
+  auto &mbbcs = pmy_pack->pmb->mb_bcs;
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
@@ -164,6 +177,15 @@ void MeshBoundaryValuesCC::ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> 
     const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
     const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
 
+    // not through a shear-periodic x1 face when the shearing box collects them
+    if (skip_shr) {
+      const int ox = ShearSlotOx1(n);
+      if ((ox == -1 && mbbcs.d_view(m,BoundaryFace::inner_x1) == BoundaryFlag::shear_periodic)
+          || (ox == 1 &&
+              mbbcs.d_view(m,BoundaryFace::outer_x1) == BoundaryFlag::shear_periodic)) {
+        return;
+      }
+    }
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
       // loop over indices for prolongation on this buffer
