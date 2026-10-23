@@ -104,26 +104,32 @@ void ShearingBox::BuildBoundaryLists() {
 //! \fn void ShearingBox::CheckLevelsAlongX2()
 //! \brief With mesh refinement in 3-D (S1') the shear exchange (and the
 //! orbital advection) shifts data between MeshBlocks of one level: FindTargetMB looks for the
-//! shifted block at the sender's level and x3 location.  Every MeshBlock's x2 neighbours must
-//! be on its level (refinement in columns along x2).  Coarser partners across the x1 boundary
+//! shifted block at the sender's level and x3 location.  Every MeshBlock on a shear-periodic x1
+//! face must have its x2 neighbours on its level (refinement in columns along x2 there).  Coarser partners across the x1 boundary
 //! are allowed: their data reach the fine block's coarse array, which is sheared as well.
 
 void ShearingBox::CheckLevelsAlongX2() const {
   Mesh *pm = pmy_pack->pmesh;
   if (!(pm->multilevel && pm->three_d &&
         pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic)) return;
+  // (S2) only the blocks on the shear-periodic x1 faces (the orbital
+  // advection handles x2 neighbours on other levels in the interior); all x2 face slots
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &lev = pmy_pack->pmb->mb_lev;
+  auto &mbbcs = pmy_pack->pmb->mb_bcs;
   bool ok = true;
   for (int m=0; m<pmy_pack->nmb_thispack; ++m) {
-    for (int n : {8, 12}) {
+    if (mbbcs.h_view(m,BoundaryFace::inner_x1) != BoundaryFlag::shear_periodic &&
+        mbbcs.h_view(m,BoundaryFace::outer_x1) != BoundaryFlag::shear_periodic) continue;
+    for (int n=8; n<16; ++n) {
       if (nghbr.h_view(m,n).gid >= 0 && nghbr.h_view(m,n).lev != lev.h_view(m)) ok = false;
     }
   }
   if (!ok) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Shearing box with mesh refinement (experimental_smr): every MeshBlock's x2 "
-              << "neighbours must be on its level (refine in columns along x2)" << std::endl;
+              << "Shearing box with mesh refinement (experimental_smr): the x2 neighbours of "
+              << "every MeshBlock on a shear-periodic x1 face must be on its level (the "
+              << "blocks there refine in columns along x2)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 }
