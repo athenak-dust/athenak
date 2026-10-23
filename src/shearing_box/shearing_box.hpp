@@ -85,6 +85,10 @@ class ShearingBox {
   // senders and remapped by the receiver (ShearingBox::PlanPull, ShearingBoxCC::PullSend/
   // PullRecv), instead of the two-step exchange between blocks of one level.
   bool face_levels = false;
+  // host time of the per-stage plans (<shearing_box>/report_timing)
+  bool report_timing = false;
+  double t_plan_pull = 0.0, t_plan_flux = 0.0;
+  long n_plan_pull = 0, n_plan_flux = 0;
   bool pull_ghost_valid = false;   // (S2c) x1 ghosts hold collected values (not after a regrid)
   int nvar_pull = 0;
   ReconstructionMethod rcon_pull = ReconstructionMethod::plm;

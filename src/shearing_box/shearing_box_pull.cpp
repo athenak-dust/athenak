@@ -21,6 +21,7 @@
 //! per (receiving block, sending block) pair.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -48,6 +49,12 @@ long long FloorDiv(long long a, long long d) {
 //! \fn void ShearingBox::PlanPull()
 
 void ShearingBox::PlanPull() {
+  const auto tp0 = std::chrono::steady_clock::now();
+  struct Tm {   // host time of the plan, on every return path
+    ShearingBox *b; std::chrono::steady_clock::time_point t0;
+    ~Tm() {b->t_plan_pull += std::chrono::duration<double>(std::chrono::steady_clock::now()
+                                                           - t0).count(); b->n_plan_pull++;}
+  } tm_{this, tp0};
   nppiece = 0;
   nprecv = 0;
   Mesh *pm = pmy_pack->pmesh;

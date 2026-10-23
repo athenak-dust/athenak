@@ -17,6 +17,7 @@
 //! mass and momentum leave one face exactly as they enter the other (up to round-off).
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -37,6 +38,11 @@
 //! this rank sends or receives, the buffers; posts the MPI receives.
 
 void ShearingBoxCC::PlanFluxMatch() {
+  struct Tm {   // host time of the plan (both kinds), on every return path
+    ShearingBox *b; std::chrono::steady_clock::time_point t0;
+    ~Tm() {b->t_plan_flux += std::chrono::duration<double>(std::chrono::steady_clock::now()
+                                                           - t0).count(); b->n_plan_flux++;}
+  } tm_{this, std::chrono::steady_clock::now()};
   nfpiece = 0;
   nfrecv = 0;
   if (!flux_on) return;

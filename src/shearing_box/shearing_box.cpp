@@ -7,6 +7,7 @@
 //! \brief constructor for ShearingBox abstract base class, and utility functions
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -36,6 +37,7 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   is_stratified = pin->GetOrAddBoolean("shearing_box","stratified",false);
   // (S2b) blocks on the x1 faces may change level along x2
   face_levels = pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", false);
+  report_timing = pin->GetOrAddBoolean("shearing_box", "report_timing", false);
   // (S2c) non-periodic x3 needs the coarse-array physical
   // boundaries for the corners the collected ghost zones leave to them; dust
   // (u* through the same collection, deposits through the general remap, particle routing by the
@@ -66,6 +68,11 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
 // ShearingBox base class destructor
 
 ShearingBox::~ShearingBox() {
+  if (report_timing) {   // per rank
+    std::cout << "# shearing box timing rank " << global_variable::my_rank << ": PlanPull "
+              << n_plan_pull << " calls " << t_plan_pull << " s, flux plans " << n_plan_flux
+              << " calls " << t_plan_flux << " s (host)" << std::endl;
+  }
   FreeRequests();
 }
 
