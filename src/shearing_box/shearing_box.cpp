@@ -36,6 +36,16 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   is_stratified = pin->GetOrAddBoolean("shearing_box","stratified",false);
   // (S2b) blocks on the x1 faces may change level along x2
   face_levels = pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", false);
+  // what the collected ghost zones do not cover yet: the pull assumes periodic x3, and
+  // the dust u* shear (psbox_us) and particle routing still use the column exchange
+  if (face_levels &&
+      (ppack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic ||
+       pin->DoesBlockExist("dust") || pin->DoesBlockExist("particles"))) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<shearing_box>/experimental_face_levels supports hydro with periodic x3 only "
+              << "(no dust or particles yet)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 
   BuildBoundaryLists();
   CheckLevelsAlongX2();
