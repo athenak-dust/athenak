@@ -1063,7 +1063,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   // S3a: in 3-D with refinement or with shear-periodic x1 faces the ghost
   // deposits go through the general remap (any levels, several ranks, the shear offset)
-  if (pmy_pack->pmesh->three_d && (pmy_pack->pmesh->multilevel || shear_x1)) {
+  // (<dust>/test_general_deposit: also on a uniform periodic 3-D mesh; a test control)
+  if (pmy_pack->pmesh->three_d && (pmy_pack->pmesh->multilevel || shear_x1 ||
+                                   pin->GetOrAddBoolean("dust", "test_general_deposit", false))) {
     if (drag_solver != DustDragSolver::local ||
         !(smr_transfer_mode == DustSMRTransfer::owner_overlap ||
           smr_transfer_mode == DustSMRTransfer::none)) {

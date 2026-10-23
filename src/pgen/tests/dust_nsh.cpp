@@ -1172,10 +1172,10 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   }
   // in 3-D with the lattice (or random) placement instead of the root parents
   if (dtest && (!dust_active || pin->DoesBlockExist("shearing_box") ||
-                (pmy_mesh_->three_d ? cloud_root_random : !cloud_root_random))) {
+                (pmy_mesh_->three_d && cloud_root_random))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<problem>/dust_test needs 2-D dust with cloud_root_random (3-D: without) and "
-              << "no <shearing_box>" << std::endl;
+              << "<problem>/dust_test needs dust (2-D: root clouds or the lattice; 3-D: the "
+              << "lattice) and no <shearing_box>" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (!dtest && !(pin->DoesBlockExist("shearing_box"))) {
@@ -1327,6 +1327,17 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     std::exit(EXIT_FAILURE);
   }
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2, lnx3 = indcs.nx3;
+  // <problem>/lattice_sub: in 3-D the ppc particles of a cell on an n^3 sub-lattice
+  // (offsets (a + 1/2)/n) instead of all at the cell centre; ppc = n^3 times nspecies
+  int nsub = 1;
+  if (pin->GetOrAddBoolean("problem", "lattice_sub", false)) {
+    nsub = static_cast<int>(std::lround(std::cbrt(static_cast<double>(ppc_int/nspec))));
+    if (!three_d || nsub*nsub*nsub*nspec != ppc_int) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "lattice_sub: 3-D and ppc = n^3 * nspecies" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
   Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
   std::uint64_t random_seed = static_cast<std::uint64_t>(
       pin->GetOrAddInteger("problem","random_seed",1));
@@ -1488,6 +1499,13 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
                              mbsize.d_view(m).x2max);
       pr(IPZ,p) = three_d ?
           CellCenterX(k, lnx3, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max) : 0.0;
+      if (nsub > 1) {   // the sub-lattice point of this particle (species cycle fastest)
+        const int r = (q % ppc_int)/nspec;
+        const int a = r % nsub, b = (r/nsub) % nsub, cc = r/(nsub*nsub);
+        pr(IPX,p) += ((a + 0.5)/nsub - 0.5)*mbsize.d_view(m).dx1;
+        pr(IPY,p) += ((b + 0.5)/nsub - 0.5)*mbsize.d_view(m).dx2;
+        pr(IPZ,p) += ((cc + 0.5)/nsub - 0.5)*mbsize.d_view(m).dx3;
+      }
     }
     pi(PGID,p) = gids + m;
     pi(PSP,p) = s;
