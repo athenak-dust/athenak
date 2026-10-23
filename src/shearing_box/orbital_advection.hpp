@@ -36,6 +36,27 @@ class OrbitalAdvection {
   MPI_Comm comm_orb_advect;
 #endif
 
+  // x2-face neighbours on another level (stage S2).  xlev(m,n) for the lower
+  // (n=0) and upper (n=1) x2 face: 0 a neighbour on the same level, 1 a coarser neighbour,
+  // 2 four finer neighbours.  A coarser sender prolongates (limited linear, as ProlongCC) and
+  // a finer sender restricts the rows into the receiver's buffer, so the remap itself is the
+  // same-level one.  The coarse side then takes the finer side's remap fluxes through the face
+  // (sum of the 2x2 fine fluxes / 8): conservative to round-off.
+  DualArray2D<int> xlev;
+  DualArray2D<int> xslot;   // (m,n): the slot (nghbr index) of the coarser neighbour
+  bool any_mixed;           // on this rank
+  bool oa_flux_correct;     // <shearing_box>/experimental_oa_flux_correct (default true)
+  int nvar_oa;              // variables (set by the CC class)
+  int nrow;                 // ng + maxjshift: rows exchanged at the receiver's resolution
+  DvceArray3D<Real> msend[2], mrecv[2];   // mixed-level data (m, subface, flat) for MPI
+  DvceArray3D<Real> fsend[2], frecv[2];   // remap fluxes through mixed faces (m, subface, flat)
+  DvceArray5D<Real> fown;                 // (m, v, n, k, i): own remap flux at mixed faces
+#if MPI_PARALLEL_ENABLED
+  MPI_Request *msreq[2], *mrreq[2], *fsreq[2], *frreq[2];   // index 4*m + subface
+  int nreq_mixed;
+#endif
+  void BuildMixedLists();   // in the constructor and after every regrid
+
   // functions
   TaskStatus InitRecv();
   TaskStatus ClearRecv();
@@ -57,6 +78,13 @@ class OrbitalAdvectionCC : public OrbitalAdvection {
   // functions to communicate CC data with orbital advection
   TaskStatus PackAndSendCC(DvceArray5D<Real> &a);
   TaskStatus RecvAndUnpackCC(DvceArray5D<Real> &a, ReconstructionMethod rcon);
+  // the fine side sends its remap fluxes through faces with a coarser neighbour;
+  // the coarse side replaces its own by them
+  TaskStatus SendFluxCC();
+  TaskStatus RecvFluxCC(DvceArray5D<Real> &a);
+  // public for CUDA (extended lambdas): pack of the mixed-level rows
+  void PackMixedCC(DvceArray5D<Real> &a);
+  void UnpackMixedCC();
 };
 
 //----------------------------------------------------------------------------------------

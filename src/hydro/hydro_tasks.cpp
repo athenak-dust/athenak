@@ -60,7 +60,9 @@ void Hydro::AssembleHydroTasks(std::map<std::string, std::shared_ptr<TaskList>> 
   id.srctrms   = tl["stagen"]->AddTask(&Hydro::HydroSrcTerms, this, id.rkupdt);
   id.sendu_oa  = tl["stagen"]->AddTask(&Hydro::SendU_OA, this, id.srctrms);
   id.recvu_oa  = tl["stagen"]->AddTask(&Hydro::RecvU_OA, this, id.sendu_oa);
-  id.restu     = tl["stagen"]->AddTask(&Hydro::RestrictU, this, id.recvu_oa);
+  id.sendf_oa  = tl["stagen"]->AddTask(&Hydro::SendFlx_OA, this, id.recvu_oa);
+  id.recvf_oa  = tl["stagen"]->AddTask(&Hydro::RecvFlx_OA, this, id.sendf_oa);
+  id.restu     = tl["stagen"]->AddTask(&Hydro::RestrictU, this, id.recvf_oa);
   id.sendu     = tl["stagen"]->AddTask(&Hydro::SendU, this, id.restu);
   id.recvu     = tl["stagen"]->AddTask(&Hydro::RecvU, this, id.sendu);
   id.sendu_shr = tl["stagen"]->AddTask(&Hydro::SendU_Shr, this, id.recvu);
@@ -285,6 +287,27 @@ TaskStatus Hydro::RecvU_OA(Driver *pdrive, int stage) {
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
       tstat = porb_u->RecvAndUnpackCC(u0, recon_method);
     }
+  }
+  return tstat;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskList Hydro::SendFlx_OA, RecvFlx_OA
+//! \brief Orbital advection across x2 faces with a level change (S2): the finer
+//! side sends its remap fluxes, the coarser side corrects its cells next to the face
+
+TaskStatus Hydro::SendFlx_OA(Driver *pdrive, int stage) {
+  TaskStatus tstat = TaskStatus::complete;
+  if (porb_u != nullptr && stage == pdrive->nexp_stages && pmy_pack->pmesh->three_d) {
+    tstat = porb_u->SendFluxCC();
+  }
+  return tstat;
+}
+
+TaskStatus Hydro::RecvFlx_OA(Driver *pdrive, int stage) {
+  TaskStatus tstat = TaskStatus::complete;
+  if (porb_u != nullptr && stage == pdrive->nexp_stages && pmy_pack->pmesh->three_d) {
+    tstat = porb_u->RecvFluxCC(u0);
   }
   return tstat;
 }
