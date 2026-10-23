@@ -57,8 +57,20 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
     // into the leaves directly: this exchange is not used then
     bool experimental_mpi = pin->GetOrAddBoolean("dust", "experimental_mpi", false) &&
         pin->GetOrAddString("dust", "experimental_smr_transfer", "smooth_p2") == "refinable_cloud";
-    if (!(experimental_smr && (!(pp->pmesh->adaptive) || experimental_amr) && pp->pmesh->two_d &&
-          pp->pmesh->strictly_periodic &&
+    // 3-D refinable clouds (<dust>/experimental_3d) deposit into the leaves directly
+    // too; with experimental_3d_shear_plain also on a shear-periodic 3-D mesh (test)
+    const bool rc = pin->GetOrAddString("dust", "experimental_smr_transfer", "smooth_p2") ==
+                    "refinable_cloud";
+    const bool clouds3d = rc && pp->pmesh->three_d &&
+                          pin->GetOrAddBoolean("dust", "experimental_3d", false);
+    const bool plain3d = clouds3d &&
+                         pin->GetOrAddBoolean("dust", "experimental_3d_shear_plain", false);
+    // (or the sheared image, in the leaf traversal)
+    const bool shear3d = clouds3d &&
+        pp->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
+    if (!(experimental_smr && (!(pp->pmesh->adaptive) || experimental_amr) &&
+          (pp->pmesh->two_d || clouds3d) &&
+          (pp->pmesh->strictly_periodic || plain3d || shear3d) &&
           (global_variable::nranks == 1 || experimental_mpi))) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Additive deposit exchange does not support this "

@@ -42,7 +42,8 @@ constexpr int kNCand = 8;              // null vectors looked at per step
 constexpr double kInf = std::numeric_limits<double>::infinity();
 
 // columns of the pool table (one row per pool cloud)
-enum PoolColumn {JX=0, JY=1, JM=2, JVX=3, JVY=4, JVZ=5, JTS=6, JUX=7, JUY=8, JUZ=9, JCAP=10, NPD=11};
+enum PoolColumn {JX=0, JY=1, JM=2, JVX=3, JVY=4, JVZ=5, JTS=6, JUX=7, JUY=8, JUZ=9, JCAP=10, NPD=11,
+                 JZ=11, NPD3=12};   // x3 position (3-D pools only)
 
 // per-patch counters returned by the device solver (columns of outi)
 enum PatchCount {PN=0, PKEPT=1, PNCAP=2, PFALLBACK=3, PZERO=4, PCAPSTEP=5, PSCANS=6, PNROW=7, PNB=8,
@@ -61,6 +62,10 @@ struct DevicePatchProblem {
   DvceArray2D<Real> pgeo;
   int npool = 0, npatch = 0;
   double lx = 0.0, ly = 0.0;
+  // 3-D refinable clouds: pools with JZ, pgeo (x, y, z centre, three half widths) and a
+  // third centre-of-mass row; the 2-D rows and their order are unchanged
+  bool three = false;
+  double lz = 0.0;
   // amr_profile only: device clock cycles of the patch solves by stage, summed over
   // the teams (kNStage entries; empty = off)
   DvceArray1D<unsigned long long> stage;

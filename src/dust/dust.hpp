@@ -103,8 +103,12 @@ struct SMRCompositeTransfer {
   static constexpr int kCloudLobeShift2 = 4;
   static constexpr int kCloudLobeShift1 = 6;
   static constexpr int kCloudGatherPoint = 256;
+  // 3-D refinable clouds: bits 9-10 the x3 lobe; 2-D codes never set them
+  static constexpr int kCloudLobeShift3 = 9;
   KOKKOS_INLINE_FUNCTION
   static int CloudLevel(const int code) {return code & kCloudLevelMask;}
+  KOKKOS_INLINE_FUNCTION
+  static int CloudLobe3(const int code) {return (code >> kCloudLobeShift3) & 3;}
   KOKKOS_INLINE_FUNCTION
   static int CloudLobe1(const int code) {return (code >> kCloudLobeShift1) & 3;}
   KOKKOS_INLINE_FUNCTION
@@ -1134,6 +1138,9 @@ struct LeafTraversal {
   int LeafOwner(const Real x1, const Real x2, const int m) const {return Owner(x1, x2, m);}
 };
 
+// the 3-D leaf traversal (LeafTraversal3D)
+#include "dust_leaf3d.hpp"
+
 // the name of a per-rank log file: unchanged on one rank, name.rNNNN.ext on several
 inline std::string RankFile(const std::string &name) {
   if (global_variable::nranks == 1) return name;
@@ -1176,6 +1183,10 @@ inline bool LogEmpty(std::FILE *fp) {
 //! part that the clouds of the receiving rank can reach).  One rank: no peers.
 struct DustHalo {
   int nx1 = 0, nx2 = 0, is = 0, js = 0, ncells1 = 0, ncells2 = 0;
+  // 3-D clouds: flat leaf index ((slot ncells3 + k) ncells2 + j) ncells1 + i; 2-D:
+  // nx3 = ncells3 = 1, ks = 0 (the flat index has no k)
+  bool three = false;
+  int nx3 = 1, ks = 0, ncells3 = 1;
   int hslot0 = 0, hslot1 = 0;          // the halo slots [hslot0, hslot1)
   int npeer = 0;
   unsigned long long builds = 0;
@@ -1187,9 +1198,10 @@ struct DustHalo {
   DvceArray1D<int> scell, rcell;
   DvceArray1D<Real> sbuf, rbuf;
   long long nblk_send = 0, nblk_recv = 0;   // blocks in the lists (for the log)
-  // the rectangle [i0, i1) x [j0, j1) (interior cell indices) of every halo slot that this rank
-  // receives, by halo slot (slot - nmb); and the guard of the strips (test)
-  std::vector<std::array<int, 4>> rect;
+  // the rectangle [i0, i1) x [j0, j1) x [k0, k1) (interior cell indices; 2-D: k0 = 0, k1 = 1) of
+  // every halo slot that this rank receives, by halo slot (slot - nmb); and the guard of the
+  // strips (test)
+  std::vector<std::array<int, 6>> rect;
   DvceArray2D<int> rect_d;
   bool guard = false;
 #if MPI_PARALLEL_ENABLED
@@ -1777,6 +1789,40 @@ class DustGasDrag {
   void PackGasGather(const DvceArray5D<Real> &u);       // ... from a conserved state
   // block-local traversal of the actual leaves (dust_leaf.cpp)
   LeafTraversal leaf_traversal;
+  // S3b: 3-D refinable clouds (<dust>/experimental_3d): the 3-D leaf traversal, the
+  // packed gather field (velocity and its central differences in x1, x2, x3: 12 numbers per
+  // cell) and the 3-D paths (dust_cloud3d.cpp)
+  bool experimental_3d = false;
+  LeafTraversal3D leaf_traversal3d;
+  DvceArray5D<Real> gpack3;
+  bool clouds3d = false;               // experimental_3d on a 3-D mesh (set by the constructor)
+  bool Clouds3D() const {return clouds3d;}
+  // stage 4: 3-D clouds in a shearing box with shear-periodic x1 (not the test
+  // option experimental_3d_shear_plain); the shear neighbours of LeafTraversal3D for the shear
+  // offset at a time (UpdateShear3D: rebuilt when the offset changes), from the finest-cell boxes
+  // of the slots, the slots near the inner / outer x1 face and the reach of every local block
+  bool shear3d = false;
+  bool shear3d_route_fix = true;   // <dust>/cloud_shear_route_time (test: false = AthenaK's time)
+  bool shear3d_lists_ok_ = false;
+  std::vector<std::array<int, 6>> shear3d_fbox_;
+  std::vector<int> shear3d_face_[2], shear3d_reach_;
+  void UpdateShear3D(const Real time);
+  void BuildLeafTraversal3D();
+  void CheckLeafTraversal3D(const int nsample);
+  int SplitCloudsP1Device3D();
+  void PackGatherField3D(const DvceArray5D<Real> &vel);
+  void PackGasGather3D(const DvceArray5D<Real> &u);
+  void CloudPredictor3D(const bool rate_dep);
+  void CloudAdvance3D();
+  void DepositCloudDensity3D(DvceArray5D<Real> &f);
+  void CheckClouds3D();   // the restrictions of 3-D stage 1
+  void WrapParticles3D();
+  int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
+  void FrameToBlock3D(const Real tpos);         // 3-D stages 3 and 4
+  bool CheckHaloReach3D(const char *when);
+  int RouteToOwnerBlocks3D(const char *when);
+  int MergeCloudsDevice3D();   // 3-D stage 2b (dust_cloud_device.cpp)
+  int ResampleClouds3D(const bool local);   // 3-D stage 2c (dust_resample.cpp)
   int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
   // timing diagnostic: storage order of the particles
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)
@@ -1820,6 +1866,7 @@ class DustGasDrag {
   // work arrays of the density trigger kept between checks (allocating and freeing
   // device arrays in every check synchronizes the device); reallocated when a size changes
   DvceArray2D<Real> trig_f;
+  DvceArray5D<Real> trig_f3;          // the 3-D leaf densities of the trigger
   // Rixin: dust_trigger_log.txt gets the line of a check only when the mesh changes after
   // it (BeforeRegrid writes the pending line) and the first check of the run
   std::string trig_log_line;
@@ -1831,7 +1878,7 @@ class DustGasDrag {
   void BuildHalo(const std::vector<int> &slot_gid);
   void CheckMultiRank();
   void MigrateClouds();
-  void FrameToBlock();
+  void FrameToBlock(const Real tpos = -1.0);   // tpos: the time of the positions
   // the reach of the halo per block of this rank (finest cells): the level rule
   // (HaloReach), the widenings found by CheckHaloReach (kept until the mesh changes), and the
   // furthest a support may extend beyond each block
@@ -1857,6 +1904,7 @@ class DustGasDrag {
   void DumpParticles();
   void HaloForwardPack(DvceArray5D<Real> &gp);
   void HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int nc);
+  void HaloForward5D(DvceArray5D<Real> &f, const int c0, const int nc);
   void HaloForwardFlat(DvceArray2D<Real> &f, const int nc);
   void HaloReverseAddFlat(DvceArray2D<Real> &f, const int nc);
   void HaloForwardFlags(DvceArray1D<int> &f);

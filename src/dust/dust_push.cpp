@@ -147,6 +147,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         // midpoint, implicit-midpoint kick and drift, cloud-weight impulse deposit.  Same
         // arithmetic as dust_pc2_advance below, kept separate because the paths there
         // (TSC, smooth_p2 / owner_overlap, the analytic gather) cost registers and occupancy.
+        if (clouds3d) {CloudAdvance3D(); return TaskStatus::complete;}
         PackGatherField(ustar);
         auto gp = gpack;
         // (a split into gather + deposit kernels and a shared-memory weight

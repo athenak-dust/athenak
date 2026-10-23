@@ -156,7 +156,10 @@ TaskStatus DustGasDrag::UpdateParticleGIDs(Driver *pdrive, int stage) {
   MigTimer timer(mpi_time[1], mpi_time[2]);
   // several ranks: clouds made at the start of the cycle may keep a block across a periodic
   // boundary
-  if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) FrameToBlock();
+  // (the positions after the push, at the end of the step)
+  if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
+    FrameToBlock(pmy_pack->pmesh->time + pmy_pack->pmesh->dt);
+  }
   return pmy_pack->ppart->NewGID(pdrive, stage);
 }
 

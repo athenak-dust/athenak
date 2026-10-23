@@ -107,6 +107,22 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // <dust>/experimental_mpi: refinable clouds on several MPI ranks with the dust
   // halo (dust_halo.cpp); the supported options in CheckMultiRank
   experimental_mpi = pin->GetOrAddBoolean("dust", "experimental_mpi", false);
+  // S3b: refinable clouds on a 3-D mesh (dust_cloud3d.cpp); stage 1: one rank, static
+  // mesh, split only.  <dust>/experimental_3d_shear_plain (test): a 3-D shearing box with
+  // shear-periodic x1, the cloud supports across the radial boundaries taken in the plain
+  // periodic image (correct only for states uniform in x2, e.g. LinA in a thin box)
+  experimental_3d = pin->GetOrAddBoolean("dust", "experimental_3d", false);
+  clouds3d = experimental_3d && pmy_pack->pmesh->three_d;
+  const bool shear_plain3d = clouds3d &&
+      pin->GetOrAddBoolean("dust", "experimental_3d_shear_plain", false) &&
+      pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
+  // Stage 4: shear-periodic x1 in the leaf traversal (the cloud supports across
+  // the radial boundaries on the sheared image)
+  shear3d = clouds3d && !shear_plain3d &&
+      pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
+  // (test) false: particles crossing an x1 face after the push take the shear offset of the start
+  // of the step, as the routing of point particles does
+  if (shear3d) shear3d_route_fix = pin->GetOrAddBoolean("dust", "cloud_shear_route_time", true);
   // Rixin: set the default to 4 (the balance of clouds per rank, fastest of 1 / 2 / 4); 0 gives
   // every new block the cost 1 as AthenaK does; one rank never uses it
   lb_cloud_weight = pin->GetOrAddReal("dust", "load_balance_cloud_weight", 4.0);
@@ -138,12 +154,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         pin->GetString("dust", "experimental_smr_transfer") == "owner_overlap";
     const bool sh3 = pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] ==
                      BoundaryFlag::shear_periodic;
-    // and with physical x3 faces
+    // S3b: 3-D refinable clouds (<dust>/experimental_3d), periodic or shear-periodic
+    // x1 (or, test, the plain periodic image across it); OO also with physical x3 faces
     const bool x3p = pmy_pack->pmesh->three_d &&
         pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic;
     if (!(experimental_smr && (!(pmy_pack->pmesh->adaptive) || experimental_amr) && ranks_ok &&
           ((pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic) ||
-           (oo3d && (pmy_pack->pmesh->strictly_periodic || sh3 || x3p))))) {
+           (oo3d && (pmy_pack->pmesh->strictly_periodic || sh3 || x3p)) ||
+           (clouds3d && (pmy_pack->pmesh->strictly_periodic || shear_plain3d || shear3d))))) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Dust drag does not support SMR/AMR. The current "
                 << "experimental exception requires explicit opt-in, static 2-D SMR, "
@@ -431,7 +449,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           std::cout << "# NOTE (dust): defaults changed on 2026-10-20 / 21 apply to:" << unset << std::endl;
         }
       }
-      if (!multilevel && !(pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic &&
+      if (!multilevel && !((pmy_pack->pmesh->two_d || clouds3d) &&
+                           (pmy_pack->pmesh->strictly_periodic || shear_plain3d || shear3d) &&
                            global_variable::nranks == 1 &&
                            drag_solver == DustDragSolver::local)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -730,8 +749,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Rixin: the default follows the build: the device solver when the
       // default execution space is not a host space (GPU builds), the threaded host solver
       // otherwise (on a CPU build the host solver was 3.3x faster than the device code)
+      // (3-D refinable clouds have only the device solver, which also runs on a CPU)
       cloud_resample_device = pin->GetOrAddBoolean("dust", "cloud_resample_device",
-          !std::is_same<DevExeSpace, Kokkos::DefaultHostExecutionSpace>::value);
+          !std::is_same<DevExeSpace, Kokkos::DefaultHostExecutionSpace>::value || clouds3d);
       cloud_resample_device_mem_mb = pin->GetOrAddInteger("dust", "cloud_resample_device_mem_mb", 2048);
       // A middle bucket (65 .. cloud_resample_device_mid clouds; 0: off) of the
       // device solves with narrower teams, several per SM
@@ -1030,6 +1050,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       Kokkos::realloc(cdummy, nmb, 3, nccells3, nccells2, nccells1);
     }
     CheckMultiRank();
+    CheckClouds3D();   // the 3-D stage-1 restrictions
     if (global_variable::my_rank == 0) {
       std::cout << "# WARNING (dust): experimental static-SMR refinable_cloud transfer "
                 << "is enabled (hat clouds, exact leaf integrals, two-scale split; "
@@ -1096,8 +1117,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // S3a: in 3-D with refinement or with shear-periodic x1 faces the ghost
   // deposits go through the general remap (any levels, several ranks, the shear offset)
   // (<dust>/test_general_deposit: also on a uniform periodic 3-D mesh; a test control)
-  if (pmy_pack->pmesh->three_d && (pmy_pack->pmesh->multilevel || shear_x1 || x3_phys ||
-                                   pin->GetOrAddBoolean("dust", "test_general_deposit", false))) {
+  // Not for 3-D refinable clouds: they deposit into the leaves directly
+  if (pmy_pack->pmesh->three_d && !clouds3d &&
+      (pmy_pack->pmesh->multilevel || shear_x1 || x3_phys ||
+       pin->GetOrAddBoolean("dust", "test_general_deposit", false))) {
     if (drag_solver != DustDragSolver::local ||
         !(smr_transfer_mode == DustSMRTransfer::owner_overlap ||
           smr_transfer_mode == DustSMRTransfer::none)) {
@@ -1170,7 +1193,8 @@ void DustGasDrag::CheckMultiRank() {
     bad.push_back("stage X under the pass budget (cloud_merge_budget_x)");
   }
   if (cloud_split_log) bad.push_back("cloud_split_log");
-  if (cloud_leaf_check > 0) bad.push_back("cloud_leaf_check");
+  // The 3-D check runs on several ranks (CheckLeafTraversal3D)
+  if (cloud_leaf_check > 0 && !clouds3d) bad.push_back("cloud_leaf_check");
   // the audit is on whenever cloud_audit_t1 > 0 (dust_cloud_device.cpp; cloud_audit_t0 may stay at
   // its default -1): the check follows that condition (flag audit / Codex review)
   if (cloud_audit_t1 > 0.0) bad.push_back("merge pass audits (cloud_audit_t1 > 0)");
@@ -1267,7 +1291,7 @@ DustGasDrag::~DustGasDrag() {
               << t[0] << " pack=" << t[1] << " mpi=" << t[2] << " unpack=" << t[3]
               << " | halo reverse (" << halo_.nexch[1] << "): kernels_before=" << t[4] << " pack="
               << t[5] << " mpi=" << t[6] << " add=" << t[7] << " | halo widenings " << halo_widenings_
-              << ", halo blocks " << leaf_traversal.nfld - leaf_traversal.nmb << ", cells sent "
+              << ", halo blocks " << halo_.hslot1 - halo_.hslot0 << ", cells sent "
               << (halo_.soff.empty() ? 0 : halo_.soff.back()) << " received "
               << (halo_.roff.empty() ? 0 : halo_.roff.back())
               << (cloud_halo_strips ? " (strips)" : " (whole blocks)") << std::endl;

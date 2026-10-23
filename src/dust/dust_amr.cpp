@@ -50,6 +50,7 @@
 //! density trigger uses that deposit (OwnerOverlapDeposit) with the same block values.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -267,18 +268,214 @@ void SetupDensityTrigger(ParameterInput *pin) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn dust::DensityRefinement3D
+//! \brief Stage 2a: the density trigger with 3-D refinable clouds.  The dust density on
+//! the leaves (DepositCloudDensity3D); per block the largest rho_d/mean over the leaf cells that
+//! overlap the block widened by amr_rho_buffer cells of its level (the slots with leaf fields,
+//! every periodic image; the widened box must be covered); the thresholds and the log line as
+//! in 2-D.  Several ranks (stage 3): the halo slots, each with the cells it receives.
+
+void DensityRefinement3D(MeshBlockPack *pmbp) {
+  Mesh *pm = pmbp->pmesh;
+  DustGasDrag *pd = pmbp->pdust;
+  // several ranks (stage 3): the deposit traverses the supports, so the reach of the
+  // halo is checked first; the deposit adds the halo parts to their owners, and with a buffer the
+  // owners' sums go back to the halo slots
+  pd->CheckHaloReach("density trigger");
+  pd->DepositCloudDensity3D(pd->trig_f3);
+  if (trig_.buffer > 0) pd->HaloForward5D(pd->trig_f3, 0, 1);
+  auto f = pd->trig_f3;
+  particles::Particles *ppar = pmbp->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  Real mtot = 0.0;
+  int nlev[3] = {0, 0, 0};
+  Kokkos::parallel_reduce("amr_rho3d_totals", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p, Real &m, int &n0, int &n1, int &nl) {
+    m += pr(IPM,p);
+    const int code = pi(PLEV,p);
+    if (code > 15) ++nl; else if ((code & 15) == 0) ++n0; else ++n1;
+  }, mtot, nlev[0], nlev[1], nlev[2]);
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, nlev, 3, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
+  const auto &ms = pm->mesh_size;
+  const Real lx = ms.x1max - ms.x1min, ly = ms.x2max - ms.x2min, lz = ms.x3max - ms.x3min;
+  const Real vbox = lx*ly*lz;
+  const Real mean = mtot/vbox;
+  const auto &ind = pm->mb_indcs;
+  const int nmb = pmbp->nmb_thispack, mbs = pm->gids_eachrank[global_variable::my_rank];
+  const int is = ind.is, js = ind.js, ks = ind.ks, nx1 = ind.nx1, nx2 = ind.nx2, nx3 = ind.nx3;
+  auto mbsz = pmbp->pmb->mb_size;
+  DvceArray1D<Real> qd("amr_rho3d_q", std::max(1, nmb)), ad("amr_rho3d_vol", std::max(1, nmb));
+  DvceArray1D<int> bd("amr_rho3d_bad", std::max(1, nmb));
+  const int bb = trig_.buffer;
+  // the slots with leaf fields (this rank's blocks and the halo blocks; one rank: the blocks) and
+  // the box of cells each holds (a halo slot: what it receives, its strip or the whole block)
+  const auto lt3 = pd->leaf_traversal3d;
+  const int nslot = lt3.nfld;
+  DvceArray2D<int> srect("amr_rho3d_rect", std::max(1, nslot), 6);
+  {
+    auto rh = Kokkos::create_mirror_view(srect);
+    for (int b=0; b<nslot; ++b) {
+      const std::array<int, 6> full = {0, nx1, 0, nx2, 0, nx3};
+      const auto &c = (b < nmb) ? full : pd->halo_.rect[b - nmb];
+      for (int q=0; q<6; ++q) rh(b, q) = c[q];
+    }
+    Kokkos::deep_copy(srect, rh);
+  }
+  Kokkos::parallel_for("amr_rho3d_blocks",
+  Kokkos::MDRangePolicy<DevExeSpace, Kokkos::Rank<2>>({0, 0}, {nmb, nslot}),
+  KOKKOS_LAMBDA(const int m, const int s) {
+    const auto &bm = mbsz.d_view(m);
+    const Real ex0 = bm.x1min - bb*bm.dx1, ex1 = bm.x1max + bb*bm.dx1;
+    const Real ey0 = bm.x2min - bb*bm.dx2, ey1 = bm.x2max + bb*bm.dx2;
+    const Real ez0 = bm.x3min - bb*bm.dx3, ez1 = bm.x3max + bb*bm.dx3;
+    const Real tol = 1.0e-9*Kokkos::fmin(bm.dx1, Kokkos::fmin(bm.dx2, bm.dx3));
+    // the received box of slot s
+    const Real sdx1 = lt3.box(s,3), sdx2 = lt3.box(s,4), sdx3 = lt3.box(s,5);
+    const Real sx0 = lt3.box(s,0) + srect(s,0)*sdx1, sx1 = lt3.box(s,0) + srect(s,1)*sdx1;
+    const Real sy0 = lt3.box(s,1) + srect(s,2)*sdx2, sy1 = lt3.box(s,1) + srect(s,3)*sdx2;
+    const Real sz0 = lt3.box(s,2) + srect(s,4)*sdx3, sz1 = lt3.box(s,2) + srect(s,5)*sdx3;
+    Real q = 0.0, vol = 0.0;
+    int nbad = 0;
+    const int oym = lt3.shear ? 2 : 1;   // (sheared images of x1: two more in x2)
+    for (int oz=-1; oz<=1; ++oz) {
+      for (int oy=-oym; oy<=oym; ++oy) {
+        for (int ox=-1; ox<=1; ++ox) {
+          // (shear-periodic x1: an image shifted in x1 moves by -ox ysh in x2)
+          const Real ysx = lt3.shear ? -ox*lt3.ysh : 0.0;
+          const Real a0 = sx0 + ox*lx, a1 = sx1 + ox*lx;
+          const Real c0 = sy0 + oy*ly + ysx, c1 = sy1 + oy*ly + ysx;
+          const Real e0 = sz0 + oz*lz, e1 = sz1 + oz*lz;
+          if (a1 <= ex0 + tol || a0 >= ex1 - tol || c1 <= ey0 + tol || c0 >= ey1 - tol ||
+              e1 <= ez0 + tol || e0 >= ez1 - tol) continue;
+          vol += (Kokkos::fmin(a1, ex1) - Kokkos::fmax(a0, ex0))*
+                 (Kokkos::fmin(c1, ey1) - Kokkos::fmax(c0, ey0))*
+                 (Kokkos::fmin(e1, ez1) - Kokkos::fmax(e0, ez0));
+          // the cells of slot s (indices from its left face) in the widened box
+          const Real b0 = lt3.box(s,0) + ox*lx, d0 = lt3.box(s,1) + oy*ly + ysx;
+          const Real f0 = lt3.box(s,2) + oz*lz;
+          const int i0 = Kokkos::max(srect(s,0),
+                                     static_cast<int>(Kokkos::floor((ex0 - b0)/sdx1 + 1.0e-9)));
+          const int i1 = Kokkos::min(srect(s,1),
+                                     static_cast<int>(Kokkos::ceil((ex1 - b0)/sdx1 - 1.0e-9)));
+          const int j0 = Kokkos::max(srect(s,2),
+                                     static_cast<int>(Kokkos::floor((ey0 - d0)/sdx2 + 1.0e-9)));
+          const int j1 = Kokkos::min(srect(s,3),
+                                     static_cast<int>(Kokkos::ceil((ey1 - d0)/sdx2 - 1.0e-9)));
+          const int k0 = Kokkos::max(srect(s,4),
+                                     static_cast<int>(Kokkos::floor((ez0 - f0)/sdx3 + 1.0e-9)));
+          const int k1 = Kokkos::min(srect(s,5),
+                                     static_cast<int>(Kokkos::ceil((ez1 - f0)/sdx3 - 1.0e-9)));
+          for (int k=k0; k<k1; ++k) {
+            for (int j=j0; j<j1; ++j) {
+              for (int i=i0; i<i1; ++i) {
+                const Real v = f(s,0,ks+k,js+j,is+i);
+                if (!Kokkos::isfinite(v)) {++nbad; continue;}
+                q = Kokkos::fmax(q, v/mean);
+              }
+            }
+          }
+        }
+      }
+    }
+    if (vol > 0.0) Kokkos::atomic_add(&ad(m), vol);
+    if (q > 0.0) Kokkos::atomic_max(&qd(m), q);
+    if (nbad > 0) Kokkos::atomic_add(&bd(m), nbad);
+  });
+  auto qh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), qd);
+  auto ah = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ad);
+  auto bh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bd);
+  // the largest value and the share of the dust mass and volume on finer blocks
+  Real qmax = 0.0, mfine = 0.0, vfine = 0.0;
+  {
+    DvceArray1D<int> fine_d("amr_rho3d_fine", std::max(1, nmb));
+    auto fine_h = Kokkos::create_mirror_view(fine_d);
+    for (int m=0; m<nmb; ++m) fine_h(m) = (pm->lloc_eachmb[m + mbs].level > pm->root_level) ? 1 : 0;
+    Kokkos::deep_copy(fine_d, fine_h);
+    Real qm = 0.0, mf = 0.0;
+    const int ncell = nmb*nx3*nx2*nx1;
+    Kokkos::parallel_reduce("amr_rho3d_qmax", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
+    KOKKOS_LAMBDA(const int c, Real &qq, Real &mm) {
+      const int i = c % nx1, j = (c/nx1) % nx2, k = (c/(nx1*nx2)) % nx3, m = c/(nx1*nx2*nx3);
+      const Real v = f(m,0,ks+k,js+j,is+i);
+      qq = Kokkos::fmax(qq, v/mean);
+      if (fine_d(m)) mm += v*mbsz.d_view(m).dx1*mbsz.d_view(m).dx2*mbsz.d_view(m).dx3;
+    }, Kokkos::Max<Real>(qm), mf);
+    qmax = qm; mfine = mf;
+  }
+  for (int m=0; m<nmb; ++m) {
+    const auto &sz = mbsz.h_view(m);
+    if (pm->lloc_eachmb[m + mbs].level > pm->root_level) vfine += nx1*sz.dx1*nx2*sz.dx2*nx3*sz.dx3;
+  }
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {   // the totals over all ranks
+    MPI_Allreduce(MPI_IN_PLACE, &qmax, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+    Real fv[2] = {mfine, vfine};
+    MPI_Allreduce(MPI_IN_PLACE, fv, 2, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+    mfine = fv[0]; vfine = fv[1];
+  }
+#endif
+  auto &refine_flag = pm->pmr->refine_flag;
+  int nref = 0, nder = 0;
+  for (int m=0; m<nmb; ++m) {
+    const auto &sz = mbsz.h_view(m);
+    const Real want = (nx1 + 2*bb)*sz.dx1*(nx2 + 2*bb)*sz.dx2*(nx3 + 2*bb)*sz.dx3;
+    if (std::fabs(ah(m) - want) > 1.0e-9*want || bh(m) > 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "3-D density trigger: the buffer of block " << m + mbs << " is not covered "
+                << "(volume " << ah(m) << " of " << want << ", " << bh(m) << " non-finite cells)"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const int lev = pm->lloc_eachmb[m + mbs].level;
+    const int l = lev - pm->root_level;
+    const Real fr = std::pow(trig_.level_factor, l);
+    const Real fdr = (l > 0) ? std::pow(trig_.level_factor, l - 1) : 1.0;
+    int flag = 0;
+    if (qh(m) >= trig_.rho_refine*fr && lev < pm->max_level) flag = 1;
+    else if (qh(m) < trig_.rho_derefine*fdr && lev > pm->root_level) flag = -1;
+    refine_flag.h_view(m + mbs) = flag;
+    if (flag > 0) ++nref;
+    if (flag < 0) ++nder;
+  }
+  refine_flag.template modify<HostMemSpace>();
+  refine_flag.template sync<DevExeSpace>();
+  if (global_variable::my_rank == 0) {
+    std::vector<int> perlev(pm->max_level - pm->root_level + 1, 0);
+    for (int g=0; g<pm->nmb_total; ++g) ++perlev[pm->lloc_eachmb[g].level - pm->root_level];
+    std::string pl;
+    for (std::size_t l=0; l<perlev.size(); ++l) pl += (l ? "/" : "") + std::to_string(perlev[l]);
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d %s\n", pm->ncycle,
+                  pm->time, qmax, nmb, nref, nder, vfine/vbox, (mtot > 0.0) ? mfine/mtot : 0.0,
+                  nlev[0], nlev[1], nlev[2], pl.c_str());
+    pd->trig_log_line = buf;
+    if (pd->trig_log_first) {
+      pd->trig_log_first = false;
+      pd->WriteTriggerLog();
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn dust::DensityRefinement
 //! \brief Refinement request from the deposited dust density (see the file header).
 
 //----------------------------------------------------------------------------------------
-//! \fn dust::DensityRefinement3D
+//! \fn dust::DensityRefinement3DPoint
 //! \brief The dust-density request in 3-D (point particles, owner_overlap or a
 //! uniform root): the particle mass of every block on its own cells (NGP), the largest rho_d /
 //! mean of the block (mean over the whole mesh) against amr_rho_refine / amr_rho_derefine, times
 //! amr_rho_level_factor^level as in 2-D.  No buffer: the 2:1 rule and the shear-face columns of
 //! the mesh refinement do the rest.
 
-void DensityRefinement3D(MeshBlockPack *pmbp) {
+void DensityRefinement3DPoint(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
   particles::Particles *ppar = pmbp->ppart;
   auto &refine_flag = pm->pmr->refine_flag;
@@ -347,7 +544,11 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
 void DensityRefinement(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
   DustGasDrag *pdust = pmbp->pdust;
-  if (pm->three_d) {DensityRefinement3D(pmbp); return;}
+  // 3-D point particles here; 3-D refinable clouds below
+  if (pm->three_d && !(pdust != nullptr && pdust->Clouds3D())) {
+    DensityRefinement3DPoint(pmbp);
+    return;
+  }
   double dummy_t = 0.0; long long dummy_c = 0;   // for the profile timer
   ProfTimer prof_timer(pdust ? pdust->prof_time[DustGasDrag::kProfTrigger] : dummy_t,
                        pdust ? pdust->prof_count[DustGasDrag::kProfTrigger] : dummy_c);
@@ -355,6 +556,11 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   // ghost parts added to the leaves they overlap); the block values below are the same
   const bool oo = (pdust != nullptr) &&
                   pdust->smr_transfer_mode == DustSMRTransfer::owner_overlap;
+  // 3-D refinable clouds have their own (exact leaf deposit, halo on several ranks)
+  if (pdust != nullptr && pdust->Clouds3D()) {
+    DensityRefinement3D(pmbp);
+    return;
+  }
   if (pdust == nullptr || !(pdust->UsesCompositeTransfer() || oo) || pm->three_d) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "amr_density_trigger needs 2-D refinable-cloud or owner_overlap dust" << std::endl;
@@ -861,6 +1067,16 @@ void DustGasDrag::ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin) {
 
 int DustGasDrag::ResetPGIDFromPositions(const char *when) {
   if (global_variable::nranks > 1) return RouteToOwnerBlocks(when);
+  if (clouds3d) {   // the 3-D leaves
+    Real dw = 0.0;
+    double ms = 0.0;
+    const int n = ResetBlocks3D(when, false, dw, ms);
+    if (global_variable::my_rank == 0) {
+      std::cout << "# dust: MeshBlock ids set from the positions at the " << when << ": "
+                << n << " of " << pmy_pack->ppart->nprtcl_thispack << " changed" << std::endl;
+    }
+    return n;
+  }
   particles::Particles *ppar = pmy_pack->ppart;
   const int npart = ppar->nprtcl_thispack;
   auto pr = ppar->prtcl_rdata;
@@ -906,6 +1122,7 @@ int DustGasDrag::ResetPGIDFromPositions(const char *when) {
 //! rank's particles changed.
 
 int DustGasDrag::RouteToOwnerBlocks(const char *when) {
+  if (clouds3d) return RouteToOwnerBlocks3D(when);
   particles::Particles *ppar = pmy_pack->ppart;
   auto *pb = ppar->pbval_part;
   const int npart = ppar->nprtcl_thispack;
@@ -1172,7 +1389,9 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
   amr_regrid_ndel = ndel;
   // Positions into the box before the checksum (the rebuild sets the blocks from
   // the wrapped positions and must find the same particles)
-  if (smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
+  if (clouds3d) {   // the third direction too
+    WrapParticles3D();
+  } else if (smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
       pmy_pack->ppart->nprtcl_thispack > 0) {
     auto pr = pmy_pack->ppart->prtcl_rdata;
     const auto &ms = pmy_pack->pmesh->mesh_size;
@@ -1332,6 +1551,8 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   auto rnow = [&]() {if (rlog) Kokkos::fence(); return RClock::now();};
   auto r0 = rnow();
   BuildRefinableCloudTransfer(pin);
+  // Shear-periodic x1: the particle routing across the radial faces on the new mesh
+  if (ppar->pbval_part->shear_periodic_x1) ppar->pbval_part->BuildShearMaps();
   auto r1 = rnow(), r2 = r1, r3 = r1;
   // Several ranks: the particles follow their blocks to the ranks that hold
   // them on the new mesh (load balancing may move blocks anywhere)
@@ -1348,7 +1569,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
                     std::chrono::duration<double>(r2 - r1).count(),
                     std::chrono::duration<double>(r3 - r2).count()};
     MPI_Allreduce(MPI_IN_PLACE, tl, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    int mine[3] = {pmy_pack->nmb_thispack, ppar->nprtcl_thispack, leaf_traversal.nfld - leaf_traversal.nmb};
+    int mine[3] = {pmy_pack->nmb_thispack, ppar->nprtcl_thispack, halo_.hslot1 - halo_.hslot0};
     std::vector<int> all(3*nr, 0);
     MPI_Gather(mine, 3, MPI_INT, all.data(), 3, MPI_INT, 0, MPI_COMM_WORLD);
     if (global_variable::my_rank == 0) {
@@ -1385,6 +1606,9 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     cloud_merge_burst_until = pmesh->time + cloud_merge_burst_dt;
   }
 
+  if (clouds3d) {   // the blocks and the weight check on the 3-D leaves
+    ResetBlocks3D("regrid", true, dwmax, msum);
+  } else {
   const auto lt = leaf_traversal;   // the actual leaves
   auto pr = ppar->prtcl_rdata;
   auto pi = ppar->prtcl_idata;
@@ -1441,6 +1665,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     }
     std::exit(EXIT_FAILURE);
   }
+  }   // 2-D
   }   // refinable clouds
 
   // nothing but PGID may have changed since BeforeRegrid (several ranks: over all ranks; the
@@ -1506,7 +1731,9 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
               << nprt << " max|sum w - 1|=" << dwmax << std::endl;
   }
   // The leaf traversal also right after a regrid (old clouds on the new mesh)
-  if (cloud_leaf_check > 0) CheckLeafTraversal();
+  if (cloud_leaf_check > 0) {
+    if (clouds3d) {CheckLeafTraversal3D(256);} else {CheckLeafTraversal();}
+  }
 }
 
 //----------------------------------------------------------------------------------------

@@ -54,6 +54,7 @@
 
 // user history: Fourier projections onto the seeded mode
 void StreamingLinearHistory(HistoryData *pdata, Mesh *pm);
+void StreamingLinearHistory3D(HistoryData *pdata, Mesh *pm);   // 3-D refinable clouds
 void StreamingKx0Filter(Mesh *pm, const Real bdt);
 void RunMergeReplay(ParameterInput *pin, Mesh *pm, const Real taus0);
 void RunAuditReplay(ParameterInput *pin, Mesh *pm);
@@ -178,7 +179,11 @@ void SolveNSH2(const Real omega0, const Real qshear, const Real ax,
 //! \brief Problem Generator for linear streaming-instability eigenmodes
 
 void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) {
-  user_hist_func = StreamingLinearHistory;
+  // in 3-D the mode lies in the x1-x3 plane (x2 the azimuth, the state uniform in x2)
+  // (StreamingLinearHistory also projects the 3-D lattice with x3 vertical)
+  user_hist_func = (pmy_mesh_->three_d && pmy_mesh_->pmb_pack->pdust != nullptr &&
+                    pmy_mesh_->pmb_pack->pdust->Clouds3D()) ? StreamingLinearHistory3D
+                                                           : StreamingLinearHistory;
   // experimental dynamic mesh: scheduled refinement request
   if (pmy_mesh_->adaptive && pin->DoesBlockExist("dust")) {
     dust::SetupScheduledRefinement(pin);
@@ -241,7 +246,8 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       cloud_mode_ = (pr->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud);
       if (cloud_mode_) {
         cloud_root_dx1_ = pr->pdust->smr_transfer.root_dx1;
-        cloud_root_dx2_ = pr->pdust->smr_transfer.root_dx2;
+        cloud_root_dx2_ = pmy_mesh_->three_d ? pr->pdust->leaf_traversal3d.root_dx3
+                                             : pr->pdust->smr_transfer.root_dx2;
       }
     }
     return;
@@ -256,11 +262,13 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     std::exit(EXIT_FAILURE);
   }
   // also a 3-D shearing box (x1 radial, x2 azimuthal, x3 vertical),
-  // the mode independent of x2, with the lattice (point particles; no clouds and none of the 2-D
-  // diagnostics below)
+  // the mode independent of x2, with the lattice (point particles; none of the 2-D diagnostics
+  // below).  Refinable clouds in 3-D need <dust>/experimental_3d; their setup is
+  // the 3-D branch below
   const bool lina3d = pmy_mesh_->three_d;
   if (pmbp->pdust->nspecies != 1 ||
-      (lina3d && (pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud ||
+      (lina3d && ((pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
+                   !pmbp->pdust->Clouds3D()) ||
                   pin->GetOrAddBoolean("problem", "prescribed_gas", false) ||
                   pin->GetOrAddBoolean("problem", "split_oracle", false) ||
                   pin->GetOrAddBoolean("problem", "analytic_gather", false) ||
@@ -268,8 +276,8 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
                   pin->GetOrAddBoolean("problem", "kx0_filter", false) ||
                   pin->GetOrAddReal("problem", "boost_vx", 0.0) != 0.0))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Streaming test requires a single dust species; in 3-D the lattice without "
-              << "clouds and without the 2-D diagnostics" << std::endl;
+              << "Streaming test requires a single dust species; in 3-D the lattice or 3-D "
+              << "refinable clouds, without the 2-D diagnostics" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
@@ -340,6 +348,190 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       std::cout << "# streaming_linear: radial boost W = " << boost << ", gas vx = " << ugx
                 << ", dust vx = " << vnx << ", azimuthal accel = " << aphi << std::endl;
     }
+  }
+
+  // the 3-D LinA (x1 radial, x2 azimuthal, x3 vertical; the state uniform in x2):
+  // refinable clouds on the root lattice (npar1d^2 per root cell in x1-x3, one per root cell in
+  // x2), split to the leaves, the seed imprinted after the split with seed_after_split
+  if (pmy_mesh_->three_d && pmbp->pdust->Clouds3D()) {
+    for (const char *key : {"prescribed_gas", "split_oracle", "split_oracle_velocity",
+                            "split_oracle_node", "analytic_gather", "kx0_filter",
+                            "double_precision_snapshots"}) {
+      if (pin->GetOrAddBoolean("problem", key, false)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "<problem>/" << key << " is not available in 3-D" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+    }
+    if (boost != 0.0 || !pin->GetOrAddString("problem", "merge_replay", "").empty() ||
+        !pin->GetOrAddString("problem", "merge_audit_replay", "").empty()) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "boost_vx and the replays are not available in 3-D" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    auto &ind3 = pmy_mesh_->mb_indcs;
+    const int is3 = ind3.is, ie3 = ind3.ie, js3 = ind3.js, je3 = ind3.je;
+    const int ks3 = ind3.ks, ke3 = ind3.ke, n1 = ind3.nx1, n3 = ind3.nx3;
+    const int nmb3 = pmbp->nmb_thispack;
+    auto &ug = pmbp->phydro->u0;
+    auto &msz3 = pmbp->pmb->mb_size;
+    par_for("stream_gas3d", DevExeSpace(),0,(nmb3-1),ks3,ke3,js3,je3,is3,ie3,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      Real x = CellCenterX(i-is3, n1, msz3.d_view(m).x1min, msz3.d_view(m).x1max);
+      Real z = CellCenterX(k-ks3, n3, msz3.d_view(m).x3min, msz3.d_view(m).x3max);
+      Real ce = cos(kx*x), se = sin(kx*x);
+      Real cz = cos(kz*z), sz = sin(kz*z);
+      Real rho = rho0 + (Agr*ce - Agi*se)*cz;
+      Real ux  = ugx  + (Uxr*ce - Uxi*se)*cz;
+      Real up  = ugp  + (Upr*ce - Upi*se)*cz;
+      Real uz  =      - (Uzr*se + Uzi*ce)*sz;
+      ug(m,IDN,k,j,i) = rho;
+      ug(m,IM1,k,j,i) = rho*ux;
+      ug(m,IM2,k,j,i) = rho*up;   // azimuthal (x2) component
+      ug(m,IM3,k,j,i) = rho*uz;   // vertical (x3) component
+    });
+    particles::Particles *ppar = pmbp->ppart;
+    auto &pr = ppar->prtcl_rdata;
+    auto &pi = ppar->prtcl_idata;
+    const Real ppc = pin->GetOrAddReal("particles", "ppc", 1.0);
+    const int npar1d = static_cast<int>(std::lround(std::sqrt(ppc)));
+    if (npar1d*npar1d != static_cast<int>(std::lround(ppc)) ||
+        pmbp->pdust->smr_transfer_mode != DustSMRTransfer::refinable_cloud) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "3-D streaming test: refinable clouds and <particles>/ppc a perfect square "
+                << "(the x1-x3 sub-lattice of each root cell)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const int ppc_int = npar1d*npar1d;
+    const Real lshift = pin->GetOrAddReal("problem", "lattice_shift", 0.0);
+    const Real lshiftz = pin->GetOrAddReal("problem", "lattice_shift_z", 0.0);
+    const bool seed_after = pin->GetOrAddBoolean("problem", "seed_after_split", false);
+    const Real rhop0 = eps*rho0;
+    const auto &lt3 = pmbp->pdust->leaf_traversal3d;
+    const Real hx = lt3.root_dx1, hy = lt3.root_dx2, hz = lt3.root_dx3;
+    cloud_mode_ = true;
+    cloud_root_dx1_ = hx;
+    cloud_root_dx2_ = hz;
+    auto imprint = [&](auto &h, int p, Real x0, Real y0, Real z0) {
+      Real ce = std::cos(kx*x0), se = std::sin(kx*x0);
+      Real cz = std::cos(kz*z0), sz = std::sin(kz*z0);
+      h(IPX,p) = x0 - (Apr/(kx*rhop0))*se*cz;
+      h(IPY,p) = y0;
+      h(IPZ,p) = z0;
+      h(IPX1,p) = h(IPX,p); h(IPY1,p) = y0; h(IPZ1,p) = z0;
+      h(IPVX,p) = vnx + (Vxr*ce - Vxi*se)*cz;
+      h(IPVY,p) = vnp + (Vpr*ce - Vpi*se)*cz;   // azimuthal
+      h(IPVZ,p) =     - (Vzr*se + Vzi*ce)*sz;   // vertical
+      h(IPVX1,p) = h(IPVX,p); h(IPVY1,p) = h(IPVY,p); h(IPVZ1,p) = h(IPVZ,p);
+    };
+    auto &mblev = pmbp->pmb->mb_lev;
+    std::vector<int> first(nmb3 + 1, 0), nr1(nmb3), nr2(nmb3), nr3(nmb3);
+    for (int m=0; m<nmb3; ++m) {
+      const int ratio = 1 << (mblev.h_view(m) - pmy_mesh_->root_level);
+      if ((ind3.nx1 % ratio) != 0 || (ind3.nx2 % ratio) != 0 || (ind3.nx3 % ratio) != 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "refinable_cloud lattice requires MeshBlocks that contain whole root cells"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      nr1[m] = ind3.nx1/ratio; nr2[m] = ind3.nx2/ratio; nr3[m] = ind3.nx3/ratio;
+      first[m+1] = first[m] + ppc_int*nr1[m]*nr2[m]*nr3[m];
+    }
+    const int nlattice = first[nmb3];
+    Kokkos::realloc(pr, ppar->nrdata, nlattice);
+    Kokkos::realloc(pi, ppar->nidata, nlattice);
+    auto hr = Kokkos::create_mirror_view(pr);
+    auto hi = Kokkos::create_mirror_view(pi);
+    const Real taus0 = taus;
+    for (int m=0; m<nmb3; ++m) {
+      const auto &size = msz3.h_view(m);
+      for (int q=0; q<first[m+1]-first[m]; ++q) {
+        const int p = first[m] + q;
+        const int c = q/ppc_int, sub = q - c*ppc_int;
+        const int ip = sub % npar1d, kp = sub/npar1d;
+        const int i = c % nr1[m], j = (c/nr1[m]) % nr2[m], kk = c/(nr1[m]*nr2[m]);
+        const Real x0 = size.x1min + (i + lshift + (ip + 0.5)/static_cast<Real>(npar1d))*hx;
+        const Real y0 = size.x2min + (j + 0.5)*hy;
+        const Real z0 = size.x3min + (kk + lshiftz + (kp + 0.5)/static_cast<Real>(npar1d))*hz;
+        hi(PGID,p) = pmbp->gids + m;
+        hi(PTAG,p) = p*global_variable::nranks + global_variable::my_rank;   // unique over ranks
+        hi(PSP,p) = 0;
+        hi(PLEV,p) = 0;
+        for (int col=0; col<ppar->nrdata; ++col) hr(col,p) = 0.0;
+        hr(IPTS,p) = taus0;
+        hr(IPM,p) = eps*rho0*hx*hy*hz/ppc_int;
+        if (seed_after) {
+          hr(IPX,p) = x0; hr(IPY,p) = y0; hr(IPZ,p) = z0;
+          hr(IPX1,p) = x0; hr(IPY1,p) = y0; hr(IPZ1,p) = z0;
+          hr(IPVX,p) = vnx; hr(IPVY,p) = vnp;
+          hr(IPVX1,p) = vnx; hr(IPVY1,p) = vnp;
+        } else {
+          imprint(hr, p, x0, y0, z0);
+        }
+      }
+    }
+    Kokkos::deep_copy(pr, hr);
+    Kokkos::deep_copy(pi, hi);
+    ppar->nprtcl_thispack = nlattice;
+    pmy_mesh_->nprtcl_thisrank = nlattice;
+    pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = nlattice;
+    pmy_mesh_->nprtcl_total = nlattice;
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      MPI_Allgather(&nlattice, 1, MPI_INT, pmy_mesh_->nprtcl_eachrank, 1, MPI_INT, MPI_COMM_WORLD);
+      int tot = 0;
+      for (int r=0; r<global_variable::nranks; ++r) tot += pmy_mesh_->nprtcl_eachrank[r];
+      pmy_mesh_->nprtcl_total = tot;
+    }
+#endif
+    pmbp->pdust->EnsureNextTag();
+    pmbp->pdust->SplitToLeaves();
+    if (seed_after) {
+      auto h2 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_rdata);
+      auto i2 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_idata);
+      const auto &msz = pmy_mesh_->mesh_size;
+      const Real len1 = msz.x1max - msz.x1min, len3 = msz.x3max - msz.x3min;
+      for (int p=0; p<ppar->nprtcl_thispack; ++p) {
+        imprint(h2, p, h2(IPX,p), h2(IPY,p), h2(IPZ,p));
+        Real x = h2(IPX,p), y = h2(IPY,p), z = h2(IPZ,p);
+        if (x < msz.x1min) x += len1;
+        if (x >= msz.x1max) x -= len1;
+        if (z < msz.x3min) z += len3;
+        if (z >= msz.x3max) z -= len3;
+        h2(IPX,p) = x; h2(IPX1,p) = x; h2(IPZ,p) = z; h2(IPZ1,p) = z;
+        // several ranks: the block (and rank) from the position below (RouteToOwnerBlocks)
+        if (global_variable::nranks > 1) continue;
+        int owner = -1;
+        for (int m=0; m<nmb3 && owner<0; ++m) {
+          const auto &size = msz3.h_view(m);
+          if (x >= size.x1min && x < size.x1max && y >= size.x2min && y < size.x2max &&
+              z >= size.x3min && z < size.x3max) owner = m;
+        }
+        if (owner < 0) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "seed_after_split: particle outside every MeshBlock"
+                    << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        i2(PGID,p) = pmbp->gids + owner;
+      }
+      Kokkos::deep_copy(ppar->prtcl_rdata, h2);
+      Kokkos::deep_copy(ppar->prtcl_idata, i2);
+      if (global_variable::nranks > 1) pmbp->pdust->ResetPGIDFromPositions("seed_after_split");
+    }
+    long long nroot = nlattice, nsplit = ppar->nprtcl_thispack;
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &nroot, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &nsplit, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+#endif
+    if (global_variable::my_rank == 0) {
+      std::cout << "# refinable_cloud lattice (3-D): " << nroot << " root clouds -> "
+                << nsplit << " particles after the initial split"
+                << (seed_after ? ", seed imprinted after the split" : "") << std::endl;
+    }
+    const Real vmax3 = std::max({fabs(vnx), fabs(vnp), 1.0e-30});
+    ppar->dtnew = std::min({msz3.h_view(0).dx1, msz3.h_view(0).dx2, msz3.h_view(0).dx3})/vmax3;
+    return;
   }
 
   // initialize gas: NSH background + eigenmode at t=0
@@ -899,6 +1091,95 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
     if (due) WriteStreamingSnapshot(pm);
   }
   return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void StreamingLinearHistory3D()
+//! \brief StreamingLinearHistory in 3-D (the mode in x1-x3; x3 = vertical): the same
+//! projections, summed over x2; the cloud's Fourier factor along x1 and x3 (lobes 1 and 3), its
+//! x2 shape integrates out (k_y = 0).
+
+void StreamingLinearHistory3D(HistoryData *pdata, Mesh *pm) {
+  MeshBlockPack *pmbp = pm->pmb_pack;
+  particles::Particles *ppar = pmbp->ppart;
+  pdata->nhist = 6;
+  pdata->label[0] = "rhop_re";
+  pdata->label[1] = "rhop_im";
+  pdata->label[2] = "rhog_re";
+  pdata->label[3] = "rhog_im";
+  pdata->label[4] = "mgx_re";
+  pdata->label[5] = "mgx_im";
+  const Real kx = kx_, kz = kz_, rho0 = rho0_;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  const int npart = ppar->nprtcl_thispack;
+  const Real hx = cloud_root_dx1_, hz = cloud_root_dx2_;
+  Real pre = 0.0, pim = 0.0;
+  Kokkos::parallel_reduce("stream_hp3d",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
+  KOKKOS_LAMBDA(const int &p, Real &re_, Real &im_) {
+    using T = SMRCompositeTransfer;
+    const int code = pi(PLEV,p);
+    const Real scale = 1.0/static_cast<Real>(1 << T::CloudLevel(code));
+    const Real ax = 0.5*kx*hx*scale, az = 0.5*kz*hz*scale;
+    const Real sx = (ax == 0.0) ? 1.0 : sin(ax)/ax;
+    const Real sz = (az == 0.0) ? 1.0 : sin(az)/az;
+    const int l1 = T::CloudLobe1(code), l3 = T::CloudLobe3(code);
+    const Real x = pr(IPX,p), z = pr(IPZ,p);
+    Real w = pr(IPM,p)*cos(kz*z);
+    if (l3 == 3) {
+      const Real d = hz*scale;
+      w = pr(IPM,p)*(0.5*cos(kz*z) + 0.25*cos(kz*(z - d)) + 0.25*cos(kz*(z + d)));
+    } else if (l3) {
+      const Real d = ((l3 == 1) ? -hz : hz)*scale;
+      w = pr(IPM,p)*((2.0/3.0)*cos(kz*z) + (1.0/3.0)*cos(kz*(z + d)));
+    }
+    Real cxr = cos(kx*x), cxi = sin(kx*x);
+    if (l1 == 3) {
+      const Real d = hx*scale;
+      cxr = 0.5*cos(kx*x) + 0.25*cos(kx*(x - d)) + 0.25*cos(kx*(x + d));
+      cxi = 0.5*sin(kx*x) + 0.25*sin(kx*(x - d)) + 0.25*sin(kx*(x + d));
+    } else if (l1) {
+      const Real d = ((l1 == 1) ? -hx : hx)*scale;
+      cxr = (2.0/3.0)*cos(kx*x) + (1.0/3.0)*cos(kx*(x + d));
+      cxi = (2.0/3.0)*sin(kx*x) + (1.0/3.0)*sin(kx*(x + d));
+    }
+    w *= SQR(sx)*SQR(sz);
+    re_ += w*cxr;
+    im_ -= w*cxi;
+  }, Kokkos::Sum<Real>(pre), Kokkos::Sum<Real>(pim));
+  pdata->hdata[0] = pre;
+  pdata->hdata[1] = pim;
+  auto &indcs = pm->mb_indcs;
+  const int is = indcs.is, js = indcs.js, ks = indcs.ks;
+  const int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
+  const int nkji = nx3*nx2*nx1, nji = nx2*nx1;
+  const int nmkji = pmbp->nmb_thispack*nkji;
+  auto &u0 = pmbp->phydro->u0;
+  auto &mbsize = pmbp->pmb->mb_size;
+  Real gre = 0.0, gim = 0.0, mre = 0.0, mim = 0.0;
+  Kokkos::parallel_reduce("stream_hg3d",Kokkos::RangePolicy<>(DevExeSpace(),0,nmkji),
+  KOKKOS_LAMBDA(const int &idx, Real &gr_, Real &gi_, Real &mr_, Real &mi_) {
+    const int m = idx/nkji;
+    int k = (idx - m*nkji)/nji;
+    int j = (idx - m*nkji - k*nji)/nx1;
+    const int i = (idx - m*nkji - k*nji - j*nx1) + is;
+    k += ks;
+    j += js;
+    const Real x = CellCenterX(i-is, nx1, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max);
+    const Real z = CellCenterX(k-ks, nx3, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max);
+    const Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2*mbsize.d_view(m).dx3;
+    const Real wc = vol*cos(kz*z);
+    const Real drho = u0(m,IDN,k,j,i) - rho0;
+    gr_ += drho*wc*cos(kx*x);
+    gi_ -= drho*wc*sin(kx*x);
+    mr_ += u0(m,IM1,k,j,i)*wc*cos(kx*x);
+    mi_ -= u0(m,IM1,k,j,i)*wc*sin(kx*x);
+  }, Kokkos::Sum<Real>(gre), Kokkos::Sum<Real>(gim),
+     Kokkos::Sum<Real>(mre), Kokkos::Sum<Real>(mim));
+  pdata->hdata[2] = gre;
+  pdata->hdata[3] = gim;
+  pdata->hdata[4] = mre;
+  pdata->hdata[5] = mim;
 }
 
 //----------------------------------------------------------------------------------------

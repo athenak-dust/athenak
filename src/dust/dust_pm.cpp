@@ -142,6 +142,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         // The gas velocity of every cell (ghosts included) is formed once; the gather then
         // reads velocities, as the advance does with u*, instead of dividing five momenta
         // by five densities in each of the cloud's cells.
+        if (clouds3d) {CloudPredictor3D(rate_dep); return TaskStatus::complete;}
         PackGasGather(uold);
         auto gp = gpack;
         // (a split into gather + deposit kernels and a shared-memory weight
