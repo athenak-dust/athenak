@@ -53,6 +53,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -66,6 +67,7 @@
 #include "driver/driver.hpp"
 #include "particles/particles.hpp"
 #include "hydro/hydro.hpp"
+#include "shearing_box/shearing_box.hpp"
 #include "dust.hpp"
 
 namespace dust {
@@ -76,6 +78,7 @@ namespace {
 struct SchedPatch {
   Real t0, t1;                          // wanted for t0 <= t < t1
   Real x1min, x1max, x2min, x2max;      // blocks whose centre lies inside
+  Real x3min = -1.0e300, x3max = 1.0e300;   // 3-D: also in x3 (default: all)
   int level;                            // levels above the root
 };
 std::vector<SchedPatch> sched_;
@@ -146,6 +149,8 @@ int SetupScheduledRefinement(ParameterInput *pin) {
     s.x2min = pin->GetReal("dust", b + "x2min");
     s.x2max = pin->GetReal("dust", b + "x2max");
     s.level = pin->GetOrAddInteger("dust", b + "level", 1);
+    if (pin->DoesParameterExist("dust", b + "x3min")) s.x3min = pin->GetReal("dust", b + "x3min");
+    if (pin->DoesParameterExist("dust", b + "x3max")) s.x3max = pin->GetReal("dust", b + "x3max");
     sched_.push_back(s);
   }
   return n;
@@ -171,10 +176,11 @@ void ScheduledRefinement(MeshBlockPack *pmbp) {
     const auto &sz = size.h_view(m);
     const Real xc = sz.x1min + 0.5*indcs.nx1*sz.dx1;
     const Real yc = sz.x2min + 0.5*indcs.nx2*sz.dx2;
+    const Real zc = sz.x3min + 0.5*indcs.nx3*sz.dx3;
     int want = 0;
     for (const auto &s : sched_) {
       if (pm->time >= s.t0 && pm->time < s.t1 && xc > s.x1min && xc < s.x1max &&
-          yc > s.x2min && yc < s.x2max) {
+          yc > s.x2min && yc < s.x2max && zc > s.x3min && zc < s.x3max) {
         want = std::max(want, s.level);
       }
     }
@@ -898,6 +904,173 @@ int DustGasDrag::RouteToOwnerBlocks(const char *when) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::DepositRemapTest
+//! \brief The particle mass density deposited with <dust>/deposit on each particle's
+//! own block, ghost cells included, then remapped by the general deposit exchange with the shear
+//! offset of time t_test.  Writes, per rank, deptest_<tag>_r<rank>.bin: int nmb nx1 nx2 nx3, then
+//! per block int gid level lx1 lx2 lx3 and the active cells (double, k j i).  Prints the mass on
+//! the active cells and the particle mass (sums over the ranks).
+
+void DustGasDrag::DepositRemapTest(const Real t_test, const std::string &tag) {
+  Mesh *pm = pmy_pack->pmesh;
+  if (dep_plan == nullptr || !pm->three_d) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "deposit test: needs the general 3-D deposit remap" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  auto &indcs = pm->mb_indcs;
+  const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
+  const int nc1 = indcs.nx1 + 2*indcs.ng, nc2 = indcs.nx2 + 2*indcs.ng;
+  const int nc3 = indcs.nx3 + 2*indcs.ng;
+  const int is = indcs.is, js = indcs.js, ks = indcs.ks;
+  const int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
+  DvceArray5D<Real> a("dust_deptest", std::max(1, nmb), 1, nc3, nc2, nc1);
+  auto pr = pmy_pack->ppart->prtcl_rdata;
+  auto pi = pmy_pack->ppart->prtcl_idata;
+  const int npart = pmy_pack->ppart->nprtcl_thispack;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  const int scheme = static_cast<int>(deposit);
+  double mp = 0.0;
+  if (npart > 0) {
+    Kokkos::parallel_reduce("dust_deptest_dep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, double &msum) {
+      const int m = pi(PGID,p) - gids;
+      int ip, jp, kp;
+      Real wx[3], wy[3], wz[3];
+      PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is, scheme, ip, wx);
+      PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js, scheme, jp, wy);
+      PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks, scheme, kp, wz);
+      const Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2*mbsize.d_view(m).dx3;
+      const Real f = pr(IPM,p)/vol;
+      for (int c=0; c<3; ++c) for (int b=0; b<3; ++b) for (int q=0; q<3; ++q) {
+        const Real w = wz[c]*wy[b]*wx[q]*f;
+        if (w != 0.0) Kokkos::atomic_add(&a(m,0,kp+c-1,jp+b-1,ip+q-1), w);
+      }
+      msum += static_cast<double>(pr(IPM,p));
+    }, Kokkos::Sum<double>(mp));
+  }
+  dep_plan->UpdateShear(t_test);
+  pbval_dm->InitRecvDep(1);
+  pbval_dm->PackAndSendDeposit(a);
+  while (pbval_dm->RecvAndSumDeposit(a) != TaskStatus::complete) {}
+  pbval_dm->ClearSendDep();
+  pbval_dm->ClearRecvDep();
+  dep_plan->shear_time = -1.0;   // the next stage builds its own shear part
+  auto ah = Kokkos::create_mirror_view_and_copy(HostMemSpace(), a);
+  double mg = 0.0;
+  std::string fn = "deptest_" + tag + "_r" + std::to_string(global_variable::my_rank) + ".bin";
+  std::FILE *fp = std::fopen(fn.c_str(), "wb");
+  int hdr[4] = {nmb, nx1, nx2, nx3};
+  std::fwrite(hdr, sizeof(int), 4, fp);
+  std::vector<double> buf(static_cast<std::size_t>(nx1)*nx2*nx3);
+  for (int m=0; m<nmb; ++m) {
+    const LogicalLocation &ll = pm->lloc_eachmb[gids + m];
+    int bh[5] = {gids + m, ll.level, ll.lx1, ll.lx2, ll.lx3};
+    std::fwrite(bh, sizeof(int), 5, fp);
+    const auto &sz = mbsize.h_view(m);
+    const double vol = sz.dx1*sz.dx2*sz.dx3;
+    std::size_t q = 0;
+    for (int k=0; k<nx3; ++k) for (int j=0; j<nx2; ++j) for (int i=0; i<nx1; ++i) {
+      buf[q++] = ah(m,0,k+ks,j+js,i+is);
+      mg += ah(m,0,k+ks,j+js,i+is)*vol;
+    }
+    std::fwrite(buf.data(), sizeof(double), buf.size(), fp);
+  }
+  std::fclose(fp);
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &mg, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &mp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  if (global_variable::my_rank == 0) {
+    std::cout << std::setprecision(17) << "# deposit test " << tag << ": t_test=" << t_test
+              << " mass on the active cells " << mg << " particle mass " << mp
+              << " relative difference " << (mg - mp)/mp << std::endl;
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::RouteOO3D
+//! \brief 3-D owner_overlap after a regrid: every particle's new block from its old
+//! block (PGID still holds the old id) and the octant of its position in the old block
+//! (RegridCosts), and the particles of blocks now on other ranks through the AthenaK particle
+//! exchange.  Returns how many particles were sent.
+
+int DustGasDrag::RouteOO3D() {
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto *pb = ppar->pbval_part;
+  Mesh *pm = pmy_pack->pmesh;
+  const int npart = ppar->nprtcl_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  auto ngid = oo_newgid;
+  auto ctr = oo_oldctr;
+  const int me = global_variable::my_rank;
+  DvceArray1D<int> rank_d("dust_oo_ranks", std::max(1, pm->nmb_total));
+  {
+    auto rh = Kokkos::create_mirror_view(rank_d);
+    for (int g=0; g<pm->nmb_total; ++g) rh(g) = pm->rank_eachmb[g];
+    Kokkos::deep_copy(rank_d, rh);
+  }
+  int nbad = 0;
+#if MPI_PARALLEL_ENABLED
+  if (pb->sendlist.extent_int(0) < std::max(npart, 1)) {
+    Kokkos::realloc(pb->sendlist, std::max(npart, 1));
+  }
+  Kokkos::deep_copy(pb->send_count.d_view, 0);
+  auto psendl = pb->sendlist.d_view;
+  int *pcounter = pb->send_count.d_view.data();
+#endif
+  if (npart > 0) {
+    Kokkos::parallel_reduce("dust_oo_route3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &bad) {
+      const int o = pi(PGID,p);
+      if (o < 0 || o >= ngid.extent_int(0)) {++bad; return;}
+      const int b = ((pr(IPZ,p) >= ctr(o,2)) ? 4 : 0) | ((pr(IPY,p) >= ctr(o,1)) ? 2 : 0) |
+                    ((pr(IPX,p) >= ctr(o,0)) ? 1 : 0);
+      const int n = ngid(o,b);
+      if (n < 0) {++bad; return;}
+      pi(PGID,p) = n;
+#if MPI_PARALLEL_ENABLED
+      if (rank_d(n) != me) {
+        const int k = Kokkos::atomic_fetch_add(pcounter, 1);
+        psendl(k).prtcl_indx = p;
+        psendl(k).dest_gid = n;
+        psendl(k).dest_rank = rank_d(n);
+      }
+#endif
+    }, Kokkos::Sum<int>(nbad));
+  }
+  if (nbad > 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << nbad << " particles without a new MeshBlock after the regrid" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  int nsent = 0;
+#if MPI_PARALLEL_ENABLED
+  Kokkos::deep_copy(pb->send_count.h_view, pb->send_count.d_view);
+  pb->nprtcl_send = pb->send_count.h_view(0);
+  if (pb->nprtcl_send > 0) {
+    auto d = Kokkos::subview(pb->sendlist.d_view, std::make_pair(0, pb->nprtcl_send));
+    auto h = Kokkos::subview(pb->sendlist.h_view, std::make_pair(0, pb->nprtcl_send));
+    Kokkos::deep_copy(h, d);
+  }
+  nsent = pb->nprtcl_send;
+  if (global_variable::nranks > 1) {
+    pb->CountSendsAndRecvs();
+    pb->InitPrtclRecv();
+    pb->PackAndSendPrtcls();
+    while (pb->RecvAndUnpackPrtcls() != TaskStatus::complete) {}
+    pb->ClearPrtclSend();
+    pb->ClearPrtclRecv();
+    long long tot = 0;
+    for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
+    pm->nprtcl_total = static_cast<int>(tot);
+  }
+#endif
+  return nsent;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::BeforeRegrid
 //! \brief Called by MeshRefinement::AdaptiveMeshRefinement before the mesh changes: the
 //! particle count and checksum that RebuildAfterRegrid must find again.
@@ -972,6 +1145,40 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
 void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_lloc,
                               const int new_nmb, float *cost) {
   Mesh *pm = pmy_pack->pmesh;
+  // 3-D owner_overlap: the new block of every old block by the octant of a position
+  if (smr_transfer_mode == DustSMRTransfer::owner_overlap && pm->three_d) {
+    const int old_nmb = pm->nmb_total;
+    oo_newgid = DvceArray2D<int>("dust_oo_newgid", std::max(1, old_nmb), 8);
+    oo_oldctr = DvceArray2D<Real>("dust_oo_oldctr", std::max(1, old_nmb), 3);
+    auto ng = Kokkos::create_mirror_view(oo_newgid);
+    auto ct = Kokkos::create_mirror_view(oo_oldctr);
+    Kokkos::deep_copy(ng, -1);
+    const auto &ms = pm->mesh_size;
+    for (int o=0; o<old_nmb; ++o) {
+      const LogicalLocation &ll = pm->lloc_eachmb[o];
+      const int sh = ll.level - pm->root_level;
+      ct(o,0) = ms.x1min + (ll.lx1 + 0.5)*(ms.x1max - ms.x1min)/(pm->nmb_rootx1 << sh);
+      ct(o,1) = ms.x2min + (ll.lx2 + 0.5)*(ms.x2max - ms.x2min)/(pm->nmb_rootx2 << sh);
+      ct(o,2) = ms.x3min + (ll.lx3 + 0.5)*(ms.x3max - ms.x3min)/(pm->nmb_rootx3 << sh);
+    }
+    for (int n=0; n<new_nmb; ++n) {
+      const int o = newtoold[n];
+      const LogicalLocation &lo = pm->lloc_eachmb[o], &ln = new_lloc[n];
+      if (ln.level > lo.level) {        // a child of the refined block o
+        const int b = ((ln.lx3 & 1) << 2) | ((ln.lx2 & 1) << 1) | (ln.lx1 & 1);
+        ng(o,b) = n;
+      } else if (ln.level == lo.level) {
+        for (int b=0; b<8; ++b) ng(o,b) = n;
+      } else {                          // the parent of the derefined blocks o .. o+7
+        for (int c=0; c<8 && o + c < old_nmb; ++c) {
+          if (pm->lloc_eachmb[o + c].level != lo.level) break;
+          for (int b=0; b<8; ++b) ng(o + c,b) = n;
+        }
+      }
+    }
+    Kokkos::deep_copy(oo_newgid, ng);
+    Kokkos::deep_copy(oo_oldctr, ct);
+  }
   if (lb_cloud_weight <= 0.0 || lb_old_counts.empty()) return;
   const int nleaf = pm->three_d ? 8 : (pm->two_d ? 4 : 2);
   std::vector<double> c(new_nmb, 0.0);
@@ -1014,7 +1221,24 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   double msum = 0.0;
   const int nmb = pmy_pack->nmb_thispack;
   int npart = ppar->nprtcl_thispack;
-  if (oo) {
+  if (oo && pmesh->three_d) {
+    // 3-D: the particles to their new blocks and ranks; the deposit remap, the shear
+    // maps of the particles and the u* shear lists of the new mesh
+    RouteOO3D();
+    npart = ppar->nprtcl_thispack;
+    if (dep_plan != nullptr) dep_plan->BuildStatic();
+    if (ppar->pbval_part->shear_periodic_x1) ppar->pbval_part->BuildShearMaps();
+    if (psbox_us != nullptr) {
+      psbox_us->BuildBoundaryLists();
+      psbox_us->AllocateBuffers();
+    }
+    auto pr = ppar->prtcl_rdata;
+    if (npart > 0) {
+      Kokkos::parallel_reduce("dust_oo_regrid_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p, double &ms) {ms += static_cast<double>(pr(IPM,p));},
+      Kokkos::Sum<double>(msum));
+    }
+  } else if (oo) {
     // The old owner_overlap path: point particles, nothing to split or merge; the boxes,
     // the block table, the deposit remaps and the block of every particle on the new mesh
     BuildOwnerOverlapMesh(true);

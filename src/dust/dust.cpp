@@ -131,13 +131,22 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     // host wait for the device several times per cycle
     ProfOn() = pin->GetOrAddBoolean("dust", "amr_profile", false);
     const bool ranks_ok = (global_variable::nranks == 1) || experimental_mpi;
-    if (!(experimental_smr && (!(pmy_pack->pmesh->adaptive) || experimental_amr) &&
-          pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic && ranks_ok)) {
+    // S3a: 3-D with the owner_overlap transfer (point particles, TSC on the
+    // own block, ghost deposits remapped by DepRemapPlan), periodic or 3-D shearing box
+    const bool oo3d = pmy_pack->pmesh->three_d &&
+        pin->DoesParameterExist("dust", "experimental_smr_transfer") &&
+        pin->GetString("dust", "experimental_smr_transfer") == "owner_overlap";
+    const bool sh3 = pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] ==
+                     BoundaryFlag::shear_periodic;
+    if (!(experimental_smr && (!(pmy_pack->pmesh->adaptive) || experimental_amr) && ranks_ok &&
+          ((pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic) ||
+           (oo3d && (pmy_pack->pmesh->strictly_periodic || sh3))))) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Dust drag does not support SMR/AMR. The current "
                 << "experimental exception requires explicit opt-in, static 2-D SMR, "
                 << "ordinary periodic boundaries, and one MPI rank (several ranks: "
-                << "<dust>/experimental_mpi)" << std::endl;
+                << "<dust>/experimental_mpi); or 3-D with experimental_smr_transfer = "
+                << "owner_overlap (periodic or shearing box)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
@@ -151,14 +160,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                 << "directions (or shear-periodic x1 in 3D)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    if (global_variable::my_rank == 0) {
-      std::cout << "# WARNING (dust): shear-periodic x1 boundaries active. The "
-                << "conservative azimuthal remap of ghost DEPOSITS across the radial "
-                << "boundaries is not yet implemented (deposits are exchanged with the "
-                << "plain-periodic pattern, exact only for azimuthally uniform states "
-                << "such as the NSH drift equilibrium). The u* ghost fill IS remapped."
-                << std::endl;
-    }
+    // S3a: the ghost deposits across the shear-periodic faces are moved
+    // to the opposite face with the shear offset (DepRemapPlan); the u* ghost fill is remapped
   }
   if (pmy_pack->pmesh->mb_indcs.ng < 2) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -975,8 +978,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     std::exit(EXIT_FAILURE);
   }
   // The old owner_overlap transfer also runs on a dynamic mesh (one rank)
+  // In 3-D also on several ranks (the general deposit remap)
   if (pmy_pack->pmesh->adaptive && smr_transfer_mode != DustSMRTransfer::refinable_cloud &&
-      !(smr_transfer_mode == DustSMRTransfer::owner_overlap && global_variable::nranks == 1)) {
+      !(smr_transfer_mode == DustSMRTransfer::owner_overlap &&
+        (global_variable::nranks == 1 || pmy_pack->pmesh->three_d))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "<dust>/experimental_amr requires experimental_smr_transfer = "
               << "refinable_cloud (or owner_overlap on one rank)" << std::endl;
@@ -1050,10 +1055,42 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // shear-periodic remap of the u* radial ghost zones (3D shearing box only)
   if (shear_x1 && pmy_pack->pmesh->three_d) {
     psbox_us = new ShearingBoxCC(pmy_pack, pin, 3);
+    // With refinement also the coarse u* array (cdummy), before its prolongation
+    if (pmy_pack->pmesh->multilevel) {
+      psbox_us->coarse_on = true;
+      psbox_us->AllocateBuffers();
+    }
+  }
+  // S3a: in 3-D with refinement or with shear-periodic x1 faces the ghost
+  // deposits go through the general remap (any levels, several ranks, the shear offset)
+  // (<dust>/test_general_deposit: also on a uniform periodic 3-D mesh; a test control)
+  if (pmy_pack->pmesh->three_d && (pmy_pack->pmesh->multilevel || shear_x1 ||
+                                   pin->GetOrAddBoolean("dust", "test_general_deposit", false))) {
+    if (drag_solver != DustDragSolver::local ||
+        !(smr_transfer_mode == DustSMRTransfer::owner_overlap ||
+          smr_transfer_mode == DustSMRTransfer::none)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "3-D dust with refinement or a shearing box: drag_solver = local and "
+                << "experimental_smr_transfer = owner_overlap (none on a uniform mesh)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const auto &id = pmy_pack->pmesh->mb_indcs;
+    if (pmy_pack->pmesh->multilevel &&
+        (id.nx1 < 2*id.ng || id.nx2 < 2*id.ng || id.nx3 < 2*id.ng)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "3-D dust with refinement: MeshBlocks need at least 2*nghost cells in each "
+                << "direction (the ghost zone of a coarser block reaches 2*nghost finer cells)"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    dep_plan = new DepRemapPlan(pmy_pack, shear_x1, qshear, omega0);
+    pbval_qp->SetGeneralPlan(dep_plan);
+    pbval_dm->SetGeneralPlan(dep_plan);
   }
   // owner_overlap on a dynamic mesh: the block boxes and the block table of the
-  // initial mesh (the exchanges above built their remaps)
-  if (pmy_pack->pmesh->adaptive && smr_transfer_mode == DustSMRTransfer::owner_overlap) {
+  // initial mesh (the exchanges above built their remaps); 2-D only
+  if (pmy_pack->pmesh->adaptive && smr_transfer_mode == DustSMRTransfer::owner_overlap &&
+      !pmy_pack->pmesh->three_d) {
     BuildOwnerOverlapMesh(false);
   }
 }

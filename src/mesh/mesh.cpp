@@ -189,11 +189,16 @@ Mesh::Mesh(ParameterInput *pin) :
   // MeshRefinement::CheckForRefinement); hydro only for now (no MHD, dust or particles)
   const bool sbox_smr = multilevel && pin->DoesBlockExist("shearing_box") && three_d &&
       pin->GetOrAddBoolean("shearing_box", "experimental_smr", false);
-  if (sbox_smr && (pin->DoesBlockExist("mhd") || pin->DoesBlockExist("dust") ||
-                   pin->DoesBlockExist("particles"))) {
+  // S3a: dust particles with the owner_overlap transfer (the dust
+  // module checks the rest); no MHD, no other particles
+  const bool sbox_dust_oo = pin->DoesParameterExist("dust", "experimental_smr_transfer") &&
+      pin->GetString("dust", "experimental_smr_transfer") == "owner_overlap";
+  if (sbox_smr && (pin->DoesBlockExist("mhd") ||
+                   ((pin->DoesBlockExist("dust") || pin->DoesBlockExist("particles")) &&
+                    !sbox_dust_oo))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<shearing_box>/experimental_smr: hydro only for now (no MHD, dust or "
-              << "particles)" << std::endl;
+              << "<shearing_box>/experimental_smr: hydro, or dust with experimental_smr_transfer "
+              << "= owner_overlap (no MHD, no other particles)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (sbox_smr && global_variable::my_rank == 0) {
