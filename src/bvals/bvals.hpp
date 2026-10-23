@@ -280,6 +280,11 @@ struct DepRemapMap {
   DvceArray1D<int> send_cell;  // local source cells packed for the other ranks (by rank)
   std::vector<int> send_rank, send_off, send_cnt;   // per peer rank: offset, count (entries)
   std::vector<int> recv_rank, recv_off, recv_cnt;
+  // Ghost cells beyond a physical x3 face that are dropped (x3 mode drop): local
+  // source cells and their volumes, for the record of the dropped deposits
+  int ndrop = 0;
+  DvceArray1D<int> drop_cell;
+  DvceArray1D<Real> drop_vol;
 };
 
 //----------------------------------------------------------------------------------------
@@ -294,7 +299,9 @@ struct DepRemapMap {
 
 class DepRemapPlan {
  public:
-  DepRemapPlan(MeshBlockPack *pp, bool shear_x1, Real qshear, Real omega0);
+  // x3mode (a 3-D mesh with physical x3 faces): 0 periodic x3, 1 the ghost cells beyond
+  // a physical x3 face fold back onto their mirror cells, 2 they are dropped (and recorded)
+  DepRemapPlan(MeshBlockPack *pp, bool shear_x1, Real qshear, Real omega0, int x3mode = 0);
   void BuildStatic();              // after construction and after every regrid
   void UpdateShear(Real time);     // the shear part for the offset at time (no-op without shear)
   bool Shear() const {return shear_x1_;}
@@ -307,6 +314,7 @@ class DepRemapPlan {
  private:
   MeshBlockPack *pmy_pack;
   bool shear_x1_;
+  int x3mode_ = 0;
   Real qshear_, omega0_;
   std::vector<int> face_gids_[2];  // blocks at the inner / outer x1 face (all ranks)
 };
@@ -327,6 +335,8 @@ class MeshBoundaryValuesDep : public MeshBoundaryValues {
   void GeneralPack(DvceArray5D<Real> &a, const DepRemapMap &map, DvceArray1D<Real> &buf);
   void GeneralApply(DvceArray5D<Real> &a, const DepRemapMap &map,
                     const DvceArray1D<Real> &buf);
+  void GeneralDropRecord(DvceArray5D<Real> &a, const DepRemapMap &map);
+  std::vector<double> dropped_sum;   // dropped deposits, integrated, per variable
 
   //functions
   void InitSendIndices(MeshBoundaryBuffer &b,int o1,int o2,int o3,int f1,int f2) override;
@@ -444,6 +454,12 @@ class ParticlesBoundaryValues {
   DualArray3D<int> sgid_map;           // destination GID:  (side, lx3, lx2)
   DualArray3D<int> srank_map;          // destination rank: (side, lx3, lx2)
   void BuildShearMaps();               // also after every regrid
+  // Dust particles at the physical x3 faces of a 3-D mesh (S3c): 0 periodic,
+  // 1 reflect (mirror position and velocity), 2 outflow (the particle leaves: mass and count added
+  // to x3_removed, mass set to 0, parked at rest in its block; DustGasDrag removes it at the start
+  // of the next cycle)
+  int x3bc_dust = 0;
+  DualArray1D<Real> x3_removed;        // (mass, count) since the last removal
 
   // Data needed to count number of messages and particles to send between ranks
   int nsends; // number of MPI sends to neighboring ranks on this rank
