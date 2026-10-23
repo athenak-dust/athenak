@@ -2701,9 +2701,9 @@ int DustGasDrag::MergeCloudsDevice3D() {
           for (int jb=0; jb<n2; ++jb) {
             for (int ja=0; ja<n1; ++ja) {
               const int s = s0 + k;
-              const Real cx = T::WrapPosition(pr(IPX,p) + a[ja].off*e1, lt.x1min, lt.x1max);
-              const Real cy = T::WrapPosition(pr(IPY,p) + b[jb].off*e2, lt.x2min, lt.x2max);
-              const Real cz = T::WrapPosition(pr(IPZ,p) + cc[jc].off*e3, lt.x3min, lt.x3max);
+              Real cx = pr(IPX,p) + a[ja].off*e1, cy = pr(IPY,p) + b[jb].off*e2;
+              Real cz = pr(IPZ,p) + cc[jc].off*e3;
+              lt.WrapPos(cx, cy, cz);   // (shear-periodic x1)
               for (int c=0; c<nrdata; ++c) prn(c,s) = pr(c,p);
               for (int c=0; c<nidata; ++c) pin(c,s) = pi(c,p);
               prn(IPX,s) = cx; prn(IPX1,s) = cx; prn(IPY,s) = cy; prn(IPY1,s) = cy;
@@ -2767,12 +2767,10 @@ int DustGasDrag::MergeCloudsDevice3D() {
       const Real den = Kokkos::fmax(rho, rfloor);
       Real s = 0.0;
       for (int d=0; d<6; ++d) {
-        const Real x = T::WrapPosition(xc + ((d == 0) ? dx : ((d == 1) ? -dx : 0.0)),
-                                       lt.x1min, lt.x1max);
-        const Real y = T::WrapPosition(yc + ((d == 2) ? dy : ((d == 3) ? -dy : 0.0)),
-                                       lt.x2min, lt.x2max);
-        const Real z = T::WrapPosition(zc + ((d == 4) ? dz : ((d == 5) ? -dz : 0.0)),
-                                       lt.x3min, lt.x3max);
+        Real x = xc + ((d == 0) ? dx : ((d == 1) ? -dx : 0.0));
+        Real y = yc + ((d == 2) ? dy : ((d == 3) ? -dy : 0.0));
+        Real z = zc + ((d == 4) ? dz : ((d == 5) ? -dz : 0.0));
+        lt.WrapPos(x, y, z);
         const int tn = lt.LeafOwner(x, y, z, b);
         if (tn < 0) continue;
         const int bn = tn/ncell123;
@@ -2830,6 +2828,9 @@ int DustGasDrag::MergeCloudsDevice3D() {
         if (kp(c) < 0 || pr(IPM,c) <= 0.0) return;
         const Real xc0 = pr(IPX,c), yc0 = pr(IPY,c), zc0 = pr(IPZ,c);
         const Real mc = pr(IPM,c), ts = pr(IPTS,c);
+        // shear-periodic x1: no family across an x1 face (its members were wrapped
+        // with the shear offset; the template does not hold there)
+        if (lt.shear && (xc0 - ell1 < lt.x1min || xc0 + ell1 >= lt.x1max)) return;
         if (!mm.In(xc0, yc0, zc0, L, lt.Anchor(pi(PGID,c)))) return;
         const int sp = pi(PSP,c);
         const Real tau = (omega > 0.0) ? Kokkos::fmin(ts, 1.0/omega) : ts;
@@ -2887,9 +2888,8 @@ int DustGasDrag::MergeCloudsDevice3D() {
         }
         for (int q=0; q<nrdata; ++q) nr(q,knew) /= M;
         if (exact_ts) nr(IPTS,knew) = ts;
-        const Real px = T::WrapPosition(xc0 + sx/M, lt.x1min, lt.x1max);
-        const Real py = T::WrapPosition(yc0 + sy/M, lt.x2min, lt.x2max);
-        const Real pz = T::WrapPosition(zc0 + sz/M, lt.x3min, lt.x3max);
+        Real px = xc0 + sx/M, py = yc0 + sy/M, pz = zc0 + sz/M;
+        lt.WrapPos(px, py, pz);
         nr(IPM,knew) = M;
         nr(IPX,knew) = px; nr(IPX1,knew) = px; nr(IPY,knew) = py; nr(IPY1,knew) = py;
         nr(IPZ,knew) = pz; nr(IPZ1,knew) = pz;
@@ -3106,9 +3106,8 @@ int DustGasDrag::MergeCloudsDevice3D() {
             if (exact_ts && q == IPTS) continue;
             nr(q,k) /= M;
           }
-          const Real px = T::WrapPosition(aref(0,k) + acc(1,k)/M, lt.x1min, lt.x1max);
-          const Real py = T::WrapPosition(aref(1,k) + acc(2,k)/M, lt.x2min, lt.x2max);
-          const Real pz = T::WrapPosition(aref(2,k) + acc(3,k)/M, lt.x3min, lt.x3max);
+          Real px = aref(0,k) + acc(1,k)/M, py = aref(1,k) + acc(2,k)/M, pz = aref(2,k) + acc(3,k)/M;
+          lt.WrapPos(px, py, pz);
           nr(IPM,k) = M;
           nr(IPX,k) = px; nr(IPX1,k) = px; nr(IPY,k) = py; nr(IPY1,k) = py;
           nr(IPZ,k) = pz; nr(IPZ1,k) = pz;

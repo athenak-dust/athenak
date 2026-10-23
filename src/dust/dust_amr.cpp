@@ -343,11 +343,14 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     const Real sz0 = lt3.box(s,2) + srect(s,4)*sdx3, sz1 = lt3.box(s,2) + srect(s,5)*sdx3;
     Real q = 0.0, vol = 0.0;
     int nbad = 0;
+    const int oym = lt3.shear ? 2 : 1;   // (sheared images of x1: two more in x2)
     for (int oz=-1; oz<=1; ++oz) {
-      for (int oy=-1; oy<=1; ++oy) {
+      for (int oy=-oym; oy<=oym; ++oy) {
         for (int ox=-1; ox<=1; ++ox) {
+          // (shear-periodic x1: an image shifted in x1 moves by -ox ysh in x2)
+          const Real ysx = lt3.shear ? -ox*lt3.ysh : 0.0;
           const Real a0 = sx0 + ox*lx, a1 = sx1 + ox*lx;
-          const Real c0 = sy0 + oy*ly, c1 = sy1 + oy*ly;
+          const Real c0 = sy0 + oy*ly + ysx, c1 = sy1 + oy*ly + ysx;
           const Real e0 = sz0 + oz*lz, e1 = sz1 + oz*lz;
           if (a1 <= ex0 + tol || a0 >= ex1 - tol || c1 <= ey0 + tol || c0 >= ey1 - tol ||
               e1 <= ez0 + tol || e0 >= ez1 - tol) continue;
@@ -355,7 +358,8 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
                  (Kokkos::fmin(c1, ey1) - Kokkos::fmax(c0, ey0))*
                  (Kokkos::fmin(e1, ez1) - Kokkos::fmax(e0, ez0));
           // the cells of slot s (indices from its left face) in the widened box
-          const Real b0 = lt3.box(s,0) + ox*lx, d0 = lt3.box(s,1) + oy*ly, f0 = lt3.box(s,2) + oz*lz;
+          const Real b0 = lt3.box(s,0) + ox*lx, d0 = lt3.box(s,1) + oy*ly + ysx;
+          const Real f0 = lt3.box(s,2) + oz*lz;
           const int i0 = Kokkos::max(srect(s,0),
                                      static_cast<int>(Kokkos::floor((ex0 - b0)/sdx1 + 1.0e-9)));
           const int i1 = Kokkos::min(srect(s,1),

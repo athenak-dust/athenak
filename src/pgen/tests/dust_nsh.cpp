@@ -926,6 +926,14 @@ struct RootPlacement {
 // exact solution for the errors that DustNSHHistory computes in the code
 struct DustTest3D {
   bool on = false, wave = false;
+  bool nsh = false;   // the NSH equilibrium (shearing box): gas at (ux0, uy0), uniform dust
+  Real ux0 = 0.0, uy0 = 0.0;
+  // the NSH dust with the density rho0 eps (1 + amp cos(ky y)) at t = 0, advected
+  // with the drift (vx, vy) and the shear: the phase ky (y - vy t + q Omega (x t - vx t^2/2));
+  // e_rhod is then the L1 error over amp, y_rhod the same within two root cells of an x1 face
+  bool ymode = false;
+  Real yamp = 0.0, ky = 0.0, yvx = 0.0, yvy = 0.0, qom = 0.0, hface = 0.0;
+  Real x1min = 0.0, x1max = 0.0;
   Real rho0 = 1.0, eps = 1.0, ts = 1.0, v0 = 0.0;
   Real kwv = 0.0, wr = 0.0, wi = 0.0;
   Real dgr = 0.0, dgi = 0.0, dur = 0.0, dui = 0.0, ddr = 0.0, ddi = 0.0;   // drho_g, du, drho_d
@@ -1439,6 +1447,24 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     dtest3d_.v0 = (dust_test == "damping") ? pin->GetOrAddReal("problem", "dust_test_v0", 0.1)
                                           : 0.0;
   }
+  // the NSH equilibrium of 3-D refinable clouds in the shearing box, with the same
+  // error columns (gas against its equilibrium, dust density against eps rho0)
+  if (!dtest && three_d && nspec == 1 && cloud_root_random && pmbp->pdust->Clouds3D()) {
+    dtest3d_.on = true;
+    dtest3d_.nsh = true;
+    dtest3d_.rho0 = rho0; dtest3d_.eps = eps[0]; dtest3d_.ts = taus[0];
+    dtest3d_.ux0 = ugx; dtest3d_.uy0 = ugp;
+    const Real yamp = pin->GetOrAddReal("problem", "dust_ymode_amp", 0.0);
+    if (yamp != 0.0) {
+      const auto &ms = pmy_mesh_->mesh_size;
+      dtest3d_.ymode = true;
+      dtest3d_.yamp = yamp;
+      dtest3d_.ky = 2.0*M_PI*pin->GetOrAddReal("problem", "dust_ymode_n", 1.0)/(ms.x2max - ms.x2min);
+      dtest3d_.yvx = vx[0]; dtest3d_.yvy = vp[0]; dtest3d_.qom = qshear*omega0;
+      dtest3d_.hface = 2.0*(ms.x1max - ms.x1min)/pmy_mesh_->mesh_indcs.nx1;
+      dtest3d_.x1min = ms.x1min; dtest3d_.x1max = ms.x1max;
+    }
+  }
   if (cloud_root_random && three_d) {
     // the root parents in 3-D (refinable clouds with <dust>/experimental_3d, or the
     // canonical deposit on a uniform mesh), one rank: random, lattice (ppc = n^3) or generic
@@ -1506,6 +1532,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     auto gids0 = pmbp->gids;
     const int nrdata = ppar->nrdata;
     const Real mass_unit = place.hx*place.hy*place.hz;
+    // the y-modulated NSH dust (dust_ymode_amp), the mass of each parent
+    const Real yamp = dtest3d_.ymode ? dtest3d_.yamp : 0.0, ky = dtest3d_.ky;
     par_for("nsh_cloud_root3d", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int q) {
       const int p = pnew(q);
       if (p < 0) return;
@@ -1521,7 +1549,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       pr0(IPY,p) = y; pr0(IPY1,p) = y;
       pr0(IPZ,p) = z; pr0(IPZ1,p) = z;
       pr0(IPTS,p) = taus_.d_view(sp);
-      pr0(IPM,p) = spdat.d_view(sp,2)*mass_unit;
+      pr0(IPM,p) = spdat.d_view(sp,2)*mass_unit*((yamp != 0.0) ? 1.0 + yamp*cos(ky*y) : 1.0);
       pr0(IPVX,p) = spdat.d_view(sp,0) + vw;
       pr0(IPVY,p) = spdat.d_view(sp,1);
       pr0(IPVX1,p) = pr0(IPVX,p);
@@ -2043,6 +2071,20 @@ void DustTest3DErrors(Mesh *pm, Real out[7]) {
       g_ += vol*fabs(rg - (c.rho0 + (c.dgr*cp - c.dgi*sp)*sinc));
       u_ += vol*fabs(ux - (c.dur*cp - c.dui*sp));
       d_ += vol*fabs(rd - (eps_rho + (c.ddr*cp - c.ddi*sp)*sinc));
+    } else if (c.nsh) {
+      g_ += vol*SQR(rg - c.rho0);
+      u_ += vol*SQR(ux - c.ux0);
+      if (c.ymode) {
+        const Real y = CellCenterX(j - js, nx2, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max);
+        const Real dy = mbsize.d_view(m).dx2;
+        const Real kx = c.ky*c.qom*t;
+        const Real ph = c.ky*(y - c.yvy*t + c.qom*(x*t - 0.5*c.yvx*t*t));
+        const Real ay = 0.5*c.ky*dy, ax = 0.5*kx*dx;
+        const Real sinc = ((ay == 0.0) ? 1.0 : sin(ay)/ay)*((ax == 0.0) ? 1.0 : sin(ax)/ax);
+        d_ += vol*fabs(rd - eps_rho*(1.0 + c.yamp*sinc*cos(ph)));
+      } else {
+        d_ += vol*SQR(rd/eps_rho - 1.0);
+      }
     } else {
       g_ += vol*SQR(rg - c.rho0);
       u_ += vol*SQR(ux - uexact);
@@ -2063,7 +2105,7 @@ void DustTest3DErrors(Mesh *pm, Real out[7]) {
     Kokkos::deep_copy(col, ch);
   }
 #endif
-  Real yg = 0.0, yd = 0.0;
+  Real yg = 0.0, yd = 0.0, yf = 0.0, vf = 0.0;
   Kokkos::parallel_reduce("dtest3d_err2", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
   KOKKOS_LAMBDA(const int q, Real &p_, Real &yg_, Real &yd_, Real &ml_) {
     int m, k, j, i;
@@ -2072,13 +2114,36 @@ void DustTest3DErrors(Mesh *pm, Real out[7]) {
     const Real vol = dx*mbsize.d_view(m).dx2*mbsize.d_view(m).dx3;
     const Real rg = u0(m,IDN,k,j,i);
     const Real rd = clouds ? fd(m,0,k,j,i) : 0.0;
-    p_ += vol*(SQR(u0(m,IM2,k,j,i)) + SQR(u0(m,IM3,k,j,i)))/SQR(rg);
+    if (c.nsh) {
+      p_ += vol*(SQR(u0(m,IM2,k,j,i)/rg - c.uy0) + SQR(u0(m,IM3,k,j,i)/rg));
+    } else {
+      p_ += vol*(SQR(u0(m,IM2,k,j,i)) + SQR(u0(m,IM3,k,j,i)))/SQR(rg);
+    }
     const Real x = CellCenterX(i - is, nx1, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max);
     const int key = (mblev.d_view(m) - root)*nf1 + static_cast<int>(floor((x - xmin)/dx));
     yg_ += vol*SQR(rg - col(key,0)/col(key,2));
     yd_ += vol*SQR(rd - col(key,1)/col(key,2));
     ml_ += vol*rd;
   }, Kokkos::Sum<Real>(ep), Kokkos::Sum<Real>(yg), Kokkos::Sum<Real>(yd), Kokkos::Sum<Real>(mleaf));
+  if (c.nsh && c.ymode) {   // the y-mode error within two root cells of an x1 face
+    Kokkos::parallel_reduce("dtest3d_face", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncell),
+    KOKKOS_LAMBDA(const int q, Real &f_, Real &v_) {
+      int m, k, j, i;
+      DTest3DCell(q, nx1, nx2, nx3, is, js, ks, m, k, j, i);
+      const Real dx = mbsize.d_view(m).dx1, dy = mbsize.d_view(m).dx2;
+      const Real vol = dx*dy*mbsize.d_view(m).dx3;
+      const Real x = CellCenterX(i - is, nx1, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max);
+      if (x - c.x1min > c.hface && c.x1max - x > c.hface) return;
+      const Real y = CellCenterX(j - js, nx2, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max);
+      const Real rd = clouds ? fd(m,0,k,j,i) : 0.0;
+      const Real kx = c.ky*c.qom*t;
+      const Real ph = c.ky*(y - c.yvy*t + c.qom*(x*t - 0.5*c.yvx*t*t));
+      const Real ay = 0.5*c.ky*dy, ax = 0.5*kx*dx;
+      const Real sinc = ((ay == 0.0) ? 1.0 : sin(ay)/ay)*((ax == 0.0) ? 1.0 : sin(ax)/ax);
+      f_ += vol*fabs(rd - eps_rho*(1.0 + c.yamp*sinc*cos(ph)));
+      v_ += vol;
+    }, Kokkos::Sum<Real>(yf), Kokkos::Sum<Real>(vf));
+  }
   auto &pr = pmbp->ppart->prtcl_rdata;
   Real mpart = 0.0;
   Kokkos::parallel_reduce("dtest3d_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0,
@@ -2086,10 +2151,10 @@ void DustTest3DErrors(Mesh *pm, Real out[7]) {
   KOKKOS_LAMBDA(const int p, Real &a) {a += pr(IPM,p);}, Kokkos::Sum<Real>(mpart));
 #if MPI_PARALLEL_ENABLED
   if (global_variable::nranks > 1) {   // the sums of all ranks (every rank gets the same out)
-    Real sums[10] = {vtot, eg, eu, ed, ep, yg, yd, mleaf, mpart, 0.0};
-    MPI_Allreduce(MPI_IN_PLACE, sums, 9, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+    Real sums[11] = {vtot, eg, eu, ed, ep, yg, yd, mleaf, mpart, yf, vf};
+    MPI_Allreduce(MPI_IN_PLACE, sums, 11, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
     vtot = sums[0]; eg = sums[1]; eu = sums[2]; ed = sums[3]; ep = sums[4]; yg = sums[5];
-    yd = sums[6]; mleaf = sums[7]; mpart = sums[8];
+    yd = sums[6]; mleaf = sums[7]; mpart = sums[8]; yf = sums[9]; vf = sums[10];
   }
 #endif
   if (c.wave) {
@@ -2100,6 +2165,10 @@ void DustTest3DErrors(Mesh *pm, Real out[7]) {
   } else {
     out[0] = std::sqrt(eg/vtot); out[1] = std::sqrt(eu/vtot); out[2] = std::sqrt(ed/vtot);
     out[3] = std::sqrt(ep/vtot); out[4] = std::sqrt(yg/vtot); out[5] = std::sqrt(yd/vtot)/eps_rho;
+    if (c.nsh && c.ymode) {
+      out[2] = ed/vtot/(eps_rho*c.yamp);
+      out[5] = (vf > 0.0) ? yf/vf/(eps_rho*c.yamp) : 0.0;
+    }
   }
   out[6] = (mpart > 0.0) ? mleaf/mpart - 1.0 : 0.0;
   if (!clouds) {out[2] = -1.0; out[5] = -1.0; out[6] = -1.0;}

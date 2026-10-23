@@ -331,6 +331,48 @@ void DustGasDrag::BuildLeafTraversal3D() {
             }
           }
         }
+        // Shear-periodic x1: across an x1 face the reach lands at a y that moves
+        // with time: every block within the reach of the opposite face whose z range meets the
+        // reach, at any y (cells within the reach in x1 and z, every y)
+        if (shear3d) {
+          for (int side=0; side<2; ++side) {
+            const bool cross = (side == 1) ? (mb[1] + rf > nf[0]) : (mb[0] - rf < 0);
+            if (!cross) continue;
+            for (int g=0; g<ntot; ++g) {
+              if (slot_of[g] >= 0) continue;
+              std::int64_t gb[6];
+              fb(g, gb);
+              const bool nearx = (side == 1) ? (gb[0] < rf) : (gb[1] > nf[0] - rf);
+              if (!nearx || !overlap(gb[4], gb[5], mb[4] - rf, mb[5] + rf, nf[2])) continue;
+              h.push_back(g);
+              const LogicalLocation &gl = pm->lloc_eachmb[g];
+              const std::int64_t ratio =
+                  static_cast<std::int64_t>(1) << (nl - (gl.level - pm->root_level));
+              std::int64_t r0 = gb[5], r1 = gb[4];
+              for (int sft=-1; sft<=1; ++sft) {
+                const std::int64_t a0 = std::max(gb[4], mb[4] - rf - sft*nf[2]);
+                const std::int64_t a1 = std::min(gb[5], mb[5] + rf - sft*nf[2]);
+                if (a0 < a1) {r0 = std::min(r0, a0); r1 = std::max(r1, a1);}
+              }
+              const std::int64_t x0 = (side == 1) ? gb[0] : std::max(gb[0], nf[0] - rf);
+              const std::int64_t x1 = (side == 1) ? std::min(gb[1], rf) : gb[1];
+              std::array<int, 6> c = {static_cast<int>((x0 - gb[0])/ratio),
+                                      static_cast<int>((x1 - gb[0] + ratio - 1)/ratio),
+                                      0, indcs.nx2,
+                                      static_cast<int>((r0 - gb[4])/ratio),
+                                      static_cast<int>((r1 - gb[4] + ratio - 1)/ratio)};
+              auto it = hrect.find(g);
+              if (it == hrect.end()) {
+                hrect[g] = c;
+              } else {
+                for (int d=0; d<3; ++d) {
+                  it->second[2*d] = std::min(it->second[2*d], c[2*d]);
+                  it->second[2*d + 1] = std::max(it->second[2*d + 1], c[2*d + 1]);
+                }
+              }
+            }
+          }
+        }
       }
     }
     std::sort(h.begin(), h.end());
@@ -610,6 +652,37 @@ void DustGasDrag::BuildLeafTraversal3D() {
     Kokkos::deep_copy(dmom, 0.0);
   }
   BuildHalo(slot_gid);
+  // Shear-periodic x1, the data of the shear neighbours (UpdateShear3D): the finest
+  // boxes of all slots, the slots near each x1 face, the reach of each local block (the halo's
+  // on several ranks, the level rule on one)
+  lt.shear = shear3d;
+  shear3d_lists_ok_ = false;
+  shear3d_fbox_.clear(); shear3d_face_[0].clear(); shear3d_face_[1].clear();
+  shear3d_reach_.assign(nmb, 0);
+  if (shear3d) {
+    int rmax = 0;
+    for (int m=0; m<nmb; ++m) {
+      std::int64_t reach = 0, allow = 0;
+      if (global_variable::nranks > 1) {
+        reach = halo_reach_[m];
+      } else {
+        HaloReach(blev(m), 0, reach, allow);
+      }
+      shear3d_reach_[m] = static_cast<int>(reach);
+      rmax = std::max(rmax, shear3d_reach_[m]);
+    }
+    shear3d_fbox_.resize(nall);
+    for (int b=0; b<nall; ++b) {
+      for (int q=0; q<6; ++q) shear3d_fbox_[b][q] = fbox(b, q);
+      if (fbox(b, 0) < rmax + 1) shear3d_face_[0].push_back(b);
+      if (fbox(b, 1) > lt.nfine1 - rmax - 1) shear3d_face_[1].push_back(b);
+    }
+    lt.sreach = DvceArray1D<int>("dust_leaf3d_sreach", std::max(1, nmb));
+    auto rh = Kokkos::create_mirror_view(lt.sreach);
+    for (int m=0; m<nmb; ++m) rh(m) = shear3d_reach_[m];
+    Kokkos::deep_copy(lt.sreach, rh);
+    UpdateShear3D(pm->time);
+  }
   halo_allow_d_ = DvceArray1D<std::int64_t>("dust_halo_allow", std::max(nmb, 1));
   if (global_variable::nranks > 1) {
     auto ah = Kokkos::create_mirror_view(halo_allow_d_);
@@ -638,6 +711,75 @@ void DustGasDrag::BuildLeafTraversal3D() {
 //! particle mass.  Returns how many block ids changed; stops on a particle without a block of
 //! this rank or with weights outside the blocks.
 
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::UpdateShear3D
+//! \brief Shear-periodic x1: the shear offset ysh = fmod(q Omega Lx t, Ly) of the
+//! time t of the positions to be traversed (bvals_part.cpp) and, when it changed, the shear
+//! neighbours of every local block: for each side, the blocks that meet the block translated
+//! across that x1 face ((+Lx, -ysh) across the inner face, (-Lx, +ysh) across the outer one)
+//! and widened by its reach, with their periodic shifts in y and z (none in x).  Host lists from
+//! the finest-cell boxes of the slots near the opposite face; a few per block.
+
+void DustGasDrag::UpdateShear3D(const Real time) {
+  if (!shear3d) return;
+  auto &lt = leaf_traversal3d;
+  const Real ysh = std::fmod(qshear*omega0*lt.lx*time, lt.ly);   // as bvals_part.cpp
+  if (shear3d_lists_ok_ && ysh == lt.ysh) return;
+  lt.ysh = ysh;
+  const int nmb = lt.nmb, nf1 = lt.nfine1, nf2 = lt.nfine2, nf3 = lt.nfine3;
+  const double yf = static_cast<double>(ysh)/static_cast<double>(lt.fine_dx2);
+  const auto &fb = shear3d_fbox_;
+  std::vector<std::vector<int>> lst(2*static_cast<std::size_t>(nmb));
+  int kmax = 1;
+  for (int m=0; m<nmb; ++m) {
+    const int R = shear3d_reach_[m];
+    for (int side=0; side<2; ++side) {
+      const int sg = 2*side - 1;   // across the outer face (1): x - Lx, y + ysh
+      const int x0 = std::max(fb[m][0] - sg*nf1 - R, 0), x1 = std::min(fb[m][1] - sg*nf1 + R, nf1);
+      if (x0 >= x1) continue;
+      const double y0 = fb[m][2] + sg*yf - R, y1 = fb[m][3] + sg*yf + R;
+      const int z0 = fb[m][4] - R, z1 = fb[m][5] + R;
+      auto &l = lst[2*static_cast<std::size_t>(m) + side];
+      for (const int b : shear3d_face_[1 - side]) {
+        if (!(fb[b][0] < x1 && x0 < fb[b][1])) continue;
+        for (int sy=-2; sy<=2; ++sy) {
+          const double by0 = fb[b][2] - static_cast<double>(sy)*nf2;
+          const double by1 = fb[b][3] - static_cast<double>(sy)*nf2;
+          if (!(by0 < y1 && y0 < by1)) continue;
+          for (int sz=-1; sz<=1; ++sz) {
+            const int bz0 = fb[b][4] - sz*nf3, bz1 = fb[b][5] - sz*nf3;
+            if (!(bz0 < z1 && z0 < bz1)) continue;
+            if (b >= lt.nfld) {
+              std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                        << std::endl << "3-D clouds, shear-periodic x1: shear neighbour slot " << b
+                        << " of block " << lt.gids + m << " is beyond the halo" << std::endl;
+              std::exit(EXIT_FAILURE);
+            }
+            l.push_back(LeafTraversal3D::Pack(b, 0, sy, sz));
+          }
+        }
+      }
+      kmax = std::max(kmax, static_cast<int>(l.size()));
+    }
+  }
+  if (lt.nsnb.extent_int(0) != std::max(1, nmb) || lt.snb.extent_int(2) < kmax) {
+    lt.nsnb = DvceArray2D<int>("dust_leaf3d_nsnb", std::max(1, nmb), 2);
+    lt.snb = DvceArray3D<int>("dust_leaf3d_snb", std::max(1, nmb), 2, kmax);
+  }
+  auto nh = Kokkos::create_mirror_view(lt.nsnb);
+  auto sh = Kokkos::create_mirror_view(lt.snb);
+  for (int m=0; m<nmb; ++m) {
+    for (int side=0; side<2; ++side) {
+      const auto &l = lst[2*static_cast<std::size_t>(m) + side];
+      nh(m, side) = static_cast<int>(l.size());
+      for (std::size_t k=0; k<l.size(); ++k) sh(m, side, k) = l[k];
+    }
+  }
+  Kokkos::deep_copy(lt.nsnb, nh);
+  Kokkos::deep_copy(lt.snb, sh);
+  shear3d_lists_ok_ = true;
+}
+
 void DustGasDrag::WrapParticles3D() {
   particles::Particles *ppar = pmy_pack->ppart;
   const int npart = ppar->nprtcl_thispack;
@@ -646,8 +788,19 @@ void DustGasDrag::WrapParticles3D() {
   const auto &ms = pmy_pack->pmesh->mesh_size;
   const Real x1a = ms.x1min, x1b = ms.x1max, x2a = ms.x2min, x2b = ms.x2max;
   const Real x3a = ms.x3min, x3b = ms.x3max;
+  // Across a shear-periodic x1 face y moves by n ysh (with its register)
+  const bool sh = leaf_traversal3d.shear;
+  const Real ysh = leaf_traversal3d.ysh, ilx = 1.0/(x1b - x1a);
   Kokkos::parallel_for("dust_wrap3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
+    if (sh) {
+      const Real x = pr(IPX,p), xw = SMRCompositeTransfer::WrapPosition(x, x1a, x1b);
+      if (xw != x) {
+        const Real dy = round((x - xw)*ilx)*ysh;
+        pr(IPX,p) = xw; pr(IPX1,p) += xw - x;
+        pr(IPY,p) += dy; pr(IPY1,p) += dy;
+      }
+    }
     SMRCompositeTransfer::WrapParticle(pr, p, x1a, x1b, x2a, x2b);
     const Real z = pr(IPZ,p), zw = SMRCompositeTransfer::WrapPosition(z, x3a, x3b);
     if (zw != z) {pr(IPZ,p) = zw; pr(IPZ1,p) += zw - z;}
@@ -703,24 +856,47 @@ int DustGasDrag::ResetBlocks3D(const char *when, const bool check, Real &dwmax, 
 //! is widened and every rank rebuilds the leaf traversal and the halo.  RouteToOwnerBlocks3D:
 //! every particle to the block (and rank) that holds its position.
 
-void DustGasDrag::FrameToBlock3D() {
+void DustGasDrag::FrameToBlock3D(const Real tpos) {
   auto pr = pmy_pack->ppart->prtcl_rdata;
   auto pi = pmy_pack->ppart->prtcl_idata;
   const auto lt = leaf_traversal3d;
   const int npart = pmy_pack->ppart->nprtcl_thispack;
   if (npart == 0) return;
+  const bool frame = global_variable::nranks > 1;
+  // The particle routing (bvals_part.cpp) moves a particle across a shear-periodic x1
+  // face by ysh at pm->time; positions at tpos != pm->time (after the push) get the difference
+  // first, so that the move is the one of their time
+  Real dsh = 0.0, ysp = lt.ysh;   // ysp: the shear offset at the time of the positions
+  if (shear3d && shear3d_route_fix && tpos >= 0.0) {
+    const Real t0 = pmy_pack->pmesh->time;
+    ysp = std::fmod(qshear*omega0*lt.lx*tpos, lt.ly);
+    dsh = ysp - std::fmod(qshear*omega0*lt.lx*t0, lt.ly);
+  }
+  if (!frame && dsh == 0.0) return;
+  const bool sh = lt.shear;
   Kokkos::parallel_for("dust_migrate_frame3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
-    const int m = lt.Anchor(pi(PGID,p));
-    const Real cx = lt.box(m,0) + 0.5*lt.nx1*lt.box(m,3);
-    const Real cy = lt.box(m,1) + 0.5*lt.nx2*lt.box(m,4);
-    const Real cz = lt.box(m,2) + 0.5*lt.nx3*lt.box(m,5);
-    const Real sx = lt.lx*round((pr(IPX,p) - cx)*lt.ilx);
-    const Real sy = lt.ly*round((pr(IPY,p) - cy)*lt.ily);
-    const Real sz = lt.lz*round((pr(IPZ,p) - cz)*lt.ilz);
-    if (sx != 0.0) {pr(IPX,p) -= sx; pr(IPX1,p) -= sx;}
-    if (sy != 0.0) {pr(IPY,p) -= sy; pr(IPY1,p) -= sy;}
-    if (sz != 0.0) {pr(IPZ,p) -= sz; pr(IPZ1,p) -= sz;}
+    if (frame) {
+      const int m = lt.Anchor(pi(PGID,p));
+      const Real cx = lt.box(m,0) + 0.5*lt.nx1*lt.box(m,3);
+      const Real cy = lt.box(m,1) + 0.5*lt.nx2*lt.box(m,4);
+      const Real cz = lt.box(m,2) + 0.5*lt.nx3*lt.box(m,5);
+      const Real n1 = round((pr(IPX,p) - cx)*lt.ilx);
+      const Real sx = lt.lx*n1;
+      if (sx != 0.0) {
+        pr(IPX,p) -= sx; pr(IPX1,p) -= sx;
+        if (sh) {pr(IPY,p) += n1*ysp; pr(IPY1,p) += n1*ysp;}
+      }
+      const Real sy = lt.ly*round((pr(IPY,p) - cy)*lt.ily);
+      const Real sz = lt.lz*round((pr(IPZ,p) - cz)*lt.ilz);
+      if (sy != 0.0) {pr(IPY,p) -= sy; pr(IPY1,p) -= sy;}
+      if (sz != 0.0) {pr(IPZ,p) -= sz; pr(IPZ1,p) -= sz;}
+    }
+    if (dsh != 0.0) {
+      const Real x = pr(IPX,p);
+      const Real c = (x >= lt.x1max) ? 1.0 : ((x < lt.x1min) ? -1.0 : 0.0);
+      if (c != 0.0) {pr(IPY,p) += c*dsh; pr(IPY1,p) += c*dsh;}
+    }
   });
 }
 
@@ -865,7 +1041,7 @@ int DustGasDrag::RouteToOwnerBlocks3D(const char *when) {
 //! in a block finer than the cloud".  Stops with an error beyond round-off.
 
 void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
-  const auto lt = leaf_traversal3d;
+  auto lt = leaf_traversal3d;
   // several ranks (stage 3): the leaves with fields (this rank's blocks and the halo); the clouds
   // then sit in their anchor block, at the levels the halo reach covers (HaloReach)
   const bool multi = global_variable::nranks > 1;
@@ -878,18 +1054,31 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
   int nelig_bad = 0, nglobal = 0;
   const Real slack = cloud_split_slack;
   const std::uint64_t seed = static_cast<std::uint64_t>(pmy_pack->pmesh->ncycle) + 12345;
+  // shear-periodic x1: every sample at a random shear offset (the shear neighbours
+  // rebuilt for it; the offset of the current time restored at the end)
+  const Real tshear = (shear3d && qshear*omega0 != 0.0)
+                    ? lt.ly/(qshear*omega0*lt.lx) : 0.0;   // the time of one full offset
   for (int s=0; s<nsample; ++s) {
     const std::uint64_t key = seed*UINT64_C(1000003) + static_cast<std::uint64_t>(s)*7919;
-    const int anchor = std::min(lt.nmb - 1, static_cast<int>(Uniform01(key + 10)*lt.nmb));
+    if (tshear > 0.0) {
+      UpdateShear3D(tshear*Uniform01(key + 13));
+      lt = leaf_traversal3d;
+    }
+    const int anchor0 = std::min(lt.nmb - 1, static_cast<int>(Uniform01(key + 10)*lt.nmb));
     Real px = lt.x1min + Uniform01(key + 1)*lt.lx;
     Real py = lt.x2min + Uniform01(key + 2)*lt.ly;
     Real pz = lt.x3min + Uniform01(key + 3)*lt.lz;
     int lmin = 0;
+    // shear-periodic x1: a third of the clouds within two root cells of an x1 face
+    if (lt.shear && !multi && Uniform01(key + 11) < 1.0/3.0) {
+      const Real u = 2.0*lt.root_dx1*Uniform01(key + 1);
+      px = (Uniform01(key + 12) < 0.5) ? lt.x1min + u : lt.x1max - u;
+    }
     if (multi) {
-      px = box_h(anchor,0) + Uniform01(key + 1)*lt.nx1*box_h(anchor,3);
-      py = box_h(anchor,1) + Uniform01(key + 2)*lt.nx2*box_h(anchor,4);
-      pz = box_h(anchor,2) + Uniform01(key + 3)*lt.nx3*box_h(anchor,5);
-      lmin = std::max(0, blev_h(anchor) - 1);
+      px = box_h(anchor0,0) + Uniform01(key + 1)*lt.nx1*box_h(anchor0,3);
+      py = box_h(anchor0,1) + Uniform01(key + 2)*lt.nx2*box_h(anchor0,4);
+      pz = box_h(anchor0,2) + Uniform01(key + 3)*lt.nx3*box_h(anchor0,5);
+      lmin = std::max(0, blev_h(anchor0) - 1);
     }
     const int lev = std::min(lt.nlev, lmin + static_cast<int>(Uniform01(key + 4)*(lt.nlev + 1 - lmin)));
     int code = lev;
@@ -899,29 +1088,61 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
       code |= (static_cast<int>(Uniform01(key + 8)*4) & 3) << SMRCompositeTransfer::kCloudLobeShift3;
     }
     if (Uniform01(key + 9) < 0.3) code |= SMRCompositeTransfer::kCloudGatherPoint;
+    // one rank: two thirds of the clouds anchored in the block that holds them (the neighbour
+    // and shear-neighbour lists), the others in a random block (the searches over all blocks)
+    const bool own = !multi && Uniform01(key + 14) < 2.0/3.0;
     Kokkos::deep_copy(d, 0.0);
     Kokkos::parallel_for("dust_leaf3d_check", Kokkos::RangePolicy<>(DevExeSpace(), 0, 1),
     KOKKOS_LAMBDA(const int) {
       using LT = LeafTraversal;
       using T = SMRCompositeTransfer;
       bool reach = true;
+      int anchor = anchor0;
+      if (own) {
+        int b = -1;
+        lt.Owner(px, py, pz, anchor0, &b);
+        if (b >= 0 && b < lt.nmb) anchor = b;
+      }
+      // the first moments about the leaf centres, as the gather uses them (m1 + MinImage(p - c) w)
+      auto centre = [&](const int t, Real &xc, Real &yc, Real &zc) {
+        int tb, tk, tj, ti;
+        lt.Decode(t, tb, tk, tj, ti);
+        xc = lt.box(tb,0) + (ti - lt.is + 0.5)*lt.box(tb,3);
+        yc = lt.box(tb,1) + (tj - lt.js + 0.5)*lt.box(tb,4);
+        zc = lt.box(tb,2) + (tk - lt.ks + 0.5)*lt.box(tb,5);
+      };
       const Real sum = lt.ForEach<true>(px, py, pz, code, anchor,
       [&](const int t, const Real w, const Real m1x, const Real m1y, const Real m1z) {
-        d(t, 0) += w; d(t, 1) += m1x; d(t, 2) += m1y; d(t, 3) += m1z;
+        Real xc, yc, zc;
+        centre(t, xc, yc, zc);
+        d(t, 0) += w;
+        d(t, 1) += m1x + T::MinImage(px - xc, lt.lx)*w;
+        d(t, 2) += m1y + T::MinImage(py - yc, lt.ly)*w;
+        d(t, 3) += m1z + T::MinImage(pz - zc, lt.lz)*w;
       }, &reach);
       res(0) = sum;
       res(3) = reach ? 0.0 : 1.0;
-      // brute force over the finest cells of the support (unwrapped indices; Locate wraps)
+      // brute force over the finest cells of the support (unwrapped indices; Locate wraps); with
+      // shear-periodic x1 and the support across an x1 face, the part in the domain and the cloud
+      // translated across the face, each over its finest cells in the domain
       const int lv = T::CloudLevel(code);
       const bool point = (code & T::kCloudGatherPoint) != 0;
-      const LT::Shape s1 = LT::MakeShape(px, ldexp(lt.root_dx1, -lv), ldexp(lt.iroot_dx1, lv),
+      const LT::Shape s1a = LT::MakeShape(px, ldexp(lt.root_dx1, -lv), ldexp(lt.iroot_dx1, lv),
+                                          T::CloudLobe1(code), point);
+      const int npart = (lt.shear && (s1a.lo < lt.x1min || s1a.hi > lt.x1max)) ? 2 : 1;
+      const Real sgn = (s1a.hi > lt.x1max) ? 1.0 : -1.0;
+      for (int part=0; part<npart; ++part) {
+      const Real qx = (part == 0) ? px : px - sgn*lt.lx;
+      const Real qy = (part == 0) ? py : py + sgn*lt.ysh;
+      const LT::Shape s1 = LT::MakeShape(qx, ldexp(lt.root_dx1, -lv), ldexp(lt.iroot_dx1, lv),
                                          T::CloudLobe1(code), point);
-      const LT::Shape s2 = LT::MakeShape(py, ldexp(lt.root_dx2, -lv), ldexp(lt.iroot_dx2, lv),
+      const LT::Shape s2 = LT::MakeShape(qy, ldexp(lt.root_dx2, -lv), ldexp(lt.iroot_dx2, lv),
                                          T::CloudLobe2(code), point);
       const LT::Shape s3 = LT::MakeShape(pz, ldexp(lt.root_dx3, -lv), ldexp(lt.iroot_dx3, lv),
                                          T::CloudLobe3(code), point);
-      const int ia = static_cast<int>(floor((s1.lo - lt.x1min)/lt.fine_dx1));
-      const int ib = static_cast<int>(ceil((s1.hi - lt.x1min)/lt.fine_dx1)) - 1;
+      int ia = static_cast<int>(floor((s1.lo - lt.x1min)/lt.fine_dx1));
+      int ib = static_cast<int>(ceil((s1.hi - lt.x1min)/lt.fine_dx1)) - 1;
+      if (npart == 2) {ia = (ia < 0) ? 0 : ia; ib = (ib > lt.nfine1 - 1) ? lt.nfine1 - 1 : ib;}
       const int ja = static_cast<int>(floor((s2.lo - lt.x2min)/lt.fine_dx2));
       const int jb = static_cast<int>(ceil((s2.hi - lt.x2min)/lt.fine_dx2)) - 1;
       const int ka = static_cast<int>(floor((s3.lo - lt.x3min)/lt.fine_dx3));
@@ -940,22 +1161,38 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
                            LT::FaceAt<true>(s1, lt.x1min + (i + 1)*lt.fine_dx1), w1, g1);
             const int t = lt.Locate(i, j, k);
             if (t < 0 || t >= nleaf) {res(1) = 1.0e30; continue;}
-            d(t, 0) -= w1*w2*w3; d(t, 1) -= g1*w2*w3; d(t, 2) -= w1*g2*w3; d(t, 3) -= w1*w2*g3;
+            Real xc, yc, zc;
+            centre(t, xc, yc, zc);
+            const Real w = w1*w2*w3;
+            d(t, 0) -= w;
+            d(t, 1) -= g1*w2*w3 + T::MinImage(qx - xc, lt.lx)*w;
+            d(t, 2) -= w1*g2*w3 + T::MinImage(qy - yc, lt.ly)*w;
+            d(t, 3) -= w1*w2*g3 + T::MinImage(pz - zc, lt.lz)*w;
           }
         }
+      }
       }
       // eligibility of a plain cloud of level lv at the position (overlap rule)
       if (lt.split_overlap && lv < lt.nlev && lv < lt.cloud_max_level && !lt.split_everywhere) {
         const bool fast = lt.InsideFiner(px, py, pz, lv, slack, anchor);
+        bool brute = false;
         int fa, fb, ga, gb, ha, hb;
         lt.SupportBox(px, py, pz, 1.0 - slack, lv, fa, fb, ga, gb, ha, hb);
-        bool brute = false;
-        for (int k=ha; k<=hb && !brute; ++k) {
-          for (int j=ga; j<=gb && !brute; ++j) {
-            for (int i=fa; i<=fb && !brute; ++i) {
-              int b = -1;
-              lt.Locate(i, j, k, &b);
-              if (b >= 0 && lt.blev(b) > lv) brute = true;
+        // (shear-periodic x1: the part in the domain and the box around the translated position)
+        const int side = lt.ShearSide(fa, fb);
+        for (int part=0; part<((side >= 0) ? 2 : 1); ++part) {
+          if (part == 1) {
+            const Real sg = (side == 1) ? 1.0 : -1.0;
+            lt.SupportBox(px - sg*lt.lx, py + sg*lt.ysh, pz, 1.0 - slack, lv, fa, fb, ga, gb, ha, hb);
+          }
+          if (side >= 0) {fa = (fa < 0) ? 0 : fa; fb = (fb > lt.nfine1 - 1) ? lt.nfine1 - 1 : fb;}
+          for (int k=ha; k<=hb && !brute; ++k) {
+            for (int j=ga; j<=gb && !brute; ++j) {
+              for (int i=fa; i<=fb && !brute; ++i) {
+                int b = -1;
+                lt.Locate(i, j, k, &b);
+                if (b >= 0 && lt.blev(b) > lv) brute = true;
+              }
             }
           }
         }
@@ -978,6 +1215,7 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
     if (rh(2) != 0.0) ++nelig_bad;
     if (rh(3) != 0.0) ++nglobal;
   }
+  if (tshear > 0.0) UpdateShear3D(pmy_pack->pmesh->time);
 #if MPI_PARALLEL_ENABLED
   if (multi) {
     double mx[3] = {maxw, maxm, maxsum};
@@ -987,7 +1225,9 @@ void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
     maxw = mx[0]; maxm = mx[1]; maxsum = mx[2]; nelig_bad = ni[0]; nglobal = ni[1];
   }
 #endif
-  const bool ok = (maxw <= 1.0e-13 && maxm <= 1.0e-13 && maxsum <= 1.0e-13 && nelig_bad == 0);
+  // (the moments about the leaf centres carry the round-off of the positions, about 1e-16 of the
+  // domain size: relative to the half-width at the deepest level up to a few 1e-14)
+  const bool ok = (maxw <= 1.0e-13 && maxm <= 1.0e-11 && maxsum <= 1.0e-13 && nelig_bad == 0);
   if (global_variable::my_rank == 0) {
     std::cout << "# 3-D leaf traversal check, cycle " << pmy_pack->pmesh->ncycle
               << ": " << nsample << " clouds" << (multi ? " per rank" : "")
@@ -1075,9 +1315,8 @@ int DustGasDrag::SplitCloudsP1Device3D() {
     for (int k=n12*n3-1; k>=0; --k) {
       const int a = k % n1, b = (k/n1) % n2, c = k/n12;
       const int s = (k == 0) ? p : npart + tagoff(p) + k - 1;
-      const Real cx = LeafTraversal::Wrap(x + p1[a].off*e1, lt.x1min, lt.x1max);
-      const Real cy = LeafTraversal::Wrap(y + p2[b].off*e2, lt.x2min, lt.x2max);
-      const Real cz = LeafTraversal::Wrap(z + p3[c].off*e3, lt.x3min, lt.x3max);
+      Real cx = x + p1[a].off*e1, cy = y + p2[b].off*e2, cz = z + p3[c].off*e3;
+      lt.WrapPos(cx, cy, cz);   // (shear-periodic x1: y moves with an x wrap)
       if (k > 0) {
         for (int q=0; q<nrdata; ++q) prv(q,s) = prv(q,p);
         for (int q=0; q<nidata; ++q) piv(q,s) = piv(q,p);
@@ -1164,6 +1403,7 @@ void DustGasDrag::CloudPredictor3D(const bool rate_dep) {
   const int is = indcs.is, js = indcs.js, ks = indcs.ks;
   const Real dt = pmy_pack->pmesh->dt;
   auto &qdep_ = qdep;
+  UpdateShear3D(pmy_pack->pmesh->time);   // positions at the start of the step
   const auto lt = leaf_traversal3d;
   const int tmode = cloud_transition;
   PackGasGather3D(pmy_pack->phydro->u1);
@@ -1237,6 +1477,7 @@ void DustGasDrag::CloudAdvance3D() {
   const bool is_sbox = is_shearing_box, is_strat = is_stratified;
   const Real qshear_ = qshear, omega0_ = omega0;
   auto &dmom_ = dmom;
+  UpdateShear3D(pmy_pack->pmesh->time + 0.5*dt);   // the midpoint positions
   const auto lt = leaf_traversal3d;
   const int tmode = cloud_transition;
   PackGatherField3D(ustar);
@@ -1338,6 +1579,7 @@ void DustGasDrag::DepositCloudDensity3D(DvceArray5D<Real> &f) {
     Kokkos::realloc(f, qdep.extent(0), 4, qdep.extent(2), qdep.extent(3), qdep.extent(4));
   }
   Kokkos::deep_copy(f, 0.0);
+  UpdateShear3D(pmy_pack->pmesh->time);
   particles::Particles *ppar = pmy_pack->ppart;
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;

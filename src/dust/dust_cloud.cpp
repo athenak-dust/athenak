@@ -546,9 +546,12 @@ bool DustGasDrag::CheckHaloReach(const char *when) {
 //! to their block (positions and the RK position registers together), so that the particle
 //! exchange sees a step of one block at most and wraps them again.
 
-void DustGasDrag::FrameToBlock() {
+void DustGasDrag::FrameToBlock(const Real tpos) {
+  if (clouds3d && (global_variable::nranks > 1 || shear3d)) {   // with shear3d also on one rank
+    FrameToBlock3D(tpos);
+    return;
+  }
   if (global_variable::nranks == 1) return;
-  if (clouds3d) {FrameToBlock3D(); return;}
   {
     auto pr = pmy_pack->ppart->prtcl_rdata;
     auto pi = pmy_pack->ppart->prtcl_idata;
@@ -573,6 +576,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) return TaskStatus::complete;
   ProfTimer prof_all(prof_time[kProfRefineClouds], prof_count[kProfRefineClouds]);
   if (cloud_particle_dump >= 0 && pmy_pack->pmesh->ncycle == cloud_particle_dump) DumpParticles();
+  UpdateShear3D(pmy_pack->pmesh->time);   // the positions at the start of the step
   EnsureNextTag();
   {
     ProfTimer pt(prof_time[kProfSplit], prof_count[kProfSplit]);

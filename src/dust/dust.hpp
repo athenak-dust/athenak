@@ -1789,6 +1789,16 @@ class DustGasDrag {
   DvceArray5D<Real> gpack3;
   bool clouds3d = false;               // experimental_3d on a 3-D mesh (set by the constructor)
   bool Clouds3D() const {return clouds3d;}
+  // stage 4: 3-D clouds in a shearing box with shear-periodic x1 (not the test
+  // option experimental_3d_shear_plain); the shear neighbours of LeafTraversal3D for the shear
+  // offset at a time (UpdateShear3D: rebuilt when the offset changes), from the finest-cell boxes
+  // of the slots, the slots near the inner / outer x1 face and the reach of every local block
+  bool shear3d = false;
+  bool shear3d_route_fix = true;   // <dust>/cloud_shear_route_time (test: false = AthenaK's time)
+  bool shear3d_lists_ok_ = false;
+  std::vector<std::array<int, 6>> shear3d_fbox_;
+  std::vector<int> shear3d_face_[2], shear3d_reach_;
+  void UpdateShear3D(const Real time);
   void BuildLeafTraversal3D();
   void CheckLeafTraversal3D(const int nsample);
   int SplitCloudsP1Device3D();
@@ -1800,7 +1810,7 @@ class DustGasDrag {
   void CheckClouds3D();   // the restrictions of 3-D stage 1
   void WrapParticles3D();
   int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
-  void FrameToBlock3D();                       // 3-D stage 3 (several ranks)
+  void FrameToBlock3D(const Real tpos);         // 3-D stages 3 and 4
   bool CheckHaloReach3D(const char *when);
   int RouteToOwnerBlocks3D(const char *when);
   int MergeCloudsDevice3D();   // 3-D stage 2b (dust_cloud_device.cpp)
@@ -1860,7 +1870,7 @@ class DustGasDrag {
   void BuildHalo(const std::vector<int> &slot_gid);
   void CheckMultiRank();
   void MigrateClouds();
-  void FrameToBlock();
+  void FrameToBlock(const Real tpos = -1.0);   // tpos: the time of the positions
   // the reach of the halo per block of this rank (finest cells): the level rule
   // (HaloReach), the widenings found by CheckHaloReach (kept until the mesh changes), and the
   // furthest a support may extend beyond each block
