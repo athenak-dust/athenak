@@ -714,8 +714,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Rixin: the default follows the build: the device solver when the
       // default execution space is not a host space (GPU builds), the threaded host solver
       // otherwise (on a CPU build the host solver was 3.3x faster than the device code)
+      // (3-D refinable clouds have only the device solver, which also runs on a CPU)
       cloud_resample_device = pin->GetOrAddBoolean("dust", "cloud_resample_device",
-          !std::is_same<DevExeSpace, Kokkos::DefaultHostExecutionSpace>::value);
+          !std::is_same<DevExeSpace, Kokkos::DefaultHostExecutionSpace>::value || clouds3d);
       cloud_resample_device_mem_mb = pin->GetOrAddInteger("dust", "cloud_resample_device_mem_mb", 2048);
       // A middle bucket (65 .. cloud_resample_device_mid clouds; 0: off) of the
       // device solves with narrower teams, several per SM

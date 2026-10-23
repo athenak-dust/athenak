@@ -77,14 +77,14 @@ struct WsSize {
   std::size_t nd = 0, ni = 0;                     // doubles and ints per team slot
 };
 
-WsSize Sizes(const int nmax, const int emax, const int lmax) {
+WsSize Sizes(const int nmax, const int emax, const int lmax, const int extra = 0) {
   WsSize z;
   z.nmax = std::max(nmax, 2);
   z.emax = std::max(emax, 1);
   z.lmax = std::max(lmax, 1);
   z.hmax = 4;
   while (z.hmax < 4*z.lmax) z.hmax *= 2;
-  z.rmax = 7*lmax + 8;
+  z.rmax = 7*lmax + 8 + extra;   // (3-D: extra = 1, the x3 centre-of-mass row)
   const int rb = std::min(z.rmax, z.nmax);
   z.cmax = std::max(2*rb, rb + 32);
   const std::size_t r = z.rmax, n = z.nmax, c = z.cmax;
@@ -584,7 +584,9 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
   const int e0 = pb.sptr(a0), ne = pb.sptr(a1) - e0;
   const int nl = DistinctSorted(tm, ne, [&](const int e) {return pb.stgt(e0 + e);}, ws.tab,
                                 hmask, ws.ltmp, ws.leaves);
-  const int nrow = 7*nl + 8;
+  const int ncom = pb.three ? 3 : 2;   // centre-of-mass rows (x3 too in 3-D)
+  const int nrow = 7*nl + 6 + ncom;
+  const int fb0 = 4*nl + 6 + ncom;     // the first feedback row (2-D: 4 nl + 8)
   // mass-weighted mean velocity, host order
   Kokkos::single(Kokkos::PerTeam(tm), [&]() {
     double mt = 0.0, vb[3] = {0.0, 0.0, 0.0};
@@ -609,12 +611,18 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
       const int l = LowerBound(ws.leaves, nl, pb.stgt(e));
       const double wgt = pb.swgt(e);
       col(l) += wgt;
-      for (int k=0; k<3; ++k) {col((1 + k)*nl + l) += wgt*c[k]; col(4*nl + 8 + k*nl + l) += wgt*f[k];}
+      for (int k=0; k<3; ++k) {col((1 + k)*nl + l) += wgt*c[k]; col(fb0 + k*nl + l) += wgt*f[k];}
     }
     double dx = spd(a, JX) - xc, dy = spd(a, JY) - yc;
     dx -= pb.lx*Kokkos::floor(dx/pb.lx + 0.5); dy -= pb.ly*Kokkos::floor(dy/pb.ly + 0.5);
-    const int g = 4*nl;
+    int g = 4*nl;
     col(g) = dx/rdx; col(g + 1) = dy/rdy;
+    if (pb.three) {
+      double dz = spd(a, JZ) - pb.pgeo(q,4);
+      dz -= pb.lz*Kokkos::floor(dz/pb.lz + 0.5);
+      col(g + 2) = dz/pb.pgeo(q,5);
+      ++g;
+    }
     col(g + 2) = c[0]*c[0]; col(g + 3) = c[0]*c[1]; col(g + 4) = c[0]*c[2]; col(g + 5) = c[1]*c[1];
     col(g + 6) = c[1]*c[2]; col(g + 7) = c[2]*c[2];
   });
@@ -840,7 +848,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     t.reset();
     const int nq = nqb[b];
     if (nq > 0) {
-      const WsSize ws = Sizes(nmx[b], emx[b], lmx[b]);
+      const WsSize ws = Sizes(nmx[b], emx[b], lmx[b], pb.three ? 1 : 0);
       const double per = 8.0*ws.nd + 4.0*ws.ni;
       int nslot = static_cast<int>(std::min<double>(nq, std::max(1.0, budget/per)));
       nslot = std::min(nslot, 4096);

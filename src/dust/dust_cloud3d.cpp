@@ -160,7 +160,14 @@ void DustGasDrag::CheckClouds3D() {
     bad.push_back("merging other than the device quantum G (no stage-X budget, X protection, "
                   "audits)");
   }
-  if (cloud_resample) bad.push_back("R (cloud_resample = true)");
+  // R (stage 2c): the device solve (ResampleClouds3D), without its diagnostics
+  if (cloud_resample && (!cloud_resample_device || cloud_resample_compare ||
+                         cloud_resample_feedback_check || cloud_resample_stress > 0 ||
+                         cloud_resample_stress_copies > 0 || !cloud_resample_dump.empty() ||
+                         cloud_resample_patch_stats || cloud_resample_pos_order)) {
+    bad.push_back("resampling other than the device solve (no host solve, compare, dump, stress, "
+                  "feedback check, patch statistics, position order)");
+  }
   if (!cloud_split_device || cloud_split_log || split_oracle) bad.push_back("the host split");
   if (cloud_instant_switch) bad.push_back("cloud_instant_switch");
   if (cloud_sort_interval > 0 || cloud_order_interval > 0) {
