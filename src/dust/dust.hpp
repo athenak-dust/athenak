@@ -1260,6 +1260,7 @@ struct DustGasDragTaskIDs {
   // "stagen" tasks
   TaskID first2;
   TaskID h_flux, h_sendf, h_recvf, h_rkupdt, h_srctrms;
+  TaskID h_sendf_shr, h_recvf_shr, h_sendf_oa, h_recvf_oa;   // S2a
   TaskID gatwid, push;
   TaskID p_newgid, p_cnt, p_irecv, p_sendp, p_recvp;
   TaskID scat, sendd, recvd, solve, sendus, recvus, sendus_shr, recvus_shr;

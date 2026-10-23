@@ -61,7 +61,11 @@ void DustGasDrag::AssembleDustGasDragTasks(
   id.h_flux    = tl["stagen"]->AddTask(&Hydro::Fluxes, phyd, id.first2);
   id.h_sendf   = tl["stagen"]->AddTask(&Hydro::SendFlux, phyd, id.h_flux);
   id.h_recvf   = tl["stagen"]->AddTask(&Hydro::RecvFlux, phyd, id.h_sendf);
-  id.h_rkupdt  = tl["stagen"]->AddTask(&Hydro::RKUpdate, phyd, id.h_recvf);
+  // the x1 flux matching across the shear-periodic boundary of S2a, as in the
+  // hydro task list (its receives are posted by Hydro::InitRecv; no-ops without refinement)
+  id.h_sendf_shr = tl["stagen"]->AddTask(&Hydro::SendFlx_Shr, phyd, id.h_recvf);
+  id.h_recvf_shr = tl["stagen"]->AddTask(&Hydro::RecvFlx_Shr, phyd, id.h_sendf_shr);
+  id.h_rkupdt  = tl["stagen"]->AddTask(&Hydro::RKUpdate, phyd, id.h_recvf_shr);
   id.h_srctrms = tl["stagen"]->AddTask(&Hydro::HydroSrcTerms, phyd, id.h_rkupdt);
   // gas drag-rate history (stage 2 only); must precede the implicit solve
   id.gatwid    = tl["stagen"]->AddTask(&DustGasDrag::AddDragHistoryGas, this,
@@ -105,7 +109,10 @@ void DustGasDrag::AssembleDustGasDragTasks(
   // standard hydro tail (boundary comms, BCs, cons-to-prim, timestep)
   id.h_sendu_oa  = tl["stagen"]->AddTask(&Hydro::SendU_OA, phyd, id.apply);
   id.h_recvu_oa  = tl["stagen"]->AddTask(&Hydro::RecvU_OA, phyd, id.h_sendu_oa);
-  id.h_restu     = tl["stagen"]->AddTask(&Hydro::RestrictU, phyd, id.h_recvu_oa);
+  // the remap fluxes of the orbital advection through x2 faces with a level change
+  id.h_sendf_oa  = tl["stagen"]->AddTask(&Hydro::SendFlx_OA, phyd, id.h_recvu_oa);
+  id.h_recvf_oa  = tl["stagen"]->AddTask(&Hydro::RecvFlx_OA, phyd, id.h_sendf_oa);
+  id.h_restu     = tl["stagen"]->AddTask(&Hydro::RestrictU, phyd, id.h_recvf_oa);
   id.h_sendu     = tl["stagen"]->AddTask(&Hydro::SendU, phyd, id.h_restu);
   id.h_recvu     = tl["stagen"]->AddTask(&Hydro::RecvU, phyd, id.h_sendu);
   id.h_sendu_shr = tl["stagen"]->AddTask(&Hydro::SendU_Shr, phyd, id.h_recvu);
