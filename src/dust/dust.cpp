@@ -163,6 +163,20 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     // S3a: the ghost deposits across the shear-periodic faces are moved
     // to the opposite face with the shear offset (DepRemapPlan); the u* ghost fill is remapped
   }
+  // AthenaK's time step is cfl_number times the smallest dx/(|v| + c)
+  // over the directions; the unsplit RK2 + PLM gas update is stable in 3-D only up to about 1/3
+  // (the oblique hydro linear wave breaks down at 0.4).  The dust deposits seed the grid-scale
+  // diagonal modes, so a 3-D dust run above 1/3 blows up within a fraction of a sound crossing.
+  if (pmy_pack->pmesh->three_d &&
+      pin->GetReal("time", "cfl_number") > 1.0/3.0 + 1.0e-12 &&
+      !pin->GetOrAddBoolean("dust", "allow_cfl_above_third_3d", false)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "3-D dust: <time>/cfl_number = " << pin->GetReal("time", "cfl_number")
+              << " exceeds 1/3, the stability limit of the 3-D RK2 + PLM gas update"
+              << "; use cfl_number <= 0.3 (or <dust>/allow_cfl_above_third_3d = true for an "
+              << "integrator that allows more)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   if (pmy_pack->pmesh->mb_indcs.ng < 2) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "Dust drag requires at least 2 ghost zones" << std::endl;
