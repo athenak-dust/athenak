@@ -160,6 +160,8 @@ void WriteP3DSnapshot(Mesh *pm) {
   }
   std::fclose(fp);
   ++p3d_number_;
+  // native restart: the number of the next frame travels in the restart file
+  if (ba_pin_ != nullptr) ba_pin_->SetInteger("problem", "rst_p3d_number", p3d_number_);
 }
 int ba_field_number_ = 0;
 bool ba_geom_written_ = false;   // the geometry file is written with the first field file
@@ -1231,6 +1233,10 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // file.  The output numbers continue from the values the file carries in <problem>; a file
     // without them falls back on the time.  No file is touched here (the run directory is set
     // later); the distribution file is cut back and continued at its next record.
+    if (p3d_dt_ > 0.0) {   // the 3-D particle snapshots continue their numbering
+      p3d_number_ = pin->GetOrAddInteger("problem", "rst_p3d_number",
+          static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/p3d_dt_)));
+    }
     if (ba_snapshots_) {
       ba_snapshot_number_ = pin->GetOrAddInteger("problem", "rst_ba_snapshot_number",
           static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_snapshot_dt_)));
