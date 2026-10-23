@@ -235,11 +235,40 @@ void ShearingBoxCC::PlanFluxMatch() {
     frreq_ = new MPI_Request[nfreq_];
   }
   for (int n=0; n<nfreq_; ++n) {fsreq_[n] = MPI_REQUEST_NULL; frreq_[n] = MPI_REQUEST_NULL;}
+  // one message per piece here (not per peer): on two GB200 nodes the merged
+  // messages made the band case 6% slower (large messages between nodes); tag (receiver lid,
+  // 40 + its piece number in the receiver's walk), as before S2d
+  fmsg_rank.clear(); fmsg_off.clear(); fmsg_size.clear(); fmsg_send.clear(); fmsg_tag.clear();
+  for (int n=0; n<nfpiece; ++n) {
+    const auto &p = pcs[n];
+    const bool rloc = (p[kRIdx] >= 0), sloc = (p[kSLoc] == 1);
+    if (rloc == sloc) continue;
+    fmsg_rank.push_back(rloc ? p[kSRank] : p[kRRank]);
+    fmsg_off.push_back(p[kOff]);
+    fmsg_size.push_back(nvar_*p[kNk]*p[kLen]);
+    fmsg_send.push_back(rloc ? 0 : 1);
+    const int lid = p[kRGid] - pm->gids_eachrank[p[kRRank]];
+    fmsg_tag.push_back(CreateBvals_MPI_Tag(lid, 40 + p[kQ]));
+    if (p[kQ] > 22) bad = true;
+  }
+  if (bad) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "shear flux matching: too many pieces for the MPI tags" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const int nmsg1 = static_cast<int>(fmsg_rank.size());
+  if (nfreq_ < nmsg1) {
+    delete [] fsreq_; delete [] frreq_;
+    nfreq_ = std::max(16, 2*nmsg1);
+    fsreq_ = new MPI_Request[nfreq_];
+    frreq_ = new MPI_Request[nfreq_];
+    for (int r=0; r<nfreq_; ++r) {fsreq_[r] = MPI_REQUEST_NULL; frreq_[r] = MPI_REQUEST_NULL;}
+  }
   bool no_errors = true;
-  for (int n=0; n<nmsg; ++n) {
+  for (int n=0; n<nmsg1; ++n) {
     if (fmsg_send[n] == 1) continue;
     if (MPI_Irecv(frecvflat.data() + fmsg_off[n], fmsg_size[n], MPI_ATHENA_REAL, fmsg_rank[n],
-                  CreateBvals_MPI_Tag(0, 40), comm_sbox, &(frreq_[n])) != MPI_SUCCESS) {
+                  fmsg_tag[n], comm_sbox, &(frreq_[n])) != MPI_SUCCESS) {
       no_errors = false;
     }
   }
@@ -297,7 +326,7 @@ TaskStatus ShearingBoxCC::SendFluxMatch(DvceFaceFld5D<Real> &flx) {
   for (size_t n=0; n<fmsg_rank.size(); ++n) {   // one message per peer
     if (fmsg_send[n] == 0) continue;
     if (MPI_Isend(fsendflat.data() + fmsg_off[n], fmsg_size[n], MPI_ATHENA_REAL, fmsg_rank[n],
-                  CreateBvals_MPI_Tag(0, 40), comm_sbox, &(fsreq_[n])) != MPI_SUCCESS) {
+                  fmsg_tag[n], comm_sbox, &(fsreq_[n])) != MPI_SUCCESS) {
       no_errors = false;
     }
   }

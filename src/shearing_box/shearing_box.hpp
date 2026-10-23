@@ -217,7 +217,7 @@ class ShearingBoxCC : public ShearingBox {
 #if MPI_PARALLEL_ENABLED
   MPI_Request *fsreq_ = nullptr, *frreq_ = nullptr;
   int nfreq_ = 0;
-  std::vector<int> fmsg_rank, fmsg_off, fmsg_size, fmsg_send;   // per peer
+  std::vector<int> fmsg_rank, fmsg_off, fmsg_size, fmsg_send, fmsg_tag;   // one per message
 #endif
   void PlanFluxMatch();                     // with the current yshear (InitRecv)
   TaskStatus SendFluxMatch(DvceFaceFld5D<Real> &flx);
