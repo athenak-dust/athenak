@@ -873,7 +873,9 @@ void DustGasDrag::FrameToBlock3D(const Real tpos) {
   if (shear3d && shear3d_route_fix && tpos >= 0.0) {
     const Real t0 = pmy_pack->pmesh->time;
     ysp = std::fmod(qshear*omega0*lt.lx*tpos, lt.ly);
-    dsh = ysp - std::fmod(qshear*omega0*lt.lx*t0, lt.ly);
+    // the difference unfolded: the folded values jump by ly when q Omega lx t passes a
+    // multiple of ly, which moved the crossing particles by a whole box in y (routing abort)
+    dsh = qshear*omega0*lt.lx*(tpos - t0);
   }
   if (!frame && dsh == 0.0) return;
   const bool sh = lt.shear;

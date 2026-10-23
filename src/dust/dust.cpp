@@ -987,6 +987,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     omega0 = 0.0;
     is_stratified = false;
   }
+  // Point particles crossing a shear-periodic x1 face take the shear offset of the
+  // time of their position (<dust>/shear_route_time, default true; 3-D, where the push advects y
+  // with the background shear).  The 3-D clouds keep their own key (cloud_shear_route_time).
+  if (is_shearing_box && pmy_pack->pmesh->three_d && !clouds3d &&
+      pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
+    shear_route_point = pin->GetOrAddBoolean("dust", "shear_route_time", true);
+  }
   // constant azimuthal acceleration on the particles (with the gas's const_accel2 it keeps
   // a radially boosted 2-D r-z shearing-box equilibrium, see the streaming_linear pgen)
   const_accel_phi = pin->GetOrAddReal("dust", "const_accel_phi", 0.0);
@@ -1358,6 +1365,54 @@ bool DustGasDrag::FirstMigrationActive(Driver *pdrive, int stage) const {
 bool DustGasDrag::SecondMigrationActive(Driver *pdrive, int stage) const {
   return (coupling == DustCoupling::hybrid &&
           hybrid_mode == HybridMode::split_be && stage == 2);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::ShearRouteTime, ShiftShearCrossings
+//! \brief AthenaK's particle routing (SetNewPrtclGID) moves a particle across a
+//! shear-periodic x1 face by the shear offset of pm->time = t^n, but the push has already moved it
+//! on.  PC2 and hybrid migrate once, after the full push: the move needs the offset of t^n + dt.
+//! imex migrates after every moving stage; a particle wrapped at stage s keeps moving in the
+//! following stages with the wrapped x, whose shear advection -q Omega x adds q Omega Lx w dt to its
+//! y (w_k = gam0_k w_(k-1) + beta_k over those stages, gam0_k + gam1_k = 1, w_s = 0), so the wrap
+//! itself needs the offset of t^n + (1 - w) dt (imex2+: t^n + dt/sqrt(2) at stage 1, t^n + dt at
+//! stage 2).  ShiftShearCrossings adds q Omega Lx (tau - t^n) to the y (and the RK register) of the
+//! particles the routing will move across an x1 face (the routing's own block-offset test).
+
+Real DustGasDrag::ShearRouteTime(Driver *pdrive, int stage) const {
+  const Real t = pmy_pack->pmesh->time, dt = pmy_pack->pmesh->dt;
+  if (coupling != DustCoupling::imex) return t + dt;
+  Real w = 0.0;
+  for (int k = stage + 1; k <= pdrive->nexp_stages; ++k) {
+    w = pdrive->gam0[k-1]*w + pdrive->beta[k-1];
+  }
+  return t + (1.0 - w)*dt;
+}
+
+void DustGasDrag::ShiftShearCrossings(const Real tau) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  const auto &ms = pmy_pack->pmesh->mesh_size;
+  // the difference of the offsets taken unfolded (small), not of the folded fmod values
+  const Real dsh = qshear*omega0*(ms.x1max - ms.x1min)*(tau - pmy_pack->pmesh->time);
+  if (npart == 0 || dsh == 0.0) return;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  const int gids = pmy_pack->gids;
+  const Real xa = ms.x1min, xb = ms.x1max;
+  par_for("dust_shear_route_time", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
+    const int m = pi(PGID,p) - gids;
+    const Real b0 = mbsize.d_view(m).x1min, b1 = mbsize.d_view(m).x1max, lx = b1 - b0;
+    const int ix = static_cast<int>((pr(IPX,p) - b0 + lx)/lx) - 1;   // as SetNewPrtclGID
+    const bool lo1 = (ix < 0) && (b0 < xa + 0.5*lx);
+    const bool hi1 = (ix > 0) && (b1 > xb - 0.5*lx);
+    if (lo1 || hi1) {
+      const Real d = hi1 ? dsh : -dsh;
+      pr(IPY,p) += d;
+      pr(IPY1,p) += d;
+    }
+  });
 }
 
 Real DustGasDrag::DragStep(Driver *pdrive) const {

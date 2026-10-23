@@ -160,6 +160,8 @@ TaskStatus DustGasDrag::UpdateParticleGIDs(Driver *pdrive, int stage) {
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
     FrameToBlock(pmy_pack->pmesh->time + pmy_pack->pmesh->dt);
   }
+  // point particles crossing a shear-periodic x1 face, the offset of their time
+  if (shear_route_point) {ShiftShearCrossings(ShearRouteTime(pdrive, stage));}
   return pmy_pack->ppart->NewGID(pdrive, stage);
 }
 
@@ -190,6 +192,7 @@ TaskStatus DustGasDrag::RecvParticles(Driver *pdrive, int stage) {
 
 TaskStatus DustGasDrag::UpdateParticleGIDs2(Driver *pdrive, int stage) {
   if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  if (shear_route_point) {ShiftShearCrossings(ShearRouteTime(pdrive, stage));}
   return pmy_pack->ppart->NewGID(pdrive, stage);
 }
 
