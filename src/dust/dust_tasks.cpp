@@ -14,6 +14,7 @@
 //! the explicit gas update and the boundary communication tail.
 
 #include <chrono>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <string>
@@ -42,7 +43,10 @@ void DustGasDrag::AssembleDustGasDragTasks(
   Hydro *phyd = pmy_pack->phydro;
 
   // assemble "before_timeintegrator" task list
-  id.gswitch = tl["before_timeintegrator"]->AddTask(&DustGasDrag::GammaSwitch,this,none);
+  // remove the particles that left through an outflow x3 face in the last cycle (no-op otherwise)
+  id.x3out   = tl["before_timeintegrator"]->AddTask(&DustGasDrag::RemoveOutflowParticles, this,
+                                                    none);
+  id.gswitch = tl["before_timeintegrator"]->AddTask(&DustGasDrag::GammaSwitch,this,id.x3out);
   // refinable clouds: split particles whose cloud lies on finer leaves before the cycle
   id.cloud   = tl["before_timeintegrator"]->AddTask(&DustGasDrag::RefineClouds, this,
                                                     id.gswitch);
@@ -401,6 +405,64 @@ TaskStatus DustGasDrag::ClearDep(Driver *pdrive, int stage) {
     tstat = psbox_us->ClearRecv();
   }
   return tstat;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::RemoveOutflowParticles
+//! \brief The particles that left through an outflow x3 face were given zero
+//! mass and parked at rest in their block by the particle routing (bvals_part.cpp); here, before
+//! the cycle (no exchange in flight), they are removed and the mass and count are added to the
+//! run totals (logged on rank 0, sums over the ranks, when any left).
+
+TaskStatus DustGasDrag::RemoveOutflowParticles(Driver *pdrive, int stage) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto *pb = ppar->pbval_part;
+  if (pb->x3bc_dust != 2) return TaskStatus::complete;
+  Kokkos::deep_copy(pb->x3_removed.h_view, pb->x3_removed.d_view);
+  double rm[2] = {pb->x3_removed.h_view(0), pb->x3_removed.h_view(1)};
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, rm, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  if (rm[1] == 0.0) return TaskStatus::complete;
+  const int npart = ppar->nprtcl_thispack;
+  if (pb->x3_removed.h_view(1) > 0.0) {
+    auto pr = ppar->prtcl_rdata;
+    auto pi = ppar->prtcl_idata;
+    const int nrdata = ppar->nrdata, nidata = ppar->nidata;
+    DvceArray1D<int> koff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "x3o_koff"), npart);
+    int nkeep = 0;
+    Kokkos::parallel_scan("x3o_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+      if (final) koff(p) = upd;
+      upd += (pr(IPM,p) > 0.0) ? 1 : 0;
+    }, nkeep);
+    DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata,
+                          std::max(1, nkeep));
+    DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata,
+                         std::max(1, nkeep));
+    Kokkos::parallel_for("x3o_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      if (pr(IPM,p) <= 0.0) return;
+      const int k = koff(p);
+      for (int c=0; c<nrdata; ++c) prn(c,k) = pr(c,p);
+      for (int c=0; c<nidata; ++c) pin(c,k) = pi(c,p);
+    });
+    ppar->prtcl_rdata = prn;
+    ppar->prtcl_idata = pin;
+    ppar->nprtcl_thispack = nkeep;
+    pmy_pack->pmesh->nprtcl_thisrank = nkeep;
+    pmy_pack->pmesh->nprtcl_eachrank[global_variable::my_rank] = nkeep;
+  }
+  x3_outflow_mass += rm[0];
+  x3_outflow_count += static_cast<long long>(rm[1] + 0.5);
+  Kokkos::deep_copy(pb->x3_removed.d_view, 0.0);
+  if (global_variable::my_rank == 0) {
+    std::cout << std::setprecision(17) << "# dust x3 outflow: cycle " << pmy_pack->pmesh->ncycle << " removed "
+              << static_cast<long long>(rm[1] + 0.5) << " particles, mass " << rm[0]
+              << "; total " << x3_outflow_count << " particles, mass " << x3_outflow_mass
+              << std::endl;
+  }
+  return TaskStatus::complete;
 }
 
 } // namespace dust

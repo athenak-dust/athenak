@@ -135,6 +135,7 @@ void WriteBASnapshot(Mesh *pm) {
 
 bool ba_fields_ = false;
 bool ba_history_ = false;
+bool dust_moments_hist_ = false;   // msum, mvx, mvz, mz2 columns in the user history
 int ba_field_number_ = 0;
 bool ba_geom_written_ = false;   // the geometry file is written with the first field file
 int ba_geom_seq_ = -1;           // mesh update sequence of the geometry last written
@@ -1052,6 +1053,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     std::exit(EXIT_FAILURE);
   }
   ba_history_ = pin->GetOrAddBoolean("problem", "ba_history", false);
+  dust_moments_hist_ = pin->GetOrAddBoolean("problem", "dust_moments_hist", false);
   // several ranks: fields of the canonical TSC deposit on a uniform mesh (WriteBAFieldsGlobal), or
   // of refinable clouds with <dust>/experimental_mpi (2026-10-21, WriteBAFields); not ba_history
   const bool fields_mpi = dust_active && !ba_history_ &&
@@ -1298,6 +1300,21 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       u0(m,IM1,k,j,i) = rho*v;
       u0(m,IM2,k,j,i) = 0.0;
       u0(m,IM3,k,j,i) = 0.0;
+    });
+  }
+
+  // <problem>/stratified_dust: the hydrostatic gas (also without dust, as a control);
+  // the dust part follows the particle set-up below
+  if (pin->GetOrAddBoolean("problem", "stratified_dust", false) && three_d &&
+      pin->GetOrAddBoolean("shearing_box", "stratified", false)) {
+    const Real hgas = pmbp->phydro->peos->eos_data.iso_cs/omega0;
+    const int ks0 = indcs.ks, nz3 = indcs.nx3;
+    auto &mbs = pmbp->pmb->mb_size;
+    par_for("strat_gas", DevExeSpace(),0,(nmb-1),0,(n3-1),0,(n2-1),0,(n1-1),
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real z = CellCenterX(k - ks0, nz3, mbs.d_view(m).x3min, mbs.d_view(m).x3max);
+      const Real g = exp(-0.5*z*z/(hgas*hgas));
+      for (int v=IDN; v<=IM3; ++v) u0(m,v,k,j,i) *= g;
     });
   }
 
@@ -1613,6 +1630,32 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     std::exit(EXIT_SUCCESS);
   }
 
+  // S3c: <problem>/stratified_dust (3-D shearing box with <shearing_box>/stratified):
+  // isothermal hydrostatic gas rho0 exp(-z^2/2H^2), H = cs/omega0, the velocities of the set-up
+  // above (NSH, zero for etavk = 0), dust masses times exp(-z^2/2 Hp^2) (<problem>/dust_hp,
+  // default H: the dust-to-gas ratio of the set-up everywhere), <problem>/dust_vz0 added to vz
+  if (pin->GetOrAddBoolean("problem", "stratified_dust", false)) {
+    if (!three_d || !pin->GetOrAddBoolean("shearing_box", "stratified", false) || cloud_root_random) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "stratified_dust: 3-D, <shearing_box>/stratified = true, lattice or random "
+                << "placement" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const Real hgas = pmbp->phydro->peos->eos_data.iso_cs/omega0;
+    const Real hp = pin->GetOrAddReal("problem", "dust_hp", hgas);
+    const Real vz0 = pin->GetOrAddReal("problem", "dust_vz0", 0.0);
+    auto &prs = ppar->prtcl_rdata;
+    par_for("strat_dust", DevExeSpace(), 0, ppar->nprtcl_thispack-1, KOKKOS_LAMBDA(const int p) {
+      const Real z = prs(IPZ,p);
+      prs(IPM,p) *= exp(-0.5*z*z/(hp*hp));
+      prs(IPVZ,p) += vz0;
+    });
+    if (global_variable::my_rank == 0) {
+      std::cout << "# stratified dust: H = " << hgas << ", Hp = " << hp << ", vz0 = " << vz0
+                << std::endl;
+    }
+  }
+
   // two cold streams along x2 for the multi-stream regrid test; the
   // particles below the midplane get +two_stream_v added to their x2 velocity, the others
   // two_stream_v_upper (default -two_stream_v) (2-D lattice or random placement)
@@ -1840,10 +1883,38 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     pdata->hdata[3*s+1] = sp;
     pdata->hdata[3*s+2] = sn;
   }
+  if (dust_moments_hist_) {   // all species: sum m, m vx, m vz, m z^2
+    int h = pdata->nhist;
+    if (h + 4 > NHISTORY_VARIABLES) {
+      std::cerr << "dust_moments_hist: too many history columns" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const char *labels[4] = {"msum", "mvx", "mvz", "mz2"};
+    for (int c=0; c<4; ++c) pdata->label[h+c] = labels[c];
+    Real s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    Kokkos::parallel_reduce("dust_mom_hist",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
+    KOKKOS_LAMBDA(const int &p, Real &a0, Real &a1, Real &a2, Real &a3) {
+      const Real m = pr(IPM,p);
+      a0 += m; a1 += m*pr(IPVX,p); a2 += m*pr(IPVZ,p); a3 += m*pr(IPZ,p)*pr(IPZ,p);
+    }, Kokkos::Sum<Real>(s0), Kokkos::Sum<Real>(s1), Kokkos::Sum<Real>(s2),
+       Kokkos::Sum<Real>(s3));
+    pdata->hdata[h] = s0; pdata->hdata[h+1] = s1; pdata->hdata[h+2] = s2; pdata->hdata[h+3] = s3;
+    pdata->nhist = h + 4;
+    // with <dust>/x3_ghost_deposit = drop: the momentum of the dropped back-reaction deposits
+    const auto &ds = pm->pmb_pack->pdust->pbval_dm->dropped_sum;
+    if (ds.size() == 3 && pdata->nhist + 3 <= NHISTORY_VARIABLES) {
+      const char *dl[3] = {"dropmx", "dropmy", "dropmz"};
+      for (int c=0; c<3; ++c) {
+        pdata->label[pdata->nhist + c] = dl[c];
+        pdata->hdata[pdata->nhist + c] = static_cast<Real>(ds[c]);
+      }
+      pdata->nhist += 3;
+    }
+  }
   if (ba_history_) {
     // mass-weighted dust moments (all species) and the cumulative cloud
     // machinery counters; the merge passes themselves are in cloud_merge_log.txt
-    int h = 3*nsout;
+    int h = pdata->nhist;   // after any columns above (3*nsout without them)
     if (h + 14 > NHISTORY_VARIABLES) {
       std::cerr << "BA history: too many species for the history columns" << std::endl;
       std::exit(EXIT_FAILURE);

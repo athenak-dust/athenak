@@ -56,6 +56,7 @@ struct Geo {
   std::int64_t N[3] = {1, 1, 1};    // the domain in units of the finest level
   int nmbroot[3] = {1, 1, 1};
   bool shear = false;
+  int x3mode = 0;     // 0 periodic x3, 1 fold at the physical x3 faces, 2 drop
 };
 
 BlkR MakeBlk(Mesh *pm, const Geo &g, const int gid) {
@@ -107,6 +108,12 @@ void Overlaps(const Geo &g, const BlkR &s, const BlkR &t, const int d, const int
   std::int64_t a = a0, b = b0;
   if (mode == 1) {           // x1 beyond a shear face: the opposite face
     if (a < 0) {a += N; b += N;} else {a -= N; b -= N;}
+  } else if (d == 2 && g.x3mode != 0) {   // a physical x3 face
+    if (a < 0 || a >= N) {
+      if (g.x3mode == 2) return;          // dropped
+      if (a < 0) {const std::int64_t t = a; a = -b; b = -t;}           // mirror about 0
+      else {const std::int64_t t = a; a = 2*N - b; b = 2*N - t;}       // mirror about N
+    }
   } else {                   // ordinary periodic wrap (one image: the box is inside [0,N))
     if (a < 0) {a += N; b += N;} else if (a >= N) {a -= N; b -= N;}
   }
@@ -204,8 +211,9 @@ struct TEnt {int tflat; int sgid; int scell; int sref; double w;};
 //----------------------------------------------------------------------------------------
 // DepRemapPlan constructor
 
-DepRemapPlan::DepRemapPlan(MeshBlockPack *pp, bool shear_x1, Real qshear, Real omega0) :
-    pmy_pack(pp), shear_x1_(shear_x1), qshear_(qshear), omega0_(omega0) {
+DepRemapPlan::DepRemapPlan(MeshBlockPack *pp, bool shear_x1, Real qshear, Real omega0,
+                           int x3mode) :
+    pmy_pack(pp), shear_x1_(shear_x1), x3mode_(x3mode), qshear_(qshear), omega0_(omega0) {
   BuildStatic();
 }
 
@@ -262,6 +270,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
              (static_cast<std::int64_t>(1) << (g.R - g.root));
   }
   g.shear = shear_x1_;
+  g.x3mode = x3mode_;
   const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
   const int ncell = g.nc[0]*g.nc[1]*g.nc[2];
   const int me = global_variable::my_rank;
@@ -321,9 +330,11 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
       spairs.push_back(std::move(sp));
     }
   }
-  // every ghost cell of the part covered once
+  // every ghost cell of the part covered once (dropped cells beyond a physical x3 face: none)
   int nbad = 0;
   double worst = 0.0;
+  std::vector<int> dcell;
+  std::vector<double> dvol;
   for (int sm=0; sm<nmb; ++sm) {
     const BlkR s = MakeBlk(pm, g, gids + sm);
     const double svol = static_cast<double>(s.sc)*static_cast<double>(s.sc)*
@@ -335,6 +346,15 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
       const std::int64_t a0 = s.lo[0] + (i - g.ng)*s.sc;
       const bool beyond = g.shear && (a0 < 0 || a0 >= g.N[0]);
       if ((part == 1) != beyond) continue;
+      const std::int64_t c0 = s.lo[2] + (k - g.ng)*s.sc;
+      if (g.x3mode == 2 && (c0 < 0 || c0 >= g.N[2])) {   // dropped: recorded, not covered
+        if (part == 0) {
+          dcell.push_back(sm*ncell + (k*g.nc[1] + j)*g.nc[0] + i);
+          const auto &sz = pmy_pack->pmb->mb_size.h_view(sm);
+          dvol.push_back(sz.dx1*sz.dx2*sz.dx3);
+        }
+        continue;
+      }
       const double c = cov[static_cast<std::size_t>(sm)*ncell + (k*g.nc[1] + j)*g.nc[0] + i];
       const double err = std::fabs(c - svol)/svol;
       worst = std::max(worst, err);
@@ -421,6 +441,16 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
   map.ent_src = DvceArray1D<int>("dep_ent_src", std::max(1, map.nent));
   map.ent_w = DvceArray1D<Real>("dep_ent_w", std::max(1, map.nent));
   map.send_cell = DvceArray1D<int>("dep_send_cell", std::max(1, map.nsend));
+  map.ndrop = static_cast<int>(dcell.size());
+  map.drop_cell = DvceArray1D<int>("dep_drop_cell", std::max(1, map.ndrop));
+  map.drop_vol = DvceArray1D<Real>("dep_drop_vol", std::max(1, map.ndrop));
+  {
+    auto hc = Kokkos::create_mirror_view(map.drop_cell);
+    auto hv = Kokkos::create_mirror_view(map.drop_vol);
+    for (int q=0; q<map.ndrop; ++q) {hc(q) = dcell[q]; hv(q) = static_cast<Real>(dvol[q]);}
+    Kokkos::deep_copy(map.drop_cell, hc);
+    Kokkos::deep_copy(map.drop_vol, hv);
+  }
   auto h_tgt = Kokkos::create_mirror_view(map.seg_tgt);
   auto h_ptr = Kokkos::create_mirror_view(map.seg_ptr);
   auto h_src = Kokkos::create_mirror_view(map.ent_src);
@@ -552,4 +582,32 @@ void MeshBoundaryValuesDep::GeneralApply(DvceArray5D<Real> &a, const DepRemapMap
       a(m,v,k,j,i) += sum;
     }
   });
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn MeshBoundaryValuesDep::GeneralDropRecord
+//! \brief The deposits in the ghost cells beyond a physical x3 face that are dropped
+//! (x3 mode drop), integrated over their volumes and added to dropped_sum (per variable).
+
+void MeshBoundaryValuesDep::GeneralDropRecord(DvceArray5D<Real> &a, const DepRemapMap &map) {
+  if (map.ndrop == 0) return;   // (fold mode, periodic x3, or no block at a dropped face)
+  const int nvar = a.extent_int(1);
+  if (static_cast<int>(dropped_sum.size()) != nvar) dropped_sum.assign(nvar, 0.0);
+  const int nc1 = a.extent_int(4), nc2 = a.extent_int(3), nc3 = a.extent_int(2);
+  const int ncell = nc1*nc2*nc3;
+  auto cells = map.drop_cell;
+  auto vol = map.drop_vol;
+  for (int v=0; v<nvar; ++v) {
+    double sum = 0.0;
+    Kokkos::parallel_reduce("dep_gen_drop", Kokkos::RangePolicy<>(DevExeSpace(), 0, map.ndrop),
+    KOKKOS_LAMBDA(const int e, double &ss) {
+      const int c = cells(e);
+      const int m = c/ncell;
+      int r = c - m*ncell;
+      const int k = r/(nc2*nc1); r -= k*(nc2*nc1);
+      const int j = r/nc1, i = r - j*nc1;
+      ss += static_cast<double>(a(m,v,k,j,i)*vol(e));
+    }, Kokkos::Sum<double>(sum));
+    dropped_sum[v] += sum;
+  }
 }
