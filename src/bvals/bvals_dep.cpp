@@ -67,7 +67,8 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
                          pin->GetOrAddBoolean("dust", "experimental_3d_shear_plain", false);
     // (or the sheared image, in the leaf traversal)
     const bool shear3d = clouds3d &&
-        pp->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
+        (pp->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic ||
+         pp->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic);   // (physical x3 faces)
     if (!(experimental_smr && (!(pp->pmesh->adaptive) || experimental_amr) &&
           (pp->pmesh->two_d || clouds3d) &&
           (pp->pmesh->strictly_periodic || plain3d || shear3d) &&

@@ -58,6 +58,13 @@ struct LeafTraversal3D {
   // the translated box of m widened by sreach(m) finest cells
   bool shear = false;
   Real ysh = 0.0;
+  // physical x3 faces (x3per false; x3bc 1 reflect, 2 outflow for the
+  // particles).  No periodic images in x3; every query box is cut at the faces; the part of a
+  // support beyond a face is mirrored back into the domain (ForEach: the cloud mirrored about
+  // the face, its x3 lobe swapped), so the weights still add up to one: the deposit folds back,
+  // the gather is its transpose (as for the fold of the ghost deposits)
+  bool x3per = true;
+  int x3bc = 0;
   DvceArray2D<int> nsnb;
   DvceArray3D<int> snb;
   DvceArray1D<int> sreach;
@@ -90,18 +97,39 @@ struct LeafTraversal3D {
     x1 -= lx*n1;
     if (shear) x2 += n1*ysh;
     x2 -= ly*round((x2 - cy)*ily);
-    x3 -= lz*round((x3 - cz)*ilz);
+    if (x3per) x3 -= lz*round((x3 - cz)*ilz);
     return static_cast<int>(n1);
+  }
+  // the x3 lobe code mirrored about an x3 face (1 <-> 2)
+  KOKKOS_INLINE_FUNCTION
+  static int MirrorLobe(const int l) {return (l == 1 || l == 2) ? 3 - l : l;}
+  // a cell range [ka, kb] cut at the physical x3 faces
+  KOKKOS_INLINE_FUNCTION
+  void ClipZ(int &ka, int &kb) const {
+    if (x3per) return;
+    ka = (ka < 0) ? 0 : ka; kb = (kb > nfine3 - 1) ? nfine3 - 1 : kb;
   }
   // a position into the domain (every direction); with shear-periodic x1 a wrap in x1 by n domain
   // lengths moves x2 by n ysh (the rule of the particle routing)
+  // Physical x3 faces: a position beyond a face is mirrored into the domain; returns 1 then
+  // (the caller swaps the x3 lobe and, at a reflecting face, flips vz), 0 otherwise.
   KOKKOS_INLINE_FUNCTION
-  void WrapPos(Real &x1, Real &x2, Real &x3) const {
+  int WrapPos(Real &x1, Real &x2, Real &x3) const {
     const Real w1 = LT::Wrap(x1, x1min, x1max);
     if (shear && w1 != x1) x2 += round((x1 - w1)*ilx)*ysh;
     x1 = w1;
     x2 = LT::Wrap(x2, x2min, x2max);
-    x3 = LT::Wrap(x3, x3min, x3max);
+    if (x3per) {
+      x3 = LT::Wrap(x3, x3min, x3max);
+      return 0;
+    }
+    if (x3 < x3min) {x3 = 2.0*x3min - x3; return 1;}
+    if (x3 >= x3max) {
+      x3 = 2.0*x3max - x3;
+      if (x3 >= x3max) x3 = x3max - 1.0e-12*lz;
+      return 1;
+    }
+    return 0;
   }
   // the side of an x1 face a finest-cell range [ia, ib] crosses (-1: none; 0 inner; 1 outer)
   KOKKOS_INLINE_FUNCTION
@@ -142,6 +170,10 @@ struct LeafTraversal3D {
       if (mode != 0) {   // only the image without an x1 shift
         if (kx0 > 0 || kx1 < 0) continue;
         kx0 = 0; kx1 = 0;
+      }
+      if (!x3per) {   // physical x3 faces: no image in x3
+        if (kz0 > 0 || kz1 < 0) continue;
+        kz0 = 0; kz1 = 0;
       }
       for (int kz=kz0; kz<=kz1; ++kz) {
         for (int ky=ky0; ky<=ky1; ++ky) {
@@ -229,17 +261,18 @@ struct LeafTraversal3D {
   bool NeedGlobal(const int m, const int ia, const int ib, const int ja, const int jb,
                   const int ka, const int kb, const int r, const int mode = 0) const {
     // modes 1-3 (shear-periodic x1, one part of a support): the box in the domain in x1
-    int a1 = ia - r, b1 = ib + r;
+    int a1 = ia - r, b1 = ib + r, c1 = ka - r, d1 = kb + r;
     if (mode != 0) {a1 = (a1 < 0) ? 0 : a1; b1 = (b1 > nfine1 - 1) ? nfine1 - 1 : b1;}
-    if (mode >= 2) return !InShearBox(m, mode, a1, b1, ja - r, jb + r, ka - r, kb + r);
+    ClipZ(c1, d1);   // (physical x3 faces)
+    if (mode >= 2) return !InShearBox(m, mode, a1, b1, ja - r, jb + r, c1, d1);
     int x0, x1, y0, y1, z0, z1;
     ImageRect(m, 0, 0, 0, 0, x0, x1, y0, y1, z0, z1);
     const int s1 = safe(m, 0), s2 = safe(m, 1), s3 = safe(m, 2);
     if (x0 - s1 <= a1 && x1 + s1 > b1 && y0 - s2 <= ja - r && y1 + s2 > jb + r &&
-        z0 - s3 <= ka - r && z1 + s3 > kb + r) {
+        z0 - s3 <= c1 && z1 + s3 > d1) {
       return false;
     }
-    return !Covered(m, a1, b1, ja - r, jb + r, ka - r, kb + r, 0, 0, false, mode);
+    return !Covered(m, a1, b1, ja - r, jb + r, c1, d1, 0, 0, false, mode);
   }
 
   // candidate blocks of a support that does not lie inside the anchor block (see
@@ -267,8 +300,9 @@ struct LeafTraversal3D {
     }
     const int ja = static_cast<int>(floor((lo2 - x2min)/fine_dx2));
     const int jb = static_cast<int>(ceil((hi2 - x2min)/fine_dx2)) - 1;
-    const int ka = static_cast<int>(floor((lo3 - x3min)/fine_dx3));
-    const int kb = static_cast<int>(ceil((hi3 - x3min)/fine_dx3)) - 1;
+    int ka = static_cast<int>(floor((lo3 - x3min)/fine_dx3));
+    int kb = static_cast<int>(ceil((hi3 - x3min)/fine_dx3)) - 1;
+    ClipZ(ka, kb);   // (physical x3 faces: the part in the domain)
     auto meets = [&](const int b, const int sx, const int sy, const int sz) {
       const Real bx0 = box(b, 0) - sx*lx, by0 = box(b, 1) - sy*ly, bz0 = box(b, 2) - sz*lz;
       return !(hi1 <= bx0 || lo1 >= bx0 + nx1*box(b, 3) ||
@@ -298,6 +332,10 @@ struct LeafTraversal3D {
       if (mode != 0) {   // only the image without an x1 shift
         if (kx0 > 0 || kx1 < 0) continue;
         kx0 = 0; kx1 = 0;
+      }
+      if (!x3per) {   // physical x3 faces: no image in x3
+        if (kz0 > 0 || kz1 < 0) continue;
+        kz0 = 0; kz1 = 0;
       }
       const int nimg = (kx1 >= kx0 && ky1 >= ky0 && kz1 >= kz0)
                      ? (kx1 - kx0 + 1)*(ky1 - ky0 + 1)*(kz1 - kz0 + 1) : 0;
@@ -336,26 +374,41 @@ struct LeafTraversal3D {
     const bool point = kMoments && (code & T::kCloudGatherPoint) != 0;
     const Real h1 = ldexp(root_dx1, -lev), ih1 = ldexp(iroot_dx1, lev);
     const Real h2 = ldexp(root_dx2, -lev), ih2 = ldexp(iroot_dx2, lev);
+    const Real h3 = ldexp(root_dx3, -lev), ih3 = ldexp(iroot_dx3, lev);
     LT::Shape s1 = LT::MakeShape(x1, h1, ih1, T::CloudLobe1(code), point);
     LT::Shape s2 = LT::MakeShape(x2, h2, ih2, T::CloudLobe2(code), point);
-    const LT::Shape s3 = LT::MakeShape(x3, ldexp(root_dx3, -lev), ldexp(iroot_dx3, lev),
-                                       T::CloudLobe3(code), point);
-    int npart = 1, side = 0;
-    if (shear && (s1.lo < x1min || s1.hi > x1max)) {npart = 2; side = (s1.hi > x1max) ? 1 : 0;}
+    LT::Shape s3 = LT::MakeShape(x3, h3, ih3, T::CloudLobe3(code), point);
+    // the parts: across a shear-periodic x1 face the translated cloud, across a
+    // physical x3 face the mirrored one, both: four
+    int npx = 1, side = 0, npz = 1, zside = 0;
+    if (shear && (s1.lo < x1min || s1.hi > x1max)) {npx = 2; side = (s1.hi > x1max) ? 1 : 0;}
+    if (!x3per && (s3.lo < x3min || s3.hi > x3max)) {npz = 2; zside = (s3.hi > x3max) ? 1 : 0;}
     Real wsum = 0.0;
     bool global_any = false;
 #pragma unroll 1
-    for (int part=0; part<npart; ++part) {
-      int mode = (npart == 2) ? 1 : 0;
-      Real yp = x2;   // the y of this part's cloud
-      if (part == 1) {
-        const Real sg = (side == 1) ? 1.0 : -1.0;
-        yp = x2 + sg*ysh;
-        s1 = LT::MakeShape(x1 - sg*lx, h1, ih1, T::CloudLobe1(code), point);
+    for (int part=0; part<npx*npz; ++part) {
+      const int pxp = part % npx, pzp = part/npx;
+      int mode = (npx == 2) ? 1 : 0;
+      Real yp = x2, zp = x3;   // the y and z of this part's cloud
+      if (part > 0) {
+        Real xq = x1;
+        if (pxp == 1) {
+          const Real sg = (side == 1) ? 1.0 : -1.0;
+          xq = x1 - sg*lx;
+          yp = x2 + sg*ysh;
+          mode = 2 + side;
+        }
+        int l3 = T::CloudLobe3(code);
+        if (pzp == 1) {
+          zp = 2.0*((zside == 1) ? x3max : x3min) - x3;
+          l3 = MirrorLobe(l3);
+        }
+        s1 = LT::MakeShape(xq, h1, ih1, T::CloudLobe1(code), point);
         s2 = LT::MakeShape(yp, h2, ih2, T::CloudLobe2(code), point);
-        mode = 2 + side;
+        s3 = LT::MakeShape(zp, h3, ih3, l3, point);
       }
-      const bool ycorr = kMoments && shear && (part == 1 || nw != 0);
+      const bool ycorr = kMoments && shear && (pxp == 1 || nw != 0);
+      const bool zcorr = kMoments && pzp == 1;
       const Real ax0 = box(m, 0), ay0 = box(m, 1), az0 = box(m, 2);
       const bool inside = (mode == 0 && s1.lo >= ax0 && s1.hi <= ax0 + nx1*box(m, 3) &&
                            s2.lo >= ay0 && s2.hi <= ay0 + nx2*box(m, 4) &&
@@ -410,6 +463,12 @@ struct LeafTraversal3D {
               LT::Cell<kMoments>(s3, f3, fn3, w3, g3);
               f3 = fn3;
               if (w3 == 0.0 && (!kMoments || g3 == 0.0)) continue;
+              // the mirror of this part against the caller's position (see above)
+              Real czk = 0.0;
+              if (zcorr) {
+                const Real zc = bz0 + (k + 0.5)*dz;
+                czk = (zp - zc) - T::MinImage(px3 - zc, lz);
+              }
               LT::Face f2 = LT::FaceAt<kMoments>(s2, by0 + j0*dy);
 #pragma unroll 1
               for (int j=j0; j<=j1; ++j) {
@@ -433,9 +492,10 @@ struct LeafTraversal3D {
                   wsum += w;
                   if constexpr (kMoments) {
                     const Real ga = (a == 0) ? g1[0] : ((a == 1) ? g1[1] : ((a == 2) ? g1[2] : g1[3]));
-                    const Real m1x = w23*ga, m1z = wa*w2*g3;
-                    Real m1y = wa*g2*w3;
+                    const Real m1x = w23*ga;
+                    Real m1y = wa*g2*w3, m1z = wa*w2*g3;
                     if (ycorr) m1y += cyj*w;
+                    if (zcorr) m1z += czk*w;
                     if (w == 0.0 && m1x == 0.0 && m1y == 0.0 && m1z == 0.0) continue;
                     function(row + a, w, m1x, m1y, m1z);
                   } else {
@@ -466,6 +526,7 @@ struct LeafTraversal3D {
   int Locate(const int ic_in, const int jc_in, const int kc_in, int *bout = nullptr) const {
     const int ic = ((ic_in % nfine1) + nfine1) % nfine1;
     const int jc = ((jc_in % nfine2) + nfine2) % nfine2;
+    if (!x3per && (kc_in < 0 || kc_in >= nfine3)) return -1;   // beyond a physical x3 face
     const int kc = ((kc_in % nfine3) + nfine3) % nfine3;
     for (int l=0; l<=nlev; ++l) {
       const int sh = nlev - l, w1 = nx1 << sh, w2 = nx2 << sh, w3 = nx3 << sh;
@@ -490,6 +551,10 @@ struct LeafTraversal3D {
             int *bout = nullptr) const {
     Real x1 = px1, x2 = px2, x3 = px3;
     Frame(m, x1, x2, x3);
+    if (!x3per) {   // (physical x3 faces: a point beyond a face mirrored into the domain)
+      if (x3 < x3min) x3 = 2.0*x3min - x3;
+      if (x3 >= x3max) x3 = fmin(2.0*x3max - x3, x3max - 1.0e-12*lz);
+    }
     // shear-periodic x1: a point beyond an x1 face into the domain, then the
     // shear neighbours of m
     int mode = 0;
@@ -583,6 +648,8 @@ struct LeafTraversal3D {
                     const int lev, bool *reach) const {
     int ia, ib, ja, jb, ka, kb;
     SupportBox(x1, x2, x3, f, lev, ia, ib, ja, jb, ka, kb);
+    // (physical x3 faces: the mirrored part lies inside the part in the domain)
+    ClipZ(ka, kb);
     const int side = ShearSide(ia, ib);
     if (side < 0) {
       return kAll ? AllAbove(m, ia, ib, ja, jb, ka, kb, lev, reach)
@@ -591,6 +658,7 @@ struct LeafTraversal3D {
     const Real sg = (side == 1) ? 1.0 : -1.0;
     int ia2, ib2, ja2, jb2, ka2, kb2;
     SupportBox(x1 - sg*lx, x2 + sg*ysh, x3, f, lev, ia2, ib2, ja2, jb2, ka2, kb2);
+    ClipZ(ka2, kb2);
     return AboveParts<kAll>(m, side, lev, reach, ia, ib, ja, jb, ka, kb, ia2, ib2, ja2, jb2, ka2,
                             kb2);
   }
@@ -645,18 +713,19 @@ struct LeafTraversal3D {
     const int K = static_cast<int>(floor((x3 - x3min)/(root_dx3/static_cast<Real>(1 << L))));
     if (reach != nullptr) *reach = true;
     const int side = ShearSide((I - B)*r, (I + B + 1)*r - 1);
+    int Ka = (K - B)*r, Kb = (K + B + 1)*r - 1;
+    ClipZ(Ka, Kb);   // (physical x3 faces)
     if (side < 0) {
       return !AnyAbove(m, (I - B)*r, (I + B + 1)*r - 1, (J - B)*r, (J + B + 1)*r - 1,
-                       (K - B)*r, (K + B + 1)*r - 1, L, reach);
+                       Ka, Kb, L, reach);
     }
     // across a shear-periodic x1 face: also the cells around the translated position
     const Real sg = (side == 1) ? 1.0 : -1.0;
     const int I2 = static_cast<int>(floor((x1 - sg*lx - x1min)/(root_dx1/static_cast<Real>(1 << L))));
     const int J2 = static_cast<int>(floor((x2 + sg*ysh - x2min)/(root_dx2/static_cast<Real>(1 << L))));
     return !AboveParts<false>(m, side, L, reach, (I - B)*r, (I + B + 1)*r - 1, (J - B)*r,
-                              (J + B + 1)*r - 1, (K - B)*r, (K + B + 1)*r - 1, (I2 - B)*r,
-                              (I2 + B + 1)*r - 1, (J2 - B)*r, (J2 + B + 1)*r - 1, (K - B)*r,
-                              (K + B + 1)*r - 1);
+                              (J + B + 1)*r - 1, Ka, Kb, (I2 - B)*r,
+                              (I2 + B + 1)*r - 1, (J2 - B)*r, (J2 + B + 1)*r - 1, Ka, Kb);
   }
 
   // ---- the cloud interface (LeafTraversal) --------------------------------------------

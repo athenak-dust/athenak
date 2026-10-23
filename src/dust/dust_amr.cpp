@@ -334,7 +334,9 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     const auto &bm = mbsz.d_view(m);
     const Real ex0 = bm.x1min - bb*bm.dx1, ex1 = bm.x1max + bb*bm.dx1;
     const Real ey0 = bm.x2min - bb*bm.dx2, ey1 = bm.x2max + bb*bm.dx2;
-    const Real ez0 = bm.x3min - bb*bm.dx3, ez1 = bm.x3max + bb*bm.dx3;
+    // (physical x3 faces: the buffer stops at the face)
+    const Real ez0 = lt3.x3per ? bm.x3min - bb*bm.dx3 : Kokkos::fmax(bm.x3min - bb*bm.dx3, lt3.x3min);
+    const Real ez1 = lt3.x3per ? bm.x3max + bb*bm.dx3 : Kokkos::fmin(bm.x3max + bb*bm.dx3, lt3.x3max);
     const Real tol = 1.0e-9*Kokkos::fmin(bm.dx1, Kokkos::fmin(bm.dx2, bm.dx3));
     // the received box of slot s
     const Real sdx1 = lt3.box(s,3), sdx2 = lt3.box(s,4), sdx3 = lt3.box(s,5);
@@ -344,7 +346,8 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     Real q = 0.0, vol = 0.0;
     int nbad = 0;
     const int oym = lt3.shear ? 2 : 1;   // (sheared images of x1: two more in x2)
-    for (int oz=-1; oz<=1; ++oz) {
+    const int ozm = lt3.x3per ? 1 : 0;   // (physical x3 faces: no image in x3)
+    for (int oz=-ozm; oz<=ozm; ++oz) {
       for (int oy=-oym; oy<=oym; ++oy) {
         for (int ox=-1; ox<=1; ++ox) {
           // (shear-periodic x1: an image shifted in x1 moves by -ox ysh in x2)
@@ -425,7 +428,13 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
   int nref = 0, nder = 0;
   for (int m=0; m<nmb; ++m) {
     const auto &sz = mbsz.h_view(m);
-    const Real want = (nx1 + 2*bb)*sz.dx1*(nx2 + 2*bb)*sz.dx2*(nx3 + 2*bb)*sz.dx3;
+    Real wz = (nx3 + 2*bb)*sz.dx3;   // (cut at physical x3 faces)
+    if (!pd->leaf_traversal3d.x3per) {
+      const Real lo = std::max(sz.x3min - bb*sz.dx3, pm->mesh_size.x3min);
+      const Real hi = std::min(sz.x3max + bb*sz.dx3, pm->mesh_size.x3max);
+      wz = hi - lo;
+    }
+    const Real want = (nx1 + 2*bb)*sz.dx1*(nx2 + 2*bb)*sz.dx2*wz;
     if (std::fabs(ah(m) - want) > 1.0e-9*want || bh(m) > 0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "3-D density trigger: the buffer of block " << m + mbs << " is not covered "

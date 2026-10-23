@@ -2703,13 +2703,15 @@ int DustGasDrag::MergeCloudsDevice3D() {
               const int s = s0 + k;
               Real cx = pr(IPX,p) + a[ja].off*e1, cy = pr(IPY,p) + b[jb].off*e2;
               Real cz = pr(IPZ,p) + cc[jc].off*e3;
-              lt.WrapPos(cx, cy, cz);   // (shear-periodic x1)
+              // (shear-periodic x1; beyond a physical x3 face: mirrored)
+              const int zmir = lt.WrapPos(cx, cy, cz);
               for (int c=0; c<nrdata; ++c) prn(c,s) = pr(c,p);
               for (int c=0; c<nidata; ++c) pin(c,s) = pi(c,p);
               prn(IPX,s) = cx; prn(IPX1,s) = cx; prn(IPY,s) = cy; prn(IPY1,s) = cy;
               prn(IPZ,s) = cz; prn(IPZ1,s) = cz;
               prn(IPM,s) = pr(IPM,p)*a[ja].frac*b[jb].frac*cc[jc].frac;
               pin(PLEV,s) = lev;
+              if (zmir && lt.x3bc == 1) {prn(IPVZ,s) = -prn(IPVZ,s); prn(IPVZ1,s) = -prn(IPVZ1,s);}
               const int leaf = lt.LeafOwner(cx, cy, cz, lt.Anchor(pin(PGID,s)));
               const int blk = (leaf < 0) ? lt.Anchor(pin(PGID,s)) : leaf/ncell123;
               pin(PGID,s) = gids + ((blk < lt.nmb) ? blk : lt.Anchor(pin(PGID,s)));
@@ -2831,6 +2833,8 @@ int DustGasDrag::MergeCloudsDevice3D() {
         // shear-periodic x1: no family across an x1 face (its members were wrapped
         // with the shear offset; the template does not hold there)
         if (lt.shear && (xc0 - ell1 < lt.x1min || xc0 + ell1 >= lt.x1max)) return;
+        // (nor across a physical x3 face: its members were mirrored)
+        if (!lt.x3per && (zc0 - ell3 < lt.x3min || zc0 + ell3 >= lt.x3max)) return;
         if (!mm.In(xc0, yc0, zc0, L, lt.Anchor(pi(PGID,c)))) return;
         const int sp = pi(PSP,c);
         const Real tau = (omega > 0.0) ? Kokkos::fmin(ts, 1.0/omega) : ts;
