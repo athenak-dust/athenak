@@ -42,14 +42,10 @@ struct HydroTaskIDs {
   TaskID flux;
   TaskID sendf;
   TaskID recvf;
-  TaskID sendf_shr;  // x1 fluxes across the shear-periodic boundary
-  TaskID recvf_shr;
   TaskID rkupdt;
   TaskID srctrms;
   TaskID sendu_oa;
   TaskID recvu_oa;
-  TaskID sendf_oa;   // remap fluxes through x2 faces with a level change
-  TaskID recvf_oa;
   TaskID restu;
   TaskID sendu;
   TaskID recvu;
@@ -134,10 +130,6 @@ class Hydro {
   TaskStatus HydroSrcTerms(Driver *d, int stage);
   TaskStatus SendU_OA(Driver *d, int stage);
   TaskStatus RecvU_OA(Driver *d, int stage);
-  TaskStatus SendFlx_OA(Driver *d, int stage);
-  TaskStatus SendFlx_Shr(Driver *d, int stage);
-  TaskStatus RecvFlx_Shr(Driver *d, int stage);
-  TaskStatus RecvFlx_OA(Driver *d, int stage);
   TaskStatus RestrictU(Driver *d, int stage);
   TaskStatus SendU(Driver *d, int stage);
   TaskStatus RecvU(Driver *d, int stage);

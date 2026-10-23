@@ -1069,6 +1069,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // shear-periodic remap of the u* radial ghost zones (3D shearing box only)
   if (shear_x1 && pmy_pack->pmesh->three_d) {
     psbox_us = new ShearingBoxCC(pmy_pack, pin, 3);
+    // Collected u* ghost zones (S2c): the u* prolongation stays out of the slots
+    // across the shear-periodic faces, as for the gas
+    if (psbox_us->face_levels) pbval_us->skip_shear_x1_prol = true;
     // With refinement also the coarse u* array (cdummy), before its prolongation
     if (pmy_pack->pmesh->multilevel) {
       psbox_us->coarse_on = true;
