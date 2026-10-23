@@ -34,6 +34,8 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   qshear = pin->GetReal("shearing_box","qshear");
   omega0 = pin->GetReal("shearing_box","omega0");
   is_stratified = pin->GetOrAddBoolean("shearing_box","stratified",false);
+  // (S2b) blocks on the x1 faces may change level along x2
+  face_levels = pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", false);
 
   BuildBoundaryLists();
   CheckLevelsAlongX2();
@@ -44,6 +46,7 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
 #if MPI_PARALLEL_ENABLED
   // create unique communicators for shearing box
   MPI_Comm_dup(MPI_COMM_WORLD, &comm_sbox);
+  MPI_Comm_dup(MPI_COMM_WORLD, &comm_pull);
 #endif
 }
 
@@ -109,6 +112,7 @@ void ShearingBox::BuildBoundaryLists() {
 //! are allowed: their data reach the fine block's coarse array, which is sheared as well.
 
 void ShearingBox::CheckLevelsAlongX2() const {
+  if (face_levels) return;   // the collected ghost zones need no uniform columns
   Mesh *pm = pmy_pack->pmesh;
   if (!(pm->multilevel && pm->three_d &&
         pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic)) return;

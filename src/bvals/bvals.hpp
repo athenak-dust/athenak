@@ -39,6 +39,20 @@ class Particles;
 //! \brief calculate an MPI tag for boundary buffer communications.  Note maximum size of
 //! lid that can be encoded is set by (NUM_BITS_LID) macro defined in athena.hpp.
 //! The convention in AthenaK is lid and bufid are both for the *receiving* process.
+//! \fn int ShearSlotOx1(int n)
+//! \brief x1 direction (-1, 0, +1) of neighbour slot n (NeighborIndex layout, 3-D)
+KOKKOS_INLINE_FUNCTION
+int ShearSlotOx1(const int n) {
+  if (n < 4) return -1;
+  if (n < 8) return 1;
+  if (n < 16) return 0;
+  if (n < 24) return ((n - 16) & 2) ? 1 : -1;
+  if (n < 32) return 0;
+  if (n < 40) return ((n - 32) & 2) ? 1 : -1;
+  if (n < 48) return 0;
+  return ((n - 48) & 1) ? 1 : -1;
+}
+
 inline int CreateBvals_MPI_Tag(int lid, int bufid) {
   return (bufid << (NUM_BITS_LID)) | lid;
 }
@@ -138,6 +152,9 @@ class MeshBoundaryValues {
   // neighbour of the unsheared periodic topology is not the sheared one; the uniform shearing box
   // does no flux correction there either).  Set by Hydro with mesh refinement in 3-D.
   bool skip_shear_x1_flux=false;
+  // No prolongation or same-level restriction through neighbour slots across a
+  // shear-periodic x1 face: the shearing box collects those ghost zones itself
+  bool skip_shear_x1_prol = false;
   MeshBoundaryValues(MeshBlockPack *ppack, ParameterInput *pin, bool z4c);
   virtual ~MeshBoundaryValues();
 
