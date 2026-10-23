@@ -239,7 +239,7 @@ void ShearingBoxCC::PlanFluxMatch() {
   for (int n=0; n<nmsg; ++n) {
     if (fmsg_send[n] == 1) continue;
     if (MPI_Irecv(frecvflat.data() + fmsg_off[n], fmsg_size[n], MPI_ATHENA_REAL, fmsg_rank[n],
-                  40, comm_sbox, &(frreq_[n])) != MPI_SUCCESS) {
+                  CreateBvals_MPI_Tag(0, 40), comm_sbox, &(frreq_[n])) != MPI_SUCCESS) {
       no_errors = false;
     }
   }
@@ -297,7 +297,7 @@ TaskStatus ShearingBoxCC::SendFluxMatch(DvceFaceFld5D<Real> &flx) {
   for (size_t n=0; n<fmsg_rank.size(); ++n) {   // one message per peer
     if (fmsg_send[n] == 0) continue;
     if (MPI_Isend(fsendflat.data() + fmsg_off[n], fmsg_size[n], MPI_ATHENA_REAL, fmsg_rank[n],
-                  40, comm_sbox, &(fsreq_[n])) != MPI_SUCCESS) {
+                  CreateBvals_MPI_Tag(0, 40), comm_sbox, &(fsreq_[n])) != MPI_SUCCESS) {
       no_errors = false;
     }
   }
