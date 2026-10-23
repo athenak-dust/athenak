@@ -1551,6 +1551,8 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   auto rnow = [&]() {if (rlog) Kokkos::fence(); return RClock::now();};
   auto r0 = rnow();
   BuildRefinableCloudTransfer(pin);
+  // Shear-periodic x1: the particle routing across the radial faces on the new mesh
+  if (ppar->pbval_part->shear_periodic_x1) ppar->pbval_part->BuildShearMaps();
   auto r1 = rnow(), r2 = r1, r3 = r1;
   // Several ranks: the particles follow their blocks to the ranks that hold
   // them on the new mesh (load balancing may move blocks anywhere)
