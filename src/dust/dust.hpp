@@ -1803,6 +1803,14 @@ class DustGasDrag {
   // of the slots, the slots near the inner / outer x1 face and the reach of every local block
   bool shear3d = false;
   bool shear3d_route_fix = true;   // <dust>/cloud_shear_route_time (test: false = AthenaK's time)
+  // the same for point particles (old OO, uniform / static / AMR) in a 3-D shearing
+  // box, <dust>/shear_route_time (default true; false = AthenaK's time).  ShearRouteTime: the time
+  // whose shear offset a particle crossing an x1 face at this migration needs (the end of the step
+  // for PC2 / hybrid; for imex the stages still to come move it with the sheared x, see dust.cpp);
+  // ShiftShearCrossings adds the difference to the offset of pm->time used by the routing
+  bool shear_route_point = false;
+  Real ShearRouteTime(Driver *pdrive, int stage) const;
+  void ShiftShearCrossings(const Real tau);
   bool shear3d_lists_ok_ = false;
   std::vector<std::array<int, 6>> shear3d_fbox_;
   std::vector<int> shear3d_face_[2], shear3d_reach_;
