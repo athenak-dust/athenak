@@ -1669,6 +1669,7 @@ class DustGasDrag {
   // Boundary communication objects
   MeshBoundaryValuesDep *pbval_qp;  // additive exchange of (Q,P) ghost deposits
   MeshBoundaryValuesDep *pbval_dm;  // additive exchange of PMBR ghost deposits
+  DepRemapPlan *dep_plan = nullptr;  // general 3-D deposit remap (shared)
   MeshBoundaryValuesCC  *pbval_us;  // copy exchange to fill u* ghost zones
   ShearingBoxCC *psbox_us = nullptr;  // shear-periodic remap of u* x1 ghost zones (3D)
   MeshBoundaryValuesCC *pbval_solver_copy = nullptr;
@@ -1716,6 +1717,11 @@ class DustGasDrag {
   // of its clouds to each child, a derefined parent takes the sum of its children).
   Real lb_cloud_weight = 4.0;   // Rixin: default 4
   std::vector<float> lb_old_counts;
+  // 3-D owner_overlap on a dynamic mesh: the new block of every old block (8 entries:
+  // the child by octant of the position; one value repeated if not refined) and the old block
+  // centres, from RegridCosts (the old mesh), for RouteOO3D after the regrid
+  DvceArray2D<int> oo_newgid;
+  DvceArray2D<Real> oo_oldctr;
   void RegridCosts(const int *newtoold, const LogicalLocation *new_lloc, const int new_nmb, float *cost);
   int ResetPGIDFromPositions(const char *when);  // refinable clouds
   void RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin);
@@ -1727,6 +1733,9 @@ class DustGasDrag {
   // momentum and the raw second moments: 7 components), checked against the particle mass
   void BuildOwnerOverlapMesh(const bool remap);
   int ResetPGIDOwnerOverlap(const char *when);
+  // test of the general deposit remap: the particle mass density (TSC on the own
+  // block) remapped with the shear offset of time t_test; writes deptest_<tag>_r<rank>.bin
+  void DepositRemapTest(const Real t_test, const std::string &tag);
   void OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments);
   DvceArray2D<int> oo_block_map;
   DvceArray5D<Real> oo_rho;
@@ -1854,6 +1863,7 @@ class DustGasDrag {
   bool CheckHaloReach(const char *when);
   int SplitToLeaves();   // the initial split of a problem generator
   int RouteToOwnerBlocks(const char *when);   // after a regrid / restart
+  int RouteOO3D();   // 3-D owner_overlap: the particles to their new blocks / ranks
   // several ranks: seconds and calls of 0 MigrateClouds, 1 the migration after the
   // push, 2 the kernels these waited for (a fence before each); the halo exchanges keep their
   // own split (DustHalo::tsec)

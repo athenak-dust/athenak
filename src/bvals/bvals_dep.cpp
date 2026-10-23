@@ -40,6 +40,15 @@
 
 MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *pin) :
   MeshBoundaryValues(pp, pin, false) {
+#if MPI_PARALLEL_ENABLED
+  MPI_Comm_dup(MPI_COMM_WORLD, &comm_dep_);   // for the general path
+#endif
+  // A 3-D mesh with refinement (stage S3a) uses the general remap
+  // (DepRemapPlan, bvals_dep_general.cpp), which the dust module sets up; it checks the rest
+  if (pp->pmesh->multilevel && pp->pmesh->three_d &&
+      pin->GetOrAddString("dust", "experimental_smr_transfer", "smooth_p2") == "owner_overlap") {
+    return;
+  }
   if (pp->pmesh->multilevel) {
     bool experimental_smr = pin->GetOrAddBoolean(
         "dust", "experimental_static_smr", false);
@@ -320,6 +329,30 @@ void MeshBoundaryValuesDep::InitRecvIndices(MeshBoundaryBuffer &buf,
 //! Input array must be a 5D Kokkos View dimensioned (nmb, nvar, nx3, nx2, nx1)
 
 TaskStatus MeshBoundaryValuesDep::PackAndSendDeposit(DvceArray5D<Real> &a) {
+  if (General()) {   // pack the source ghost cells of both parts, send them
+    for (int p=0; p<2; ++p) GeneralPack(a, (p == 0) ? plan_->stat : plan_->shr, gsbuf_[p]);
+#if MPI_PARALLEL_ENABLED
+    Kokkos::fence();
+    const int nvar = a.extent_int(1);
+    bool no_errors = true;
+    for (int p=0; p<2; ++p) {
+      const DepRemapMap &map = (p == 0) ? plan_->stat : plan_->shr;
+      for (std::size_t q=0; q<map.send_rank.size(); ++q) {
+        MPI_Request req;
+        int ierr = MPI_Isend(gsbuf_[p].data() + map.send_off[q]*nvar, map.send_cnt[q]*nvar,
+                             MPI_ATHENA_REAL, map.send_rank[q], 31 + p, comm_dep_, &req);
+        if (ierr != MPI_SUCCESS) no_errors = false;
+        gsreq_.push_back(req);
+      }
+    }
+    if (!no_errors) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "MPI error in posting the deposit sends" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+#endif
+    return TaskStatus::complete;
+  }
   if (local_smr_direct_) return TaskStatus::complete;
   if (local_smr_remap_) return RemapLocalSMRDeposit(a);
 
@@ -433,6 +466,20 @@ TaskStatus MeshBoundaryValuesDep::PackAndSendDeposit(DvceArray5D<Real> &a) {
 //! concurrent accumulation over buffers would race (cf. SumBoundaryFluxes).
 
 TaskStatus MeshBoundaryValuesDep::RecvAndSumDeposit(DvceArray5D<Real> &a) {
+  if (General()) {   // all receives complete, then the two parts in order
+#if MPI_PARALLEL_ENABLED
+    bool done = true;
+    for (auto &r : grreq_) {
+      int test = 1;
+      MPI_Test(&r, &test, MPI_STATUS_IGNORE);
+      if (!test) done = false;
+    }
+    if (!done) return TaskStatus::incomplete;
+#endif
+    GeneralApply(a, plan_->stat, grbuf_[0]);
+    GeneralApply(a, plan_->shr, grbuf_[1]);
+    return TaskStatus::complete;
+  }
   if (local_smr_direct_) return TaskStatus::complete;
   if (local_smr_remap_) return TaskStatus::complete;
 

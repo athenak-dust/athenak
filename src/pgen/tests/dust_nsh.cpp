@@ -1238,10 +1238,14 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
               << "<problem>/dust_test must be none, damping or wave" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (dtest && (!dust_active || !cloud_root_random || (pmy_mesh_->three_d && !root3d_ok) ||
-                pin->DoesBlockExist("shearing_box"))) {
+  // in 3-D with the lattice (or random) placement instead of the root parents;
+  // or with the 3-D root parents of refinable clouds (<dust>/experimental_3d) or of the
+  // canonical deposit
+  if (dtest && (!dust_active || pin->DoesBlockExist("shearing_box") ||
+                (pmy_mesh_->three_d && cloud_root_random && !root3d_ok))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<problem>/dust_test needs 2-D dust with cloud_root_random and no <shearing_box>"
+              << "<problem>/dust_test needs dust (2-D: root clouds or the lattice; 3-D: the "
+              << "lattice, or the root parents of 3-D refinable clouds) and no <shearing_box>"
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -1403,6 +1407,17 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     std::exit(EXIT_FAILURE);
   }
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2, lnx3 = indcs.nx3;
+  // <problem>/lattice_sub: in 3-D the ppc particles of a cell on an n^3 sub-lattice
+  // (offsets (a + 1/2)/n) instead of all at the cell centre; ppc = n^3 times nspecies
+  int nsub = 1;
+  if (pin->GetOrAddBoolean("problem", "lattice_sub", false)) {
+    nsub = static_cast<int>(std::lround(std::cbrt(static_cast<double>(ppc_int/nspec))));
+    if (!three_d || nsub*nsub*nsub*nspec != ppc_int) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "lattice_sub: 3-D and ppc = n^3 * nspecies" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
   Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
   std::uint64_t random_seed = static_cast<std::uint64_t>(
       pin->GetOrAddInteger("problem","random_seed",1));
@@ -1417,7 +1432,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   spdat.template modify<HostMemSpace>();
   spdat.template sync<DevExeSpace>();
 
-  if (dtest && three_d && nspec == 1) {   // the 3-D history errors (DustNSHHistory)
+  // the 3-D history errors (DustNSHHistory), with the root parents (cloud_root_random)
+  if (dtest && three_d && nspec == 1 && cloud_root_random) {
     dtest3d_.on = true;
     dtest3d_.rho0 = rho0; dtest3d_.eps = eps[0]; dtest3d_.ts = taus[0];
     dtest3d_.v0 = (dust_test == "damping") ? pin->GetOrAddReal("problem", "dust_test_v0", 0.1)
@@ -1645,6 +1661,13 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
                              mbsize.d_view(m).x2max);
       pr(IPZ,p) = three_d ?
           CellCenterX(k, lnx3, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max) : 0.0;
+      if (nsub > 1) {   // the sub-lattice point of this particle (species cycle fastest)
+        const int r = (q % ppc_int)/nspec;
+        const int a = r % nsub, b = (r/nsub) % nsub, cc = r/(nsub*nsub);
+        pr(IPX,p) += ((a + 0.5)/nsub - 0.5)*mbsize.d_view(m).dx1;
+        pr(IPY,p) += ((b + 0.5)/nsub - 0.5)*mbsize.d_view(m).dx2;
+        pr(IPZ,p) += ((cc + 0.5)/nsub - 0.5)*mbsize.d_view(m).dx3;
+      }
     }
     pi(PGID,p) = gids + m;
     pi(PSP,p) = s;
@@ -1658,7 +1681,98 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     pr(IPRX,p) = 0.0;
     pr(IPRY,p) = 0.0;
     pr(IPRZ,p) = 0.0;
+    // dust_test = wave in 3-D: the eigenmode displacement and velocity of the lattice
+    if (place.kwv != 0.0) {
+      const Real x0 = pr(IPX,p);
+      const Real c = Kokkos::cos(place.kwv*x0), sn = Kokkos::sin(place.kwv*x0);
+      pr(IPX,p) = x0 + place.xir[s]*c - place.xii[s]*sn;
+      pr(IPVX,p) += place.dvr[s]*c - place.dvi[s]*sn;
+    }
   });
+  }
+
+  // <problem>/deptest: a test of the general deposit remap (3-D, one rank): every
+  // particle is placed at random within deptest_w of the two x1 faces, with a random mass, then
+  // moved by deptest_shift along x1 (crossing a shear-periodic face: y shifted by the offset of
+  // time deptest_t, as a crossing particle); the remapped mass density is written
+  // (DustGasDrag::DepositRemapTest) and the run stops
+  if (pin->GetOrAddBoolean("problem", "deptest", false)) {
+    const Real w = pin->GetReal("problem", "deptest_w");
+    const Real shx = pin->GetOrAddReal("problem", "deptest_shift", 0.0);
+    const Real tt = pin->GetOrAddReal("problem", "deptest_t", 0.0);
+    const std::string tag = pin->GetOrAddString("problem", "deptest_tag", "a");
+    const auto &ms = pmy_mesh_->mesh_size;
+    const Real lx = ms.x1max - ms.x1min, ly = ms.x2max - ms.x2min, lz = ms.x3max - ms.x3min;
+    const bool shear = pin->DoesBlockExist("shearing_box") &&
+        pmy_mesh_->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
+    const Real ysh = shear ? std::fmod(pin->GetReal("shearing_box", "qshear")*
+                                       pin->GetReal("shearing_box", "omega0")*lx*tt, ly) : 0.0;
+    // the same global set of deptest_n particles on every rank; each keeps those in its blocks
+    // (in the order of the global index, so a block's deposit does not depend on the ranks)
+    const int nglob = pin->GetOrAddInteger("problem", "deptest_n", ppar->nprtcl_thispack);
+    const Real x1a = ms.x1min, x2a = ms.x2min, x3a = ms.x3min;
+    const Real x1b = ms.x1max, x2b = ms.x2max;
+    const int nmbl = nmb;
+    auto pos = KOKKOS_LAMBDA(const int q, Real &x, Real &y, Real &z, Real &mq) {
+      std::uint64_t key = static_cast<std::uint64_t>(q) + random_seed*UINT64_C(0x9e3779b97f4a7c15);
+      const Real u0 = HashUniform01(key + UINT64_C(0x632be59bd9b4e019));
+      const Real u1 = HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7));
+      const Real u2 = HashUniform01(key + UINT64_C(0x58f38ded6f7c55b5));
+      const Real u3 = HashUniform01(key + UINT64_C(0x1f83d9abfb41bd6b));
+      x = (u0 < 0.5) ? (x1b - 2.0*u0*w) : (x1a + 2.0*(u0 - 0.5)*w);
+      y = x2a + u1*ly; z = x3a + u2*lz;
+      x += shx;
+      if (x >= x1b) {x -= lx; y += ysh;}
+      if (x < x1a) {x += lx; y -= ysh;}
+      if (y >= x2b) y -= ly;
+      if (y < x2a) y += ly;
+      mq = 1.0 + u3;
+    };
+    DvceArray1D<int> qslot("nsh_deptest_slot", std::max(1, nglob));
+    par_for("nsh_deptest_owner", DevExeSpace(), 0, nglob-1, KOKKOS_LAMBDA(const int q) {
+      Real x, y, z, mq;
+      pos(q, x, y, z, mq);
+      int mm = -1;
+      for (int b=0; b<nmbl; ++b) {
+        if (x >= mbsize.d_view(b).x1min && x < mbsize.d_view(b).x1max &&
+            y >= mbsize.d_view(b).x2min && y < mbsize.d_view(b).x2max &&
+            z >= mbsize.d_view(b).x3min && z < mbsize.d_view(b).x3max) mm = b;
+      }
+      qslot(q) = mm;
+    });
+    DvceArray1D<int> qnew("nsh_deptest_new", std::max(1, nglob));
+    int nkeep = 0;
+    Kokkos::parallel_scan("nsh_deptest_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, nglob),
+    KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
+      if (final) qnew(q) = (qslot(q) >= 0) ? upd : -1;
+      if (qslot(q) >= 0) ++upd;
+    }, nkeep);
+    Kokkos::realloc(ppar->prtcl_rdata, ppar->nrdata, std::max(1, nkeep));
+    Kokkos::realloc(ppar->prtcl_idata, ppar->nidata, std::max(1, nkeep));
+    ppar->nprtcl_thispack = nkeep;
+    auto prt = ppar->prtcl_rdata;
+    auto pit = ppar->prtcl_idata;
+    const int nrd = ppar->nrdata;
+    par_for("nsh_deptest_set", DevExeSpace(), 0, nglob-1, KOKKOS_LAMBDA(const int q) {
+      const int p = qnew(q);
+      if (p < 0) return;
+      Real x, y, z, mq;
+      pos(q, x, y, z, mq);
+      for (int c=0; c<nrd; ++c) prt(c,p) = 0.0;
+      prt(IPX,p) = x; prt(IPY,p) = y; prt(IPZ,p) = z; prt(IPM,p) = mq;
+      pit(PGID,p) = gids + qslot(q);
+      pit(PTAG,p) = q;
+    });
+    if (!three_d) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "deptest: 3-D only" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    pmbp->pdust->DepositRemapTest(tt, tag);
+#if MPI_PARALLEL_ENABLED
+    MPI_Finalize();
+#endif
+    std::exit(EXIT_SUCCESS);
   }
 
   // two cold streams along x2 for the multi-stream regrid test; the
