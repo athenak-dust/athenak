@@ -319,9 +319,14 @@ void DustGasDrag::BuildLeafTraversal3D() {
       const Real bmax_b[3] = {bmax1[b], bmax2[b], bmax3[b]};
       const Real bmax_m[3] = {bmax1[m], bmax2[m], bmax3[m]};
       for (int d=0; d<3; ++d) {
+        // across a face, edge or corner: the gap between the facing sides (0 or a domain length);
+        // along it (id = 0) the neighbour overlaps the block: the image whose centre is nearest.
+        // (The minimum-side difference rounds the wrong way when a coarser neighbour spans the
+        // whole domain in that direction: half a domain length.)
         const int id = dir[n][d];
         const Real gap = (id > 0) ? bmin_b[d] - bmax_m[d]
-                       : ((id < 0) ? bmax_b[d] - bmin_m[d] : bmin_b[d] - bmin_m[d]);
+                       : ((id < 0) ? bmax_b[d] - bmin_m[d]
+                                   : 0.5*(bmin_b[d] + bmax_b[d] - bmin_m[d] - bmax_m[d]));
         s[d] = static_cast<int>(std::lround(gap/lens[d]));
       }
       bool seen = (b == m && s[0] == 0 && s[1] == 0 && s[2] == 0);
