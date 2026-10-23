@@ -46,7 +46,7 @@ void ShwaveHistory(HistoryData *pdata, Mesh *pm);
 // (S1') scheduled refinement bands (whole x2) for adaptive shearing-box tests
 void ShwaveBands(MeshBlockPack *pmbp);
 namespace {
-struct ShwaveBand {Real t0, t1, x1a, x1b, x3a, x3b; int level;};
+struct ShwaveBand {Real t0, t1, x1a, x1b, x2a, x2b, x3a, x3b; int level;};
 std::vector<ShwaveBand> shw_bands;
 }
 
@@ -85,6 +85,9 @@ void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
     ShwaveBand bd;
     bd.t0 = pin->GetReal("problem", k + "t0"); bd.t1 = pin->GetReal("problem", k + "t1");
     bd.x1a = pin->GetReal("problem", k + "x1min"); bd.x1b = pin->GetReal("problem", k + "x1max");
+    // (S2) a box limited in x2 as well (default: the whole x2)
+    bd.x2a = pin->GetOrAddReal("problem", k + "x2min", pmy_mesh_->mesh_size.x2min);
+    bd.x2b = pin->GetOrAddReal("problem", k + "x2max", pmy_mesh_->mesh_size.x2max);
     bd.x3a = pin->GetOrAddReal("problem", k + "x3min", pmy_mesh_->mesh_size.x3min);
     bd.x3b = pin->GetOrAddReal("problem", k + "x3max", pmy_mesh_->mesh_size.x3max);
     bd.level = pin->GetOrAddInteger("problem", k + "level", 1);
@@ -171,6 +174,12 @@ void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
       user_hist_func = ShwaveHistory;
 
       auto sv = shw_var;
+      // <problem>/zmode_amp adds the density mode
+      // d0 (1 + zmode_amp cos(2 pi (z - x3min) / Lz)), mirror-symmetric about both x3 faces
+      // (a standing sound wave: reflecting and periodic x3 give the same solution)
+      const Real zamp = pin->GetOrAddReal("problem", "zmode_amp", 0.0);
+      const Real zmin = pmy_mesh_->mesh_size.x3min;
+      const Real zlen = pmy_mesh_->mesh_size.x3max - zmin;
       par_for("shwave3", DevExeSpace(), 0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
       KOKKOS_LAMBDA(int m, int k, int j, int i) {
         Real &x1min = size.d_view(m).x1min;
@@ -183,12 +192,17 @@ void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
 
         Real rvx = amp*cos(sv.kx*x1v + sv.ky*x2v);
         Real rvy = amp*(sv.ky/sv.kx)*cos(sv.kx*x1v + sv.ky*x2v);
-        u0(m,IDN,k,j,i) = d0;
-        u0(m,IM1,k,j,i) = -d0*rvx;
-        u0(m,IM2,k,j,i) = -d0*rvy;
+        Real d = d0;
+        if (zamp != 0.0) {
+          Real x3v = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min, size.d_view(m).x3max);
+          d = d0*(1.0 + zamp*cos(2.0*M_PI*(x3v - zmin)/zlen));
+        }
+        u0(m,IDN,k,j,i) = d;
+        u0(m,IM1,k,j,i) = -d*rvx;
+        u0(m,IM2,k,j,i) = -d*rvy;
         u0(m,IM3,k,j,i) = 0.0;
         if (eos.is_ideal) {
-          u0(m,IEN,k,j,i) = p0/gm1 + 0.5*d0*(SQR(rvx) + SQR(rvy));
+          u0(m,IEN,k,j,i) = p0/gm1 + 0.5*d*(SQR(rvx) + SQR(rvy));
         }
       });
     }
@@ -458,7 +472,8 @@ void ShwaveHistory(HistoryData *pdata, Mesh *pm) {
 //! \fn void ShwaveBands()
 //! \brief Refinement request of the bands (S1'): refine a block whose centre
 //! lies in an active band below its level, derefine one outside every active band (or above the
-//! level they want).  The request does not depend on x2, as the shearing box requires.
+//! level they want).  (Boxes may be limited in x2; the blocks on the shear-periodic x1
+//! faces are merged into columns along x2 by the mesh refinement.)
 
 void ShwaveBands(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
@@ -470,11 +485,12 @@ void ShwaveBands(MeshBlockPack *pmbp) {
   for (int m=0; m<nmb; ++m) {
     const auto &sz = size.h_view(m);
     const Real xc = sz.x1min + 0.5*indcs.nx1*sz.dx1;
+    const Real yc = sz.x2min + 0.5*indcs.nx2*sz.dx2;
     const Real zc = sz.x3min + 0.5*indcs.nx3*sz.dx3;
     int want = 0;
     for (const auto &b : shw_bands) {
       if (pm->time >= b.t0 && pm->time < b.t1 && xc > b.x1a && xc < b.x1b && zc > b.x3a &&
-          zc < b.x3b) {
+          zc < b.x3b && yc > b.x2a && yc < b.x2b) {
         want = std::max(want, b.level);
       }
     }

@@ -47,6 +47,8 @@ OrbitalAdvectionFC::OrbitalAdvectionFC(MeshBlockPack *pp, ParameterInput *pin) :
   ncells3 = indcs.nx3 + 2*(indcs.ng);
   Kokkos::realloc(emfx,nmb,ncells3,ncells2,ncells1);
   Kokkos::realloc(emfz,nmb,ncells3,ncells2,ncells1);
+  // the base class reads xlev; face-centred fields stop if a level changes in x2
+  BuildMixedLists();
 }
 
 //----------------------------------------------------------------------------------------

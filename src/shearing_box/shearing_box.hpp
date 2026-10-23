@@ -85,7 +85,7 @@ class ShearingBox {
   // check that the levels are constant along x2 (the exchange is between blocks of one level)
   void BuildBoundaryLists();
   void CheckLevelsAlongX2() const;
-  void CheckSupportedSetup() const;   // block widths, periodic x3
+  void CheckSupportedSetup(const bool coarse_bcs) const;   // block widths, periodic x3
   // function to find target MB offset by shear.  Returns GID and rank
   void FindTargetMB(const int igid, const int jshift, int &gid, int &rank);
   // function to find index in x1bndry array of MB with input GID
@@ -145,6 +145,33 @@ class ShearingBoxCC : public ShearingBox {
   // (public: CUDA does not allow extended device lambdas in private member functions)
   TaskStatus PackAndSend(DvceArray5D<Real> &a, ReconstructionMethod rcon, const bool coarse);
   TaskStatus RecvAndUnpack(DvceArray5D<Real> &a, const bool coarse);
+
+  // Matching of the x1 fluxes across the shear-periodic boundary (mass,
+  // momentum conservation).  On each face column the finer side is authoritative (equal levels:
+  // the outer face); every block of the other side replaces its x1 face fluxes by the
+  // authoritative ones, restricted to its level if finer and remapped by the shear offset.
+  // Planned every stage from the global block list (all ranks derive the same pieces).
+  bool flux_on = false;
+  // piece: receiver gid, sender gid, sender face, rows [r0, r0+len) of the sender's strip at the
+  // receiver's level, first receiver buffer row, receiver k offset, k rows, restrict flag,
+  // index of the piece for the receiver (MPI tag), offset in the flat MPI buffer
+  enum FluxPieceField {kRGid, kSGid, kSFace, kR0, kLen, kDst, kKofs, kNk, kRestr, kQ, kOff,
+                       kRIdx, kSLoc, kRRank, kSRank, kNField};
+  DualArray2D<int> fpiece;      // pieces with a local sender or a local receiver
+  int nfpiece = 0;
+  DualArray2D<int> frecv_list;  // local receivers: (m, face); fraction of the shift in frecv_eps
+  DualArray1D<Real> frecv_eps;
+  int nfrecv = 0;
+  DvceArray4D<Real> fbuf;       // receiver strips (m, v, k, nx2 + 6 rows)
+  DvceArray1D<Real> fsendflat, frecvflat;
+#if MPI_PARALLEL_ENABLED
+  MPI_Request *fsreq_ = nullptr, *frreq_ = nullptr;
+  int nfreq_ = 0;
+#endif
+  void PlanFluxMatch();                     // with the current yshear (InitRecv)
+  TaskStatus SendFluxMatch(DvceFaceFld5D<Real> &flx);
+  TaskStatus RecvFluxMatch(DvceFaceFld5D<Real> &flx, ReconstructionMethod rcon);
+  TaskStatus ClearFluxMatch();
 
  private:
   int nvar_;
