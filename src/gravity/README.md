@@ -10,7 +10,7 @@ refine/derefine, restart, MPI and GPU. Two gravity boundary configurations are
 required: periodic, and horizontally shearing-periodic/periodic with vertical
 isolation. Gas outflow and isolated gravitational potential are separate choices.
 Future deposited dust density and particle force gathering can reuse the same
-field solver. Current support is Newtonian hydro; particles/dust, MHD, radiation
+field solver. Current support is 2D/3D Cartesian Newtonian hydro; particles/dust, MHD, radiation
 and relativistic modules are rejected when this feature is enabled.
 
 ## Running
@@ -115,11 +115,18 @@ expected order 1.8. A donor-cell diagnostic recovered second-order time
 convergence. Limiters/characteristic remapping prevent a universal fixed-grid
 second-order claim; failed expectations remain recorded.
 
-The initial implementation passed 42 full-application CPU/1/2/4-GPU cases on
-GB200, including restart with changed decomposition. A subsequent restart-boundary
-audit found and fixed lost mesh cooldown/pending-check state. Consult the development records
-for final integrated hardware validation of the later changes before reusing an
-earlier binary's results.
+The integrated `59267024` implementation passed 34 application cases on CPU and
+1/2/4 distinct GB200 GPUs, including physical shearing AMR, combined shear/isolated
+boundaries, ideal energy, and checkpoints at actual refine/derefine events with
+changed decomposition. Active float64 restart differences were at most
+$8.9\times10^{-16}$; CPU/GPU differences at most $2.45\times10^{-15}$ in these
+tests. Gravity-off fields and history were bitwise unchanged.
+
+The final functional commit `3c46d73f` initializes static-stage counts and skips
+unposted orbital-flux correction during initialization. Its two-file host-only
+change passed targeted CPU1/4-rank and one-GPU static, physical-shear, and off-path
+regressions. The four-distinct-GPU evidence is from `59267024`; it is not relabeled
+as a fresh four-GPU execution of the final static fix.
 
 Finite-amplitude AMR tests do not conserve net self-force exactly. For one corner
 refinement test the relative imbalance decreased from $1.79\times10^{-5}$ to
@@ -129,7 +136,7 @@ energy is also not exactly conserved; ideal-gas SMR tests show convergent drift.
 Shared fluxes, small residuals, and weak-wave momentum cancellation alone do not
 prove exact conservation of these quantities.
 
-There are two known performance limitations: host setup currently holds global
+There are known performance limitations: host setup currently holds global
 geometry and matrices on each rank, and the 3D Galerkin hierarchy has significant
 fill. Direct slab boundary sums cost $O(N_{cell}N_{mode})$. They evaluate the
 horizontal Fourier projection and free-space vertical Green function on source
