@@ -117,12 +117,13 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
       std::cout << "# SG_PHASE_THREADS auto_capped=1 mpi_thread_level=" << mpi_thread_level << '\n';
   }
 #endif
-  setup_ = pin->GetOrAddString("gravity", "setup", "reference");
+  setup_ = pin->GetOrAddString("gravity", "setup", "distributed");
   if (setup_ != "reference" && setup_ != "distributed") {
     Fail("gravity/setup must be reference or distributed");
   }
   vertical_bc_ = pin->GetOrAddString("gravity", "vertical_bc", "periodic");
-  isolated_method_ = pin->GetOrAddString("gravity", "isolated_method", "direct");
+  isolated_method_ = pin->GetOrAddString("gravity", "isolated_method",
+      setup_ == "reference" ? "direct" : "vacuum");
   if (isolated_method_ != "direct" && isolated_method_ != "vacuum") {
     Fail("gravity/isolated_method must be direct or vacuum");
   }

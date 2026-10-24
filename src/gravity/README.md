@@ -1,15 +1,19 @@
-# Composite self-gravity development
+# Hydro self-gravity with AMR and shearing boundaries
 
-**Production migration is in progress.** Rixin: small functional
-validation is not the endpoint. The earlier reference implementation below is not
-the production acceptance result. Current work replaces replicated global setup
-with distributed geometry/multigrid, refreshes only shear-dependent rows, and
-replaces direct isolated-boundary sums with a coarsened vacuum solve. Large WENO-Z
-CPU/GPU time, memory, dynamics and restart gates must pass before this work closes.
-Progress and fixed acceptance criteria are in
+The default solver uses distributed geometric multigrid and updates only the
+rows affected by the changing shear phase. Vertical isolation uses a coarsened
+vacuum exterior, retaining the nonzero mean sheet field. The reference backend
+remains available explicitly for accuracy comparisons.
+
+On four GB200 GPUs, the 4.19-million-physical-cell WENO-Z disk benchmark measures
+about **40.5 ms of gravity work per step**, including source, shear updates,
+solve and force evaluation. Initial topology setup is measured separately. This
+is a 128-step benchmark with 18 assigned CPU cores per rank, not a universal cost
+bound for arbitrary sources or meshes. Exact workloads, versions, acceptance
+criteria and limitations are recorded in
 the internal run records.
 
-This experimental module is developed on `selfgrav-amr-shear`, from dust
+This module is developed on `selfgrav-amr-shear`, from dust
 development commit `6c466d6d`. It is disabled unless `<gravity>/enabled = true`.
 It solves on the actual active AMR leaves, including shearing-periodic faces;
 it does not substitute a uniform fine-grid volume solve.
@@ -51,9 +55,9 @@ hardware validation separately verified distinct GPU assignments.
 | `enabled` | `false`; absence of the block leaves existing physics unchanged |
 | `four_pi_G` | Required positive gravitational constant in code units |
 | `solver` | `multigrid` |
-| `setup` | `reference` during validation; explicitly select `distributed` for the production candidate |
+| `setup` | `distributed`; `reference` explicitly selects the replicated accuracy backend |
 | `vertical_bc` | `periodic`, or `isolated` in 3D |
-| `isolated_method` | `direct` during validation; `vacuum` requires distributed setup |
+| `isolated_method` | `vacuum` for distributed setup; explicit reference setup defaults to `direct` |
 | `rtol` | `1e-10`, relative linear-system residual |
 | `max_iterations`, `gmres_restart` | `150`, `24` |
 | `cfl` | `0.25`, safety factor for acceleration and free-fall limits |
@@ -66,7 +70,8 @@ potential/acceleration in active cells. Gravity ghost-zone output is rejected.
 
 ## Discrete operator
 
-`composite.*` constructs one potential unknown per active leaf cell. Every face
+`mesh_geometry.*` constructs one potential unknown per active leaf cell;
+`composite.*` retains the reference implementation. Every face
 fragment contributes the same integrated normal flux with opposite signs to the
 two adjacent cells, including coarse/fine and sheared periodic interfaces.
 This is conservation of Poisson/Gauss flux, not a claim of exact total momentum
@@ -105,7 +110,7 @@ request `MPI_THREAD_FUNNELED` for this use; an explicit parallel request fails i
 the library cannot provide it, while automatic mode reports a serial fallback.
 See the [MPI thread-support contract](https://www.open-mpi.org/doc/v4.1/man3/MPI_Init_thread.3.php).
 
-The vacuum boundary candidate adds coarsened, empty solver patches outside the
+The vacuum boundary backend adds coarsened, empty solver patches outside the
 physical x3 interval. It retains the physical density mean and imposes the mean
 sheet flux at distant Neumann faces. Exterior resolution follows an exponential
 bound based on the slowest horizontal mode. It avoids direct cell-by-mode sums;
@@ -184,13 +189,18 @@ cells; this is an accuracy backend, not a claim of production scaling. Two cheap
 coarse-grid prototypes failed standalone multigrid contraction and were not
 adopted. They are distinct from the new distributed geometric hierarchy.
 
-The distributed CPU candidate has been tested on CPUs with gcc 13: uniform
+The distributed backend has been tested on CPUs with gcc 13: uniform
 $128^3$ hierarchy setup takes 1.07 s on four ranks, compared with 65.45 s for the
 reference backend. The complete 4.19-million-physical-cell isolated case adds
 29.1% vacuum unknowns; on 16 ranks its initial setup takes 1.21 s and peak RSS is
-about 648 MiB per rank. These measurements do not establish GPU production
-performance. The required 100-step, matched WENO-Z GPU benchmark remains pending;
-defaults will change only after that validation.
+about 648 MiB per rank. GPU validation includes matched gravity-on/off runs,
+actual distinct device assignments, host RSS and allocation/NVML observations.
+The initial four-GPU result was 77.9 ms/step and failed the registered 50 ms goal;
+parallel host phase assembly brought it to 40.5 ms with the same numerical
+operator. CPU coefficients and matrix application, and short WENO histories,
+are unchanged by this parallelization. See the frozen experiment records for
+the distinction between the complete reference batch and the later thread-count
+comparison; results from earlier binaries are not relabeled as later executions.
 
 Detailed provenance, bounded test batches, and outstanding requirements are in
 the internal run records.
