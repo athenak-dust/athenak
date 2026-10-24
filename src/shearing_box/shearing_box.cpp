@@ -35,8 +35,9 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   qshear = pin->GetReal("shearing_box","qshear");
   omega0 = pin->GetReal("shearing_box","omega0");
   is_stratified = pin->GetOrAddBoolean("shearing_box","stratified",false);
-  // (S2b) blocks on the x1 faces may change level along x2
-  face_levels = pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", false);
+  // Blocks on the x1 faces may change level along x2.  Rixin: on by default after the
+  // fix of Codex Astra's review; false = the two-step exchange with columns
+  face_levels = pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", true);
   report_timing = pin->GetOrAddBoolean("shearing_box", "report_timing", false);
   // (S2c) non-periodic x3 needs the coarse-array physical
   // boundaries for the corners the collected ghost zones leave to them; dust

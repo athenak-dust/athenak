@@ -230,7 +230,7 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
     // shear-periodic x1 faces; refine the rest of their columns along x2
     if (three_d && mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic &&
         !(pin->DoesBlockExist("shearing_box") &&
-          pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", false))) {
+          pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", true))) {
       int nnew = 0;
       ptree->RefineShearFaceColumns(nnew);
     }

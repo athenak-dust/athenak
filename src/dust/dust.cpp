@@ -601,6 +601,22 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Stage X (the exact stencil re-merge before G in quantum mode)
       // off by default, as in production; it stays a research control
       cloud_merge_stencil = quiet_bool("cloud_merge_stencil", cloud_quiet_protection);
+      // Rixin: no X in a 3-D shearing box: the background shear pulls the
+      // members of a P1 family apart in x2 (q Omega l per unit time), so no family is ever complete
+      // again.  G with its budget (beta, kappa) and R with the cold gate stay available there.
+      if (shear_x1 && pmy_pack->pmesh->three_d && cloud_merge_stencil) {
+        if (pin->DoesParameterExist("dust", "cloud_merge_stencil")) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << "<dust>/cloud_merge_stencil (stage X) is off in a 3-D shearing box: the "
+                    << "shear separates the members of a family" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        cloud_merge_stencil = false;
+        if (global_variable::my_rank == 0) {
+          std::cout << "# NOTE (dust): stage X off in the 3-D shearing box (cloud_quiet_protection "
+                    << "keeps the cold gate and kappa)" << std::endl;
+        }
+      }
       cloud_merge_stencil_tol = pin->GetOrAddReal("dust", "cloud_merge_stencil_tol", 0.02);
       cloud_merge_smax = pin->GetOrAddReal("dust", "cloud_merge_smax", 1.0);
       cloud_merge_K = pin->GetOrAddInteger("dust", "cloud_merge_K", 4);
@@ -714,7 +730,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         // Codex review: explicit sub-keys win, and a restart file written before
         // 2026-10-22 without the flag holds all three at their off values: say which stay off
         std::string off;
-        if (!cloud_merge_stencil) off += " cloud_merge_stencil=false";
+        if (!cloud_merge_stencil && !(shear_x1 && pmy_pack->pmesh->three_d)) {
+          off += " cloud_merge_stencil=false";
+        }
         if (cloud_resample_cold_alpha <= 0.0) off += " cloud_resample_cold_alpha<=0";
         if (cloud_merge_budget_kappa <= 0.0) off += " cloud_merge_budget_kappa<=0";
         if (!off.empty()) {
