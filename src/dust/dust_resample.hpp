@@ -70,6 +70,9 @@ struct DevicePatchProblem {
   // the teams (kNStage entries; empty = off)
   DvceArray1D<unsigned long long> stage;
   bool qr_rows = false;   // the QR update shares the rows as well (cloud_resample_qr_rows)
+  // 3-D, <dust>/cloud_resample_rank_screen: patches whose clouds do not outnumber their
+  // nominal rows (7 leaves + 6 + centre-of-mass rows) are left as they are, before any bucket
+  bool rank_screen = false;
 };
 // stages: 0 rows and scaling, 1 QR, 2 null vectors, 3 end-point steps, 4 the whole stream
 // (1-3 included), 5 row check, 6 patches timed; StageTotals() sums them over the run (host).
@@ -94,7 +97,8 @@ inline unsigned long long *StageTotals() {
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
                         const int mid, const int mid_team, const int wide_team,
-                        double timing[5]);
+                        double timing[5], long long *screened = nullptr);
+// screened (pb.rank_screen): [0] patches left out by the screen, [1] their clouds
 
 // Totals of one resampling over its patches (the log row), reduced on the device from outi /
 // outr, so that no per-patch data goes to the host: patches with clouds, pool,

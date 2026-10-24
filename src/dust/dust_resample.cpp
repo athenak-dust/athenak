@@ -440,6 +440,19 @@ void AppendResampleLog(const char *row) {
   std::fflush(fp);
 }
 
+// One row per 3-D resampling of the patches the rank screen left out
+void AppendScreenLog(const int ncycle, const double time, const long long npatch,
+                     const long long nscr, const long long cscr, const long long pool) {
+  std::FILE *fp = AppendLog(RankFile("cloud_resample_screen3d.txt"));
+  if (fp == nullptr) return;
+  if (LogEmpty(fp)) {
+    std::fprintf(fp, "# cloud_resample_rank_screen: ncycle time patches"
+                 " patches_screened pool clouds_screened\n");
+  }
+  std::fprintf(fp, "%d %.17g %lld %lld %lld %lld\n", ncycle, time, npatch, nscr, pool, cscr);
+  std::fflush(fp);
+}
+
 }  // namespace
 
 //----------------------------------------------------------------------------------------
@@ -1974,6 +1987,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
   pb.npool = npool; pb.npatch = npatch;
   pb.qr_rows = cloud_resample_qr_rows;
   pb.lx = lt.lx; pb.ly = lt.ly; pb.lz = lt.lz; pb.three = true; pb.pgeo = pgeo;
+  pb.rank_screen = cloud_resample_rank_screen;
   pb.pptr = DvceArray1D<int>("rs3_pptr", npatch + 1);
   DvceArray1D<int> sorder(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_sorder"), npool);
   DvceArray1D<int> scnt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_scnt"), npool);
@@ -2013,11 +2027,16 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
   DvceArray2D<int> outi("rs3_dev_outi", npatch, resample::NPC);
   DvceArray1D<double> outr("rs3_dev_outr", npatch);
   double tim[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+  long long scr[2] = {0, 0};
   resample::SolvePatchesDevice(pb, mn, outi, outr, cloud_resample_device_mem_mb,
                                cloud_resample_device_mid, cloud_resample_device_mid_team,
-                               cloud_resample_device_wide_team, tim);
+                               cloud_resample_device_wide_team, tim, scr);
   resample::PatchSummary dsum;
   resample::SummarizePatchesDevice(outi, outr, dsum);
+  if (cloud_resample_rank_screen) {
+    AppendScreenLog(pmesh->ncycle, pmesh->time, npatch, scr[0], scr[1],
+                    static_cast<long long>(dsum.pool));
+  }
   const int nremoved = static_cast<int>(dsum.pool - dsum.kept);
   if (nremoved > 0 || dsum.csteps > 0) {
     Kokkos::parallel_for("rs3_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),

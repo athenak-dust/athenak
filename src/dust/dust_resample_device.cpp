@@ -747,7 +747,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
                         const int mid, const int mid_team, const int wide_team,
-                        double timing[5]) {
+                        double timing[5], long long *screened) {
   Kokkos::Timer t_all, t;
   const int npatch = pb.npatch;
   // per patch: clouds, CSR entries (device), distinct leaves (team sort of a copy)
@@ -786,6 +786,24 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       Kokkos::single(Kokkos::PerTeam(tm), [&]() {sz(q, 2) = nl;});
     });
   }
+  // cloud_resample_rank_screen (3-D): a patch of n clouds on nl leaves has at most
+  // 7 nl + 6 + ncom rows (PatchTeam), so for n > that many a null vector is certain.  Patches
+  // with n <= that many are left as they are, like patches of one cloud: no bucket, no workspace,
+  // no rows, no QR.  A screen of benefit, not a proof: dependent rows (coincident clouds) could
+  // still have allowed a reduction there.
+  DvceArray1D<int> skp("rs_dev_skip", std::max(npatch, 1));
+  long long nsk[2] = {0, 0};
+  if (pb.rank_screen) {
+    const int ncom = pb.three ? 3 : 2;
+    Kokkos::parallel_reduce("rs_dev_screen", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+    KOKKOS_LAMBDA(const int q, long long &np_, long long &nc_) {
+      const int n = sz(q, 0);
+      const int s = (n >= 2 && n <= 7*sz(q, 2) + 6 + ncom) ? 1 : 0;
+      skp(q) = s;
+      if (s) {++np_; nc_ += n;}
+    }, nsk[0], nsk[1]);
+  }
+  if (screened != nullptr) {screened[0] = nsk[0]; screened[1] = nsk[1];}
   // buckets: 0 at most 64 clouds, 1 (when mid > 64) at most mid clouds, 2 more;
   // patches of one or no cloud only get their counters.  Per bucket the number of patches and
   // the largest clouds / entries / leaves.  mid <= 64: no bucket 1 (the original two buckets)
@@ -797,7 +815,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     KOKKOS_LAMBDA(const int q, int &c0, int &c1, int &c2, int &n0, int &n1, int &n2, int &e0,
                   int &e1, int &e2, int &l0, int &l1, int &l2) {
       const int n = sz(q, 0);
-      if (n < 2) return;
+      if (n < 2 || skp(q) != 0) return;
       const int b = (n <= 64) ? 0 : ((n <= mid) ? 1 : 2);
       int &c = (b == 0) ? c0 : ((b == 1) ? c1 : c2);
       int &nn = (b == 0) ? n0 : ((b == 1) ? n1 : n2);
@@ -825,7 +843,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     KOKKOS_LAMBDA(const int q) {
       const int n = sz(q, 0);
       const int b = (n <= 64) ? 0 : ((n <= mid) ? 1 : 2);
-      qkey(q) = (n < 2) ? std::numeric_limits<std::int64_t>::max()
+      qkey(q) = (n < 2 || skp(q) != 0) ? std::numeric_limits<std::int64_t>::max()
                         : (b*top + top - 1 - n)*np + q;
     });
     if (npatch > 1) Kokkos::sort(qkey);
@@ -836,7 +854,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     Kokkos::parallel_for("rs_dev_small", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
     KOKKOS_LAMBDA(const int q) {
       const int n = pptr(q + 1) - pptr(q);
-      if (n >= 2) return;
+      if (n >= 2 && skp(q) == 0) return;   // (screened patches kept as they are too)
       for (int c=0; c<NPC; ++c) outi(q, c) = 0;
       outi(q, PN) = n; outi(q, PKEPT) = n; outr(q) = 0.0;
       for (int a=pptr(q); a<pptr(q + 1); ++a) mnew(a) = spd(a, JM);

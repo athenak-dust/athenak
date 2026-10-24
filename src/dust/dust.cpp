@@ -774,6 +774,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_resample_patch_split = pin->GetOrAddInteger("dust", "cloud_resample_patch_split",
                                                         split_ok ? 1024 : 0);
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
+      // For 3-D refinable clouds only (2-D ignores it): the device solve leaves out the
+      // patches of n clouds on nl leaves with n <= 7 nl + 9 (the nominal rows: no null vector is
+      // certain there).  false: every patch is solved (the reference path)
+      cloud_resample_rank_screen = pin->GetOrAddBoolean("dust", "cloud_resample_rank_screen", true);
       // Rixin: the per-patch solves on the device by default (same patches and algorithm;
       // false keeps the host solves); the
       // comparison runs both on the same pool and logs the differences (cloud_resample_compare.txt)

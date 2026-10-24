@@ -1528,6 +1528,8 @@ class DustGasDrag {
   int cloud_resample_patch_split = 1024;   // ... a patch (or quadrant) with more pool
                                       //     clouds is split into quadrants, down to cells (0: never)
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
+  bool cloud_resample_rank_screen = true;   // ... 3-D only: skip the patches whose
+                                      //     clouds do not outnumber their nominal rows (false: all)
   bool cloud_resample_device = true;   // ... the patch solves on the device (default)
   bool cloud_resample_qr_rows = true;  // ... row-parallel QR update on the device
                                        //     (matches the host only to round-off)
