@@ -25,8 +25,14 @@
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
 #include "hydro/hydro.hpp"
+#include "gravity/self_gravity.hpp"
 
 namespace hydro {
+namespace {
+bool GravityOrbitalSplit(MeshBlockPack *pack) {
+  return pack->pgrav != nullptr && pack->pgrav->UsesOrbitalSplit();
+}
+}  // namespace
 //----------------------------------------------------------------------------------------
 //! \fn  void Hydro::AssembleHydroTasks
 //! \brief Adds hydro tasks to appropriate task lists used by time integrators.
@@ -99,7 +105,7 @@ TaskStatus Hydro::InitRecv(Driver *pdrive, int stage) {
 
   // with orbital advection post receives for U
   // only execute for (last stage) AND (3D OR 2d_r_phi)
-  if (porb_u != nullptr) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack)) {
     if ((stage == pdrive->nexp_stages) &&
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
       tstat = porb_u->InitRecv();
@@ -115,6 +121,11 @@ TaskStatus Hydro::InitRecv(Driver *pdrive, int stage) {
       Real time = pmy_pack->pmesh->time;
       if (stage == pdrive->nexp_stages) {
         time += pmy_pack->pmesh->dt;
+      }
+      // Residual hydro has one fixed sheared coordinate frame after OAhalf.
+      // This override also applies to stage=-1 during primitive/ghost refresh.
+      if (pmy_pack->pgrav != nullptr) {
+        time = pmy_pack->pgrav->HydroBoundaryTime(time);
       }
       tstat = psbox_u->InitRecv(time);
       // the pieces of the shear flux matching with this yshear; posts its receives
@@ -280,7 +291,7 @@ TaskStatus Hydro::HydroSrcTerms(Driver *pdrive, int stage) {
 
 TaskStatus Hydro::SendU_OA(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
-  if (porb_u != nullptr) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack)) {
     // only execute if (last stage) AND (3D OR 2d_r_phi)
     if ((stage == pdrive->nexp_stages) &&
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
@@ -297,7 +308,7 @@ TaskStatus Hydro::SendU_OA(Driver *pdrive, int stage) {
 
 TaskStatus Hydro::RecvU_OA(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
-  if (porb_u != nullptr) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack)) {
     // only execute if (last stage) AND (3D OR 2d_r_phi)
     if ((stage == pdrive->nexp_stages) &&
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
@@ -317,7 +328,8 @@ TaskStatus Hydro::RecvU_OA(Driver *pdrive, int stage) {
 TaskStatus Hydro::RestrictU(Driver *pdrive, int stage) {
   // the coarser side of an x2 face with a level change takes the finer side's
   // orbital-advection fluxes (sent at the end of RecvU_OA), before the restriction
-  if (porb_u != nullptr && stage == pdrive->nexp_stages && pmy_pack->pmesh->three_d) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack) &&
+      stage == pdrive->nexp_stages && pmy_pack->pmesh->three_d) {
     TaskStatus tstat = porb_u->RecvFluxCC(u0);
     if (tstat != TaskStatus::complete) return tstat;
   }
@@ -480,7 +492,7 @@ TaskStatus Hydro::ClearSend(Driver *pdrive, int stage) {
 
   // with orbital advection check sends of U complete
   // only execute when (shearing box defined) AND (last stage) AND (3D OR 2d_r_phi)
-  if (porb_u != nullptr) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack)) {
     if ((stage == pdrive->nexp_stages) &&
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
       tstat = porb_u->ClearSend();
@@ -532,7 +544,7 @@ TaskStatus Hydro::ClearRecv(Driver *pdrive, int stage) {
 
   // with orbital advection check receives of U complete
   // only execute when (shearing box defined) AND (last stage) AND (3D OR 2d_r_phi)
-  if (porb_u != nullptr) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack)) {
     if ((stage == pdrive->nexp_stages) &&
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
       tstat = porb_u->ClearRecv();

@@ -43,6 +43,7 @@ add_executable(
         gravity/sparse_mg.cpp
         gravity/composite.cpp
         gravity/self_gravity.cpp
+        gravity/restart.cpp
         gravity/slab_boundary.cpp
         pgen/tests/self_gravity_wave.cpp
 

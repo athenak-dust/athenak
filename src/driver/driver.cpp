@@ -320,6 +320,9 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   if (res_flag && pmesh->pmb_pack->pdust != nullptr) {
     pmesh->pmb_pack->pdust->ResumeAmrAfterRestart(this, pin);
   }
+  if (res_flag && pmesh->pmb_pack->pgrav != nullptr) {
+    pmesh->pmb_pack->pgrav->ResumeAmrAfterRestart(this, pin);
+  }
   // Phi is a derived elliptic field. Recompute from the restored density and
   // physical time; never carry a pre-regrid potential or an old shear phase.
   if (pmesh->pmb_pack->pgrav != nullptr) {
@@ -404,13 +407,21 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
            (elapsed_time < wall_time)) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
 
-      // Strang gravity split around the existing hydro + orbital-advection step.
+      // Symmetric gravity split around hydro, with symmetric orbital halfsteps
+      // for gravity-enabled 3D boxes. The gravity-disabled task path is unchanged.
       // Checkpoints occur only after both half-kicks. The kick leaves density and
       // internal energy unchanged; primitives and ghost values must be refreshed.
-      if (pmesh->pmb_pack->pgrav != nullptr) {
-        pmesh->pmb_pack->pgrav->Solve(pmesh->time);
-        pmesh->pmb_pack->pgrav->KickHydro(0.5*pmesh->dt);
+      auto *pgrav = pmesh->pmb_pack->pgrav;
+      if (pgrav != nullptr) {
+        if (pgrav->UsesOrbitalSplit()) pgrav->SetHydroBoundaryTime(pmesh->time);
+        pgrav->Solve(pmesh->time);
+        pgrav->KickHydro(0.5*pmesh->dt);
         InitBoundaryValuesAndPrimitives(pmesh);
+        if (pgrav->UsesOrbitalSplit()) {
+          pgrav->OrbitalStep(0.5*pmesh->dt);
+          pgrav->SetHydroBoundaryTime(pmesh->time+0.5*pmesh->dt);
+          InitBoundaryValuesAndPrimitives(pmesh);
+        }
       }
 
       // Execute TaskLists
@@ -427,9 +438,16 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // Work after time integrator indicated by "1" in stage
       ExecuteTaskList(pmesh, "after_timeintegrator", 1);
 
-      if (pmesh->pmb_pack->pgrav != nullptr) {
-        pmesh->pmb_pack->pgrav->Solve(pmesh->time+pmesh->dt);
-        pmesh->pmb_pack->pgrav->KickHydro(0.5*pmesh->dt);
+      if (pgrav != nullptr) {
+        if (pgrav->UsesOrbitalSplit()) {
+          // Refill midpoint ghosts used by mixed-level remap reconstruction.
+          InitBoundaryValuesAndPrimitives(pmesh);
+          pgrav->OrbitalStep(0.5*pmesh->dt);
+          pgrav->SetHydroBoundaryTime(pmesh->time+pmesh->dt);
+          InitBoundaryValuesAndPrimitives(pmesh);
+        }
+        pgrav->Solve(pmesh->time+pmesh->dt);
+        pgrav->KickHydro(0.5*pmesh->dt);
       }
 
       // Work outside of TaskLists:
@@ -437,8 +455,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       pmesh->time = pmesh->time + pmesh->dt;
       pmesh->ncycle++;
       pmesh->dt_last_completed = pmesh->dt;
-      if (pmesh->pmb_pack->pgrav != nullptr) {
+      if (pgrav != nullptr) {
         InitBoundaryValuesAndPrimitives(pmesh);
+        pgrav->ClearHydroBoundaryTime();
         (void) pmesh->pmb_pack->phydro->NewTimeStep(this, nexp_stages);
       }
       nmb_updated_ += pmesh->nmb_total;
@@ -456,6 +475,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // Test for/make outputs.  A restart file written here is followed by
       // the mesh check of this cycle, which the dust module records in the file.
       if (pmesh->pmb_pack->pdust != nullptr) pmesh->pmb_pack->pdust->amr_check_after_output = true;
+      if (pmesh->pmb_pack->pgrav != nullptr) pmesh->pmb_pack->pgrav->amr_check_after_output = true;
       for (auto &out : pout->pout_list) {
         // compare at floating point (32-bit) precision to reduce effect of round off
         float time_32 = static_cast<float>(pmesh->time);
@@ -471,6 +491,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       }
 
       if (pmesh->pmb_pack->pdust != nullptr) pmesh->pmb_pack->pdust->amr_check_after_output = false;
+      if (pmesh->pmb_pack->pgrav != nullptr) pmesh->pmb_pack->pgrav->amr_check_after_output = false;
 
       // AMR
       if (pmesh->adaptive) {

@@ -13,6 +13,7 @@
 
 #include "athena.hpp"
 #include "gravity/sparse_mg.hpp"
+#include "gravity/restart.hpp"
 
 class Driver;
 class MeshBlockPack;
@@ -39,8 +40,21 @@ class SelfGravity {
   // change during a kick; ideal-gas internal energy is preserved exactly.
   void KickHydro(Real dt);
   void UpdateTimeStep();
+  // Gravity-enabled 3D hydro uses symmetric orbital halfsteps around residual
+  // RK hydro. This corrects operator splitting; limited PLM remapping can still
+  // have spatial errors that depend on timestep at fixed mesh resolution.
+  bool UsesOrbitalSplit() const { return orbital_split_; }
+  void OrbitalStep(Real dt);
+  void SetHydroBoundaryTime(Real time);
+  void ClearHydroBoundaryTime() { hydro_boundary_time_valid_ = false; }
+  Real HydroBoundaryTime(Real stage_time) const {
+    return hydro_boundary_time_valid_ ? hydro_boundary_time_ : stage_time;
+  }
   // Rebuild is automatic after topology/load-balance or shear-phase changes.
   void Invalidate();
+  void LoadRestartState(GravityRestartState state) { restart_state_ = std::move(state); }
+  void ResumeAmrAfterRestart(Driver *driver, ParameterInput *pin);
+  bool amr_check_after_output = false;
 
   using ExtraDensitySource = std::function<void(Real, DvceArray5D<Real> &)>;
   void SetExtraDensitySource(ExtraDensitySource source) {
@@ -70,7 +84,10 @@ class SelfGravity {
   int slab_modes_x_ = 0, slab_modes_y_ = 0;
   Real phase_ = 0, tolerance_, gravity_cfl_;
   bool phase_valid_ = false, report_each_solve_;
+  bool orbital_split_ = false, hydro_boundary_time_valid_ = false;
+  Real hydro_boundary_time_ = 0;
   std::string vertical_bc_;
+  GravityRestartState restart_state_;
 };
 }  // namespace gravity
 #endif  // GRAVITY_SELF_GRAVITY_HPP_

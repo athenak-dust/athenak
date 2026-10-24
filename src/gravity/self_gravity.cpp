@@ -20,6 +20,7 @@
 #include "hydro/hydro.hpp"
 #include "parameter_input.hpp"
 #include "shearing_box/shearing_box.hpp"
+#include "shearing_box/orbital_advection.hpp"
 
 namespace gravity {
 namespace {
@@ -41,6 +42,7 @@ Real Sum(Real value) {
 SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack) {
   auto *pm = pack->pmesh;
   if (pack->phydro == nullptr || pack->pmhd != nullptr || pack->pdust != nullptr ||
+      pack->ppart != nullptr ||
       pack->prad != nullptr || pack->pcoord->is_special_relativistic ||
       pack->pcoord->is_general_relativistic || pack->pcoord->is_dynamical_relativistic ||
       pm->nmb_packs_thisrank != 1 || pm->one_d) {
@@ -59,6 +61,15 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     if (integrator != "rk1" && integrator != "rk2" && integrator != "rk3") {
       Fail("gravity half-kicks currently support rk1/rk2/rk3 only");
     }
+  }
+  auto *orbital = pack->phydro->porb_u;
+  if (orbital != nullptr) {
+    if (pack->phydro->psbox_u == nullptr ||
+        (!pm->three_d && orbital->shearing_box_r_phi)) {
+      Fail("gravity orbital splitting requires a supported 3D shearing box");
+    }
+    // The existing 2D r-z box has Coriolis terms but no orbital remap.
+    orbital_split_ = pm->three_d && evolution == "dynamic";
   }
   four_pi_G = pin->GetReal("gravity", "four_pi_G");
   tolerance_ = pin->GetOrAddReal("gravity", "rtol", 1.0e-10);
@@ -105,6 +116,40 @@ SelfGravity::~SelfGravity() {
 void SelfGravity::Invalidate() {
   topology_ = -1;
   phase_valid_ = false;
+}
+
+void SelfGravity::SetHydroBoundaryTime(Real time) {
+  if (!std::isfinite(time)) Fail("nonfinite hydro boundary time");
+  hydro_boundary_time_ = time;
+  hydro_boundary_time_valid_ = true;
+}
+
+void SelfGravity::OrbitalStep(Real dt) {
+  if (!UsesOrbitalSplit() || !std::isfinite(dt) || dt <= 0) {
+    Fail("invalid gravity orbital halfstep");
+  }
+  auto *hydro = pack_->phydro;
+  auto *orbital = hydro->porb_u;
+  auto *pm = pack_->pmesh;
+  const Real full_dt = pm->dt;
+  // The public remap reads pm->dt, but never pm->time. Restrict this temporary
+  // change to the completed remap and restore it before residual RK stages.
+  pm->dt = dt;
+  auto finish = [](auto operation) {
+    TaskStatus status;
+    do { status = operation(); } while (status == TaskStatus::incomplete);
+    if (status != TaskStatus::complete) Fail("orbital halfstep task failed");
+  };
+  finish([&]() { return orbital->InitRecv(); });
+  finish([&]() { return orbital->PackAndSendCC(hydro->u0); });
+  finish([&]() { return orbital->RecvAndUnpackCC(hydro->u0, hydro->recon_method); });
+  // Both halfsteps retain the native conservative correction at mixed x2 faces.
+  finish([&]() { return orbital->SendFluxCC(); });
+  finish([&]() { return orbital->RecvFluxCC(hydro->u0); });
+  finish([&]() { return orbital->ClearSend(); });
+  finish([&]() { return orbital->ClearRecv(); });
+  Kokkos::fence();
+  pm->dt = full_dt;
 }
 
 void SelfGravity::Rebuild(Real shear_offset) {

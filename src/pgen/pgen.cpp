@@ -31,6 +31,7 @@
 #include "srcterms/turb_driver.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "gravity/restart.hpp"
 #include "pgen.hpp"
 
 
@@ -620,6 +621,10 @@ ProblemGenerator::ProblemGenerator(ParameterInput *pin, Mesh *pm, IOWrapper resf
 
   // particles and dust state (dust/dust_restart.cpp): the section after the
   // data of the last MeshBlock
+  if (pm->pmb_pack->pgrav != nullptr) {
+    gravity::ReadRestartState(resfile, headeroffset+data_size*pm->nmb_total,
+                              pm, pin, single_file_per_rank);
+  }
   if (pm->pmb_pack->ppart != nullptr) {
     if (single_file_per_rank) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
