@@ -6,11 +6,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 namespace gravity {
 namespace {
@@ -18,6 +23,7 @@ using Vec = std::array<double, 3>;
 using Entry = std::pair<GlobalIndex, double>;
 using Row = std::vector<Entry>;
 using Gradient = std::vector<std::pair<GlobalIndex, Vec>>;
+using GradientCache = std::unordered_map<GlobalIndex, Gradient>;
 struct Box { Vec lo{}, hi{}; };
 struct Node { Box box; int begin, end, left = -1, right = -1; };
 struct Face {
@@ -80,6 +86,37 @@ struct RowWorkspace {
     for (auto &row : g) row.reserve(32);
   }
 };
+
+int AvailablePhaseCpus() {
+#if defined(__linux__)
+  cpu_set_t affinity;
+  CPU_ZERO(&affinity);
+  if (sched_getaffinity(0,sizeof(affinity),&affinity) == 0)
+    return std::max(1,CPU_COUNT(&affinity));
+#endif
+  // Unknown affinity must not cause accidental node-wide oversubscription.
+  return 1;
+}
+
+void JoinPhaseRows(CsrRowUpdate &out, const std::vector<CsrRowUpdate *> &parts) {
+  size_t rows = 0, nnz = 0;
+  for (const auto *part : parts) { rows += part->rows.size(); nnz += part->values.size(); }
+  if (nnz > static_cast<size_t>(std::numeric_limits<int>::max()))
+    throw std::overflow_error("Gravity compact phase CSR exceeds 32-bit offsets");
+  out.global_rows = parts.front()->global_rows; out.global_cols = parts.front()->global_cols;
+  out.row_begin = parts.front()->row_begin;
+  out.rows.reserve(rows); out.rowptr.reserve(rows+1);
+  out.colidx.reserve(nnz); out.values.reserve(nnz);
+  for (auto *part : parts) {
+    const int offset = static_cast<int>(out.values.size());
+    out.rows.insert(out.rows.end(),part->rows.begin(),part->rows.end());
+    for (size_t i = 1; i < part->rowptr.size(); ++i) out.rowptr.push_back(offset+part->rowptr[i]);
+    out.colidx.insert(out.colidx.end(),part->colidx.begin(),part->colidx.end());
+    out.values.insert(out.values.end(),part->values.begin(),part->values.end());
+    // Release each compact chunk as it is consumed; no complete fine CSR is copied.
+    *part = CsrRowUpdate{};
+  }
+}
 }  // namespace
 
 struct MeshGeometry::Impl {
@@ -92,7 +129,13 @@ struct MeshGeometry::Impl {
   std::vector<GlobalIndex> partition, sample_partition, sample_begin;
   std::vector<int> order, row_order, sample_order;
   std::vector<Node> tree;
-  std::unordered_map<GlobalIndex, Gradient> gradients;
+  GradientCache gradients;
+  struct PhaseContext {
+    GradientCache gradients;
+    double shear = std::numeric_limits<double>::quiet_NaN();
+  };
+  std::vector<PhaseContext> phase_contexts;
+  int phase_threads = 1;
   std::vector<int> phase_rows;
   bool phase_rows_ready = false;
 
@@ -301,9 +344,9 @@ struct MeshGeometry::Impl {
     }
     return faces;
   }
-  const Gradient &Grad(GlobalIndex row) {
-    auto found = gradients.find(row);
-    if (found != gradients.end()) return found->second;
+  const Gradient &Grad(GlobalIndex row, GradientCache &cache) const {
+    auto found = cache.find(row);
+    if (found != cache.end()) return found->second;
     const auto faces = Faces(row);
     std::array<Vec,3> normal{};
     for (const auto &f : faces) {
@@ -330,7 +373,7 @@ struct MeshGeometry::Impl {
         add(other,r,coefficient); add(row,r,-coefficient);
       }
     }
-    return gradients.emplace(row,std::move(g)).first->second;
+    return cache.emplace(row,std::move(g)).first->second;
   }
   bool TouchesX(const CompositeCell &cell) const {
     return std::abs(cell.center[0]-.5*cell.width[0]-domain.lo[0]) < minwidth[0]*1.e-5 ||
@@ -373,8 +416,8 @@ struct MeshGeometry::Impl {
   // Full setup and phase refresh deliberately share this exact physical row
   // routine, including canonical faces and all Dirichlet/Neumann LS couplings.
   void AssembleRow(GlobalIndex row, const CompositeCell &ci, double volume,
-                   bool forces, RowWorkspace &work, bool *is_interface = nullptr,
-                   bool *phase_dependent = nullptr) {
+                   bool forces, RowWorkspace &work, GradientCache &cache,
+                   bool *is_interface = nullptr, bool *phase_dependent = nullptr) const {
     work.a.clear(); for (auto &component : work.g) component.clear();
     if (is_interface) *is_interface = false;
     if (phase_dependent) *phase_dependent = TouchesX(ci);
@@ -385,7 +428,7 @@ struct MeshGeometry::Impl {
         if (cell >= partition.back() || !HasOffset(offset)) return;
         if (phase_dependent && !*phase_dependent &&
             (cell == row ? TouchesX(ci) : TouchesX(cell))) *phase_dependent = true;
-        for (const auto &v : Grad(cell)) for (int d = 0; d < nd; ++d)
+        for (const auto &v : Grad(cell,cache)) for (int d = 0; d < nd; ++d)
           AddPotential(work.difference,v.first,sign*offset[d]*v.second[d]);
       };
       slope(f.right,f.tj,1.); slope(f.left,f.ti,-1.);
@@ -403,6 +446,41 @@ struct MeshGeometry::Impl {
       if (is_interface && other < partition.back()) {
         const auto cj = Cell(other);
         if (std::abs(ci.width[0]-cj.width[0]) > minwidth[0]*1.e-5) *is_interface = true;
+      }
+    }
+  }
+  void AssemblePhaseRange(size_t first, size_t last, LocalCompositeUpdate &out,
+                          PhaseContext &context) const {
+    // A context belongs to exactly one worker. Only its seam gradients depend
+    // on phase; nonseam gradients used by selected CF rows stay cached.
+    if (context.shear != shear) {
+      for (auto it = context.gradients.begin(); it != context.gradients.end();) {
+        if (TouchesX(it->first)) it = context.gradients.erase(it);
+        else ++it;
+      }
+      context.shear = shear;
+    }
+    const GlobalIndex n = partition.back(), ns = sample_partition.back();
+    const GlobalIndex begin = partition[rank];
+    auto init = [&](CsrRowUpdate &a, GlobalIndex columns) {
+      a.global_rows = n; a.global_cols = columns; a.row_begin = begin;
+      a.rows.assign(phase_rows.begin()+first,phase_rows.begin()+last);
+      a.rowptr.reserve(last-first+1);
+    };
+    init(out.matrix,n); init(out.boundary_rhs,ns);
+    for (int d = 0; d < 3; ++d) {
+      init(out.acceleration[d],n); init(out.boundary_acceleration[d],ns);
+    }
+    RowWorkspace work;
+    for (size_t i = first; i < last; ++i) {
+      const GlobalIndex row = begin+phase_rows[i];
+      const auto cell = Cell(row); double volume = 1.;
+      for (int d = 0; d < nd; ++d) volume *= cell.width[d];
+      AssembleRow(row,cell,volume,true,work,context.gradients);
+      Append(out.matrix,work.a,n,false); Append(out.boundary_rhs,work.a,n,true,-1.);
+      for (int d = 0; d < 3; ++d) {
+        Append(out.acceleration[d],work.g[d],n,false);
+        Append(out.boundary_acceleration[d],work.g[d],n,true);
       }
     }
   }
@@ -698,6 +776,10 @@ std::vector<std::pair<GlobalIndex,Real>> MeshGeometry::VirtualAverage(
 
 LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   auto &m = *impl_;
+  // Full setup owns its scratch independently of retained phase-worker caches.
+  // In particular, a reused object must never inherit gradients from an earlier
+  // full build or an interrupted assembly at a different phase.
+  m.gradients.clear();
   LocalCompositeSystem out;
   out.neumann_z = m.neumann_z;
   out.row_partition = m.partition; out.sample_partition = m.sample_partition;
@@ -735,7 +817,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
       out.volume.push_back(volume); out.cells.push_back(ci); out.interface.push_back(0);
     }
     bool is_interface = false, phase_dependent = false;
-    m.AssembleRow(row,ci,volume,forces,work,forces ? &is_interface : nullptr,
+    m.AssembleRow(row,ci,volume,forces,work,m.gradients,forces ? &is_interface : nullptr,
                   discover_phase_rows ? &phase_dependent : nullptr);
     if (forces) out.interface.back() = is_interface;
     if (discover_phase_rows && phase_dependent)
@@ -771,6 +853,24 @@ const std::vector<int> &MeshGeometry::PhaseRows() const {
   return impl_->phase_rows;
 }
 
+void MeshGeometry::SetPhaseThreads(int threads) {
+  if (threads < 0) throw std::invalid_argument("Gravity phase thread count must be nonnegative");
+  if (threads == 0) {
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
+    threads = 8;
+#else
+    threads = 1;
+#endif
+  }
+  impl_->phase_threads = std::min(threads,AvailablePhaseCpus());
+}
+
+int MeshGeometry::PhaseThreads() const {
+  const auto &m = *impl_;
+  const int bound = std::min(m.phase_threads,AvailablePhaseCpus());
+  return m.phase_rows_ready ? std::min(bound,static_cast<int>(m.phase_rows.size())) : bound;
+}
+
 LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase) {
   auto &m = *impl_;
   if (!m.phase_rows_ready)
@@ -778,36 +878,48 @@ LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase) {
   double shear = std::fmod(static_cast<double>(phase),m.length[1]);
   if (!std::isfinite(shear)) throw std::invalid_argument("Gravity nonfinite shear phase");
   if (shear < 0.) shear += m.length[1];
-  const bool changed = shear != m.shear;
   m.shear = shear; m.domain.shear_offset = phase;
-  // A gradient depends on phase exactly when its own face geometry crosses the
-  // x seam. Other gradients used by selected CF rows can be retained unchanged.
-  if (changed) for (auto it = m.gradients.begin(); it != m.gradients.end();) {
-      if (m.TouchesX(it->first)) it = m.gradients.erase(it);
-      else ++it;
-    }
-  LocalCompositeUpdate out;
-  const GlobalIndex n = m.partition.back(), ns = m.sample_partition.back();
-  const GlobalIndex begin = m.partition[m.rank];
-  auto init = [&](CsrRowUpdate &a, GlobalIndex columns) {
-    a.global_rows = n; a.global_cols = columns; a.row_begin = begin;
-    a.rows = m.phase_rows; a.rowptr.reserve(m.phase_rows.size()+1);
-  };
-  init(out.matrix,n); init(out.boundary_rhs,ns);
-  for (int d = 0; d < 3; ++d) {
-    init(out.acceleration[d],n); init(out.boundary_acceleration[d],ns);
+  const int workers = std::max(1,PhaseThreads());
+  if (m.phase_contexts.size() != static_cast<size_t>(workers)) {
+    m.phase_contexts.clear(); m.phase_contexts.resize(workers);
   }
-  RowWorkspace work;
-  for (int local : m.phase_rows) {
-    const GlobalIndex row = begin+local;
-    const auto cell = m.Cell(row); double volume = 1.;
-    for (int d = 0; d < m.nd; ++d) volume *= cell.width[d];
-    m.AssembleRow(row,cell,volume,true,work);
-    Append(out.matrix,work.a,n,false); Append(out.boundary_rhs,work.a,n,true,-1.);
-    for (int d = 0; d < 3; ++d) {
-      Append(out.acceleration[d],work.g[d],n,false);
-      Append(out.boundary_acceleration[d],work.g[d],n,true);
-    }
+  LocalCompositeUpdate out;
+  if (workers == 1) {
+    m.AssemblePhaseRange(0,m.phase_rows.size(),out,m.phase_contexts[0]);
+    return out;
+  }
+  std::vector<LocalCompositeUpdate> parts(workers);
+  std::vector<std::exception_ptr> errors(workers);
+  auto assemble = [&](int worker) {
+    try {
+      const size_t first = m.phase_rows.size()*worker/workers;
+      const size_t last = m.phase_rows.size()*(worker+1)/workers;
+      m.AssemblePhaseRange(first,last,parts[worker],m.phase_contexts[worker]);
+    } catch (...) { errors[worker] = std::current_exception(); }
+  };
+  std::vector<std::thread> threads;
+  threads.reserve(workers-1);
+  try {
+    for (int worker = 1; worker < workers; ++worker) threads.emplace_back(assemble,worker);
+  } catch (...) {
+    for (auto &thread : threads) thread.join();
+    throw;
+  }
+  assemble(0);
+  for (auto &thread : threads) thread.join();
+  for (const auto &error : errors) if (error) std::rethrow_exception(error);
+  // Chunks contain consecutive sorted rows. Concatenation performs no floating
+  // arithmetic, preserving serial coefficients and sparse entry order bitwise.
+  std::vector<CsrRowUpdate *> matrices(workers);
+  auto join = [&](auto select, CsrRowUpdate &destination) {
+    for (int worker = 0; worker < workers; ++worker) matrices[worker] = select(parts[worker]);
+    JoinPhaseRows(destination,matrices);
+  };
+  join([](LocalCompositeUpdate &p) { return &p.matrix; },out.matrix);
+  join([](LocalCompositeUpdate &p) { return &p.boundary_rhs; },out.boundary_rhs);
+  for (int d = 0; d < 3; ++d) {
+    join([&](LocalCompositeUpdate &p) { return &p.acceleration[d]; },out.acceleration[d]);
+    join([&](LocalCompositeUpdate &p) { return &p.boundary_acceleration[d]; },out.boundary_acceleration[d]);
   }
   return out;
 }

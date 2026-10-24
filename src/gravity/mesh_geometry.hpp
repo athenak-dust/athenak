@@ -72,6 +72,11 @@ class MeshGeometry {
   // BuildSystem records this dependency list during its initial row pass. A
   // stand-alone call discovers it once without constructing matrices.
   const std::vector<int> &PhaseRows() const;
+  // 1 keeps serial assembly; positive counts are capped by CPU affinity. Zero
+  // selects at most eight workers in GPU builds and one in CPU builds. Workers
+  // only assemble host rows; callers must not concurrently use this geometry.
+  void SetPhaseThreads(int threads);
+  int PhaseThreads() const;  // actual workers, including the calling thread
   // Requires initial BuildSystem or PhaseRows. Only PhaseRows are visited;
   // physical topology and sample ownership stay fixed across arbitrary phases.
   LocalCompositeUpdate BuildPhaseUpdate(Real phase);

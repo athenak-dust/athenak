@@ -59,6 +59,7 @@ hardware validation separately verified distinct GPU assignments.
 | `cfl` | `0.25`, safety factor for acceleration and free-fall limits |
 | `slab_modes_x`, `slab_modes_y` | `0`: use finest horizontal Nyquist cutoff |
 | `report_each_solve` | `false`; final solve summary is always emitted |
+| `phase_threads` | `0`: up to eight affinity-limited host workers in GPU builds, one in CPU builds; `1` forces serial assembly |
 
 Native output choices `gravity_phi`, `gravity_g1/g2/g3`, and `gravity` expose the
 potential/acceleration in active cells. Gravity ghost-zone output is rejected.
@@ -98,6 +99,11 @@ convergence is always checked against the current matrix. A failed cached attemp
 refreshes the hierarchy once and retries, with both attempts included in timing.
 Identical source, topology, phase and gravitational constant can reuse a field;
 extra-source callbacks are still evaluated before checking source equality.
+Host phase workers use private gradient caches and concatenate consecutive row
+chunks in the original order. They do not call MPI or launch GPU work. MPI builds
+request `MPI_THREAD_FUNNELED` for this use; an explicit parallel request fails if
+the library cannot provide it, while automatic mode reports a serial fallback.
+See the [MPI thread-support contract](https://www.open-mpi.org/doc/v4.1/man3/MPI_Init_thread.3.php).
 
 The vacuum boundary candidate adds coarsened, empty solver patches outside the
 physical x3 interval. It retains the physical density mean and imposes the mean

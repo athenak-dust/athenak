@@ -102,6 +102,21 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   restart_ = pin->GetOrAddInteger("gravity", "gmres_restart", 24);
   report_each_solve_ = pin->GetOrAddBoolean("gravity", "report_each_solve", false);
   profile_ = pin->GetOrAddBoolean("gravity", "profile", false);
+  phase_threads_ = pin->GetOrAddInteger("gravity", "phase_threads", 0);
+  if (phase_threads_ < 0) Fail("gravity/phase_threads must be nonnegative");
+#if MPI_PARALLEL_ENABLED
+  int mpi_thread_level = MPI_THREAD_SINGLE, mpi_main_thread = 0;
+  MPI_Query_thread(&mpi_thread_level);
+  MPI_Is_thread_main(&mpi_main_thread);
+  if (!mpi_main_thread) Fail("SelfGravity must be initialized on the MPI main thread");
+  if (mpi_thread_level < MPI_THREAD_FUNNELED) {
+    if (phase_threads_ > 1)
+      Fail("gravity/phase_threads>1 requires MPI_THREAD_FUNNELED or stronger support");
+    phase_serial_only_ = true;
+    if (phase_threads_ == 0 && global_variable::my_rank == 0)
+      std::cout << "# SG_PHASE_THREADS auto_capped=1 mpi_thread_level=" << mpi_thread_level << '\n';
+  }
+#endif
   setup_ = pin->GetOrAddString("gravity", "setup", "reference");
   if (setup_ != "reference" && setup_ != "distributed") {
     Fail("gravity/setup must be reference or distributed");
@@ -452,6 +467,7 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
     solver_domain_ = domain;
     solver_patches_ = setup.patches[0];
     geometry_ = std::move(setup.fine_geometry);
+    geometry_->SetPhaseThreads(phase_serial_only_ ? 1 : phase_threads_);
     if (pm->mesh_bcs[0] == BoundaryFlag::shear_periodic) {
       const auto &rows = geometry_->PhaseRows();
       mg_->ConfigureFinePhaseRows(rows);
@@ -537,6 +553,8 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
       std::cout << std::setprecision(10) << "# SG_PROFILE_PHASE rank="
                 << global_variable::my_rank << " phase=" << shear_offset
                 << " phase_updates=" << phase_update_count
+                << " assembly_workers=" << geometry_->PhaseThreads()
+                << " phase_threads_config=" << phase_threads_
                 << " assembly_s=" << assembled-begin
                 << " operators_s=" << ProfileTime(true)-assembled
                 << " value_updates=" << counters.value_updates
