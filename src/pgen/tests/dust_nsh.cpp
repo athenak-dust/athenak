@@ -1712,6 +1712,17 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
                 << "<problem>/stratified_dust_sampling must be weight or gaussian" << std::endl;
       std::exit(EXIT_FAILURE);
     }
+    // <problem>/cloud_seed = leaf: every parent becomes a cloud at the level of the
+    // leaf that holds it (no lobes; the P1 split then only acts on the clouds whose supports
+    // reach finer leaves), so that the clouds start from the same samples as a uniform-mesh run
+    // of particles on the finest grid; root (default): root-level parents split to the leaves
+    const std::string cseed = pin->GetOrAddString("problem", "cloud_seed", "root");
+    if ((cseed != "root" && cseed != "leaf") || (cseed == "leaf" && canonical_root)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<problem>/cloud_seed must be root or leaf (leaf: refinable clouds)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const bool seed_leaf = (cseed == "leaf");
     // the parents of this rank (several ranks): every rank draws all of them and
     // keeps those whose leaf is in one of its blocks, in the order of their global index q,
     // which stays the tag (one rank: all of them)
@@ -1771,6 +1782,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     const bool tvzm = pin->GetOrAddBoolean("problem", "dust_test_vz_mirror", false);
     const bool gsamp = place.gauss;
     const Real gfac = std::sqrt(2.0*M_PI)*place.hp/place.lz;
+    auto mblev0 = pmbp->pmb->mb_lev;
+    const int rootlev0 = pmy_mesh_->root_level;
     const bool nshz = nsh_vertical;
     const NSHTableZ ntab = nshtab;
     par_for("nsh_cloud_root3d", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int q) {
@@ -1782,7 +1795,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       pi0(PGID,p) = gids0 + pslot(q);
       pi0(PTAG,p) = q;
       pi0(PSP,p) = sp;
-      pi0(PLEV,p) = 0;
+      pi0(PLEV,p) = seed_leaf ? (mblev0.d_view(pslot(q)) - rootlev0) : 0;
       for (int c=0; c<nrdata; ++c) pr0(c,p) = 0.0;
       pr0(IPX,p) = x; pr0(IPX1,p) = x;
       pr0(IPY,p) = y; pr0(IPY1,p) = y;
@@ -1823,6 +1836,32 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       // before any split: taken later (at the first G or R) it is the largest root cloud still
       // unsplit, which for stratified masses lies far from the refined midplane (4e-6 of the
       // midplane mass for Hp = 0.02 H and a band |z| < 0.1 H).  Equal masses: the same value.
+      if (seed_leaf) {
+        // the root cloud mass of G and R: 8^lmax times the largest cloud, so that a
+        // seeded cloud on the finest level is one quantum there (the clouds are not root parents)
+        Real mmax = 0.0;
+        int lmax = 0;
+        auto prq = ppar->prtcl_rdata;
+        auto piq = ppar->prtcl_idata;
+        Kokkos::parallel_reduce("nsh_seed_leaf_m", Kokkos::RangePolicy<>(DevExeSpace(), 0,
+                                ppar->nprtcl_thispack),
+        KOKKOS_LAMBDA(const int p, Real &a, int &l) {
+          if (prq(IPM,p) > a) a = prq(IPM,p);
+          const int lv = piq(PLEV,p) & 15;   // the level bits of the cloud code
+          if (lv > l) l = lv;
+        }, Kokkos::Max<Real>(mmax), Kokkos::Max<int>(lmax));
+#if MPI_PARALLEL_ENABLED
+        MPI_Allreduce(MPI_IN_PLACE, &mmax, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(MPI_IN_PLACE, &lmax, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+#endif
+        const Real mroot = mmax*static_cast<Real>(std::int64_t(1) << (3*lmax));
+        pmbp->pdust->cloud_merge_mroot.assign(std::max(1, nspec), mroot);
+        if (global_variable::my_rank == 0) {
+          std::cout << "# cloud_seed = leaf: clouds on their leaf levels (finest " << lmax
+                    << "), root cloud mass of G and R " << mroot << " = 8^" << lmax << " x "
+                    << mmax << std::endl;
+        }
+      }
       pmbp->pdust->EnsureRootCloudMass();
       pmbp->pdust->SplitToLeaves();
     }
