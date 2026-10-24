@@ -328,7 +328,9 @@ TaskStatus Hydro::RecvU_OA(Driver *pdrive, int stage) {
 TaskStatus Hydro::RestrictU(Driver *pdrive, int stage) {
   // the coarser side of an x2 face with a level change takes the finer side's
   // orbital-advection fluxes (sent at the end of RecvU_OA), before the restriction
-  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack) &&
+  // Stage zero is also used by initialization/static field checks, before any
+  // orbital-advection flux exchange has been posted.
+  if (stage > 0 && porb_u != nullptr && !GravityOrbitalSplit(pmy_pack) &&
       stage == pdrive->nexp_stages && pmy_pack->pmesh->three_d) {
     TaskStatus tstat = porb_u->RecvFluxCC(u0);
     if (tstat != TaskStatus::complete) return tstat;

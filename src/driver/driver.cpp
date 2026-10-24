@@ -62,6 +62,8 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
   tlim(-1.0),
   nlim(-1),
   ndiag(1),
+  nimp_stages(0),
+  nexp_stages(0),
   pwall_clock_(ptimer),
   wall_time(wtlim),
   nmb_updated_(0),
