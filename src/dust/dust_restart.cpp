@@ -172,6 +172,27 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   // 2026-10-21 (cloud_event_dt): the first regrid of a pending event (time, cycle)
   const double et[2] = {amr_event_first_time, static_cast<double>(amr_event_first_ncycle)};
   PutRecord(b, "regrid_evt_t", et, sizeof(et));
+  // (Codex Astra review) the physical-x3 ledger: the run totals of the outflow (the same on
+  // every rank), the particles parked for removal and the dropped deposits (summed over the ranks
+  // here, restored on rank 0 only, so a restart on any number of ranks counts them once)
+  {
+    auto *pb = pmy_pack->ppart->pbval_part;
+    Kokkos::deep_copy(pb->x3_removed.h_view, pb->x3_removed.d_view);
+    const auto &ds = pbval_dm->dropped_sum;
+    const int nd = static_cast<int>(ds.size());
+    std::vector<double> led(5 + nd, 0.0);
+    led[0] = x3_outflow_mass; led[1] = static_cast<double>(x3_outflow_count);
+    led[2] = pb->x3_removed.h_view(0); led[3] = pb->x3_removed.h_view(1);
+    led[4] = static_cast<double>(nd);
+    for (int v=0; v<nd; ++v) led[5 + v] = ds[v];
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      MPI_Allreduce(MPI_IN_PLACE, led.data() + 2, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+      if (nd > 0) MPI_Allreduce(MPI_IN_PLACE, led.data() + 5, nd, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    }
+#endif
+    PutRecord(b, "x3_ledger", led.data(), led.size()*sizeof(double));
+  }
 }
 
 void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
@@ -261,6 +282,24 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
     } else if (name == "regrid_evt_t") {
       double v[2]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));
       amr_event_first_time = v[0]; amr_event_first_ncycle = static_cast<long long>(v[1]);
+    } else if (name == "x3_ledger") {
+      if (n < static_cast<std::int32_t>(5*sizeof(double)) || n % sizeof(double) != 0) {
+        Broken("dust record x3_ledger has an unexpected size");
+      }
+      std::vector<double> led(n/sizeof(double));
+      std::memcpy(led.data(), d, n);
+      const int nd = static_cast<int>(led[4]);
+      if (static_cast<std::size_t>(5 + nd) != led.size()) Broken("dust record x3_ledger is inconsistent");
+      x3_outflow_mass = led[0];
+      x3_outflow_count = static_cast<long long>(led[1] + 0.5);
+      const bool r0 = (global_variable::my_rank == 0);
+      auto *pb = pmy_pack->ppart->pbval_part;
+      pb->x3_removed.h_view(0) = r0 ? led[2] : 0.0;
+      pb->x3_removed.h_view(1) = r0 ? led[3] : 0.0;
+      pb->x3_removed.template modify<HostMemSpace>();
+      pb->x3_removed.template sync<DevExeSpace>();
+      pbval_dm->dropped_sum.assign(nd, 0.0);
+      if (r0) for (int v=0; v<nd; ++v) pbval_dm->dropped_sum[v] = led[5 + v];
     } else if (global_variable::my_rank == 0) {
       std::cout << "# WARNING (dust restart): record '" << name << "' is not known to this code "
                 << "and is ignored" << std::endl;

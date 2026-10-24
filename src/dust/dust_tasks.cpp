@@ -427,7 +427,9 @@ TaskStatus DustGasDrag::RemoveOutflowParticles(Driver *pdrive, int stage) {
 #endif
   if (rm[1] == 0.0) return TaskStatus::complete;
   const int npart = ppar->nprtcl_thispack;
-  if (pb->x3_removed.h_view(1) > 0.0) {
+  // (Codex Astra review) every rank removes its parked particles: after a restart the
+  // pending count is held by rank 0 while the parked particles may sit on any rank
+  {
     auto pr = ppar->prtcl_rdata;
     auto pi = ppar->prtcl_idata;
     const int nrdata = ppar->nrdata, nidata = ppar->nidata;
@@ -438,22 +440,24 @@ TaskStatus DustGasDrag::RemoveOutflowParticles(Driver *pdrive, int stage) {
       if (final) koff(p) = upd;
       upd += (pr(IPM,p) > 0.0) ? 1 : 0;
     }, nkeep);
-    DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata,
-                          std::max(1, nkeep));
-    DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata,
-                         std::max(1, nkeep));
-    Kokkos::parallel_for("x3o_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      if (pr(IPM,p) <= 0.0) return;
-      const int k = koff(p);
-      for (int c=0; c<nrdata; ++c) prn(c,k) = pr(c,p);
-      for (int c=0; c<nidata; ++c) pin(c,k) = pi(c,p);
-    });
-    ppar->prtcl_rdata = prn;
-    ppar->prtcl_idata = pin;
-    ppar->nprtcl_thispack = nkeep;
-    pmy_pack->pmesh->nprtcl_thisrank = nkeep;
-    pmy_pack->pmesh->nprtcl_eachrank[global_variable::my_rank] = nkeep;
+    if (nkeep < npart) {
+      DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"),
+                            nrdata, std::max(1, nkeep));
+      DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"),
+                           nidata, std::max(1, nkeep));
+      Kokkos::parallel_for("x3o_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p) {
+        if (pr(IPM,p) <= 0.0) return;
+        const int k = koff(p);
+        for (int c=0; c<nrdata; ++c) prn(c,k) = pr(c,p);
+        for (int c=0; c<nidata; ++c) pin(c,k) = pi(c,p);
+      });
+      ppar->prtcl_rdata = prn;
+      ppar->prtcl_idata = pin;
+      ppar->nprtcl_thispack = nkeep;
+      pmy_pack->pmesh->nprtcl_thisrank = nkeep;
+      pmy_pack->pmesh->nprtcl_eachrank[global_variable::my_rank] = nkeep;
+    }
   }
   x3_outflow_mass += rm[0];
   x3_outflow_count += static_cast<long long>(rm[1] + 0.5);

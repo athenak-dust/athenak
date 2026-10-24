@@ -20,6 +20,7 @@
 #include "mesh/mesh.hpp"
 #include "particles/particles.hpp"
 #include "bvals.hpp"
+#include "dust/dust.hpp"
 
 namespace particles {
 //----------------------------------------------------------------------------------------
@@ -96,6 +97,7 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
   auto psendl = sendlist.d_view;
   // (S3c) the physical x3 faces: reflect or outflow (see bvals.hpp)
   const int x3bc = x3bc_dust;
+  constexpr int kLobe3Shift = SMRCompositeTransfer::kCloudLobeShift3;   // dust.hpp
   auto x3rem = x3_removed.d_view;
   const Real z3a = meshsize.x3min, z3b = meshsize.x3max;
   par_for("part_update",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
@@ -110,7 +112,14 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
         if (z < z3a) z = z3a;
         pr(IPZ,p) = z;
         pr(IPVZ,p) = -pr(IPVZ,p);
-        if (has_reg) {pr(IPZ1,p) = 2.0*zf - pr(IPZ1,p); pr(IPVZ1,p) = -pr(IPVZ1,p);}
+        if (has_reg) {
+          pr(IPZ1,p) = 2.0*zf - pr(IPZ1,p); pr(IPVZ1,p) = -pr(IPVZ1,p);
+          // (Codex Astra review) a refinable cloud's x3 lobe mirrors too: lobe 1 <-> 2 (bits
+          // 9-10 of PLEV, dust::SMRCompositeTransfer::kCloudLobeShift3; 0 and 3 are symmetric;
+          // point particles have no lobe bits)
+          const int l3 = (pi(PLEV,p) >> kLobe3Shift) & 3;
+          if (l3 == 1 || l3 == 2) pi(PLEV,p) ^= (3 << kLobe3Shift);
+        }
       } else {           // outflow: record the mass, park the (now massless) particle at rest
         Kokkos::atomic_add(&x3rem(0), pr(IPM,p));
         Kokkos::atomic_add(&x3rem(1), 1.0);

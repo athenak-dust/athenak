@@ -554,7 +554,7 @@ void ShearingBoxCC::PlanFluxPair() {
     if (rloc == sloc) continue;
     const int peer = rloc ? pm->rank_eachmb[p[kQSGid]] : pm->rank_eachmb[p[kQRGid]];
     key.push_back({rloc ? 0LL : 1LL, peer, p[kQRGid], p[kQRFace], p[kQSGid], p[kQPair], 0,
-                   static_cast<long long>(nvar_ + 1)*p[kQNz]*p[kQNy]});
+                   static_cast<long long>(nvar_ + 2)*p[kQNz]*p[kQNy]});
     rem.push_back(n);
   }
   std::vector<int> offset;
@@ -580,8 +580,9 @@ void ShearingBoxCC::PlanFluxPair() {
   qfrac.template modify<HostMemSpace>();
   qfrac.template sync<DevExeSpace>();
   if (static_cast<int>(qacc.extent(0)) < std::max(1, nmb) ||
-      static_cast<int>(qacc.extent(2)) != nvar_ + 1) {
-    Kokkos::realloc(qacc, std::max(1, nmb), 2, nvar_ + 1, nx3, nx2);
+      static_cast<int>(qacc.extent(2)) != nvar_ + 2) {
+    Kokkos::realloc(qacc, std::max(1, nmb), 2, nvar_ + 2, nx3, nx2);
+    Kokkos::realloc(qnew, std::max(1, nmb), 2, nvar_, nx3, nx2);
   }
   if (static_cast<int>(qsendflat.extent(0)) < std::max(1, soff)) {
     Kokkos::realloc(qsendflat, std::max(1, soff));
@@ -618,8 +619,9 @@ void ShearingBoxCC::PlanFluxPair() {
 //----------------------------------------------------------------------------------------
 //! \fn TaskStatus ShearingBoxCC::SendFluxPair()
 //! \brief The authoritative blocks integrate their x1 face fluxes (piecewise linear in x2,
-//! limited, none at the block's own first and last rows) over each receiving cell; the sums
-//! and the covered fraction go to the receiver's accumulators or to the flat buffer.
+//! limited, none at the block's own first and last rows) over each receiving cell; the sums,
+//! the covered fraction and its first moment in the receiving cell (x2, in units
+//! of its width, about its centre) go to the receiver's accumulators or to the flat buffer.
 
 TaskStatus ShearingBoxCC::SendFluxPair(DvceFaceFld5D<Real> &flx) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -634,7 +636,7 @@ TaskStatus ShearingBoxCC::SendFluxPair(DvceFaceFld5D<Real> &flx) {
   auto acc = qacc;
   auto sf = qsendflat;
   auto f1 = flx.x1f;
-  par_for("shr-qflx-pack", DevExeSpace(), 0, nqpiece-1, 0, nv, 0, nx3-1, 0, nx2-1,
+  par_for("shr-qflx-pack", DevExeSpace(), 0, nqpiece-1, 0, nv+1, 0, nx3-1, 0, nx2-1,
   KOKKOS_LAMBDA(const int n, const int vv, const int kk, const int rr) {
     if (qp.d_view(n,kQSLoc) == 0) return;
     const int ny = qp.d_view(n,kQNy), nz = qp.d_view(n,kQNz);
@@ -658,6 +660,9 @@ TaskStatus ShearingBoxCC::SendFluxPair(DvceFaceFld5D<Real> &flx) {
         if (hi <= lo) continue;
         if (vv == nv) {
           sum += hi - lo;
+        } else if (vv == nv + 1) {
+          const Real yc = 0.5*(ylo + yhi);
+          sum += ((hi - yc)*(hi - yc) - (lo - yc)*(lo - yc))/(2.0*static_cast<Real>(f2));
         } else {
           const Real fc = f1(mx, vv, ks+kx, js+jl, ix);
           Real slope = 0.0;
@@ -698,7 +703,7 @@ TaskStatus ShearingBoxCC::SendFluxPair(DvceFaceFld5D<Real> &flx) {
 
 //----------------------------------------------------------------------------------------
 //! \fn TaskStatus ShearingBoxCC::RecvFluxPair()
-//! \brief Sums from other ranks, then every face cell: F = F_own (1 - covered) + received
+//! \brief Sums from other ranks, then every face cell: F = F_own (1 - covered) - slope m1 + received
 
 TaskStatus ShearingBoxCC::RecvFluxPair(DvceFaceFld5D<Real> &flx) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -723,7 +728,7 @@ TaskStatus ShearingBoxCC::RecvFluxPair(DvceFaceFld5D<Real> &flx) {
   if (!done) return TaskStatus::incomplete;
   if (nqpiece > 0) {
     auto rf = qrecvflat;
-    par_for("shr-qflx-unpk", DevExeSpace(), 0, nqpiece-1, 0, nv, 0, nx3-1, 0, nx2-1,
+    par_for("shr-qflx-unpk", DevExeSpace(), 0, nqpiece-1, 0, nv+1, 0, nx3-1, 0, nx2-1,
     KOKKOS_LAMBDA(const int n, const int vv, const int kk, const int rr) {
       if (qp.d_view(n,kQSLoc) == 1 || qp.d_view(n,kQRIdx) < 0) return;
       const int ny = qp.d_view(n,kQNy), nz = qp.d_view(n,kQNz);
@@ -737,6 +742,12 @@ TaskStatus ShearingBoxCC::RecvFluxPair(DvceFaceFld5D<Real> &flx) {
   const int nmb = pmy_pack->nmb_thispack;
   auto f1 = flx.x1f;
   auto &mbbcs = pmy_pack->pmb->mb_bcs;
+  auto qn = qnew;
+  // (Codex Astra review) a cell only partly covered by authoritative partners keeps its own
+  // flux on the rest, where it is itself authoritative and sends the integral of its piecewise
+  // linear flux (SendFluxPair): keep the same integral, F_own (1 - covered) - slope m1 (m1 = first
+  // moment of the covered part), so both sides of every piece agree.  Fully covered cells as before.
+  // Into qnew first: the slope reads the neighbours' unreplaced fluxes.
   par_for("shr-qflx-apply", DevExeSpace(), 0, nmb-1, 0, 1, 0, nv-1, 0, nx3-1, 0, nx2-1,
   KOKKOS_LAMBDA(const int m, const int f, const int v, const int k, const int j) {
     const auto face = (f == 0) ? BoundaryFace::inner_x1 : BoundaryFace::outer_x1;
@@ -744,7 +755,21 @@ TaskStatus ShearingBoxCC::RecvFluxPair(DvceFaceFld5D<Real> &flx) {
     const Real cov = acc(m, f, nv, k, j);
     if (cov <= 0.0) return;
     const int ix = (f == 0) ? is : (ie + 1);
-    f1(m, v, ks+k, js+j, ix) = f1(m, v, ks+k, js+j, ix)*(1.0 - cov) + acc(m, f, v, k, j);
+    const Real fc = f1(m, v, ks+k, js+j, ix);
+    Real val = fc*(1.0 - cov) + acc(m, f, v, k, j);
+    if (cov < 1.0 - 1.0e-12 && j > 0 && j < nx2 - 1) {
+      const Real dql = fc - f1(m, v, ks+k, js+j-1, ix);
+      const Real dqr = f1(m, v, ks+k, js+j+1, ix) - fc;
+      if (dql*dqr > 0.0) val -= 2.0*dql*dqr/(dql + dqr)*acc(m, f, nv+1, k, j);
+    }
+    qn(m, f, v, k, j) = val;
+  });
+  par_for("shr-qflx-copy", DevExeSpace(), 0, nmb-1, 0, 1, 0, nv-1, 0, nx3-1, 0, nx2-1,
+  KOKKOS_LAMBDA(const int m, const int f, const int v, const int k, const int j) {
+    const auto face = (f == 0) ? BoundaryFace::inner_x1 : BoundaryFace::outer_x1;
+    if (mbbcs.d_view(m,face) != BoundaryFlag::shear_periodic) return;
+    if (acc(m, f, nv, k, j) <= 0.0) return;
+    f1(m, v, ks+k, js+j, (f == 0) ? is : (ie + 1)) = qn(m, f, v, k, j);
   });
   return TaskStatus::complete;
 }

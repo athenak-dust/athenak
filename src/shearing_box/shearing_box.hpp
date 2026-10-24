@@ -230,7 +230,9 @@ class ShearingBoxCC : public ShearingBox {
   DualArray2D<int> qpiece;
   DualArray1D<Real> qfrac;      // fractional part of the shift of each piece (sender cells)
   int nqpiece = 0;
-  DvceArray5D<Real> qacc;       // (m, face, nvar+1, k, j): sum of contributions, last = fraction
+  // (m, face, nvar+2, k, j): sum of contributions, then the covered fraction and its
+  // first moment in x2; qnew the replaced fluxes before they are copied back
+  DvceArray5D<Real> qacc, qnew;
   DvceArray1D<Real> qsendflat, qrecvflat;
 #if MPI_PARALLEL_ENABLED
   MPI_Comm comm_qflx;
