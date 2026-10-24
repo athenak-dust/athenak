@@ -136,6 +136,10 @@ void WriteBASnapshot(Mesh *pm) {
 bool ba_fields_ = false;
 bool ba_history_ = false;
 bool dust_moments_hist_ = false;   // msum, mvx, mvz, mz2 columns in the user history
+// Diagnostic: the x momentum of the dust (m vx) and of the gas (M1 dV) as
+// compensated (Neumaier) sums on the host, columns mvx_c and gpx_c, to tell a summation
+// error of the ordinary history columns from a conservation error.
+bool dust_moments_exact_ = false;
 // 3-D particle snapshots: every p3d_snapshot_dt, per rank p3d.NNNNN.rRRRRR.bin with
 // "P3D1", the time (double), the particle count (int), then x, y, z, m (float32 arrays)
 Real p3d_dt_ = -1.0;
@@ -1154,6 +1158,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   }
   ba_history_ = pin->GetOrAddBoolean("problem", "ba_history", false);
   dust_moments_hist_ = pin->GetOrAddBoolean("problem", "dust_moments_hist", false);
+  dust_moments_exact_ = pin->GetOrAddBoolean("problem", "dust_moments_exact", false);
   p3d_dt_ = pin->GetOrAddReal("problem", "p3d_snapshot_dt", -1.0);
   // several ranks: fields of the canonical TSC deposit on a uniform mesh (WriteBAFieldsGlobal), or
   // of refinable clouds with <dust>/experimental_mpi (2026-10-21, WriteBAFields); not ba_history
@@ -1590,6 +1595,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     const Real shp = strat ? pin->GetOrAddReal("problem", "dust_hp",
                                                pmbp->phydro->peos->eos_data.iso_cs/omega0) : 1.0;
     const Real svz0 = strat ? pin->GetOrAddReal("problem", "dust_vz0", 0.0) : 0.0;
+    // a uniform dust vz on the root parents of any 3-D set-up; with
+    // dust_test_vz_mirror its sign follows z (a state mirrored about z = 0, the image of a box
+    // with reflecting x3 faces)
+    const Real tvz0 = pin->GetOrAddReal("problem", "dust_test_vz0", 0.0);
+    const bool tvzm = pin->GetOrAddBoolean("problem", "dust_test_vz_mirror", false);
     par_for("nsh_cloud_root3d", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int q) {
       const int p = pnew(q);
       if (p < 0) return;
@@ -1613,6 +1623,10 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       if (strat) {
         pr0(IPM,p) *= exp(-0.5*z*z/(shp*shp));
         pr0(IPVZ,p) = svz0; pr0(IPVZ1,p) = svz0;
+      }
+      if (tvz0 != 0.0) {
+        pr0(IPVZ,p) += (tvzm && z < 0.0) ? -tvz0 : tvz0;
+        pr0(IPVZ1,p) = pr0(IPVZ,p);
       }
     });
     if (strat && global_variable::my_rank == 0) {
@@ -2332,6 +2346,34 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
       }
       pdata->nhist += 3;
     }
+  }
+  if (dust_moments_exact_ && pdata->nhist + 2 <= NHISTORY_VARIABLES) {
+    // compensated sums, rank-local; few ranks add only O(eps |sum|)
+    auto prh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
+    auto *pack = pm->pmb_pack;
+    auto &ind = pm->mb_indcs;
+    auto u0h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pack->phydro->u0);
+    double sum[2] = {0.0, 0.0}, cmp[2] = {0.0, 0.0};
+    auto add = [&](int k, double x) {
+      const double t = sum[k] + x;
+      cmp[k] += (std::abs(sum[k]) >= std::abs(x)) ? (sum[k] - t) + x : (x - t) + sum[k];
+      sum[k] = t;
+    };
+    for (int p=0; p<npart; ++p) add(0, prh(IPM,p)*prh(IPVX,p));
+    for (int m=0; m<pack->nmb_thispack; ++m) {
+      const auto &size = pack->pmb->mb_size.h_view(m);
+      const double vol = size.dx1*size.dx2*size.dx3;
+      for (int k=ind.ks; k<=ind.ke; ++k) {
+        for (int j=ind.js; j<=ind.je; ++j) {
+          for (int i=ind.is; i<=ind.ie; ++i) add(1, u0h(m,IM1,k,j,i)*vol);
+        }
+      }
+    }
+    pdata->label[pdata->nhist] = "mvx_c";
+    pdata->label[pdata->nhist + 1] = "gpx_c";
+    pdata->hdata[pdata->nhist] = sum[0] + cmp[0];
+    pdata->hdata[pdata->nhist + 1] = sum[1] + cmp[1];
+    pdata->nhist += 2;
   }
   if (ba_history_) {
     // mass-weighted dust moments (all species) and the cumulative cloud
