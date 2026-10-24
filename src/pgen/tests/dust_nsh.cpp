@@ -1636,6 +1636,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // the tag counter is set collectively before the splits
     if (!canonical_root) {
       pmbp->pdust->EnsureNextTag();
+      // the root cloud mass of G and R (the largest root parent) is taken now,
+      // before any split: taken later (at the first G or R) it is the largest root cloud still
+      // unsplit, which for stratified masses lies far from the refined midplane (4e-6 of the
+      // midplane mass for Hp = 0.02 H and a band |z| < 0.1 H).  Equal masses: the same value.
+      pmbp->pdust->EnsureRootCloudMass();
       pmbp->pdust->SplitToLeaves();
     }
     long long nnow = ppar->nprtcl_thispack;
