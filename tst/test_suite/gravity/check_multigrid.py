@@ -102,10 +102,10 @@ def main():
     for n in (16,32):
         results[f'periodic{n}'] = run_case(args, f'periodic{n}',
             'self_gravity_poisson.athinput', (f'mesh/nx1={n}',f'mesh/nx2={n}'))
-    for n in (8,16):
+    for n in (16,32):
         results[f'slab{n}'] = run_case(args, f'slab{n}', 'self_gravity_slab.athinput',
             (f'mesh/nx1={n}',f'mesh/nx2={n}',f'mesh/nx3={n}'))
-    for family, coarse, fine, minimum in (('periodic',16,32,1.7),('slab',8,16,1.5)):
+    for family, coarse, fine, minimum in (('periodic',16,32,1.7),('slab',16,32,1.5)):
         a,b = results[f'{family}{coarse}'],results[f'{family}{fine}']
         for key in ('phi_l2','acceleration_l2'):
             order = math.log2(a[key]/b[key])

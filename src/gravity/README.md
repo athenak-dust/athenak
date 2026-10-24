@@ -27,6 +27,10 @@ and relativistic modules are rejected when this feature is enabled.
 Initialize the pinned Kokkos submodule and build outside the checkout with the
 usual AthenaK CMake options. No additional solver library is required. Examples
 are in `inputs/hydro/self_gravity_{poisson,jeans,slab,shear_amr}.athinput`.
+All examples select WENO-Z and explicitly select distributed setup; the isolated
+example also selects the vacuum boundary backend. The portable slab comparison
+uses 16 and 32 root cells with 8-cell blocks so both grids contain an actual
+coarse/fine interface.
 Run them in an external, project-designated scratch directory. Static Poisson
 tests use `evolution=static` and the native `advect` solver; the Jeans and shearing
 examples evolve the actual hydro equations.

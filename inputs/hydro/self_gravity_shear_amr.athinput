@@ -46,6 +46,7 @@ reconstruct = wenoz
 rsolver = hlle
 <gravity>
 enabled = true
+setup = distributed
 four_pi_G = 50
 vertical_bc = periodic
 rtol = 1e-11
