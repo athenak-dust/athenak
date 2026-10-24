@@ -42,6 +42,10 @@ add_executable(
 
         gravity/sparse_mg.cpp
         gravity/composite.cpp
+        gravity/mesh_geometry.cpp
+        gravity/geometric_mg.cpp
+        gravity/vacuum_mesh.cpp
+        gravity/vacuum_boundary.cpp
         gravity/self_gravity.cpp
         gravity/restart.cpp
         gravity/slab_boundary.cpp

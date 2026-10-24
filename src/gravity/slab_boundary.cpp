@@ -58,7 +58,7 @@ SlabBoundary::SlabBoundary(const std::vector<CompositeCell> &cells,
   samples_ = DvceArray2D<Real>("slab_samples",send-sbegin,4);
   auto ch = Kokkos::create_mirror_view(cells_);
   auto sh = Kokkos::create_mirror_view(samples_);
-  Real hmin[2] = {std::numeric_limits<Real>::max(),std::numeric_limits<Real>::max()};
+  std::array<Real,2> hmin{{std::numeric_limits<Real>::max(),std::numeric_limits<Real>::max()}};
   for (const auto &cell : cells) {
     for (int d = 0; d < 2; ++d) hmin[d] = std::min(hmin[d],cell.width[d]);
   }
@@ -72,26 +72,67 @@ SlabBoundary::SlabBoundary(const std::vector<CompositeCell> &cells,
   }
   Kokkos::deep_copy(cells_,ch);
   Kokkos::deep_copy(samples_,sh);
+  InitializeModes(domain,hmin,modes_x,modes_y);
+}
+
+SlabBoundary::SlabBoundary(const std::vector<CompositeCell> &cells,
+    const CompositeDomain &domain, const std::vector<BoundarySample> &samples,
+    const std::array<Real,2> &min_width, int modes_x, int modes_y) {
+  if (!domain.isolated_z || domain.ndim != 3) {
+    throw std::invalid_argument("owned slab gravity boundary requires 3D isolated z");
+  }
+  cells_ = DvceArray2D<Real>("slab_cells",cells.size(),6);
+  samples_ = DvceArray2D<Real>("slab_samples",samples.size(),4);
+  auto ch = Kokkos::create_mirror_view(cells_);
+  auto sh = Kokkos::create_mirror_view(samples_);
+  for (size_t q = 0; q < cells.size(); ++q) for (int d = 0; d < 3; ++d) {
+    ch(q,d) = cells[q].center[d];
+    ch(q,d+3) = cells[q].width[d];
+  }
+  for (size_t q = 0; q < samples.size(); ++q) {
+    for (int d = 0; d < 3; ++d) sh(q,d) = samples[q].center[d];
+    sh(q,3) = samples[q].side;
+  }
+  Kokkos::deep_copy(cells_,ch);
+  Kokkos::deep_copy(samples_,sh);
+  InitializeModes(domain,min_width,modes_x,modes_y);
+}
+
+void SlabBoundary::InitializeModes(const CompositeDomain &domain,
+    const std::array<Real,2> &hmin, int modes_x, int modes_y) {
+  if (!(hmin[0] > 0) || !(hmin[1] > 0) || !std::isfinite(hmin[0]) ||
+      !std::isfinite(hmin[1]) || modes_x < 0 || modes_y < 0) {
+    throw std::invalid_argument("slab gravity invalid global spacing/mode cutoff");
+  }
   const Real lx = domain.hi[0]-domain.lo[0], ly = domain.hi[1]-domain.lo[1];
+  lx_ = lx; ly_ = ly;
   area_ = lx*ly; zlo_ = domain.lo[2]; zhi_ = domain.hi[2];
   // Default cutoff resolves the finest active horizontal spacing. Explicit smaller
   // cutoffs are convergence-study parameters, not silently adaptive approximations.
   if (modes_x <= 0) modes_x = std::max(1,static_cast<int>(std::lround(lx/hmin[0]))/2);
   if (modes_y <= 0) modes_y = std::max(1,static_cast<int>(std::lround(ly/hmin[1]))/2);
-  const long long count = static_cast<long long>(2*modes_x+1)*modes_y+modes_x;
+  const long long count = (2LL*modes_x+1)*modes_y+modes_x;
   if (count > std::numeric_limits<int>::max()/4) {
     throw std::runtime_error("slab gravity Fourier coefficient count exceeds MPI capacity");
   }
   nmodes_ = count;
+  modes_x_ = modes_x; modes_y_ = modes_y;
   wave_ = DvceArray2D<Real>("slab_modes",nmodes_,3);
   coefficients_ = DvceArray2D<Real>("slab_coefficients",nmodes_,4);
+  SetShearOffset(domain.shear_offset);
+}
+
+void SlabBoundary::SetShearOffset(Real shear_offset) {
+  if (!std::isfinite(shear_offset)) {
+    throw std::invalid_argument("slab gravity nonfinite shear offset");
+  }
   auto kh = Kokkos::create_mirror_view(wave_);
   const Real twopi = 2*std::acos(Real(-1));
-  const Real shift = std::remainder(domain.shear_offset,ly);
+  const Real shift = std::remainder(shear_offset,ly_);
   int m = 0;
-  for (int ny = 0; ny <= modes_y; ++ny) {
-    for (int nx = ny == 0 ? 1 : -modes_x; nx <= modes_x; ++nx) {
-      const Real ky = twopi*ny/ly, kx = twopi*nx/lx-ky*shift/lx;
+  for (int ny = 0; ny <= modes_y_; ++ny) {
+    for (int nx = ny == 0 ? 1 : -modes_x_; nx <= modes_x_; ++nx) {
+      const Real ky = twopi*ny/ly_, kx = twopi*nx/lx_-ky*shift/lx_;
       kh(m,0) = kx; kh(m,1) = ky; kh(m,2) = std::sqrt(kx*kx+ky*ky);
       ++m;
     }

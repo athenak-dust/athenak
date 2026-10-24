@@ -3,6 +3,8 @@
 //========================================================================================
 // poisson: cell-averaged periodic/sheared sinusoidal density, stationary field check.
 // slab: nonzero mean isolated slab, with a horizontal sinusoidal density perturbation.
+// slab_evolve: the same positive slab initialization, then freely evolving hydro;
+//              final diagnostics are measured state, not a frozen analytic solution.
 // jeans: physical isothermal/adiabatic linear mode initialization, without external forcing.
 // shear: physical isothermal shearing wave, compared externally with its linear ODE.
 // topology: explicitly diagnostic source reset before refinement checks, not hydro dynamics.
@@ -11,6 +13,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <string>
 
 #include "athena.hpp"
@@ -33,7 +36,7 @@ struct WaveData {
   Real fourpig, frequency, growth, pressure;
   Real refine_start, refine_end, band_lo, band_hi;
   Real band2_lo, band2_hi, band3_lo, band3_hi;
-  bool jeans, shear, topology, slab, scheduled_amr;
+  bool jeans, shear, topology, slab, slab_evolve, scheduled_amr;
 };
 WaveData wave;
 
@@ -92,8 +95,9 @@ array_sum::GlobalSum WaveMoments(Mesh *pm) {
   const int n = pm->pmb_pack->nmb_thispack*nc;
   const bool three_d = pm->three_d;
   const bool ideal_jeans = sv.jeans && pm->pmb_pack->phydro->peos->eos_data.is_ideal;
-  const Real source_mean = pm->pmb_pack->pgrav->last_source_mean;
-  auto phi = pm->pmb_pack->pgrav->phi;
+  const auto *gravity = pm->pmb_pack->pgrav;
+  const Real source_mean = gravity == nullptr ? 0 : gravity->last_source_mean;
+  auto phi = gravity == nullptr ? DvceArray5D<Real>() : gravity->phi;
   array_sum::GlobalSum result;
   Kokkos::parallel_reduce("sg_wave_moments",Kokkos::RangePolicy<DevExeSpace>(0,n),
   KOKKOS_LAMBDA(int q, array_sum::GlobalSum &sum) {
@@ -187,15 +191,76 @@ void ShearDiagnostics(Mesh *pm) {
             << ",\"momentum2\":" << b[15] << ",\"momentum3\":" << b[16]
             << ",\"volume\":" << b[17]
             << ",\"oa_mixed_blocks\":" << b[19]
-            << ",\"iterations\":" << pm->pmb_pack->pgrav->last_solve.iterations
-            << ",\"residual\":" << pm->pmb_pack->pgrav->last_solve.relative_residual
-            << ",\"solves\":" << pm->pmb_pack->pgrav->solve_count
-            << ",\"rebuilds\":" << pm->pmb_pack->pgrav->rebuild_count << "}\n";
+            << ",\"gravity_enabled\":" << (pm->pmb_pack->pgrav != nullptr ? "true" : "false");
+  if (const auto *gravity = pm->pmb_pack->pgrav) {
+    std::cout << ",\"iterations\":" << gravity->last_solve.iterations
+              << ",\"residual\":" << gravity->last_solve.relative_residual
+              << ",\"solves\":" << gravity->solve_count
+              << ",\"rebuilds\":" << gravity->rebuild_count;
+  }
+  std::cout << "}\n";
+}
+
+// A physical, non-resetting slab control. Mean/momentum/positivity are meaningful
+// after hydro/AMR evolution; the initial sinusoid is not an evolved exact solution.
+void SlabEvolutionDiagnostics(Mesh *pm) {
+  auto *pack=pm->pmb_pack;
+  if (pack->pgrav != nullptr) pack->pgrav->Solve(pm->time);
+  auto moments=WaveMoments(pm);
+  auto u=Kokkos::create_mirror_view_and_copy(HostMemSpace(),pack->phydro->u0);
+  HostArray5D<Real> phi,acc;
+  if (pack->pgrav != nullptr) {
+    phi=Kokkos::create_mirror_view_and_copy(HostMemSpace(),pack->pgrav->phi);
+    acc=Kokkos::create_mirror_view_and_copy(HostMemSpace(),pack->pgrav->acceleration);
+  }
+  const auto ind=pm->mb_indcs;
+  const auto eos=pack->phydro->peos->eos_data;
+  Real minimum[2]={std::numeric_limits<Real>::max(),std::numeric_limits<Real>::max()};
+  Real maximum_density=0;
+  int nonfinite=0;
+  for (int m=0;m<pack->nmb_thispack;++m) for (int k=ind.ks;k<=ind.ke;++k)
+    for (int j=ind.js;j<=ind.je;++j) for (int i=ind.is;i<=ind.ie;++i) {
+      const Real rho=u(m,IDN,k,j,i);
+      Real momentum2=0;
+      for (int d=0;d<3;++d) momentum2+=SQR(u(m,IM1+d,k,j,i));
+      const Real pressure=eos.is_ideal ? (eos.gamma-1)*(u(m,IEN,k,j,i)-Real(.5)*momentum2/rho)
+                                         : SQR(eos.iso_cs)*rho;
+      minimum[0]=std::min(minimum[0],rho); minimum[1]=std::min(minimum[1],pressure);
+      maximum_density=std::max(maximum_density,rho);
+      for (int q=0;q<u.extent_int(1);++q) nonfinite+=!std::isfinite(u(m,q,k,j,i));
+      if (pack->pgrav != nullptr) {
+        nonfinite+=!std::isfinite(phi(m,0,k,j,i));
+        for (int d=0;d<3;++d) nonfinite+=!std::isfinite(acc(m,d,k,j,i));
+      }
+    }
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE,moments.the_array,20,MPI_ATHENA_REAL,MPI_SUM,MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE,minimum,2,MPI_ATHENA_REAL,MPI_MIN,MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE,&maximum_density,1,MPI_ATHENA_REAL,MPI_MAX,MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE,&nonfinite,1,MPI_INT,MPI_SUM,MPI_COMM_WORLD);
+#endif
+  if (global_variable::my_rank != 0) return;
+  const auto &b=moments.the_array;
+  std::cout << std::setprecision(16) << "# SELF_GRAVITY_WAVE {\"mode\":\"slab_evolve\",\"time\":"
+            << pm->time << ",\"cycle\":" << pm->ncycle << ",\"blocks\":" << pm->nmb_total
+            << ",\"gravity_enabled\":" << (pack->pgrav != nullptr ? "true" : "false")
+            << ",\"mass\":" << b[13] << ",\"momentum1\":" << b[14]
+            << ",\"momentum2\":" << b[15] << ",\"momentum3\":" << b[16]
+            << ",\"volume\":" << b[17] << ",\"density_min\":" << minimum[0]
+            << ",\"density_max\":" << maximum_density << ",\"pressure_min\":" << minimum[1]
+            << ",\"nonfinite_values\":" << nonfinite;
+  if (const auto *gravity=pack->pgrav) {
+    std::cout << ",\"iterations\":" << gravity->last_solve.iterations
+              << ",\"residual\":" << gravity->last_solve.relative_residual
+              << ",\"solves\":" << gravity->solve_count << ",\"rebuilds\":" << gravity->rebuild_count;
+  }
+  std::cout << "}\n";
 }
 
 void WaveErrors(ParameterInput *, Mesh *pm) {
   auto *pack=pm->pmb_pack;
   if (wave.shear) {ShearDiagnostics(pm); return;}
+  if (wave.slab_evolve) {SlabEvolutionDiagnostics(pm); return;}
   if (wave.topology) InitializeKnownWave(pm,pm->time);
   pack->pgrav->Solve(pm->time);
   auto u=Kokkos::create_mirror_view_and_copy(HostMemSpace(),pack->phydro->u0);
@@ -353,15 +418,19 @@ void WaveRefinement(MeshBlockPack *pack) {
 void ProblemGenerator::SelfGravityWave(ParameterInput *pin, const bool restart) {
   auto *pm=pmy_mesh_;
   auto *pack=pm->pmb_pack;
-  if (pack->phydro==nullptr || pack->pgrav==nullptr) WaveFail("requires hydro and gravity/enabled=true");
+  if (pack->phydro==nullptr) WaveFail("requires hydro");
   const auto mode=pin->GetOrAddString("problem","mode","poisson");
   wave.jeans=mode=="jeans"; wave.topology=mode=="topology";
-  wave.slab=mode=="slab"; wave.shear=mode=="shear";
+  wave.slab_evolve=mode=="slab_evolve";
+  wave.slab=mode=="slab" || wave.slab_evolve; wave.shear=mode=="shear";
+  if (pack->pgrav==nullptr && !wave.shear && !wave.slab_evolve) {
+    WaveFail("analytic/static gravity controls require gravity/enabled=true");
+  }
   wave.scheduled_amr=pin->GetOrAddBoolean("problem","scheduled_amr",false);
   if (!wave.jeans && !wave.shear && !wave.topology && !wave.slab && mode!="poisson") WaveFail("unknown mode");
   const bool isolated=pin->GetOrAddString("gravity","vertical_bc","periodic")=="isolated";
   if (wave.slab != isolated || (wave.slab && !pm->three_d)) {
-    WaveFail("use 3D mode=slab for isolated-z gravity; other analytic modes require periodic gravity");
+    WaveFail("use 3D mode=slab or slab_evolve for isolated-z gravity; other modes require periodic gravity");
   }
   if (wave.jeans && pack->phydro->psbox_u!=nullptr) {
     WaveFail("Jeans mode requires hydro without rotation/shear");
@@ -370,7 +439,8 @@ void ProblemGenerator::SelfGravityWave(ParameterInput *pin, const bool restart) 
       pack->phydro->psbox_u==nullptr || pack->phydro->psbox_u->is_stratified)) {
     WaveFail("shear mode requires 3D unstratified isothermal shearing-box hydro");
   }
-  if (!wave.jeans && !wave.shear && !wave.topology && pin->GetString("time","evolution")!="static") {
+  if (!wave.jeans && !wave.shear && !wave.topology && !wave.slab_evolve
+      && pin->GetString("time","evolution")!="static") {
     WaveFail("Poisson field check requires time/evolution=static");
   }
   wave.rho0=pin->GetOrAddReal("problem","rho0",1);
@@ -382,14 +452,16 @@ void ProblemGenerator::SelfGravityWave(ParameterInput *pin, const bool restart) 
   const int nz=pin->GetOrAddInteger("problem","nwz",pm->three_d && !wave.jeans && !wave.slab ? 1 : 0);
   if (wave.slab && nz!=0) WaveFail("analytic slab mode requires nwz=0");
   if ((!pm->three_d && nz!=0) || (nx==0&&ny==0&&nz==0) || wave.rho0<=0 ||
-      wave.amp<=0 || wave.amp>=1) WaveFail("invalid density, amplitude, or wavenumbers");
+      wave.amp<0 || (wave.amp==0 && !wave.slab) || wave.amp>=1) {
+    WaveFail("invalid density, amplitude, or wavenumbers");
+  }
   wave.x0=pm->mesh_size.x1min; wave.y0=pm->mesh_size.x2min; wave.z0=pm->mesh_size.x3min;
   wave.kx=2*M_PI*nx/(pm->mesh_size.x1max-wave.x0);
   wave.ky=2*M_PI*ny/(pm->mesh_size.x2max-wave.y0);
   wave.kz=2*M_PI*nz/(pm->mesh_size.x3max-wave.z0);
   wave.qomega=pack->phydro->psbox_u==nullptr ? 0 :
       pack->phydro->psbox_u->qshear*pack->phydro->psbox_u->omega0;
-  wave.fourpig=pack->pgrav->four_pi_G;
+  wave.fourpig=pack->pgrav==nullptr ? 0 : pack->pgrav->four_pi_G;
   wave.frequency=wave.growth=0;
   if (wave.jeans) {
     const auto eos=pack->phydro->peos->eos_data;
@@ -411,8 +483,8 @@ void ProblemGenerator::SelfGravityWave(ParameterInput *pin, const bool restart) 
   wave.band3_hi=pin->GetOrAddReal("problem","refine_x3max",pm->mesh_size.x3max);
   pgen_final_func=WaveErrors;
   user_hist_func=WaveHistory;
-  if (wave.scheduled_amr && !wave.jeans && !wave.shear) {
-    WaveFail("scheduled_amr is supported only for physical Jeans/shear modes");
+  if (wave.scheduled_amr && !wave.jeans && !wave.shear && !wave.slab_evolve) {
+    WaveFail("scheduled_amr is supported only for physical Jeans/shear/slab_evolve modes");
   }
   if (wave.topology || wave.scheduled_amr) {
     if (!pm->adaptive) WaveFail("refinement schedule requires adaptive mesh");

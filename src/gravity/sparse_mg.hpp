@@ -5,6 +5,7 @@
 #ifndef GRAVITY_SPARSE_MG_HPP_
 #define GRAVITY_SPARSE_MG_HPP_
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -14,6 +15,8 @@
 #endif
 
 namespace gravity {
+
+using GlobalIndex = std::int64_t;
 
 // Global host setup data. Iteration retains only locally owned matrix rows and vectors
 // on the device. Global geometry/operator assembly is currently a setup limitation.
@@ -32,6 +35,35 @@ struct HostHierarchy {
   bool constant_nullspace = false;    // both left and right constant nullspaces
 };
 
+// Contiguous OWNED rows only, with 64-bit GLOBAL column IDs. A zero-row rank
+// supplies rowptr={0}. rowptr offsets and locally remapped device columns are
+// 32-bit; neither global cell count nor global row/column IDs have that limit.
+struct LocalCsr {
+  GlobalIndex global_rows = 0, global_cols = 0, row_begin = 0;
+  std::vector<int> rowptr{0};
+  std::vector<GlobalIndex> colidx;
+  std::vector<Real> values;
+  int LocalRows() const { return static_cast<int>(rowptr.size())-1; }
+};
+
+// Complete replacements for a fixed sorted/unique list of LOCAL output rows.
+// rowptr indexes the compact rows array; column IDs remain global and 64-bit.
+struct CsrRowUpdate {
+  GlobalIndex global_rows = 0, global_cols = 0, row_begin = 0;
+  std::vector<int> rows;
+  std::vector<int> rowptr{0};
+  std::vector<GlobalIndex> colidx;
+  std::vector<Real> values;
+};
+
+struct DistributedHierarchy {
+  std::vector<LocalCsr> matrices;       // fine to coarse, owned A rows only
+  std::vector<LocalCsr> prolongation;   // P[l]: coarse -> fine
+  std::vector<LocalCsr> restriction;    // R[l]: fine -> coarse; explicit production input
+  std::vector<std::vector<GlobalIndex>> row_partitions;
+  bool constant_nullspace = false;
+};
+
 struct SolveStats {
   bool converged = false;
   int iterations = 0;
@@ -41,8 +73,21 @@ struct SolveStats {
   Real removed_rhs_mean = 0;
 };
 
-// Restarted flexible GMRES preconditioned by a genuine Galerkin V-cycle. This supports
-// nonsymmetric conservative FV operators; it deliberately does not assume CG symmetry.
+// Local storage, including retained host halo buffers but excluding input setup data.
+struct StorageStats {
+  std::uint64_t a_nnz = 0, p_nnz = 0, r_nnz = 0;
+  std::uint64_t csr_bytes = 0, halo_bytes = 0, vector_bytes = 0;
+  std::uint64_t current_a_nnz = 0, host_pattern_bytes = 0;
+  std::uint64_t phase_nnz = 0, phase_rows = 0, phase_map_bytes = 0;
+};
+
+struct FineOperatorStats {
+  std::uint64_t updates = 0, value_updates = 0, structure_rebuilds = 0;
+};
+
+// Restarted flexible GMRES preconditioned by the supplied multigrid V-cycle. The
+// production path accepts independent A/P/R; the legacy adapter uses Galerkin R=P^T.
+// Supports nonsymmetric conservative FV operators without assuming CG symmetry.
 // Calls are collective, and an instance must not be used concurrently by multiple threads.
 class SparseMultigrid {
  public:
@@ -51,8 +96,11 @@ class SparseMultigrid {
   struct Impl;
 #if MPI_PARALLEL_ENABLED
   explicit SparseMultigrid(const HostHierarchy &hierarchy, MPI_Comm comm = MPI_COMM_WORLD);
+  explicit SparseMultigrid(const DistributedHierarchy &hierarchy,
+                          MPI_Comm comm = MPI_COMM_WORLD);
 #else
   explicit SparseMultigrid(const HostHierarchy &hierarchy);
+  explicit SparseMultigrid(const DistributedHierarchy &hierarchy);
 #endif
   ~SparseMultigrid();
   SparseMultigrid(const SparseMultigrid &) = delete;
@@ -60,13 +108,24 @@ class SparseMultigrid {
 
   int Levels() const;
   int LocalSize(int level = 0) const;
-  int LocalBegin(int level = 0) const;
-  int LocalEnd(int level = 0) const;
+  GlobalIndex LocalBegin(int level = 0) const;
+  GlobalIndex LocalEnd(int level = 0) const;
+  StorageStats Storage() const;
+  // Refresh only the CURRENT outer fine matrix. The cached MG A/P/R and coarse
+  // solve remain unchanged. Ownership and nullspace type must remain unchanged;
+  // otherwise construct a fresh hierarchy. Empty partition uses existing ownership.
+  void UpdateFineOperator(const LocalCsr &matrix,
+                          const std::vector<GlobalIndex> &partition = {});
+  FineOperatorStats FineUpdates() const;
+  void ConfigureFinePhaseRows(const std::vector<int> &rows);
+  void UpdateFinePhaseRows(const CsrRowUpdate &matrix);
   SolveStats Solve(const DvceArray1D<Real> &rhs, const DvceArray1D<Real> &x,
                    Real tolerance, int max_iterations, int restart = 24);
-  // Collective diagnostic/useful building blocks; all arguments contain local rows only.
+  // Collective diagnostics; arguments contain owned rows only. Level zero uses
+  // CURRENT outer A; higher levels use the cached preconditioner matrices.
   void ApplyMatrix(int level, const DvceArray1D<Real> &x,
                    const DvceArray1D<Real> &result);
+  // Always the CACHED multigrid preconditioner, including its unchanged fine A.
   void ApplyVCycle(const DvceArray1D<Real> &rhs, const DvceArray1D<Real> &result);
 
  private:
@@ -82,14 +141,25 @@ class DistributedOperator {
   DistributedOperator(const HostCsr &matrix, const std::vector<int> &row_partition,
                       const std::vector<int> &col_partition,
                       MPI_Comm comm = MPI_COMM_WORLD);
+  DistributedOperator(const LocalCsr &matrix,
+                      const std::vector<GlobalIndex> &row_partition,
+                      const std::vector<GlobalIndex> &col_partition,
+                      MPI_Comm comm = MPI_COMM_WORLD);
 #else
   DistributedOperator(const HostCsr &matrix, const std::vector<int> &row_partition,
                       const std::vector<int> &col_partition);
+  DistributedOperator(const LocalCsr &matrix,
+                      const std::vector<GlobalIndex> &row_partition,
+                      const std::vector<GlobalIndex> &col_partition);
 #endif
   ~DistributedOperator();
   DistributedOperator(const DistributedOperator &) = delete;
   DistributedOperator &operator=(const DistributedOperator &) = delete;
   void Apply(const DvceArray1D<Real> &x, const DvceArray1D<Real> &result);
+  StorageStats Storage() const;
+  void ConfigurePhaseRows(const std::vector<int> &rows);
+  void UpdatePhaseRows(const CsrRowUpdate &matrix);
+  FineOperatorStats PhaseUpdates() const;
 
  private:
   struct Impl;

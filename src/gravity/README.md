@@ -1,5 +1,14 @@
 # Composite self-gravity development
 
+**Production migration is in progress.** Rixin: small functional
+validation is not the endpoint. The earlier reference implementation below is not
+the production acceptance result. Current work replaces replicated global setup
+with distributed geometry/multigrid, refreshes only shear-dependent rows, and
+replaces direct isolated-boundary sums with a coarsened vacuum solve. Large WENO-Z
+CPU/GPU time, memory, dynamics and restart gates must pass before this work closes.
+Progress and fixed acceptance criteria are in
+the internal run records.
+
 This experimental module is developed on `selfgrav-amr-shear`, from dust
 development commit `6c466d6d`. It is disabled unless `<gravity>/enabled = true`.
 It solves on the actual active AMR leaves, including shearing-periodic faces;
@@ -38,7 +47,9 @@ hardware validation separately verified distinct GPU assignments.
 | `enabled` | `false`; absence of the block leaves existing physics unchanged |
 | `four_pi_G` | Required positive gravitational constant in code units |
 | `solver` | `multigrid` |
+| `setup` | `reference` during validation; explicitly select `distributed` for the production candidate |
 | `vertical_bc` | `periodic`, or `isolated` in 3D |
+| `isolated_method` | `direct` during validation; `vacuum` requires distributed setup |
 | `rtol` | `1e-10`, relative linear-system residual |
 | `max_iterations`, `gmres_restart` | `150`, `24` |
 | `cfl` | `0.25`, safety factor for acceleration and free-fall limits |
@@ -67,11 +78,30 @@ density. The shear convention is
 $\phi(x+L_x,y)=\phi(x,y-s)$, with $s=-q\Omega L_x t$ for the existing hydro
 shearing-wave convention.
 
-`sparse_mg.*` uses dyadic geometric aggregates, smoothed interpolation and Galerkin
-coarse matrices. A V-cycle preconditions restarted flexible GMRES because the
-composite stencil is generally nonsymmetric. Bulk matrix, smoother, and vector
-operations use Kokkos, with local MPI rows and sparse reusable halo plans. Only
-the tiny coarsest problem uses a root CPU LU solve.
+The reference backend uses dyadic aggregates, smoothed interpolation and Galerkin
+coarse matrices. The distributed candidate instead constructs owned leaf rows
+from global patch metadata (`mesh_geometry.*`). Its geometric hierarchy
+(`geometric_mg.*`) uses tensor linear interpolation, integrated-residual child
+sums, and rediscretized coarse operators. No rank expands the global leaf volume.
+A V-cycle preconditions restarted flexible GMRES because the composite stencil
+is generally nonsymmetric. Bulk matrix, smoother, and vector operations use
+Kokkos, with local MPI rows and sparse reusable halo plans. Only the tiny coarsest
+problem uses a root CPU LU solve.
+
+At each new shear phase the distributed backend updates surface-dependent rows
+of the current matrix and force operators. The preconditioner can remain cached;
+convergence is always checked against the current matrix. A failed cached attempt
+refreshes the hierarchy once and retries, with both attempts included in timing.
+Identical source, topology, phase and gravitational constant can reuse a field;
+extra-source callbacks are still evaluated before checking source equality.
+
+The vacuum boundary candidate adds coarsened, empty solver patches outside the
+physical x3 interval. It retains the physical density mean and imposes the mean
+sheet flux at distant Neumann faces. Exterior resolution follows an exponential
+bound based on the slowest horizontal mode. It avoids direct cell-by-mode sums;
+the hydro mesh and its boundary conditions are unchanged. Current vacuum geometry
+requires power-of-two root counts and block dimensions, with at least eight cells
+per active direction and aligned dyadic AMR. Unsupported geometry fails explicitly.
 
 ## Coupling and lifecycle
 
@@ -136,13 +166,21 @@ energy is also not exactly conserved; ideal-gas SMR tests show convergent drift.
 Shared fluxes, small residuals, and weak-wave momentum cancellation alone do not
 prove exact conservation of these quantities.
 
-There are known performance limitations: host setup currently holds global
-geometry and matrices on each rank, and the 3D Galerkin hierarchy has significant
+The reference backend has known performance limitations: host setup holds global
+geometry and matrices on each rank, and its 3D Galerkin hierarchy has significant
 fill. Direct slab boundary sums cost $O(N_{cell}N_{mode})$. They evaluate the
 horizontal Fourier projection and free-space vertical Green function on source
 cells; this is an accuracy backend, not a claim of production scaling. Two cheaper
 coarse-grid prototypes failed standalone multigrid contraction and were not
-adopted. The validated Galerkin hierarchy remains the implementation.
+adopted. They are distinct from the new distributed geometric hierarchy.
+
+The distributed CPU candidate has been tested on CPUs with gcc 13: uniform
+$128^3$ hierarchy setup takes 1.07 s on four ranks, compared with 65.45 s for the
+reference backend. The complete 4.19-million-physical-cell isolated case adds
+29.1% vacuum unknowns; on 16 ranks its initial setup takes 1.21 s and peak RSS is
+about 648 MiB per rank. These measurements do not establish GPU production
+performance. The required 100-step, matched WENO-Z GPU benchmark remains pending;
+defaults will change only after that validation.
 
 Detailed provenance, bounded test batches, and outstanding requirements are in
 the internal run records.
