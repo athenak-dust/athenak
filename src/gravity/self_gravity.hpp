@@ -52,7 +52,7 @@ class SelfGravity {
   Real HydroBoundaryTime(Real stage_time) const {
     return hydro_boundary_time_valid_ ? hydro_boundary_time_ : stage_time;
   }
-  // Rebuild is automatic after topology/load-balance or shear-phase changes.
+  // Topology/load balance rebuilds automatically; shear updates only surface rows.
   void Invalidate();
   void LoadRestartState(GravityRestartState state) { restart_state_ = std::move(state); }
   void ResumeAmrAfterRestart(Driver *driver, ParameterInput *pin);

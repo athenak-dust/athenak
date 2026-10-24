@@ -18,8 +18,8 @@ namespace gravity {
 
 using GlobalIndex = std::int64_t;
 
-// Global host setup data. Iteration retains only locally owned matrix rows and vectors
-// on the device. Global geometry/operator assembly is currently a setup limitation.
+// Legacy reference input with global host setup data. Iteration retains only local
+// rows/vectors. The distributed production interface below avoids this global input.
 struct HostCsr {
   int rows = 0, cols = 0;
   std::vector<int> rowptr, colidx;

@@ -18,12 +18,13 @@ development commit `6c466d6d`. It is disabled unless `<gravity>/enabled = true`.
 It solves on the actual active AMR leaves, including shearing-periodic faces;
 it does not substitute a uniform fine-grid volume solve.
 
-The requested endpoint is hydro + multigrid + AMR + shearing box, including dynamic
-refine/derefine, restart, MPI and GPU. Two gravity boundary configurations are
-required: periodic, and horizontally shearing-periodic/periodic with vertical
-isolation. Gas outflow and isolated gravitational potential are separate choices.
+The implemented scope is hydro + multigrid + AMR + shearing box, including dynamic
+refine/derefine, restart, MPI and GPU. Gravity boundaries can be periodic, or
+horizontally shearing-periodic/periodic with vertical isolation. Gas outflow and
+isolated gravitational potential are separate choices.
 Future deposited dust density and particle force gathering can reuse the same
-field solver. Current support is 2D/3D Cartesian Newtonian hydro; particles/dust, MHD, radiation
+field solver. Current support is 2D/3D Cartesian Newtonian hydro with one pack per
+rank; particles/dust, MHD, radiation
 and relativistic modules are rejected when this feature is enabled.
 
 ## Running
@@ -89,7 +90,7 @@ $\phi(x+L_x,y)=\phi(x,y-s)$, with $s=-q\Omega L_x t$ for the existing hydro
 shearing-wave convention.
 
 The reference backend uses dyadic aggregates, smoothed interpolation and Galerkin
-coarse matrices. The distributed candidate instead constructs owned leaf rows
+coarse matrices. The distributed backend instead constructs owned leaf rows
 from global patch metadata (`mesh_geometry.*`). Its geometric hierarchy
 (`geometric_mg.*`) uses tensor linear interpolation, integrated-residual child
 sums, and rediscretized coarse operators. No rank expands the global leaf volume.
@@ -180,6 +181,12 @@ coupling error, not an iterative-solver tolerance effect. Total gas plus gravity
 energy is also not exactly conserved; ideal-gas SMR tests show convergent drift.
 Shared fluxes, small residuals, and weak-wave momentum cancellation alone do not
 prove exact conservation of these quantities.
+
+Actual topology changes still rebuild the hierarchy. On the four-GB200 disk
+benchmark this setup costs about 4.37 s, separate from the 40.5 ms steady-step
+number. Regridding frequency therefore affects total run cost. The GPU benchmark
+has 128 evolving steps; full shear-wrap and refine/derefine/restart controls are
+separate validation records, not a claim of 40.5 ms under every AMR schedule.
 
 The reference backend has known performance limitations: host setup holds global
 geometry and matrices on each rank, and its 3D Galerkin hierarchy has significant
