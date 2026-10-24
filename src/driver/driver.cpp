@@ -398,6 +398,13 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
            (elapsed_time < wall_time)) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
 
+      // Problem work at the start of every cycle, before the time integrator
+      // (e.g. the mass renormalisation of the Li et al. 2018 outflow boundaries).  At the start,
+      // not after the step: a restarted run then sees exactly the state of the continued one
+      if (pmesh->pgen->user_work_in_loop_func != nullptr) {
+        (pmesh->pgen->user_work_in_loop_func)(pmesh);
+      }
+
       // Execute TaskLists
       // Work before time integrator indicated by "0" in stage
       ExecuteTaskList(pmesh, "before_timeintegrator", 0);

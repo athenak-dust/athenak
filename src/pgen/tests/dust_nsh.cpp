@@ -63,6 +63,10 @@
 void DustNSHErrors(ParameterInput *pin, Mesh *pm);
 void DustNSHHistory(HistoryData *pdata, Mesh *pm);
 void RunAuditReplay(ParameterInput *pin, Mesh *pm);   // streaming_linear.cpp
+// the outflow vertical boundaries of Li et al. (2018) and the mass renormalisation
+void LiVerticalBCs(Mesh *pm);
+void LiVerticalBCsCoarse(Mesh *pm);
+void LiRenormalize(Mesh *pm);
 
 namespace {
 
@@ -140,9 +144,27 @@ bool dust_moments_hist_ = false;   // msum, mvx, mvz, mz2 columns in the user hi
 // compensated (Neumaier) sums on the host, columns mvx_c and gpx_c, to tell a summation
 // error of the ordinary history columns from a conservation error.
 bool dust_moments_exact_ = false;
+// <problem>/vertical_bc = li2018: the outflow vertical boundaries of Li, Youdin &
+// Simon (2018, §2.2; Simon et al. 2011, appendix) as in Athena's par_strat3d.c (strat_ix3,
+// strat_ox3, mass_cons / Userwork_in_loop): in the ghost cells the density of the last physical
+// cell times exp(-(z^2 - z_b^2)/(2 H^2)), its x and y velocities, its z velocity unless that
+// flows into the box (then 0); after every cycle the gas density of the whole box is scaled back
+// to the initial mean (the momenta are left as they are) with the floor vbc_density_floor
+struct LiVBC {
+  bool on = false;
+  Real h2 = 1.0;          // (cs/omega0)^2
+  Real floor = 1.0e-4;    // Athena's D_FLOOR
+  Real mean0 = 0.0;       // the initial mean gas density of the box
+  Real ratio = 1.0;       // the ratio of the last renormalisation
+  Real dm = 0.0;          // the gas mass put back so far
+};
+LiVBC livbc_;
+Real LiGasMass(Mesh *pm);      // below
+Real LiBoxVolume(Mesh *pm);
 // 3-D particle snapshots: every p3d_snapshot_dt, per rank p3d.NNNNN.rRRRRR.bin with
 // "P3D1", the time (double), the particle count (int), then x, y, z, m (float32 arrays)
 Real p3d_dt_ = -1.0;
+Real p3d_t0_ = 0.0;   // frame k at p3d_t0 + k p3d_dt (p3d_snapshot_t0)
 int p3d_number_ = 0;
 void WriteP3DSnapshot(Mesh *pm) {
   auto *ppar = pm->pmb_pack->ppart;
@@ -913,11 +935,27 @@ struct RootPlacement {
   // x2, x3 (g1, g2 the inverse plastic number and its square), mode 0 an independent random draw
   int nc2 = 1;
   Real x3min = 0.0, lz = 1.0, hz = 1.0;
+  // gauss: mode 0 with z ~ N(0, hp) truncated to the box (Box-Muller, drawn again
+  // with the next key when outside; Athena's par_strat3d.c draws Normal() until inside)
+  bool gauss = false;
+  Real hp = 1.0;
   KOKKOS_INLINE_FUNCTION void Base3(const int q, Real &x, Real &y, Real &z) const {
     if (mode == 0) {
       std::uint64_t key = static_cast<std::uint64_t>(q) + seed*UINT64_C(0x9e3779b97f4a7c15);
       x = x1min + HashUniform01(key + UINT64_C(0x632be59bd9b4e019))*lx;
       y = x2min + HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7))*ly;
+      if (gauss) {
+        z = 0.0;
+        for (int t=0; t<64; ++t) {
+          const std::uint64_t kz = key + UINT64_C(0x58f38ded6f7c55b5) +
+                                   static_cast<std::uint64_t>(t)*UINT64_C(0x2545f4914f6cdd1d);
+          const Real u1 = Kokkos::fmax(HashUniform01(kz), 1.0e-300);
+          const Real u2 = HashUniform01(kz + UINT64_C(0x1d8e4e27c47d124f));
+          const Real zz = hp*Kokkos::sqrt(-2.0*Kokkos::log(u1))*Kokkos::cos(2.0*M_PI*u2);
+          if (zz >= x3min && zz < x3min + lz) {z = zz; break;}
+        }
+        return;
+      }
       z = x3min + HashUniform01(key + UINT64_C(0x58f38ded6f7c55b5))*lz;
       return;
     }
@@ -951,6 +989,23 @@ struct RootPlacement {
       vx = dvr[s]*c - dvi[s]*sn;
       x -= lx*Kokkos::floor((x - x1min)/lx);
     }
+  }
+};
+
+// <problem>/nsh_vertical: the multi-species NSH drift with the local dust-to-gas
+// ratio eps_s(z) = eps_s exp(-z^2 (1/Hp^2 - 1/H^2)/2), solved on the host on a fine table in z
+// (Athena's par_strat3d.c with ipert = 0 solves MultiNSH at the cell faces); columns u_gx, u_gphi,
+// then v_x, v_phi of each species; linear interpolation on the device
+struct NSHTableZ {
+  DvceArray2D<Real> t;
+  Real z0 = 0.0, dz = 1.0;
+  int nt = 0;
+  KOKKOS_INLINE_FUNCTION Real At(const Real z, const int c) const {
+    Real f = (z - z0)/dz;
+    int i = static_cast<int>(Kokkos::floor(f));
+    i = (i < 0) ? 0 : ((i > nt - 2) ? nt - 2 : i);
+    f -= static_cast<Real>(i);
+    return (1.0 - f)*t(i,c) + f*t(i + 1,c);
   }
 };
 
@@ -1160,6 +1215,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   dust_moments_hist_ = pin->GetOrAddBoolean("problem", "dust_moments_hist", false);
   dust_moments_exact_ = pin->GetOrAddBoolean("problem", "dust_moments_exact", false);
   p3d_dt_ = pin->GetOrAddReal("problem", "p3d_snapshot_dt", -1.0);
+  p3d_t0_ = pin->GetOrAddReal("problem", "p3d_snapshot_t0", 0.0);
   // several ranks: fields of the canonical TSC deposit on a uniform mesh (WriteBAFieldsGlobal), or
   // of refinable clouds with <dust>/experimental_mpi (2026-10-21, WriteBAFields); not ba_history
   const bool fields_mpi = dust_active && !ba_history_ &&
@@ -1192,7 +1248,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   // several ranks: refinable clouds with <dust>/experimental_mpi; every rank
   // draws the same parents and keeps those in its blocks
   const bool ranks_ok = (global_variable::nranks == 1) ||
-      (dust_active && pmbp->pdust->experimental_mpi && !canonical_root);
+      (dust_active && pmbp->pdust->experimental_mpi && !canonical_root) ||
+      (dust_active && canonical_root && pmy_mesh_->three_d);   // 3-D point particles
   // 3-D with refinable clouds (<dust>/experimental_3d) or the canonical deposit
   // (several ranks: the clouds only, ranks_ok)
   const bool root3d_ok = dust_active && (pmbp->pdust->Clouds3D() || canonical_root);
@@ -1233,6 +1290,39 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     }
   }
   ba_pin_ = pin;
+  // <problem>/vertical_bc = li2018: the outflow vertical boundaries of Li et al.
+  // (2018) with the mass renormalisation after every cycle; x3 faces of type user
+  {
+    const std::string vbc = pin->GetOrAddString("problem", "vertical_bc", "none");
+    if (vbc == "li2018") {
+      const auto &mbc = pmy_mesh_->mesh_bcs;
+      if (!pmy_mesh_->three_d || pmbp->phydro == nullptr ||
+          mbc[BoundaryFace::inner_x3] != BoundaryFlag::user ||
+          mbc[BoundaryFace::outer_x3] != BoundaryFlag::user ||
+          !pin->GetOrAddBoolean("shearing_box", "stratified", false)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "vertical_bc = li2018: 3-D hydro, <shearing_box>/stratified = true, "
+                  << "ix3_bc = ox3_bc = user" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      const Real cs = pmbp->phydro->peos->eos_data.iso_cs;
+      const Real om = pin->GetReal("shearing_box", "omega0");
+      livbc_.on = true;
+      livbc_.h2 = (cs/om)*(cs/om);
+      livbc_.floor = pin->GetOrAddReal("problem", "vbc_density_floor", 1.0e-4);
+      user_bcs_func = LiVerticalBCs;
+      user_bcs_coarse_func = LiVerticalBCsCoarse;
+      user_work_in_loop_func = LiRenormalize;
+      if (restart) {   // the initial mean density and the running total from the restart file
+        livbc_.mean0 = pin->GetReal("problem", "vbc_mean0");
+        livbc_.dm = pin->GetOrAddReal("problem", "vbc_dm", 0.0);
+      }
+    } else if (vbc != "none") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<problem>/vertical_bc must be none or li2018" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
   if (restart) {
     // native restart: gas, particles and the dust counters come from the
     // file.  The output numbers continue from the values the file carries in <problem>; a file
@@ -1240,7 +1330,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // later); the distribution file is cut back and continued at its next record.
     if (p3d_dt_ > 0.0) {   // the 3-D particle snapshots continue their numbering
       p3d_number_ = pin->GetOrAddInteger("problem", "rst_p3d_number",
-          static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/p3d_dt_)));
+          std::max(0, static_cast<int>(std::ceil((pmy_mesh_->time - p3d_t0_ - 1.0e-10)/p3d_dt_))));
     }
     if (ba_snapshots_) {
       ba_snapshot_number_ = pin->GetOrAddInteger("problem", "rst_ba_snapshot_number",
@@ -1346,6 +1436,46 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   } else {
     SolveNSH(omega0, qshear, ax, eps, taus, ugx, ugp, vx, vp);
   }
+  // <problem>/nsh_vertical: the NSH drift with the local dust-to-gas ratio
+  // eps_s(z) = eps_s exp(-z^2 (1/Hp^2 - 1/H^2)/2) for the gas (the mean of the two cell faces) and
+  // the particles (their height), on a table of at least 64 points per root cell in z
+  const bool nsh_vertical = !dtest && dust_active && pmy_mesh_->three_d &&
+                            pin->GetOrAddBoolean("problem", "nsh_vertical", false);
+  NSHTableZ nshtab;
+  if (nsh_vertical) {
+    if (!pin->GetOrAddBoolean("problem", "stratified_dust", false) ||
+        !pin->GetOrAddBoolean("shearing_box", "stratified", false)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "nsh_vertical needs stratified_dust in a stratified shearing box" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const Real hg = pmbp->phydro->peos->eos_data.iso_cs/omega0;
+    const Real hpz = pin->GetOrAddReal("problem", "dust_hp", hg);
+    const auto &ms = pmy_mesh_->mesh_size;
+    const int nt = std::max(4097, 64*pmy_mesh_->mesh_indcs.nx3 + 1);
+    nshtab.nt = nt;
+    nshtab.z0 = ms.x3min;
+    nshtab.dz = (ms.x3max - ms.x3min)/static_cast<Real>(nt - 1);
+    nshtab.t = DvceArray2D<Real>("nsh_ztab", nt, 2 + 2*nspec);
+    auto th = Kokkos::create_mirror_view(nshtab.t);
+    const Real a = 1.0/(hpz*hpz) - 1.0/(hg*hg);
+    std::vector<Real> ez(nspec), vxz(nspec, 0.0), vpz(nspec, 0.0);
+    for (int n=0; n<nt; ++n) {
+      const Real z = nshtab.z0 + n*nshtab.dz;
+      for (int s=0; s<nspec; ++s) ez[s] = eps[s]*std::exp(-0.5*z*z*a);
+      Real gx = 0.0, gp = 0.0;
+      SolveNSH(omega0, qshear, ax, ez, taus, gx, gp, vxz, vpz);
+      th(n,0) = gx; th(n,1) = gp;
+      for (int s=0; s<nspec; ++s) {th(n,2 + 2*s) = vxz[s]; th(n,3 + 2*s) = vpz[s];}
+    }
+    Kokkos::deep_copy(nshtab.t, th);
+    if (global_variable::my_rank == 0) {
+      const int n0 = (nt - 1)/2;
+      std::cout << "# NSH(z): " << nt << " heights, Hp = " << hpz << "; at z = "
+                << nshtab.z0 + n0*nshtab.dz << ": u_gx = " << th(n0,0) << " u_gphi = " << th(n0,1)
+                << " v_x = " << th(n0,2) << " v_phi = " << th(n0,3) << std::endl;
+    }
+  }
   if (global_variable::my_rank == 0 && !dtest) {
     if (dust_active) {
       std::cout << "# NSH equilibrium: u_gx=" << ugx << " u_gphi=" << ugp << std::endl;
@@ -1435,12 +1565,31 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     const Real hgas = pmbp->phydro->peos->eos_data.iso_cs/omega0;
     const int ks0 = indcs.ks, nz3 = indcs.nx3;
     auto &mbs = pmbp->pmb->mb_size;
+    const bool nshz = nsh_vertical;
+    const NSHTableZ ntab = nshtab;
     par_for("strat_gas", DevExeSpace(),0,(nmb-1),0,(n3-1),0,(n2-1),0,(n1-1),
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
       const Real z = CellCenterX(k - ks0, nz3, mbs.d_view(m).x3min, mbs.d_view(m).x3max);
       const Real g = exp(-0.5*z*z/(hgas*hgas));
       for (int v=IDN; v<=IM3; ++v) u0(m,v,k,j,i) *= g;
+      if (nshz) {   // the NSH drift at this height: the mean of the two faces
+        const Real dz = mbs.d_view(m).dx3, rho = u0(m,IDN,k,j,i);
+        u0(m,IM1,k,j,i) = rho*0.5*(ntab.At(z - 0.5*dz, 0) + ntab.At(z + 0.5*dz, 0));
+        u0(m,IM2,k,j,i) = rho*0.5*(ntab.At(z - 0.5*dz, 1) + ntab.At(z + 0.5*dz, 1));
+        u0(m,IM3,k,j,i) = 0.0;
+      }
     });
+  }
+  // the initial mean gas density of the box for the renormalisation (17 digits in
+  // <problem>/vbc_mean0, which the restart files carry)
+  if (livbc_.on) {
+    livbc_.mean0 = LiGasMass(pmy_mesh_)/LiBoxVolume(pmy_mesh_);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.17g", livbc_.mean0);
+    pin->SetString("problem", "vbc_mean0", buf);
+    if (global_variable::my_rank == 0) {
+      std::cout << "# vertical_bc = li2018: initial mean gas density " << buf << std::endl;
+    }
   }
 
   // There are no particle or dust modules to initialize in the dust-free equilibrium.
@@ -1544,6 +1693,25 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     place.x1min = ms.x1min; place.x2min = ms.x2min; place.x3min = ms.x3min;
     place.lx = ms.x1max - ms.x1min; place.ly = ms.x2max - ms.x2min; place.lz = ms.x3max - ms.x3min;
     place.hx = place.lx/nc1; place.hy = place.ly/nc2; place.hz = place.lz/nc3;
+    // <problem>/stratified_dust_sampling = gaussian: equal masses, z ~ N(0, Hp)
+    // truncated to the box (Li et al. 2018); weight (default): uniform z, masses times
+    // exp(-z^2/2 Hp^2)
+    const std::string ssamp = pin->GetOrAddString("problem", "stratified_dust_sampling", "weight");
+    if (ssamp == "gaussian") {
+      if (place.mode != 0 || !pin->GetOrAddBoolean("problem", "stratified_dust", false) ||
+          !pin->GetOrAddBoolean("shearing_box", "stratified", false)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "stratified_dust_sampling = gaussian: stratified_dust, a stratified shearing "
+                  << "box and root_placement = random" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      place.gauss = true;
+      place.hp = pin->GetOrAddReal("problem", "dust_hp", pmbp->phydro->peos->eos_data.iso_cs/omega0);
+    } else if (ssamp != "weight") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<problem>/stratified_dust_sampling must be weight or gaussian" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
     // the parents of this rank (several ranks): every rank draws all of them and
     // keeps those whose leaf is in one of its blocks, in the order of their global index q,
     // which stays the tag (one rank: all of them)
@@ -1556,6 +1724,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       place(q, x, y, z, vw);
       int m = 0;
       if (canon) {
+        m = nmb;   // not in a block of this rank: dropped (one rank: never)
         for (int b=0; b<nmb; ++b) {
           if (x >= mbsize.d_view(b).x1min && x < mbsize.d_view(b).x1max &&
               y >= mbsize.d_view(b).x2min && y < mbsize.d_view(b).x2max &&
@@ -1600,6 +1769,10 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // with reflecting x3 faces)
     const Real tvz0 = pin->GetOrAddReal("problem", "dust_test_vz0", 0.0);
     const bool tvzm = pin->GetOrAddBoolean("problem", "dust_test_vz_mirror", false);
+    const bool gsamp = place.gauss;
+    const Real gfac = std::sqrt(2.0*M_PI)*place.hp/place.lz;
+    const bool nshz = nsh_vertical;
+    const NSHTableZ ntab = nshtab;
     par_for("nsh_cloud_root3d", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int q) {
       const int p = pnew(q);
       if (p < 0) return;
@@ -1621,8 +1794,16 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       pr0(IPVX1,p) = pr0(IPVX,p);
       pr0(IPVY1,p) = pr0(IPVY,p);
       if (strat) {
-        pr0(IPM,p) *= exp(-0.5*z*z/(shp*shp));
+        // gaussian: the equal mass eps rho0 sqrt(2 pi) Hp Lx Ly / (parents of the
+        // species) = (the uniform root mass) sqrt(2 pi) Hp / Lz
+        pr0(IPM,p) *= gsamp ? gfac : exp(-0.5*z*z/(shp*shp));
         pr0(IPVZ,p) = svz0; pr0(IPVZ1,p) = svz0;
+      }
+      if (nshz) {   // the NSH drift at the height of the parent
+        pr0(IPVX,p) = ntab.At(z, 2 + 2*sp) + vw;
+        pr0(IPVY,p) = ntab.At(z, 3 + 2*sp);
+        pr0(IPVX1,p) = pr0(IPVX,p);
+        pr0(IPVY1,p) = pr0(IPVY,p);
       }
       if (tvz0 != 0.0) {
         pr0(IPVZ,p) += (tvzm && z < 0.0) ? -tvz0 : tvz0;
@@ -1630,7 +1811,9 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       }
     });
     if (strat && global_variable::my_rank == 0) {
-      std::cout << "# stratified dust (3-D root clouds): Hp = " << shp << ", vz0 = " << svz0
+      std::cout << "# stratified dust (3-D root " << (canonical_root ? "particles" : "clouds")
+                << "): Hp = " << shp << ", vz0 = " << svz0 << ", sampling "
+                << (gsamp ? "gaussian (equal masses)" : "weight") << (nshz ? ", NSH(z)" : "")
                 << std::endl;
     }
     // the tag counter is set collectively before the splits
@@ -1918,7 +2101,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   // default H: the dust-to-gas ratio of the set-up everywhere), <problem>/dust_vz0 added to vz
   // (the 3-D root clouds got it in their set-up)
   if (pin->GetOrAddBoolean("problem", "stratified_dust", false) &&
-      !(cloud_root_random && three_d && pmbp->pdust->Clouds3D())) {
+      !(cloud_root_random && three_d && (pmbp->pdust->Clouds3D() || canonical_root))) {
+    // (the 3-D root parents, clouds or canonical point particles, got it above)
     if (!three_d || !pin->GetOrAddBoolean("shearing_box", "stratified", false) || cloud_root_random) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "stratified_dust: 3-D, <shearing_box>/stratified = true, lattice or random "
@@ -1929,10 +2113,18 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     const Real hp = pin->GetOrAddReal("problem", "dust_hp", hgas);
     const Real vz0 = pin->GetOrAddReal("problem", "dust_vz0", 0.0);
     auto &prs = ppar->prtcl_rdata;
+    auto &pis = ppar->prtcl_idata;
+    const bool nshz = nsh_vertical;
+    const NSHTableZ ntab = nshtab;
     par_for("strat_dust", DevExeSpace(), 0, ppar->nprtcl_thispack-1, KOKKOS_LAMBDA(const int p) {
       const Real z = prs(IPZ,p);
       prs(IPM,p) *= exp(-0.5*z*z/(hp*hp));
       prs(IPVZ,p) += vz0;
+      if (nshz) {   // the NSH drift at the height of the particle
+        const int s = pis(PSP,p);
+        prs(IPVX,p) = ntab.At(z, 2 + 2*s);
+        prs(IPVY,p) = ntab.At(z, 3 + 2*s);
+      }
     });
     if (global_variable::my_rank == 0) {
       std::cout << "# stratified dust: H = " << hgas << ", Hp = " << hp << ", vz0 = " << vz0
@@ -2293,6 +2485,14 @@ void DustTest3DErrors(Mesh *pm, Real out[7]) {
 void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
   if (pm->pmb_pack->ppart == nullptr || pm->pmb_pack->pdust == nullptr) {
     pdata->nhist = 0;
+    if (livbc_.on) {   // the gas-only control keeps the renormalisation columns
+      const bool r0 = (global_variable::my_rank == 0);
+      pdata->label[0] = "vbc_mratio";
+      pdata->label[1] = "vbc_dm";
+      pdata->hdata[0] = r0 ? livbc_.ratio : 0.0;
+      pdata->hdata[1] = r0 ? livbc_.dm : 0.0;
+      pdata->nhist = 2;
+    }
     return;
   }
   particles::Particles *ppar = pm->pmb_pack->ppart;
@@ -2323,7 +2523,7 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     pdata->hdata[3*s+2] = sn;
   }
   // the particle snapshots ride on the history calls
-  if (p3d_dt_ > 0.0 && pm->time >= p3d_number_*p3d_dt_ - 1.0e-10*p3d_dt_) WriteP3DSnapshot(pm);
+  if (p3d_dt_ > 0.0 && pm->time >= p3d_t0_ + p3d_number_*p3d_dt_ - 1.0e-10*p3d_dt_) WriteP3DSnapshot(pm);
   if (dust_moments_hist_) {   // all species: sum m, m vx, m vz, m z^2
     int h = pdata->nhist;
     if (h + 4 > NHISTORY_VARIABLES) {
@@ -2378,6 +2578,16 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     pdata->label[pdata->nhist + 1] = "gpx_c";
     pdata->hdata[pdata->nhist] = sum[0] + cmp[0];
     pdata->hdata[pdata->nhist + 1] = sum[1] + cmp[1];
+    pdata->nhist += 2;
+  }
+  if (livbc_.on && pdata->nhist + 2 <= NHISTORY_VARIABLES) {
+    // the last renormalisation ratio and the gas mass put back so far (rank 0
+    // only: the history sums the ranks)
+    const bool r0 = (global_variable::my_rank == 0);
+    pdata->label[pdata->nhist] = "vbc_mratio";
+    pdata->label[pdata->nhist + 1] = "vbc_dm";
+    pdata->hdata[pdata->nhist] = r0 ? livbc_.ratio : 0.0;
+    pdata->hdata[pdata->nhist + 1] = r0 ? livbc_.dm : 0.0;
     pdata->nhist += 2;
   }
   if (ba_history_) {
@@ -2435,4 +2645,123 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     ++ba_field_k_;
   }
   return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn LiVerticalBCs, LiVerticalBCsCoarse
+//! \brief The outflow vertical boundaries of Li et al. (2018) on u0 or, for the
+//! ghost prolongation next to the x3 faces of a refined mesh, on coarse_u0 with the
+//! coarse indices; the same rules as Athena's strat_ix3 / strat_ox3 (isothermal)
+
+namespace {
+void LiVerticalBCsApply(Mesh *pm, const bool coarse) {
+  auto *pmbp = pm->pmb_pack;
+  auto &indcs = pm->mb_indcs;
+  const int ng = indcs.ng;
+  const int nx1 = coarse ? indcs.cnx1 : indcs.nx1;
+  const int nx2 = coarse ? indcs.cnx2 : indcs.nx2;
+  const int nx3 = coarse ? indcs.cnx3 : indcs.nx3;
+  const int n1 = nx1 + 2*ng, n2 = nx2 + 2*ng;
+  const int ks = coarse ? indcs.cks : indcs.ks, ke = coarse ? indcs.cke : indcs.ke;
+  const int nmb = pmbp->nmb_thispack;
+  auto &mb_bcs = pmbp->pmb->mb_bcs;
+  auto &size = pmbp->pmb->mb_size;
+  auto u = coarse ? pmbp->phydro->coarse_u0 : pmbp->phydro->u0;
+  const Real h2 = livbc_.h2;
+  par_for("li_vbc", DevExeSpace(), 0, (nmb-1), 0, (n2-1), 0, (n1-1),
+  KOKKOS_LAMBDA(int m, int j, int i) {
+    const Real zmin = size.d_view(m).x3min, zmax = size.d_view(m).x3max;
+    if (mb_bcs.d_view(m, BoundaryFace::inner_x3) == BoundaryFlag::user) {
+      const Real zb = CellCenterX(0, nx3, zmin, zmax);
+      const Real d = u(m,IDN,ks,j,i);
+      const Real v1 = u(m,IM1,ks,j,i)/d, v2 = u(m,IM2,ks,j,i)/d, v3 = u(m,IM3,ks,j,i)/d;
+      const bool in = (u(m,IM3,ks,j,i) >= 0.0);   // copied, it would flow into the box
+      for (int k=0; k<ng; ++k) {
+        const Real z = CellCenterX(-1 - k, nx3, zmin, zmax);
+        const Real rho = d*exp(-(z*z - zb*zb)/(2.0*h2));
+        u(m,IDN,ks-k-1,j,i) = rho;
+        u(m,IM1,ks-k-1,j,i) = rho*v1;
+        u(m,IM2,ks-k-1,j,i) = rho*v2;
+        u(m,IM3,ks-k-1,j,i) = in ? 0.0 : rho*v3;
+      }
+    }
+    if (mb_bcs.d_view(m, BoundaryFace::outer_x3) == BoundaryFlag::user) {
+      const Real zt = CellCenterX(nx3 - 1, nx3, zmin, zmax);
+      const Real d = u(m,IDN,ke,j,i);
+      const Real v1 = u(m,IM1,ke,j,i)/d, v2 = u(m,IM2,ke,j,i)/d, v3 = u(m,IM3,ke,j,i)/d;
+      const bool in = (u(m,IM3,ke,j,i) <= 0.0);
+      for (int k=0; k<ng; ++k) {
+        const Real z = CellCenterX(nx3 + k, nx3, zmin, zmax);
+        const Real rho = d*exp(-(z*z - zt*zt)/(2.0*h2));
+        u(m,IDN,ke+k+1,j,i) = rho;
+        u(m,IM1,ke+k+1,j,i) = rho*v1;
+        u(m,IM2,ke+k+1,j,i) = rho*v2;
+        u(m,IM3,ke+k+1,j,i) = in ? 0.0 : rho*v3;
+      }
+    }
+  });
+}
+
+// the gas mass of the box (all ranks, the leaf blocks of every level)
+Real LiGasMass(Mesh *pm) {
+  auto *pmbp = pm->pmb_pack;
+  auto &indcs = pm->mb_indcs;
+  const int is = indcs.is, js = indcs.js, ks = indcs.ks;
+  const int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
+  const int nji = nx2*nx1, nkji = nx3*nji, nmkji = pmbp->nmb_thispack*nkji;
+  auto &u0 = pmbp->phydro->u0;
+  auto &size = pmbp->pmb->mb_size;
+  Real sum = 0.0;
+  Kokkos::parallel_reduce("li_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
+  KOKKOS_LAMBDA(const int idx, Real &s) {
+    const int m = idx/nkji, k = (idx - m*nkji)/nji, j = (idx - m*nkji - k*nji)/nx1;
+    const int i = idx - m*nkji - k*nji - j*nx1;
+    s += u0(m,IDN,ks+k,js+j,is+i)*size.d_view(m).dx1*size.d_view(m).dx2*size.d_view(m).dx3;
+  }, Kokkos::Sum<Real>(sum));
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &sum, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  return sum;
+}
+
+Real LiBoxVolume(Mesh *pm) {
+  const auto &ms = pm->mesh_size;
+  return (ms.x1max - ms.x1min)*(ms.x2max - ms.x2min)*(ms.x3max - ms.x3min);
+}
+}  // namespace
+
+void LiVerticalBCs(Mesh *pm) {LiVerticalBCsApply(pm, false);}
+void LiVerticalBCsCoarse(Mesh *pm) {LiVerticalBCsApply(pm, true);}
+
+//----------------------------------------------------------------------------------------
+//! \fn LiRenormalize
+//! \brief At the start of every cycle (ProblemGenerator::user_work_in_loop_func):
+//! the gas density of the whole box scaled back to the initial mean, the momenta left as they
+//! are, with the floor vbc_density_floor (Athena's mass_cons / Userwork_in_loop, which runs after
+//! the step).  Every cell, the ghost cells too, then the primitives from the conserved variables
+//! everywhere, so that the state stays consistent and a restart continues bitwise.
+
+void LiRenormalize(Mesh *pm) {
+  if (!livbc_.on) return;
+  const Real vol = LiBoxVolume(pm);
+  const Real mean = LiGasMass(pm)/vol;
+  const Real ratio = livbc_.mean0/mean;
+  livbc_.ratio = ratio;
+  livbc_.dm += (livbc_.mean0 - mean)*vol;
+  auto *pmbp = pm->pmb_pack;
+  auto &u0 = pmbp->phydro->u0;
+  auto &w0 = pmbp->phydro->w0;
+  const int n1m1 = u0.extent_int(4) - 1, n2m1 = u0.extent_int(3) - 1, n3m1 = u0.extent_int(2) - 1;
+  const Real dfloor = livbc_.floor;
+  par_for("li_renorm", DevExeSpace(), 0, (pmbp->nmb_thispack-1), 0, n3m1, 0, n2m1, 0, n1m1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    u0(m,IDN,k,j,i) = fmax(u0(m,IDN,k,j,i)*ratio, dfloor);
+  });
+  pmbp->phydro->peos->ConsToPrim(u0, w0, false, 0, n1m1, 0, n2m1, 0, n3m1);
+  // the running total travels in the restart files
+  if (ba_pin_ != nullptr) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.17g", livbc_.dm);
+    ba_pin_->SetString("problem", "vbc_dm", buf);
+  }
 }
