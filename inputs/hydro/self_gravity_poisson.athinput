@@ -1,0 +1,57 @@
+# Composite Poisson validation, 16/32 refinement; no time evolution.
+<job>
+basename = gravity_poisson
+<mesh>
+nx1 = 16
+nx2 = 16
+nx3 = 1
+nghost = 2
+x1min = 0
+x1max = 1
+x2min = 0
+x2max = 1
+x3min = 0
+x3max = 1
+ix1_bc = periodic
+ox1_bc = periodic
+ix2_bc = periodic
+ox2_bc = periodic
+ix3_bc = periodic
+ox3_bc = periodic
+<meshblock>
+nx1 = 4
+nx2 = 4
+nx3 = 1
+<mesh_refinement>
+refinement = static
+<refined_region1>
+level = 1
+x1min = 0.25
+x1max = 0.75
+x2min = 0.25
+x2max = 0.75
+<time>
+evolution = static
+integrator = rk2
+cfl_number = 0.3
+<hydro>
+eos = isothermal
+iso_sound_speed = 1
+reconstruct = plm
+rsolver = advect
+<gravity>
+enabled = true
+four_pi_G = 1
+solver = multigrid
+vertical_bc = periodic
+rtol = 1e-11
+<problem>
+pgen_name = self_gravity_wave
+mode = poisson
+amp = 0.1
+nwx = 2
+nwy = 1
+<output1>
+file_type = bin
+variable = gravity
+dt = 1

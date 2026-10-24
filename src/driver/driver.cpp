@@ -25,6 +25,7 @@
 #include "radiation/radiation.hpp"
 #include "driver.hpp"
 #include "dust/dust.hpp"
+#include "gravity/self_gravity.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
@@ -319,6 +320,11 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   if (res_flag && pmesh->pmb_pack->pdust != nullptr) {
     pmesh->pmb_pack->pdust->ResumeAmrAfterRestart(this, pin);
   }
+  // Phi is a derived elliptic field. Recompute from the restored density and
+  // physical time; never carry a pre-regrid potential or an old shear phase.
+  if (pmesh->pmb_pack->pgrav != nullptr) {
+    pmesh->pmb_pack->pgrav->Solve(pmesh->time);
+  }
 
   //---- Step 2.  Compute time step (if problem involves time evolution)
   hydro::Hydro *phydro = pmesh->pmb_pack->phydro;
@@ -398,6 +404,15 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
            (elapsed_time < wall_time)) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
 
+      // Strang gravity split around the existing hydro + orbital-advection step.
+      // Checkpoints occur only after both half-kicks. The kick leaves density and
+      // internal energy unchanged; primitives and ghost values must be refreshed.
+      if (pmesh->pmb_pack->pgrav != nullptr) {
+        pmesh->pmb_pack->pgrav->Solve(pmesh->time);
+        pmesh->pmb_pack->pgrav->KickHydro(0.5*pmesh->dt);
+        InitBoundaryValuesAndPrimitives(pmesh);
+      }
+
       // Execute TaskLists
       // Work before time integrator indicated by "0" in stage
       ExecuteTaskList(pmesh, "before_timeintegrator", 0);
@@ -412,11 +427,20 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // Work after time integrator indicated by "1" in stage
       ExecuteTaskList(pmesh, "after_timeintegrator", 1);
 
+      if (pmesh->pmb_pack->pgrav != nullptr) {
+        pmesh->pmb_pack->pgrav->Solve(pmesh->time+pmesh->dt);
+        pmesh->pmb_pack->pgrav->KickHydro(0.5*pmesh->dt);
+      }
+
       // Work outside of TaskLists:
       // increment time, ncycle, etc.
       pmesh->time = pmesh->time + pmesh->dt;
       pmesh->ncycle++;
       pmesh->dt_last_completed = pmesh->dt;
+      if (pmesh->pmb_pack->pgrav != nullptr) {
+        InitBoundaryValuesAndPrimitives(pmesh);
+        (void) pmesh->pmb_pack->phydro->NewTimeStep(this, nexp_stages);
+      }
       nmb_updated_ += pmesh->nmb_total;
       npart_updated_ += pmesh->nprtcl_total;
       // load balancing efficiency

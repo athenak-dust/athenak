@@ -20,6 +20,7 @@
 #include "coordinates/cell_locations.hpp"
 #include "refinement_criteria.hpp"
 #include "hydro/hydro.hpp"
+#include "gravity/self_gravity.hpp"
 #include "mhd/mhd.hpp"
 #include "z4c/z4c.hpp"
 #include "diffusion/viscosity.hpp"
@@ -678,6 +679,10 @@ void Mesh::NewTimeStep(const Real tlim) {
     dt = std::min(dt, (cfl_no)*(pmb_pack->prad->dtnew) );
   }
   // Particles timestep
+  if (pmb_pack->pgrav != nullptr) {
+    // Gravity dtnew already includes its own acceleration/free-fall safety factor.
+    dt = std::min(dt, pmb_pack->pgrav->dtnew);
+  }
   if (pmb_pack->ppart != nullptr) {
     dt = std::min(dt, (pmb_pack->ppart->dtnew) );
   }

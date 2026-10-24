@@ -987,6 +987,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     SimpleWave(pin, is_restart);
   } else if (pgen_fun_name.compare("shwave") == 0) {
     Shwave(pin, is_restart);
+  } else if (pgen_fun_name.compare("self_gravity_wave") == 0) {
+    SelfGravityWave(pin, is_restart);
   } else if (pgen_fun_name.compare("streaming_linear") == 0) {
     StreamingLinear(pin, is_restart);
   } else if (pgen_fun_name.compare("z4c_boosted_puncture") == 0) {
