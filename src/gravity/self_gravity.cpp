@@ -121,6 +121,15 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   if (setup_ != "reference" && setup_ != "distributed") {
     Fail("gravity/setup must be reference or distributed");
   }
+  if (setup_ == "distributed") {
+    const int cells[3] = {pm->mb_indcs.nx1,pm->mb_indcs.nx2,pm->mb_indcs.nx3};
+    for (int d = 0; d < (pm->three_d ? 3 : 2); ++d) {
+      if (cells[d] <= 0 || (cells[d] & (cells[d]-1)) != 0) {
+        Fail("distributed gravity requires power-of-two active MeshBlock dimensions; "
+             "use a supported block shape or explicitly select setup=reference");
+      }
+    }
+  }
   vertical_bc_ = pin->GetOrAddString("gravity", "vertical_bc", "periodic");
   isolated_method_ = pin->GetOrAddString("gravity", "isolated_method",
       setup_ == "reference" ? "direct" : "vacuum");
@@ -146,6 +155,10 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   for (int d = 0; d < (pm->three_d ? 3 : 2); ++d) {
     if (d == 2 && vertical_bc_ == "isolated") continue;
     const auto left = pm->mesh_bcs[2*d], right = pm->mesh_bcs[2*d+1];
+    if (!pm->three_d && (left == BoundaryFlag::shear_periodic ||
+                        right == BoundaryFlag::shear_periodic)) {
+      Fail("shear-periodic gravity requires 3D hydro; 2D r-z boxes use periodic x1");
+    }
     const bool periodic = left == BoundaryFlag::periodic && right == BoundaryFlag::periodic;
     const bool shear = d == 0 && pack->phydro->psbox_u != nullptr &&
         left == BoundaryFlag::shear_periodic && right == BoundaryFlag::shear_periodic;

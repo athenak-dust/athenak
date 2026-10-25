@@ -18,6 +18,7 @@
 #include "mesh/mesh.hpp"
 #include "outputs/outputs.hpp"
 #include "hydro/hydro.hpp"
+#include "eos/eos.hpp"
 #include "mhd/mhd.hpp"
 #include "z4c/z4c.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
@@ -436,6 +437,10 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // Work before time integrator indicated by "0" in stage
       ExecuteTaskList(pmesh, "before_timeintegrator", 0);
 
+      const int gravity_dfloor = pmesh->ecounter.neos_dfloor;
+      const int gravity_efloor = pmesh->ecounter.neos_efloor;
+      const int gravity_tfloor = pmesh->ecounter.neos_tfloor;
+
       // time-integrator tasks for each stage of integrator
       for (int stage=1; stage<=(nexp_stages); ++stage) {
         ExecuteTaskList(pmesh, "before_stagen", stage);
@@ -448,11 +453,28 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
 
       if (pgrav != nullptr) {
         if (pgrav->UsesOrbitalSplit()) {
-          // Refill midpoint ghosts used by mixed-level remap reconstruction.
-          InitBoundaryValuesAndPrimitives(pmesh);
+          // The last RK stage already filled midpoint ghosts. C2P can still
+          // alter conserved cells through floors; then refresh collectively.
+          // Scalar clipping has no event counter, so retain the refresh there.
+          int changed = (pmesh->ecounter.neos_dfloor != gravity_dfloor ||
+                         pmesh->ecounter.neos_efloor != gravity_efloor ||
+                         pmesh->ecounter.neos_tfloor != gravity_tfloor ||
+                         pmesh->pmb_pack->phydro->nscalars > 0) ? 1 : 0;
+#if MPI_PARALLEL_ENABLED
+          if (global_variable::nranks > 1) {
+            MPI_Allreduce(MPI_IN_PLACE, &changed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+          }
+#endif
+          if (changed) InitBoundaryValuesAndPrimitives(pmesh);
           pgrav->OrbitalStep(0.5*pmesh->dt);
           pgrav->SetHydroBoundaryTime(pmesh->time+pmesh->dt);
-          InitBoundaryValuesAndPrimitives(pmesh);
+          // Gravity needs only active cells. Preserve any post-remap EOS floor
+          // correction without another exchange/prolongation; the final kick
+          // is followed by the complete boundary/primitive refresh below.
+          auto *hydro = pmesh->pmb_pack->phydro;
+          const auto &ind = pmesh->mb_indcs;
+          hydro->peos->ConsToPrim(hydro->u0, hydro->w0, false,
+              ind.is, ind.ie, ind.js, ind.je, ind.ks, ind.ke);
         }
         pgrav->Solve(pmesh->time+pmesh->dt);
         pgrav->KickHydro(0.5*pmesh->dt);
