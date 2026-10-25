@@ -189,8 +189,10 @@ void DustGasDrag::CheckClouds3D() {
     bad.push_back("x3 faces other than periodic, reflect, outflow or user");
   }
   if (cloud_instant_switch) bad.push_back("cloud_instant_switch");
-  if (cloud_sort_interval > 0 || cloud_order_interval > 0) {
-    bad.push_back("the particle sort or order index (cloud_sort_interval, cloud_order_interval)");
+  // 2026-10-25 (Codex perf review item 2): the execution-order index (cloud_order_interval) has
+  // 3-D keys; the physical sort (cloud_sort_interval) still has 2-D keys only
+  if (cloud_sort_interval > 0) {
+    bad.push_back("the particle sort (cloud_sort_interval)");
   }
   if (!bad.empty()) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -1507,7 +1509,11 @@ void DustGasDrag::CloudPredictor3D(const bool rate_dep) {
       lt.ForEachCloudWeight(xp, yp, zp, lev, am, add);
     }
   };
-  CloudParFor("dust_pc2_cloud3d_predictor", npart, body);
+  if (cloud_ord_n > 0) {   // (cloud_order_interval) in the cell-sorted index order
+    CloudParForOrdered("dust_pc2_cloud3d_predictor", npart, cloud_ord, cloud_ord_n, body);
+  } else {
+    CloudParFor("dust_pc2_cloud3d_predictor", npart, body);
+  }
   // deposits on halo blocks back to their owners; component 4 (stiffness) only when the automatic
   // PC2 / split-BE switch reads it (rate_dep, the same on every rank; 2026-10-25, Codex perf review)
   HaloReverseAdd(qdep, 1, rate_dep ? 4 : 3);
@@ -1616,7 +1622,11 @@ void DustGasDrag::CloudAdvance3D() {
       lt.ForEachCloudWeight(xh, yh, zh, pi(PLEV,p), am, add);
     }
   };
-  CloudParFor("dust_pc2_cloud3d_advance", npart, body);
+  if (cloud_ord_n > 0) {   // (cloud_order_interval) in the cell-sorted index order
+    CloudParForOrdered("dust_pc2_cloud3d_advance", npart, cloud_ord, cloud_ord_n, body);
+  } else {
+    CloudParFor("dust_pc2_cloud3d_advance", npart, body);
+  }
   if (br) HaloReverseAdd(dmom, 0, 3);   // deposits on halo blocks back to their owners
 }
 

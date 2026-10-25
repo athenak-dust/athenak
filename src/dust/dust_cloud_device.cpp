@@ -2471,9 +2471,12 @@ void DustGasDrag::UpdateCloudOrder() {
   if (npart < 2) {cloud_ord_n = 0; return;}
   Kokkos::Timer t;
   const int nx1 = pmy_pack->pmesh->mb_indcs.nx1, nx2 = pmy_pack->pmesh->mb_indcs.nx2;
+  // 2026-10-25 (Codex perf review item 2): 3-D keys (block, k, j, i); in 2-D nx3 = 1, k = 0
+  const int nx3 = clouds3d ? pmy_pack->pmesh->mb_indcs.nx3 : 1;
+  const bool z3 = clouds3d;
   const int gids = pmy_pack->gids, nmb = pmy_pack->nmb_thispack;
   auto &mbsize = pmy_pack->pmb->mb_size;
-  const std::int64_t ncell = static_cast<std::int64_t>(nx1)*nx2, np = npart;
+  const std::int64_t ncell = static_cast<std::int64_t>(nx1)*nx2*nx3, np = npart;
   KeyScratch &s = Scratch();
   auto key = Grow(s.skey, npart, "sort_key");
   Kokkos::parallel_for("cloud_order_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -2484,7 +2487,12 @@ void DustGasDrag::UpdateCloudOrder() {
     int j = static_cast<int>(Kokkos::floor((pr(IPY,p) - mbsize.d_view(m).x2min)/mbsize.d_view(m).dx2));
     i = (i < 0) ? 0 : ((i >= nx1) ? nx1 - 1 : i);
     j = (j < 0) ? 0 : ((j >= nx2) ? nx2 - 1 : j);
-    key(p) = (m*ncell + static_cast<std::int64_t>(j)*nx1 + i)*np + p;
+    int k = 0;
+    if (z3) {
+      k = static_cast<int>(Kokkos::floor((pr(IPZ,p) - mbsize.d_view(m).x3min)/mbsize.d_view(m).dx3));
+      k = (k < 0) ? 0 : ((k >= nx3) ? nx3 - 1 : k);
+    }
+    key(p) = (m*ncell + (static_cast<std::int64_t>(k)*nx2 + j)*nx1 + i)*np + p;
   });
   SortFirst(key, npart);
   if (cloud_ord.extent_int(0) < npart) {
