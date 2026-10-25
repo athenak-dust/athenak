@@ -182,8 +182,11 @@ void DustGasDrag::CheckClouds3D() {
   // is refused by the constructor)
   if (pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
       pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::reflect &&
-      pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::outflow) {
-    bad.push_back("x3 faces other than periodic, reflect or outflow");
+      pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::outflow &&
+      pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::user) {
+    // (user faces, e.g. the Li et al. 2018 gas boundaries; the clouds only need the
+    // faces to be non-periodic and <dust>/particle_x3_bc)
+    bad.push_back("x3 faces other than periodic, reflect, outflow or user");
   }
   if (cloud_instant_switch) bad.push_back("cloud_instant_switch");
   if (cloud_sort_interval > 0 || cloud_order_interval > 0) {

@@ -409,6 +409,12 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
            (elapsed_time < wall_time)) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
 
+      // Problem work may change density (e.g. Li2018 mass normalization).
+      // Apply it before gravity samples the source or performs either kick.
+      if (pmesh->pgen->user_work_in_loop_func != nullptr) {
+        (pmesh->pgen->user_work_in_loop_func)(pmesh);
+      }
+
       // Symmetric gravity split around hydro, with symmetric orbital halfsteps
       // for gravity-enabled 3D boxes. The gravity-disabled task path is unchanged.
       // Checkpoints occur only after both half-kicks. The kick leaves density and

@@ -38,6 +38,14 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   // Blocks on the x1 faces may change level along x2.  Rixin: on by default after the
   // fix of Codex Astra's review; false = the two-step exchange with columns
   face_levels = pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", true);
+  // face_levels only across shear-periodic x1 faces.  PlanPull picks the receivers
+  // by position (the blocks on the x1 faces) but the senders from the shear-periodic boundary
+  // lists, so with periodic x1 the face blocks got collected x1 ghosts without any sender and the
+  // gas mass leaked through the x1 faces (mr_lina3d_32_pl lost 93% in 0.026 time units)
+  if (ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic ||
+      ppack->pmesh->mesh_bcs[BoundaryFace::outer_x1] != BoundaryFlag::shear_periodic) {
+    face_levels = false;
+  }
   report_timing = pin->GetOrAddBoolean("shearing_box", "report_timing", false);
   // (S2c) non-periodic x3 needs the coarse-array physical
   // boundaries for the corners the collected ghost zones leave to them; dust
