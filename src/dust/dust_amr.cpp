@@ -86,7 +86,11 @@ std::vector<SchedPatch> sched_;
 
 // the dust-density request (SetupDensityTrigger)
 struct DensityTrigger {
-  Real rho_refine = 0.0, rho_derefine = 0.0;   // in units of the mean dust density
+  Real rho_refine = 0.0, rho_derefine = 0.0;   // in units of the mean dust density (or code units)
+  // <dust>/amr_rho_units = mean (default, the 2-D BA trigger:
+  // rho_d over the box mean) or code (rho_d itself, code units; the box mean of a stratified box
+  // depends on its height)
+  bool code_units = false;
   int buffer = 0;                               // cells of the block's level
   // The thresholds grow by level_factor per level (amr_rho_level_factor): a
   // block of level l is refined at rho_refine f^l and derefined below rho_derefine f^(l - 1); 4 is
@@ -208,6 +212,11 @@ void SetupDensityTrigger(ParameterInput *pin) {
   trig_.rho_derefine = pin->GetReal("dust", "amr_rho_derefine");
   trig_.buffer = pin->GetOrAddInteger("dust", "amr_rho_buffer", 2);
   {
+    const std::string un = pin->GetOrAddString("dust", "amr_rho_units", "mean");
+    if (un != "mean" && un != "code") fatal("<dust>/amr_rho_units must be mean or code");
+    trig_.code_units = (un == "code");
+  }
+  {
     // Rixin: each block on its own leaf cells, as the AthenaK criteria.
     // The root-grid map (root) is gone
     RemovedKey(pin, "amr_rho_map",
@@ -260,7 +269,8 @@ void SetupDensityTrigger(ParameterInput *pin) {
   // several ranks: the buffer is part of the reach of the halo (DustGasDrag::HaloReach), so the
   // strips hold the buffer cells; BlockValue checks that the received cells cover it
   if (global_variable::my_rank == 0) {
-    std::cout << "# dust density trigger: refine at rho_d/mean >= " << trig_.rho_refine
+    std::cout << "# dust density trigger: refine at "
+              << (trig_.code_units ? "rho_d (code units)" : "rho_d/mean") << " >= " << trig_.rho_refine
               << ", derefine below " << trig_.rho_derefine << ", buffer " << trig_.buffer
               << " cells of the block's level, each block on its own leaf cells"
               << "; thresholds x" << trig_.level_factor << " per level" << std::endl;
@@ -306,7 +316,7 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
   const auto &ms = pm->mesh_size;
   const Real lx = ms.x1max - ms.x1min, ly = ms.x2max - ms.x2min, lz = ms.x3max - ms.x3min;
   const Real vbox = lx*ly*lz;
-  const Real mean = mtot/vbox;
+  const Real mean = trig_.code_units ? 1.0 : mtot/vbox;   // (amr_rho_units)
   const auto &ind = pm->mb_indcs;
   const int nmb = pmbp->nmb_thispack, mbs = pm->gids_eachrank[global_variable::my_rank];
   const int is = ind.is, js = ind.js, ks = ind.ks, nx1 = ind.nx1, nx2 = ind.nx2, nx3 = ind.nx3;
@@ -530,7 +540,8 @@ void DensityRefinement3DPoint(MeshBlockPack *pmbp) {
   MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
 #endif
   const auto &ms = pm->mesh_size;
-  const Real mean = mtot/((ms.x1max - ms.x1min)*(ms.x2max - ms.x2min)*(ms.x3max - ms.x3min));
+  const Real mean = trig_.code_units ? 1.0   // (amr_rho_units)
+                  : mtot/((ms.x1max - ms.x1min)*(ms.x2max - ms.x2min)*(ms.x3max - ms.x3min));
   auto bh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bmax);
   int nflag[2] = {0, 0};   // (counts, for a log)
   for (int m=0; m<nmb; ++m) {
@@ -666,7 +677,8 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   const int nr1 = pm->mesh_indcs.nx1, nr2 = pm->mesh_indcs.nx2;
   const Real x0 = pm->mesh_size.x1min, y0 = pm->mesh_size.x2min;
   const Real hx = (pm->mesh_size.x1max - x0)/nr1, hy = (pm->mesh_size.x2max - y0)/nr2;
-  const Real mean = mtot/((pm->mesh_size.x1max - x0)*(pm->mesh_size.x2max - y0));
+  const Real mean = trig_.code_units ? 1.0   // (amr_rho_units)
+                  : mtot/((pm->mesh_size.x1max - x0)*(pm->mesh_size.x2max - y0));
   Real qmax = 0.0, mfine = 0.0, vfine = 0.0;
   if (!host_f && nmb > 0) {   // the largest value and the mass on finer blocks, on the device
     if (pdust->trig_fine.extent_int(0) != nmb) pdust->trig_fine = DvceArray1D<int>("amr_rho_fine", nmb);
@@ -1381,7 +1393,7 @@ void DustGasDrag::WriteTriggerLog() {
   std::FILE *fp = AppendLog("dust_trigger_log.txt");
   if (fp == nullptr) return;
   if (LogEmpty(fp)) {
-    std::fprintf(fp, "# ncycle time max_rho/mean blocks flag_refine flag_derefine fine_volume_share "
+    std::fprintf(fp, "# ncycle time max_rho/mean (code units with amr_rho_units = code) blocks flag_refine flag_derefine fine_volume_share "
                  "fine_dust_mass_share clouds_root clouds_finer_plain clouds_lobed "
                  "blocks_per_level(0/1/...); since 2026-10-21 a line only for the check before each "
                  "regrid (and the first check)\n");
