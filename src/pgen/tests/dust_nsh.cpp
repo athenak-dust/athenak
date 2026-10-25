@@ -1838,28 +1838,38 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       // midplane mass for Hp = 0.02 H and a band |z| < 0.1 H).  Equal masses: the same value.
       if (seed_leaf) {
         // the root cloud mass of G and R: 8^lmax times the largest cloud, so that a
-        // seeded cloud on the finest level is one quantum there (the clouds are not root parents)
-        Real mmax = 0.0;
+        // seeded cloud on the finest level is one quantum there (the clouds are not root parents).
+        // Per species (Codex review): the largest cloud of all species
+        // gave a light species the quantum of the heaviest one
+        const int nsp = std::max(1, nspec);
+        std::vector<Real> mmax(nsp, 0.0);
         int lmax = 0;
         auto prq = ppar->prtcl_rdata;
         auto piq = ppar->prtcl_idata;
-        Kokkos::parallel_reduce("nsh_seed_leaf_m", Kokkos::RangePolicy<>(DevExeSpace(), 0,
-                                ppar->nprtcl_thispack),
-        KOKKOS_LAMBDA(const int p, Real &a, int &l) {
-          if (prq(IPM,p) > a) a = prq(IPM,p);
+        const int npq = ppar->nprtcl_thispack;
+        Kokkos::parallel_reduce("nsh_seed_leaf_lev", Kokkos::RangePolicy<>(DevExeSpace(), 0, npq),
+        KOKKOS_LAMBDA(const int p, int &l) {
           const int lv = piq(PLEV,p) & 15;   // the level bits of the cloud code
           if (lv > l) l = lv;
-        }, Kokkos::Max<Real>(mmax), Kokkos::Max<int>(lmax));
+        }, Kokkos::Max<int>(lmax));
+        for (int sp=0; sp<nsp; ++sp) {
+          Kokkos::parallel_reduce("nsh_seed_leaf_m", Kokkos::RangePolicy<>(DevExeSpace(), 0, npq),
+          KOKKOS_LAMBDA(const int p, Real &a) {
+            if (piq(PSP,p) == sp && prq(IPM,p) > a) a = prq(IPM,p);
+          }, Kokkos::Max<Real>(mmax[sp]));
+        }
 #if MPI_PARALLEL_ENABLED
-        MPI_Allreduce(MPI_IN_PLACE, &mmax, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(MPI_IN_PLACE, mmax.data(), nsp, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
         MPI_Allreduce(MPI_IN_PLACE, &lmax, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 #endif
-        const Real mroot = mmax*static_cast<Real>(std::int64_t(1) << (3*lmax));
-        pmbp->pdust->cloud_merge_mroot.assign(std::max(1, nspec), mroot);
+        const Real f8 = static_cast<Real>(std::int64_t(1) << (3*lmax));
+        pmbp->pdust->cloud_merge_mroot.assign(nsp, 0.0);
+        for (int sp=0; sp<nsp; ++sp) pmbp->pdust->cloud_merge_mroot[sp] = mmax[sp]*f8;
         if (global_variable::my_rank == 0) {
           std::cout << "# cloud_seed = leaf: clouds on their leaf levels (finest " << lmax
-                    << "), root cloud mass of G and R " << mroot << " = 8^" << lmax << " x "
-                    << mmax << std::endl;
+                    << "), root cloud mass of G and R per species 8^" << lmax << " x the largest cloud:";
+          for (int sp=0; sp<nsp; ++sp) std::cout << " " << mmax[sp]*f8;
+          std::cout << std::endl;
         }
       }
       pmbp->pdust->EnsureRootCloudMass();
