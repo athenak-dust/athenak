@@ -743,9 +743,17 @@ void DustGasDrag::UpdateShear3D(const Real time) {
   auto &lt = leaf_traversal3d;
   const Real ysh = std::fmod(qshear*omega0*lt.lx*time, lt.ly);   // as bvals_part.cpp
   if (shear3d_lists_ok_ && ysh == lt.ysh) return;
-  lt.ysh = ysh;
-  const int nmb = lt.nmb, nf1 = lt.nfine1, nf2 = lt.nfine2, nf3 = lt.nfine3;
+  ++shear3d_updates;
   const double yf = static_cast<double>(ysh)/static_cast<double>(lt.fine_dx2);
+  // (cloud_shear_list_cache) the lists of the unit interval [k, k + 1) of yf: block boxes and
+  // reaches are whole finest cells, so the windows of all yf in it lie in the window of the
+  // interval; the traversal still tests every candidate at the current ysh (Candidates, meets)
+  const double kf = std::floor(yf);
+  lt.ysh = ysh;
+  if (shear3d_list_cache && shear3d_lists_ok_ && kf == shear3d_key_) return;
+  ++shear3d_rebuilds;
+  shear3d_key_ = kf;
+  const int nmb = lt.nmb, nf1 = lt.nfine1, nf2 = lt.nfine2, nf3 = lt.nfine3;
   const auto &fb = shear3d_fbox_;
   std::vector<std::vector<int>> lst(2*static_cast<std::size_t>(nmb));
   int kmax = 1;
@@ -755,7 +763,9 @@ void DustGasDrag::UpdateShear3D(const Real time) {
       const int sg = 2*side - 1;   // across the outer face (1): x - Lx, y + ysh
       const int x0 = std::max(fb[m][0] - sg*nf1 - R, 0), x1 = std::min(fb[m][1] - sg*nf1 + R, nf1);
       if (x0 >= x1) continue;
-      const double y0 = fb[m][2] + sg*yf - R, y1 = fb[m][3] + sg*yf + R;
+      const double ylo = shear3d_list_cache ? std::min(sg*kf, sg*(kf + 1.0)) : sg*yf;
+      const double yhi = shear3d_list_cache ? std::max(sg*kf, sg*(kf + 1.0)) : sg*yf;
+      const double y0 = fb[m][2] + ylo - R, y1 = fb[m][3] + yhi + R;
       const int z0 = fb[m][4] - R, z1 = fb[m][5] + R;
       auto &l = lst[2*static_cast<std::size_t>(m) + side];
       for (const int b : shear3d_face_[1 - side]) {

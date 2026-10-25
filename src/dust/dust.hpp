@@ -1814,6 +1814,12 @@ class DustGasDrag {
   Real ShearRouteTime(Driver *pdrive, int stage) const;
   void ShiftShearCrossings(const Real tau);
   bool shear3d_lists_ok_ = false;
+  // 2026-10-25 (Codex perf review item 1): <dust>/cloud_shear_list_cache keeps the shear neighbour
+  // lists while ysh / fine_dx2 stays in one unit interval [k, k + 1) (lists built for the whole
+  // interval: a superset, the traversal filters by the current ysh); shear3d_key_ = k
+  bool shear3d_list_cache = false;
+  double shear3d_key_ = 0.0;
+  unsigned long long shear3d_rebuilds = 0, shear3d_updates = 0;
   std::vector<std::array<int, 6>> shear3d_fbox_;
   std::vector<int> shear3d_face_[2], shear3d_reach_;
   void UpdateShear3D(const Real time);
