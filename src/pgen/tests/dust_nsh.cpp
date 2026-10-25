@@ -939,6 +939,8 @@ struct RootPlacement {
   // with the next key when outside; Athena's par_strat3d.c draws Normal() until inside)
   bool gauss = false;
   Real hp = 1.0;
+  // <problem>/dust_zcut > 0: the Gaussian truncated to |z| < zcut as well
+  Real zcut = 0.0;
   KOKKOS_INLINE_FUNCTION void Base3(const int q, Real &x, Real &y, Real &z) const {
     if (mode == 0) {
       std::uint64_t key = static_cast<std::uint64_t>(q) + seed*UINT64_C(0x9e3779b97f4a7c15);
@@ -952,7 +954,10 @@ struct RootPlacement {
           const Real u1 = Kokkos::fmax(HashUniform01(kz), 1.0e-300);
           const Real u2 = HashUniform01(kz + UINT64_C(0x1d8e4e27c47d124f));
           const Real zz = hp*Kokkos::sqrt(-2.0*Kokkos::log(u1))*Kokkos::cos(2.0*M_PI*u2);
-          if (zz >= x3min && zz < x3min + lz) {z = zz; break;}
+          if (zz >= x3min && zz < x3min + lz && (zcut <= 0.0 || Kokkos::fabs(zz) < zcut)) {
+            z = zz;
+            break;
+          }
         }
         return;
       }
@@ -1459,10 +1464,15 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     nshtab.t = DvceArray2D<Real>("nsh_ztab", nt, 2 + 2*nspec);
     auto th = Kokkos::create_mirror_view(nshtab.t);
     const Real a = 1.0/(hpz*hpz) - 1.0/(hg*hg);
+    // <problem>/dust_zcut: the truncated profile of the Gaussian sampling, the
+    // same total dust mass (higher by 1/erf inside, zero outside)
+    const Real zcut = pin->GetOrAddReal("problem", "dust_zcut", 0.0);
+    const Real fcut = (zcut > 0.0) ? 1.0/std::erf(zcut/(std::sqrt(2.0)*hpz)) : 1.0;
     std::vector<Real> ez(nspec), vxz(nspec, 0.0), vpz(nspec, 0.0);
     for (int n=0; n<nt; ++n) {
       const Real z = nshtab.z0 + n*nshtab.dz;
-      for (int s=0; s<nspec; ++s) ez[s] = eps[s]*std::exp(-0.5*z*z*a);
+      const bool in = (zcut <= 0.0 || std::fabs(z) < zcut);
+      for (int s=0; s<nspec; ++s) ez[s] = in ? eps[s]*fcut*std::exp(-0.5*z*z*a) : 0.0;
       Real gx = 0.0, gp = 0.0;
       SolveNSH(omega0, qshear, ax, ez, taus, gx, gp, vxz, vpz);
       th(n,0) = gx; th(n,1) = gp;
@@ -1707,6 +1717,19 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       }
       place.gauss = true;
       place.hp = pin->GetOrAddReal("problem", "dust_hp", pmbp->phydro->peos->eos_data.iso_cs/omega0);
+      // truncation: the same total dust mass (the equal masses are unchanged, all
+      // samples inside), so the dust density inside is higher by 1/erf(zcut/(sqrt(2) Hp)); the
+      // NSH(z) table uses the same profile (nsh_vertical)
+      place.zcut = pin->GetOrAddReal("problem", "dust_zcut", 0.0);
+      if (place.zcut > 0.0 && global_variable::my_rank == 0) {
+        std::cout << "# dust_zcut: Gaussian truncated to |z| < " << place.zcut
+                  << ", density inside x " << 1.0/std::erf(place.zcut/(std::sqrt(2.0)*place.hp))
+                  << std::endl;
+      }
+    } else if (pin->GetOrAddReal("problem", "dust_zcut", 0.0) > 0.0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<problem>/dust_zcut needs stratified_dust_sampling = gaussian" << std::endl;
+      std::exit(EXIT_FAILURE);
     } else if (ssamp != "weight") {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "<problem>/stratified_dust_sampling must be weight or gaussian" << std::endl;
