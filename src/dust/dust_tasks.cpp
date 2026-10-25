@@ -135,14 +135,20 @@ namespace {
 struct MigTimer {
   double &acc;
   std::chrono::steady_clock::time_point t0;
-  // the kernels before are waited for first and counted apart (wait)
-  MigTimer(double &a, double &wait) : acc(a) {
+  bool on;
+  // the kernels before are waited for first and counted apart (wait).  2026-10-25 (Codex perf
+  // review): only with <dust>/amr_profile; the fence is for the timing alone (the migration
+  // fences before its MPI sends, bvals_part.cpp), off it is neither fenced nor timed
+  MigTimer(double &a, double &wait) : acc(a), on(ProfOn()) {
+    if (!on) return;
     const auto tw = std::chrono::steady_clock::now();
     Kokkos::fence();
     t0 = std::chrono::steady_clock::now();
     wait += std::chrono::duration<double>(t0 - tw).count();
   }
-  ~MigTimer() {acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();}
+  ~MigTimer() {
+    if (on) acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  }
 };
 }  // namespace
 

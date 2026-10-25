@@ -203,7 +203,9 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         } else {
           CloudParFor("dust_pc2_cloud_predictor_linear", npart, pred_body);
         }
-        HaloReverseAdd(qdep, 1, 4);   // deposits on halo blocks back to their owners
+        // Deposits on halo blocks back to their owners; component 4 only for the
+        // automatic switch (rate_dep, 2026-10-25, Codex perf review)
+        HaloReverseAdd(qdep, 1, rate_dep ? 4 : 3);
         return TaskStatus::complete;
       }
       par_for("dust_pc2_composite_predictor",DevExeSpace(),0,(npart-1),

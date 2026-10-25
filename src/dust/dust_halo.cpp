@@ -118,8 +118,12 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc, con
   double *ts = h.tsec + (reverse ? 4 : 0);
   ++h.nexch[reverse ? 1 : 0];
   Clock::time_point tc = Clock::now();
-  Kokkos::fence();                     // the kernels before the exchange (their time, not MPI)
-  ts[0] += since(tc);
+  // the kernels before the exchange (their time, not MPI): a fence for the timing alone (the pack
+  // below fences before the sends), so only with <dust>/amr_profile (2026-10-25, Codex perf review)
+  if (ProfOn()) {
+    Kokkos::fence();
+    ts[0] += since(tc);
+  }
   const int nc1 = h.ncells1, nc2 = h.ncells2;
   // forward: send the owner list, receive into the halo slots; reverse: the other way
   const std::vector<int> &out_off = reverse ? h.roff : h.soff;

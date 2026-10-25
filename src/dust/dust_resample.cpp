@@ -1592,7 +1592,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
   Mesh *pmesh = pmy_pack->pmesh;
   const int npart = ppar->nprtcl_thispack;
   const auto lt = leaf_traversal3d;
-  PackGasGather3D(pmy_pack->phydro->u0);
+  // (the gas gather field is packed below, once the pool is known; 2026-10-25, Codex perf review)
   if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
   if (npart == 0) return 0;
   const int nsp = std::max(1, nspecies);
@@ -1828,6 +1828,16 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       if (final) coff(p) = upd;
       upd += (cnt(p) > 0) ? cnt(p) : 0;
     }, nnz);
+  }
+  // 2026-10-25 (Codex perf review): the gas gather field (u0 velocities, with a forward halo
+  // exchange on several ranks) is only needed when some rank resamples; the decision is
+  // collective because the halo exchange is.  u0 is unchanged since the call above used to be.
+  {
+    int npool_max = npool;
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &npool_max, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+#endif
+    if (npool_max >= 2) PackGasGather3D(pmy_pack->phydro->u0);
   }
   if (npool < 2) {
     ++cloud_resample_pass;

@@ -1498,7 +1498,9 @@ void DustGasDrag::CloudPredictor3D(const bool rate_dep) {
     }
   };
   CloudParFor("dust_pc2_cloud3d_predictor", npart, body);
-  HaloReverseAdd(qdep, 1, 4);   // deposits on halo blocks back to their owners
+  // deposits on halo blocks back to their owners; component 4 (stiffness) only when the automatic
+  // PC2 / split-BE switch reads it (rate_dep, the same on every rank; 2026-10-25, Codex perf review)
+  HaloReverseAdd(qdep, 1, rate_dep ? 4 : 3);
 }
 
 //----------------------------------------------------------------------------------------

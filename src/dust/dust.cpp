@@ -1327,6 +1327,8 @@ DustGasDrag::~DustGasDrag() {
       smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
     // Rank 0's seconds in the multi-rank parts of the dust
     const double *t = halo_.tsec;
+    if (!ProfOn()) std::cout << "# DUST_MPI_TIMING note: amr_profile off, migrate_* and the halo "
+                             << "kernels_before are not measured (no timing fences)" << std::endl;
     std::cout << "# DUST_MPI_TIMING rank0 migrate_refine=" << mpi_time[0] << " (" << mpi_count[0]
               << ") migrate_push=" << mpi_time[1] << " (" << mpi_count[1] << ") kernels_before="
               << mpi_time[2] << " | halo forward (" << halo_.nexch[0] << "): kernels_before="
