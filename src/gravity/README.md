@@ -6,15 +6,20 @@ vacuum exterior, retaining the nonzero mean sheet field. The reference backend
 remains available explicitly for accuracy comparisons.
 
 On four GB200 GPUs, the 4.19-million-physical-cell WENO-Z disk benchmark measures
-about **40.5 ms of gravity work per step**, including source, shear updates,
-solve and force evaluation. Initial topology setup is measured separately. This
-is a 128-step benchmark with 18 assigned CPU cores per rank, not a universal cost
-bound for arbitrary sources or meshes. Exact workloads, versions, acceptance
-criteria and limitations are recorded in
+about **40.5 ms of gravity work per step at fixed dt=1e-4**. A follow-up using
+the same binary and normal CFL=0.3 through 1.02 shear wraps measures **118.4 ms
+per step**, including eight hierarchy refreshes. Source, shear updates, failed
+attempts, refreshes, accepted solves and force evaluation are included; initial
+topology setup is separate. The short fixed-step benchmark does not establish
+normal-CFL production cost. Both allocate 18 CPU cores per rank. Exact workloads
+and versions are recorded under
 the internal run records.
 
-This module is developed on `selfgrav-amr-shear`, from dust
-development commit `6c466d6d`. It is disabled unless `<gravity>/enabled = true`.
+This module is developed on `selfgrav-amr-shear`, originally from dust
+development commit `6c466d6d`. Merge `06c8fc23` incorporates the stable fixes
+through `530be393`, including ordinary-periodic-x1 mass conservation with AMR;
+the original pre-review version remains available at `1661775b`.
+It is disabled unless `<gravity>/enabled = true`.
 It solves on the actual active AMR leaves, including shearing-periodic faces;
 it does not substitute a uniform fine-grid volume solve.
 
@@ -25,7 +30,10 @@ isolated gravitational potential are separate choices.
 Future deposited dust density and particle force gathering can reuse the same
 field solver. Current support is 2D/3D Cartesian Newtonian hydro with one pack per
 rank; particles/dust, MHD, radiation
-and relativistic modules are rejected when this feature is enabled.
+and relativistic modules are rejected when this feature is enabled. Shearing-
+periodic gravity requires 3D hydro; 2D periodic-x1 gravity remains supported.
+Distributed setup requires power-of-two active MeshBlock dimensions. The
+isolated vacuum backend has additional root-grid restrictions described below.
 
 ## Running
 
@@ -59,7 +67,7 @@ hardware validation separately verified distinct GPU assignments.
 | `setup` | `distributed`; `reference` explicitly selects the replicated accuracy backend |
 | `vertical_bc` | `periodic`, or `isolated` in 3D |
 | `isolated_method` | `vacuum` for distributed setup; explicit reference setup defaults to `direct` |
-| `rtol` | `1e-10`, relative linear-system residual |
+| `rtol` | `1e-10`, residual relative to the full linear-system RHS, including the isolated mean-sheet/boundary terms |
 | `max_iterations`, `gmres_restart` | `150`, `24` |
 | `cfl` | `0.25`, safety factor for acceleration and free-fall limits |
 | `slab_modes_x`, `slab_modes_y` | `0`: use finest horizontal Nyquist cutoff |
@@ -131,6 +139,22 @@ not a claim of exact total gravitational-energy conservation. Density is solved
 at the beginning and end physical times, and primitives/ghost values are refreshed
 after kicks. Acceleration and free-fall limits participate in the timestep.
 
+For the orbital split, the last RK stage already supplies midpoint ghosts.
+The driver repeats that exchange only if EOS floor counters changed on any rank,
+or passive scalars are present (their clipping has no counter). After the second
+orbital halfstep, active-cell conserved-to-primitive conversion applies any EOS
+floors before gravity samples density; it needs no full boundary exchange there.
+The final post-kick exchange remains. In the short two-rank baseline/candidate
+tests, including active density floors, histories and all active conserved cells
+are bitwise identical. Stored inactive ghosts are not bitwise identical. This
+test does not establish a GPU speedup for the reduced refreshes.
+
+Problem-specific loop work, including density renormalization, runs before the
+first gravity solve/kick. Gravity-off retains the native orbital splitting,
+which differs from the two-halfstep gravity-on path. It is a useful cost control,
+but differences from gravity-on cannot be attributed solely to gravity. An
+accuracy comparison must also control the time-integration path.
+
 Regrid/load-balance invalidates the composite system and solves again from the new
 active density. Shared-file restart metadata preserves global block cooldown ages
 and whether the checkpoint precedes a pending mesh check. Resume restores/replays
@@ -182,11 +206,37 @@ energy is also not exactly conserved; ideal-gas SMR tests show convergent drift.
 Shared fluxes, small residuals, and weak-wave momentum cancellation alone do not
 prove exact conservation of these quantities.
 
+An independent isolated mean-sheet SMR check found false horizontal acceleration
+near vertical coarse/fine faces: its maximum relative to the vertical force
+decreased from about 0.41% to 0.20% between 16 and 32 root cells. This spatial
+interface error is separate from the iterative residual. It matters for small
+perturbations and future clump-drift tests even when the linear solve converges.
+
+The full-RHS `rtol` does not prescribe relative accuracy of a tiny perturbation.
+However, the review's quoted 0.28% potential error was the total-field difference
+between tolerances divided by the perturbation amplitude. Subtracting a separately
+computed zero-amplitude background at each tolerance reduces that diagnostic to
+about 8e-8 (forces about 0.9e-7 to 1.3e-7) against the discrete rtol=1e-13 result.
+Most of the quoted difference was common background error. The raw force still
+acts on hydro, and this subtraction is not performed at runtime. These static
+comparisons neither establish continuum accuracy nor test acceptance of a tiny
+changing source in a warm-started solve. The default tolerance is unchanged;
+small-signal applications need matched-background and observable convergence
+checks rather than an assumed universal perturbation-error bound.
+
 Actual topology changes still rebuild the hierarchy. On the four-GB200 disk
 benchmark this setup costs about 4.37 s, separate from the 40.5 ms steady-step
-number. Regridding frequency therefore affects total run cost. The GPU benchmark
-has 128 evolving steps; full shear-wrap and refine/derefine/restart controls are
-separate validation records, not a claim of 40.5 ms under every AMR schedule.
+number at fixed small dt. Regridding frequency therefore affects total run cost.
+The follow-up normal-CFL GPU run took 1452 steps to t=0.68, with hierarchy refreshes
+at steps 172, 336, 496, 681, 839, 1019, 1172 and 1340. Subsequent refresh intervals
+were 153--185 steps. Accepted cached solves cost 74.5 ms/step and amortized hierarchy
+refresh 22.9 ms/step, the main remaining optimization targets. Every accepted
+current-system residual remained <=1e-10. Observed CUDA peak was 2114 MiB/rank
+versus 1742 MiB in the matched fixed-step run; this is an observed allocation
+window, not a universal peak bound. Normal CFL advances about 4.68 times as much
+physical time per step, so its higher per-step cost must not be confused with
+a slower advance per unit physical time. These GPU timings use the old frozen
+binary from `e1ffa5e8`; they do not include the later boundary-refresh changes.
 
 The reference backend has known performance limitations: host setup holds global
 geometry and matrices on each rank, and its 3D Galerkin hierarchy has significant
