@@ -336,8 +336,13 @@ void ReadRestartState(IOWrapper &file, std::uint64_t offset, Mesh *pm,
     if (pm->pmb_pack->pgrav != nullptr && global_variable::my_rank == 0) {
       std::cout << "# gravity restart LEGACY: no gravity restart metadata; ";
       if (pm->adaptive) {
-        std::cout << "cooldown ages start at zero and the pending mesh check cannot be "
-                     "recovered; exact AMR continuation is not guaranteed\n";
+        const auto *dust = pm->pmb_pack->pdust;
+        if (dust != nullptr && dust->amr_restart_state_found) {
+          std::cout << "dust AMR metadata supplies cooldown ages and the pending mesh check\n";
+        } else {
+          std::cout << "cooldown ages start at zero and the pending mesh check cannot be "
+                       "recovered; exact AMR continuation is not guaranteed\n";
+        }
       } else {
         std::cout << "static mesh needs no AMR replay\n";
       }
@@ -375,6 +380,14 @@ void ReadRestartState(IOWrapper &file, std::uint64_t offset, Mesh *pm,
         Get<std::int32_t>(buffer, position) != loc.level) Broken("global block ordering mismatch");
     state.ages[m] = Get<std::int32_t>(buffer, position);
     if (state.ages[m] < 0) Broken("negative mesh cooldown age");
+  }
+  // Duplicate records are a file-integrity invariant, independent of whether
+  // the user enables gravity for this continuation. Never hide malformed joint
+  // metadata by switching a physics module off.
+  const auto *dust = pm->pmb_pack->pdust;
+  if (dust != nullptr && dust->amr_restart_state_found &&
+      (dust->amr_restart_pending != state.pending || dust->amr_restart_ages != state.ages)) {
+    Broken("dust and gravity AMR replay metadata disagree");
   }
   if (pm->pmb_pack->pgrav != nullptr) pm->pmb_pack->pgrav->LoadRestartState(std::move(state));
 }
