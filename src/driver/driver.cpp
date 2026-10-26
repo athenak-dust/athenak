@@ -27,6 +27,7 @@
 #include "driver.hpp"
 #include "dust/dust.hpp"
 #include "gravity/self_gravity.hpp"
+#include "gravity/restart.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
@@ -320,12 +321,7 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   // A restarted dynamic dust mesh gets its cooldown ages back and the
   // mesh check that followed the outputs of the restart cycle, before the time step;
   // refinable clouds get their MeshBlock ids from their positions (any mesh)
-  if (res_flag && pmesh->pmb_pack->pdust != nullptr) {
-    pmesh->pmb_pack->pdust->ResumeAmrAfterRestart(this, pin);
-  }
-  if (res_flag && pmesh->pmb_pack->pgrav != nullptr) {
-    pmesh->pmb_pack->pgrav->ResumeAmrAfterRestart(this, pin);
-  }
+  if (res_flag) gravity::ResumeRestart(pmesh, this, pin);
   // Phi is a derived elliptic field. Recompute from the restored density and
   // physical time; never carry a pre-regrid potential or an old shear phase.
   if (pmesh->pmb_pack->pgrav != nullptr) {

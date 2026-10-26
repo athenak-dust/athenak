@@ -6,13 +6,19 @@
 class IOWrapper;
 class Mesh;
 class ParameterInput;
+class Driver;
 namespace gravity {
 struct GravityRestartState {
   bool found = false, pending = false, adaptive = false;
   std::vector<int> ages;
 };
-// Shared-file metadata lives immediately after native fluid arrays. SelfGravity
-// currently excludes particles/dust, whose existing trailing sections are unchanged.
+// Extension chain: native fluid arrays, optional legacy AKPRST01 rank sections,
+// optional AKSGRST1 record. Each module receives its own bounded byte range.
+void WriteRestartExtensions(IOWrapper &file, std::uint64_t offset, Mesh *mesh,
+                            bool single_file_per_rank);
+void ReadRestartExtensions(IOWrapper &file, std::uint64_t offset, Mesh *mesh,
+                           ParameterInput *pin, bool single_file_per_rank);
+void ResumeRestart(Mesh *mesh, Driver *driver, ParameterInput *pin);
 void MarkRestartHeader(ParameterInput *pin, bool single_file_per_rank);
 void WriteRestartState(IOWrapper &file, std::uint64_t offset, Mesh *mesh);
 void ReadRestartState(IOWrapper &file, std::uint64_t offset, Mesh *mesh,

@@ -57,6 +57,8 @@ class SelfGravity {
   // Topology/load balance rebuilds automatically; shear updates only surface rows.
   void Invalidate();
   void LoadRestartState(GravityRestartState state) { restart_state_ = std::move(state); }
+  const GravityRestartState &RestartState() const { return restart_state_; }
+  void ClearRestartState() { restart_state_ = GravityRestartState{}; }
   void ResumeAmrAfterRestart(Driver *driver, ParameterInput *pin);
   bool amr_check_after_output = false;
 

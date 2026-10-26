@@ -619,60 +619,8 @@ ProblemGenerator::ProblemGenerator(ParameterInput *pin, Mesh *pm, IOWrapper resf
     myoffset = offset_myrank;
   }
 
-  // particles and dust state (dust/dust_restart.cpp): the section after the
-  // data of the last MeshBlock
-  if (pm->pmb_pack->pgrav != nullptr) {
-    gravity::ReadRestartState(resfile, headeroffset+data_size*pm->nmb_total,
-                              pm, pin, single_file_per_rank);
-  }
-  if (pm->pmb_pack->ppart != nullptr) {
-    if (single_file_per_rank) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "restart files with particles are implemented for a single file" << std::endl;
-      exit(EXIT_FAILURE);
-    }
-    // one section per rank that wrote the file, one after the other
-    const IOWrapperSizeT poff = headeroffset + data_size*(pm->nmb_total);
-    std::vector<char> phead(dust::ParticleRestartHeadBytes());
-    auto head_at = [&](const IOWrapperSizeT at) {
-      std::uint64_t b = 0;
-      if (resfile.Read_bytes_at(phead.data(), 1, phead.size(), at, single_file_per_rank)
-          == phead.size()) {
-        b = dust::ParticleRestartSectionBytes(phead.data());
-      }
-      if (b < phead.size()) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "this run has particles but the restart file holds none (it was written "
-                  << "by a run without particles or by a code without particle restart)"
-                  << std::endl;
-        exit(EXIT_FAILURE);
-      }
-      return static_cast<IOWrapperSizeT>(b);
-    };
-    std::vector<IOWrapperSizeT> soff, slen;
-    soff.push_back(poff);
-    slen.push_back(head_at(poff));
-    const int nsec = dust::ParticleRestartSections(phead.data());
-    for (int k=1; k<nsec; ++k) {
-      soff.push_back(soff[k-1] + slen[k-1]);
-      slen.push_back(head_at(soff[k]));
-    }
-    auto read_section = [&](const int k, std::vector<char> &pbuf) {
-      pbuf.resize(slen[k]);
-      const IOWrapperSizeT chunk = static_cast<IOWrapperSizeT>(1) << 30;
-      for (IOWrapperSizeT done = 0; done < pbuf.size(); done += chunk) {
-        const IOWrapperSizeT n = std::min<IOWrapperSizeT>(chunk, pbuf.size() - done);
-        if (resfile.Read_bytes_at(pbuf.data() + done, 1, n, soff[k] + done, single_file_per_rank)
-            != n) {
-          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                    << "particle data not read correctly from rst file, restart file is "
-                    << "broken." << std::endl;
-          exit(EXIT_FAILURE);
-        }
-      }
-    };
-    dust::UnpackParticleRestart(pm->pmb_pack, nsec, read_section);
-  }
+  gravity::ReadRestartExtensions(resfile, headeroffset+data_size*pm->nmb_total,
+                                 pm, pin, single_file_per_rank);
 
   // call problem generator again to re-initialize data, fn ptrs, as needed
   // second argument true since this IS a restart

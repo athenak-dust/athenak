@@ -4,6 +4,7 @@
 // sizeof(Real)/reserved, nmb*(int32 lx1,lx2,lx3,level,age), magic[8].
 #include "gravity/restart.hpp"
 #include <cmath>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -19,6 +20,7 @@
 #include "gravity/self_gravity.hpp"
 #include "outputs/io_wrapper.hpp"
 #include "parameter_input.hpp"
+#include "dust/dust.hpp"
 
 namespace gravity {
 namespace {
@@ -49,17 +51,199 @@ T Get(const std::vector<char> &buffer, std::size_t &position) {
 }
 std::size_t Bytes(const Mesh *pm) {
   if (pm->nmb_total < 1 || static_cast<std::uint64_t>(pm->nmb_total) >
-      (static_cast<std::uint64_t>(std::numeric_limits<int>::max())-kFixed)/kBlock) {
+      (std::numeric_limits<std::size_t>::max()-kFixed)/kBlock) {
     Broken("global block count exceeds metadata capacity");
   }
-  return kFixed+kBlock*pm->nmb_total;
+  return kFixed+kBlock*static_cast<std::size_t>(pm->nmb_total);
 }
 void Guard(const Mesh *pm) {
-  if (pm->pmb_pack->ppart != nullptr || pm->pmb_pack->pdust != nullptr) {
-    Broken("combined gravity/particle restart sections are not implemented");
+  if (pm->pmb_pack->pgrav == nullptr) Broken("gravity metadata writer has no gravity module");
+}
+std::uint64_t Add(std::uint64_t a, std::uint64_t b) {
+  const auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+  if (a > limit || b > limit-a) Broken("extension offset exceeds signed 64-bit file extent");
+  return a+b;
+}
+void Transfer(IOWrapper &file, char *data, std::uint64_t bytes, std::uint64_t offset,
+              bool write) {
+  Add(offset, bytes);
+  constexpr std::uint64_t chunk = std::uint64_t(1) << 30;
+  for (std::uint64_t done = 0; done < bytes;) {
+    const auto n = std::min(chunk, bytes-done);
+    const auto actual = write ? file.Write_any_type_at(data+done, n, offset+done, "byte", false)
+                             : file.Read_bytes_at(data+done, 1, n, offset+done, false);
+    if (actual != n) Broken(write ? "extension write failed" : "truncated extension record");
+    done += n;
   }
 }
 }  // namespace
+
+void WriteRestartExtensions(IOWrapper &file, std::uint64_t offset, Mesh *pm,
+                            bool single_file_per_rank) {
+  if (pm->pmb_pack->ppart == nullptr && pm->pmb_pack->pgrav == nullptr) return;
+  if (single_file_per_rank) Broken("particles/self-gravity require a shared restart file");
+  if (pm->pmb_pack->ppart != nullptr) {
+    std::vector<char> buffer;
+    dust::PackParticleRestart(pm->pmb_pack, buffer);
+    std::vector<std::uint64_t> lengths(global_variable::nranks, buffer.size());
+#if MPI_PARALLEL_ENABLED
+    const std::uint64_t mine = buffer.size();
+    MPI_Allgather(&mine, 1, MPI_UINT64_T, lengths.data(), 1, MPI_UINT64_T, MPI_COMM_WORLD);
+#endif
+    std::uint64_t own = offset, end = offset;
+    for (int rank = 0; rank < global_variable::nranks; ++rank) {
+      if (rank == global_variable::my_rank) own = end;
+      end = Add(end, lengths[rank]);
+    }
+    Transfer(file, buffer.data(), buffer.size(), own, true);
+    offset = end;
+  }
+  if (pm->pmb_pack->pgrav != nullptr) WriteRestartState(file, offset, pm);
+}
+
+void ReadRestartExtensions(IOWrapper &file, std::uint64_t offset, Mesh *pm,
+                           ParameterInput *pin, bool single_file_per_rank) {
+  // Per-rank fluid-only restarts retain their original layout and behavior.
+  if (single_file_per_rank) {
+    if (pm->pmb_pack->ppart != nullptr || pm->pmb_pack->pgrav != nullptr) {
+      Broken("particles/self-gravity require a shared restart file");
+    }
+    return;
+  }
+  const auto extent = file.GetSize(false);
+  Add(0, extent);
+  if (offset > extent) Broken("native fluid arrays run past EOF");
+  auto read = [&](char *data, std::uint64_t bytes, std::uint64_t at) {
+    if (at > extent || bytes > extent-at) Broken("extension runs past EOF");
+    Transfer(file, data, bytes, at, false);
+  };
+  std::vector<std::uint64_t> offsets, lengths;
+  std::vector<char> global_amr;
+  if (extent-offset >= 8) {
+    char magic[8];
+    read(magic, 8, offset);
+    if (std::memcmp(magic, "AKPRST01", 8) == 0) {
+      std::vector<char> head(dust::ParticleRestartHeadBytes());
+      read(head.data(), head.size(), offset);
+      const int sections = dust::ParticleRestartSections(head.data());
+      // Every rank, including an empty particle rank, has a fixed head and footer.
+      if (sections < 1 || static_cast<std::uint64_t>(sections) >
+          (extent-offset)/(head.size()+8)) Broken("invalid particle rank-section count");
+      for (int rank = 0; rank < sections; ++rank) {
+        read(head.data(), head.size(), offset);
+        const auto bytes = dust::ParticleRestartSectionBytes(head.data());
+        if (bytes < head.size()+sizeof(std::int64_t)+sizeof(Real)+sizeof(std::int32_t)+8 ||
+            bytes > extent-offset || bytes > std::numeric_limits<std::size_t>::max() ||
+            dust::ParticleRestartSections(head.data()) != sections) {
+          Broken("invalid particle section extent or inconsistent rank count");
+        }
+        char footer[8];
+        read(footer, 8, Add(offset, bytes-8));
+        if (std::memcmp(footer, "AKPRST01", 8) != 0) Broken("invalid particle section footer");
+        // Validate size arithmetic before the legacy unpacker allocates buffers.
+        // Do this for every section, even when the MPI decomposition is unchanged.
+        std::int32_t columns[6];
+        std::memcpy(columns, head.data()+8, sizeof(columns));
+        if (columns[0] != 1 || columns[1] != sizeof(Real) || columns[2] != sizeof(int) ||
+            columns[4] < 1 || columns[5] < 1) Broken("invalid particle section types");
+        std::vector<char> fixed(sizeof(std::int64_t)+sizeof(Real)+sizeof(std::int32_t));
+        read(fixed.data(), fixed.size(), Add(offset, head.size()));
+        std::int64_t count;
+        std::int32_t state_bytes;
+        std::memcpy(&count, fixed.data(), sizeof(count));
+        std::memcpy(&state_bytes, fixed.data()+sizeof(count)+sizeof(Real), sizeof(state_bytes));
+        const auto row_bytes = std::uint64_t(columns[4])*sizeof(Real) +
+                               std::uint64_t(columns[5])*sizeof(int);
+        const auto available = bytes-head.size()-fixed.size()-8;
+        if (count < 0 || state_bytes < 0 || std::uint64_t(state_bytes) > available ||
+            std::uint64_t(count) > (available-state_bytes)/row_bytes ||
+            std::uint64_t(count)*row_bytes != available-state_bytes) {
+          Broken("inconsistent particle/state payload sizes");
+        }
+        auto record_at = Add(offset, head.size()+fixed.size());
+        const auto state_end = Add(record_at, state_bytes);
+        while (record_at < state_end) {
+          char record[20];
+          if (state_end-record_at < sizeof(record)) Broken("truncated dust state record header");
+          read(record, sizeof(record), record_at);
+          std::int32_t n;
+          std::memcpy(&n, record+16, sizeof(n));
+          record_at = Add(record_at, sizeof(record));
+          if (n < 0 || std::uint64_t(n) > state_end-record_at) Broken("truncated dust state record");
+          if (std::memcmp(record, "amr_state", 10) == 0) {
+            if (std::uint64_t(n) != (std::uint64_t(pm->nmb_total)+2)*sizeof(std::int32_t)) {
+              Broken("dust AMR state block count mismatch");
+            }
+            std::vector<char> amr(n);
+            read(amr.data(), amr.size(), record_at);
+            for (std::size_t j = 0; j < amr.size()/sizeof(std::int32_t); ++j) {
+              std::int32_t value;
+              std::memcpy(&value, amr.data()+j*sizeof(value), sizeof(value));
+              if (value < 0 || (j == 0 && value > 1) ||
+                  (j == 1 && value != pm->nmb_total)) Broken("invalid dust AMR state");
+            }
+            if (!global_amr.empty() && amr != global_amr) {
+              Broken("particle rank sections disagree on global AMR state");
+            }
+            global_amr = std::move(amr);
+          }
+          record_at = Add(record_at, n);
+        }
+        offsets.push_back(offset);
+        lengths.push_back(bytes);
+        offset = Add(offset, bytes);
+      }
+    }
+  }
+  if (pm->pmb_pack->ppart != nullptr) {
+    if (offsets.empty()) Broken("this run has particles but the checkpoint has none");
+    auto section = [&](int rank, std::vector<char> &buffer) {
+      buffer.resize(static_cast<std::size_t>(lengths[rank]));
+      read(buffer.data(), buffer.size(), offsets[rank]);
+    };
+    dust::UnpackParticleRestart(pm->pmb_pack, offsets.size(), section);
+  } else if (!offsets.empty()) {
+    Broken("checkpoint contains live particle sections but this run has no particles");
+  }
+  // Always validate the SG tail, including continuations with gravity disabled.
+  ReadRestartState(file, offset, pm, pin, false);
+}
+
+void ResumeRestart(Mesh *pm, Driver *driver, ParameterInput *pin) {
+  auto *dust = pm->pmb_pack->pdust;
+  auto *grav = pm->pmb_pack->pgrav;
+  if (dust == nullptr) {
+    if (grav != nullptr) grav->ResumeAmrAfterRestart(driver, pin);
+    return;
+  }
+  if (grav != nullptr) {
+    const auto &state = grav->RestartState();
+    if (state.found && state.adaptive) {
+      if (dust->amr_restart_state_found) {
+        if (dust->amr_restart_pending != state.pending || dust->amr_restart_ages != state.ages) {
+          Broken("dust and gravity AMR replay metadata disagree");
+        }
+      } else if (dust->experimental_amr) {
+        dust->amr_restart_state_found = true;
+        dust->amr_restart_pending = state.pending;
+        dust->amr_restart_ages = state.ages;
+      }
+    }
+  }
+  // This also maps/routs clouds before any pending topology change. The dust
+  // route owns replay when active; otherwise gravity handles a hydro AMR replay.
+  const bool dust_replays = dust->experimental_amr && pm->adaptive && pm->pmr != nullptr;
+  dust->ResumeAmrAfterRestart(driver, pin);
+  if (grav != nullptr) {
+    if (dust_replays) grav->ClearRestartState();
+    else grav->ResumeAmrAfterRestart(driver, pin);
+    grav->amr_check_after_output = false;
+  }
+  dust->amr_restart_state_found = false;
+  dust->amr_restart_pending = false;
+  dust->amr_restart_ages.clear();
+  dust->amr_check_after_output = false;
+}
 
 void MarkRestartHeader(ParameterInput *pin, bool single_file_per_rank) {
   if (single_file_per_rank) Broken("self-gravity requires a shared restart file");
@@ -104,13 +288,12 @@ void WriteRestartState(IOWrapper &file, std::uint64_t offset, Mesh *pm) {
     Put(buffer, static_cast<std::int32_t>(age));
   }
   buffer.insert(buffer.end(), kMagic, kMagic+8);
-  if (buffer.size() != Bytes(pm) || file.Write_any_type_at(buffer.data(), buffer.size(),
-      offset, "byte", false) != buffer.size()) Broken("metadata write failed");
+  if (buffer.size() != Bytes(pm)) Broken("metadata size mismatch");
+  Transfer(file, buffer.data(), buffer.size(), offset, true);
 }
 
 void ReadRestartState(IOWrapper &file, std::uint64_t offset, Mesh *pm,
                       ParameterInput *pin, bool single_file_per_rank) {
-  Guard(pm);
   if (single_file_per_rank) Broken("self-gravity requires a shared restart file");
   const int marker = pin->DoesParameterExist("gravity", "restart_record_version") ?
                      pin->GetInteger("gravity", "restart_record_version") : 0;
@@ -126,11 +309,12 @@ void ReadRestartState(IOWrapper &file, std::uint64_t offset, Mesh *pm,
       if (n != 8 || std::memcmp(magic, kMagic, 8) != 0) {
         Broken("marked checkpoint has missing, truncated or invalid metadata magic");
       }
-      if (file.Read_bytes_at(buffer.data(), 1, buffer.size(), offset, false) != buffer.size()) {
+      if (offset > file.GetSize() || buffer.size() > file.GetSize()-offset) {
         Broken("truncated metadata record");
       }
+      Transfer(file, buffer.data(), buffer.size(), offset, false);
       char extra;
-      if (file.Read_bytes_at(&extra, 1, 1, offset+buffer.size(), false) != 0) {
+      if (file.Read_bytes_at(&extra, 1, 1, Add(offset, buffer.size()), false) != 0) {
         Broken("unexpected bytes after metadata record");
       }
       found = 1;
@@ -138,11 +322,18 @@ void ReadRestartState(IOWrapper &file, std::uint64_t offset, Mesh *pm,
   }
 #if MPI_PARALLEL_ENABLED
   MPI_Bcast(&found, 1, MPI_INT, 0, MPI_COMM_WORLD);
-  if (found) MPI_Bcast(buffer.data(), buffer.size(), MPI_BYTE, 0, MPI_COMM_WORLD);
+  if (found) {
+    constexpr std::size_t chunk = std::size_t(1) << 30;
+    for (std::size_t done = 0; done < buffer.size();) {
+      const auto n = std::min(chunk, buffer.size()-done);
+      MPI_Bcast(buffer.data()+done, static_cast<int>(n), MPI_BYTE, 0, MPI_COMM_WORLD);
+      done += n;
+    }
+  }
 #endif
   GravityRestartState state;
   if (!found) {
-    if (global_variable::my_rank == 0) {
+    if (pm->pmb_pack->pgrav != nullptr && global_variable::my_rank == 0) {
       std::cout << "# gravity restart LEGACY: no gravity restart metadata; ";
       if (pm->adaptive) {
         std::cout << "cooldown ages start at zero and the pending mesh check cannot be "
@@ -151,7 +342,7 @@ void ReadRestartState(IOWrapper &file, std::uint64_t offset, Mesh *pm,
         std::cout << "static mesh needs no AMR replay\n";
       }
     }
-    pm->pmb_pack->pgrav->LoadRestartState(std::move(state));
+    if (pm->pmb_pack->pgrav != nullptr) pm->pmb_pack->pgrav->LoadRestartState(std::move(state));
     return;
   }
   if (std::memcmp(buffer.data(), kMagic, 8) != 0 ||
@@ -185,7 +376,7 @@ void ReadRestartState(IOWrapper &file, std::uint64_t offset, Mesh *pm,
     state.ages[m] = Get<std::int32_t>(buffer, position);
     if (state.ages[m] < 0) Broken("negative mesh cooldown age");
   }
-  pm->pmb_pack->pgrav->LoadRestartState(std::move(state));
+  if (pm->pmb_pack->pgrav != nullptr) pm->pmb_pack->pgrav->LoadRestartState(std::move(state));
 }
 
 void SelfGravity::ResumeAmrAfterRestart(Driver *driver, ParameterInput *pin) {
