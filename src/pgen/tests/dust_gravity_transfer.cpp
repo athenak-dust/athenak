@@ -51,7 +51,10 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
   DvceArray5D<Real> density;
   dust->DepositGravityDensity(time,density);
   auto rho=Kokkos::create_mirror_view_and_copy(HostMemSpace(),density);
-  auto pr=Kokkos::create_mirror_view_and_copy(HostMemSpace(),particles->prtcl_rdata);
+  // A true copy is required: mirror_view_and_copy may alias the original on
+  // Serial/OpenMP, which would invalidate the before/after kick comparison.
+  auto pr=Kokkos::create_mirror(particles->prtcl_rdata);
+  Kokkos::deep_copy(pr,particles->prtcl_rdata);
   const auto original_particles=pr;
   Real mass[2]={0,0};
   for (int p=0;p<npart;++p) mass[0]+=pr(IPM,p);
