@@ -169,11 +169,21 @@ Real DustGasDrag::GravityAccelerationTimeStep(const DvceArray2D<Real> &accelerat
   auto pr=particles->prtcl_rdata;
   auto pi=particles->prtcl_idata;
   const auto lt=leaf_traversal3d;
+  const bool points=PointGravityTransferSupported();
+  auto sizes=pmy_pack->pmb->mb_size.d_view;
   Real limit=std::numeric_limits<Real>::max();
   Kokkos::parallel_reduce("gravity_dust_acceleration_timestep",
       Kokkos::RangePolicy<DevExeSpace>(0,npart),KOKKOS_LAMBDA(int p,Real &minimum) {
     if (pr(IPM,p)==0) return;
     const int b=pi(PGID,p)-gids;
+    if (points) {
+      const Real width[3]={sizes(b).dx1,sizes(b).dx2,sizes(b).dx3};
+      for (int d=0;d<3;++d) {
+        const Real a=fabs(acceleration(d,p));
+        if (a>0) minimum=fmin(minimum,sqrt(width[d]/a));
+      }
+      return;
+    }
     const int level=pi(PLEV,p)&SMRCompositeTransfer::kCloudLevelMask;
     const Real width[3]={lt.root_dx1/static_cast<Real>(1<<level),
         lt.root_dx2/static_cast<Real>(1<<level),lt.root_dx3/static_cast<Real>(1<<level)};
