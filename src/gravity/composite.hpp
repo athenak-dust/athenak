@@ -37,7 +37,7 @@ struct BoundarySample {
 
 struct CompositeSystem {
   HostHierarchy hierarchy;                // A = -integrated FV Laplacian
-  std::array<HostCsr, 3> acceleration;      // MINUS averaged shared normal derivatives
+  std::array<HostCsr, 3> acceleration;      // MINUS volume gradient of shared face averages
   std::vector<Real> volume;
   std::vector<unsigned char> interface;    // cell touches a different refinement level
   // Caller supplies potential at these exterior CELL CENTERS, not at the wall face.

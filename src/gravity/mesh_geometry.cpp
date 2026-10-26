@@ -37,7 +37,7 @@ struct Face {
   GlobalIndex left, right;
   int normal, side;
   double area = 1., distance;
-  Vec delta{}, ti{}, tj{};
+  Vec delta{}, ti{}, tj{}, width{};
 };
 
 void Add(Row &row, GlobalIndex column, double value) {
@@ -86,10 +86,10 @@ std::array<Vec, 3> Inverse(std::array<Vec, 3> a, int ndim) {
 }
 
 struct RowWorkspace {
-  Row a, difference;
+  Row a, difference, potential;
   std::array<Row,3> g;
   RowWorkspace() {
-    a.reserve(32); difference.reserve(32);
+    a.reserve(32); difference.reserve(32); potential.reserve(48);
     for (auto &row : g) row.reserve(32);
   }
 };
@@ -268,6 +268,7 @@ struct MeshGeometry::Impl {
                                 right.center[t]+.5*right.width[t]+shift);
       if (hi-lo <= minwidth[t]*1.e-8) { f.area = 0.; break; }
       f.area *= hi-lo;
+      f.width[t] = hi-lo;
       f.ti[t] = .5*(hi+lo)-left.center[t];
       f.tj[t] = .5*(hi+lo)-right.center[t]-shift;
       // Roundoff in patch coordinates must not turn an aligned seven-point
@@ -300,7 +301,9 @@ struct MeshGeometry::Impl {
         f.distance = ci.width[d]; f.delta[d] = f.distance;
         f.left = side < 0 ? Sample(p,ijk,side) : row;
         f.right = side < 0 ? row : Sample(p,ijk,side);
-        for (int t = 0; t < nd; ++t) if (t != d) f.area *= ci.width[t];
+        for (int t = 0; t < nd; ++t) if (t != d) {
+          f.area *= ci.width[t]; f.width[t] = ci.width[t];
+        }
         coverage[d] += f.area; faces.push_back(f); continue;
       }
       const int wraps = periodic && d == 0 ? 1 : 0;
@@ -530,25 +533,11 @@ struct MeshGeometry::Impl {
     return false;
   }
   bool IsPhaseRow(GlobalIndex row) const {
-    if (TouchesX(row)) return true;
-    // All faces strictly inside one rectangular patch are aligned, so no LS
-    // stencil can couple their geometry to a distant shearing face.
-    const int p = Patch(row); const auto ijk = Indices(p,row);
-    bool interior = true;
-    for (int d = 0; d < nd; ++d)
-      interior = interior && ijk[d] > 0 && ijk[d]+1 < patches[p].cells[d];
-    if (interior && domain.c1_z_interfaces.empty()) return false;
-    QuadraticCache cache;
-    for (const auto &f : Faces(row)) {
-      if (!HasOffset(f.ti) && !HasOffset(f.tj) &&
-          !AtC1Interface(f) &&
-          (f.left >= partition.back() || f.right >= partition.back() ||
-           Cell(f.left).width[f.normal] == Cell(f.right).width[f.normal])) continue;
-      for (GlobalIndex id : {f.left,f.right}) if (id < partition.back()) {
-        if (Quad(id,cache).phase_dependent) return true;
-      }
-    }
-    return false;
+    const auto cell = Cell(row); double volume = 1.;
+    for (int d = 0; d < nd; ++d) volume *= cell.width[d];
+    QuadraticCache cache; RowWorkspace work; bool dependent = false;
+    AssembleRow(row,cell,volume,true,work,cache,nullptr,&dependent);
+    return dependent;
   }
   void DiscoverPhaseRows() {
     if (phase_rows_ready) return;
@@ -563,6 +552,113 @@ struct MeshGeometry::Impl {
       const auto ghost = Ghost(column);
       Add(target,ghost.first,value); Add(target,column,value*ghost.second);
     } else Add(target,column,value);
+  }
+  // Add diagonal Hessians using cheap centered axes where all neighbors are
+  // aligned and equally sized. Only irregular/one-sided cells need a full fit.
+  void AddDiagonal(Row &target, GlobalIndex row, const Vec &weights,
+                   QuadraticCache &cache, bool *phase_dependent) const {
+    const int p = Patch(row); const auto index = Indices(p,row);
+    const auto cell = Cell(p,index);
+    if (phase_dependent && TouchesX(cell)) *phase_dependent = true;
+    bool interior = true, near_plane = false;
+    for (int d = 0; d < nd; ++d)
+      interior = interior && index[d] > 0 && index[d]+1 < patches[p].cells[d];
+    for (double plane : domain.c1_z_interfaces)
+      near_plane = near_plane || std::abs(std::abs(cell.center[2]-plane)-
+                   .5*cell.width[2]) < minwidth[2]*1.e-7;
+    std::array<std::array<GlobalIndex,2>,3> neighbor{};
+    bool regular = !near_plane;
+    if (interior && regular) {
+      for (int d = 0; d < nd; ++d) for (int side = 0; side < 2; ++side) {
+        auto next = index; next[d] += 2*side-1; neighbor[d][side] = Id(p,next);
+      }
+    } else if (regular) {
+      const auto faces = Faces(row);
+      regular = faces.size() == static_cast<size_t>(2*nd);
+      for (const auto &f : faces) {
+        const auto other = f.side > 0 ? f.right : f.left;
+        regular = regular && !HasOffset(f.ti) && !HasOffset(f.tj) && !AtC1Interface(f);
+        if (other < partition.back()) {
+          const auto other_cell = Cell(other);
+          for (int d = 0; d < nd; ++d)
+            regular = regular && std::abs(other_cell.width[d]-cell.width[d]) <
+                                 minwidth[d]*1.e-8;
+        }
+        neighbor[f.normal][f.side > 0 ? 1 : 0] = other;
+      }
+    }
+    if (regular) {
+      for (int d = 0; d < nd; ++d) {
+        const double coefficient = weights[d]/(cell.width[d]*cell.width[d]);
+        AddPotential(target,neighbor[d][0],coefficient);
+        AddPotential(target,neighbor[d][1],coefficient);
+        AddPotential(target,row,-2.*coefficient);
+      }
+    } else {
+      const auto &q = Quad(row,cache);
+      if (phase_dependent && q.phase_dependent) *phase_dependent = true;
+      for (const auto &v : q.coefficients) {
+        double coefficient = 0.; int k = nd;
+        for (int d = 0; d < nd; ++d) for (int t = d; t < nd; ++t) {
+          if (d == t) coefficient += weights[d]*v.second[k]/
+                                     (cell.width[d]*cell.width[d]);
+          ++k;
+        }
+        AddPotential(target,v.first,coefficient);
+      }
+    }
+  }
+  void FacePotential(const Face &face, Row &potential, QuadraticCache &cache,
+                     bool *phase_dependent) const {
+    potential.clear();
+    const GlobalIndex n = partition.back();
+    if (face.left >= n || face.right >= n) {
+      // Mirrored ghost potential is known, or phi_adjacent+h*q in Neumann
+      // mode. The adjacent Hessian supplies the point-to-face-average moments.
+      const auto row = face.left < n ? face.left : face.right;
+      const auto cell = Cell(row);
+      AddPotential(potential,face.left,.5); AddPotential(potential,face.right,.5);
+      Vec weights{};
+      for (int d = 0; d < nd; ++d)
+        weights[d] = d == face.normal ? -.125*cell.width[d]*cell.width[d] :
+                                       face.width[d]*face.width[d]/24.;
+      AddDiagonal(potential,row,weights,cache,phase_dependent);
+      return;
+    }
+    const auto left = Cell(face.left), right = Cell(face.right);
+    const double weight_left = right.width[face.normal]/
+                              (left.width[face.normal]+right.width[face.normal]);
+    const bool transverse = HasOffset(face.ti) || HasOffset(face.tj);
+    auto side = [&](GlobalIndex row, const CompositeCell &cell,
+                    const Vec &offset, double weight) {
+      AddPotential(potential,row,weight);
+      Vec diagonal{};
+      for (int d = 0; d < nd; ++d)
+        diagonal[d] = weight*(d == face.normal ? -.125*cell.width[d]*cell.width[d] :
+                                                face.width[d]*face.width[d]/24.);
+      if (!transverse) {
+        AddDiagonal(potential,row,diagonal,cache,phase_dependent);
+        return;
+      }
+      const auto &q = Quad(row,cache);
+      if (phase_dependent && q.phase_dependent) *phase_dependent = true;
+      Modes moment{};
+      for (int d = 0; d < nd; ++d) moment[d] = weight*offset[d]/cell.width[d];
+      int k = nd;
+      for (int d = 0; d < nd; ++d) for (int t = d; t < nd; ++t) {
+        moment[k] = weight*offset[d]*offset[t]/(cell.width[d]*cell.width[t])*
+                    (d == t ? .5 : 1.);
+        if (d == t) moment[k] += diagonal[d]/(cell.width[d]*cell.width[d]);
+        ++k;
+      }
+      for (const auto &v : q.coefficients) {
+        double coefficient = 0.;
+        for (int i = 0; i < k; ++i) coefficient += moment[i]*v.second[i];
+        AddPotential(potential,v.first,coefficient);
+      }
+    };
+    side(face.left,left,face.ti,weight_left);
+    side(face.right,right,face.tj,1.-weight_left);
   }
   // Full setup and phase refresh deliberately share this exact physical row
   // routine, including canonical faces and all Dirichlet/Neumann LS couplings.
@@ -612,7 +708,11 @@ struct MeshGeometry::Impl {
         // still contribute to the averaged acceleration below. Row IDs alone
         // cannot distinguish the two sides of such a sheared self-face.
         if (f.left != f.right) Add(work.a,v.first,-sign*flux);
-        if (forces) Add(work.g[f.normal],v.first,-flux*ci.width[f.normal]/(2.*volume));
+      }
+      if (forces) {
+        FacePotential(f,work.potential,quadratic_cache,phase_dependent);
+        for (const auto &v : work.potential)
+          Add(work.g[f.normal],v.first,-sign*f.area*v.second/volume);
       }
       const GlobalIndex other = row == f.left ? f.right : f.left;
       if (is_interface && other < partition.back()) {

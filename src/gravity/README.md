@@ -94,8 +94,11 @@ For equal curvatures this accounts for the secant midpoint's displacement from
 the physical face. Separate curvatures also handle a $C^1$ source/vacuum join.
 Both transverse quadratic moments and this normal correction are necessary to
 reproduce general quadratic potentials at a coarse/fine face. Aligned equal-width interior faces retain the
-seven-point stencil. Acceleration uses the area average of the shared normal
-face derivatives; the reconstruction gradient is not used directly as force.
+seven-point potential stencil. Acceleration is the negative volume gradient of
+one shared face-averaged potential per fragment. The face average includes both
+normal interpolation curvature and tangential area moments on every face,
+including aligned bulk faces; regular bulk Hessians use cheap centered axis
+differences. The reconstruction gradient is not used directly as force.
 The wider reconstruction affects setup/phase assembly and CSR halo size, while
 all force applications remain sparse matrix operations. The potential has point
 semantics even though hydro supplies cell-average density; their source
@@ -247,12 +250,13 @@ at 16 and 32 root cells with `rtol=1e-12`. A nonzero slab perturbation retains
 spatial error: its interface force maxima decrease by 3.55 under the same mesh
 doubling. These are static Poisson checks, not hydro momentum acceptance.
 
-The width-weighted face-normal acceleration average does not guarantee
-$\sum_i V_i\mathbf{g}_i=0$ after quadratic interface reconstruction. A periodic
-mixed shearing-wave audit finds a contribution linear in perturbation amplitude,
-and finite-amplitude hydro controls show increased net momentum. Correcting the
-potential operator alone therefore does not establish production momentum
-accuracy; a compatible volume gradient or momentum-flux coupling is required.
+The earlier width-weighted face-normal acceleration average did not preserve
+$\sum_i V_i\mathbf{g}_i=0$ after quadratic interface reconstruction and introduced
+a self-force linear in a wave's amplitude. The shared potential volume gradient
+restores that identity to roundoff for periodic composite meshes. This removes
+the constant-density contribution; it does not make
+$\sum_i\rho_i V_i\mathbf{g}_i$ exactly zero. The remaining density-weighted
+perturbation self-force and nonlinear momentum accuracy require separate checks.
 
 The full-RHS `rtol` does not prescribe relative accuracy of a tiny perturbation.
 However, the review's quoted 0.28% potential error was the total-field difference
