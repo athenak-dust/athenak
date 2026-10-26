@@ -563,10 +563,12 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
   const double begin = ProfileTime(profile_);
   try {
     auto update = geometry_->BuildPhaseUpdate(shear_offset);
+    const double fine_assembled = ProfileTime(profile_);
     std::vector<CsrRowUpdate> a;
     a.reserve(coarse_geometry_.size()+1); a.push_back(std::move(update.matrix));
     for (auto &coarse : coarse_geometry_)
       a.push_back(std::move(coarse->BuildPhaseUpdate(shear_offset,false).matrix));
+    const double coarse_assembled = ProfileTime(profile_);
     std::vector<CsrRowUpdate> p;
     p.reserve(coarse_geometry_.size());
     auto current_domain = solver_domain_;
@@ -598,6 +600,9 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
                 << " assembly_workers=" << geometry_->PhaseThreads()
                 << " phase_threads_config=" << phase_threads_
                 << " assembly_s=" << assembled-begin
+                << " fine_assembly_s=" << fine_assembled-begin
+                << " coarse_assembly_s=" << coarse_assembled-fine_assembled
+                << " prolongation_assembly_s=" << assembled-coarse_assembled
                 << " operators_s=" << ProfileTime(true)-assembled
                 << " value_updates=" << counters.value_updates
                 << " structure_rebuilds=" << counters.structure_rebuilds << '\n';
