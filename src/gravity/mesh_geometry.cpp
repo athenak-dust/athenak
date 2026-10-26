@@ -29,6 +29,7 @@ struct Quadratic {
   std::vector<std::pair<GlobalIndex,Modes>> coefficients;
   bool phase_dependent = false;
   bool interface_fallback = false;
+  bool x_image_fallback = false;
 };
 using QuadraticCache = std::unordered_map<GlobalIndex,Quadratic>;
 struct Box { Vec lo{}, hi{}; };
@@ -423,7 +424,12 @@ struct MeshGeometry::Impl {
     const auto cell = Cell(row);
     std::vector<Sample> samples;
     bool one_sided = !domain.c1_z_interfaces.empty();
+    bool one_sided_x = domain.shear_phase_updates;
+    Quadratic q;
     auto add = [&](GlobalIndex id, const Vec &delta) {
+      const double x = cell.center[0]+delta[0];
+      const bool x_image = x < domain.lo[0] || x >= domain.hi[0];
+      if (one_sided_x && x_image) return;
       if (one_sided) for (double plane : domain.c1_z_interfaces)
         if ((cell.center[2] < plane) != (cell.center[2]+delta[2] < plane)) return;
       double distance = 0.;
@@ -437,10 +443,9 @@ struct MeshGeometry::Impl {
         if (error < 1.e-8) return;
       }
       samples.push_back({id,delta});
+      q.phase_dependent = q.phase_dependent || x_image;
     };
-    Quadratic q;
     auto neighbors = [&](GlobalIndex id, const Vec &offset) {
-      q.phase_dependent = q.phase_dependent || TouchesX(id);
       std::vector<Face> uncached;
       for (const auto &f : CachedReconstructionFaces(id,face_cache,uncached)) {
         const double sign = f.side;
@@ -502,9 +507,22 @@ struct MeshGeometry::Impl {
     bool full_rank = invert();
     // Near a join, find enough same-side normal positions rather than falling
     // back merely because the first two rings were anisotropic or incomplete.
-    for (int ring = 2; !full_rank && one_sided && ring < 4; ++ring) {
+    for (int ring = 2; !full_rank && (one_sided || one_sided_x) && ring < 4; ++ring) {
       expand(first,last); first = last; last = samples.size();
       full_rank = invert();
+    }
+    if (!full_rank && one_sided_x) {
+      // Thin x regions may not determine curvature without periodic images.
+      // Keep the real source/vacuum z filter strict in this fallback.
+      one_sided_x = false; samples.clear(); q.phase_dependent = false;
+      q.x_image_fallback = true;
+      neighbors(row,Vec{}); first = 0; last = samples.size();
+      expand(first,last); first = last; last = samples.size();
+      full_rank = invert();
+      for (int ring = 2; !full_rank && one_sided && ring < 4; ++ring) {
+        expand(first,last); first = last; last = samples.size();
+        full_rank = invert();
+      }
     }
     if (!full_rank && one_sided && coarse_reconstruction) {
       // A coarse region may have only one normal cell, so quadratic curvature
@@ -587,7 +605,6 @@ struct MeshGeometry::Impl {
                    bool *phase_dependent) const {
     const int p = Patch(row); const auto index = Indices(p,row);
     const auto cell = Cell(p,index);
-    if (phase_dependent && TouchesX(cell)) *phase_dependent = true;
     bool interior = true, near_plane = false;
     for (int d = 0; d < nd; ++d)
       interior = interior && index[d] > 0 && index[d]+1 < patches[p].cells[d];
@@ -595,7 +612,7 @@ struct MeshGeometry::Impl {
       near_plane = near_plane || std::abs(std::abs(cell.center[2]-plane)-
                    .5*cell.width[2]) < minwidth[2]*1.e-7;
     std::array<std::array<GlobalIndex,2>,3> neighbor{};
-    bool regular = !near_plane;
+    bool regular = !near_plane && !(domain.shear_phase_updates && TouchesX(cell));
     if (interior && regular) {
       for (int d = 0; d < nd; ++d) for (int side = 0; side < 2; ++side) {
         auto next = index; next[d] += 2*side-1; neighbor[d][side] = Id(p,next);
@@ -703,7 +720,9 @@ struct MeshGeometry::Impl {
       AddPotential(work.difference,f.right,1.); AddPotential(work.difference,f.left,-1.);
       if (f.left < partition.back() && f.right < partition.back()) {
         const auto left = Cell(f.left), right = Cell(f.right);
-        if (HasOffset(f.ti) || HasOffset(f.tj) || AtC1Interface(f) ||
+        const bool c1 = AtC1Interface(f);
+        const double shift = .25*(left.width[f.normal]-right.width[f.normal]);
+        if (HasOffset(f.ti) || HasOffset(f.tj) || c1 ||
             left.width[f.normal] != right.width[f.normal]) {
           auto reconstruct = [&](GlobalIndex id, const CompositeCell &cell,
                                  const Vec &offset, double sign) {
@@ -715,10 +734,12 @@ struct MeshGeometry::Impl {
             for (int d = 0; d < nd; ++d) for (int t = d; t < nd; ++t) {
               moment[k] = sign*offset[d]*offset[t]/(cell.width[d]*cell.width[t])*
                           (d == t ? .5 : 1.);
-              // Separate one-sided curvatures also handle a C1 source/vacuum
-              // join: derivative correction is (hL^2 HL-hR^2 HR)/(8d).
-              if (d == f.normal && t == d)
-                moment[k] -= sign*.125;
+              if (d == f.normal && t == d) {
+                // Real C1 joins need separate curvatures. Smooth equal-width
+                // shear faces need a correction that vanishes with alignment.
+                if (c1) moment[k] -= sign*.125;
+                else moment[k] += .5*f.distance*shift/(cell.width[d]*cell.width[d]);
+              }
               ++k;
             }
             for (const auto &v : q.coefficients) {
@@ -1001,6 +1022,8 @@ MeshGeometry::MeshGeometry(std::vector<GravityPatch> patches,
   m.shear = std::fmod(static_cast<double>(domain.shear_offset),m.length[1]);
   if (!std::isfinite(m.shear)) throw std::invalid_argument("Gravity nonfinite shear");
   if (m.shear < 0.) m.shear += m.length[1];
+  if (!domain.shear_phase_updates && m.shear != 0.)
+    throw std::invalid_argument("Gravity ordinary-periodic geometry requires zero shear");
   m.partition.assign(nranks+1,0); m.sample_partition.assign(nranks+1,0);
   m.sample_begin.resize(m.patches.size());
   for (size_t p = 0; p < m.patches.size(); ++p) {
@@ -1172,8 +1195,10 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   }
   // Gradient maps are assembly scratch, and must not survive alongside device CSR.
   m.gradients.clear(); m.gradients.rehash(0);
-  for (const auto &q : m.quadratics)
+  for (const auto &q : m.quadratics) {
     out.quadratic_interface_fallbacks += q.second.interface_fallback;
+    out.quadratic_x_image_fallbacks += q.second.x_image_fallback;
+  }
   m.quadratics.clear(); m.quadratics.rehash(0);
   m.reconstruction_faces = ReconstructionFaces{};
   return out;
@@ -1209,6 +1234,8 @@ LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase, bool forces) {
   double shear = std::fmod(static_cast<double>(phase),m.length[1]);
   if (!std::isfinite(shear)) throw std::invalid_argument("Gravity nonfinite shear phase");
   if (shear < 0.) shear += m.length[1];
+  if (!m.domain.shear_phase_updates && shear != 0.)
+    throw std::invalid_argument("Gravity phase updates are disabled for ordinary periodic x");
   m.shear = shear; m.domain.shear_offset = phase;
   const int workers = std::max(1,PhaseThreads());
   if (m.phase_contexts.size() != static_cast<size_t>(workers)) {

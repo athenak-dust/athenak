@@ -49,6 +49,7 @@ struct LocalCompositeSystem {
   // Unique local coarse fits that lacked a full-rank one-sided quadratic and
   // used a two-sided fit. This fallback is forbidden on the physical fine mesh.
   std::size_t quadratic_interface_fallbacks = 0;
+  std::size_t quadratic_x_image_fallbacks = 0;
 };
 
 // Compact replacements for the same stable local row list in every component.

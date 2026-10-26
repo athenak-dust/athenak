@@ -88,10 +88,13 @@ This is conservation of Poisson/Gauss flux, not a claim of exact total momentum
 conservation of the coupled AMR scheme.
 At offset or unequal-width faces, a scaled quadratic least-squares fit on two
 face-neighbor rings brings the potentials to the fragment's transverse centroid.
-The shared center-to-center secant is corrected by
+Away from real curvature jumps, the shared center-to-center secant is corrected
+by $(h_L-h_R)(\phi_{nn,L}+\phi_{nn,R})/8$.
+At a real $C^1$ source/vacuum join it instead uses
 $(h_L^2\phi_{nn,L}-h_R^2\phi_{nn,R})/(8d)$, where $d=(h_L+h_R)/2$.
-For equal curvatures this accounts for the secant midpoint's displacement from
-the physical face. Separate curvatures also handle a $C^1$ source/vacuum join.
+The smooth correction vanishes for equal widths. Applying separate curvatures
+only when an equal-width shear face is offset would leave a finite operator
+jump as the offset tends to zero; the two formulas avoid that discontinuity.
 Both transverse quadratic moments and this normal correction are necessary to
 reproduce general quadratic potentials at a coarse/fine face. Aligned equal-width interior faces retain the
 seven-point potential stencil. Acceleration is the negative volume gradient of
@@ -113,6 +116,18 @@ two-sided fit when a region has too few normal cells; this is a lower-order
 preconditioner approximation, counted in `quadratic_interface_fallbacks` and the
 setup profile. Constant and shared-flux identities still hold for that fallback.
 Phase dependencies include every neighborhood traversed by an expanded fit.
+
+`CompositeDomain::shear_phase_updates` is an explicit capability, defaulting to
+true for generic geometry callers that may advance from phase zero. Both fluid
+adapters set it from the actual x boundary. With this capability, quadratic fits
+first stay on the anchor's physical x side, including at phase zero, so their
+coefficients can be reused across phase changes. If that fit remains rank
+deficient after four rings, x images are permitted while retaining the fine
+source/vacuum z filter. Only accepted x-image samples mark a fit as phase
+dependent. Fine x-image fallbacks are counted separately from coarse C1 fallback.
+Ordinary-periodic geometry disables the capability, retains centered periodic
+Hessians and rejects nonzero shear updates. This stencil choice changes
+higher-order errors; it is separate from exact geometry-cache optimization.
 
 The matrix is the **negative integrated Laplacian**, so the physical right-hand
 side is $-4\pi G\rho V$. Periodic solves subtract the volume-weighted density mean

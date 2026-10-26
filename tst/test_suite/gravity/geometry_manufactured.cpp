@@ -239,7 +239,8 @@ void PiecewiseVacuum() {
     }
   }
   std::cout << "piecewise vacuum A=" << error << " G=" << force << '\n';
-  Require(error < 2.e-9 && force < 2.e-11 && s.quadratic_interface_fallbacks == 0,
+  Require(error < 2.e-9 && force < 2.e-11 && s.quadratic_interface_fallbacks == 0 &&
+          s.quadratic_x_image_fallbacks == 0,
           "piecewise vacuum quadratic reproduction failed");
   ConstantsAndFlux(s,true);
 }
@@ -247,14 +248,16 @@ void CoarseC1Fallback() {
   auto d = Domain(2,3,true); d.c1_z_interfaces = {.5};
   MeshGeometry coarse(Patches(2,3,false),d,0,1,true,true);
   const auto system = coarse.BuildSystem();
-  Require(system.quadratic_interface_fallbacks > 0,"thin coarse C1 fallback was not counted");
+  Require(system.quadratic_interface_fallbacks > 0 && system.quadratic_x_image_fallbacks > 0,
+          "thin coarse reconstruction fallback was not counted");
   ConstantsAndFlux(system,true);
   bool rejected = false;
   try {
     MeshGeometry fine(Patches(2,3,false),d,0,1,true); fine.BuildSystem();
   } catch (const std::runtime_error &) { rejected = true; }
   Require(rejected,"rank-deficient fine one-sided reconstruction silently fell back");
-  std::cout << "counted coarse C1 fallbacks=" << system.quadratic_interface_fallbacks << '\n';
+  std::cout << "counted coarse C1 fallbacks=" << system.quadratic_interface_fallbacks
+            << " x-image fallbacks=" << system.quadratic_x_image_fallbacks << '\n';
 }
 void VirtualImages() {
   auto d = Domain(8,3,true); d.shear_offset = .137;
@@ -269,6 +272,74 @@ void VirtualImages() {
   geometry.VirtualAverage({0.,.25,.25},{.0625,.3125,.3125},&images,&shear);
   Require(images && shear,"recursive x image was not marked as a shear dependency");
   std::cout << "virtual-average x/y/z and recursive shear dependency checks passed\n";
+}
+void OrdinaryPeriodicTranslation() {
+  auto d = Domain(16,2,false); d.shear_phase_updates = false;
+  MeshGeometry geometry(Patches(16,2,false),d,0,1); const auto s = geometry.BuildSystem();
+  std::vector<double> phi(s.cells.size()), shifted(phi.size());
+  std::vector<GlobalIndex> partner(phi.size());
+  for (size_t i = 0; i < phi.size(); ++i) {
+    const auto x = s.cells[i].center;
+    phi[i] = std::sin(7.1*x[0]+3.7*x[1]+5.3*x[0]*x[1]);
+    auto point = x; point[0] += 1./16.; partner[i] = geometry.Locate(point);
+  }
+  for (size_t i = 0; i < phi.size(); ++i) shifted[i] = phi[partner[i]];
+  double error = 0.;
+  for (size_t i = 0; i < phi.size(); ++i) {
+    error = std::max(error,std::abs(Apply(s.matrix,i,shifted)-Apply(s.matrix,partner[i],phi)));
+    for (int q = 0; q < 2; ++q)
+      error = std::max(error,std::abs(Apply(s.acceleration[q],i,shifted)-
+                                     Apply(s.acceleration[q],partner[i],phi)));
+  }
+  bool rejected = false;
+  try { geometry.BuildPhaseUpdate(.01); } catch (const std::invalid_argument &) { rejected = true; }
+  Require(error < 2.e-12 && rejected,"ordinary periodic translation/capability failed");
+  std::cout << "ordinary periodic translation max_error=" << error << '\n';
+}
+void PhaseContinuity(bool mixed, bool isolated) {
+  auto d = Domain(8,3,isolated);
+  if (isolated) d.c1_z_interfaces = {.25,.75};
+  auto sample = [&](double phase) {
+    d.shear_offset = phase;
+    MeshGeometry geometry(Patches(8,3,mixed),d,0,1,isolated);
+    const auto s = geometry.BuildSystem();
+    std::vector<double> phi(s.cells.size()), boundary(s.boundary_samples.size());
+    for (size_t i = 0; i < phi.size(); ++i) {
+      const auto x = s.cells[i].center;
+      phi[i] = std::sin(2*M_PI*x[0]+.37)*std::cos(2*M_PI*x[1]+.21)+
+               .13*std::cos(4*M_PI*x[2]+.11);
+    }
+    for (size_t i = 0; i < boundary.size(); ++i) {
+      const auto &b = s.boundary_samples[i];
+      const double wall = b.center[2]-b.side*.5*s.boundary_width[i];
+      boundary[i] = b.side*(-.52*M_PI*std::sin(4*M_PI*wall+.11));
+    }
+    std::array<std::vector<double>,4> values;
+    for (auto &v : values) v.resize(phi.size());
+    for (size_t i = 0; i < phi.size(); ++i) {
+      values[0][i] = Apply(s.matrix,i,phi)-Apply(s.boundary_rhs,i,boundary);
+      for (int q = 0; q < 3; ++q)
+        values[q+1][i] = Apply(s.acceleration[q],i,phi)+
+                         Apply(s.boundary_acceleration[q],i,boundary);
+    }
+    return values;
+  };
+  for (double center : {0.,1./8.}) {
+    const auto exact = sample(center);
+    double previous = 1.e100;
+    for (double epsilon : {1.e-6,1.e-8,1.e-10}) {
+      double error = 0.;
+      for (double sign : {-1.,1.}) {
+        const auto shifted = sample(center+sign*epsilon);
+        for (int q = 0; q < 4; ++q) for (size_t i = 0; i < exact[q].size(); ++i)
+          error = std::max(error,std::abs(shifted[q][i]-exact[q][i]));
+      }
+      std::cout << "phase continuity mixed=" << mixed << " isolated=" << isolated
+                << " center=" << center << " epsilon=" << epsilon << " error=" << error << '\n';
+      Require(error < previous*.05+5.e-10,"A/G has a finite jump at an aligned shear phase");
+      previous = error;
+    }
+  }
 }
 void Reference(bool isolated) {
   auto d = Domain(8,3,isolated); d.shear_offset = .137;
@@ -311,6 +382,8 @@ int main() {
   Reference(false); Reference(true);
   PiecewiseVacuum(); CoarseC1Fallback();
   VirtualImages();
+  OrdinaryPeriodicTranslation();
+  PhaseContinuity(false,false); PhaseContinuity(true,false); PhaseContinuity(true,true);
   E3Multilevel({1.,1.,1.}); E3Multilevel({.2,.2,.4});
   std::cout << "gravity geometry checks passed\n";
 }

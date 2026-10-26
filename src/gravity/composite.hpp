@@ -28,6 +28,10 @@ struct CompositeDomain {
   // but curvature may jump. Vacuum extension records the physical source-box
   // walls here. Reconstruction must not fit across these planes.
   std::vector<Real> c1_z_interfaces;
+  // Generic geometry callers may update shear from phase zero. A fluid adapter
+  // explicitly disables this capability for ordinary periodic x boundaries.
+  // Capable geometries use phase-independent one-sided x reconstruction.
+  bool shear_phase_updates = true;
 };
 
 struct BoundarySample {

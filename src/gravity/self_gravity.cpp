@@ -244,6 +244,7 @@ void SelfGravity::Rebuild(Real shear_offset) {
   domain.root_counts = {pm->mesh_indcs.nx1, pm->mesh_indcs.nx2, pm->mesh_indcs.nx3};
   domain.shear_offset = shear_offset;
   domain.isolated_z = vertical_bc_ == "isolated";
+  domain.shear_phase_updates = pm->mesh_bcs[0] == BoundaryFlag::shear_periodic;
   const int mbnc[3] = {ind.nx1, ind.nx2, ind.nx3};
   std::vector<CompositeCell> cells(n);
   for (int m = 0; m < pm->nmb_total; ++m) {
@@ -395,6 +396,7 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
   domain.root_counts = {pm->mesh_indcs.nx1,pm->mesh_indcs.nx2,pm->mesh_indcs.nx3};
   domain.shear_offset = shear_offset;
   domain.isolated_z = vertical_bc_ == "isolated";
+  domain.shear_phase_updates = pm->mesh_bcs[0] == BoundaryFlag::shear_periodic;
   std::vector<GravityPatch> patches(pm->nmb_total);
   const int counts[3] = {ind.nx1,ind.nx2,ind.nx3};
   for (int m = 0; m < pm->nmb_total; ++m) {
