@@ -916,6 +916,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     DustNSH(pin, is_restart);
   } else if (pgen_fun_name.compare("dust_gravity_transfer") == 0) {
     DustGravityTransfer(pin, is_restart);
+  } else if (pgen_fun_name.compare("dust_jeans") == 0) {
+    DustJeans(pin, is_restart);
   } else if (pgen_fun_name.compare("dusty_wave") == 0) {
     DustyWave(pin, is_restart);
   } else if (pgen_fun_name.compare("linear_wave") == 0) {
