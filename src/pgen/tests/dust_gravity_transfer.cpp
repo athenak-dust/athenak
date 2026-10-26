@@ -78,6 +78,16 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
   Kokkos::deep_copy(pr,particles->prtcl_rdata);
   const auto original_particles=pr;
   auto codes=Kokkos::create_mirror_view_and_copy(HostMemSpace(),particles->prtcl_idata);
+  Real assignment_wall_particles=0;
+  if (dust->PointGravityTransferSupported() &&
+      pm->mesh_bcs[BoundaryFace::inner_x3]!=BoundaryFlag::periodic) {
+    for (int p=0;p<npart;++p) if (pr(IPM,p)>0) {
+      const auto s=pack->pmb->mb_size.h_view(codes(PGID,p)-pack->gids);
+      if (pr(IPZ,p)<pm->mesh_size.x3min+s.dx3 ||
+          pr(IPZ,p)>pm->mesh_size.x3max-s.dx3) ++assignment_wall_particles;
+    }
+    Sum(&assignment_wall_particles,1);
+  }
   Real shapes[4]={0,0,0,0};
   for (int p=0;p<npart;++p) if (clouds && pr(IPM,p)>0) {
     const int code=codes(PLEV,p);
@@ -217,6 +227,7 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
       <<",\"diagnostic_density_checked\":"<<((clouds && time==pm->time) ? "true" : "false")
       <<",\"native_tsc_checked\":"<<(native_tsc ? "true" : "false")
       <<",\"native_tsc_density_error\":"<<native_error
+      <<",\"point_assignment_wall_particles\":"<<assignment_wall_particles
       <<",\"representation\":\""<<(clouds ? "refinable_cloud" : "owner_grid_tsc")<<"\""
       <<",\"diagnostic_shape_sweep\":"<<(shape_sweep ? "true" : "false")
       <<",\"shape_counts_plain_x1_x2_x3\":["<<shapes[0]<<','<<shapes[1]<<','
@@ -229,6 +240,16 @@ void ProblemGenerator::DustGravityTransfer(ParameterInput *pin,const bool restar
   auto *pack=pmy_mesh_->pmb_pack;
   Require(pack->pdust!=nullptr && pack->pdust->GravityTransferSupported(),
           "requires a supported 3D cloud or TSC point initializer");
+  if (!restart && pin->GetOrAddBoolean("problem","gravity_test_mass_modulation",false)) {
+    Require(pack->pdust->PointGravityTransferSupported(),"mass-modulation fixture requires points");
+    auto pr=pack->ppart->prtcl_rdata;
+    auto pi=pack->ppart->prtcl_idata;
+    Kokkos::parallel_for("gravity_test_unequal_particle_masses",
+      Kokkos::RangePolicy<DevExeSpace>(0,pack->ppart->nprtcl_thispack),KOKKOS_LAMBDA(int p) {
+        const unsigned int tag=static_cast<unsigned int>(pi(PTAG,p));
+        pr(IPM,p)*=.5+1.5*static_cast<Real>(tag%17)/17;
+      });
+  }
   const int empty=pin->GetOrAddInteger("problem","gravity_test_empty_rank",-1);
   if (!restart && empty>=0) {
     Require(empty<global_variable::nranks,"empty rank outside communicator");
