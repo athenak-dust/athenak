@@ -66,6 +66,7 @@ add_executable(
         dust/dust_cloud3d.cpp
         dust/dust_imex3d.cpp
         dust/dust_gravity.cpp
+        dust/dust_gravity_points.cpp
         dust/dust_halo.cpp
         dust/dust_amr.cpp
         dust/dust_restart.cpp

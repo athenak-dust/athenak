@@ -77,7 +77,10 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   }
   coupled_dust_ = pack->pdust != nullptr;
   if (coupled_dust_ && !pack->pdust->GravityTransferSupported())
-    Fail("dust gravity currently requires supported 3D refinable clouds");
+    Fail("dust gravity requires supported 3D refinable clouds, uniform TSC, or owner_overlap TSC");
+  if (coupled_dust_ && pack->pdust->PointGravityTransferSupported() &&
+      pin->GetOrAddString("gravity","dust_x3_assignment","fold")!="fold")
+    Fail("point gravity/dust_x3_assignment supports fold only; drag deposit policy is independent");
   if (pin->GetOrAddString("gravity", "solver", "multigrid") != "multigrid") {
     Fail("solver must be multigrid");
   }
@@ -87,12 +90,13 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   }
   if (evolution == "dynamic") {
     const auto integrator = pin->GetOrAddString("time", "integrator", "rk2");
-    const bool cloud_imex = coupled_dust_ && integrator == "imex2+" &&
-        pack->pdust->Clouds3D() && pack->pdust->coupling == DustCoupling::imex &&
+    const bool dust_imex = coupled_dust_ && integrator == "imex2+" &&
+        (pack->pdust->Clouds3D() || pack->pdust->PointGravityTransferSupported()) &&
+        pack->pdust->coupling == DustCoupling::imex &&
         pack->pdust->drag_solver == DustDragSolver::local;
-    if (integrator != "rk1" && integrator != "rk2" && integrator != "rk3" && !cloud_imex) {
+    if (integrator != "rk1" && integrator != "rk2" && integrator != "rk3" && !dust_imex) {
       Fail("gravity half-kicks support rk1/rk2/rk3, or imex2+ with supported "
-           "3D refinable-cloud local dust drag");
+           "3D cloud or TSC point local dust drag");
     }
   }
   auto *orbital = pack->phydro->porb_u;

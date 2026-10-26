@@ -1284,6 +1284,7 @@ struct DustGasDragTaskIDs {
 };
 
 namespace dust {
+struct GravityPointTransfer;
 
 // 2026-10-20 cleanup: a key whose option was removed.  An input or
 // restart file that still writes it is accepted when the value asks for the behaviour that
@@ -1839,6 +1840,12 @@ class DustGasDrag {
   // velocity reconstruction. Fields contain owned active leaves; halo exchange
   // is performed internally at the explicitly supplied geometry time.
   bool GravityTransferSupported() const;
+  bool PointGravityTransferSupported() const;
+  void PreparePointGravity(Real geometry_time);
+  void DepositPointGravityDensity(Real geometry_time, DvceArray5D<Real> &owned_density);
+  void GatherPointGravityAcceleration(Real geometry_time,
+                                     const DvceArray5D<Real> &owned_acceleration,
+                                     DvceArray2D<Real> &particle_acceleration);
   void DepositGravityDensity(Real geometry_time, DvceArray5D<Real> &owned_density);
   void GatherGravityAcceleration(Real geometry_time,
                                 const DvceArray5D<Real> &owned_acceleration,
@@ -2004,6 +2011,7 @@ class DustGasDrag {
 
  private:
   DvceArray5D<Real> gravity_density_halo_, gravity_acceleration_halo_;
+  std::shared_ptr<GravityPointTransfer> gravity_points_;
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this DustGasDrag
 };
 

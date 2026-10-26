@@ -49,6 +49,8 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
   const int nmb=pack->nmb_thispack,npart=particles->nprtcl_thispack;
   const Real time=pin->GetOrAddReal("problem","gravity_test_time",pm->time);
   const bool shape_sweep=pin->GetOrAddBoolean("problem","gravity_test_shape_sweep",false);
+  const bool clouds=dust->Clouds3D();
+  Require(!shape_sweep || clouds,"shape sweep requires refinable clouds, not point TSC");
   auto original_codes=Kokkos::create_mirror(particles->prtcl_idata);
   Kokkos::deep_copy(original_codes,particles->prtcl_idata);
   if (shape_sweep) {
@@ -77,7 +79,7 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
   const auto original_particles=pr;
   auto codes=Kokkos::create_mirror_view_and_copy(HostMemSpace(),particles->prtcl_idata);
   Real shapes[4]={0,0,0,0};
-  for (int p=0;p<npart;++p) if (pr(IPM,p)>0) {
+  for (int p=0;p<npart;++p) if (clouds && pr(IPM,p)>0) {
     const int code=codes(PLEV,p);
     const bool l1=::SMRCompositeTransfer::CloudLobe1(code)!=0;
     const bool l2=::SMRCompositeTransfer::CloudLobe2(code)!=0;
@@ -125,10 +127,51 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
     adjoint_error=std::max(adjoint_error,std::abs(inner[d]-inner[3+d])/(1+std::abs(inner[d])));
   Require(adjoint_error<1.e-10,"mass-weighted deposition/gather identity");
 
+  // Uniform periodic control against the established native ghost-deposit exchange.
+  // It shares only the canonical TSC stencil, not the new remap or communication.
+  const bool native_tsc=pin->GetOrAddBoolean("problem","gravity_test_native_tsc",false);
+  Real native_error=0;
+  if (native_tsc) {
+    Require(!clouds && !pm->multilevel && pm->strictly_periodic && !dust->pbval_qp->General(),
+            "native TSC control requires uniform periodic point dust with native deposit exchange");
+    DvceArray5D<Real> reference("gravity_native_tsc_control",nmb,1,
+                              density.extent(2),density.extent(3),density.extent(4));
+    Kokkos::deep_copy(reference,0.0);
+    auto particle=particles->prtcl_rdata;
+    auto ids=particles->prtcl_idata;
+    auto sizes=pack->pmb->mb_size.d_view;
+    const int gids=pack->gids;
+    Kokkos::parallel_for("gravity_native_tsc_deposit",Kokkos::RangePolicy<DevExeSpace>(0,npart),
+      KOKKOS_LAMBDA(int p) {
+        if (particle(IPM,p)==0) return;
+        const int b=ids(PGID,p)-gids;
+        const auto s=sizes(b);
+        int ip,jp,kp; Real wx[3],wy[3],wz[3];
+        dust::PMWeights(particle(IPX,p),s.x1min,s.x1max,ind.nx1,ind.is,2,ip,wx);
+        dust::PMWeights(particle(IPY,p),s.x2min,s.x2max,ind.nx2,ind.js,2,jp,wy);
+        dust::PMWeights(particle(IPZ,p),s.x3min,s.x3max,ind.nx3,ind.ks,2,kp,wz);
+        const Real rd=particle(IPM,p)/(s.dx1*s.dx2*s.dx3);
+        for (int c=0;c<3;++c) for (int j=0;j<3;++j) for (int i=0;i<3;++i)
+          dust::DepositAdd(&reference(b,0,kp+c-1,jp+j-1,ip+i-1),rd*wz[c]*wy[j]*wx[i]);
+      });
+    dust->pbval_qp->InitRecvDep(1);
+    dust->pbval_qp->PackAndSendDeposit(reference);
+    while (dust->pbval_qp->RecvAndSumDeposit(reference)!=TaskStatus::complete) {}
+    dust->pbval_qp->ClearSendDep();
+    dust->pbval_qp->ClearRecvDep();
+    auto native=Kokkos::create_mirror_view_and_copy(HostMemSpace(),reference);
+    for (int b=0;b<nmb;++b) for (int k=ind.ks;k<=ind.ke;++k)
+      for (int j=ind.js;j<=ind.je;++j) for (int i=ind.is;i<=ind.ie;++i)
+        native_error=std::max(native_error,std::abs(native(b,0,k,j,i)-rho(b,0,k,j,i))/
+                                         (1+std::abs(rho(b,0,k,j,i))));
+    native_error=Maximum(native_error);
+    Require(native_error<1.e-10,"uniform TSC differs from native periodic deposit");
+  }
+
   // A distinct existing diagnostic deposit provides a useful owned/halo and
   // channel-layout control at the actual particle time, where it is defined.
   Real old_density_error=0;
-  if (time==pm->time) {
+  if (clouds && time==pm->time) {
     DvceArray5D<Real> reference;
     dust->DepositCloudDensity3D(reference);
     auto old=Kokkos::create_mirror_view_and_copy(HostMemSpace(),reference);
@@ -171,6 +214,10 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
       <<",\"mass_error\":"<<mass_error<<",\"adjoint_error\":"<<adjoint_error
       <<",\"constant_error\":"<<constant_error<<",\"kick_error\":"<<kick_error
       <<",\"diagnostic_density_error\":"<<old_density_error
+      <<",\"diagnostic_density_checked\":"<<((clouds && time==pm->time) ? "true" : "false")
+      <<",\"native_tsc_checked\":"<<(native_tsc ? "true" : "false")
+      <<",\"native_tsc_density_error\":"<<native_error
+      <<",\"representation\":\""<<(clouds ? "refinable_cloud" : "owner_grid_tsc")<<"\""
       <<",\"diagnostic_shape_sweep\":"<<(shape_sweep ? "true" : "false")
       <<",\"shape_counts_plain_x1_x2_x3\":["<<shapes[0]<<','<<shapes[1]<<','
       <<shapes[2]<<','<<shapes[3]<<"],\"passed\":true}\n";
@@ -181,7 +228,7 @@ void ProblemGenerator::DustGravityTransfer(ParameterInput *pin,const bool restar
   DustNSH(pin,restart);
   auto *pack=pmy_mesh_->pmb_pack;
   Require(pack->pdust!=nullptr && pack->pdust->GravityTransferSupported(),
-          "requires the 3D refinable-cloud initializer");
+          "requires a supported 3D cloud or TSC point initializer");
   const int empty=pin->GetOrAddInteger("problem","gravity_test_empty_rank",-1);
   if (!restart && empty>=0) {
     Require(empty<global_variable::nranks,"empty rank outside communicator");

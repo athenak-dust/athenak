@@ -38,12 +38,13 @@ void ResizeField(DvceArray5D<Real> &field, const char *name, int blocks,
 }  // namespace
 
 bool DustGasDrag::GravityTransferSupported() const {
-  return clouds3d && pmy_pack->pmesh->three_d &&
+  return PointGravityTransferSupported() || (clouds3d && pmy_pack->pmesh->three_d &&
       smr_transfer_mode==DustSMRTransfer::refinable_cloud &&
-      (pmy_pack->pmesh->mesh_bcs[0]!=BoundaryFlag::shear_periodic || shear3d);
+      (pmy_pack->pmesh->mesh_bcs[0]!=BoundaryFlag::shear_periodic || shear3d));
 }
 
 void DustGasDrag::DepositGravityDensity(Real time, DvceArray5D<Real> &owned) {
+  if (PointGravityTransferSupported()) {DepositPointGravityDensity(time,owned);return;}
   if (!GravityTransferSupported() || !std::isfinite(time))
     GravityTransferFail("requires 3D refinable clouds and a finite geometry time");
   UpdateShear3D(time);
@@ -91,6 +92,9 @@ void DustGasDrag::DepositGravityDensity(Real time, DvceArray5D<Real> &owned) {
 
 void DustGasDrag::GatherGravityAcceleration(Real time,
     const DvceArray5D<Real> &owned,DvceArray2D<Real> &particle_acceleration) {
+  if (PointGravityTransferSupported()) {
+    GatherPointGravityAcceleration(time,owned,particle_acceleration);return;
+  }
   if (!GravityTransferSupported() || !std::isfinite(time))
     GravityTransferFail("requires 3D refinable clouds and a finite geometry time");
   UpdateShear3D(time);
