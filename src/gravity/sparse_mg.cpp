@@ -18,6 +18,45 @@ namespace {
 using Vector = DvceArray1D<Real>;
 using Indices = DvceArray1D<int>;
 
+// LASSQ representation: ||x|| = scale*sqrt(squares), without squaring an
+// unscaled component. A negative scale propagates any NaN/Inf collectively.
+// Empty MPI ranks contribute the identity (0,0).
+struct ScaledSquares {
+  Real scale, squares;
+  KOKKOS_INLINE_FUNCTION void Join(const ScaledSquares &b) {
+    if (scale < 0 || b.scale < 0) { scale = -1; squares = 0; return; }
+    if (b.scale == 0) return;
+    if (scale < b.scale) {
+      const Real ratio = scale/b.scale;
+      squares = b.squares+squares*ratio*ratio;
+      scale = b.scale;
+    } else {
+      const Real ratio = b.scale/scale;
+      squares += b.squares*ratio*ratio;
+    }
+  }
+};
+static_assert(sizeof(ScaledSquares) == 2*sizeof(Real),"MPI norm pair layout");
+struct NormReduction {
+  using value_type = ScaledSquares;
+  Vector x;
+  KOKKOS_INLINE_FUNCTION void init(value_type &s) const { s = {0,0}; }
+  KOKKOS_INLINE_FUNCTION void join(value_type &a, const value_type &b) const {
+    a.Join(b);
+  }
+  KOKKOS_INLINE_FUNCTION void operator()(int i, value_type &s) const {
+    const Real a = fabs(x(i));
+    s.Join({a <= std::numeric_limits<Real>::max() ? a : Real(-1),1});
+  }
+};
+#if MPI_PARALLEL_ENABLED
+void MergeScaledSquares(void *input, void *inout, int *length, MPI_Datatype *) {
+  auto a = static_cast<ScaledSquares *>(input);
+  auto b = static_cast<ScaledSquares *>(inout);
+  for (int i = 0; i < *length; ++i) b[i].Join(a[i]);
+}
+#endif
+
 template <typename T>
 DvceArray1D<T> DeviceCopy(const std::vector<T> &data, const char *name) {
   DvceArray1D<T> result(std::string(name), data.size());
@@ -148,7 +187,7 @@ struct SparseMultigrid::Impl {
   FineOperatorStats fine_updates;
   // FGMRES storage belongs to the hierarchy and is reused across solves. Each solve
   // still copies and projects its CURRENT rhs and recomputes the true residual.
-  Vector krylov_b, krylov_r, krylov_w;
+  Vector krylov_b, krylov_r, krylov_w, krylov_x;
   std::vector<Vector> krylov_v, krylov_z;
   std::vector<Real> krylov_h, krylov_cosine, krylov_sine, krylov_g, krylov_y;
   int krylov_restart = 0;
@@ -157,6 +196,8 @@ struct SparseMultigrid::Impl {
   int matrix_applications = 0, vcycles = 0;
 #if MPI_PARALLEL_ENABLED
   MPI_Comm comm = MPI_COMM_NULL;
+  mutable MPI_Datatype norm_type = MPI_DATATYPE_NULL;
+  mutable MPI_Op norm_op = MPI_OP_NULL;
 #endif
   // Only rank zero stores and solves the tiny dense coarse problem.
   std::vector<Real> coarse_lu, coarse_rhs;
@@ -201,6 +242,8 @@ struct SparseMultigrid::Impl {
 #if MPI_PARALLEL_ENABLED
     int finalized = 0;
     MPI_Finalized(&finalized);
+    if (!finalized && norm_op != MPI_OP_NULL) MPI_Op_free(&norm_op);
+    if (!finalized && norm_type != MPI_DATATYPE_NULL) MPI_Type_free(&norm_type);
     if (!finalized && comm != MPI_COMM_NULL) MPI_Comm_free(&comm);
 #endif
   }
@@ -887,7 +930,26 @@ struct SparseMultigrid::Impl {
     return Sum(result);
   }
 
-  Real Norm(const Vector &x) const { return std::sqrt(Dot(x, x)); }
+  ScaledSquares NormData(const Vector &x) const {
+    ScaledSquares result;
+    Kokkos::parallel_reduce("gravity_safe_norm",
+        Kokkos::RangePolicy<DevExeSpace>(0,x.extent_int(0)),NormReduction{x},result);
+#if MPI_PARALLEL_ENABLED
+    if (norm_type == MPI_DATATYPE_NULL) {
+      MPI_Type_contiguous(2,MPI_ATHENA_REAL,&norm_type);
+      MPI_Type_commit(&norm_type);
+      MPI_Op_create(MergeScaledSquares,1,&norm_op);
+    }
+    MPI_Allreduce(MPI_IN_PLACE,&result,1,norm_type,norm_op,comm);
+#endif
+    return result;
+  }
+
+  Real Norm(const Vector &x) const {
+    const auto s = NormData(x);
+    return s.scale < 0 ? std::numeric_limits<Real>::infinity()
+                       : s.scale*std::sqrt(s.squares);
+  }
 
   Real Project(const Vector &x, GlobalIndex global_size) const {
     if (!nullspace) return 0;
@@ -993,11 +1055,11 @@ struct SparseMultigrid::Impl {
     ++vcycles;
   }
 
-  SolveStats Solve(const Vector &rhs, const Vector &x, Real tolerance,
+  SolveStats Solve(const Vector &rhs, const Vector &solution, Real tolerance,
                    int max_iterations, int restart) {
     const int n = levels[0].a.rows;
     const GlobalIndex global_n = levels[0].partition.back();
-    if (rhs.extent_int(0) != n || x.extent_int(0) != n || !(tolerance > 0)
+    if (rhs.extent_int(0) != n || solution.extent_int(0) != n || !(tolerance > 0)
         || !std::isfinite(tolerance) || max_iterations < 0 || restart < 1) {
       throw std::runtime_error("self-gravity: invalid FGMRES arguments");
     }
@@ -1008,6 +1070,7 @@ struct SparseMultigrid::Impl {
       krylov_b = Vector("gravity_krylov_rhs", n);
       krylov_r = Vector("gravity_krylov_residual", n);
       krylov_w = Vector("gravity_krylov_work", n);
+      krylov_x = Vector("gravity_krylov_solution", n);
       krylov_v.clear();
       krylov_z.clear();
       for (int j = 0; j <= m; ++j) krylov_v.emplace_back("gravity_arnoldi", n);
@@ -1019,7 +1082,7 @@ struct SparseMultigrid::Impl {
       krylov_y.resize(m);
       krylov_restart = m;
     }
-    auto b = krylov_b, r = krylov_r, w = krylov_w;
+    auto b = krylov_b, r = krylov_r, w = krylov_w, x = krylov_x;
     auto &v = krylov_v;
     auto &z = krylov_z;
     auto &h = krylov_h;
@@ -1027,15 +1090,40 @@ struct SparseMultigrid::Impl {
     auto &sine = krylov_sine;
     auto &g = krylov_g;
     auto &y = krylov_y;
-    Kokkos::deep_copy(b, rhs);
-    stats.removed_rhs_mean = Project(b, global_n);
+    const auto rhs_data = NormData(rhs), guess_data = NormData(solution);
+    if (rhs_data.scale < 0 || guess_data.scale < 0) {
+      throw std::runtime_error("self-gravity: nonfinite FGMRES rhs/initial guess");
+    }
+    const Real largest = std::max(rhs_data.scale,guess_data.scale);
+    // Leave ordinary-scale arithmetic unchanged. At extreme scales solve for
+    // x/scale with b/scale so projection, coarse solves and Krylov updates stay
+    // representable. Divide directly (the reciprocal could overflow).
+    const Real safe_low = std::sqrt(std::numeric_limits<Real>::min());
+    const Real safe_high = std::sqrt(std::numeric_limits<Real>::max());
+    const Real scale = largest > 0 && (largest < safe_low || largest > safe_high)
+                       ? largest : Real(1);
+    if (rhs_data.scale > 0 && rhs_data.scale/scale == 0) {
+      throw std::runtime_error("self-gravity: FGMRES rhs/guess scale range unsupported");
+    }
+    Kokkos::parallel_for("gravity_normalize_system",Kokkos::RangePolicy<DevExeSpace>(0,n),
+        KOKKOS_LAMBDA(int i) { b(i) = rhs(i)/scale; x(i) = solution(i)/scale; });
+    stats.removed_rhs_mean = Project(b, global_n)*scale;
     Project(x, global_n);
     const Real norm_b = Norm(b);
-    const Real denominator = norm_b > 0 ? norm_b : 1;
-    const Real target = tolerance*denominator;
+    // Zero is an exact gauge-fixed solution of the homogeneous system. Taking
+    // it directly avoids spending iterations cancelling an enormous warm guess
+    // down to the absolute tolerance used for a zero projected RHS.
+    if (norm_b == 0) Kokkos::deep_copy(x,Real(0));
+    // Compare dimensionless ratios rather than tolerance*||b||, which could
+    // underflow. For zero RHS retain the original absolute-tolerance contract.
+    auto relative = [norm_b,scale](Real value) {
+      return norm_b > 0 ? value/norm_b : value*scale;
+    };
     CurrentResidual(b,x,r);
     Real beta = Norm(r);
-    while (beta > target && stats.iterations < max_iterations && std::isfinite(beta)) {
+    while (std::isfinite(norm_b) && std::isfinite(beta) &&
+           std::isfinite(relative(beta)) && relative(beta) > tolerance &&
+           stats.iterations < max_iterations) {
       std::fill(h.begin(), h.end(), Real(0));
       std::fill(g.begin(), g.end(), Real(0));
       g[0] = beta;
@@ -1075,7 +1163,7 @@ struct SparseMultigrid::Impl {
         g[j] *= cosine[j];
         ++stats.iterations;
         used = j+1;
-        if (std::abs(g[j+1]) <= target || next == 0 || rotation_norm == 0) break;
+        if (relative(std::abs(g[j+1])) <= tolerance || next == 0 || rotation_norm == 0) break;
       }
       bool triangular_ok = true;
       for (int i = used-1; i >= 0; --i) {
@@ -1097,13 +1185,23 @@ struct SparseMultigrid::Impl {
       // near-singular coarse solve producing 1e15-size cancelling updates.
       // Include the requested target in the comparison so normal residual
       // replacement near the roundoff floor is not mistaken for breakdown.
-      if (beta > 1000*std::max(std::abs(g[used]),target)) {
+      if (relative(beta)/1000 > std::max(relative(std::abs(g[used])),tolerance)) {
         stats.preconditioner_breakdown = true;
         break;
       }
     }
-    stats.relative_residual = beta/denominator;
-    stats.converged = std::isfinite(beta) && beta <= target;
+    stats.relative_residual = relative(beta);
+    stats.converged = std::isfinite(norm_b) && std::isfinite(beta) &&
+        std::isfinite(stats.relative_residual) && stats.relative_residual <= tolerance;
+    // Validate before publishing the rescaled answer, including a nonfinite
+    // flexible-basis update that might otherwise evade a residual comparison.
+    const auto answer = NormData(x);
+    if (answer.scale < 0 || answer.scale > std::numeric_limits<Real>::max()/scale) {
+      stats.converged = false;
+    } else {
+      Kokkos::parallel_for("gravity_restore_solution",Kokkos::RangePolicy<DevExeSpace>(0,n),
+          KOKKOS_LAMBDA(int i) { solution(i) = x(i)*scale; });
+    }
     stats.matrix_applications = matrix_applications-initial_matvecs;
     stats.vcycles = vcycles-initial_cycles;
     return stats;
@@ -1167,7 +1265,7 @@ StorageStats SparseMultigrid::Storage() const {
       +(impl_->coarse_pivots.size()+impl_->coarse_counts.size()
         +impl_->coarse_offsets.size())*sizeof(int);
   s.vector_bytes += (impl_->krylov_b.size()+impl_->krylov_r.size()
-                    +impl_->krylov_w.size())*sizeof(Real);
+                    +impl_->krylov_w.size()+impl_->krylov_x.size())*sizeof(Real);
   for (const auto &v : impl_->krylov_v) s.vector_bytes += v.size()*sizeof(Real);
   for (const auto &z : impl_->krylov_z) s.vector_bytes += z.size()*sizeof(Real);
   s.vector_bytes += (impl_->krylov_h.capacity()+impl_->krylov_cosine.capacity()

@@ -281,5 +281,14 @@ if (ENABLE_MPI)
   target_link_libraries(gravity_slab_window_check PRIVATE MPI::MPI_CXX)
 endif()
 
+add_executable(gravity_solver_scaling_check EXCLUDE_FROM_ALL
+  tst/test_suite/gravity/solver_scaling.cpp src/gravity/sparse_mg.cpp)
+target_include_directories(gravity_solver_scaling_check PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(gravity_solver_scaling_check PRIVATE Kokkos::kokkos)
+if (ENABLE_MPI)
+  target_link_libraries(gravity_solver_scaling_check PRIVATE MPI::MPI_CXX)
+endif()
+
 install( TARGETS athena DESTINATION bin )
 
