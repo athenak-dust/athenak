@@ -1355,11 +1355,18 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       // (numbered) geometry file instead of replacing the one of frame zero
       ba_geom_written_ = ba_field_number_ > 0;
     }
-    if (pmy_mesh_->pmb_pack->pdust != nullptr && pmy_mesh_->pmb_pack->ppart != nullptr &&
-        pmy_mesh_->pmb_pack->ppart->nprtcl_thispack == 0) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "restart of a dust run without particles in the restart file" << std::endl;
-      std::exit(EXIT_FAILURE);
+    if (pmy_mesh_->pmb_pack->pdust != nullptr && pmy_mesh_->pmb_pack->ppart != nullptr) {
+      // 2026-10-26 fix: the total over the ranks; a rank may hold no particles (blocks far from
+      // the midplane: u640 seed 4 on 128 ranks stopped here on every such rank)
+      long long np = pmy_mesh_->pmb_pack->ppart->nprtcl_thispack;
+#if MPI_PARALLEL_ENABLED
+      MPI_Allreduce(MPI_IN_PLACE, &np, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+#endif
+      if (np == 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "restart of a dust run without particles in the restart file" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
     }
     return;
   }

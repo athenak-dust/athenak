@@ -598,8 +598,10 @@ void DustGasDrag::StressResamplePool() {
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   const int npart = ppar->nprtcl_thispack;
-  if (npart == 0) return;
+  // (2026-10-26: EnsureRootCloudMass is collective, so it comes before the return of a rank
+  // without particles)
   if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
+  if (npart == 0) return;
   const int nsp = std::max(1, nspecies);
   DvceArray1D<Real> m0sp("rs_stress_m0", nsp);
   {
