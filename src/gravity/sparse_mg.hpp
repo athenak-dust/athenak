@@ -79,6 +79,7 @@ struct StorageStats {
   std::uint64_t csr_bytes = 0, halo_bytes = 0, vector_bytes = 0;
   std::uint64_t current_a_nnz = 0, host_pattern_bytes = 0;
   std::uint64_t phase_nnz = 0, phase_rows = 0, phase_map_bytes = 0;
+  std::uint64_t terminal_host_csr_bytes = 0;
 };
 
 struct FineOperatorStats {
@@ -124,15 +125,27 @@ class SparseMultigrid {
   // the entire effective fine diagonal once. A single-level hierarchy has no
   // smoother and retains its cached terminal LU.
   void UpdateFinePhaseRows(const CsrRowUpdate &matrix);
+  // Complete current-phase V-cycle: independent compact A and P dependency
+  // lists, unchanged physical child-sum R, and current terminal factorization.
+  // Terminal ownership must contain <=128 global rows. No fine host CSR retained.
+  void ConfigureHierarchyPhaseRows(const std::vector<std::vector<int>> &a_rows,
+                                  const std::vector<std::vector<int>> &p_rows);
+  void UpdateHierarchyPhaseRows(const std::vector<CsrRowUpdate> &a,
+                               const std::vector<CsrRowUpdate> &p);
   SolveStats Solve(const DvceArray1D<Real> &rhs, const DvceArray1D<Real> &x,
                    Real tolerance, int max_iterations, int restart = 24);
   // Collective diagnostics; arguments contain owned rows only. Level zero uses
-  // CURRENT outer A; higher levels use the cached preconditioner matrices.
+  // CURRENT outer A; higher levels use the preconditioner matrices, updated by
+  // UpdateHierarchyPhaseRows when that interface is configured.
   void ApplyMatrix(int level, const DvceArray1D<Real> &x,
                    const DvceArray1D<Real> &result);
+  void ApplyProlongation(int level, const DvceArray1D<Real> &x,
+                         const DvceArray1D<Real> &result);
+  void ApplyRestriction(int level, const DvceArray1D<Real> &x,
+                        const DvceArray1D<Real> &result);
   // Uses the current finest phase operator/diagonal after UpdateFinePhaseRows;
-  // all other levels and transfers remain cached. A single-level hierarchy uses
-  // its cached terminal LU even after fine phase updates.
+  // all other levels and transfers remain cached for the fine-only interface.
+  // UpdateHierarchyPhaseRows instead refreshes every A/P and terminal LU.
   void ApplyVCycle(const DvceArray1D<Real> &rhs, const DvceArray1D<Real> &result);
 
  private:

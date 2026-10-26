@@ -132,9 +132,15 @@ Kokkos, with local MPI rows and sparse reusable halo plans. Only the tiny coarse
 problem uses a root CPU LU solve.
 
 At each new shear phase the distributed backend updates surface-dependent rows
-of the current matrix and force operators. The preconditioner can remain cached;
-convergence is always checked against the current matrix. A failed cached attempt
-refreshes the hierarchy once and retries, with both attempts included in timing.
+of every multigrid matrix and prolongation operator, together with the finest
+force and boundary operators. Prolongation dependencies are traced independently
+through recursive shear images. Physical child-sum restriction remains fixed.
+Every smoothing diagonal and the tiny terminal factorization use the current
+operator. Only the owned part of the at-most-128-row terminal CSR stays on the
+host after upload; fine and intermediate host matrices are released.
+Convergence is checked against the current true residual. The existing capped
+attempt and full-hierarchy refresh/retry remain available, with both attempts
+included in timing.
 Identical source, topology, phase and gravitational constant can reuse a field;
 extra-source callbacks are still evaluated before checking source equality.
 Host phase workers use private gradient caches and concatenate consecutive row

@@ -22,6 +22,11 @@ struct GeometricSystem {
   // Retains patch metadata and the initialized stable phase-row list only.
   // The adapter can refresh the current fine operator without another volume scan.
   std::unique_ptr<MeshGeometry> fine_geometry;
+  // Retained geometry metadata only; no host leaf matrices or vectors survive
+  // upload. Entry l-1 is hierarchy level l.
+  std::vector<std::unique_ptr<MeshGeometry>> coarse_geometry;
+  // Independently traced through P's recursive VirtualAverage x-image visits.
+  std::vector<std::vector<int>> prolongation_phase_rows;
   // matrix has been moved to hierarchy.matrices[0]. Other finest fields remain.
   LocalCompositeSystem fine;
   // Patch metadata only, one vector per level. No global cell or CSR arrays.
@@ -43,6 +48,12 @@ struct GeometricSystem {
 GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     const CompositeDomain &domain, int rank, int nranks, bool neumann_z = false,
     bool fine_forces = true);
+
+// Both geometries must already have the current phase. Visits only the fixed
+// local P dependency list discovered during the original transfer construction.
+CsrRowUpdate BuildProlongationPhaseUpdate(const MeshGeometry &fine,
+    const MeshGeometry &coarse, const CompositeDomain &domain, int rank,
+    const std::vector<int> &rows);
 
 }  // namespace gravity
 #endif  // GRAVITY_GEOMETRIC_MG_HPP_

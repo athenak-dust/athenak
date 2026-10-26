@@ -364,7 +364,8 @@ void SelfGravity::Rebuild(Real shear_offset) {
               << " global_a_nnz=" << host_nnz << " local_a_nnz=" << storage.a_nnz
               << " local_p_nnz=" << storage.p_nnz << " local_r_nnz=" << storage.r_nnz
               << " input_host_csr_bytes=" << host_csr
-              << " retained_host_csr_bytes=0" << " local_csr_bytes=" << storage.csr_bytes
+              << " retained_host_csr_bytes=" << storage.terminal_host_csr_bytes
+              << " local_csr_bytes=" << storage.csr_bytes
               << " local_halo_bytes=" << storage.halo_bytes
               << " mg_vector_bytes=" << storage.vector_bytes
               << " field_bytes=" << (rhs_.size()+solution_.size()+work_.size()
@@ -483,9 +484,17 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
     solver_patches_ = setup.patches[0];
     geometry_ = std::move(setup.fine_geometry);
     geometry_->SetPhaseThreads(phase_serial_only_ ? 1 : phase_threads_);
+    coarse_geometry_ = std::move(setup.coarse_geometry);
+    prolongation_phase_rows_ = std::move(setup.prolongation_phase_rows);
+    for (auto &coarse : coarse_geometry_) {
+      const int threads = coarse->PhaseRows().size() < 256 || phase_serial_only_ ? 1 : phase_threads_;
+      coarse->SetPhaseThreads(threads);
+    }
     if (pm->mesh_bcs[0] == BoundaryFlag::shear_periodic) {
       const auto &rows = geometry_->PhaseRows();
-      mg_->ConfigureFinePhaseRows(rows);
+      std::vector<std::vector<int>> a_rows{rows};
+      for (const auto &coarse : coarse_geometry_) a_rows.push_back(coarse->PhaseRows());
+      mg_->ConfigureHierarchyPhaseRows(a_rows,prolongation_phase_rows_);
       for (int d = 0; d < domain.ndim; ++d) force_[d]->ConfigurePhaseRows(rows);
       if (slab_ || vacuum_) {
         boundary_rhs_op_->ConfigurePhaseRows(rows);
@@ -539,6 +548,7 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
                 << " global_a_nnz=" << global_nnz << " local_a_nnz=" << storage.a_nnz
                 << " local_p_nnz=" << storage.p_nnz << " local_r_nnz=" << storage.r_nnz
                 << " retained_global_host_csr_bytes=0 local_csr_bytes=" << storage.csr_bytes
+                << " terminal_owned_host_csr_bytes=" << storage.terminal_host_csr_bytes
                 << " local_halo_bytes=" << storage.halo_bytes
                 << " host_pattern_bytes=" << storage.host_pattern_bytes
                 << " mg_vector_bytes=" << storage.vector_bytes
@@ -553,8 +563,21 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
   const double begin = ProfileTime(profile_);
   try {
     auto update = geometry_->BuildPhaseUpdate(shear_offset);
+    std::vector<CsrRowUpdate> a;
+    a.reserve(coarse_geometry_.size()+1); a.push_back(std::move(update.matrix));
+    for (auto &coarse : coarse_geometry_)
+      a.push_back(std::move(coarse->BuildPhaseUpdate(shear_offset,false).matrix));
+    std::vector<CsrRowUpdate> p;
+    p.reserve(coarse_geometry_.size());
+    auto current_domain = solver_domain_;
+    current_domain.shear_offset = shear_offset;
+    for (size_t l = 0; l < coarse_geometry_.size(); ++l) {
+      const auto &fine = l == 0 ? *geometry_ : *coarse_geometry_[l-1];
+      p.push_back(BuildProlongationPhaseUpdate(fine,*coarse_geometry_[l],current_domain,
+          global_variable::my_rank,prolongation_phase_rows_[l]));
+    }
     const double assembled = ProfileTime(profile_);
-    mg_->UpdateFinePhaseRows(update.matrix);
+    mg_->UpdateHierarchyPhaseRows(a,p);
     for (int d = 0; d < solver_domain_.ndim; ++d) {
       force_[d]->UpdatePhaseRows(update.acceleration[d]);
     }
@@ -591,7 +614,9 @@ void SelfGravity::RefreshHierarchy() {
   }
   auto solver = std::make_unique<SparseMultigrid>(refreshed.hierarchy);
   if (pack_->pmesh->mesh_bcs[0] == BoundaryFlag::shear_periodic) {
-    solver->ConfigureFinePhaseRows(geometry_->PhaseRows());
+    std::vector<std::vector<int>> a_rows{geometry_->PhaseRows()};
+    for (const auto &coarse : coarse_geometry_) a_rows.push_back(coarse->PhaseRows());
+    solver->ConfigureHierarchyPhaseRows(a_rows,prolongation_phase_rows_);
   }
   mg_ = std::move(solver);
   ++preconditioner_refresh_count;

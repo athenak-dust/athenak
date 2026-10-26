@@ -85,6 +85,8 @@ class SelfGravity {
   std::unique_ptr<CompositeSystem> system_;
   std::unique_ptr<SparseMultigrid> mg_;
   std::unique_ptr<MeshGeometry> geometry_;
+  std::vector<std::unique_ptr<MeshGeometry>> coarse_geometry_;
+  std::vector<std::vector<int>> prolongation_phase_rows_;
   std::vector<GravityPatch> solver_patches_;
   CompositeDomain solver_domain_;
   bool solver_neumann_z_ = false, hierarchy_fresh_ = true;

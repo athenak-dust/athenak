@@ -6,10 +6,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace gravity {
@@ -22,7 +24,8 @@ void Add(Row &row, GlobalIndex column, Real value) {
   row.emplace_back(column,value);
 }
 
-void Append(LocalCsr &a, Row &row) {
+template<class Matrix>
+void Append(Matrix &a, Row &row) {
   std::sort(row.begin(),row.end(),[](const auto &x, const auto &y) { return x.first < y.first; });
   for (const auto &v : row) if (v.second != 0.) {
     if (a.values.size() == static_cast<size_t>(std::numeric_limits<int>::max()))
@@ -130,9 +133,42 @@ std::vector<GravityPatch> Coarsen(const std::vector<GravityPatch> &fine,
   return coarse;
 }
 
+void ProlongationRow(const MeshGeometry &fine, const MeshGeometry &coarse,
+    const CompositeDomain &domain, GlobalIndex i, Row &row,
+    bool &images, bool &shear_images) {
+  const auto cell = fine.Cell(i);
+  const GlobalIndex parent = coarse.Locate(cell.center);
+  const auto cc = coarse.Cell(parent);
+  std::array<int,3> sign{}; int split = 0;
+  for (int d = 0; d < domain.ndim; ++d) {
+    if (cell.width[d] > cc.width[d]*(1.+1.e-8))
+      throw std::runtime_error("Gravity coarse cell is smaller than a fine child");
+    const double delta = (cell.center[d]-cc.center[d])/cc.width[d];
+    if (std::abs(delta) < 1.e-8) continue;
+    if (std::abs(std::abs(delta)-.25) > 1.e-7)
+      throw std::runtime_error("Gravity interpolation requires centered dyadic children");
+    sign[d] = delta > 0. ? 1 : -1; split |= 1<<d;
+  }
+  row.clear(); images = false; shear_images = false;
+  for (int bits = 0; bits < (1<<domain.ndim); ++bits) {
+    if (bits & ~split) continue;
+    Real weight = 1.; std::array<Real,3> lo{}, hi{};
+    for (int d = 0; d < domain.ndim; ++d) {
+      const bool neighbor = bits & (1<<d);
+      if (sign[d] != 0) weight *= neighbor ? .25 : .75;
+      const double center = cc.center[d]+(neighbor ? sign[d]*cc.width[d] : 0.);
+      lo[d] = center-.5*cc.width[d]; hi[d] = center+.5*cc.width[d];
+    }
+    bool image = false, shear_image = false;
+    for (const auto &v : coarse.VirtualAverage(lo,hi,&image,&shear_image))
+      Add(row,v.first,weight*v.second);
+    images = images || image; shear_images = shear_images || shear_image;
+  }
+}
+
 void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
     const CompositeDomain &domain, int rank, LocalCsr &p, LocalCsr &r,
-    TransferDiagnostics &diagnostics, bool neumann_z) {
+    TransferDiagnostics &diagnostics, bool neumann_z, std::vector<int> &phase_rows) {
   p.global_rows = fine.GlobalRows(); p.global_cols = coarse.GlobalRows();
   p.row_begin = fine.RowPartition()[rank];
   r.global_rows = coarse.GlobalRows(); r.global_cols = fine.GlobalRows();
@@ -151,32 +187,12 @@ void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
   Row row; row.reserve(64);
   for (GlobalIndex i = p.row_begin; i < fine_end; ++i) {
     const auto cell = fine.Cell(i);
-    const GlobalIndex parent = coarse.Locate(cell.center);
-    const auto cc = coarse.Cell(parent);
-    std::array<int,3> sign{}; int split = 0;
-    for (int d = 0; d < domain.ndim; ++d) {
-      if (cell.width[d] > cc.width[d]*(1.+1.e-8))
-        throw std::runtime_error("Gravity coarse cell is smaller than a fine child");
-      const double delta = (cell.center[d]-cc.center[d])/cc.width[d];
-      if (std::abs(delta) < 1.e-8) continue;
-      if (std::abs(std::abs(delta)-.25) > 1.e-7)
-        throw std::runtime_error("Gravity interpolation requires centered dyadic children");
-      sign[d] = delta > 0. ? 1 : -1; split |= 1<<d;
-    }
-    row.clear(); bool images = false;
-    for (int bits = 0; bits < (1<<domain.ndim); ++bits) {
-      if (bits & ~split) continue;
-      Real weight = 1.; std::array<Real,3> lo{}, hi{};
-      for (int d = 0; d < domain.ndim; ++d) {
-        const bool neighbor = bits & (1<<d);
-        if (sign[d] != 0) weight *= neighbor ? .25 : .75;
-        const double center = cc.center[d]+(neighbor ? sign[d]*cc.width[d] : 0.);
-        lo[d] = center-.5*cc.width[d]; hi[d] = center+.5*cc.width[d];
-      }
-      bool image = false;
-      for (const auto &v : coarse.VirtualAverage(lo,hi,&image)) Add(row,v.first,weight*v.second);
-      images = images || image;
-    }
+    bool images = false, shear_images = false;
+    ProlongationRow(fine,coarse,domain,i,row,images,shear_images);
+    // Before the first x-image traversal, geometry routing is phase independent.
+    // Thus a row that can depend on phase records this traversal at every phase,
+    // even if its final coefficients cancel. No A-row dependency is assumed.
+    if (shear_images) phase_rows.push_back(static_cast<int>(i-p.row_begin));
     Real constant = 0.; std::array<Real,3> linear{};
     for (const auto &v : row) {
       constant += v.second;
@@ -228,7 +244,6 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
   GeometricSystem out;
   out.fine_geometry.reset(new MeshGeometry(std::move(patches),domain,rank,nranks,neumann_z));
   MeshGeometry *fine = out.fine_geometry.get();
-  std::unique_ptr<MeshGeometry> coarse_owner;
   out.fine = fine->BuildSystem(fine_forces);
   out.quadratic_interface_fallbacks.push_back(out.fine.quadratic_interface_fallbacks);
   out.hierarchy.constant_nullspace = !domain.isolated_z || neumann_z;
@@ -242,17 +257,66 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
       throw std::runtime_error("Gravity geometric coarsening did not reduce global rows");
     std::unique_ptr<MeshGeometry> coarse(new MeshGeometry(std::move(coarse_patches),domain,
                                                         rank,nranks,neumann_z,true));
-    LocalCsr p, r; TransferDiagnostics check;
-    Transfers(*fine,*coarse,domain,rank,p,r,check,neumann_z);
+    LocalCsr p, r; TransferDiagnostics check; std::vector<int> phase_rows;
+    Transfers(*fine,*coarse,domain,rank,p,r,check,neumann_z,phase_rows);
     auto system = coarse->BuildSystem(false);
     out.quadratic_interface_fallbacks.push_back(system.quadratic_interface_fallbacks);
     out.hierarchy.matrices.push_back(std::move(system.matrix));
     out.hierarchy.row_partitions.push_back(coarse->RowPartition());
     out.hierarchy.prolongation.push_back(std::move(p));
     out.hierarchy.restriction.push_back(std::move(r));
+    out.prolongation_phase_rows.push_back(std::move(phase_rows));
     out.patches.push_back(coarse->Patches()); out.transfer_checks.push_back(check);
-    coarse_owner = std::move(coarse);
-    fine = coarse_owner.get();
+    out.coarse_geometry.push_back(std::move(coarse));
+    fine = out.coarse_geometry.back().get();
+  }
+  return out;
+}
+
+CsrRowUpdate BuildProlongationPhaseUpdate(const MeshGeometry &fine,
+    const MeshGeometry &coarse, const CompositeDomain &domain, int rank,
+    const std::vector<int> &rows) {
+  const GlobalIndex begin = fine.RowPartition()[rank];
+  const GlobalIndex count = fine.RowPartition()[rank+1]-begin;
+  if (!std::is_sorted(rows.begin(),rows.end()) ||
+      std::adjacent_find(rows.begin(),rows.end()) != rows.end() ||
+      (!rows.empty() && (rows.front() < 0 || rows.back() >= count)))
+    throw std::invalid_argument("Gravity invalid prolongation phase rows");
+  const int workers = rows.size() < 256 ? 1 :
+      std::max(1,std::min(fine.PhaseThreads(),static_cast<int>(rows.size())));
+  std::vector<CsrRowUpdate> parts(workers);
+  std::vector<std::exception_ptr> errors(workers);
+  auto assemble = [&](int worker) {
+    try {
+      auto &a = parts[worker]; a.global_rows = fine.GlobalRows();
+      a.global_cols = coarse.GlobalRows(); a.row_begin = begin;
+      const size_t first = rows.size()*worker/workers, last = rows.size()*(worker+1)/workers;
+      a.rows.assign(rows.begin()+first,rows.begin()+last);
+      Row row; row.reserve(64);
+      for (size_t j = first; j < last; ++j) {
+        bool images = false, shear_images = false;
+        ProlongationRow(fine,coarse,domain,begin+rows[j],row,images,shear_images);
+        Append(a,row);
+      }
+    } catch (...) { errors[worker] = std::current_exception(); }
+  };
+  std::vector<std::thread> threads;
+  try {
+    for (int worker = 1; worker < workers; ++worker) threads.emplace_back(assemble,worker);
+  } catch (...) { for (auto &thread : threads) thread.join(); throw; }
+  assemble(0);
+  for (auto &thread : threads) thread.join();
+  for (const auto &error : errors) if (error) std::rethrow_exception(error);
+  auto out = std::move(parts[0]);
+  for (int worker = 1; worker < workers; ++worker) {
+    const auto &part = parts[worker]; const int offset = out.values.size();
+    if (out.values.size()+part.values.size() >
+        static_cast<size_t>(std::numeric_limits<int>::max()))
+      throw std::overflow_error("Gravity prolongation phase CSR exceeds local offsets");
+    out.rows.insert(out.rows.end(),part.rows.begin(),part.rows.end());
+    out.colidx.insert(out.colidx.end(),part.colidx.begin(),part.colidx.end());
+    out.values.insert(out.values.end(),part.values.begin(),part.values.end());
+    for (size_t j = 1; j < part.rowptr.size(); ++j) out.rowptr.push_back(offset+part.rowptr[j]);
   }
   return out;
 }
