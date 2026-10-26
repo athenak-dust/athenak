@@ -733,7 +733,13 @@ void SelfGravity::Solve(Real time) {
   auto extra = extra_density_;
   Kokkos::deep_copy(extra,0.0);
   if (extra_source_) extra_source_(time,extra);
-  if (coupled_dust_) pack_->pdust->DepositGravityDensity(time,dust_density_);
+  if (coupled_dust_) {
+    auto *dust=pack_->pdust;
+    if (!dust->stopping_times_initialized ||
+        dust->stopping_time_mode==DustStoppingTimeMode::dynamic)
+      dust->RefreshStoppingTimeMaximum();
+    dust->DepositGravityDensity(time,dust_density_);
+  }
   if (extra.extent(0) < static_cast<std::size_t>(pack_->nmb_thispack)
       || extra.extent(1) < 1 || extra.extent(2) <= static_cast<std::size_t>(ind.ke)
       || extra.extent(3) <= static_cast<std::size_t>(ind.je)
@@ -1035,5 +1041,26 @@ void SelfGravity::UpdateTimeStep() {
   if (coupled_dust_)
     limit=std::min(limit,pack_->pdust->GravityAccelerationTimeStep(particle_acceleration_));
   dtnew = gravity_cfl_*limit;
+  if (coupled_dust_ && pack_->pdust->coupling==DustCoupling::hybrid &&
+      pack_->pdust->hybrid_force_mode==HybridForceMode::pc2) {
+    // Forced PC2 is a resolved-drag method: its gas feedback predictor is not
+    // unconditionally stable for dt/t_s or high dust loading. A conservative
+    // bound on the local relaxation rate is (1+rho_d/rho_g)/min(t_s).
+    // IMEX has no such explicit restriction. Keep legacy gravity-off behavior.
+    const Real stopping=pack_->pdust->taus_min;
+    auto dust_density=dust_density_;
+    auto gas=pack_->phydro->u0;
+    Real drag_limit=std::numeric_limits<Real>::max();
+    Kokkos::parallel_reduce("gravity_resolved_pc2_timestep",
+        Kokkos::RangePolicy<DevExeSpace>(0,n),KOKKOS_LAMBDA(int q,Real &minimum) {
+      int t=q;
+      const int i=t%ind.nx1+ind.is;t/=ind.nx1;
+      const int j=t%ind.nx2+ind.js;t/=ind.nx2;
+      const int k=t%ind.nx3+ind.ks;t/=ind.nx3;
+      const Real eps=dust_density(t,0,k,j,i)/gas(t,IDN,k,j,i);
+      minimum=fmin(minimum,stopping/(1+eps));
+    },Kokkos::Min<Real>(drag_limit));
+    dtnew=std::min(dtnew,Real(.25)*drag_limit);
+  }
 }
 }  // namespace gravity
