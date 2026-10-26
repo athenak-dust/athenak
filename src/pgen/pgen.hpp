@@ -81,6 +81,7 @@ class ProblemGenerator {
   void ShockTube(ParameterInput *pin, const bool restart);
   void SimpleWave(ParameterInput *pin, const bool restart);
   void Shwave(ParameterInput *pin, const bool restart);
+  void SelfGravityWave(ParameterInput *pin, const bool restart);
   void StreamingLinear(ParameterInput *pin, const bool restart);
   void RadiationLinearWave(ParameterInput *pin, const bool restart);
   void RadiationBeam(ParameterInput *pin, const bool restart);

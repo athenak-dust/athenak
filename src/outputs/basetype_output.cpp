@@ -21,6 +21,7 @@
 #include "eos/eos.hpp"
 #include "globals.hpp"
 #include "hydro/hydro.hpp"
+#include "gravity/self_gravity.hpp"
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "coordinates/adm.hpp"
@@ -64,6 +65,11 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     std::exit(EXIT_FAILURE);
   }
 
+  if (ivar >= 154 && (pm->pmb_pack->pgrav == nullptr || out_params.include_gzs)) {
+    std::cerr << "### FATAL ERROR: gravity output requires gravity/enabled=true "
+              << "and active cells only (include_gzs=false)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   // check that appropriate physics is defined for requested output variable
   // TODO(@user): Index limits of variable choices below may change if more choices added
   if ((ivar<16) && (pm->pmb_pack->phydro == nullptr)) {
@@ -191,6 +197,23 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
 
 
   for (const auto& variable : variables) {
+    if (variable == "gravity" || variable == "gravity_phi" ||
+        variable == "gravity_g1" || variable == "gravity_g2" || variable == "gravity_g3") {
+      if (pm->pmb_pack->pgrav == nullptr || out_params.include_gzs) {
+        std::cerr << "### FATAL ERROR: gravity output requires enabled gravity and active cells"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      if (variable == "gravity" || variable == "gravity_phi") {
+        outvars.emplace_back("phi",0,&(pm->pmb_pack->pgrav->phi));
+      }
+      for (int d = 0; d < 3; ++d) {
+        const std::string name = "gravity_g"+std::to_string(d+1);
+        if (variable == "gravity" || variable == name) {
+          outvars.emplace_back(name,d,&(pm->pmb_pack->pgrav->acceleration));
+        }
+      }
+    }
     // hydro (lab-frame) density
     if (variable.compare("hydro_u_d") == 0 ||
         variable.compare("hydro_u") == 0 ||

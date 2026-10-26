@@ -40,6 +40,17 @@ add_executable(
 
         driver/driver.cpp
 
+        gravity/sparse_mg.cpp
+        gravity/composite.cpp
+        gravity/mesh_geometry.cpp
+        gravity/geometric_mg.cpp
+        gravity/vacuum_mesh.cpp
+        gravity/vacuum_boundary.cpp
+        gravity/self_gravity.cpp
+        gravity/restart.cpp
+        gravity/slab_boundary.cpp
+        pgen/tests/self_gravity_wave.cpp
+
         dust/dust.cpp
         dust/dust_newdt.cpp
         dust/dust_pm.cpp

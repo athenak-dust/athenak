@@ -31,6 +31,7 @@
 #include "srcterms/turb_driver.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "gravity/restart.hpp"
 #include "pgen.hpp"
 
 
@@ -620,6 +621,10 @@ ProblemGenerator::ProblemGenerator(ParameterInput *pin, Mesh *pm, IOWrapper resf
 
   // particles and dust state (dust/dust_restart.cpp): the section after the
   // data of the last MeshBlock
+  if (pm->pmb_pack->pgrav != nullptr) {
+    gravity::ReadRestartState(resfile, headeroffset+data_size*pm->nmb_total,
+                              pm, pin, single_file_per_rank);
+  }
   if (pm->pmb_pack->ppart != nullptr) {
     if (single_file_per_rank) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -987,6 +992,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     SimpleWave(pin, is_restart);
   } else if (pgen_fun_name.compare("shwave") == 0) {
     Shwave(pin, is_restart);
+  } else if (pgen_fun_name.compare("self_gravity_wave") == 0) {
+    SelfGravityWave(pin, is_restart);
   } else if (pgen_fun_name.compare("streaming_linear") == 0) {
     StreamingLinear(pin, is_restart);
   } else if (pgen_fun_name.compare("z4c_boosted_puncture") == 0) {

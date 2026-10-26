@@ -37,6 +37,7 @@
 #include "coordinates/adm.hpp"
 #include "z4c/z4c.hpp"
 #include "z4c/z4c_amr.hpp"
+#include "gravity/self_gravity.hpp"
 #include "prolongation.hpp"
 #include "restriction.hpp"
 
@@ -206,6 +207,12 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
     }
 
     MeshBlockPack* pmbp = pmy_mesh->pmb_pack;
+    // Rebuild the composite operator/source on the new ACTIVE leaf mesh, after
+    // hydro restriction/prolongation and redistribution have completed.
+    if (pmbp->pgrav != nullptr) {
+      pmbp->pgrav->Invalidate();
+      pmbp->pgrav->Solve(pmy_mesh->time);
+    }
     // dust on the new mesh: leaf maps, PGID, particle time step.  Done
     // here and not at the next cycle because outputs may follow the last regrid of a run.
     if (pmbp->pdust != nullptr) {
