@@ -123,7 +123,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // (test) false: particles crossing an x1 face after the push take the shear offset of the start
   // of the step, as the routing of point particles does
   if (shear3d) shear3d_route_fix = pin->GetOrAddBoolean("dust", "cloud_shear_route_time", true);
-  if (shear3d) shear3d_list_cache = pin->GetOrAddBoolean("dust", "cloud_shear_list_cache", false);
+  // Rixin: default on (history bitwise equal)
+  if (shear3d) shear3d_list_cache = pin->GetOrAddBoolean("dust", "cloud_shear_list_cache", true);
   // 3-D clouds at physical x3 faces fold their supports back (the drop mode has
   // no cloud version)
   if (clouds3d && pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&

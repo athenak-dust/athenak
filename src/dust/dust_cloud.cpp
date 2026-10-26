@@ -141,12 +141,12 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
     // The cell-sorted index is on by default (every 8 cycles) where the two
     // production cloud kernels run (hybrid / PC2 coupling, linear gather); 0 turns it off (the
-    // control, and the runs before ce92ed4b)
+    // control, and the runs before ce92ed4b).  Rixin: default on also in 3-D (keys
+    // (block, k, j, i) since 063823b1; GB200 c640 -2.7%)
     {
       const bool prod = coupling == DustCoupling::hybrid &&
                         hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2;
-      cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval",
-                                                  (prod && !clouds3d) ? 8 : 0);
+      cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval", prod ? 8 : 0);
     }
   }
   std::string users;
