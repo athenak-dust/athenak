@@ -118,6 +118,8 @@ class SparseMultigrid {
                           const std::vector<GlobalIndex> &partition = {});
   FineOperatorStats FineUpdates() const;
   void ConfigureFinePhaseRows(const std::vector<int> &rows);
+  // Refresh the outer and V-cycle finest operator together, including selected
+  // smoother diagonal entries. They share one CSR/halo; coarse A/P/R stay cached.
   void UpdateFinePhaseRows(const CsrRowUpdate &matrix);
   SolveStats Solve(const DvceArray1D<Real> &rhs, const DvceArray1D<Real> &x,
                    Real tolerance, int max_iterations, int restart = 24);
@@ -125,7 +127,8 @@ class SparseMultigrid {
   // CURRENT outer A; higher levels use the cached preconditioner matrices.
   void ApplyMatrix(int level, const DvceArray1D<Real> &x,
                    const DvceArray1D<Real> &result);
-  // Always the CACHED multigrid preconditioner, including its unchanged fine A.
+  // Uses the current finest phase operator/diagonal after UpdateFinePhaseRows;
+  // all other levels and transfers remain cached.
   void ApplyVCycle(const DvceArray1D<Real> &rhs, const DvceArray1D<Real> &result);
 
  private:

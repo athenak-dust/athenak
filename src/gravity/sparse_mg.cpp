@@ -376,7 +376,7 @@ struct SparseMultigrid::Impl {
     op.phase_configured = true;
   }
 
-  bool UpdatePhase(Operator &op, const CsrRowUpdate &a) {
+  bool UpdatePhase(Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal = false) {
     bool valid = op.phase_configured && a.global_rows == op.global_rows
         && a.global_cols == op.global_cols && a.row_begin == op.row_begin
         && a.rows == op.phase_rows_host && a.rowptr.size() == a.rows.size()+1
@@ -388,8 +388,16 @@ struct SparseMultigrid::Impl {
       for (size_t k = 0; valid && k < a.values.size(); ++k) {
         valid = a.colidx[k] >= 0 && a.colidx[k] < op.global_cols && std::isfinite(a.values[k]);
       }
+      if (smoothing_diagonal) for (size_t j = 0; valid && j < a.rows.size(); ++j) {
+        Real diagonal = 0;
+        for (int k = a.rowptr[j]; k < a.rowptr[j+1]; ++k) {
+          if (a.colidx[k] == a.row_begin+a.rows[j]) diagonal += a.values[k];
+        }
+        valid = diagonal != 0 && std::isfinite(diagonal)
+            && std::isfinite(Real(1)/diagonal);
+      }
     }
-    Require(valid,"invalid compact phase CSR, ownership, or configured row set");
+    Require(valid,"invalid compact phase CSR, ownership, row set, or smoothing diagonal");
     int same = a.rowptr == op.phase_rowptr_host && a.colidx == op.phase_columns_host;
 #if MPI_PARALLEL_ENABLED
     MPI_Allreduce(MPI_IN_PLACE,&same,1,MPI_INT,MPI_MIN,comm);
@@ -429,6 +437,31 @@ struct SparseMultigrid::Impl {
     op.phase_active = true;
     ++op.phase_updates.updates;
     return same != 0;
+  }
+
+  void UpdateFinePhaseDiagonal() {
+    // Diagonals were validated collectively with the compact CSR before upload.
+    // Device compact columns use the owned input index for each diagonal entry.
+    auto rows = current_a.phase_rows;
+    auto rp = current_a.phase_rowptr;
+    auto ci = current_a.phase_colidx;
+    auto av = current_a.phase_values;
+    auto inverse = levels[0].inverse_diagonal;
+    const int count = current_a.phase_rows_host.size();
+    Kokkos::parallel_for("gravity_phase_diagonal",Kokkos::RangePolicy<DevExeSpace>(0,count),
+    KOKKOS_LAMBDA(int j) {
+      const int i = rows(j);
+      Real diagonal = 0;
+      for (int k = rp(j); k < rp(j+1); ++k) if (ci(k) == i) diagonal += av(k);
+      inverse(i) = Real(1)/diagonal;
+    });
+  }
+
+  Operator &CycleMatrix(Level &level) {
+    // The production compact phase update shares the current finest matrix and
+    // its existing halo with the V-cycle. Coarse A/P/R remain cached. The legacy
+    // full-matrix update retains its outer-operator-only contract.
+    return &level == &levels[0] && current_a.phase_active ? current_a : level.a;
   }
 
   void Initialize(const HostHierarchy &h) {
@@ -544,6 +577,9 @@ struct SparseMultigrid::Impl {
             "fine ownership changed; construct a fresh hierarchy");
     CheckLocal(a,part,part);
     if (current_a.phase_configured) {
+      // A caller switching back to the outer-only full update freezes the most
+      // recent phase preconditioner, including its already updated diagonal.
+      if (current_a.phase_active) levels[0].a = current_a;
       current_a = Build(a,part,part);
       current_rowptr = a.rowptr;
       current_columns = a.colidx;
@@ -735,7 +771,7 @@ struct SparseMultigrid::Impl {
   }
 
   void Residual(Level &l, const Vector &b, const Vector &x, const Vector &r) {
-    Multiply(l.a, x, r);
+    Multiply(CycleMatrix(l), x, r);
     const int n = r.extent_int(0);
     Kokkos::parallel_for("gravity_residual", Kokkos::RangePolicy<DevExeSpace>(0, n),
                          KOKKOS_LAMBDA(int i) { r(i) = b(i)-r(i); });
@@ -757,7 +793,7 @@ struct SparseMultigrid::Impl {
     auto diagonal = l.inverse_diagonal;
     const int n = x.extent_int(0);
     for (int sweep = 0; sweep < 3; ++sweep) {
-      Multiply(l.a, x, temp);
+      Multiply(CycleMatrix(l), x, temp);
       Kokkos::parallel_for("gravity_jacobi", Kokkos::RangePolicy<DevExeSpace>(0, n),
                            KOKKOS_LAMBDA(int i) {
         x(i) += Real(0.65)*diagonal(i)*(b(i)-temp(i));
@@ -1007,7 +1043,9 @@ void SparseMultigrid::ConfigureFinePhaseRows(const std::vector<int> &rows) {
   std::vector<GlobalIndex>().swap(impl_->current_columns);
 }
 void SparseMultigrid::UpdateFinePhaseRows(const CsrRowUpdate &a) {
-  const bool same = impl_->UpdatePhase(impl_->current_a,a);
+  const bool smooth = impl_->levels.size() > 1;
+  const bool same = impl_->UpdatePhase(impl_->current_a,a,smooth);
+  if (smooth) impl_->UpdateFinePhaseDiagonal();
   ++impl_->fine_updates.updates;
   if (same) ++impl_->fine_updates.value_updates;
   else ++impl_->fine_updates.structure_rebuilds;
