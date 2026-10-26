@@ -48,6 +48,25 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
   const auto ind=pm->mb_indcs;
   const int nmb=pack->nmb_thispack,npart=particles->nprtcl_thispack;
   const Real time=pin->GetOrAddReal("problem","gravity_test_time",pm->time);
+  const bool shape_sweep=pin->GetOrAddBoolean("problem","gravity_test_shape_sweep",false);
+  auto original_codes=Kokkos::create_mirror(particles->prtcl_idata);
+  Kokkos::deep_copy(original_codes,particles->prtcl_idata);
+  if (shape_sweep) {
+    // An explicit frozen-state kernel test, not a physical split operation:
+    // cover all 64 combinations of valid directional lobe codes, at widths
+    // no larger than the original root-cloud support. Restore exact codes below.
+    auto test_codes=Kokkos::create_mirror(particles->prtcl_idata);
+    Kokkos::deep_copy(test_codes,particles->prtcl_idata);
+    for (int p=0;p<npart;++p) {
+      using T=::dust::SMRCompositeTransfer;
+      const unsigned int pattern=static_cast<unsigned int>(test_codes(PTAG,p))%64;
+      const int level=std::max(1,T::CloudLevel(test_codes(PLEV,p)));
+      test_codes(PLEV,p)=level | ((pattern&3)<<T::kCloudLobeShift1) |
+          (((pattern>>2)&3)<<T::kCloudLobeShift2) |
+          (((pattern>>4)&3)<<T::kCloudLobeShift3);
+    }
+    Kokkos::deep_copy(particles->prtcl_idata,test_codes);
+  }
   DvceArray5D<Real> density;
   dust->DepositGravityDensity(time,density);
   auto rho=Kokkos::create_mirror_view_and_copy(HostMemSpace(),density);
@@ -144,6 +163,7 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
   }
   kick_error=Maximum(kick_error);
   Kokkos::deep_copy(particles->prtcl_rdata,original_particles);
+  Kokkos::deep_copy(particles->prtcl_idata,original_codes);
   Require(kick_error<1.e-10,"kick changed positions, mass, history or wrong velocity component");
   if (global_variable::my_rank==0)
     std::cout<<std::setprecision(16)<<"# DUST_GRAVITY_TRANSFER {\"time\":"<<time
@@ -151,6 +171,7 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
       <<",\"mass_error\":"<<mass_error<<",\"adjoint_error\":"<<adjoint_error
       <<",\"constant_error\":"<<constant_error<<",\"kick_error\":"<<kick_error
       <<",\"diagnostic_density_error\":"<<old_density_error
+      <<",\"diagnostic_shape_sweep\":"<<(shape_sweep ? "true" : "false")
       <<",\"shape_counts_plain_x1_x2_x3\":["<<shapes[0]<<','<<shapes[1]<<','
       <<shapes[2]<<','<<shapes[3]<<"],\"passed\":true}\n";
 }
