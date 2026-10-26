@@ -1365,11 +1365,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
 #if MPI_PARALLEL_ENABLED
       MPI_Allreduce(MPI_IN_PLACE, &np, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
 #endif
-      if (np == 0) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "restart of a dust run without particles in the restart file" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
+      // The typed restart reader already distinguishes a missing/corrupt
+      // particle extension from valid zero-count sections. All dust may have
+      // left an outflow domain; that is a legitimate gas-only continuation.
+      if (np == 0 && global_variable::my_rank == 0)
+        std::cout << "# dust restart: valid empty particle population restored" << std::endl;
     }
     return;
   }

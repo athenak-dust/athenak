@@ -78,9 +78,9 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   coupled_dust_ = pack->pdust != nullptr;
   if (coupled_dust_ && !pack->pdust->GravityTransferSupported())
     Fail("dust gravity requires supported 3D refinable clouds, uniform TSC, or owner_overlap TSC");
-  if (coupled_dust_ && pack->pdust->PointGravityTransferSupported() &&
+  if (coupled_dust_ &&
       pin->GetOrAddString("gravity","dust_x3_assignment","fold")!="fold")
-    Fail("point gravity/dust_x3_assignment supports fold only; drag deposit policy is independent");
+    Fail("dust gravity/dust_x3_assignment supports fold only; drag deposit policy is independent");
   if (pin->GetOrAddString("gravity", "solver", "multigrid") != "multigrid") {
     Fail("solver must be multigrid");
   }

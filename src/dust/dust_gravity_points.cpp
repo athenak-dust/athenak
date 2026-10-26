@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -80,6 +81,9 @@ struct GravityPointTransfer {
 #endif
   }
   void Buffers(const DepRemapMap &map,int nv) {
+    if (nv<1 || map.nsend<0 || map.nrecv<0 ||
+        std::max(map.nsend,map.nrecv)>std::numeric_limits<int>::max()/nv)
+      PointFail("gravity remap buffer exceeds MPI/device count capacity");
     const int n=std::max(1,std::max(map.nsend,map.nrecv)*nv);
     if (outgoing.extent_int(0)<n) {
       outgoing=DvceArray1D<Real>("gravity_point_send",n);
