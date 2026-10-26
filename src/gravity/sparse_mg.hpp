@@ -80,10 +80,19 @@ struct StorageStats {
   std::uint64_t current_a_nnz = 0, host_pattern_bytes = 0;
   std::uint64_t phase_nnz = 0, phase_rows = 0, phase_map_bytes = 0;
   std::uint64_t terminal_host_csr_bytes = 0;
+  // Retained phase ghost-map buckets and value payload; excludes allocator/node overhead.
+  std::uint64_t phase_ghost_map_bytes = 0;
 };
 
 struct FineOperatorStats {
   std::uint64_t updates = 0, value_updates = 0, structure_rebuilds = 0;
+  // Actual local phase operations in the current base-operator epoch. Halo
+  // rebuilds are collective; local CSR changes need not occur on every rank.
+  std::uint64_t local_pattern_changes = 0, halo_rebuilds = 0, halo_reuses = 0;
+  std::uint64_t local_ghost_changes = 0, global_ghost_changes = 0;
+  // Last map size/bucket count and peak bucket+value payload bytes, excluding
+  // implementation-specific node/allocator overhead (not a process RSS estimate).
+  std::uint64_t host_map_entries = 0, host_map_buckets = 0, host_map_peak_bytes = 0;
 };
 
 // Restarted flexible GMRES preconditioned by the supplied multigrid V-cycle. The
@@ -118,6 +127,9 @@ class SparseMultigrid {
   void UpdateFineOperator(const LocalCsr &matrix,
                           const std::vector<GlobalIndex> &partition = {});
   FineOperatorStats FineUpdates() const;
+  // Sum current fine/coarse A/P phase counters (R is fixed); map peaks are summed
+  // per operator, not a simultaneous transient process-memory measurement.
+  FineOperatorStats HierarchyPhaseUpdates() const;
   void ConfigureFinePhaseRows(const std::vector<int> &rows);
   // Refresh the outer and V-cycle finest operator together, including selected
   // smoother diagonal entries. They share one CSR/halo; coarse A/P/R stay cached.

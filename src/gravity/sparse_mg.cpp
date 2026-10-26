@@ -95,6 +95,7 @@ struct SparseMultigrid::Impl {
     Vector phase_values;
     std::vector<int> phase_rows_host, phase_rowptr_host;
     std::vector<GlobalIndex> phase_columns_host, phase_base_ghosts;
+    std::unordered_map<GlobalIndex,int> phase_ghost_slots;
     std::uint64_t phase_masked_base_nnz = 0;
     FineOperatorStats phase_updates;
   };
@@ -116,6 +117,10 @@ struct SparseMultigrid::Impl {
     s.host_pattern_bytes += (op.input_partition.capacity()+op.ghost_ids.capacity()
         +op.phase_base_ghosts.capacity()+op.phase_columns_host.capacity())*sizeof(GlobalIndex)
         +(op.phase_rows_host.capacity()+op.phase_rowptr_host.capacity())*sizeof(int);
+    const auto map_bytes = op.phase_ghost_slots.bucket_count()*sizeof(void*)
+        +op.phase_ghost_slots.size()*sizeof(decltype(op.phase_ghost_slots)::value_type);
+    s.phase_ghost_map_bytes += map_bytes;
+    s.host_pattern_bytes += map_bytes;
   }
   static void AddStorage(const Operator &op, StorageStats &s) {
     s.csr_bytes += (op.rowptr.size()+op.colidx.size())*sizeof(int)
@@ -381,7 +386,20 @@ struct SparseMultigrid::Impl {
     Kokkos::parallel_reduce("gravity_phase_base_nnz",Kokkos::RangePolicy<DevExeSpace>(0,count),
     KOKKOS_LAMBDA(int j, std::uint64_t &sum) { sum += rp(indices(j)+1)-rp(indices(j)); },masked);
     op.phase_masked_base_nnz = masked;
+    if (!rows.empty()) BuildGhostSlots(op);
     op.phase_configured = true;
+  }
+
+  void BuildGhostSlots(Operator &op) {
+    auto &slots = op.phase_ghost_slots;
+    slots.clear();
+    slots.reserve(op.ghost_ids.size());
+    for (size_t k = 0; k < op.ghost_ids.size(); ++k) slots.emplace(op.ghost_ids[k],k);
+    op.phase_updates.host_map_entries = slots.size();
+    op.phase_updates.host_map_buckets = slots.bucket_count();
+    op.phase_updates.host_map_peak_bytes = std::max(op.phase_updates.host_map_peak_bytes,
+        static_cast<std::uint64_t>(slots.bucket_count()*sizeof(void*)
+            +slots.size()*sizeof(decltype(op.phase_ghost_slots)::value_type)));
   }
 
   bool UpdatePhase(Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal = false) {
@@ -406,36 +424,60 @@ struct SparseMultigrid::Impl {
       }
     }
     Require(valid,"invalid compact phase CSR, ownership, row set, or smoothing diagonal");
-    int same = a.rowptr == op.phase_rowptr_host && a.colidx == op.phase_columns_host;
+    const bool same = a.rowptr == op.phase_rowptr_host && a.colidx == op.phase_columns_host;
+    if (!same) ++op.phase_updates.local_pattern_changes;
+    std::vector<GlobalIndex> next_ghosts;
+    const auto begin = op.input_partition[rank], end = op.input_partition[rank+1];
+    if (!same) {
+      next_ghosts = op.phase_base_ghosts;
+      std::vector<GlobalIndex> extra;
+      for (GlobalIndex j : a.colidx) {
+        if (j >= begin && j < end) continue;
+        const auto slot = op.phase_ghost_slots.find(j);
+        if (slot == op.phase_ghost_slots.end()
+            || slot->second >= static_cast<int>(op.phase_base_ghosts.size())) extra.push_back(j);
+      }
+      std::sort(extra.begin(),extra.end());
+      extra.erase(std::unique(extra.begin(),extra.end()),extra.end());
+      next_ghosts.insert(next_ghosts.end(),extra.begin(),extra.end());
+    }
+    const auto &ghosts = same ? op.ghost_ids : next_ghosts;
+    const int local_ghost_change = ghosts != op.ghost_ids;
+    int global_ghost_change = local_ghost_change;
 #if MPI_PARALLEL_ENABLED
-    MPI_Allreduce(MPI_IN_PLACE,&same,1,MPI_INT,MPI_MIN,comm);
+    // A remote rank may change requests addressed to this rank even when our
+    // own CSR/ghost list is unchanged. Every rank must rebuild the send plan.
+    MPI_Allreduce(MPI_IN_PLACE,&global_ghost_change,1,MPI_INT,MPI_MAX,comm);
 #endif
+    op.phase_updates.local_ghost_changes += local_ghost_change;
+    op.phase_updates.global_ghost_changes += global_ghost_change;
+    if (global_ghost_change) {
+      BuildHalo(op,ghosts);
+      ++op.phase_updates.halo_rebuilds;
+    } else {
+      ++op.phase_updates.halo_reuses;
+    }
+    if (local_ghost_change) BuildGhostSlots(op);
+    // No MPI occurs below this point: CSR/value uploads are local decisions.
     if (same) {
       auto host = Kokkos::create_mirror_view(op.phase_values);
       for (size_t k = 0; k < a.values.size(); ++k) host(k) = a.values[k];
       Kokkos::deep_copy(op.phase_values,host);
       ++op.phase_updates.value_updates;
     } else {
-      std::vector<GlobalIndex> ghosts = op.phase_base_ghosts, extra;
-      std::unordered_map<GlobalIndex,int> slots;
-      slots.reserve(ghosts.size()+a.colidx.size());
-      for (size_t k = 0; k < ghosts.size(); ++k) slots.emplace(ghosts[k],k);
-      const auto begin = op.input_partition[rank], end = op.input_partition[rank+1];
-      for (GlobalIndex j : a.colidx) {
-        if ((j < begin || j >= end) && slots.find(j) == slots.end()) extra.push_back(j);
-      }
-      std::sort(extra.begin(),extra.end());
-      extra.erase(std::unique(extra.begin(),extra.end()),extra.end());
-      for (GlobalIndex j : extra) {
-        slots.emplace(j,ghosts.size()); ghosts.push_back(j);
-      }
-      BuildHalo(op,ghosts);
       std::vector<int> columns(a.colidx.size());
       for (size_t k = 0; k < a.colidx.size(); ++k) {
         const GlobalIndex j = a.colidx[k];
-        columns[k] = j >= begin && j < end ? static_cast<int>(j-begin) : op.inputs+slots.at(j);
+        columns[k] = j >= begin && j < end ? static_cast<int>(j-begin)
+            : op.inputs+op.phase_ghost_slots.at(j);
       }
-      op.phase_rowptr = DeviceCopy(a.rowptr,"gravity_phase_rowptr");
+      if (op.phase_rowptr.size() == a.rowptr.size()) {
+        auto host = Kokkos::create_mirror_view(op.phase_rowptr);
+        for (size_t k = 0; k < a.rowptr.size(); ++k) host(k) = a.rowptr[k];
+        Kokkos::deep_copy(op.phase_rowptr,host);
+      } else {
+        op.phase_rowptr = DeviceCopy(a.rowptr,"gravity_phase_rowptr");
+      }
       op.phase_colidx = DeviceCopy(columns,"gravity_phase_columns");
       op.phase_values = DeviceCopy(a.values,"gravity_phase_values");
       op.phase_rowptr_host = a.rowptr;
@@ -1108,7 +1150,32 @@ void SparseMultigrid::UpdateFineOperator(const LocalCsr &a,
                                         const std::vector<GlobalIndex> &partition) {
   impl_->UpdateFine(a,partition);
 }
-FineOperatorStats SparseMultigrid::FineUpdates() const { return impl_->fine_updates; }
+FineOperatorStats SparseMultigrid::FineUpdates() const {
+  auto stats = impl_->current_a.phase_updates;
+  stats.updates = impl_->fine_updates.updates;
+  stats.value_updates = impl_->fine_updates.value_updates;
+  stats.structure_rebuilds = impl_->fine_updates.structure_rebuilds;
+  return stats;
+}
+FineOperatorStats SparseMultigrid::HierarchyPhaseUpdates() const {
+  FineOperatorStats total;
+  auto add = [&](const Impl::Operator &op) {
+    const auto &s = op.phase_updates;
+    total.updates += s.updates; total.value_updates += s.value_updates;
+    total.structure_rebuilds += s.structure_rebuilds;
+    total.local_pattern_changes += s.local_pattern_changes;
+    total.halo_rebuilds += s.halo_rebuilds; total.halo_reuses += s.halo_reuses;
+    total.local_ghost_changes += s.local_ghost_changes;
+    total.global_ghost_changes += s.global_ghost_changes;
+    total.host_map_entries += s.host_map_entries;
+    total.host_map_buckets += s.host_map_buckets;
+    total.host_map_peak_bytes += s.host_map_peak_bytes;
+  };
+  add(impl_->current_a);
+  for (size_t l = 1; l < impl_->levels.size(); ++l) add(impl_->levels[l].a);
+  for (size_t l = 0; l+1 < impl_->levels.size(); ++l) add(impl_->levels[l].p);
+  return total;
+}
 void SparseMultigrid::ConfigureFinePhaseRows(const std::vector<int> &rows) {
   impl_->ConfigurePhase(impl_->current_a,rows);
   std::vector<int>().swap(impl_->current_rowptr);
