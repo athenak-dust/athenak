@@ -88,8 +88,8 @@ std::vector<SchedPatch> sched_;
 struct DensityTrigger {
   Real rho_refine = 0.0, rho_derefine = 0.0;   // in units of the mean dust density (or code units)
   // <dust>/amr_rho_units = mean (default, the 2-D BA trigger:
-  // rho_d over the box mean) or code (rho_d itself, code units; the box mean of a stratified box
-  // depends on its height)
+  // rho_d over the box mean), code, or roche (thresholds in 9 Omega^2/(4 pi G)).
+  // Roche thresholds are converted once to code density; the traversal is shared.
   bool code_units = false;
   int buffer = 0;                               // cells of the block's level
   // The thresholds grow by level_factor per level (amr_rho_level_factor): a
@@ -213,8 +213,25 @@ void SetupDensityTrigger(ParameterInput *pin) {
   trig_.buffer = pin->GetOrAddInteger("dust", "amr_rho_buffer", 2);
   {
     const std::string un = pin->GetOrAddString("dust", "amr_rho_units", "mean");
-    if (un != "mean" && un != "code") fatal("<dust>/amr_rho_units must be mean or code");
-    trig_.code_units = (un == "code");
+    if (un != "mean" && un != "code" && un != "roche")
+      fatal("<dust>/amr_rho_units must be mean, code or roche");
+    trig_.code_units = (un != "mean");
+    if (un == "roche") {
+      if (!pin->DoesBlockExist("shearing_box") || !pin->DoesParameterExist("gravity","four_pi_G"))
+        fatal("Roche-density refinement requires shearing_box and gravity/four_pi_G");
+      const Real omega=pin->GetReal("shearing_box","omega0");
+      const Real fourpig=pin->GetReal("gravity","four_pi_G");
+      if (!std::isfinite(omega) || omega<=0 || !std::isfinite(fourpig) || fourpig<=0)
+        fatal("Roche-density refinement requires finite positive Omega and four_pi_G");
+      const Real roche=9*omega*omega/fourpig;
+      if (!std::isfinite(roche) || roche<=0) fatal("nonfinite Roche density");
+      trig_.rho_refine*=roche;
+      trig_.rho_derefine*=roche;
+      if (global_variable::my_rank==0)
+        std::cout<<"# DUST_ROCHE_REFINEMENT rho_roche="<<roche
+                 <<" reference_four_pi_G="<<fourpig<<" omega="<<omega
+                 <<"; level_factor=1 tags every above-threshold clump to user max level\n";
+    }
   }
   {
     // Rixin: each block on its own leaf cells, as the AthenaK criteria.
