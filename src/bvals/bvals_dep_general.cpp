@@ -26,7 +26,9 @@
 //! Every source ghost cell must be covered exactly once (checked).
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -202,6 +204,16 @@ std::vector<int> Candidates(MeshBlockPack *pp, const BlkR &b, const int m, const
   return std::vector<int>(c.begin(), c.end());
 }
 
+// ATHENA_DEP_PROFILE=1 in the environment prints, on rank 0 every 200
+// builds of the shear part, the mean host time per build of its phases (diagnostic only)
+struct DepProfile {
+  bool on = false;
+  int nbuild = 0;
+  double t[7] = {0, 0, 0, 0, 0, 0, 0};   // recv pairs, send pairs, check, layout+Alltoall, sort, device, total
+  DepProfile() {const char *e = std::getenv("ATHENA_DEP_PROFILE"); on = (e != nullptr && e[0] == '1');}
+};
+DepProfile &DepProf() {static DepProfile p; return p;}
+
 struct RecvPair {int rank, sgid, tgid; std::vector<int> cells; std::vector<PairEnt> ent; int tm;};
 struct SendPair {int rank, sgid, tgid; std::vector<int> cells; int sm;};
 struct TEnt {int tflat; int sgid; int scell; int sref; double w;};
@@ -279,6 +291,15 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
   std::vector<RecvPair> rpairs;
   std::vector<SendPair> spairs;
   std::vector<double> cov(static_cast<std::size_t>(nmb)*ncell, 0.0);
+  using PClock = std::chrono::steady_clock;
+  const bool prof = (part == 1) && DepProf().on;
+  auto tp0 = PClock::now(), tp = tp0;
+  auto lap = [&](const int k) {
+    if (!prof) return;
+    const auto now = PClock::now();
+    DepProf().t[k] += std::chrono::duration<double>(now - tp).count();
+    tp = now;
+  };
 
   // receiving side: the targets of this rank and their sources
   for (int tm=0; tm<nmb; ++tm) {
@@ -307,6 +328,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
       }
     }
   }
+  lap(0);
   // sending side: the sources of this rank with targets on other ranks
   for (int sm=0; sm<nmb; ++sm) {
     const BlkR s = MakeBlk(pm, g, gids + sm);
@@ -330,6 +352,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
       spairs.push_back(std::move(sp));
     }
   }
+  lap(1);
   // every ghost cell of the part covered once (dropped cells beyond a physical x3 face: none)
   int nbad = 0;
   double worst = 0.0;
@@ -369,6 +392,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
     std::exit(EXIT_FAILURE);
   }
 
+  lap(2);
   // message layouts: pairs sorted by (rank, source gid, target gid)
   auto key = [](int r, int s, int t) {return std::make_tuple(r, s, t);};
   std::sort(rpairs.begin(), rpairs.end(), [&](const RecvPair &x, const RecvPair &y) {
@@ -420,6 +444,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
   }
 #endif
 
+  lap(3);
   // target lists: by target cell, then (source gid, source cell)
   std::sort(tent.begin(), tent.end(), [](const TEnt &x, const TEnt &y) {
     if (x.tflat != y.tflat) return x.tflat < y.tflat;
@@ -436,6 +461,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
   seg_ptr.push_back(static_cast<int>(tent.size()));
   map.nseg = static_cast<int>(seg_tgt.size());
   map.nent = static_cast<int>(tent.size());
+  lap(4);
   map.seg_tgt = DvceArray1D<int>("dep_seg_tgt", std::max(1, map.nseg));
   map.seg_ptr = DvceArray1D<int>("dep_seg_ptr", map.nseg + 1);
   map.ent_src = DvceArray1D<int>("dep_ent_src", std::max(1, map.nent));
@@ -465,6 +491,18 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
   Kokkos::deep_copy(map.ent_src, h_src);
   Kokkos::deep_copy(map.ent_w, h_w);
   Kokkos::deep_copy(map.send_cell, h_send);
+  if (prof) {
+    lap(5);
+    DepProfile &P = DepProf();
+    P.t[6] += std::chrono::duration<double>(PClock::now() - tp0).count();
+    if (++P.nbuild % 200 == 0 && global_variable::my_rank == 0) {
+      const double f = 1.0e3/P.nbuild;
+      std::printf("# DEP_PROFILE shear builds %d, ms per build: recv pairs %.2f send pairs %.2f check %.2f "
+                  "layout+Alltoall %.2f sort %.2f device %.2f total %.2f (entries %d, sends %d)\n", P.nbuild,
+                  f*P.t[0], f*P.t[1], f*P.t[2], f*P.t[3], f*P.t[4], f*P.t[5], f*P.t[6], map.nent, map.nsend);
+      std::fflush(stdout);
+    }
+  }
 }
 
 //----------------------------------------------------------------------------------------
