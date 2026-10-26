@@ -248,6 +248,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   hybrid_enter_chi  = pin->GetOrAddReal("dust", "hybrid_enter_chi", 0.5);
   hybrid_exit_zeta  = pin->GetOrAddReal("dust", "hybrid_exit_zeta", 0.25);
   hybrid_exit_chi   = pin->GetOrAddReal("dust", "hybrid_exit_chi", 0.25);
+  // PC2 feedback stiffness monitor, optional dt limit and predictor damping (all off by default)
+  stiff_log = pin->GetOrAddBoolean("dust", "stiff_log", false);
+  stiff_thresh = pin->GetOrAddReal("dust", "stiff_thresh", -1.0);
+  pc2_feedback_damping = pin->GetOrAddBoolean("dust", "pc2_feedback_damping", false);
   if (!(hybrid_enter_zeta > hybrid_exit_zeta && hybrid_exit_zeta >= 0.0 &&
         hybrid_enter_chi > hybrid_exit_chi && hybrid_exit_chi >= 0.0)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -1276,6 +1280,11 @@ DustGasDrag::~DustGasDrag() {
       std::cout << " metric=not_computed";
     }
     std::cout << std::endl;
+  }
+  if (global_variable::my_rank == 0 && StiffnessActive()) {
+    std::cout << std::setprecision(6) << "# DUST_STIFFNESS max_chi=" << stiff_chi_run_max
+              << " last_chi=" << stiff_chi_last << " stiff_thresh=" << stiff_thresh
+              << " pc2_feedback_damping=" << (pc2_feedback_damping ? 1 : 0) << std::endl;
   }
   if (global_variable::my_rank == 0 && (prof_count[kProfAmr] > 0 || prof_count[kProfRefineClouds] > 0)) {
     // Rank 0's fenced phase times (s) and calls

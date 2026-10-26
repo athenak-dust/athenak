@@ -1425,6 +1425,22 @@ class DustGasDrag {
   Real hybrid_last_chi = 0.0;
   Real hybrid_feedback_rate_max = 0.0;
   bool hybrid_have_metric = false;
+  // Following Bai 2010 §2.4 and Athena-C, the PC2 feedback stiffness
+  // chi = dt max_cells sum_p w m_p/(t_s,p V rho_g) (= Bai's chi when t_s >= dt), from the stage-1
+  // predictor deposit qdep[4].  stiff_log: one line per cycle (dust_stiffness_log.txt); stiff_thresh
+  // > 0: dt <= stiff_thresh/max rate (as AthenaSG new_dt.c; < 0 = off, the default);
+  // pc2_feedback_damping: scale each cell's predictor feedback by 1/max(1, chi_cell) (Athena-C's
+  // feedback predictor; the stage-2 correction subtracts the scaled predictor, so momentum stays exact)
+  bool stiff_log = false;
+  Real stiff_thresh = -1.0;
+  bool pc2_feedback_damping = false;
+  Real stiff_rate_max = 0.0;       // max_cells sum w m/(t_s V rho_g) of the last PC2 predictor (global)
+  Real stiff_chi_last = 0.0;       // dt * stiff_rate_max of that cycle
+  Real stiff_chi_run_max = 0.0;    // largest chi of this run (since the start or restart)
+  bool StiffnessActive() const {
+    return stiff_log || stiff_thresh > 0.0 || pc2_feedback_damping;
+  }
+  void UpdateStiffness(const Real dt);
   unsigned long long hybrid_pc2_cycles = 0;
   unsigned long long hybrid_split_be_cycles = 0;
   DustSMRTransfer smr_transfer_mode = DustSMRTransfer::none;
