@@ -5,18 +5,129 @@
 #include "gravity/geometric_mg.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace gravity {
 namespace {
 using Row = std::vector<std::pair<GlobalIndex,Real>>;
+
+// One cache belongs to one fixed coarse geometry/phase and one host worker.
+// Keys retain every input coordinate bit; values retain the original weight
+// sequence and both dependency flags. Nothing is summed or reordered here.
+class AverageCache {
+  using Weight = std::pair<GlobalIndex,Real>;
+  using Key = std::array<std::uint64_t,6>;
+  static constexpr std::size_t kLimit = 16u*1024u*1024u;
+  struct Hash {
+    std::size_t operator()(const Key &key) const noexcept {
+      std::uint64_t value = 0x9e3779b97f4a7c15ULL;
+      for (auto bits : key) value ^= bits+0x9e3779b97f4a7c15ULL+(value<<6)+(value>>2);
+      return static_cast<std::size_t>(value);
+    }
+  };
+  class Budget final : public std::pmr::memory_resource {
+   public:
+    std::size_t used = 0, peak = 0;
+   private:
+    void *do_allocate(std::size_t bytes, std::size_t alignment) override {
+      if (bytes > kLimit-used) throw std::bad_alloc();
+      void *pointer = std::pmr::new_delete_resource()->allocate(bytes,alignment);
+      used += bytes; peak = std::max(peak,used); return pointer;
+    }
+    void do_deallocate(void *pointer, std::size_t bytes, std::size_t alignment) override {
+      std::pmr::new_delete_resource()->deallocate(pointer,bytes,alignment); used -= bytes;
+    }
+    bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
+      return this == &other;
+    }
+  };
+  struct Entry {
+    std::pmr::vector<Weight> values;
+    bool images, shear_images;
+    Entry(std::pmr::memory_resource *resource, const Row &weights, bool image, bool shear)
+        : values(weights.begin(),weights.end(),resource), images(image), shear_images(shear) {}
+  };
+ public:
+  struct Result {
+    Row owned;  // only an uncached query owns this ordinary working vector
+    const Weight *cached = nullptr;
+    std::size_t count = 0;
+    bool stored = false, images = false, shear_images = false;
+    std::size_t Size() const { return stored ? count : owned.size(); }
+    const Weight &operator[](std::size_t i) const { return stored ? cached[i] : owned[i]; }
+  };
+  explicit AverageCache(const MeshGeometry &coarse, bool measure = false)
+      : coarse_(coarse), arena_(4096,&budget_), cache_(&arena_), measure_(measure) {}
+
+  Result Get(const std::array<Real,3> &lo, const std::array<Real,3> &hi) {
+    Key key;
+    for (int d = 0; d < 3; ++d) {
+      const double lower = lo[d], upper = hi[d];
+      std::memcpy(&key[d],&lower,sizeof(lower));
+      std::memcpy(&key[d+3],&upper,sizeof(upper));
+    }
+    ++statistics_.queries;
+    const auto found = cache_.find(key);
+    if (found != cache_.end()) {
+      ++statistics_.hits;
+      const auto &entry = found->second;
+      return {{},entry.values.data(),entry.values.size(),true,entry.images,entry.shear_images};
+    }
+    ++statistics_.misses;
+    bool images = false, shear_images = false;
+    const auto begin = measure_ ? std::chrono::steady_clock::now() :
+                                 std::chrono::steady_clock::time_point{};
+    auto values = coarse_.VirtualAverage(lo,hi,&images,&shear_images);
+    if (measure_) statistics_.virtual_average_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
+    const bool oversized = values.size() > kLimit/sizeof(Weight);
+    if (!exhausted_ && !oversized) {
+      try {
+        const auto insertion = cache_.try_emplace(key,&arena_,values,images,shear_images);
+        const auto &entry = insertion.first->second;
+        return {{},entry.values.data(),entry.values.size(),true,entry.images,entry.shear_images};
+      } catch (const std::bad_alloc &) {
+        // Failed arena growth cannot affect the original query result. Keep
+        // existing entries usable, and bypass all subsequent new keys.
+        exhausted_ = true;
+      }
+    }
+    ++statistics_.bypasses;
+    statistics_.oversized_bypasses += oversized;
+    return {std::move(values),nullptr,0,false,images,shear_images};
+  }
+
+  ProlongationCacheStats Statistics() const {
+    auto result = statistics_;
+    result.entries = cache_.size(); result.worker_peak_bytes = budget_.peak;
+    return result;
+  }
+ private:
+  const MeshGeometry &coarse_;
+  Budget budget_;
+  std::pmr::monotonic_buffer_resource arena_;
+  std::pmr::unordered_map<Key,Entry,Hash> cache_;
+  bool measure_ = false, exhausted_ = false;
+  ProlongationCacheStats statistics_;
+};
+
+void AddCacheStats(ProlongationCacheStats &total, const ProlongationCacheStats &part) {
+  total.queries += part.queries; total.hits += part.hits; total.misses += part.misses;
+  total.bypasses += part.bypasses; total.oversized_bypasses += part.oversized_bypasses;
+  total.entries += part.entries; total.worker_peak_bytes += part.worker_peak_bytes;
+  total.virtual_average_seconds += part.virtual_average_seconds;
+}
 
 void Add(Row &row, GlobalIndex column, Real value) {
   if (value == 0.) return;
@@ -135,7 +246,7 @@ std::vector<GravityPatch> Coarsen(const std::vector<GravityPatch> &fine,
 
 void ProlongationRow(const MeshGeometry &fine, const MeshGeometry &coarse,
     const CompositeDomain &domain, GlobalIndex i, Row &row,
-    bool &images, bool &shear_images) {
+    bool &images, bool &shear_images, AverageCache &cache) {
   const auto cell = fine.Cell(i);
   const GlobalIndex parent = coarse.Locate(cell.center);
   const auto cc = coarse.Cell(parent);
@@ -159,16 +270,19 @@ void ProlongationRow(const MeshGeometry &fine, const MeshGeometry &coarse,
       const double center = cc.center[d]+(neighbor ? sign[d]*cc.width[d] : 0.);
       lo[d] = center-.5*cc.width[d]; hi[d] = center+.5*cc.width[d];
     }
-    bool image = false, shear_image = false;
-    for (const auto &v : coarse.VirtualAverage(lo,hi,&image,&shear_image))
+    const auto average = cache.Get(lo,hi);
+    for (std::size_t i = 0; i < average.Size(); ++i) {
+      const auto &v = average[i];
       Add(row,v.first,weight*v.second);
-    images = images || image; shear_images = shear_images || shear_image;
+    }
+    images = images || average.images; shear_images = shear_images || average.shear_images;
   }
 }
 
 void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
     const CompositeDomain &domain, int rank, LocalCsr &p, LocalCsr &r,
-    TransferDiagnostics &diagnostics, bool neumann_z, std::vector<int> &phase_rows) {
+    TransferDiagnostics &diagnostics, bool neumann_z, std::vector<int> &phase_rows,
+    ProlongationCacheStats &cache_statistics) {
   p.global_rows = fine.GlobalRows(); p.global_cols = coarse.GlobalRows();
   p.row_begin = fine.RowPartition()[rank];
   r.global_rows = coarse.GlobalRows(); r.global_cols = fine.GlobalRows();
@@ -185,32 +299,36 @@ void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
     r.colidx.reserve(expected_r); r.values.reserve(expected_r);
   }
   Row row; row.reserve(64);
-  for (GlobalIndex i = p.row_begin; i < fine_end; ++i) {
-    const auto cell = fine.Cell(i);
-    bool images = false, shear_images = false;
-    ProlongationRow(fine,coarse,domain,i,row,images,shear_images);
-    // Before the first x-image traversal, geometry routing is phase independent.
-    // Thus a row that can depend on phase records this traversal at every phase,
-    // even if its final coefficients cancel. No A-row dependency is assumed.
-    if (shear_images) phase_rows.push_back(static_cast<int>(i-p.row_begin));
-    Real constant = 0.; std::array<Real,3> linear{};
-    for (const auto &v : row) {
-      constant += v.second;
-      if (!images) {
-        const auto source = coarse.Cell(v.first);
-        for (int d = 0; d < domain.ndim; ++d) linear[d] += v.second*source.center[d];
+  {
+    AverageCache cache(coarse);
+    for (GlobalIndex i = p.row_begin; i < fine_end; ++i) {
+      const auto cell = fine.Cell(i);
+      bool images = false, shear_images = false;
+      ProlongationRow(fine,coarse,domain,i,row,images,shear_images,cache);
+      // Before the first x-image traversal, geometry routing is phase independent.
+      // Thus a row that can depend on phase records this traversal at every phase,
+      // even if its final coefficients cancel. No A-row dependency is assumed.
+      if (shear_images) phase_rows.push_back(static_cast<int>(i-p.row_begin));
+      Real constant = 0.; std::array<Real,3> linear{};
+      for (const auto &v : row) {
+        constant += v.second;
+        if (!images) {
+          const auto source = coarse.Cell(v.first);
+          for (int d = 0; d < domain.ndim; ++d) linear[d] += v.second*source.center[d];
+        }
       }
+      if (!domain.isolated_z || neumann_z)
+        diagnostics.constant_defect = std::max(diagnostics.constant_defect,std::abs(constant-Real(1)));
+      if (!images) {
+        ++diagnostics.interior_linear_rows;
+        for (int d = 0; d < domain.ndim; ++d)
+          diagnostics.interior_linear_defect = std::max(diagnostics.interior_linear_defect,
+                                                      std::abs(linear[d]-cell.center[d]));
+      }
+      Append(p,row);
     }
-    if (!domain.isolated_z || neumann_z)
-      diagnostics.constant_defect = std::max(diagnostics.constant_defect,std::abs(constant-Real(1)));
-    if (!images) {
-      ++diagnostics.interior_linear_rows;
-      for (int d = 0; d < domain.ndim; ++d)
-        diagnostics.interior_linear_defect = std::max(diagnostics.interior_linear_defect,
-                                                    std::abs(linear[d]-cell.center[d]));
-    }
-    Append(p,row);
-  }
+    cache_statistics = cache.Statistics();
+  }  // Free the P-query cache before constructing R or uploading either matrix.
   for (GlobalIndex i = r.row_begin; i < coarse_end; ++i) {
     const auto cell = coarse.Cell(i); std::array<Real,3> lo{}, hi{};
     double volume = 1.;
@@ -258,7 +376,9 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     std::unique_ptr<MeshGeometry> coarse(new MeshGeometry(std::move(coarse_patches),domain,
                                                         rank,nranks,neumann_z,true));
     LocalCsr p, r; TransferDiagnostics check; std::vector<int> phase_rows;
-    Transfers(*fine,*coarse,domain,rank,p,r,check,neumann_z,phase_rows);
+    ProlongationCacheStats cache_statistics;
+    Transfers(*fine,*coarse,domain,rank,p,r,check,neumann_z,phase_rows,cache_statistics);
+    out.initial_prolongation_cache.push_back(cache_statistics);
     auto system = coarse->BuildSystem(false);
     out.quadratic_interface_fallbacks.push_back(system.quadratic_interface_fallbacks);
     out.hierarchy.matrices.push_back(std::move(system.matrix));
@@ -275,7 +395,7 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
 
 CsrRowUpdate BuildProlongationPhaseUpdate(const MeshGeometry &fine,
     const MeshGeometry &coarse, const CompositeDomain &domain, int rank,
-    const std::vector<int> &rows) {
+    const std::vector<int> &rows, ProlongationCacheStats *statistics) {
   const GlobalIndex begin = fine.RowPartition()[rank];
   const GlobalIndex count = fine.RowPartition()[rank+1]-begin;
   if (!std::is_sorted(rows.begin(),rows.end()) ||
@@ -285,6 +405,7 @@ CsrRowUpdate BuildProlongationPhaseUpdate(const MeshGeometry &fine,
   const int workers = rows.size() < 256 ? 1 :
       std::max(1,std::min(fine.PhaseThreads(),static_cast<int>(rows.size())));
   std::vector<CsrRowUpdate> parts(workers);
+  std::vector<ProlongationCacheStats> cache_statistics(workers);
   std::vector<std::exception_ptr> errors(workers);
   auto assemble = [&](int worker) {
     try {
@@ -293,11 +414,13 @@ CsrRowUpdate BuildProlongationPhaseUpdate(const MeshGeometry &fine,
       const size_t first = rows.size()*worker/workers, last = rows.size()*(worker+1)/workers;
       a.rows.assign(rows.begin()+first,rows.begin()+last);
       Row row; row.reserve(64);
+      AverageCache cache(coarse,statistics != nullptr);
       for (size_t j = first; j < last; ++j) {
         bool images = false, shear_images = false;
-        ProlongationRow(fine,coarse,domain,begin+rows[j],row,images,shear_images);
+        ProlongationRow(fine,coarse,domain,begin+rows[j],row,images,shear_images,cache);
         Append(a,row);
       }
+      cache_statistics[worker] = cache.Statistics();
     } catch (...) { errors[worker] = std::current_exception(); }
   };
   std::vector<std::thread> threads;
@@ -307,6 +430,10 @@ CsrRowUpdate BuildProlongationPhaseUpdate(const MeshGeometry &fine,
   assemble(0);
   for (auto &thread : threads) thread.join();
   for (const auto &error : errors) if (error) std::rethrow_exception(error);
+  if (statistics) {
+    *statistics = {};
+    for (const auto &part : cache_statistics) AddCacheStats(*statistics,part);
+  }
   auto out = std::move(parts[0]);
   for (int worker = 1; worker < workers; ++worker) {
     const auto &part = parts[worker]; const int offset = out.values.size();

@@ -5,6 +5,7 @@
 #ifndef GRAVITY_GEOMETRIC_MG_HPP_
 #define GRAVITY_GEOMETRIC_MG_HPP_
 
+#include <cstdint>
 #include <memory>
 #include "gravity/mesh_geometry.hpp"
 
@@ -15,6 +16,15 @@ struct TransferDiagnostics {
   Real interior_linear_defect = 0;
   Real restriction_volume_defect = 0;
   GlobalIndex interior_linear_rows = 0;
+};
+
+struct ProlongationCacheStats {
+  std::uint64_t queries = 0, hits = 0, misses = 0;
+  std::uint64_t bypasses = 0, oversized_bypasses = 0, entries = 0;
+  // Sum of worker arena peaks, excluding allocator overhead and uncached query
+  // working storage. Each lazily allocated arena is capped at16MiB.
+  std::uint64_t worker_peak_bytes = 0;
+  double virtual_average_seconds = 0;  // measured only for an explicit stats request
 };
 
 struct GeometricSystem {
@@ -33,6 +43,7 @@ struct GeometricSystem {
   std::vector<std::vector<GravityPatch>> patches;
   // Local maxima/counts; callers may reduce them for collective diagnostics.
   std::vector<TransferDiagnostics> transfer_checks;
+  std::vector<ProlongationCacheStats> initial_prolongation_cache;
   std::vector<std::size_t> quadratic_interface_fallbacks;
 };
 
@@ -53,7 +64,7 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
 // local P dependency list discovered during the original transfer construction.
 CsrRowUpdate BuildProlongationPhaseUpdate(const MeshGeometry &fine,
     const MeshGeometry &coarse, const CompositeDomain &domain, int rank,
-    const std::vector<int> &rows);
+    const std::vector<int> &rows, ProlongationCacheStats *statistics = nullptr);
 
 }  // namespace gravity
 #endif  // GRAVITY_GEOMETRIC_MG_HPP_
