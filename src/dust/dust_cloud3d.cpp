@@ -1539,7 +1539,9 @@ void DustGasDrag::CloudAdvance3D() {
   const bool is_sbox = is_shearing_box, is_strat = is_stratified;
   const Real qshear_ = qshear, omega0_ = omega0;
   auto &dmom_ = dmom;
-  UpdateShear3D(pmy_pack->pmesh->time + 0.5*dt);   // the midpoint positions
+  // The gas is sampled in its t^n orbital-advection frame (the remap runs after this
+  // gather and the impulse deposit), so the shear-periodic images are those of t^n
+  UpdateShear3D(pmy_pack->pmesh->time);
   const auto lt = leaf_traversal3d;
   const int tmode = cloud_transition;
   PackGatherField3D(ustar);
@@ -1554,10 +1556,13 @@ void DustGasDrag::CloudAdvance3D() {
     const Real xh = x0 + 0.5*dt*vx0;
     const Real yh = y0 + 0.5*dt*(vy0 - (is_sbox ? qshear_*omega0_*x0 : 0.0));
     const Real zh = z0 + 0.5*dt*vz0;
+    // The gas met at the lab midpoint (xh, yh) sits at yh + q Omega xh dt/2 in the stored
+    // field (IPY1 keeps the lab midpoint)
+    const Real yg = yh + (is_sbox ? qshear_*omega0_*xh*0.5*dt : 0.0);
     Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
     const int glev = T::GatherCode(pi(PLEV,p), tmode);
     const bool same = (glev & ~T::kCloudGatherPoint) == pi(PLEV,p);
-    lt.ForEachCloudMoment(xh, yh, zh, glev, am,
+    lt.ForEachCloudMoment(xh, yg, zh, glev, am,
     [&](const int target, const Real w, const Real m1x, const Real m1y, const Real m1z) {
       int tb, tk, tj, ti;
       lt.Decode(target, tb, tk, tj, ti);
@@ -1566,7 +1571,7 @@ void DustGasDrag::CloudAdvance3D() {
       const Real yc = lt.box(tb,1) + (tj - js + 0.5)*dx2;
       const Real zc = lt.box(tb,2) + (tk - ks + 0.5)*dx3;
       const Real cx = 0.5*(m1x + T::MinImage(xh - xc, lt.lx)*w)/dx1;
-      const Real cy = 0.5*(m1y + T::MinImage(yh - yc, lt.ly)*w)/dx2;
+      const Real cy = 0.5*(m1y + T::MinImage(yg - yc, lt.ly)*w)/dx2;
       const Real cz = 0.5*(m1z + T::MinImage(zh - zc, lt.lz)*w)/dx3;
       ugx += w*gp(tb,tk,tj,ti,0) + cx*gp(tb,tk,tj,ti,3) + cy*gp(tb,tk,tj,ti,6) + cz*gp(tb,tk,tj,ti,9);
       ugy += w*gp(tb,tk,tj,ti,1) + cx*gp(tb,tk,tj,ti,4) + cy*gp(tb,tk,tj,ti,7) + cz*gp(tb,tk,tj,ti,10);
@@ -1620,7 +1625,7 @@ void DustGasDrag::CloudAdvance3D() {
     if (same && nt <= kCache3) {
       for (int q=0; q<nt; ++q) if (tw[q] != 0.0) add(tt[q], tw[q]);
     } else {
-      lt.ForEachCloudWeight(xh, yh, zh, pi(PLEV,p), am, add);
+      lt.ForEachCloudWeight(xh, yg, zh, pi(PLEV,p), am, add);
     }
   };
   if (cloud_ord_n > 0) {   // (cloud_order_interval) in the cell-sorted index order

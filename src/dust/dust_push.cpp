@@ -265,13 +265,17 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         Real yh = y0 + 0.5*dt*(vy0 - ((is_sbox && three_d) ?
                                       qshear_*omega0_*x0 : 0.0));
         Real zh = three_d ? z0 + 0.5*dt*vz0 : z0;
+        // Inside the step the gas is still in the t^n orbital-advection frame (the remap
+        // runs at the end of the last stage, after this gather and the impulse deposit): the gas met
+        // at the lab midpoint (xh, yh) sits at yh + q Omega xh dt/2 in the stored field
+        Real yg = yh + ((is_sbox && three_d) ? qshear_*omega0_*xh*0.5*dt : 0.0);
 
         int ip, jp, kp;
         Real wx[3], wy[3], wz[3];
         if (!composite_smr) {
           PMWeights(xh, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
                     scheme, ip, wx);
-          PMWeights(yh, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
+          PMWeights(yg, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
                     scheme, jp, wy);
           if (three_d) {
             PMWeights(zh, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
@@ -310,18 +314,18 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         };
         int glev = SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode);
         if (linear) {
-          lt.ForEachCloudMoment(xh, yh, glev, am,
+          lt.ForEachCloudMoment(xh, yg, glev, am,
           [&](const int target, const Real w, const Real m1x, const Real m1y) {
             int ti = target % ncells1;
             int remainder = target/ncells1;
             int tj = remainder % ncells2;
             int tm = remainder/ncells2;
             Real ux, uy, uz;
-            leaf_value(xh, yh, tm, tj, ti, w, m1x, m1y, ux, uy, uz);
+            leaf_value(xh, yg, tm, tj, ti, w, m1x, m1y, ux, uy, uz);
             ugx += ux; ugy += uy; ugz += uz;
           });
         } else if (composite_smr) {
-          ForEachCompositeWeight(transfer, lt, xh, yh, glev, am,
+          ForEachCompositeWeight(transfer, lt, xh, yg, glev, am,
           [&](const int target, const Real particle_weight) {
             int ti = target % ncells1;
             int remainder = target/ncells1;
@@ -427,7 +431,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         if (br) {
           if (composite_smr) {
             Real mass = -pr(IPM,p);
-            ForEachCompositeWeight(transfer, lt, xh, yh, pi(PLEV,p), am,
+            ForEachCompositeWeight(transfer, lt, xh, yg, pi(PLEV,p), am,
             [&](const int target, const Real particle_weight) {
               int ti = target % ncells1;
               int remainder = target/ncells1;
