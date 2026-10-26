@@ -364,13 +364,14 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
     return TaskStatus::complete;
   }
 
+  const Real sh = ImplicitShearShift(pdrive, stage);   // 0 for the hybrid paths
   par_for("dust_scatter",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     int ip, jp, kp;
     Real wx[3], wy[3], wz[3];
     PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
               scheme, ip, wx);
-    PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
+    PMWeights(pr(IPY,p) + sh*pr(IPX,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
               scheme, jp, wy);
     if (three_d) {
       PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
@@ -936,13 +937,14 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
     return TaskStatus::complete;
   }
 
+  const Real sh = ImplicitShearShift(pdrive, stage);   // 0 for split-BE
   par_for("dust_gather",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     int ip, jp, kp;
     Real wx[3], wy[3], wz[3];
     PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
               scheme, ip, wx);
-    PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
+    PMWeights(pr(IPY,p) + sh*pr(IPX,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
               scheme, jp, wy);
     if (three_d) {
       PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,

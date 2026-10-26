@@ -32,13 +32,15 @@ void DustGasDrag::CloudDepositImplicit3D(Driver *pdrive, int stage) {
   auto pi = pmy_pack->ppart->prtcl_idata;
   const int npart = pmy_pack->ppart->nprtcl_thispack;
   const Real a_dt = DragStep(pdrive);
-  UpdateShear3D(CloudImplicitTime3D(pdrive, stage));
+  // The gas is in its t^n orbital-advection frame: shear images of t^n, positions shifted
+  const Real sh = ImplicitShearShift(pdrive, stage);
+  UpdateShear3D(pmy_pack->pmesh->time);
   const auto lt = leaf_traversal3d;
   auto qp = qdep;  // cleared, including halo slots, by DepositDrag
   auto body = KOKKOS_LAMBDA(const int p) {
     const Real mass_c = pr(IPM,p)*a_dt/(pr(IPTS,p) + a_dt);
     const Real vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
-    lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p),
+    lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p) + sh*pr(IPX,p), pr(IPZ,p), pi(PLEV,p),
                           lt.Anchor(pi(PGID,p)),
     [&](const int target, const Real w) {
       int b, k, j, i;
@@ -68,7 +70,8 @@ void DustGasDrag::CloudGatherImplicit3D(Driver *pdrive, int stage) {
   const Real a_dt = DragStep(pdrive);
   const bool br = back_reaction;
   const int tmode = cloud_transition;
-  UpdateShear3D(CloudImplicitTime3D(pdrive, stage));
+  const Real sh = ImplicitShearShift(pdrive, stage);   // as in CloudDepositImplicit3D
+  UpdateShear3D(pmy_pack->pmesh->time);
   const auto lt = leaf_traversal3d;
   // The common u* exchange has already filled same-level and coarse/fine ghosts,
   // including physical x3 boundaries. Pack owners' slopes before forwarding to halo.
@@ -80,7 +83,7 @@ void DustGasDrag::CloudGatherImplicit3D(Driver *pdrive, int stage) {
     constexpr int cache = 27;
     int nt = 0, tt[cache];
     Real tw[cache];
-    const Real xp = pr(IPX,p), yp = pr(IPY,p), zp = pr(IPZ,p);
+    const Real xp = pr(IPX,p), yp = pr(IPY,p) + sh*pr(IPX,p), zp = pr(IPZ,p);
     const int am = lt.Anchor(pi(PGID,p)), lev = pi(PLEV,p);
     const int glev = T::GatherCode(lev, tmode);
     const bool same = (glev & ~T::kCloudGatherPoint) == lev;

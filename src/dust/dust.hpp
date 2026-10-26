@@ -1849,6 +1849,13 @@ class DustGasDrag {
   void CloudPredictor3D(const bool rate_dep);
   void CloudAdvance3D();
   Real CloudImplicitTime3D(Driver *pdrive, int stage) const;
+  // IMEX stages see the gas in its t^n orbital-advection frame (the remap runs at the end
+  // of the last stage): a particle at the lab stage position (x, y) meets the gas stored at
+  // y + ImplicitShearShift*x (0 outside the 3-D shearing box and for the hybrid paths)
+  Real ImplicitShearShift(Driver *pdrive, int stage) const {
+    if (!is_shearing_box || !pmy_pack->pmesh->three_d || coupling != DustCoupling::imex) return 0.0;
+    return qshear*omega0*(CloudImplicitTime3D(pdrive, stage) - pmy_pack->pmesh->time);
+  }
   void CloudDepositImplicit3D(Driver *pdrive, int stage);
   void CloudGatherImplicit3D(Driver *pdrive, int stage);
   void DepositCloudDensity3D(DvceArray5D<Real> &f);
