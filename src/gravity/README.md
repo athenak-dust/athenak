@@ -26,9 +26,9 @@ changed-rank2->4 restart differences were below2e-15.
 This completes the implemented hydro feature set and its engineering regression
 checks. Long nonlinear self-gravitating application validation and deposited
 dust gravity/particle gathering remain separate work. Density-weighted total
-self-force is convergent, not exactly zero. Dedicated-library experiments are
-isolated on a separate benchmark branch; they do not change this baseline or
-its default backend.
+self-force is convergent, not exactly zero. Rixin: decided not to include the
+cuSPARSE experiment in the final module: the adapter, dependency and runtime
+selectors are absent from this branch.
 
 The following timings are historical benchmarks with earlier operators and
 different meshes/time-step windows, retained for provenance:
