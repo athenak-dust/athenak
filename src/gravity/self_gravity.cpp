@@ -87,8 +87,12 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   }
   if (evolution == "dynamic") {
     const auto integrator = pin->GetOrAddString("time", "integrator", "rk2");
-    if (integrator != "rk1" && integrator != "rk2" && integrator != "rk3") {
-      Fail("gravity half-kicks currently support rk1/rk2/rk3 only");
+    const bool cloud_imex = coupled_dust_ && integrator == "imex2+" &&
+        pack->pdust->Clouds3D() && pack->pdust->coupling == DustCoupling::imex &&
+        pack->pdust->drag_solver == DustDragSolver::local;
+    if (integrator != "rk1" && integrator != "rk2" && integrator != "rk3" && !cloud_imex) {
+      Fail("gravity half-kicks support rk1/rk2/rk3, or imex2+ with supported "
+           "3D refinable-cloud local dust drag");
     }
   }
   auto *orbital = pack->phydro->porb_u;

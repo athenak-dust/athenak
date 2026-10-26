@@ -320,6 +320,10 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   Real a_dt = DragStep(pdrive);
   auto &qdep_ = qdep;
 
+  if (clouds3d) {
+    CloudDepositImplicit3D(pdrive, stage);
+    return TaskStatus::complete;
+  }
   if (UsesCompositeTransfer()) {
     auto transfer = smr_transfer;
     auto lt = leaf_traversal;   // cloud weights on the actual leaves
@@ -712,6 +716,10 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
   auto &ustar_ = ustar;
   auto &dmom_ = dmom;
 
+  if (clouds3d) {
+    CloudGatherImplicit3D(pdrive, stage);
+    return TaskStatus::complete;
+  }
   if (UsesCompositeTransfer()) {
     auto transfer = smr_transfer;
     auto lt = leaf_traversal;   // cloud weights on the actual leaves

@@ -1631,6 +1631,12 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   auto rnow = [&]() {if (rlog) Kokkos::fence(); return RClock::now();};
   auto r0 = rnow();
   BuildRefinableCloudTransfer(pin);
+  // Cloud IMEX exchanges u* at each working stage. PC2 did not read this shear
+  // object, whose topology must follow the same regrid as the cloud/gas lists.
+  if (psbox_us != nullptr) {
+    psbox_us->BuildBoundaryLists();
+    psbox_us->AllocateBuffers();
+  }
   // Shear-periodic x1: the particle routing across the radial faces on the new mesh
   if (ppar->pbval_part->shear_periodic_x1) ppar->pbval_part->BuildShearMaps();
   auto r1 = rnow(), r2 = r1, r3 = r1;

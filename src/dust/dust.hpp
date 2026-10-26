@@ -1831,6 +1831,9 @@ class DustGasDrag {
   void PackGasGather3D(const DvceArray5D<Real> &u);
   void CloudPredictor3D(const bool rate_dep);
   void CloudAdvance3D();
+  Real CloudImplicitTime3D(Driver *pdrive, int stage) const;
+  void CloudDepositImplicit3D(Driver *pdrive, int stage);
+  void CloudGatherImplicit3D(Driver *pdrive, int stage);
   void DepositCloudDensity3D(DvceArray5D<Real> &f);
   // Gravity uses the physical mass assignment, independently of drag's linear
   // velocity reconstruction. Fields contain owned active leaves; halo exchange
