@@ -79,16 +79,26 @@ potential/acceleration in active cells. Gravity ghost-zone output is rejected.
 
 ## Discrete operator
 
-`mesh_geometry.*` constructs one potential unknown per active leaf cell;
-`composite.*` retains the reference implementation. Every face
+`mesh_geometry.*` constructs one point-center potential unknown per active leaf
+cell. `composite.*` uses the same finest physical operator and retains a separate
+global Galerkin hierarchy. Every face
 fragment contributes the same integrated normal flux with opposite signs to the
 two adjacent cells, including coarse/fine and sheared periodic interfaces.
 This is conservation of Poisson/Gauss flux, not a claim of exact total momentum
 conservation of the coupled AMR scheme.
-Transverse least-squares slopes bring the two potentials to the fragment's
-transverse centroid. The slope operator is only for reconstruction; acceleration
-uses the area average of shared normal face derivatives. Using the raw slope as
-the force had first-order maximum errors in the prototype.
+At offset or unequal-width faces, a scaled quadratic least-squares fit on two
+face-neighbor rings brings the potentials to the fragment's transverse centroid.
+The shared center-to-center secant is corrected by
+$(h_L-h_R)(\phi_{nn,L}+\phi_{nn,R})/8$ because its midpoint differs from the
+physical face when the normal widths differ. Both transverse quadratic moments
+and this normal correction are necessary to reproduce general quadratic
+potentials at a coarse/fine face. Aligned equal-width interior faces retain the
+seven-point stencil. Acceleration uses the area average of the shared normal
+face derivatives; the reconstruction gradient is not used directly as force.
+The wider reconstruction affects setup/phase assembly and CSR halo size, while
+all force applications remain sparse matrix operations. The potential has point
+semantics even though hydro supplies cell-average density; their source
+quadrature difference remains a second-order spatial approximation.
 
 The matrix is the **negative integrated Laplacian**, so the physical right-hand
 side is $-4\pi G\rho V$. Periodic solves subtract the volume-weighted density mean
@@ -172,8 +182,17 @@ time coupling remain the responsibility of the future dust implementation.
 
 Whole-AthenaK periodic and mixed 2D/3D manufactured tests show approximately
 second-order potential and force $L_2$ convergence. Mixed isolated-slab force
-convergence was about 1.73; maximum/interface-force convergence is weaker than
-uniform-grid convergence. The isolated slab retains its nonzero mean sheet field.
+convergence was about 1.73 with the earlier linear interface reconstruction;
+these historical numbers do not validate the quadratic interface update.
+The isolated slab retains its nonzero mean sheet field.
+
+The explicit double-precision `gravity_geometry_check` CMake target checks every quadratic moment
+in 2D/3D (including mixed moments), isolated potential/normal-derivative data,
+second-order interface force convergence for a cubic potential, periodic Gauss
+flux and constant identities, full-wrap phase-update/rebuild equivalence, and
+reference row/boundary-sample mapping. Run the executable from an external
+scratch directory. This is a direct operator check, separate from convergence
+of a physical-density Poisson solve or conservation of hydro momentum.
 
 Physical tests include Jeans growth/oscillation, actual refine/derefine, and
 three-dimensional shearing waves with mixed orbital-advection faces. Doubling

@@ -24,11 +24,17 @@ using Entry = std::pair<GlobalIndex, double>;
 using Row = std::vector<Entry>;
 using Gradient = std::vector<std::pair<GlobalIndex, Vec>>;
 using GradientCache = std::unordered_map<GlobalIndex, Gradient>;
+using Modes = std::array<double,9>;
+struct Quadratic {
+  std::vector<std::pair<GlobalIndex,Modes>> coefficients;
+  bool phase_dependent = false;
+};
+using QuadraticCache = std::unordered_map<GlobalIndex,Quadratic>;
 struct Box { Vec lo{}, hi{}; };
 struct Node { Box box; int begin, end, left = -1, right = -1; };
 struct Face {
   GlobalIndex left, right;
-  int normal;
+  int normal, side;
   double area = 1., distance;
   Vec delta{}, ti{}, tj{};
 };
@@ -130,8 +136,9 @@ struct MeshGeometry::Impl {
   std::vector<int> order, row_order, sample_order;
   std::vector<Node> tree;
   GradientCache gradients;
+  QuadraticCache quadratics;
   struct PhaseContext {
-    GradientCache gradients;
+    QuadraticCache quadratics;
     double shear = std::numeric_limits<double>::quiet_NaN();
   };
   std::vector<PhaseContext> phase_contexts;
@@ -245,7 +252,7 @@ struct MeshGeometry::Impl {
   }
   Face MakeFace(GlobalIndex row, const CompositeCell &ci, GlobalIndex other,
                 const CompositeCell &cj, const Vec &image, int d, int side) const {
-    Face f{}; f.normal = d;
+    Face f{}; f.normal = d; f.side = side;
     const auto &left = side > 0 ? ci : cj;
     const auto &right = side > 0 ? cj : ci;
     f.left = side > 0 ? row : other; f.right = side > 0 ? other : row;
@@ -287,7 +294,8 @@ struct MeshGeometry::Impl {
       const bool periodic = std::abs(edge-(side < 0 ? domain.lo[d] : domain.hi[d])) <
                             minwidth[d]*1.e-5;
       if (periodic && d == 2 && domain.isolated_z) {
-        Face f{}; f.normal = d; f.distance = ci.width[d]; f.delta[d] = f.distance;
+        Face f{}; f.normal = d; f.side = side;
+        f.distance = ci.width[d]; f.delta[d] = f.distance;
         f.left = side < 0 ? Sample(p,ijk,side) : row;
         f.right = side < 0 ? row : Sample(p,ijk,side);
         for (int t = 0; t < nd; ++t) if (t != d) f.area *= ci.width[t];
@@ -364,7 +372,7 @@ struct MeshGeometry::Impl {
     for (const auto &f : faces) {
       double d2 = 0.;
       for (int d = 0; d < nd; ++d) d2 += f.delta[d]*f.delta[d];
-      const double sign = row == f.left ? 1. : -1.;
+      const double sign = f.side;
       const GlobalIndex other = row == f.left ? f.right : f.left;
       for (int r = 0; r < nd; ++r) {
         double coefficient = 0.;
@@ -374,6 +382,105 @@ struct MeshGeometry::Impl {
       }
     }
     return cache.emplace(row,std::move(g)).first->second;
+  }
+  // Point-center quadratic reconstruction. Two face-neighbor rings include
+  // mixed moments even on a Cartesian interior (one ring has only axis points).
+  // All coordinates are local unwrapped images, including at a shearing seam.
+  const Quadratic &Quad(GlobalIndex row, QuadraticCache &cache) const {
+    auto found = cache.find(row);
+    if (found != cache.end()) return found->second;
+    struct Sample { GlobalIndex id; Vec delta; };
+    const auto cell = Cell(row);
+    std::vector<Sample> samples;
+    auto add = [&](GlobalIndex id, const Vec &delta) {
+      double distance = 0.;
+      for (int d = 0; d < nd; ++d)
+        distance += (delta[d]/cell.width[d])*(delta[d]/cell.width[d]);
+      if (distance < 1.e-20) return;
+      for (const auto &s : samples) {
+        if (s.id != id) continue;
+        double error = 0.;
+        for (int d = 0; d < nd; ++d) error += std::abs(s.delta[d]-delta[d])/cell.width[d];
+        if (error < 1.e-8) return;
+      }
+      samples.push_back({id,delta});
+    };
+    auto neighbors = [&](GlobalIndex id, const Vec &offset) {
+      for (const auto &f : Faces(id)) {
+        const double sign = f.side;
+        Vec delta = offset;
+        for (int d = 0; d < nd; ++d) delta[d] += sign*f.delta[d];
+        add(id == f.left ? f.right : f.left,delta);
+      }
+    };
+    Quadratic q; q.phase_dependent = TouchesX(cell);
+    neighbors(row,Vec{});
+    const size_t first_ring = samples.size();
+    for (size_t i = 0; i < first_ring; ++i) {
+      const auto sample = samples[i];
+      if (sample.id >= partition.back()) continue;
+      q.phase_dependent = q.phase_dependent || TouchesX(sample.id);
+      neighbors(sample.id,sample.delta);
+    }
+    const int modes = nd+nd*(nd+1)/2;
+    auto basis = [&](const Vec &delta) {
+      Modes b{};
+      for (int d = 0; d < nd; ++d) b[d] = delta[d]/cell.width[d];
+      int k = nd;
+      for (int d = 0; d < nd; ++d) for (int t = d; t < nd; ++t)
+        b[k++] = b[d]*b[t]*(d == t ? .5 : 1.);
+      return b;
+    };
+    std::array<Modes,9> normal{}, inverse{};
+    for (const auto &s : samples) {
+      const auto b = basis(s.delta);
+      double distance = 0.;
+      for (int d = 0; d < nd; ++d) distance += b[d]*b[d];
+      const double weight = 1./distance;
+      for (int i = 0; i < modes; ++i) for (int j = 0; j < modes; ++j)
+        normal[i][j] += weight*b[i]*b[j];
+    }
+    for (int i = 0; i < modes; ++i) inverse[i][i] = 1.;
+    for (int i = 0; i < modes; ++i) {
+      int pivot = i;
+      for (int j = i+1; j < modes; ++j)
+        if (std::abs(normal[j][i]) > std::abs(normal[pivot][i])) pivot = j;
+      if (std::abs(normal[pivot][i]) < 1.e-12)
+        throw std::runtime_error("Gravity singular quadratic face reconstruction");
+      std::swap(normal[i],normal[pivot]); std::swap(inverse[i],inverse[pivot]);
+      const double scale = normal[i][i];
+      for (int j = 0; j < modes; ++j) {
+        normal[i][j] /= scale; inverse[i][j] /= scale;
+      }
+      for (int j = 0; j < modes; ++j) if (j != i) {
+        const double factor = normal[j][i];
+        for (int k = 0; k < modes; ++k) {
+          normal[j][k] -= factor*normal[i][k];
+          inverse[j][k] -= factor*inverse[i][k];
+        }
+      }
+    }
+    auto coefficient = [&](GlobalIndex id, const Modes &value) {
+      for (auto &v : q.coefficients) if (v.first == id) {
+        for (int i = 0; i < modes; ++i) v.second[i] += value[i];
+        return;
+      }
+      q.coefficients.emplace_back(id,value);
+    };
+    Modes center{};
+    for (const auto &s : samples) {
+      const auto b = basis(s.delta);
+      double distance = 0.;
+      for (int d = 0; d < nd; ++d) distance += b[d]*b[d];
+      Modes value{};
+      for (int i = 0; i < modes; ++i) {
+        for (int j = 0; j < modes; ++j) value[i] += inverse[i][j]*b[j]/distance;
+        center[i] -= value[i];
+      }
+      coefficient(s.id,value);
+    }
+    coefficient(row,center);
+    return cache.emplace(row,std::move(q)).first->second;
   }
   bool TouchesX(const CompositeCell &cell) const {
     return std::abs(cell.center[0]-.5*cell.width[0]-domain.lo[0]) < minwidth[0]*1.e-5 ||
@@ -394,8 +501,16 @@ struct MeshGeometry::Impl {
       interior = interior && ijk[d] > 0 && ijk[d]+1 < patches[p].cells[d];
     if (interior) return false;
     for (const auto &f : Faces(row)) {
-      if (f.left < partition.back() && HasOffset(f.ti) && TouchesX(f.left)) return true;
-      if (f.right < partition.back() && HasOffset(f.tj) && TouchesX(f.right)) return true;
+      if (!HasOffset(f.ti) && !HasOffset(f.tj) &&
+          (f.left >= partition.back() || f.right >= partition.back() ||
+           Cell(f.left).width[f.normal] == Cell(f.right).width[f.normal])) continue;
+      for (GlobalIndex id : {f.left,f.right}) if (id < partition.back()) {
+        if (TouchesX(id)) return true;
+        for (const auto &neighbor : Faces(id)) {
+          const auto other = id == neighbor.left ? neighbor.right : neighbor.left;
+          if (other < partition.back() && TouchesX(other)) return true;
+        }
+      }
     }
     return false;
   }
@@ -416,7 +531,7 @@ struct MeshGeometry::Impl {
   // Full setup and phase refresh deliberately share this exact physical row
   // routine, including canonical faces and all Dirichlet/Neumann LS couplings.
   void AssembleRow(GlobalIndex row, const CompositeCell &ci, double volume,
-                   bool forces, RowWorkspace &work, GradientCache &cache,
+                   bool forces, RowWorkspace &work, QuadraticCache &quadratic_cache,
                    bool *is_interface = nullptr, bool *phase_dependent = nullptr) const {
     work.a.clear(); for (auto &component : work.g) component.clear();
     if (is_interface) *is_interface = false;
@@ -424,15 +539,37 @@ struct MeshGeometry::Impl {
     for (const auto &f : Faces(row)) {
       work.difference.clear();
       AddPotential(work.difference,f.right,1.); AddPotential(work.difference,f.left,-1.);
-      auto slope = [&](GlobalIndex cell, const Vec &offset, double sign) {
-        if (cell >= partition.back() || !HasOffset(offset)) return;
-        if (phase_dependent && !*phase_dependent &&
-            (cell == row ? TouchesX(ci) : TouchesX(cell))) *phase_dependent = true;
-        for (const auto &v : Grad(cell,cache)) for (int d = 0; d < nd; ++d)
-          AddPotential(work.difference,v.first,sign*offset[d]*v.second[d]);
-      };
-      slope(f.right,f.tj,1.); slope(f.left,f.ti,-1.);
-      const double sign = row == f.left ? 1. : -1.;
+      if (f.left < partition.back() && f.right < partition.back()) {
+        const auto left = Cell(f.left), right = Cell(f.right);
+        const double shift = .25*(left.width[f.normal]-right.width[f.normal]);
+        if (HasOffset(f.ti) || HasOffset(f.tj) || shift != 0.) {
+          auto reconstruct = [&](GlobalIndex id, const CompositeCell &cell,
+                                 const Vec &offset, double sign) {
+            const auto &q = Quad(id,quadratic_cache);
+            if (phase_dependent && q.phase_dependent) *phase_dependent = true;
+            Modes moment{};
+            for (int d = 0; d < nd; ++d) moment[d] = sign*offset[d]/cell.width[d];
+            int k = nd;
+            for (int d = 0; d < nd; ++d) for (int t = d; t < nd; ++t) {
+              moment[k] = sign*offset[d]*offset[t]/(cell.width[d]*cell.width[t])*
+                          (d == t ? .5 : 1.);
+              // The secant lies halfway between centers. Unequal widths put
+              // that point off the physical face; both reconstructions share
+              // the same correction, averaged here without changing face flux.
+              if (d == f.normal && t == d)
+                moment[k] += .5*f.distance*shift/(cell.width[d]*cell.width[d]);
+              ++k;
+            }
+            for (const auto &v : q.coefficients) {
+              double value = 0.;
+              for (int i = 0; i < k; ++i) value += moment[i]*v.second[i];
+              AddPotential(work.difference,v.first,value);
+            }
+          };
+          reconstruct(f.right,right,f.tj,1.); reconstruct(f.left,left,f.ti,-1.);
+        }
+      }
+      const double sign = f.side;
       for (const auto &v : work.difference) {
         const double flux = f.area/f.distance*v.second;
         // A periodic image can be the same real cell when an axis has one
@@ -451,11 +588,11 @@ struct MeshGeometry::Impl {
   }
   void AssemblePhaseRange(size_t first, size_t last, LocalCompositeUpdate &out,
                           PhaseContext &context) const {
-    // A context belongs to exactly one worker. Only its seam gradients depend
-    // on phase; nonseam gradients used by selected CF rows stay cached.
+    // A context belongs to exactly one worker. A two-ring fit changes phase
+    // when either its center or a first-ring neighbor touches the seam.
     if (context.shear != shear) {
-      for (auto it = context.gradients.begin(); it != context.gradients.end();) {
-        if (TouchesX(it->first)) it = context.gradients.erase(it);
+      for (auto it = context.quadratics.begin(); it != context.quadratics.end();) {
+        if (it->second.phase_dependent) it = context.quadratics.erase(it);
         else ++it;
       }
       context.shear = shear;
@@ -476,7 +613,7 @@ struct MeshGeometry::Impl {
       const GlobalIndex row = begin+phase_rows[i];
       const auto cell = Cell(row); double volume = 1.;
       for (int d = 0; d < nd; ++d) volume *= cell.width[d];
-      AssembleRow(row,cell,volume,true,work,context.gradients);
+      AssembleRow(row,cell,volume,true,work,context.quadratics);
       Append(out.matrix,work.a,n,false); Append(out.boundary_rhs,work.a,n,true,-1.);
       for (int d = 0; d < 3; ++d) {
         Append(out.acceleration[d],work.g[d],n,false);
@@ -780,6 +917,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   // In particular, a reused object must never inherit gradients from an earlier
   // full build or an interrupted assembly at a different phase.
   m.gradients.clear();
+  m.quadratics.clear();
   LocalCompositeSystem out;
   out.neumann_z = m.neumann_z;
   out.row_partition = m.partition; out.sample_partition = m.sample_partition;
@@ -817,7 +955,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
       out.volume.push_back(volume); out.cells.push_back(ci); out.interface.push_back(0);
     }
     bool is_interface = false, phase_dependent = false;
-    m.AssembleRow(row,ci,volume,forces,work,m.gradients,forces ? &is_interface : nullptr,
+    m.AssembleRow(row,ci,volume,forces,work,m.quadratics,forces ? &is_interface : nullptr,
                   discover_phase_rows ? &phase_dependent : nullptr);
     if (forces) out.interface.back() = is_interface;
     if (discover_phase_rows && phase_dependent)
@@ -845,6 +983,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   }
   // Gradient maps are assembly scratch, and must not survive alongside device CSR.
   m.gradients.clear(); m.gradients.rehash(0);
+  m.quadratics.clear(); m.quadratics.rehash(0);
   return out;
 }
 

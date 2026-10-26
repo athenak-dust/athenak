@@ -250,5 +250,16 @@ target_include_directories(athena PUBLIC
 
 configure_file(config.hpp.in config.hpp)
 
+# Explicit, lightweight numerical regression target; omitted from normal builds.
+add_executable(gravity_geometry_check EXCLUDE_FROM_ALL
+  tst/test_suite/gravity/geometry_manufactured.cpp
+  src/gravity/mesh_geometry.cpp src/gravity/composite.cpp)
+target_include_directories(gravity_geometry_check PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(gravity_geometry_check PRIVATE Kokkos::kokkos)
+if (ENABLE_MPI)
+  target_link_libraries(gravity_geometry_check PRIVATE MPI::MPI_CXX)
+endif()
+
 install( TARGETS athena DESTINATION bin )
 
