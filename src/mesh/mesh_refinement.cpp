@@ -182,6 +182,7 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
       ProfTimer pt(pd ? pd->prof_time[pd->kProfRegridMesh] : dummy_t,
                          pd ? pd->prof_count[pd->kProfRegridMesh] : dummy_c);
       RedistAndRefineMeshBlocks(pin, nnew, ndel);
+      if (pmy_mesh->stop_max_nmb) return;   // (dropped: the run stops, see there)
 
       // Mark one mesh-topology update event (AMR and any resulting load balancing).
       pmy_mesh->MarkMeshUpdated();
@@ -591,13 +592,34 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   }
   pm->LoadBalance(new_cost_eachmb, new_rank_eachmb, new_gids_eachrank, new_nmb_eachrank,
                   new_nmb_total);
-  if (new_nmb_eachrank[global_variable::my_rank] > pm->nmb_maxperrank) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-        << "Number of MeshBlocks in this rank on new tree = "
-        << new_nmb_eachrank[global_variable::my_rank] << " on rank = "
-        << global_variable::my_rank <<" exceeds <mesh_refinement>/max_nmb_per_rank = "
-        << pm->nmb_maxperrank << std::endl;
-    std::exit(EXIT_FAILURE);
+  // Rixin: more MeshBlocks on some rank than max_nmb_per_rank (the
+  // arrays are allocated for that many): instead of exiting at once, every rank (the counts are
+  // the same everywhere) drops this regrid, keeps the old mesh and its data (nothing of the Mesh
+  // has changed yet; the tree is not used again) and asks the driver to stop, which writes the
+  // final outputs, a restart file among them.  Restart with a larger max_nmb_per_rank.
+  {
+    int worst = 0, worst_rank = 0;
+    for (int r=0; r<global_variable::nranks; ++r) {
+      if (new_nmb_eachrank[r] > worst) {worst = new_nmb_eachrank[r]; worst_rank = r;}
+    }
+    if (worst > pm->nmb_maxperrank) {
+      if (global_variable::my_rank == 0) {
+        std::cout << "### WARNING in " << __FILE__ << " at line " << __LINE__ << std::endl
+            << "cycle " << pm->ncycle << ": the new tree would put " << worst
+            << " MeshBlocks on rank " << worst_rank << ", more than <mesh_refinement>/"
+            << "max_nmb_per_rank = " << pm->nmb_maxperrank << "; the regrid is dropped and the "
+            << "run stops with its outputs (restart file): restart with a larger value"
+            << std::endl;
+      }
+      delete [] new_lloc_eachmb; delete [] newtoold; delete [] oldtonew;
+      delete [] new_cost_eachmb; delete [] new_rank_eachmb; delete [] new_gids_eachrank;
+      delete [] new_nmb_eachrank;
+      new_lloc_eachmb = nullptr; newtoold = nullptr; oldtonew = nullptr;
+      new_cost_eachmb = nullptr; new_rank_eachmb = nullptr; new_gids_eachrank = nullptr;
+      new_nmb_eachrank = nullptr;
+      pm->stop_max_nmb = true;
+      return;
+    }
   }
 
   // UpdateMeshBlockTree function can refine/de-refine MBs to ensure resolution jump is

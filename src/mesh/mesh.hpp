@@ -119,6 +119,10 @@ class Mesh {
   int nmb_total;           // total number of MeshBlocks across all levels/ranks
   int nmb_thisrank;        // number of MeshBlocks on this MPI rank (local)
   int nmb_maxperrank;      // max allowed number of MBs per device (memory limit for AMR)
+  // Rixin: a regrid would put more MeshBlocks on a rank than
+  // max_nmb_per_rank: the regrid is not done and the run stops with its final outputs (a restart
+  // file) instead of exiting at once
+  bool stop_max_nmb = false;
 
   int root_level; // logical level of root (physical) grid (e.g. Fig. 3 of method paper)
   int max_level;  // logical level of maximum refinement grid in Mesh

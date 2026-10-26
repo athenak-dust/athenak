@@ -395,7 +395,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       elapsed_time = UpdateWallClock();
     }
     while ((pmesh->time < tlim) && (pmesh->ncycle < nlim || nlim < 0) &&
-           (elapsed_time < wall_time)) {
+           (elapsed_time < wall_time) && !pmesh->stop_max_nmb) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
 
       // Problem work at the start of every cycle, before the time integrator
@@ -473,6 +473,11 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         elapsed_time = UpdateWallClock();
       }
     }  // end while
+    // (2026-10-26) a dropped regrid (max_nmb_per_rank): the restart file of the final outputs
+    // marks this cycle's mesh check as pending, so a restart with a larger limit redoes it first
+    if (pmesh->stop_max_nmb && pmesh->pmb_pack->pdust != nullptr) {
+      pmesh->pmb_pack->pdust->amr_check_after_output = true;
+    }
   }    // end of (time_evolution != tstatic) clause
   return;
 }
@@ -531,7 +536,10 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
     if (global_variable::my_rank == 0) {
       // Print diagnostic messages related to the end of the simulation
       OutputCycleDiagnostics(pmesh);
-      if (pmesh->ncycle == nlim) {
+      if (pmesh->stop_max_nmb) {
+        std::cout << std::endl << "Terminating on max_nmb_per_rank (a regrid would exceed it; "
+                  << "restart file written: restart with a larger value)" << std::endl;
+      } else if (pmesh->ncycle == nlim) {
         std::cout << std::endl << "Terminating on cycle limit" << std::endl;
       } else if (pmesh->time >= tlim) {
         std::cout << std::endl << "Terminating on time limit" << std::endl;
