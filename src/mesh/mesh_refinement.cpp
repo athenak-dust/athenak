@@ -624,6 +624,10 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
       new_lloc_eachmb = nullptr; newtoold = nullptr; oldtonew = nullptr;
       new_cost_eachmb = nullptr; new_rank_eachmb = nullptr; new_gids_eachrank = nullptr;
       new_nmb_eachrank = nullptr;
+      // Undo this cycle's age
+      // increment of CheckForRefinement: the restart file stores the ages, and the pending check
+      // replayed after the restart increments them again (else the replay sees ages one too high)
+      for (int m=0; m<pm->nmb_total; ++m) {ncyc_since_ref(m) -= 1;}
       pm->stop_max_nmb = true;
       return;
     }
