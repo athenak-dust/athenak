@@ -722,7 +722,7 @@ struct MeshGeometry::Impl {
     }
   }
   void AssemblePhaseRange(size_t first, size_t last, LocalCompositeUpdate &out,
-                          PhaseContext &context) const {
+                          PhaseContext &context, bool forces) const {
     // A context belongs to exactly one worker. A two-ring fit changes phase
     // when either its center or a first-ring neighbor touches the seam.
     if (context.shear != shear) {
@@ -739,8 +739,9 @@ struct MeshGeometry::Impl {
       a.rows.assign(phase_rows.begin()+first,phase_rows.begin()+last);
       a.rowptr.reserve(last-first+1);
     };
-    init(out.matrix,n); init(out.boundary_rhs,ns);
-    for (int d = 0; d < 3; ++d) {
+    init(out.matrix,n);
+    if (forces) init(out.boundary_rhs,ns);
+    for (int d = 0; forces && d < 3; ++d) {
       init(out.acceleration[d],n); init(out.boundary_acceleration[d],ns);
     }
     RowWorkspace work;
@@ -748,9 +749,10 @@ struct MeshGeometry::Impl {
       const GlobalIndex row = begin+phase_rows[i];
       const auto cell = Cell(row); double volume = 1.;
       for (int d = 0; d < nd; ++d) volume *= cell.width[d];
-      AssembleRow(row,cell,volume,true,work,context.quadratics);
-      Append(out.matrix,work.a,n,false); Append(out.boundary_rhs,work.a,n,true,-1.);
-      for (int d = 0; d < 3; ++d) {
+      AssembleRow(row,cell,volume,forces,work,context.quadratics);
+      Append(out.matrix,work.a,n,false);
+      if (forces) Append(out.boundary_rhs,work.a,n,true,-1.);
+      for (int d = 0; forces && d < 3; ++d) {
         Append(out.acceleration[d],work.g[d],n,false);
         Append(out.boundary_acceleration[d],work.g[d],n,true);
       }
@@ -798,7 +800,7 @@ struct MeshGeometry::Impl {
   }
   // Recursion moves to a strictly larger covering leaf before requesting its
   // centered stencil. It therefore terminates at a finite mesh/root scale.
-  Row Average(const Box &box, bool &images, int depth = 0) const {
+  Row Average(const Box &box, bool &images, bool &shear_images, int depth = 0) const {
     if (depth > 64) throw std::runtime_error("Gravity virtual-cell recursion exceeded 64");
     Vec width{}; double volume = 1.;
     for (int d = 0; d < nd; ++d) {
@@ -816,6 +818,7 @@ struct MeshGeometry::Impl {
     const double xwrap = std::floor((center[0]-domain.lo[0])/length[0]);
     center[0] -= xwrap*length[0]; center[1] -= xwrap*shear;
     bool crossed = xwrap != 0;
+    shear_images = shear_images || xwrap != 0;
     for (int d = 1; d < nd; ++d) {
       if (d == 2 && domain.isolated_z) continue;
       const double wrap = std::floor((center[d]-domain.lo[d])/length[d]);
@@ -855,7 +858,7 @@ struct MeshGeometry::Impl {
               const double center = c.center[t]+(d == t ? side*c.width[t] : 0.);
               neighbor.lo[t] = center-.5*c.width[t]; neighbor.hi[t] = center+.5*c.width[t];
             }
-            const auto fill = Average(neighbor,images,depth+1);
+            const auto fill = Average(neighbor,images,shear_images,depth+1);
             const double factor = side*.5*offset[d]/c.width[d]*weight;
             for (const auto &v : fill) Add(out,v.first,factor*v.second);
           }
@@ -871,6 +874,7 @@ struct MeshGeometry::Impl {
       x.hi[0] = std::min(box.hi[0],domain.hi[0]+ix*length[0])-ix*length[0];
       x.lo[1] -= ix*shear; x.hi[1] -= ix*shear;
       images = images || ix != 0;
+      shear_images = shear_images || ix != 0;
       const int ymin = static_cast<int>(std::floor((x.lo[1]-domain.lo[1])/length[1]+1.e-12));
       const int ymax = static_cast<int>(std::ceil((x.hi[1]-domain.lo[1])/length[1]-1.e-12))-1;
       for (int iy = ymin; iy <= ymax; ++iy) {
@@ -1044,12 +1048,14 @@ std::vector<GlobalIndex> MeshGeometry::QueryBox(const std::array<Real,3> &lo,
 }
 
 std::vector<std::pair<GlobalIndex,Real>> MeshGeometry::VirtualAverage(
-    const std::array<Real,3> &lo, const std::array<Real,3> &hi, bool *images) const {
+    const std::array<Real,3> &lo, const std::array<Real,3> &hi, bool *images,
+    bool *shear_images) const {
   Box box;
   for (int d = 0; d < impl_->nd; ++d) { box.lo[d] = lo[d]; box.hi[d] = hi[d]; }
-  bool crossed = false;
-  const auto row = impl_->Average(box,crossed);
+  bool crossed = false, sheared = false;
+  const auto row = impl_->Average(box,crossed,sheared);
   if (images) *images = crossed;
+  if (shear_images) *shear_images = sheared;
   std::vector<std::pair<GlobalIndex,Real>> result;
   result.reserve(row.size());
   for (const auto &v : row) if (v.second != 0.) result.emplace_back(v.first,v.second);
@@ -1157,7 +1163,7 @@ int MeshGeometry::PhaseThreads() const {
   return m.phase_rows_ready ? std::min(bound,static_cast<int>(m.phase_rows.size())) : bound;
 }
 
-LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase) {
+LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase, bool forces) {
   auto &m = *impl_;
   if (!m.phase_rows_ready)
     throw std::logic_error("Gravity phase update requires initial BuildSystem or PhaseRows");
@@ -1171,7 +1177,7 @@ LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase) {
   }
   LocalCompositeUpdate out;
   if (workers == 1) {
-    m.AssemblePhaseRange(0,m.phase_rows.size(),out,m.phase_contexts[0]);
+    m.AssemblePhaseRange(0,m.phase_rows.size(),out,m.phase_contexts[0],forces);
     return out;
   }
   std::vector<LocalCompositeUpdate> parts(workers);
@@ -1180,7 +1186,7 @@ LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase) {
     try {
       const size_t first = m.phase_rows.size()*worker/workers;
       const size_t last = m.phase_rows.size()*(worker+1)/workers;
-      m.AssemblePhaseRange(first,last,parts[worker],m.phase_contexts[worker]);
+      m.AssemblePhaseRange(first,last,parts[worker],m.phase_contexts[worker],forces);
     } catch (...) { errors[worker] = std::current_exception(); }
   };
   std::vector<std::thread> threads;
@@ -1202,8 +1208,8 @@ LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase) {
     JoinPhaseRows(destination,matrices);
   };
   join([](LocalCompositeUpdate &p) { return &p.matrix; },out.matrix);
-  join([](LocalCompositeUpdate &p) { return &p.boundary_rhs; },out.boundary_rhs);
-  for (int d = 0; d < 3; ++d) {
+  if (forces) join([](LocalCompositeUpdate &p) { return &p.boundary_rhs; },out.boundary_rhs);
+  for (int d = 0; forces && d < 3; ++d) {
     join([&](LocalCompositeUpdate &p) { return &p.acceleration[d]; },out.acceleration[d]);
     join([&](LocalCompositeUpdate &p) { return &p.boundary_acceleration[d]; },out.boundary_acceleration[d]);
   }

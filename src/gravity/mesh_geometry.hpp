@@ -83,7 +83,8 @@ class MeshGeometry {
   int PhaseThreads() const;  // actual workers, including the calling thread
   // Requires initial BuildSystem or PhaseRows. Only PhaseRows are visited;
   // physical topology and sample ownership stay fixed across arbitrary phases.
-  LocalCompositeUpdate BuildPhaseUpdate(Real phase);
+  // false updates only A, without boundary/force CSR allocation or assembly.
+  LocalCompositeUpdate BuildPhaseUpdate(Real phase, bool forces = true);
   const std::vector<GravityPatch> &Patches() const;
   const std::vector<GlobalIndex> &RowPartition() const;
   const std::vector<GlobalIndex> &SamplePartition() const;
@@ -99,10 +100,11 @@ class MeshGeometry {
   // volume averages; a larger covering leaf uses centered linear reconstruction.
   // Periodic/shear boxes are split exactly into physical images. Isolated-z
   // exterior correction values are zero, or reflected for neumann_z. Optional
-  // images includes recursive fills.
+  // images includes recursive fills. shear_images reports x-image traversals
+  // only, including those first introduced by a recursive reconstruction fill.
   std::vector<std::pair<GlobalIndex, Real>> VirtualAverage(
       const std::array<Real, 3> &lo, const std::array<Real, 3> &hi,
-      bool *images = nullptr) const;
+      bool *images = nullptr, bool *shear_images = nullptr) const;
 
  private:
   struct Impl;

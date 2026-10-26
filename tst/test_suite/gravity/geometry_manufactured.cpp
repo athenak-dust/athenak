@@ -160,9 +160,16 @@ void PhaseFixture(const std::vector<GravityPatch> &patches, CompositeDomain d, b
     geometry.SetPhaseThreads(threads);
     for (double phase : {.137,.49,.999999,1.,1.0625,-.17,0.}) {
       const auto update = geometry.BuildPhaseUpdate(phase);
+      const auto matrix_only = geometry.BuildPhaseUpdate(phase,false);
       d.shear_offset = phase;
       MeshGeometry rebuilt(patches,d,0,1,neumann); const auto fresh = rebuilt.BuildSystem();
       CheckUpdate(initial.matrix,update.matrix,fresh.matrix);
+      CheckUpdate(initial.matrix,matrix_only.matrix,fresh.matrix);
+      Require(matrix_only.boundary_rhs.rows.empty(),"matrix-only phase update allocated boundary rows");
+      for (int k = 0; k < 3; ++k)
+        Require(matrix_only.acceleration[k].rows.empty() &&
+                matrix_only.boundary_acceleration[k].rows.empty(),
+                "matrix-only phase update allocated force rows");
       CheckUpdate(initial.boundary_rhs,update.boundary_rhs,fresh.boundary_rhs);
       for (int k = 0; k < 3; ++k) {
         CheckUpdate(initial.acceleration[k],update.acceleration[k],fresh.acceleration[k]);
@@ -240,6 +247,20 @@ void CoarseC1Fallback() {
   Require(rejected,"rank-deficient fine one-sided reconstruction silently fell back");
   std::cout << "counted coarse C1 fallbacks=" << system.quadratic_interface_fallbacks << '\n';
 }
+void VirtualImages() {
+  auto d = Domain(8,3,true); d.shear_offset = .137;
+  MeshGeometry geometry(Patches(8,3,true),d,0,1,true);
+  bool images = false, shear = false;
+  geometry.VirtualAverage({-.125,.25,.25},{0.,.375,.375},&images,&shear);
+  Require(images && shear,"x image was not marked as a shear dependency");
+  geometry.VirtualAverage({.25,-.125,.25},{.375,0.,.375},&images,&shear);
+  Require(images && !shear,"y-only image was marked as a shear dependency");
+  geometry.VirtualAverage({.25,.25,-.125},{.375,.375,0.},&images,&shear);
+  Require(images && !shear,"z reflection was marked as a shear dependency");
+  geometry.VirtualAverage({0.,.25,.25},{.0625,.3125,.3125},&images,&shear);
+  Require(images && shear,"recursive x image was not marked as a shear dependency");
+  std::cout << "virtual-average x/y/z and recursive shear dependency checks passed\n";
+}
 void Reference(bool isolated) {
   auto d = Domain(8,3,isolated); d.shear_offset = .137;
   MeshGeometry geometry(Patches(8,3,true),d,0,1); const auto local = geometry.BuildSystem();
@@ -280,6 +301,7 @@ int main() {
   Phases(2,false,false,false,1); Phases(3,false,false,false,1);
   Reference(false); Reference(true);
   PiecewiseVacuum(); CoarseC1Fallback();
+  VirtualImages();
   E3Multilevel({1.,1.,1.}); E3Multilevel({.2,.2,.4});
   std::cout << "gravity geometry checks passed\n";
 }
