@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <set>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -159,13 +160,17 @@ void PairOverlap(const Geo &g, const BlkR &s, const BlkR &t, const int part, con
       Overlaps(g, s, t, 1, j, 2, -shR, l2m[j]);   // beyond the inner face: y - ysh
     }
   }
+  // only the x1 indices with overlaps, in increasing order (the shear
+  // part has 2 nghost of them): the same entries in the same order as a loop over every i
+  std::vector<int> ilist;
+  for (int i=0; i<nc1; ++i) if (!l1[i].empty()) ilist.push_back(i);
+  if (ilist.empty()) return;
   for (int k=0; k<nc3; ++k) {
     if (l3[k].empty()) continue;
     const bool kin = (k >= ng && k < nc3 - ng);
     for (int j=0; j<nc2; ++j) {
       const bool jin = (j >= ng && j < nc2 - ng);
-      for (int i=0; i<nc1; ++i) {
-        if (l1[i].empty()) continue;
+      for (const int i : ilist) {
         const bool iin = (i >= ng && i < nc1 - ng);
         if (iin && jin && kin) continue;           // active cell: not a deposit to move
         const std::vector<Ov> &ly = (part == 1 && side[i] == 0) ? l2m[j] : l2p[j];
@@ -213,6 +218,19 @@ struct DepProfile {
   DepProfile() {const char *e = std::getenv("ATHENA_DEP_PROFILE"); on = (e != nullptr && e[0] == '1');}
 };
 DepProfile &DepProf() {static DepProfile p; return p;}
+
+// the device arrays of a map keep their capacity between builds (the
+// users read the counts nseg / nent / nsend / ndrop, not the extents); grown by 1/4 when too small
+template <typename T>
+void Upload(DvceArray1D<T> &v, const char *label, const std::vector<T> &h, const int n) {
+  if (v.extent_int(0) < std::max(1, n)) {
+    v = DvceArray1D<T>(std::string(label), static_cast<std::size_t>(std::max(1, n + n/4)));
+  }
+  if (n <= 0) return;
+  Kokkos::View<const T *, LayoutWrapper, HostMemSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+      hv(h.data(), n);
+  Kokkos::deep_copy(Kokkos::subview(v, std::make_pair(0, n)), hv);
+}
 
 struct RecvPair {int rank, sgid, tgid; std::vector<int> cells; std::vector<PairEnt> ent; int tm;};
 struct SendPair {int rank, sgid, tgid; std::vector<int> cells; int sm;};
@@ -290,7 +308,20 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
   std::vector<TEnt> tent;
   std::vector<RecvPair> rpairs;
   std::vector<SendPair> spairs;
-  std::vector<double> cov(static_cast<std::size_t>(nmb)*ncell, 0.0);
+  // the coverage counts of the source ghost cells: every cell of every local block for the static
+  // part; for the shear part only the x1 ghost layers (2 nghost wide), since a cell beyond a
+  // shear-periodic x1 face is an x1 ghost cell (the full array was
+  // 77 MB per rank and build for one 128 x 128 x 512 block)
+  const int nsl = 2*g.ng;
+  const bool slab = (part == 1);
+  std::vector<double> cov(slab ? static_cast<std::size_t>(nmb)*g.nc[2]*g.nc[1]*nsl
+                               : static_cast<std::size_t>(nmb)*ncell, 0.0);
+  auto covat = [&](const int sm, const int scell) -> double & {
+    if (!slab) return cov[static_cast<std::size_t>(sm)*ncell + scell];
+    const int i = scell % g.nc[0], jk = scell/g.nc[0];
+    const int is = (i < g.ng) ? i : i - (g.nc[0] - nsl);   // [0, ng) and [nc - ng, nc) -> [0, 2 ng)
+    return cov[(static_cast<std::size_t>(sm)*g.nc[2]*g.nc[1] + jk)*nsl + is];
+  };
   using PClock = std::chrono::steady_clock;
   const bool prof = (part == 1) && DepProf().on;
   auto tp0 = PClock::now(), tp = tp0;
@@ -316,7 +347,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
         const int sm = sg - gids;
         for (const PairEnt &e : pe) {
           tent.push_back({tm*ncell + e.tcell, sg, e.scell, sm*ncell + e.scell, e.w});
-          cov[static_cast<std::size_t>(sm)*ncell + e.scell] += e.vol;
+          covat(sm, e.scell) += e.vol;
         }
       } else {
         RecvPair rp;
@@ -345,7 +376,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
       sp.rank = t.rank; sp.sgid = s.gid; sp.tgid = tg; sp.sm = sm;
       for (const PairEnt &e : pe) {
         sp.cells.push_back(e.scell);
-        cov[static_cast<std::size_t>(sm)*ncell + e.scell] += e.vol;
+        covat(sm, e.scell) += e.vol;
       }
       std::sort(sp.cells.begin(), sp.cells.end());
       sp.cells.erase(std::unique(sp.cells.begin(), sp.cells.end()), sp.cells.end());
@@ -362,7 +393,10 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
     const BlkR s = MakeBlk(pm, g, gids + sm);
     const double svol = static_cast<double>(s.sc)*static_cast<double>(s.sc)*
                         static_cast<double>(s.sc);
-    for (int k=0; k<g.nc[2]; ++k) for (int j=0; j<g.nc[1]; ++j) for (int i=0; i<g.nc[0]; ++i) {
+    // (the shear part: only the x1 ghost layers, which hold every cell beyond a shear face)
+    std::vector<int> irange;
+    for (int i=0; i<g.nc[0]; ++i) if (!slab || i < g.ng || i >= g.nc[0] - g.ng) irange.push_back(i);
+    for (int k=0; k<g.nc[2]; ++k) for (int j=0; j<g.nc[1]; ++j) for (const int i : irange) {
       const bool act = (i >= g.ng && i < g.nc[0] - g.ng && j >= g.ng && j < g.nc[1] - g.ng &&
                         k >= g.ng && k < g.nc[2] - g.ng);
       if (act) continue;
@@ -378,7 +412,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
         }
         continue;
       }
-      const double c = cov[static_cast<std::size_t>(sm)*ncell + (k*g.nc[1] + j)*g.nc[0] + i];
+      const double c = covat(sm, (k*g.nc[1] + j)*g.nc[0] + i);
       const double err = std::fabs(c - svol)/svol;
       worst = std::max(worst, err);
       if (err > 1.0e-9) ++nbad;
@@ -462,35 +496,21 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
   map.nseg = static_cast<int>(seg_tgt.size());
   map.nent = static_cast<int>(tent.size());
   lap(4);
-  map.seg_tgt = DvceArray1D<int>("dep_seg_tgt", std::max(1, map.nseg));
-  map.seg_ptr = DvceArray1D<int>("dep_seg_ptr", map.nseg + 1);
-  map.ent_src = DvceArray1D<int>("dep_ent_src", std::max(1, map.nent));
-  map.ent_w = DvceArray1D<Real>("dep_ent_w", std::max(1, map.nent));
-  map.send_cell = DvceArray1D<int>("dep_send_cell", std::max(1, map.nsend));
   map.ndrop = static_cast<int>(dcell.size());
-  map.drop_cell = DvceArray1D<int>("dep_drop_cell", std::max(1, map.ndrop));
-  map.drop_vol = DvceArray1D<Real>("dep_drop_vol", std::max(1, map.ndrop));
   {
-    auto hc = Kokkos::create_mirror_view(map.drop_cell);
-    auto hv = Kokkos::create_mirror_view(map.drop_vol);
-    for (int q=0; q<map.ndrop; ++q) {hc(q) = dcell[q]; hv(q) = static_cast<Real>(dvol[q]);}
-    Kokkos::deep_copy(map.drop_cell, hc);
-    Kokkos::deep_copy(map.drop_vol, hv);
+    std::vector<Real> dv(dvol.size());
+    for (std::size_t q=0; q<dvol.size(); ++q) dv[q] = static_cast<Real>(dvol[q]);
+    Upload(map.drop_cell, "dep_drop_cell", dcell, map.ndrop);
+    Upload(map.drop_vol, "dep_drop_vol", dv, map.ndrop);
   }
-  auto h_tgt = Kokkos::create_mirror_view(map.seg_tgt);
-  auto h_ptr = Kokkos::create_mirror_view(map.seg_ptr);
-  auto h_src = Kokkos::create_mirror_view(map.ent_src);
-  auto h_w = Kokkos::create_mirror_view(map.ent_w);
-  auto h_send = Kokkos::create_mirror_view(map.send_cell);
-  for (int s=0; s<map.nseg; ++s) h_tgt(s) = seg_tgt[s];
-  for (int s=0; s<=map.nseg; ++s) h_ptr(s) = seg_ptr[s];
-  for (int e=0; e<map.nent; ++e) {h_src(e) = tent[e].sref; h_w(e) = static_cast<Real>(tent[e].w);}
-  for (int e=0; e<map.nsend; ++e) h_send(e) = scell[e];
-  Kokkos::deep_copy(map.seg_tgt, h_tgt);
-  Kokkos::deep_copy(map.seg_ptr, h_ptr);
-  Kokkos::deep_copy(map.ent_src, h_src);
-  Kokkos::deep_copy(map.ent_w, h_w);
-  Kokkos::deep_copy(map.send_cell, h_send);
+  std::vector<int> h_src(map.nent);
+  std::vector<Real> h_w(map.nent);
+  for (int e=0; e<map.nent; ++e) {h_src[e] = tent[e].sref; h_w[e] = static_cast<Real>(tent[e].w);}
+  Upload(map.seg_tgt, "dep_seg_tgt", seg_tgt, map.nseg);
+  Upload(map.seg_ptr, "dep_seg_ptr", seg_ptr, map.nseg + 1);
+  Upload(map.ent_src, "dep_ent_src", h_src, map.nent);
+  Upload(map.ent_w, "dep_ent_w", h_w, map.nent);
+  Upload(map.send_cell, "dep_send_cell", scell, map.nsend);
   if (prof) {
     lap(5);
     DepProfile &P = DepProf();
