@@ -1454,8 +1454,9 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
 //! \brief Called by MeshRefinement::RedistAndRefineMeshBlocks before the load balance of a
 //! regrid (several ranks, <dust>/load_balance_cloud_weight > 0): the cost of every new block,
 //! 1 + w * clouds / mean, with the clouds of the old blocks (BeforeRegrid): an unchanged block
-//! keeps its count, a refined block gives 1/4 (2-D) to each child, a derefined parent takes the
-//! sum of its children.  The old mesh (lloc_eachmb) is still in place when it is called.
+//! keeps its count, a refined block gives each child 1/2^d of its clouds times the 3^d children
+//! of the split of refinable clouds (since 2026-10-25; 1/2^d for point particles), a derefined
+//! parent takes the sum of its children.  The old mesh (lloc_eachmb) is still in place when it is called.
 
 void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_lloc,
                               const int new_nmb, float *cost) {
@@ -1496,6 +1497,11 @@ void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_ll
   }
   if (lb_cloud_weight <= 0.0 || lb_old_counts.empty()) return;
   const int nleaf = pm->three_d ? 8 : (pm->two_d ? 4 : 2);
+  // Rixin: refinable clouds split right after the regrid
+  // into 3 children per direction (P1 split: 27 in 3-D, 9 in 2-D), so a refined block gets
+  // 3^d / 2^d of its parent's clouds, not 1 / 2^d (other transfer modes keep the particles)
+  const double nsplit = (smr_transfer_mode == DustSMRTransfer::refinable_cloud) ?
+                        (pm->three_d ? 27.0 : (pm->two_d ? 9.0 : 3.0)) : 1.0;
   std::vector<double> c(new_nmb, 0.0);
   double tot = 0.0;
   for (int n=0; n<new_nmb; ++n) {
@@ -1504,7 +1510,7 @@ void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_ll
     if (ln == lo) {
       c[n] = lb_old_counts[o];
     } else if (ln > lo) {
-      c[n] = lb_old_counts[o]/static_cast<double>(nleaf);
+      c[n] = lb_old_counts[o]*nsplit/static_cast<double>(nleaf);
     } else {
       for (int k=0; k<nleaf && o + k < pm->nmb_total; ++k) c[n] += lb_old_counts[o + k];
     }

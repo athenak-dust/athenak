@@ -1720,8 +1720,9 @@ class DustGasDrag {
   // For the scaling on several ranks: <dust>/load_balance_cloud_weight w > 0 gives the
   // new blocks of a regrid the cost 1 + w * clouds / (mean clouds per block) in AthenaK's load
   // balance (otherwise every block costs 1).  The clouds of every old block are counted in
-  // BeforeRegrid (all ranks); RegridCosts maps them to the new blocks (a refined block passes 1/4
-  // of its clouds to each child, a derefined parent takes the sum of its children).
+  // BeforeRegrid (all ranks); RegridCosts maps them to the new blocks (a refined block passes
+  // 3^d/2^d of its clouds to each child since 2026-10-25 (the P1 split; 1/2^d for point
+  // particles), a derefined parent takes the sum of its children).
   Real lb_cloud_weight = 4.0;   // Rixin: default 4
   std::vector<float> lb_old_counts;
   // 3-D owner_overlap on a dynamic mesh: the new block of every old block (8 entries:
