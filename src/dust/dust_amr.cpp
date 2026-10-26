@@ -561,9 +561,43 @@ void DensityRefinement3DPoint(MeshBlockPack *pmbp) {
   (void) nflag;
 }
 
+// header of dust_rank_log.txt (amr_profile, several ranks): regrid lines and check lines
+static const char *kRankLogHeader =
+    "# regrid ncycle time t_transfer_build t_route t_halo_check (s, slowest rank) | per rank: "
+    "blocks particles halo_blocks; since 2026-10-25 also lines 'c ncycle time | per rank: blocks "
+    "particles' at every check of the density trigger\n";
+
+//----------------------------------------------------------------------------------------
+//! \fn RankBalanceLog
+//! \brief With amr_profile on several ranks, the blocks and particles
+//! of every rank at each check of the density trigger (every ncycle_check cycles).  The regrid
+//! line holds the counts right after the regrid, before the clouds of newly refined blocks
+//! split; these lines show the balance after the split.  Diagnostic only.
+
+static void RankBalanceLog(MeshBlockPack *pmbp) {
+#if MPI_PARALLEL_ENABLED
+  if (!ProfOn() || global_variable::nranks <= 1 || pmbp->ppart == nullptr) return;
+  const int nr = global_variable::nranks;
+  int mine[2] = {pmbp->nmb_thispack, pmbp->ppart->nprtcl_thispack};
+  std::vector<int> all(2*nr, 0);
+  MPI_Gather(mine, 2, MPI_INT, all.data(), 2, MPI_INT, 0, MPI_COMM_WORLD);
+  if (global_variable::my_rank != 0) return;
+  std::FILE *fp = AppendLog("dust_rank_log.txt");
+  if (fp == nullptr) return;
+  if (LogEmpty(fp)) std::fputs(kRankLogHeader, fp);
+  std::fprintf(fp, "c %d %.10g |", pmbp->pmesh->ncycle, pmbp->pmesh->time);
+  for (int r=0; r<nr; ++r) std::fprintf(fp, " %d %d", all[2*r], all[2*r + 1]);
+  std::fprintf(fp, "\n");
+  std::fflush(fp);
+#else
+  (void) pmbp;
+#endif
+}
+
 void DensityRefinement(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
   DustGasDrag *pdust = pmbp->pdust;
+  RankBalanceLog(pmbp);
   // 3-D point particles here; 3-D refinable clouds below
   if (pm->three_d && !(pdust != nullptr && pdust->Clouds3D())) {
     DensityRefinement3DPoint(pmbp);
@@ -1602,10 +1636,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     if (global_variable::my_rank == 0) {
       std::FILE *fp = AppendLog("dust_rank_log.txt");
       if (fp != nullptr) {
-        if (LogEmpty(fp)) {
-          std::fprintf(fp, "# regrid ncycle time t_transfer_build t_route t_halo_check (s, slowest rank) | "
-                       "per rank: blocks particles halo_blocks\n");
-        }
+        if (LogEmpty(fp)) std::fputs(kRankLogHeader, fp);
         std::fprintf(fp, "%d %d %.10g %.4e %.4e %.4e |", amr_regrids + 1, pmesh->ncycle, pmesh->time,
                      tl[0], tl[1], tl[2]);
         for (int r=0; r<nr; ++r) std::fprintf(fp, " %d %d %d", all[3*r], all[3*r + 1], all[3*r + 2]);
