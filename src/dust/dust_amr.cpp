@@ -227,6 +227,8 @@ void SetupDensityTrigger(ParameterInput *pin) {
       if (!std::isfinite(roche) || roche<=0) fatal("nonfinite Roche density");
       trig_.rho_refine*=roche;
       trig_.rho_derefine*=roche;
+      if (!std::isfinite(trig_.rho_refine) || !std::isfinite(trig_.rho_derefine))
+        fatal("Roche-scaled refinement thresholds overflow code density");
       if (global_variable::my_rank==0)
         std::cout<<"# DUST_ROCHE_REFINEMENT rho_roche="<<roche
                  <<" reference_four_pi_G="<<fourpig<<" omega="<<omega
