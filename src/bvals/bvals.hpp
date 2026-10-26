@@ -20,6 +20,7 @@ enum class BoundaryFlag {undef=-1,block, reflect, inflow, outflow, diode, user, 
                          shear_periodic, vacuum};
 
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 
 #include "athena.hpp"
@@ -310,8 +311,18 @@ class DepRemapPlan {
   Real shear_time = -1.0;
   // Public because CUDA extended lambdas cannot be enclosed by a private member.
   void BuildPart(const int part, const double shR, DepRemapMap &map);
+  int shr_builds = 0, shr_updates = 0;   // full builds and weight-only updates of the shear part
 
  private:
+  // Between full builds of the shear part (same integer part of the
+  // offset, and an integer or not) only its weights change: kRecipe doubles per entry say how
+  // to recompute them exactly (bvals_dep_general.cpp, UpdateShearWeights)
+  static constexpr int kRecipe = 8;
+  bool shr_cached_ = false, shr_int_ = false;
+  std::int64_t shr_floor_ = 0;
+  std::vector<double> shr_recipe_;
+  std::vector<Real> shr_hw_;
+  bool UpdateShearWeights(const double shR);
   MeshBlockPack *pmy_pack;
   bool shear_x1_;
   int x3mode_ = 0;

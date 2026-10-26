@@ -78,7 +78,9 @@ BlkR MakeBlk(Mesh *pm, const Geo &g, const int gid) {
 }
 
 // one overlap of a source interval with a target cell along one direction
-struct Ov {int t; double o;};
+// (for the shifted x2 overlaps also what o was computed from: o = min(yb + sh, chi) - max(ya + sh,
+// clo); the shear part recomputes its weights from these)
+struct Ov {int t; double o; double ya = 0.0, yb = 0.0, clo = 0.0, chi = 0.0;};
 
 // The overlaps along direction d of source index q (array index, ghosts included) of block s with
 // the active cells of block t.  mode: 0 ordinary periodic wrap; 1 the shear-mapped x1 index (x
@@ -103,7 +105,7 @@ void Overlaps(const Geo &g, const BlkR &s, const BlkR &t, const int d, const int
       for (int c=c0; c<=c1; ++c) {
         const double clo = lo + c*st, chi = clo + st;
         const double o = std::min(b, chi) - std::max(a, clo);
-        if (o > 0.0) out.push_back({c, o});
+        if (o > 0.0) out.push_back({c, o, static_cast<double>(a0), static_cast<double>(b0), clo, chi});
       }
     }
     return;
@@ -130,7 +132,26 @@ void Overlaps(const Geo &g, const BlkR &s, const BlkR &t, const int d, const int
   }
 }
 
-struct PairEnt {int scell; int tcell; double w; double vol;};
+// (rc: the recipe of w for the shear part, see WeightOf)
+struct WRecipe {double ox, oz, ya, yb, clo, chi, tvol; bool neg;};
+struct PairEnt {int scell; int tcell; double w; double vol; WRecipe rc;};
+
+// whether the structure of the shear part at offset shR may be cached or reused: the fractional
+// part away from 0 and 1 by more than 1e-9 cells, so that every overlap of the structure is at
+// least that and none can round to zero (an integer or nearly integer offset: always a full build)
+inline bool ShearCacheable(const double shR) {
+  const double f = shR - std::floor(shR);
+  return f > 1.0e-9 && f < 1.0 - 1.0e-9;
+}
+
+// the weight of a shear entry for the offset shR, with the arithmetic of Overlaps and PairOverlap
+inline double WeightOf(const WRecipe &r, const double shR) {
+  const double sh = r.neg ? -shR : shR;   // (a negation, as the caller of Overlaps: no product to fuse)
+  const double a = r.ya + sh, b = r.yb + sh;
+  const double oy = std::min(b, r.chi) - std::max(a, r.clo);
+  const double vol = r.ox*oy*r.oz;
+  return vol/r.tvol;
+}
 
 // All overlaps of the ghost cells of s with the active cells of t: part 0 the ordinary ghost
 // cells (not beyond a shear face), part 1 the ghost cells beyond a shear-periodic x1 face
@@ -174,6 +195,7 @@ void PairOverlap(const Geo &g, const BlkR &s, const BlkR &t, const int part, con
         const bool iin = (i >= ng && i < nc1 - ng);
         if (iin && jin && kin) continue;           // active cell: not a deposit to move
         const std::vector<Ov> &ly = (part == 1 && side[i] == 0) ? l2m[j] : l2p[j];
+        const bool neg = (part == 1 && side[i] == 0);
         if (ly.empty()) continue;
         const int scell = (k*nc2 + j)*nc1 + i;
         for (const Ov &oz : l3[k]) {
@@ -181,7 +203,8 @@ void PairOverlap(const Geo &g, const BlkR &s, const BlkR &t, const int part, con
             for (const Ov &ox : l1[i]) {
               const double vol = ox.o*oy.o*oz.o;
               const int tcell = ((oz.t + ng)*nc2 + (oy.t + ng))*nc1 + (ox.t + ng);
-              out.push_back({scell, tcell, vol/tvol, vol});
+              out.push_back({scell, tcell, vol/tvol, vol,
+                             {ox.o, oz.o, oy.ya, oy.yb, oy.clo, oy.chi, tvol, neg}});
             }
           }
         }
@@ -213,7 +236,8 @@ std::vector<int> Candidates(MeshBlockPack *pp, const BlkR &b, const int m, const
 // builds of the shear part, the mean host time per build of its phases (diagnostic only)
 struct DepProfile {
   bool on = false;
-  int nbuild = 0;
+  int nbuild = 0, ncall = 0, nupd = 0;
+  double tupd = 0.0;
   double t[7] = {0, 0, 0, 0, 0, 0, 0};   // recv pairs, send pairs, check, layout+Alltoall, sort, device, total
   DepProfile() {const char *e = std::getenv("ATHENA_DEP_PROFILE"); on = (e != nullptr && e[0] == '1');}
 };
@@ -234,7 +258,7 @@ void Upload(DvceArray1D<T> &v, const char *label, const std::vector<T> &h, const
 
 struct RecvPair {int rank, sgid, tgid; std::vector<int> cells; std::vector<PairEnt> ent; int tm;};
 struct SendPair {int rank, sgid, tgid; std::vector<int> cells; int sm;};
-struct TEnt {int tflat; int sgid; int scell; int sref; double w;};
+struct TEnt {int tflat; int sgid; int scell; int sref; double w; WRecipe rc;};
 
 }  // namespace
 
@@ -262,6 +286,7 @@ void DepRemapPlan::BuildStatic() {
   }
   BuildPart(0, 0.0, stat);
   ++build_seq;
+  shr_cached_ = false;   // (the blocks may have changed)
   if (shear_x1_ && shear_time >= 0.0) {
     const Real t = shear_time;
     shear_time = -1.0;
@@ -279,8 +304,29 @@ void DepRemapPlan::UpdateShear(Real time) {
   const std::int64_t N2 = static_cast<std::int64_t>(pm->nmb_rootx2)*pm->mb_indcs.nx2*
                           (static_cast<std::int64_t>(1) << (pm->max_level - pm->root_level));
   const double shR = static_cast<double>(ysh)*static_cast<double>(N2)/static_cast<double>(ly);
-  BuildPart(1, shR, shr);
+  // a full build only when the overlap structure changes: the integer
+  // part of shR, or shR an integer or not (the shifted cells then meet one target cell, not two)
+  const double fl = std::floor(shR);
+  using PClock = std::chrono::steady_clock;
+  const auto t0 = PClock::now();
+  bool done = false;
+  if (shr_cached_ && ShearCacheable(shR) && static_cast<std::int64_t>(fl) == shr_floor_ &&
+      (shR == fl) == shr_int_) {
+    done = UpdateShearWeights(shR);
+    if (done) {++shr_updates; DepProf().tupd += std::chrono::duration<double>(PClock::now() - t0).count();}
+  }
+  if (!done) {BuildPart(1, shR, shr); ++shr_builds;}
   shear_time = time;
+  DepProfile &P = DepProf();
+  if (P.on && ++P.ncall % 400 == 0 && global_variable::my_rank == 0) {
+    const double f = (P.nbuild > 0) ? 1.0e3/P.nbuild : 0.0;
+    std::printf("# DEP_PROFILE shear: %d full builds, ms per build: recv pairs %.2f send pairs %.2f check %.2f "
+                "layout+Alltoall %.2f sort %.2f device %.2f total %.2f; %d weight updates, %.2f ms each "
+                "(entries %d, sends %d)\n", P.nbuild, f*P.t[0], f*P.t[1], f*P.t[2], f*P.t[3], f*P.t[4],
+                f*P.t[5], f*P.t[6], shr_updates, shr_updates > 0 ? 1.0e3*P.tupd/shr_updates : 0.0,
+                shr.nent, shr.nsend);
+    std::fflush(stdout);
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -346,7 +392,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
       if (s.rank == me) {
         const int sm = sg - gids;
         for (const PairEnt &e : pe) {
-          tent.push_back({tm*ncell + e.tcell, sg, e.scell, sm*ncell + e.scell, e.w});
+          tent.push_back({tm*ncell + e.tcell, sg, e.scell, sm*ncell + e.scell, e.w, e.rc});
           covat(sm, e.scell) += e.vol;
         }
       } else {
@@ -442,7 +488,7 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
     for (const PairEnt &e : rp.ent) {
       const int q = static_cast<int>(std::lower_bound(rp.cells.begin(), rp.cells.end(), e.scell) -
                                      rp.cells.begin());
-      tent.push_back({rp.tm*ncell + e.tcell, rp.sgid, e.scell, -(pos + q + 1), e.w});
+      tent.push_back({rp.tm*ncell + e.tcell, rp.sgid, e.scell, -(pos + q + 1), e.w, e.rc});
     }
     pos += static_cast<int>(rp.cells.size());
     map.recv_cnt.back() += static_cast<int>(rp.cells.size());
@@ -515,14 +561,45 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
     lap(5);
     DepProfile &P = DepProf();
     P.t[6] += std::chrono::duration<double>(PClock::now() - tp0).count();
-    if (++P.nbuild % 200 == 0 && global_variable::my_rank == 0) {
-      const double f = 1.0e3/P.nbuild;
-      std::printf("# DEP_PROFILE shear builds %d, ms per build: recv pairs %.2f send pairs %.2f check %.2f "
-                  "layout+Alltoall %.2f sort %.2f device %.2f total %.2f (entries %d, sends %d)\n", P.nbuild,
-                  f*P.t[0], f*P.t[1], f*P.t[2], f*P.t[3], f*P.t[4], f*P.t[5], f*P.t[6], map.nent, map.nsend);
-      std::fflush(stdout);
-    }
+    ++P.nbuild;
   }
+  // the shear part: its weights in entry order, to recompute them while
+  // the overlap structure holds (UpdateShear)
+  if (part == 1) {
+    shr_recipe_.resize(tent.size()*kRecipe);
+    for (std::size_t e=0; e<tent.size(); ++e) {
+      const WRecipe &r = tent[e].rc;
+      double *q = &shr_recipe_[e*kRecipe];
+      q[0] = r.ox; q[1] = r.oz; q[2] = r.ya; q[3] = r.yb; q[4] = r.clo; q[5] = r.chi; q[6] = r.tvol;
+      q[7] = r.neg ? 1.0 : 0.0;
+    }
+    shr_hw_.resize(tent.size());
+    const double fl = std::floor(shR);
+    shr_floor_ = static_cast<std::int64_t>(fl);
+    shr_int_ = (shR == fl);
+    shr_cached_ = ShearCacheable(shR);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn bool DepRemapPlan::UpdateShearWeights
+//! \brief The weights of the shear part for offset shR with the entries
+//! of the last build (same overlap structure: same integer part of shR, and shR an integer or not
+//! as then).  The arithmetic is that of Overlaps and PairOverlap, so the weights are those of a
+//! full build bit for bit.  False (nothing changed) if an overlap would vanish.
+
+bool DepRemapPlan::UpdateShearWeights(const double shR) {
+  const std::size_t n = shr_hw_.size();
+  for (std::size_t e=0; e<n; ++e) {
+    const double *q = &shr_recipe_[e*kRecipe];
+    const WRecipe r{q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7] != 0.0};
+    const double sh = r.neg ? -shR : shR;
+    const double a = r.ya + sh, b = r.yb + sh;
+    if (!(std::min(b, r.chi) - std::max(a, r.clo) > 0.0)) return false;
+    shr_hw_[e] = static_cast<Real>(WeightOf(r, shR));
+  }
+  Upload(shr.ent_w, "dep_ent_w", shr_hw_, static_cast<int>(n));
+  return true;
 }
 
 //----------------------------------------------------------------------------------------
