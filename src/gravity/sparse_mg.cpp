@@ -132,6 +132,7 @@ struct SparseMultigrid::Impl {
   std::vector<int> current_rowptr;
   std::vector<GlobalIndex> current_columns;
   bool current_values_shared = true;
+  bool fine_diagonal_dirty = false;
   FineOperatorStats fine_updates;
   // FGMRES storage belongs to the hierarchy and is reused across solves. Each solve
   // still copies and projects its CURRENT rhs and recomputes the true residual.
@@ -439,7 +440,7 @@ struct SparseMultigrid::Impl {
     return same != 0;
   }
 
-  void UpdateFinePhaseDiagonal() {
+  void UpdateFinePhaseDiagonal(bool all_rows) {
     // Diagonals were validated collectively with the compact CSR before upload.
     // Device compact columns use the owned input index for each diagonal entry.
     auto rows = current_a.phase_rows;
@@ -447,6 +448,36 @@ struct SparseMultigrid::Impl {
     auto ci = current_a.phase_colidx;
     auto av = current_a.phase_values;
     auto inverse = levels[0].inverse_diagonal;
+    if (all_rows) {
+      // Full outer-only updates can change nonphase rows too. On re-entering
+      // compact mode, rebuild the complete effective fine smoothing diagonal.
+      // This volume kernel and its validation are absent from regular updates.
+      auto base_rp = current_a.rowptr;
+      auto base_ci = current_a.colidx;
+      auto base_av = current_a.values;
+      auto mapping = current_a.phase_map;
+      const int n = current_a.rows;
+      int invalid = 0;
+      Kokkos::parallel_reduce("gravity_full_phase_diagonal",
+      Kokkos::RangePolicy<DevExeSpace>(0,n),KOKKOS_LAMBDA(int i, int &bad) {
+        const int j = mapping(i);
+        Real diagonal = 0;
+        if (j >= 0) {
+          for (int k = rp(j); k < rp(j+1); ++k) if (ci(k) == i) diagonal += av(k);
+        } else {
+          for (int k = base_rp(i); k < base_rp(i+1); ++k)
+            if (base_ci(k) == i) diagonal += base_av(k);
+        }
+        const Real inv = diagonal == 0 ? Real(0) : Real(1)/diagonal;
+        if (diagonal == 0 || !Kokkos::isfinite(diagonal) || !Kokkos::isfinite(inv)) {
+          ++bad;
+        } else {
+          inverse(i) = inv;
+        }
+      },invalid);
+      Require(invalid == 0,"invalid current fine smoothing diagonal after full update");
+      return;
+    }
     const int count = current_a.phase_rows_host.size();
     Kokkos::parallel_for("gravity_phase_diagonal",Kokkos::RangePolicy<DevExeSpace>(0,count),
     KOKKOS_LAMBDA(int j) {
@@ -576,6 +607,7 @@ struct SparseMultigrid::Impl {
     Require(partition.empty() || partition == part,
             "fine ownership changed; construct a fresh hierarchy");
     CheckLocal(a,part,part);
+    fine_diagonal_dirty = true;
     if (current_a.phase_configured) {
       // A caller switching back to the outer-only full update freezes the most
       // recent phase preconditioner, including its already updated diagonal.
@@ -1045,7 +1077,8 @@ void SparseMultigrid::ConfigureFinePhaseRows(const std::vector<int> &rows) {
 void SparseMultigrid::UpdateFinePhaseRows(const CsrRowUpdate &a) {
   const bool smooth = impl_->levels.size() > 1;
   const bool same = impl_->UpdatePhase(impl_->current_a,a,smooth);
-  if (smooth) impl_->UpdateFinePhaseDiagonal();
+  if (smooth) impl_->UpdateFinePhaseDiagonal(impl_->fine_diagonal_dirty);
+  impl_->fine_diagonal_dirty = false;
   ++impl_->fine_updates.updates;
   if (same) ++impl_->fine_updates.value_updates;
   else ++impl_->fine_updates.structure_rebuilds;

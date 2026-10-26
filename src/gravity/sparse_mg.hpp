@@ -120,6 +120,9 @@ class SparseMultigrid {
   void ConfigureFinePhaseRows(const std::vector<int> &rows);
   // Refresh the outer and V-cycle finest operator together, including selected
   // smoother diagonal entries. They share one CSR/halo; coarse A/P/R stay cached.
+  // Re-entering compact mode after a full outer-only update validates/refreshes
+  // the entire effective fine diagonal once. A single-level hierarchy has no
+  // smoother and retains its cached terminal LU.
   void UpdateFinePhaseRows(const CsrRowUpdate &matrix);
   SolveStats Solve(const DvceArray1D<Real> &rhs, const DvceArray1D<Real> &x,
                    Real tolerance, int max_iterations, int restart = 24);
@@ -128,7 +131,8 @@ class SparseMultigrid {
   void ApplyMatrix(int level, const DvceArray1D<Real> &x,
                    const DvceArray1D<Real> &result);
   // Uses the current finest phase operator/diagonal after UpdateFinePhaseRows;
-  // all other levels and transfers remain cached.
+  // all other levels and transfers remain cached. A single-level hierarchy uses
+  // its cached terminal LU even after fine phase updates.
   void ApplyVCycle(const DvceArray1D<Real> &rhs, const DvceArray1D<Real> &result);
 
  private:
