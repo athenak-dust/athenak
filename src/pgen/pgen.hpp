@@ -70,6 +70,7 @@ class ProblemGenerator {
   void Diffusion(ParameterInput *pin, const bool restart);
   void DustDamping(ParameterInput *pin, const bool restart);
   void DustNSH(ParameterInput *pin, const bool restart);
+  void DustGravityTransfer(ParameterInput *pin, const bool restart);
   void DustyWave(ParameterInput *pin, const bool restart);
   void LinearWave(ParameterInput *pin, const bool restart);
   void LWImplode(ParameterInput *pin, const bool restart);

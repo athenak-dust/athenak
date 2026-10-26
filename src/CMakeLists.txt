@@ -50,6 +50,7 @@ add_executable(
         gravity/restart.cpp
         gravity/slab_boundary.cpp
         pgen/tests/self_gravity_wave.cpp
+        pgen/tests/dust_gravity_transfer.cpp
 
         dust/dust.cpp
         dust/dust_newdt.cpp
