@@ -5,6 +5,16 @@ rows affected by the changing shear phase. Vertical isolation uses a coarsened
 vacuum exterior, retaining the nonzero mean sheet field. The reference backend
 remains available explicitly for accuracy comparisons.
 
+**Post-review fixes accepted:** `2b4adc3c` and `7566e314` make the
+optional direct isolated boundary continuous through shear remaps and prevent
+extreme-scale FGMRES norms from falsely certifying convergence. CPU 1/2/8-rank
+regressions and a run on four distinct GB200 GPUs pass, including
+the actual WENO-Z physical SMR and dynamic AMR cases below. The same-job large
+SMR baseline/fixed active float64 maximum difference is4.90e-13. Gravity stage
+time including setup amortization is73.48/73.57ms per step; this single pair
+shows no material regression, not a precise performance difference. The older
+30112e27 measurements remain labelled with their original provenance.
+
 **Accepted hydro baseline (2026-10-26):** the numerical implementation at
 `30112e27` has passed native WENO-Z physical SMR, dynamic AMR, changed-rank
 restart and four-distinct-GB200 checks. The final coarse-grid repair gives
@@ -98,7 +108,7 @@ hardware validation separately verified distinct GPU assignments.
 | `rtol` | `1e-10`, residual relative to the full linear-system RHS, including the isolated mean-sheet/boundary terms |
 | `max_iterations`, `gmres_restart` | `150`, `24` |
 | `cfl` | `0.25`, safety factor for acceleration and free-fall limits |
-| `slab_modes_x`, `slab_modes_y` | `0`: use finest horizontal Nyquist cutoff |
+| `slab_modes_x`, `slab_modes_y` | `0`: use finest horizontal Nyquist core/cutoff; direct x spectrum has the one-mode taper described below |
 | `report_each_solve` | `false`; final solve summary is always emitted |
 | `phase_threads` | `0`: up to eight affinity-limited host workers in GPU builds, one in CPU builds; `1` forces serial assembly |
 
@@ -349,6 +359,25 @@ horizontal Fourier projection and free-space vertical Green function on source
 cells; this is an accuracy backend, not a claim of production scaling. Two cheaper
 coarse-grid prototypes failed standalone multigrid contraction and were not
 adopted. They are distinct from the new distributed geometric hierarchy.
+
+The direct boundary now defines its x cutoff in physical wavenumber:
+`a=kx*Lx/(2*pi)` has unit weight through `abs(a)<=slab_modes_x`, with a cosine
+taper to zero over the next unit interval. Per-ky integer labels follow the
+current shear phase; labels exchanged at a wrap have zero weight and derivative.
+The unsheared rectangular finite sum is retained. At nonzero shear this is a
+windowed spectral approximation, requiring convergence checks in both cutoffs.
+`gravity_slab_window_check` verifies the wrap, cutoff edges, update-history
+independence, and the original unsheared sum. The production vacuum path is
+unaffected by this reference-boundary change.
+
+FGMRES uses scaled sum-of-squares norms and common extreme-scale normalization
+of its RHS and warm guess. Nonfinite inputs and unrepresentable RHS/guess ranges
+are rejected. An exactly homogeneous projected system takes the zero gauge-fixed
+solution. `gravity_solver_scaling_check` exercises finite scales1e-300..1e308,
+warm guesses and collective rejection, including ranks owning no rows. There is
+one MPI collective per existing norm, as before, plus three validation norms per
+solve and one working solution vector; inner dot-product collective counts are
+unchanged. These checks do not promise solvability for every finite-double matrix.
 
 The distributed backend has been tested on CPUs with gcc 13: uniform
 $128^3$ hierarchy setup takes 1.07 s on four ranks, compared with 65.45 s for the
