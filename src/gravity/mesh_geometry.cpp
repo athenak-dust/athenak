@@ -39,7 +39,15 @@ struct Face {
   double area = 1., distance;
   Vec delta{}, ti{}, tj{}, width{};
 };
-
+struct ReconstructionFaces {
+  std::unordered_map<GlobalIndex,std::vector<Face>> rows;
+  size_t bytes = 0;
+  static size_t Bytes(const std::vector<Face> &faces) {
+    return faces.capacity()*sizeof(Face)+sizeof(std::vector<Face>)+
+           sizeof(GlobalIndex)+4*sizeof(void *);
+  }
+  void Clear() { rows.clear(); bytes = 0; }
+};
 void Add(Row &row, GlobalIndex column, double value) {
   // Most rows contain only seven entries; a short contiguous scan avoids a
   // heap node per coefficient and avoids gradient maps on aligned interiors.
@@ -139,8 +147,10 @@ struct MeshGeometry::Impl {
   std::vector<Node> tree;
   GradientCache gradients;
   QuadraticCache quadratics;
+  ReconstructionFaces reconstruction_faces;
   struct PhaseContext {
     QuadraticCache quadratics;
+    ReconstructionFaces faces;
     double shear = std::numeric_limits<double>::quiet_NaN();
   };
   std::vector<PhaseContext> phase_contexts;
@@ -357,6 +367,20 @@ struct MeshGeometry::Impl {
     }
     return faces;
   }
+  const std::vector<Face> &CachedReconstructionFaces(GlobalIndex row,
+      ReconstructionFaces &cache, std::vector<Face> &uncached) const {
+    const auto found = cache.rows.find(row);
+    if (found != cache.rows.end()) return found->second;
+    auto faces = Faces(row);
+    const size_t bytes = ReconstructionFaces::Bytes(faces);
+    // This cache serves repeated reconstruction neighborhoods, not a global
+    // face expansion. Keep its payload bounded independently of mesh size.
+    constexpr size_t limit = 8*1024*1024;
+    if (bytes > limit) { uncached = std::move(faces); return uncached; }
+    if (cache.bytes+bytes > limit) cache.Clear();
+    cache.bytes += bytes;
+    return cache.rows.emplace(row,std::move(faces)).first->second;
+  }
   const Gradient &Grad(GlobalIndex row, GradientCache &cache) const {
     auto found = cache.find(row);
     if (found != cache.end()) return found->second;
@@ -391,7 +415,8 @@ struct MeshGeometry::Impl {
   // Point-center quadratic reconstruction. Two face-neighbor rings include
   // mixed moments even on a Cartesian interior (one ring has only axis points).
   // All coordinates are local unwrapped images, including at a shearing seam.
-  const Quadratic &Quad(GlobalIndex row, QuadraticCache &cache) const {
+  const Quadratic &Quad(GlobalIndex row, QuadraticCache &cache,
+                        ReconstructionFaces &face_cache) const {
     auto found = cache.find(row);
     if (found != cache.end()) return found->second;
     struct Sample { GlobalIndex id; Vec delta; };
@@ -416,7 +441,8 @@ struct MeshGeometry::Impl {
     Quadratic q;
     auto neighbors = [&](GlobalIndex id, const Vec &offset) {
       q.phase_dependent = q.phase_dependent || TouchesX(id);
-      for (const auto &f : Faces(id)) {
+      std::vector<Face> uncached;
+      for (const auto &f : CachedReconstructionFaces(id,face_cache,uncached)) {
         const double sign = f.side;
         Vec delta = offset;
         for (int d = 0; d < nd; ++d) delta[d] += sign*f.delta[d];
@@ -535,8 +561,9 @@ struct MeshGeometry::Impl {
   bool IsPhaseRow(GlobalIndex row) const {
     const auto cell = Cell(row); double volume = 1.;
     for (int d = 0; d < nd; ++d) volume *= cell.width[d];
-    QuadraticCache cache; RowWorkspace work; bool dependent = false;
-    AssembleRow(row,cell,volume,true,work,cache,nullptr,&dependent);
+    QuadraticCache cache; ReconstructionFaces faces;
+    RowWorkspace work; bool dependent = false;
+    AssembleRow(row,cell,volume,true,work,cache,faces,nullptr,&dependent);
     return dependent;
   }
   void DiscoverPhaseRows() {
@@ -556,7 +583,8 @@ struct MeshGeometry::Impl {
   // Add diagonal Hessians using cheap centered axes where all neighbors are
   // aligned and equally sized. Only irregular/one-sided cells need a full fit.
   void AddDiagonal(Row &target, GlobalIndex row, const Vec &weights,
-                   QuadraticCache &cache, bool *phase_dependent) const {
+                   QuadraticCache &cache, ReconstructionFaces &face_cache,
+                   bool *phase_dependent) const {
     const int p = Patch(row); const auto index = Indices(p,row);
     const auto cell = Cell(p,index);
     if (phase_dependent && TouchesX(cell)) *phase_dependent = true;
@@ -573,7 +601,8 @@ struct MeshGeometry::Impl {
         auto next = index; next[d] += 2*side-1; neighbor[d][side] = Id(p,next);
       }
     } else if (regular) {
-      const auto faces = Faces(row);
+      std::vector<Face> uncached;
+      const auto &faces = CachedReconstructionFaces(row,face_cache,uncached);
       regular = faces.size() == static_cast<size_t>(2*nd);
       for (const auto &f : faces) {
         const auto other = f.side > 0 ? f.right : f.left;
@@ -595,7 +624,7 @@ struct MeshGeometry::Impl {
         AddPotential(target,row,-2.*coefficient);
       }
     } else {
-      const auto &q = Quad(row,cache);
+      const auto &q = Quad(row,cache,face_cache);
       if (phase_dependent && q.phase_dependent) *phase_dependent = true;
       for (const auto &v : q.coefficients) {
         double coefficient = 0.; int k = nd;
@@ -609,7 +638,7 @@ struct MeshGeometry::Impl {
     }
   }
   void FacePotential(const Face &face, Row &potential, QuadraticCache &cache,
-                     bool *phase_dependent) const {
+                     ReconstructionFaces &face_cache, bool *phase_dependent) const {
     potential.clear();
     const GlobalIndex n = partition.back();
     if (face.left >= n || face.right >= n) {
@@ -622,7 +651,7 @@ struct MeshGeometry::Impl {
       for (int d = 0; d < nd; ++d)
         weights[d] = d == face.normal ? -.125*cell.width[d]*cell.width[d] :
                                        face.width[d]*face.width[d]/24.;
-      AddDiagonal(potential,row,weights,cache,phase_dependent);
+      AddDiagonal(potential,row,weights,cache,face_cache,phase_dependent);
       return;
     }
     const auto left = Cell(face.left), right = Cell(face.right);
@@ -637,10 +666,10 @@ struct MeshGeometry::Impl {
         diagonal[d] = weight*(d == face.normal ? -.125*cell.width[d]*cell.width[d] :
                                                 face.width[d]*face.width[d]/24.);
       if (!transverse) {
-        AddDiagonal(potential,row,diagonal,cache,phase_dependent);
+        AddDiagonal(potential,row,diagonal,cache,face_cache,phase_dependent);
         return;
       }
-      const auto &q = Quad(row,cache);
+      const auto &q = Quad(row,cache,face_cache);
       if (phase_dependent && q.phase_dependent) *phase_dependent = true;
       Modes moment{};
       for (int d = 0; d < nd; ++d) moment[d] = weight*offset[d]/cell.width[d];
@@ -664,6 +693,7 @@ struct MeshGeometry::Impl {
   // routine, including canonical faces and all Dirichlet/Neumann LS couplings.
   void AssembleRow(GlobalIndex row, const CompositeCell &ci, double volume,
                    bool forces, RowWorkspace &work, QuadraticCache &quadratic_cache,
+                   ReconstructionFaces &face_cache,
                    bool *is_interface = nullptr, bool *phase_dependent = nullptr) const {
     work.a.clear(); for (auto &component : work.g) component.clear();
     if (is_interface) *is_interface = false;
@@ -677,7 +707,7 @@ struct MeshGeometry::Impl {
             left.width[f.normal] != right.width[f.normal]) {
           auto reconstruct = [&](GlobalIndex id, const CompositeCell &cell,
                                  const Vec &offset, double sign) {
-            const auto &q = Quad(id,quadratic_cache);
+            const auto &q = Quad(id,quadratic_cache,face_cache);
             if (phase_dependent && q.phase_dependent) *phase_dependent = true;
             Modes moment{};
             for (int d = 0; d < nd; ++d) moment[d] = sign*offset[d]/cell.width[d];
@@ -710,7 +740,7 @@ struct MeshGeometry::Impl {
         if (f.left != f.right) Add(work.a,v.first,-sign*flux);
       }
       if (forces) {
-        FacePotential(f,work.potential,quadratic_cache,phase_dependent);
+        FacePotential(f,work.potential,quadratic_cache,face_cache,phase_dependent);
         for (const auto &v : work.potential)
           Add(work.g[f.normal],v.first,-sign*f.area*v.second/volume);
       }
@@ -729,6 +759,12 @@ struct MeshGeometry::Impl {
       for (auto it = context.quadratics.begin(); it != context.quadratics.end();) {
         if (it->second.phase_dependent) it = context.quadratics.erase(it);
         else ++it;
+      }
+      for (auto it = context.faces.rows.begin(); it != context.faces.rows.end();) {
+        if (TouchesX(it->first)) {
+          context.faces.bytes -= ReconstructionFaces::Bytes(it->second);
+          it = context.faces.rows.erase(it);
+        } else ++it;
       }
       context.shear = shear;
     }
@@ -749,7 +785,7 @@ struct MeshGeometry::Impl {
       const GlobalIndex row = begin+phase_rows[i];
       const auto cell = Cell(row); double volume = 1.;
       for (int d = 0; d < nd; ++d) volume *= cell.width[d];
-      AssembleRow(row,cell,volume,forces,work,context.quadratics);
+      AssembleRow(row,cell,volume,forces,work,context.quadratics,context.faces);
       Append(out.matrix,work.a,n,false);
       if (forces) Append(out.boundary_rhs,work.a,n,true,-1.);
       for (int d = 0; forces && d < 3; ++d) {
@@ -1069,6 +1105,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   // full build or an interrupted assembly at a different phase.
   m.gradients.clear();
   m.quadratics.clear();
+  m.reconstruction_faces.Clear();
   LocalCompositeSystem out;
   out.neumann_z = m.neumann_z;
   out.row_partition = m.partition; out.sample_partition = m.sample_partition;
@@ -1106,7 +1143,8 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
       out.volume.push_back(volume); out.cells.push_back(ci); out.interface.push_back(0);
     }
     bool is_interface = false, phase_dependent = false;
-    m.AssembleRow(row,ci,volume,forces,work,m.quadratics,forces ? &is_interface : nullptr,
+    m.AssembleRow(row,ci,volume,forces,work,m.quadratics,m.reconstruction_faces,
+                  forces ? &is_interface : nullptr,
                   discover_phase_rows ? &phase_dependent : nullptr);
     if (forces) out.interface.back() = is_interface;
     if (discover_phase_rows && phase_dependent)
@@ -1137,6 +1175,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   for (const auto &q : m.quadratics)
     out.quadratic_interface_fallbacks += q.second.interface_fallback;
   m.quadratics.clear(); m.quadratics.rehash(0);
+  m.reconstruction_faces = ReconstructionFaces{};
   return out;
 }
 

@@ -63,7 +63,9 @@ void ConstantsAndFlux(const LocalCompositeSystem &s, bool isolated) {
   std::vector<double> one(n,1.), boundary(s.boundary_samples.size(),s.neumann_z ? 0. : 1.),
       columns(n,0.);
   std::array<std::vector<double>,3> force_columns;
+  std::array<std::vector<double>,3> boundary_force_columns;
   for (auto &c : force_columns) c.assign(n,0.);
+  for (auto &c : boundary_force_columns) c.assign(s.boundary_samples.size(),0.);
   double error = 0.;
   for (int i = 0; i < n; ++i) {
     error = std::max(error,std::abs(Apply(s.matrix,i,one)-Apply(s.boundary_rhs,i,boundary)));
@@ -76,13 +78,20 @@ void ConstantsAndFlux(const LocalCompositeSystem &s, bool isolated) {
       const auto &g = s.acceleration[d];
       for (int k = g.rowptr[i]; k < g.rowptr[i+1]; ++k)
         force_columns[d][g.colidx[k]] += s.volume[i]*g.values[k];
+      const auto &b = s.boundary_acceleration[d];
+      for (int k = b.rowptr[i]; k < b.rowptr[i+1]; ++k)
+        boundary_force_columns[d][b.colidx[k]] += s.volume[i]*b.values[k];
     }
   }
   Require(error < 2.e-11,"constant potential gained a force or Laplacian");
   if (!isolated || s.neumann_z) for (double v : columns)
     Require(std::abs(v) < 2.e-12,"shared face flux lost the periodic left nullspace");
-  if (!isolated) for (const auto &c : force_columns) for (double value : c)
-    Require(std::abs(value) < 2.e-12,"shared potential face average lost zero volume force");
+  for (int d = 0; d < (isolated ? 2 : 3); ++d) {
+    for (double value : force_columns[d])
+      Require(std::abs(value) < 2.e-12,"shared potential face average lost zero volume force");
+    for (double value : boundary_force_columns[d])
+      Require(std::abs(value) < 2.e-12,"boundary potential data gained a net lateral force");
+  }
 }
 void Polynomials(int nd, bool neumann, bool c1 = false) {
   const int n = 16;
