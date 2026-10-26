@@ -1593,8 +1593,19 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
   const int npart = ppar->nprtcl_thispack;
   const auto lt = leaf_traversal3d;
   // (the gas gather field is packed below, once the pool is known; 2026-10-25, Codex perf review)
+  // 2026-10-26 fix: the decision is collective and the pack has a forward halo exchange, so every
+  // rank takes part, also one without particles (it returned before the MPI_Allreduce and the
+  // other ranks failed in it with MPI_ERR_TRUNCATE: 4 x H100, a 3-D AMR run, first R at
+  // t = 1 with the top and bottom root blocks free of dust)
+  auto gas_if_needed = [&](const int npool_mine) {
+    int npool_max = npool_mine;
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &npool_max, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+#endif
+    if (npool_max >= 2) PackGasGather3D(pmy_pack->phydro->u0);
+  };
   if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
-  if (npart == 0) return 0;
+  if (npart == 0) {gas_if_needed(0); return 0;}
   const int nsp = std::max(1, nspecies);
   DvceArray1D<Real> m0sp("rs3_m0", nsp);
   {
@@ -1832,13 +1843,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
   // 2026-10-25 (Codex perf review): the gas gather field (u0 velocities, with a forward halo
   // exchange on several ranks) is only needed when some rank resamples; the decision is
   // collective because the halo exchange is.  u0 is unchanged since the call above used to be.
-  {
-    int npool_max = npool;
-#if MPI_PARALLEL_ENABLED
-    MPI_Allreduce(MPI_IN_PLACE, &npool_max, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-#endif
-    if (npool_max >= 2) PackGasGather3D(pmy_pack->phydro->u0);
-  }
+  gas_if_needed(npool);
   if (npool < 2) {
     ++cloud_resample_pass;
     char row[1024];
