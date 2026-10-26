@@ -122,6 +122,9 @@ class SelfGravity {
   std::uint64_t cached_operator_updates_ = 0;
   bool orbital_split_ = false, hydro_boundary_time_valid_ = false;
   bool coupled_dust_ = false;
+  // Gas only / dust only / gas + dust: which matter makes the field
+  // (<gravity>/source) and which matter it acts on (<gravity>/kick, default = source)
+  bool source_gas_ = true, source_dust_ = false, kick_gas_ = true, kick_dust_ = false;
   Real hydro_boundary_time_ = 0;
   std::string vertical_bc_, setup_, isolated_method_;
   GravityRestartState restart_state_;

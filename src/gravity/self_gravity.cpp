@@ -76,11 +76,6 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
          "without the dust module are not supported");
   }
   coupled_dust_ = pack->pdust != nullptr;
-  if (coupled_dust_ && !pack->pdust->GravityTransferSupported())
-    Fail("dust gravity requires supported 3D refinable clouds, uniform TSC, or owner_overlap TSC");
-  if (coupled_dust_ &&
-      pin->GetOrAddString("gravity","dust_x3_assignment","fold")!="fold")
-    Fail("dust gravity/dust_x3_assignment supports fold only; drag deposit policy is independent");
   if (pin->GetOrAddString("gravity", "solver", "multigrid") != "multigrid") {
     Fail("solver must be multigrid");
   }
@@ -110,6 +105,28 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     // common gravity kicks. Never half-remap only gas while dust still drifts
     // its whole background shear inside the original transport update.
     orbital_split_ = pm->three_d && evolution == "dynamic" && !coupled_dust_;
+  }
+  {
+    // Rixin: we need gas only, dust only (particle self-gravity, as AthenaSG's
+    // PARTICLE_SELF_GRAVITY), or gas + dust (AthenaSG's PLUS_GAS_SELF_GRAVITY).  kick chooses the
+    // matter the field acts on (AthenaSG: PARTICLE_SELF_GRAVITY_ON_GAS / _AS_FEEDBACK let the gas feel
+    // the particles' field); the default is the matter of the source.
+    auto parse = [&](const std::string &key, const std::string &value, bool &gas, bool &dust) {
+      if (value == "both") {gas = true; dust = true;}
+      else if (value == "gas") {gas = true; dust = false;}
+      else if (value == "dust") {gas = false; dust = true;}
+      else Fail("<gravity>/" + key + " must be gas, dust or both");
+    };
+    const std::string src = pin->GetOrAddString("gravity", "source", coupled_dust_ ? "both" : "gas");
+    parse("source", src, source_gas_, source_dust_);
+    parse("kick", pin->GetOrAddString("gravity", "kick", src), kick_gas_, kick_dust_);
+    if (!coupled_dust_ && (source_dust_ || kick_dust_))
+      Fail("<gravity>/source or kick includes dust, but the run has no dust module");
+    if (coupled_dust_ && (source_dust_ || kick_dust_) && !pack->pdust->GravityTransferSupported())
+      Fail("dust gravity requires supported 3D refinable clouds, uniform TSC, or owner_overlap TSC");
+    if (coupled_dust_ && (source_dust_ || kick_dust_) &&
+        pin->GetOrAddString("gravity","dust_x3_assignment","fold")!="fold")
+      Fail("dust gravity/dust_x3_assignment supports fold only; drag deposit policy is independent");
   }
   four_pi_G = pin->GetReal("gravity", "four_pi_G");
   tolerance_ = pin->GetOrAddReal("gravity", "rtol", 1.0e-10);
@@ -707,7 +724,7 @@ void SelfGravity::RememberSource(const DvceArray1D<Real> &physical_source) {
 }
 
 void SelfGravity::UpdateDustField(Real time) {
-  if (coupled_dust_)
+  if (coupled_dust_ && kick_dust_)
     pack_->pdust->GatherGravityAcceleration(time,acceleration,particle_acceleration_);
 }
 
@@ -737,7 +754,9 @@ void SelfGravity::Solve(Real time) {
   auto extra = extra_density_;
   Kokkos::deep_copy(extra,0.0);
   if (extra_source_) extra_source_(time,extra);
-  if (coupled_dust_) {
+  // The dust density is deposited when dust is a source, or when dust is kicked (the
+  // forced-PC2 drag bound in UpdateTimeStep reads it)
+  if (coupled_dust_ && (source_dust_ || kick_dust_)) {
     auto *dust=pack_->pdust;
     if (!dust->stopping_times_initialized ||
         dust->stopping_time_mode==DustStoppingTimeMode::dynamic)
@@ -752,7 +771,7 @@ void SelfGravity::Solve(Real time) {
   }
   auto volume = volume_;
   auto b = rhs_;
-  const bool dust_source=coupled_dust_;
+  const bool dust_source=coupled_dust_ && source_dust_, gas_source=source_gas_;
   auto dust_density=dust_density_;
   Real local_mass = 0;
   Kokkos::parallel_reduce("sg_source_mass",Kokkos::RangePolicy<DevExeSpace>(0,n),
@@ -761,7 +780,7 @@ void SelfGravity::Solve(Real time) {
     const int i = t%ind.nx1+ind.is; t /= ind.nx1;
     const int j = t%ind.nx2+ind.js; t /= ind.nx2;
     const int k = t%ind.nx3+ind.ks; t /= ind.nx3;
-    physical_source(q) = u(t,IDN,k,j,i)+extra(t,0,k,j,i)
+    physical_source(q) = (gas_source ? u(t,IDN,k,j,i) : Real(0))+extra(t,0,k,j,i)
                         +(dust_source ? dust_density(t,0,k,j,i) : Real(0));
     sum += physical_source(q)*volume(rows(q));
   },local_mass);
@@ -1012,8 +1031,8 @@ void SelfGravity::KickHydro(Real dt) {
 
 void SelfGravity::KickMatter(Real dt) {
   if (!std::isfinite(dt)) Fail("nonfinite matter kick");
-  KickHydro(dt);
-  if (coupled_dust_) pack_->pdust->KickGravity(dt,particle_acceleration_);
+  if (kick_gas_) KickHydro(dt);
+  if (coupled_dust_ && kick_dust_) pack_->pdust->KickGravity(dt,particle_acceleration_);
 }
 
 void SelfGravity::UpdateTimeStep() {
@@ -1042,10 +1061,10 @@ void SelfGravity::UpdateTimeStep() {
       if (a > 0) minimum = fmin(minimum,sqrt(dx[d]/a));
     }
   },Kokkos::Min<Real>(limit));
-  if (coupled_dust_)
+  if (coupled_dust_ && kick_dust_)
     limit=std::min(limit,pack_->pdust->GravityAccelerationTimeStep(particle_acceleration_));
   dtnew = gravity_cfl_*limit;
-  if (coupled_dust_ && pack_->pdust->coupling==DustCoupling::hybrid &&
+  if (coupled_dust_ && kick_dust_ && pack_->pdust->coupling==DustCoupling::hybrid &&
       pack_->pdust->hybrid_force_mode==HybridForceMode::pc2) {
     // Forced PC2 is a resolved-drag method: its gas feedback predictor is not
     // unconditionally stable for dt/t_s or high dust loading. A conservative
