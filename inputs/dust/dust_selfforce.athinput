@@ -1,0 +1,119 @@
+<comment>
+problem = self-force of one dust cloud (or of a pair) at a coarse-fine interface through
+          deposit -> multigrid -> force -> gather; uniform control: refined_region1 over the whole box
+
+<job>
+basename = SF
+
+<mesh>
+nghost = 4
+nx1 = 16
+x1min = 0.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 16
+x2min = 0.0
+x2max = 1.0
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 16
+x3min = 0.0
+x3max = 1.0
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement = static
+num_levels = 2
+
+<refined_region1>
+level = 1
+x1min = 0.05
+x1max = 0.45
+x2min = 0.0
+x2max = 1.0
+x3min = 0.0
+x3max = 1.0
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.225
+nlim = 0
+tlim = 1.0
+ndiag = 1
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hlle
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+ppc = 1
+
+<dust>
+experimental_mpi = true
+nspecies = 1
+taus_1 = 1.0
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+drag_solver = local
+coupling = pc2
+experimental_static_smr = true
+experimental_3d = true
+experimental_smr_transfer = refinable_cloud
+cloud_gather_order = 2
+cloud_transition = 2
+cloud_p1_split = true
+cloud_split_overlap = true
+cloud_split_device = true
+cloud_merge = false
+cloud_resample = false
+cloud_leaf_check = 0
+
+<problem>
+pgen_name = dust_selfforce
+sf_mode = single
+sf_pair_dx = 0.03125
+sf_xref = 0.5
+sf_level = 1
+sf_y = 0.53
+sf_z = 0.47
+sf_x0 = 0.0
+sf_x1 = 1.0
+sf_n = 81
+sf_mass = 1.0e-3
+rho0 = 1.0
+etavk = 0.0
+eps_1 = 0.1
+cloud_root_random = true
+random_seed = 2007
+root_placement = lattice
+dust_test = damping
+dust_test_v0 = 0.0
+check_equilibrium = false
+
+<gravity>
+enabled = true
+source = dust
+setup = distributed
+solver = multigrid
+four_pi_G = 1.0
+vertical_bc = periodic
+rtol = 1e-12
+max_iterations = 300
+gmres_restart = 24
+phase_threads = 1
+profile = false
+report_each_solve = false
+
