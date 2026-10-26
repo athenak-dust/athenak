@@ -1832,6 +1832,16 @@ class DustGasDrag {
   void CloudPredictor3D(const bool rate_dep);
   void CloudAdvance3D();
   void DepositCloudDensity3D(DvceArray5D<Real> &f);
+  // Gravity uses the physical mass assignment, independently of drag's linear
+  // velocity reconstruction. Fields contain owned active leaves; halo exchange
+  // is performed internally at the explicitly supplied geometry time.
+  bool GravityTransferSupported() const;
+  void DepositGravityDensity(Real geometry_time, DvceArray5D<Real> &owned_density);
+  void GatherGravityAcceleration(Real geometry_time,
+                                const DvceArray5D<Real> &owned_acceleration,
+                                DvceArray2D<Real> &particle_acceleration);
+  void KickGravity(Real dt, const DvceArray2D<Real> &particle_acceleration);
+  Real GravityAccelerationTimeStep(const DvceArray2D<Real> &particle_acceleration);
   void CheckClouds3D();   // the restrictions of 3-D stage 1
   void WrapParticles3D();
   int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
@@ -1990,6 +2000,7 @@ class DustGasDrag {
   TaskStatus ClearDep(Driver *pdrive, int stage);
 
  private:
+  DvceArray5D<Real> gravity_density_halo_, gravity_acceleration_halo_;
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this DustGasDrag
 };
 
