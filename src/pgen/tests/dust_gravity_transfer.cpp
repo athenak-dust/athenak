@@ -56,6 +56,16 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
   auto pr=Kokkos::create_mirror(particles->prtcl_rdata);
   Kokkos::deep_copy(pr,particles->prtcl_rdata);
   const auto original_particles=pr;
+  auto codes=Kokkos::create_mirror_view_and_copy(HostMemSpace(),particles->prtcl_idata);
+  Real shapes[4]={0,0,0,0};
+  for (int p=0;p<npart;++p) if (pr(IPM,p)>0) {
+    const int code=codes(PLEV,p);
+    const bool l1=::dust::SMRCompositeTransfer::CloudLobe1(code)!=0;
+    const bool l2=::dust::SMRCompositeTransfer::CloudLobe2(code)!=0;
+    const bool l3=::dust::SMRCompositeTransfer::CloudLobe3(code)!=0;
+    shapes[0]+=!(l1||l2||l3); shapes[1]+=l1; shapes[2]+=l2; shapes[3]+=l3;
+  }
+  Sum(shapes,4);
   Real mass[2]={0,0};
   for (int p=0;p<npart;++p) mass[0]+=pr(IPM,p);
   DvceArray5D<Real> field("gravity_test_field",nmb,3,density.extent(2),
@@ -140,7 +150,9 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
       <<",\"particle_mass\":"<<mass[0]<<",\"leaf_mass\":"<<mass[1]
       <<",\"mass_error\":"<<mass_error<<",\"adjoint_error\":"<<adjoint_error
       <<",\"constant_error\":"<<constant_error<<",\"kick_error\":"<<kick_error
-      <<",\"diagnostic_density_error\":"<<old_density_error<<",\"passed\":true}\n";
+      <<",\"diagnostic_density_error\":"<<old_density_error
+      <<",\"shape_counts_plain_x1_x2_x3\":["<<shapes[0]<<','<<shapes[1]<<','
+      <<shapes[2]<<','<<shapes[3]<<"],\"passed\":true}\n";
 }
 }  // namespace
 
