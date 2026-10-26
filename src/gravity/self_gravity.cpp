@@ -596,6 +596,7 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
     ++phase_update_count;
     if (profile_) {
       const auto counters = mg_->FineUpdates();
+      const auto hierarchy = mg_->HierarchyPhaseUpdates();
       std::cout << std::setprecision(10) << "# SG_PROFILE_PHASE rank="
                 << global_variable::my_rank << " phase=" << shear_offset
                 << " phase_updates=" << phase_update_count
@@ -607,7 +608,13 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
                 << " prolongation_assembly_s=" << assembled-coarse_assembled
                 << " operators_s=" << ProfileTime(true)-assembled
                 << " value_updates=" << counters.value_updates
-                << " structure_rebuilds=" << counters.structure_rebuilds << '\n';
+                << " structure_rebuilds=" << counters.structure_rebuilds
+                << " fine_halo_rebuilds=" << counters.halo_rebuilds
+                << " fine_halo_reuses=" << counters.halo_reuses
+                << " hierarchy_halo_rebuilds=" << hierarchy.halo_rebuilds
+                << " hierarchy_halo_reuses=" << hierarchy.halo_reuses
+                << " hierarchy_phase_map_payload_bytes=" << hierarchy.host_map_peak_bytes
+                << '\n';
     }
   } catch (const std::exception &e) { Fail(e.what()); }
 }
