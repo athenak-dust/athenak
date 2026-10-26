@@ -23,6 +23,7 @@
 #include "gravity/slab_boundary.hpp"
 #include "gravity/vacuum_boundary.hpp"
 #include "hydro/hydro.hpp"
+#include "dust/dust.hpp"
 #include "parameter_input.hpp"
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
@@ -66,14 +67,17 @@ struct ExactSourceDifference {
 
 SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack) {
   auto *pm = pack->pmesh;
-  if (pack->phydro == nullptr || pack->pmhd != nullptr || pack->pdust != nullptr ||
-      pack->ppart != nullptr ||
+  if (pack->phydro == nullptr || pack->pmhd != nullptr ||
+      (pack->ppart != nullptr && pack->pdust == nullptr) ||
       pack->prad != nullptr || pack->pcoord->is_special_relativistic ||
       pack->pcoord->is_general_relativistic || pack->pcoord->is_dynamical_relativistic ||
       pm->nmb_packs_thisrank != 1 || pm->one_d) {
-    Fail("currently requires Newtonian 2D/3D hydro, one pack per rank; dust coupling "
-         "is a future consumer of the source/acceleration API");
+    Fail("requires Newtonian 2D/3D hydro, one pack per rank; standalone particles "
+         "without the dust module are not supported");
   }
+  coupled_dust_ = pack->pdust != nullptr;
+  if (coupled_dust_ && !pack->pdust->GravityTransferSupported())
+    Fail("dust gravity currently requires supported 3D refinable clouds");
   if (pin->GetOrAddString("gravity", "solver", "multigrid") != "multigrid") {
     Fail("solver must be multigrid");
   }
@@ -94,7 +98,10 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
       Fail("gravity orbital splitting requires a supported 3D shearing box");
     }
     // The existing 2D r-z box has Coriolis terms but no orbital remap.
-    orbital_split_ = pm->three_d && evolution == "dynamic";
+    // Coupled dust retains the existing complete gas+dust transport between the
+    // common gravity kicks. Never half-remap only gas while dust still drifts
+    // its whole background shear inside the original transport update.
+    orbital_split_ = pm->three_d && evolution == "dynamic" && !coupled_dust_;
   }
   four_pi_G = pin->GetReal("gravity", "four_pi_G");
   tolerance_ = pin->GetOrAddReal("gravity", "rtol", 1.0e-10);
@@ -691,6 +698,11 @@ void SelfGravity::RememberSource(const DvceArray1D<Real> &physical_source) {
   Kokkos::deep_copy(cached_source_,physical_source);
 }
 
+void SelfGravity::UpdateDustField(Real time) {
+  if (coupled_dust_)
+    pack_->pdust->GatherGravityAcceleration(time,acceleration,particle_acceleration_);
+}
+
 void SelfGravity::Solve(Real time) {
   const double t0 = ProfileTime(profile_);
   auto *pm = pack_->pmesh;
@@ -717,6 +729,7 @@ void SelfGravity::Solve(Real time) {
   auto extra = extra_density_;
   Kokkos::deep_copy(extra,0.0);
   if (extra_source_) extra_source_(time,extra);
+  if (coupled_dust_) pack_->pdust->DepositGravityDensity(time,dust_density_);
   if (extra.extent(0) < static_cast<std::size_t>(pack_->nmb_thispack)
       || extra.extent(1) < 1 || extra.extent(2) <= static_cast<std::size_t>(ind.ke)
       || extra.extent(3) <= static_cast<std::size_t>(ind.je)
@@ -725,6 +738,8 @@ void SelfGravity::Solve(Real time) {
   }
   auto volume = volume_;
   auto b = rhs_;
+  const bool dust_source=coupled_dust_;
+  auto dust_density=dust_density_;
   Real local_mass = 0;
   Kokkos::parallel_reduce("sg_source_mass",Kokkos::RangePolicy<DevExeSpace>(0,n),
   KOKKOS_LAMBDA(const int q, Real &sum) {
@@ -732,7 +747,8 @@ void SelfGravity::Solve(Real time) {
     const int i = t%ind.nx1+ind.is; t /= ind.nx1;
     const int j = t%ind.nx2+ind.js; t /= ind.nx2;
     const int k = t%ind.nx3+ind.ks; t /= ind.nx3;
-    physical_source(q) = u(t,IDN,k,j,i)+extra(t,0,k,j,i);
+    physical_source(q) = u(t,IDN,k,j,i)+extra(t,0,k,j,i)
+                        +(dust_source ? dust_density(t,0,k,j,i) : Real(0));
     sum += physical_source(q)*volume(rows(q));
   },local_mass);
   Real total_volume = (pm->mesh_size.x1max-pm->mesh_size.x1min)*
@@ -752,6 +768,9 @@ void SelfGravity::Solve(Real time) {
     ++solve_count;
     last_time = time;
     last_solve_was_cached = true;
+    // A resampling/split can preserve the complete leaf source while changing
+    // particle locations, shape codes or count. Reuse phi, not stale gathered g.
+    if (coupled_dust_) {UpdateDustField(time); UpdateTimeStep();}
     if (profile_) {
       std::cout << std::setprecision(10) << "# SG_PROFILE_SOLVE rank="
                 << global_variable::my_rank << " solve=" << solve_count
@@ -899,6 +918,7 @@ void SelfGravity::Solve(Real time) {
   }
   ++solve_count;
   last_time = time;
+  UpdateDustField(time);
   UpdateTimeStep();
   cached_phase_ = phase_;
   cached_topology_ = topology_;
@@ -976,6 +996,12 @@ void SelfGravity::KickHydro(Real dt) {
   });
 }
 
+void SelfGravity::KickMatter(Real dt) {
+  if (!std::isfinite(dt)) Fail("nonfinite matter kick");
+  KickHydro(dt);
+  if (coupled_dust_) pack_->pdust->KickGravity(dt,particle_acceleration_);
+}
+
 void SelfGravity::UpdateTimeStep() {
   const auto ind = pack_->pmesh->mb_indcs;
   const int ndim = pack_->pmesh->three_d ? 3 : 2;
@@ -1002,6 +1028,8 @@ void SelfGravity::UpdateTimeStep() {
       if (a > 0) minimum = fmin(minimum,sqrt(dx[d]/a));
     }
   },Kokkos::Min<Real>(limit));
+  if (coupled_dust_)
+    limit=std::min(limit,pack_->pdust->GravityAccelerationTimeStep(particle_acceleration_));
   dtnew = gravity_cfl_*limit;
 }
 }  // namespace gravity

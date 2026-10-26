@@ -41,6 +41,8 @@ class SelfGravity {
   // Symmetric half-kicks around the existing hydro/OA update. Density does not
   // change during a kick; ideal-gas internal energy is preserved exactly.
   void KickHydro(Real dt);
+  // Both species receive the field sampled by the immediately preceding Solve.
+  void KickMatter(Real dt);
   void UpdateTimeStep();
   // Gravity-enabled 3D hydro uses symmetric orbital halfsteps around residual
   // RK hydro. This corrects operator splitting; limited PLM remapping can still
@@ -81,6 +83,7 @@ class SelfGravity {
                       const std::vector<int> &physical_rows, bool keep_guess);
   bool CachedSourceUnchanged(const DvceArray1D<Real> &physical_source);
   void RememberSource(const DvceArray1D<Real> &physical_source);
+  void UpdateDustField(Real time);
   MeshBlockPack *pack_;
   std::unique_ptr<CompositeSystem> system_;
   std::unique_ptr<SparseMultigrid> mg_;
@@ -100,6 +103,8 @@ class SelfGravity {
   DvceArray1D<int> physical_rows_;
   DvceArray1D<Real> cached_source_;  // physical source cells, independent of MG padding
   DvceArray5D<Real> extra_density_;
+  DvceArray5D<Real> dust_density_;
+  DvceArray2D<Real> particle_acceleration_;
   ExtraDensitySource extra_source_;
   std::vector<GlobalIndex> partition_;
   int topology_ = -1, max_iterations_, restart_;
@@ -114,6 +119,7 @@ class SelfGravity {
   int cached_topology_ = -1;
   std::uint64_t cached_operator_updates_ = 0;
   bool orbital_split_ = false, hydro_boundary_time_valid_ = false;
+  bool coupled_dust_ = false;
   Real hydro_boundary_time_ = 0;
   std::string vertical_bc_, setup_, isolated_method_;
   GravityRestartState restart_state_;

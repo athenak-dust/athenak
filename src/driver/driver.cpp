@@ -421,10 +421,12 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // Checkpoints occur only after both half-kicks. The kick leaves density and
       // internal energy unchanged; primitives and ghost values must be refreshed.
       auto *pgrav = pmesh->pmb_pack->pgrav;
+      const bool matter_prepared = pgrav != nullptr && pmesh->pmb_pack->pdust != nullptr;
+      if (matter_prepared) ExecuteTaskList(pmesh, "before_timeintegrator", 0);
       if (pgrav != nullptr) {
         if (pgrav->UsesOrbitalSplit()) pgrav->SetHydroBoundaryTime(pmesh->time);
         pgrav->Solve(pmesh->time);
-        pgrav->KickHydro(0.5*pmesh->dt);
+        pgrav->KickMatter(0.5*pmesh->dt);
         InitBoundaryValuesAndPrimitives(pmesh);
         if (pgrav->UsesOrbitalSplit()) {
           pgrav->OrbitalStep(0.5*pmesh->dt);
@@ -435,7 +437,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
 
       // Execute TaskLists
       // Work before time integrator indicated by "0" in stage
-      ExecuteTaskList(pmesh, "before_timeintegrator", 0);
+      if (!matter_prepared) ExecuteTaskList(pmesh, "before_timeintegrator", 0);
 
       const int gravity_dfloor = pmesh->ecounter.neos_dfloor;
       const int gravity_efloor = pmesh->ecounter.neos_efloor;
@@ -477,7 +479,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
               ind.is, ind.ie, ind.js, ind.je, ind.ks, ind.ke);
         }
         pgrav->Solve(pmesh->time+pmesh->dt);
-        pgrav->KickHydro(0.5*pmesh->dt);
+        pgrav->KickMatter(0.5*pmesh->dt);
       }
 
       // Work outside of TaskLists:
@@ -489,6 +491,8 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         InitBoundaryValuesAndPrimitives(pmesh);
         pgrav->ClearHydroBoundaryTime();
         (void) pmesh->pmb_pack->phydro->NewTimeStep(this, nexp_stages);
+        if (pmesh->pmb_pack->pdust != nullptr)
+          (void) pmesh->pmb_pack->pdust->ComputeNewTimeStep(this,nexp_stages);
       }
       nmb_updated_ += pmesh->nmb_total;
       npart_updated_ += pmesh->nprtcl_total;
