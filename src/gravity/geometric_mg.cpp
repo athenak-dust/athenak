@@ -230,6 +230,7 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
   MeshGeometry *fine = out.fine_geometry.get();
   std::unique_ptr<MeshGeometry> coarse_owner;
   out.fine = fine->BuildSystem(fine_forces);
+  out.quadratic_interface_fallbacks.push_back(out.fine.quadratic_interface_fallbacks);
   out.hierarchy.constant_nullspace = !domain.isolated_z || neumann_z;
   out.hierarchy.matrices.push_back(std::move(out.fine.matrix));
   out.hierarchy.row_partitions.push_back(fine->RowPartition());
@@ -239,10 +240,12 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     auto coarse_patches = Coarsen(fine->Patches(),domain);
     if (Count(coarse_patches) >= fine->GlobalRows())
       throw std::runtime_error("Gravity geometric coarsening did not reduce global rows");
-    std::unique_ptr<MeshGeometry> coarse(new MeshGeometry(std::move(coarse_patches),domain,rank,nranks,neumann_z));
+    std::unique_ptr<MeshGeometry> coarse(new MeshGeometry(std::move(coarse_patches),domain,
+                                                        rank,nranks,neumann_z,true));
     LocalCsr p, r; TransferDiagnostics check;
     Transfers(*fine,*coarse,domain,rank,p,r,check,neumann_z);
     auto system = coarse->BuildSystem(false);
+    out.quadratic_interface_fallbacks.push_back(system.quadratic_interface_fallbacks);
     out.hierarchy.matrices.push_back(std::move(system.matrix));
     out.hierarchy.row_partitions.push_back(coarse->RowPartition());
     out.hierarchy.prolongation.push_back(std::move(p));

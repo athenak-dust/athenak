@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <sys/resource.h>
 
@@ -526,6 +527,10 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
                 << " unknown_overhead=" << (vacuum_mesh ? vacuum_mesh->unknown_overhead : 1)
                 << " vacuum_metadata_bytes=" << (vacuum_mesh ? vacuum_mesh->metadata_bytes : 0)
                 << " vacuum_boundary_bytes=" << (vacuum_ ? vacuum_->DeviceMetadataBytes() : 0)
+                << " local_quadratic_interface_fallbacks="
+                << std::accumulate(setup.quadratic_interface_fallbacks.begin(),
+                    setup.quadratic_interface_fallbacks.end(),std::size_t(0))
+                << " fine_quadratic_interface_fallbacks=" << setup.fine.quadratic_interface_fallbacks
                 << " geometry_s=" << t_geometry-t0 << " assembly_s=" << t_assembly-t_geometry
                 << " operators_s=" << t_operators-t_assembly
                 << " slab_setup_s=" << t_slab-t_operators

@@ -256,6 +256,11 @@ VacuumMesh BuildVacuumMesh(const std::vector<GravityPatch> &physical,
   const long long layers=static_cast<long long>(std::ceil(requested/tile[2]));
   result.padding=layers*tile[2];
   result.domain.lo[2]-=result.padding; result.domain.hi[2]+=result.padding;
+  result.domain.c1_z_interfaces.push_back(domain.lo[2]);
+  result.domain.c1_z_interfaces.push_back(domain.hi[2]);
+  std::sort(result.domain.c1_z_interfaces.begin(),result.domain.c1_z_interfaces.end());
+  result.domain.c1_z_interfaces.erase(std::unique(result.domain.c1_z_interfaces.begin(),
+      result.domain.c1_z_interfaces.end()),result.domain.c1_z_interfaces.end());
   const long long added=std::llround(2*result.padding/root_width[2]);
   if (added>std::numeric_limits<int>::max()-domain.root_counts[2])
     throw std::overflow_error("Gravity vacuum extended root count exceeds int");

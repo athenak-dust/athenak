@@ -28,6 +28,7 @@ struct GeometricSystem {
   std::vector<std::vector<GravityPatch>> patches;
   // Local maxima/counts; callers may reduce them for collective diagnostics.
   std::vector<TransferDiagnostics> transfer_checks;
+  std::vector<std::size_t> quadratic_interface_fallbacks;
 };
 
 // Rediscretized FV A, tensor-linear P, and explicit integrated-residual child-sum

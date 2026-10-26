@@ -24,6 +24,10 @@ struct CompositeDomain {
   // phi(x+Lx,y) = phi(x,y-shear_offset), reduced modulo Ly during setup.
   Real shear_offset = 0;
   bool isolated_z = false;
+  // Fixed horizontal C1 interfaces: phi and its first derivative are continuous,
+  // but curvature may jump. Vacuum extension records the physical source-box
+  // walls here. Reconstruction must not fit across these planes.
+  std::vector<Real> c1_z_interfaces;
 };
 
 struct BoundarySample {

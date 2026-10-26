@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "gravity/mesh_geometry.hpp"
+#include "gravity/vacuum_mesh.hpp"
 
 namespace {
 using namespace gravity;
@@ -74,9 +75,10 @@ void ConstantsAndFlux(const LocalCompositeSystem &s, bool isolated) {
   if (!isolated || s.neumann_z) for (double v : columns)
     Require(std::abs(v) < 2.e-12,"shared face flux lost the periodic left nullspace");
 }
-void Polynomials(int nd, bool neumann) {
+void Polynomials(int nd, bool neumann, bool c1 = false) {
   const int n = 16;
   auto domain = Domain(n,nd,nd == 3);
+  if (c1) domain.c1_z_interfaces = {.25,.75};
   MeshGeometry geometry(Patches(n,nd,true),domain,0,1,neumann);
   const auto s = geometry.BuildSystem();
   const int cells = s.cells.size();
@@ -114,7 +116,7 @@ void Polynomials(int nd, bool neumann) {
       }
     }
   }
-  std::cout << "polynomial nd=" << nd << " neumann=" << neumann
+  std::cout << "polynomial nd=" << nd << " neumann=" << neumann << " c1=" << c1
             << " A=" << operator_error << " G=" << force_error << '\n';
   Require(operator_error < 2.e-9 && force_error < 2.e-11,"quadratic reproduction failed");
 }
@@ -141,8 +143,7 @@ void CheckUpdate(const LocalCsr &initial, const CsrRowUpdate &update, const Loca
   }
   Require(next == update.rows.size() && error < 2.e-11,"phase update differs from full rebuild");
 }
-void Phases(int nd, bool mixed, bool isolated, bool neumann, int n = 8) {
-  auto d = Domain(n,nd,isolated); const auto patches = Patches(n,nd,mixed);
+void PhaseFixture(const std::vector<GravityPatch> &patches, CompositeDomain d, bool neumann) {
   MeshGeometry geometry(patches,d,0,1,neumann); const auto initial = geometry.BuildSystem();
   MeshGeometry discovered(patches,d,0,1,neumann);
   Require(discovered.PhaseRows() == geometry.PhaseRows(),"standalone phase discovery differs");
@@ -159,11 +160,76 @@ void Phases(int nd, bool mixed, bool isolated, bool neumann, int n = 8) {
         CheckUpdate(initial.boundary_acceleration[k],update.boundary_acceleration[k],
                     fresh.boundary_acceleration[k]);
       }
-      ConstantsAndFlux(fresh,isolated);
+      ConstantsAndFlux(fresh,d.isolated_z);
     }
   }
-  std::cout << "phase identities nd=" << nd << " mixed=" << mixed
-            << " isolated=" << isolated << " neumann=" << neumann << " n=" << n << '\n';
+  std::cout << "phase identities nd=" << d.ndim << " patches=" << patches.size()
+            << " isolated=" << d.isolated_z << " neumann=" << neumann
+            << " c1=" << d.c1_z_interfaces.size() << '\n';
+}
+void Phases(int nd, bool mixed, bool isolated, bool neumann, int n = 8, bool c1 = false) {
+  auto d = Domain(n,nd,isolated);
+  if (c1) d.c1_z_interfaces = {.25,.75};
+  PhaseFixture(Patches(n,nd,mixed),d,neumann);
+}
+void E3Multilevel(const Vec &length) {
+  // Same leaf boxes as review E3: all root blocks refined once, then the
+  // x1max band and the two middle z bands refined again (28+32 blocks).
+  // Cell counts are reduced by four to keep this a small geometry-only check.
+  std::vector<GravityPatch> patches;
+  for (int k = 0; k < 4; ++k) for (int j = 0; j < 2; ++j) for (int i = 0; i < 4; ++i) {
+    const int r = i == 3 && (k == 1 || k == 2) ? 2 : 1;
+    for (int kk = 0; kk < r; ++kk) for (int jj = 0; jj < r; ++jj)
+      for (int ii = 0; ii < r; ++ii) {
+        GravityPatch p;
+        p.lo = {i/4.+ii/(4.*r),j/2.+jj/(2.*r),k/4.+kk/(4.*r)};
+        p.hi = {p.lo[0]+1./(4*r),p.lo[1]+1./(2*r),p.lo[2]+1./(4*r)};
+        for (int d = 0; d < 3; ++d) { p.lo[d] *= length[d]; p.hi[d] *= length[d]; }
+        p.cells = {2,4,2}; patches.push_back(p);
+      }
+  }
+  auto d = Domain(4,3,false); d.hi = length;
+  PhaseFixture(patches,d,false);
+  std::cout << "E3 multilevel aspect " << length[0] << ',' << length[1] << ',' << length[2] << '\n';
+}
+void PiecewiseVacuum() {
+  auto d = Domain(16,3,true);
+  const auto vacuum = BuildVacuumMesh(Patches(16,3,true),d,1);
+  MeshGeometry geometry(vacuum.patches,vacuum.domain,0,1,true);
+  const auto s = geometry.BuildSystem();
+  std::vector<double> phi(s.cells.size()), boundary(s.boundary_samples.size(),.5);
+  for (size_t i = 0; i < phi.size(); ++i) {
+    const double z = s.cells[i].center[2];
+    phi[i] = z < 0 ? .25-.5*z : z > 1 ? .25+.5*(z-1) : .5*((z-.5)*(z-.5)+.25);
+  }
+  double error = 0., force = 0.;
+  for (size_t i = 0; i < phi.size(); ++i) {
+    const double z = s.cells[i].center[2], rho = z > 0 && z < 1 ? 1. : 0.;
+    error = std::max(error,std::abs((Apply(s.matrix,i,phi)-Apply(s.boundary_rhs,i,boundary))/
+                                   s.volume[i]+rho));
+    for (int d = 0; d < 3; ++d) {
+      const double derivative = d != 2 ? 0. : z < 0 ? -.5 : z > 1 ? .5 : z-.5;
+      force = std::max(force,std::abs(Apply(s.acceleration[d],i,phi)+
+                                      Apply(s.boundary_acceleration[d],i,boundary)+derivative));
+    }
+  }
+  std::cout << "piecewise vacuum A=" << error << " G=" << force << '\n';
+  Require(error < 2.e-9 && force < 2.e-11 && s.quadratic_interface_fallbacks == 0,
+          "piecewise vacuum quadratic reproduction failed");
+  ConstantsAndFlux(s,true);
+}
+void CoarseC1Fallback() {
+  auto d = Domain(2,3,true); d.c1_z_interfaces = {.5};
+  MeshGeometry coarse(Patches(2,3,false),d,0,1,true,true);
+  const auto system = coarse.BuildSystem();
+  Require(system.quadratic_interface_fallbacks > 0,"thin coarse C1 fallback was not counted");
+  ConstantsAndFlux(system,true);
+  bool rejected = false;
+  try {
+    MeshGeometry fine(Patches(2,3,false),d,0,1,true); fine.BuildSystem();
+  } catch (const std::runtime_error &) { rejected = true; }
+  Require(rejected,"rank-deficient fine one-sided reconstruction silently fell back");
+  std::cout << "counted coarse C1 fallbacks=" << system.quadratic_interface_fallbacks << '\n';
 }
 void Reference(bool isolated) {
   auto d = Domain(8,3,isolated); d.shear_offset = .137;
@@ -194,14 +260,17 @@ void Reference(bool isolated) {
 
 int main() {
   Require(sizeof(Real) == sizeof(double),"gravity geometry checks require double precision");
-  Polynomials(2,false); Polynomials(3,false); Polynomials(3,true);
+  Polynomials(2,false); Polynomials(3,false); Polynomials(3,true); Polynomials(3,true,true);
   const double coarse = CubicForce(16), fine = CubicForce(32);
   std::cout << "cubic interface force errors " << coarse << " -> " << fine << '\n';
   Require(coarse/fine > 3.8,"interface force lost second-order convergence");
   for (int nd : {2,3}) for (bool mixed : {false,true}) Phases(nd,mixed,false,false);
   Phases(3,true,true,false); Phases(3,true,true,true);
+  Phases(3,true,true,true,8,true);
   Phases(2,false,false,false,2); Phases(3,false,false,false,2);
   Phases(2,false,false,false,1); Phases(3,false,false,false,1);
   Reference(false); Reference(true);
+  PiecewiseVacuum(); CoarseC1Fallback();
+  E3Multilevel({1.,1.,1.}); E3Multilevel({.2,.2,.4});
   std::cout << "gravity geometry checks passed\n";
 }

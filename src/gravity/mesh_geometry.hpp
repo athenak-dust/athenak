@@ -46,6 +46,9 @@ struct LocalCompositeSystem {
   std::vector<GlobalIndex> boundary_cells;
   std::vector<Real> boundary_area, boundary_width;
   std::vector<GlobalIndex> row_partition, sample_partition;
+  // Unique local coarse fits that lacked a full-rank one-sided quadratic and
+  // used a two-sided fit. This fallback is forbidden on the physical fine mesh.
+  std::size_t quadratic_interface_fallbacks = 0;
 };
 
 // Compact replacements for the same stable local row list in every component.
@@ -60,7 +63,8 @@ struct LocalCompositeUpdate {
 class MeshGeometry {
  public:
   MeshGeometry(std::vector<GravityPatch> patches, const CompositeDomain &domain,
-               int rank, int nranks, bool neumann_z = false);
+               int rank, int nranks, bool neumann_z = false,
+               bool coarse_reconstruction = false);
   ~MeshGeometry();
   MeshGeometry(MeshGeometry &&) noexcept;
   MeshGeometry &operator=(MeshGeometry &&) noexcept;

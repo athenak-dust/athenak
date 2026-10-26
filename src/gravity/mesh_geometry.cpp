@@ -28,6 +28,7 @@ using Modes = std::array<double,9>;
 struct Quadratic {
   std::vector<std::pair<GlobalIndex,Modes>> coefficients;
   bool phase_dependent = false;
+  bool interface_fallback = false;
 };
 using QuadraticCache = std::unordered_map<GlobalIndex,Quadratic>;
 struct Box { Vec lo{}, hi{}; };
@@ -130,6 +131,7 @@ struct MeshGeometry::Impl {
   CompositeDomain domain;
   int rank, nranks, nd;
   bool neumann_z = false;
+  bool coarse_reconstruction = false;
   Vec length{}, minwidth{};
   double shear;
   std::vector<GlobalIndex> partition, sample_partition, sample_begin;
@@ -392,7 +394,10 @@ struct MeshGeometry::Impl {
     struct Sample { GlobalIndex id; Vec delta; };
     const auto cell = Cell(row);
     std::vector<Sample> samples;
+    bool one_sided = !domain.c1_z_interfaces.empty();
     auto add = [&](GlobalIndex id, const Vec &delta) {
+      if (one_sided) for (double plane : domain.c1_z_interfaces)
+        if ((cell.center[2] < plane) != (cell.center[2]+delta[2] < plane)) return;
       double distance = 0.;
       for (int d = 0; d < nd; ++d)
         distance += (delta[d]/cell.width[d])*(delta[d]/cell.width[d]);
@@ -405,7 +410,9 @@ struct MeshGeometry::Impl {
       }
       samples.push_back({id,delta});
     };
+    Quadratic q;
     auto neighbors = [&](GlobalIndex id, const Vec &offset) {
+      q.phase_dependent = q.phase_dependent || TouchesX(id);
       for (const auto &f : Faces(id)) {
         const double sign = f.side;
         Vec delta = offset;
@@ -413,15 +420,15 @@ struct MeshGeometry::Impl {
         add(id == f.left ? f.right : f.left,delta);
       }
     };
-    Quadratic q; q.phase_dependent = TouchesX(cell);
     neighbors(row,Vec{});
-    const size_t first_ring = samples.size();
-    for (size_t i = 0; i < first_ring; ++i) {
-      const auto sample = samples[i];
-      if (sample.id >= partition.back()) continue;
-      q.phase_dependent = q.phase_dependent || TouchesX(sample.id);
-      neighbors(sample.id,sample.delta);
-    }
+    auto expand = [&](size_t first, size_t last) {
+      for (size_t i = first; i < last; ++i) {
+        const auto sample = samples[i];
+        if (sample.id < partition.back()) neighbors(sample.id,sample.delta);
+      }
+    };
+    size_t first = 0, last = samples.size();
+    expand(first,last); first = last; last = samples.size();
     const int modes = nd+nd*(nd+1)/2;
     auto basis = [&](const Vec &delta) {
       Modes b{};
@@ -431,35 +438,57 @@ struct MeshGeometry::Impl {
         b[k++] = b[d]*b[t]*(d == t ? .5 : 1.);
       return b;
     };
-    std::array<Modes,9> normal{}, inverse{};
-    for (const auto &s : samples) {
-      const auto b = basis(s.delta);
-      double distance = 0.;
-      for (int d = 0; d < nd; ++d) distance += b[d]*b[d];
-      const double weight = 1./distance;
-      for (int i = 0; i < modes; ++i) for (int j = 0; j < modes; ++j)
-        normal[i][j] += weight*b[i]*b[j];
-    }
-    for (int i = 0; i < modes; ++i) inverse[i][i] = 1.;
-    for (int i = 0; i < modes; ++i) {
-      int pivot = i;
-      for (int j = i+1; j < modes; ++j)
-        if (std::abs(normal[j][i]) > std::abs(normal[pivot][i])) pivot = j;
-      if (std::abs(normal[pivot][i]) < 1.e-12)
-        throw std::runtime_error("Gravity singular quadratic face reconstruction");
-      std::swap(normal[i],normal[pivot]); std::swap(inverse[i],inverse[pivot]);
-      const double scale = normal[i][i];
-      for (int j = 0; j < modes; ++j) {
-        normal[i][j] /= scale; inverse[i][j] /= scale;
+    std::array<Modes,9> inverse{};
+    auto invert = [&]() {
+      std::array<Modes,9> normal{}; inverse = {};
+      for (const auto &s : samples) {
+        const auto b = basis(s.delta);
+        double distance = 0.;
+        for (int d = 0; d < nd; ++d) distance += b[d]*b[d];
+        const double weight = 1./distance;
+        for (int i = 0; i < modes; ++i) for (int j = 0; j < modes; ++j)
+          normal[i][j] += weight*b[i]*b[j];
       }
-      for (int j = 0; j < modes; ++j) if (j != i) {
-        const double factor = normal[j][i];
-        for (int k = 0; k < modes; ++k) {
-          normal[j][k] -= factor*normal[i][k];
-          inverse[j][k] -= factor*inverse[i][k];
+      for (int i = 0; i < modes; ++i) inverse[i][i] = 1.;
+      for (int i = 0; i < modes; ++i) {
+        int pivot = i;
+        for (int j = i+1; j < modes; ++j)
+          if (std::abs(normal[j][i]) > std::abs(normal[pivot][i])) pivot = j;
+        if (std::abs(normal[pivot][i]) < 1.e-12) return false;
+        std::swap(normal[i],normal[pivot]); std::swap(inverse[i],inverse[pivot]);
+        const double scale = normal[i][i];
+        for (int j = 0; j < modes; ++j) {
+          normal[i][j] /= scale; inverse[i][j] /= scale;
+        }
+        for (int j = 0; j < modes; ++j) if (j != i) {
+          const double factor = normal[j][i];
+          for (int k = 0; k < modes; ++k) {
+            normal[j][k] -= factor*normal[i][k];
+            inverse[j][k] -= factor*inverse[i][k];
+          }
         }
       }
+      return true;
+    };
+    bool full_rank = invert();
+    // Near a join, find enough same-side normal positions rather than falling
+    // back merely because the first two rings were anisotropic or incomplete.
+    for (int ring = 2; !full_rank && one_sided && ring < 4; ++ring) {
+      expand(first,last); first = last; last = samples.size();
+      full_rank = invert();
     }
+    if (!full_rank && one_sided && coarse_reconstruction) {
+      // A coarse region may have only one normal cell, so quadratic curvature
+      // on that side is unknowable. Keep an elliptic preconditioner stencil;
+      // expose this lower-order C1 fallback in hierarchy diagnostics.
+      one_sided = false; samples.clear(); q.interface_fallback = true;
+      q.phase_dependent = false;
+      neighbors(row,Vec{}); expand(0,samples.size());
+      full_rank = invert();
+    }
+    if (!full_rank)
+      throw std::runtime_error("Gravity singular one-sided quadratic reconstruction");
+    q.coefficients.reserve(samples.size()+1);
     auto coefficient = [&](GlobalIndex id, const Modes &value) {
       for (auto &v : q.coefficients) if (v.first == id) {
         for (int i = 0; i < modes; ++i) v.second[i] += value[i];
@@ -491,6 +520,15 @@ struct MeshGeometry::Impl {
     for (int d = 0; d < nd; ++d) if (offset[d] != 0.) return true;
     return false;
   }
+  bool AtC1Interface(const Face &f) const {
+    if (f.normal != 2 || f.left >= partition.back() || f.right >= partition.back())
+      return false;
+    const auto left = Cell(f.left);
+    const double z = left.center[2]+.5*left.width[2];
+    for (double plane : domain.c1_z_interfaces)
+      if (std::abs(z-plane) < minwidth[2]*1.e-7) return true;
+    return false;
+  }
   bool IsPhaseRow(GlobalIndex row) const {
     if (TouchesX(row)) return true;
     // All faces strictly inside one rectangular patch are aligned, so no LS
@@ -499,17 +537,15 @@ struct MeshGeometry::Impl {
     bool interior = true;
     for (int d = 0; d < nd; ++d)
       interior = interior && ijk[d] > 0 && ijk[d]+1 < patches[p].cells[d];
-    if (interior) return false;
+    if (interior && domain.c1_z_interfaces.empty()) return false;
+    QuadraticCache cache;
     for (const auto &f : Faces(row)) {
       if (!HasOffset(f.ti) && !HasOffset(f.tj) &&
+          !AtC1Interface(f) &&
           (f.left >= partition.back() || f.right >= partition.back() ||
            Cell(f.left).width[f.normal] == Cell(f.right).width[f.normal])) continue;
       for (GlobalIndex id : {f.left,f.right}) if (id < partition.back()) {
-        if (TouchesX(id)) return true;
-        for (const auto &neighbor : Faces(id)) {
-          const auto other = id == neighbor.left ? neighbor.right : neighbor.left;
-          if (other < partition.back() && TouchesX(other)) return true;
-        }
+        if (Quad(id,cache).phase_dependent) return true;
       }
     }
     return false;
@@ -541,8 +577,8 @@ struct MeshGeometry::Impl {
       AddPotential(work.difference,f.right,1.); AddPotential(work.difference,f.left,-1.);
       if (f.left < partition.back() && f.right < partition.back()) {
         const auto left = Cell(f.left), right = Cell(f.right);
-        const double shift = .25*(left.width[f.normal]-right.width[f.normal]);
-        if (HasOffset(f.ti) || HasOffset(f.tj) || shift != 0.) {
+        if (HasOffset(f.ti) || HasOffset(f.tj) || AtC1Interface(f) ||
+            left.width[f.normal] != right.width[f.normal]) {
           auto reconstruct = [&](GlobalIndex id, const CompositeCell &cell,
                                  const Vec &offset, double sign) {
             const auto &q = Quad(id,quadratic_cache);
@@ -553,11 +589,10 @@ struct MeshGeometry::Impl {
             for (int d = 0; d < nd; ++d) for (int t = d; t < nd; ++t) {
               moment[k] = sign*offset[d]*offset[t]/(cell.width[d]*cell.width[t])*
                           (d == t ? .5 : 1.);
-              // The secant lies halfway between centers. Unequal widths put
-              // that point off the physical face; both reconstructions share
-              // the same correction, averaged here without changing face flux.
+              // Separate one-sided curvatures also handle a C1 source/vacuum
+              // join: derivative correction is (hL^2 HL-hR^2 HR)/(8d).
               if (d == f.normal && t == d)
-                moment[k] += .5*f.distance*shift/(cell.width[d]*cell.width[d]);
+                moment[k] -= sign*.125;
               ++k;
             }
             for (const auto &v : q.coefficients) {
@@ -780,15 +815,25 @@ struct MeshGeometry::Impl {
 };
 
 MeshGeometry::MeshGeometry(std::vector<GravityPatch> patches,
-    const CompositeDomain &domain, int rank, int nranks, bool neumann_z) : impl_(new Impl) {
+    const CompositeDomain &domain, int rank, int nranks, bool neumann_z,
+    bool coarse_reconstruction) : impl_(new Impl) {
   auto &m = *impl_;
   m.patches = std::move(patches); m.domain = domain;
   m.rank = rank; m.nranks = nranks; m.nd = domain.ndim;
   m.neumann_z = neumann_z;
+  m.coarse_reconstruction = coarse_reconstruction;
   if (m.patches.empty() || nranks <= 0 || rank < 0 || rank >= nranks ||
       m.nd < 2 || m.nd > 3 || (domain.isolated_z && m.nd != 3) ||
       (neumann_z && !domain.isolated_z))
     throw std::invalid_argument("Gravity invalid patch geometry/domain/rank");
+  if (!std::is_sorted(domain.c1_z_interfaces.begin(),domain.c1_z_interfaces.end()))
+    throw std::invalid_argument("Gravity C1 planes must be sorted");
+  for (size_t i = 0; i < domain.c1_z_interfaces.size(); ++i) {
+    const double plane = domain.c1_z_interfaces[i];
+    if (m.nd != 3 || !std::isfinite(plane) || plane <= domain.lo[2] ||
+        plane >= domain.hi[2] || (i && plane == domain.c1_z_interfaces[i-1]))
+      throw std::invalid_argument("Gravity invalid C1 reconstruction plane");
+  }
   m.minwidth.fill(std::numeric_limits<double>::max());
   double volume = 0., expected = 1.;
   for (int d = 0; d < m.nd; ++d) {
@@ -983,6 +1028,8 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   }
   // Gradient maps are assembly scratch, and must not survive alongside device CSR.
   m.gradients.clear(); m.gradients.rehash(0);
+  for (const auto &q : m.quadratics)
+    out.quadratic_interface_fallbacks += q.second.interface_fallback;
   m.quadratics.clear(); m.quadratics.rehash(0);
   return out;
 }

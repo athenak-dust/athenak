@@ -89,16 +89,27 @@ conservation of the coupled AMR scheme.
 At offset or unequal-width faces, a scaled quadratic least-squares fit on two
 face-neighbor rings brings the potentials to the fragment's transverse centroid.
 The shared center-to-center secant is corrected by
-$(h_L-h_R)(\phi_{nn,L}+\phi_{nn,R})/8$ because its midpoint differs from the
-physical face when the normal widths differ. Both transverse quadratic moments
-and this normal correction are necessary to reproduce general quadratic
-potentials at a coarse/fine face. Aligned equal-width interior faces retain the
+$(h_L^2\phi_{nn,L}-h_R^2\phi_{nn,R})/(8d)$, where $d=(h_L+h_R)/2$.
+For equal curvatures this accounts for the secant midpoint's displacement from
+the physical face. Separate curvatures also handle a $C^1$ source/vacuum join.
+Both transverse quadratic moments and this normal correction are necessary to
+reproduce general quadratic potentials at a coarse/fine face. Aligned equal-width interior faces retain the
 seven-point stencil. Acceleration uses the area average of the shared normal
 face derivatives; the reconstruction gradient is not used directly as force.
 The wider reconstruction affects setup/phase assembly and CSR halo size, while
 all force applications remain sparse matrix operations. The potential has point
 semantics even though hydro supplies cell-average density; their source
 quadrature difference remains a second-order spatial approximation.
+
+The vacuum extension records the physical source-box z walls explicitly as
+`CompositeDomain::c1_z_interfaces`. Fits stay on one side of these planes and
+expand to at most four face-neighbor rings if necessary. This resolves curvature
+jumps at a general $C^1$ interface without subtracting a sheet background.
+Finest fits must remain full rank. An explicitly coarse geometry may use a
+two-sided fit when a region has too few normal cells; this is a lower-order
+preconditioner approximation, counted in `quadratic_interface_fallbacks` and the
+setup profile. Constant and shared-flux identities still hold for that fallback.
+Phase dependencies include every neighborhood traversed by an expanded fit.
 
 The matrix is the **negative integrated Laplacian**, so the physical right-hand
 side is $-4\pi G\rho V$. Periodic solves subtract the volume-weighted density mean
@@ -225,11 +236,23 @@ energy is also not exactly conserved; ideal-gas SMR tests show convergent drift.
 Shared fluxes, small residuals, and weak-wave momentum cancellation alone do not
 prove exact conservation of these quantities.
 
-An independent isolated mean-sheet SMR check found false horizontal acceleration
+An earlier isolated mean-sheet SMR check found false horizontal acceleration
 near vertical coarse/fine faces: its maximum relative to the vertical force
 decreased from about 0.41% to 0.20% between 16 and 32 root cells. This spatial
-interface error is separate from the iterative residual. It matters for small
-perturbations and future clump-drift tests even when the linear solve converges.
+interface error was separate from the iterative residual. Correcting only smooth
+quadratic interfaces leaves a curvature-jump error at the physical source/vacuum
+join. With the one-sided $C^1$ correction, the matched constant-density vacuum
+slab has total force maximum errors $4.2\times10^{-13}$ and $9.1\times10^{-13}$
+at 16 and 32 root cells with `rtol=1e-12`. A nonzero slab perturbation retains
+spatial error: its interface force maxima decrease by 3.55 under the same mesh
+doubling. These are static Poisson checks, not hydro momentum acceptance.
+
+The width-weighted face-normal acceleration average does not guarantee
+$\sum_i V_i\mathbf{g}_i=0$ after quadratic interface reconstruction. A periodic
+mixed shearing-wave audit finds a contribution linear in perturbation amplitude,
+and finite-amplitude hydro controls show increased net momentum. Correcting the
+potential operator alone therefore does not establish production momentum
+accuracy; a compatible volume gradient or momentum-flux coupling is required.
 
 The full-RHS `rtol` does not prescribe relative accuracy of a tiny perturbation.
 However, the review's quoted 0.28% potential error was the total-field difference
