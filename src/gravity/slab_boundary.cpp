@@ -111,13 +111,13 @@ void SlabBoundary::InitializeModes(const CompositeDomain &domain,
   // cutoffs are convergence-study parameters, not silently adaptive approximations.
   if (modes_x <= 0) modes_x = std::max(1,static_cast<int>(std::lround(lx/hmin[0]))/2);
   if (modes_y <= 0) modes_y = std::max(1,static_cast<int>(std::lround(ly/hmin[1]))/2);
-  const long long count = (2LL*modes_x+1)*modes_y+modes_x;
+  const long long count = (2LL*modes_x+2)*modes_y+modes_x;
   if (count > std::numeric_limits<int>::max()/4) {
     throw std::runtime_error("slab gravity Fourier coefficient count exceeds MPI capacity");
   }
   nmodes_ = count;
   modes_x_ = modes_x; modes_y_ = modes_y;
-  wave_ = DvceArray2D<Real>("slab_modes",nmodes_,3);
+  wave_ = DvceArray2D<Real>("slab_modes",nmodes_,4);
   coefficients_ = DvceArray2D<Real>("slab_coefficients",nmodes_,4);
   SetShearOffset(domain.shear_offset);
 }
@@ -131,9 +131,20 @@ void SlabBoundary::SetShearOffset(Real shear_offset) {
   const Real shift = std::remainder(shear_offset,ly_);
   int m = 0;
   for (int ny = 0; ny <= modes_y_; ++ny) {
-    for (int nx = ny == 0 ? 1 : -modes_x_; nx <= modes_x_; ++nx) {
-      const Real ky = twopi*ny/ly_, kx = twopi*nx/lx_-ky*shift/lx_;
+    const Real offset = ny*shift/ly_;
+    const int anchor = static_cast<int>(std::floor(offset));
+    const int first = ny == 0 ? 1 : anchor-modes_x_;
+    const int last = ny == 0 ? modes_x_ : anchor+modes_x_+1;
+    for (int nx = first; nx <= last; ++nx) {
+      const Real a = nx-offset;
+      const Real ky = twopi*ny/ly_, kx = twopi*a/lx_;
       kh(m,0) = kx; kh(m,1) = ky; kh(m,2) = std::sqrt(kx*kx+ky*ky);
+      // A window in physical kx is invariant under shear-period relabelling.
+      // The flat core preserves the unsheared cutoff; exchanged labels have
+      // zero value AND derivative at |a|=Mx+1, including at integer ny*phase.
+      const Real edge = std::abs(a)-modes_x_;
+      kh(m,3) = edge <= 0 ? 1 : (edge >= 1 ? 0 :
+          Real(0.5)*(1+std::cos(Real(0.5)*twopi*edge)));
       ++m;
     }
   }
@@ -196,7 +207,7 @@ void SlabBoundary::Compute(const DvceArray1D<Real> &density, Real four_pi_G,
     Real value = factor*(upper ? total_mass*z-first_z : first_z-total_mass*z);
     for (int m = 0; m < nm; ++m) {
       const Real phase = wave(m,0)*x+wave(m,1)*y, k = wave(m,2);
-      value -= 2*factor/k*exp(-k*distance)*
+      value -= wave(m,3)*2*factor/k*exp(-k*distance)*
                (coef(m,col)*cos(phase)+coef(m,col+1)*sin(phase));
     }
     boundary_values(q) = value;

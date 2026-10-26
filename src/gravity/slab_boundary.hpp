@@ -14,6 +14,13 @@ namespace gravity {
 // a substitute uniform-grid volume solve. The zero mode retains the full slab
 // mass. Cost is O(Ncell * Nmode); this remains a bounded accuracy reference.
 // The production isolated path uses the distributed, coarsened vacuum domain.
+// modes_x defines a flat physical-|kx| core through 2*pi*modes_x/Lx, with a
+// one-harmonic cosine taper to zero at modes_x+1. modes_y is a hard ky cutoff.
+// At zero shear this equals the rectangular integer cutoff. At other phases
+// it is a windowed finite spectral approximation: increase BOTH cutoffs to
+// check convergence, rather than treating a small cutoff as an exact boundary.
+// Mode labels remap with phase; the physical window is continuous and invariant
+// under shear_offset -> shear_offset+Ly, independent of previous updates/restart.
 class SlabBoundary {
  public:
   SlabBoundary(const std::vector<CompositeCell> &cells, const CompositeDomain &domain,
@@ -29,7 +36,7 @@ class SlabBoundary {
                const std::array<Real,2> &min_width, int modes_x, int modes_y);
   void Compute(const DvceArray1D<Real> &density, Real four_pi_G,
                const DvceArray1D<Real> &boundary_values);
-  // Update only the horizontal mode wavevectors; retain owned source/sample data.
+  // Update horizontal mode wavevectors and weights; retain source/sample data.
   // This direct boundary remains a reference backend, not the production vacuum path.
   void SetShearOffset(Real shear_offset);
   int Modes() const { return nmodes_; }
