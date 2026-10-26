@@ -1057,8 +1057,10 @@ void SelfGravity::UpdateTimeStep() {
       const int i=t%ind.nx1+ind.is;t/=ind.nx1;
       const int j=t%ind.nx2+ind.js;t/=ind.nx2;
       const int k=t%ind.nx3+ind.ks;t/=ind.nx3;
-      const Real eps=dust_density(t,0,k,j,i)/gas(t,IDN,k,j,i);
-      minimum=fmin(minimum,stopping/(1+eps));
+      if (dust_density(t,0,k,j,i)>0) {
+        const Real eps=dust_density(t,0,k,j,i)/gas(t,IDN,k,j,i);
+        minimum=fmin(minimum,stopping/(1+eps));
+      }
     },Kokkos::Min<Real>(drag_limit));
     dtnew=std::min(dtnew,Real(.25)*drag_limit);
   }
