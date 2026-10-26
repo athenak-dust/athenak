@@ -1279,7 +1279,10 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   }
   bool check_equilibrium =
       pin->GetOrAddBoolean("problem","check_equilibrium",!random_placement);
-  pgen_final_func = check_equilibrium ? DustNSHErrors : nullptr;
+  // Drag-only tests do not have an NSH equilibrium or a shearing-box block.
+  // Install this consistently before the restart branch returns as well.
+  const bool drag_test = pin->GetOrAddString("problem", "dust_test", "none") != "none";
+  pgen_final_func = check_equilibrium && !drag_test ? DustNSHErrors : nullptr;
   // Keep this enrolled in dust-free runs as well so an otherwise unchanged input
   // with user_hist=true remains valid; the callback emits no dust columns in that mode.
   user_hist_func = DustNSHHistory;
