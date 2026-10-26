@@ -1524,6 +1524,25 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     u0(m,IM2,k,j,i) = three_d ? rho0*ugp : 0.0;
     u0(m,IM3,k,j,i) = three_d ? 0.0 : rho0*ugp;
   });
+  // <problem>/gas_vx_amp, gas_vx_ny: a non-axisymmetric gas velocity u_x += A sin(k_y y)
+  // (gas_vx_ny wavelengths along x2; divergence free) for the check of the frame in which the drag
+  // samples the gas inside a step of the 3-D shearing box (the cell averages of the sine)
+  {
+    const Real gamp = pin->GetOrAddReal("problem", "gas_vx_amp", 0.0);
+    if (gamp != 0.0 && three_d) {
+      const auto &ms = pmy_mesh_->mesh_size;
+      const Real ky = 2.0*M_PI*pin->GetOrAddReal("problem", "gas_vx_ny", 1.0)/(ms.x2max - ms.x2min);
+      auto &mbs = pmbp->pmb->mb_size;
+      const int js0 = indcs.js, nx2 = indcs.nx2;
+      par_for("nsh_gas_vx_ky", DevExeSpace(),0,(nmb-1),0,(n3-1),0,(n2-1),0,(n1-1),
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        const Real dy = mbs.d_view(m).dx2;
+        const Real y = CellCenterX(j - js0, nx2, mbs.d_view(m).x2min, mbs.d_view(m).x2max);
+        const Real avg = (cos(ky*(y - 0.5*dy)) - cos(ky*(y + 0.5*dy)))/(ky*dy);   // <sin> over the cell
+        u0(m,IM1,k,j,i) += u0(m,IDN,k,j,i)*gamp*avg;
+      });
+    }
+  }
   // dust_test = wave: the gas part of the eigenmode (velocity normalisation, as dusty_wave.cpp)
   RootPlacement place;
   if (dust_test == "wave") {
