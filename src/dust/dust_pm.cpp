@@ -104,8 +104,9 @@ void DustGasDrag::PackGatherField(const DvceArray5D<Real> &vel) {
 
 TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
-  // The stiffness deposit qdep[4] feeds only the automatic switch's metric
-  const bool rate_dep = NeedsHybridMetric();
+  // The stiffness deposit qdep[4] feeds the automatic switch's metric and
+  // the stiffness monitor / dt limit / predictor damping
+  const bool rate_dep = NeedsHybridMetric() || StiffnessActive();
 
   if (coupling == DustCoupling::hybrid) {
     // Split-BE deposits Q/P in its fused preparation traversal.  PC2 needs only the
@@ -418,6 +419,48 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::UpdateStiffness
+//! \brief The PC2 feedback stiffness of this cycle, chi = dt max_cells
+//! sum_p w m_p/(t_s,p V rho_g) from the stage-1 predictor deposit qdep[4] (u0 still holds the
+//! start-of-step gas at this point), reduced over all ranks; one log line per cycle on rank 0.
+
+void DustGasDrag::UpdateStiffness(const Real dt) {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int is = indcs.is, js = indcs.js, ks = indcs.ks;
+  const int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
+  const int ncells = pmy_pack->nmb_thispack*nx3*nx2*nx1;
+  auto &u0 = pmy_pack->phydro->u0;
+  auto &qdep_ = qdep;
+  Real rate = 0.0;
+  Kokkos::parallel_reduce("dust_stiffness", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncells),
+  KOKKOS_LAMBDA(const int idx, Real &maximum) {
+    int q = idx;
+    const int i = is + q % nx1; q /= nx1;
+    const int j = js + q % nx2; q /= nx2;
+    const int k = ks + q % nx3; q /= nx3;
+    maximum = fmax(maximum, qdep_(q,4,k,j,i)/u0(q,IDN,k,j,i));
+  }, Kokkos::Max<Real>(rate));
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &rate, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+#endif
+  stiff_rate_max = rate;
+  stiff_chi_last = dt*rate;
+  stiff_chi_run_max = std::max(stiff_chi_run_max, stiff_chi_last);
+  if (stiff_log && global_variable::my_rank == 0) {
+    std::FILE *fp = AppendLog("dust_stiffness_log.txt");
+    if (fp != nullptr) {
+      if (LogEmpty(fp)) {
+        std::fprintf(fp, "# PC2 feedback stiffness per cycle. ncycle time dt "
+                     "chi=dt*max(sum w m/(t_s V rho_g)) dt_limit=stiff_thresh/max_rate\n");
+      }
+      std::fprintf(fp, "%d %.10g %.6e %.6e %.6e\n", pmy_pack->pmesh->ncycle, pmy_pack->pmesh->time,
+                   dt, stiff_chi_last, (stiff_thresh > 0.0 && rate > 0.0) ? stiff_thresh/rate : -1.0);
+      std::fflush(fp);
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::UpdateHybridMetric
 //! \brief Reduce the cell feedback stiffness deposited in qdep[4].  A PC2 cycle may
 //! still fall back before committing its predictor; a split-BE cycle records the metric
@@ -488,6 +531,7 @@ TaskStatus DustGasDrag::GasImplicitSolve(Driver *pdrive, int stage) {
     if (hybrid_mode == HybridMode::pc2 && stage == 1) {
       UpdateHybridMetric(pdrive, stage);
       if (hybrid_mode == HybridMode::pc2 && back_reaction) {
+        if (StiffnessActive()) UpdateStiffness(pmy_pack->pmesh->dt);
         auto &indcs = pmy_pack->pmesh->mb_indcs;
         int is = indcs.is, ie = indcs.ie;
         int js = indcs.js, je = indcs.je;
@@ -495,8 +539,20 @@ TaskStatus DustGasDrag::GasImplicitSolve(Driver *pdrive, int stage) {
         int nmb1 = pmy_pack->nmb_thispack - 1;
         auto &u0 = pmy_pack->phydro->u0;
         auto &qdep_ = qdep;
+        const bool damp = pc2_feedback_damping;
+        const Real dt = pmy_pack->pmesh->dt;
         par_for("dust_pc2_apply_predictor",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
         KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+          if (damp) {
+            // Athena-C's feedback predictor (Bai & Stone 2010 §2.4 footnote): the
+            // predictor feedback of a stiff cell is reduced by 1/max(1, chi_cell); qdep keeps the
+            // scaled value, which ApplyPMBR subtracts again at stage 2 (momentum stays exact)
+            const Real chi = dt*qdep_(m,4,k,j,i)/u0(m,IDN,k,j,i);
+            if (chi > 1.0) {
+              const Real s = 1.0/chi;
+              qdep_(m,1,k,j,i) *= s; qdep_(m,2,k,j,i) *= s; qdep_(m,3,k,j,i) *= s;
+            }
+          }
           u0(m,IM1,k,j,i) += qdep_(m,1,k,j,i);
           u0(m,IM2,k,j,i) += qdep_(m,2,k,j,i);
           u0(m,IM3,k,j,i) += qdep_(m,3,k,j,i);
