@@ -261,5 +261,16 @@ if (ENABLE_MPI)
   target_link_libraries(gravity_geometry_check PRIVATE MPI::MPI_CXX)
 endif()
 
+add_executable(gravity_coarse_check EXCLUDE_FROM_ALL
+  tst/test_suite/gravity/coarse_grid.cpp
+  src/gravity/sparse_mg.cpp src/gravity/geometric_mg.cpp
+  src/gravity/mesh_geometry.cpp src/gravity/composite.cpp src/gravity/vacuum_mesh.cpp)
+target_include_directories(gravity_coarse_check PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(gravity_coarse_check PRIVATE Kokkos::kokkos)
+if (ENABLE_MPI)
+  target_link_libraries(gravity_coarse_check PRIVATE MPI::MPI_CXX)
+endif()
+
 install( TARGETS athena DESTINATION bin )
 

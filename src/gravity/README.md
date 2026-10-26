@@ -156,6 +156,15 @@ host after upload; fine and intermediate host matrices are released.
 Convergence is checked against the current true residual. The existing capped
 attempt and full-hierarchy refresh/retry remain available, with both attempts
 included in timing.
+At a restart, a true residual more than 1000 times the larger of the Arnoldi
+estimate and requested target marks a preconditioner breakdown. The terminal LU
+checks for zero columns and uses a scale-relative pivot floor after removing the
+constant mode with an operator-scaled rank-one gauge. Extra coarse nullspaces
+therefore fail at setup instead of silently producing huge corrections.
+Full-x-period vacuum cells use periodic quadratic samples from the outset;
+the one-sided physical-source/vacuum x3 filter remains independent. The explicit
+`gravity_coarse_check` target exercises this geometry, phase updates, narrow
+domains, matrix scaling and collective rejection of invalid terminal operators.
 Identical source, topology, phase and gravitational constant can reuse a field;
 extra-source callbacks are still evaluated before checking source equality.
 Host phase workers use private gradient caches and concatenate consecutive row

@@ -424,7 +424,13 @@ struct MeshGeometry::Impl {
     const auto cell = Cell(row);
     std::vector<Sample> samples;
     bool one_sided = !domain.c1_z_interfaces.empty();
-    bool one_sided_x = domain.shear_phase_updates;
+    // A cell spanning the entire x period has no same-side x neighbours.
+    // On the deepest vacuum levels it must use periodic images from the
+    // outset, rather than inferring periodic curvature from one-sided samples.
+    // Keep the real source/vacuum z filter independent of this choice.
+    const double x_period = domain.hi[0]-domain.lo[0];
+    bool one_sided_x = domain.shear_phase_updates &&
+        cell.width[0] < x_period*(1.-64.*std::numeric_limits<double>::epsilon());
     Quadratic q;
     auto add = [&](GlobalIndex id, const Vec &delta) {
       const double x = cell.center[0]+delta[0];

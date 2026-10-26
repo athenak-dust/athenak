@@ -809,7 +809,8 @@ void SelfGravity::Solve(Real time) {
     } else { fresh_attempt_s = attempt_seconds; }
     if (cached_preconditioner && (!last_solve.converged
                                  || !std::isfinite(last_solve.relative_residual))) {
-      const std::string reason = !std::isfinite(last_solve.relative_residual)
+      const std::string reason = last_solve.preconditioner_breakdown ? "true_residual_gap" :
+          !std::isfinite(last_solve.relative_residual)
           ? "nonfinite_residual" : (last_solve.iterations >= attempt_cap
           ? "iteration_cap" : "cached_breakdown");
       auto candidate = solution_;
@@ -845,6 +846,9 @@ void SelfGravity::Solve(Real time) {
     Fail(e.what());
   }
   if (!last_solve.converged || !std::isfinite(last_solve.relative_residual)) {
+    if (last_solve.preconditioner_breakdown)
+      Fail("multigrid preconditioner breakdown: true residual greatly exceeds Arnoldi "
+           "estimate; refusing a stale gravity field");
     Fail("multigrid did not reach the requested residual; refusing a stale gravity field");
   }
   hierarchy_fresh_ = false;

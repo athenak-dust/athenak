@@ -66,6 +66,7 @@ struct DistributedHierarchy {
 
 struct SolveStats {
   bool converged = false;
+  bool preconditioner_breakdown = false;  // true/Arnoldi residual gap at a restart
   int iterations = 0;
   int vcycles = 0;
   int matrix_applications = 0;

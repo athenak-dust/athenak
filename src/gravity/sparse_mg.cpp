@@ -733,7 +733,7 @@ struct SparseMultigrid::Impl {
 #endif
     int good = 1;
     if (rank == 0) {
-      coarse_lu.assign(n*n,nullspace ? Real(1)/n : Real(0));
+      coarse_lu.assign(n*n,Real(0));
       coarse_pivots.resize(n);
       coarse_rhs.resize(n);
       int entry = 0;
@@ -742,15 +742,32 @@ struct SparseMultigrid::Impl {
           coarse_lu[i*n+static_cast<int>(columns[entry])] += values[entry];
         }
       }
-      for (int k = 0; k < n; ++k) {
+      Real matrix_scale = 0;
+      std::vector<Real> column_max(n,Real(0));
+      for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) {
+        const Real value = std::abs(coarse_lu[i*n+j]);
+        matrix_scale = std::max(matrix_scale,value);
+        column_max[j] = std::max(column_max[j],value);
+      }
+      // A zero column is an extra null direction (except for the legitimate
+      // one-cell constant-nullspace system). Check A before adding its gauge.
+      if (!(nullspace && n == 1)) for (Real value : column_max)
+        if (!(value > 0)) good = 2;
+      // Scaling the constant-mode gauge with A keeps the numerical-rank test
+      // independent of physical units. For a compatible RHS this changes only
+      // the unphysical constant potential. The singleton zero A needs a unit gauge.
+      const Real factor_scale = matrix_scale > 0 ? matrix_scale : Real(1);
+      if (nullspace) for (Real &value : coarse_lu) value += factor_scale/n;
+      const Real pivot_floor = 64*n*std::numeric_limits<Real>::epsilon()*factor_scale;
+      for (int k = 0; good == 1 && k < n; ++k) {
         int pivot = k;
         for (int i = k+1; i < n; ++i) {
           if (std::abs(coarse_lu[i*n+k]) > std::abs(coarse_lu[pivot*n+k])) pivot = i;
         }
         coarse_pivots[k] = pivot;
         if (!std::isfinite(coarse_lu[pivot*n+k])
-            || std::abs(coarse_lu[pivot*n+k]) < std::numeric_limits<Real>::min()) {
-          good = 0;
+            || std::abs(coarse_lu[pivot*n+k]) <= pivot_floor) {
+          good = 3;
           break;
         }
         if (pivot != k) {
@@ -765,7 +782,11 @@ struct SparseMultigrid::Impl {
 #if MPI_PARALLEL_ENABLED
     MPI_Bcast(&good,1,MPI_INT,0,comm);
 #endif
-    if (!good) throw std::runtime_error("self-gravity: singular/nonfinite coarse LU");
+    if (good == 2) throw std::runtime_error(
+        "self-gravity: invalid terminal geometry/operator: zero coarse column");
+    if (good != 1) throw std::runtime_error(
+        "self-gravity: singular or ill-conditioned terminal operator after constant-mode "
+        "gauge; coarse geometry may have an extra nullspace");
   }
 
   void UpdateTerminal(const CsrRowUpdate &a) {
@@ -1072,6 +1093,14 @@ struct SparseMultigrid::Impl {
       // Report and accept only an explicitly recomputed true residual.
       CurrentResidual(b,x,r);
       beta = Norm(r);
+      // A huge true/Arnoldi gap signals an unusable flexible basis, e.g. a
+      // near-singular coarse solve producing 1e15-size cancelling updates.
+      // Include the requested target in the comparison so normal residual
+      // replacement near the roundoff floor is not mistaken for breakdown.
+      if (beta > 1000*std::max(std::abs(g[used]),target)) {
+        stats.preconditioner_breakdown = true;
+        break;
+      }
     }
     stats.relative_residual = beta/denominator;
     stats.converged = std::isfinite(beta) && beta <= target;
