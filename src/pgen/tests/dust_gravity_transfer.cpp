@@ -58,7 +58,7 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
     auto test_codes=Kokkos::create_mirror(particles->prtcl_idata);
     Kokkos::deep_copy(test_codes,particles->prtcl_idata);
     for (int p=0;p<npart;++p) {
-      using T=::dust::SMRCompositeTransfer;
+      using T=::SMRCompositeTransfer;
       const unsigned int pattern=static_cast<unsigned int>(test_codes(PTAG,p))%64;
       const int level=std::max(1,T::CloudLevel(test_codes(PLEV,p)));
       test_codes(PLEV,p)=level | ((pattern&3)<<T::kCloudLobeShift1) |
@@ -79,9 +79,9 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
   Real shapes[4]={0,0,0,0};
   for (int p=0;p<npart;++p) if (pr(IPM,p)>0) {
     const int code=codes(PLEV,p);
-    const bool l1=::dust::SMRCompositeTransfer::CloudLobe1(code)!=0;
-    const bool l2=::dust::SMRCompositeTransfer::CloudLobe2(code)!=0;
-    const bool l3=::dust::SMRCompositeTransfer::CloudLobe3(code)!=0;
+    const bool l1=::SMRCompositeTransfer::CloudLobe1(code)!=0;
+    const bool l2=::SMRCompositeTransfer::CloudLobe2(code)!=0;
+    const bool l3=::SMRCompositeTransfer::CloudLobe3(code)!=0;
     shapes[0]+=!(l1||l2||l3); shapes[1]+=l1; shapes[2]+=l2; shapes[3]+=l3;
   }
   Sum(shapes,4);
