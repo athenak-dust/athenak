@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <string>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -32,7 +33,7 @@ void ResizeField(DvceArray5D<Real> &field, const char *name, int blocks,
                  int components, int nk, int nj, int ni) {
   if (field.extent_int(0)!=blocks || field.extent_int(1)!=components ||
       field.extent_int(2)!=nk || field.extent_int(3)!=nj || field.extent_int(4)!=ni)
-    field=DvceArray5D<Real>(name,blocks,components,nk,nj,ni);
+    field=DvceArray5D<Real>(std::string(name),blocks,components,nk,nj,ni);
 }
 }  // namespace
 
