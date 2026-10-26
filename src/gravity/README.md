@@ -5,6 +5,34 @@ rows affected by the changing shear phase. Vertical isolation uses a coarsened
 vacuum exterior, retaining the nonzero mean sheet field. The reference backend
 remains available explicitly for accuracy comparisons.
 
+**Accepted hydro baseline (2026-10-26):** the numerical implementation at
+`30112e27` has passed native WENO-Z physical SMR, dynamic AMR, changed-rank
+restart and four-distinct-GB200 checks. The final coarse-grid repair gives
+full-period vacuum cells a periodic reconstruction and rejects extra terminal
+nullspaces using zero-column and scale-relative LU checks. FGMRES still accepts
+only the current true residual. Exact prolongation-query and halo reuse avoid
+repeated geometry/communication setup without changing coefficients.
+
+The latest physical gas meshes contain a genuinely localized x/y/z octant:
+root64x64x128, blocks32 cubed, locally refined to the spacing of uniform
+128x128x256. Static SMR has30 blocks/983040 physical cells; dynamic AMR follows
+16->30->16. Four-GB200 runs at CFL0.3 to t0.68 took119.86/89.40 application seconds,
+with1452/1110 steps respectively. The maximum-rank gravity-stage sums including
+initial topology setup amortization were72.94/69.13ms per step. These different
+mesh/time-step histories are not a pure algorithm speedup. CPU2rank/CUDA4rank
+active float64 differences on the matched small dynamic case were1.55e-15;
+changed-rank2->4 restart differences were below2e-15.
+
+This completes the implemented hydro feature set and its engineering regression
+checks. Long nonlinear self-gravitating application validation and deposited
+dust gravity/particle gathering remain separate work. Density-weighted total
+self-force is convergent, not exactly zero. Dedicated-library experiments are
+isolated on a separate benchmark branch; they do not change this baseline or
+its default backend.
+
+The following timings are historical benchmarks with earlier operators and
+different meshes/time-step windows, retained for provenance:
+
 On four GB200 GPUs, the 4.19-million-physical-cell WENO-Z disk benchmark measures
 about **40.5 ms of gravity work per step at fixed dt=1e-4**. A follow-up using
 the same binary and normal CFL=0.3 through 1.02 shear wraps measures **118.4 ms
