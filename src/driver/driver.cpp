@@ -546,6 +546,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
     if (pmesh->stop_max_nmb && pmesh->pmb_pack->pdust != nullptr) {
       pmesh->pmb_pack->pdust->amr_check_after_output = true;
     }
+    if (pmesh->stop_max_nmb && pmesh->pmb_pack->pgrav != nullptr) {
+      pmesh->pmb_pack->pgrav->amr_check_after_output = true;
+    }
   }    // end of (time_evolution != tstatic) clause
   return;
 }
