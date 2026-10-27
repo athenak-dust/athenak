@@ -61,6 +61,8 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
   for (int i=0; i<(NOUTPUT_CHOICES); ++i) {
     if (out_params.variable.compare(var_choice[i]) == 0) {ivar = i;}
   }
+  // dust_sN_rho, dust_sN_mom(1..3): checked as dust_species (165)
+  if (ivar < 0 && DustSpeciesVariable(out_params.variable) > 0) ivar = 165;
   if (ivar < 0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
        << "Variable '" << out_params.variable << "' in block '" << out_params.block_name
@@ -180,12 +182,21 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
   }
   // dust_total, dust_total_rho, dust_total_mom(1..3): a dust module, active
   // cells
-  if ((ivar >= 159) && (ivar <= 164) &&
+  if ((ivar >= 159) && (ivar <= 165) &&
       (pm->pmb_pack->pdust == nullptr || out_params.include_gzs)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
        << "Output variable '" << out_params.variable << "' in <output> block '"
        << out_params.block_name << "' needs a <dust> block and active cells only "
        << "(ghost_zones = false)" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  // dust_sN_*: N = 1..nspecies
+  if (ivar == 165 &&
+      DustSpeciesVariable(out_params.variable) > pm->pmb_pack->pdust->nspecies) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+       << "Output variable '" << out_params.variable << "' in <output> block '"
+       << out_params.block_name << "': the run has " << pm->pmb_pack->pdust->nspecies
+       << " dust species (<dust>/nspecies)" << std::endl;
     exit(EXIT_FAILURE);
   }
   if ((ivar==153) && (pm->pmb_pack->pdust == nullptr)) {
@@ -796,6 +807,35 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
       const std::string name = "dust_total_mom" + std::to_string(c);
       if (v == "dust_total" || v == "dust_total_mom" || v == name) {
         outvars.emplace_back(name,c,&(derived_var));
+      }
+    }
+  }
+  // the same per species, only where asked for (never added to
+  // hydro outputs): dust_species, every species s in derived_var(m, 4(s-1) + c) (c = 0
+  // rho, 1..3 mom1..3); dust_sN_rho, dust_sN_mom, dust_sN_momC: species N in
+  // derived_var(m, 0..3)
+  {
+    std::string comp;
+    const int nsel = DustSpeciesVariable(out_params.variable, &comp);
+    if (nsel == 0) {
+      const int nsp = pm->pmb_pack->pdust->nspecies;
+      out_params.contains_derived = true;
+      out_params.n_derived += 4*nsp;
+      for (int n=1; n<=nsp; ++n) {
+        for (int c=0; c<4; ++c) {
+          outvars.emplace_back(DustSpeciesFieldName(n, c), 4*(n-1) + c, &(derived_var));
+        }
+      }
+    } else if (nsel > 0) {
+      out_params.contains_derived = true;
+      out_params.n_derived += 4;
+      if (comp == "rho") {
+        outvars.emplace_back(DustSpeciesFieldName(nsel, 0), 0, &(derived_var));
+      }
+      for (int c=1; c<=3; ++c) {
+        if (comp == "mom" || comp == "mom" + std::to_string(c)) {
+          outvars.emplace_back(DustSpeciesFieldName(nsel, c), c, &(derived_var));
+        }
       }
     }
   }

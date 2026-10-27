@@ -776,6 +776,30 @@ long long SumRanks(const long long v) {
 #endif
   return v;
 }
+// the per-species root cloud masses of the merge pass on the device, nsp entries
+// (nsp >= the species of every particle; zero where a species has none).  Was a fixed Real[4]
+// captured by the kernels, which limited the pass to 4 species.
+DvceArray1D<Real> SpeciesRootMass(const std::vector<Real> &mroot, const int nsp) {
+  DvceArray1D<Real> d("merge_mroot_species", nsp);
+  auto h = Kokkos::create_mirror_view(d);
+  for (int sp=0; sp<nsp; ++sp) {
+    h(sp) = (sp < static_cast<int>(mroot.size())) ? mroot[sp] : 0.0;
+  }
+  Kokkos::deep_copy(d, h);
+  return d;
+}
+// the bound of the cell keys (sp ncl + cell) << shift of nsp species, stopped if
+// a key could leave the 64-bit range
+std::int64_t SpeciesKeyBound(const int nsp, const std::int64_t ncl, const int shift) {
+  const std::int64_t lim = std::numeric_limits<std::int64_t>::max() >> shift;
+  if (nsp < 1 || ncl < 1 || ncl > lim/nsp) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "merge cell keys out of the 64-bit range (" << nsp << " species, " << ncl
+              << " cells, shift " << shift << ")" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  return (static_cast<std::int64_t>(nsp)*ncl) << shift;
+}
 }  // namespace
 
 int DustGasDrag::MergeCloudsDevice() {
@@ -964,17 +988,13 @@ int DustGasDrag::MergeCloudsDevice() {
   // Several ranks: every rank gets here (the pass returns early only when no rank has particles)
   // and the value is reduced over them
   EnsureRootCloudMass();
-  const int nsp = static_cast<int>(cloud_merge_mroot.size());
-  if (nsp > 4) {
-    std::cout << "### FATAL ERROR: MergeCloudsDevice supports at most 4 species" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  Real mrootsp[4] = {0.0, 0.0, 0.0, 0.0};
-  for (int sp=0; sp<nsp; ++sp) mrootsp[sp] = cloud_merge_mroot[sp];
+  // any number of species (the keys sp ncl + cell are 64-bit; the masses a View)
+  const int nsp = std::max(1, std::max(static_cast<int>(cloud_merge_mroot.size()), nspecies));
+  const auto mrootsp = SpeciesRootMass(cloud_merge_mroot, nsp);
   // the mass floor of the budgets (cloud_absorb_floor root clouds per root cell): the largest
   // root cloud mass of the species (species 0 may have none, e.g. eps_1 = 0)
   Real mroot_floor = 0.0;
-  for (int sp=0; sp<nsp; ++sp) mroot_floor = std::max(mroot_floor, mrootsp[sp]);
+  for (const Real m : cloud_merge_mroot) mroot_floor = std::max(mroot_floor, m);
   // cloud_merge_budget_kappa > 0: the budget of leaf t is
   // max(min(beta, kappa s_t), 1e-12), s_t = max over its four neighbour leaves (the leaves at one
   // cell width beside its centre, of any level) of |rho_n - rho_t| / max(rho_t, floor), with the
@@ -1081,11 +1101,12 @@ int DustGasDrag::MergeCloudsDevice() {
     });
     // sparse cell lists (KeyCSR), no table over the level-L grid
     KeyCSR spc, scc, slc;
-    BuildKeyCSR(kp, 4*ncl, 0, spc);   // keys sp ncl + cell, at most 4 species
+    const std::int64_t kbnd = SpeciesKeyBound(nsp, ncl, 0);   // keys sp ncl + cell
+    BuildKeyCSR(kp, kbnd, 0, spc);
     // the level-L clouds are looked up by the tent pass only (in quantum mode they were read by
     // the absorption, removed on 2026-10-20)
-    if (cloud_merge_mode != 1) BuildKeyCSR(kc, 4*ncl, 1, scc);
-    if (lobe_keys) BuildKeyCSR(kl, 4*ncl, 2, slc);
+    if (cloud_merge_mode != 1) BuildKeyCSR(kc, kbnd, 1, scc);
+    if (lobe_keys) BuildKeyCSR(kl, kbnd, 2, slc);
     if (cloud_merge_mode == 1) {
       // ===== quantum mode =====
       // X: exact P1-stencil re-merge (geometric, strict tolerance, velocity bounding box);
@@ -1488,9 +1509,9 @@ int DustGasDrag::MergeCloudsDevice() {
             const int p = static_cast<int>(sk(r) % nn);
             qrank(p) = r; qinv(r) = p;
           });
-          BuildKeyCSR(kq, (4*nc) << 4, 3, qsc, qrank, qinv);
+          BuildKeyCSR(kq, SpeciesKeyBound(nsp, nc, 4), 3, qsc, qrank, qinv);
         } else {
-          BuildKeyCSR(kq, (4*nc) << 4, 3, qsc);
+          BuildKeyCSR(kq, SpeciesKeyBound(nsp, nc, 4), 3, qsc);
         }
         // the distinct cells: their first entry in qsc.ukey (the 16 sub-keys of a cell are adjacent)
         DvceArray1D<int> cfirst(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q_cfirst"), qsc.nu + 1);
@@ -1512,7 +1533,7 @@ int DustGasDrag::MergeCloudsDevice() {
           const int sp = static_cast<int>(kcell/nc);
           const std::int64_t cell = kcell % nc;
           const int I = static_cast<int>(cell % m1), J = static_cast<int>(cell/m1);
-          const Real mq = mrootsp[sp]/qden;
+          const Real mq = mrootsp(sp)/qden;
           const Real xcc = transfer.x1min + (I + 0.5)*cs1, ycc = transfer.x2min + (J + 0.5)*cs2;
           Real gM[8], vlo[8][3], vhi[8][3];
           Real xlo[8], xhi[8], ylo[8], yhi[8], gts[8];
@@ -1922,7 +1943,7 @@ int DustGasDrag::MergeCloudsDevice() {
       const int I = static_cast<int>(cell % n1), J = static_cast<int>(cell/n1);
         if ((I % 4) + 4*(J % 4) != col) return;
         if (pr(IPM,c) <= 0.0) return;
-        const Real mref = mrootsp[sp]/static_cast<Real>(1 << (2*L)), mnode = 0.25*mref;
+        const Real mref = mrootsp(sp)/static_cast<Real>(1 << (2*L)), mnode = 0.25*mref;
         const Real xc0 = pr(IPX,c), yc0 = pr(IPY,c);
         // neighbours with a positive tent weight
         int nb[kNbMax]; int nnb = 0; bool ready = true, over = false; int why = 6;
@@ -2752,17 +2773,11 @@ int DustGasDrag::MergeCloudsDevice3D() {
     }
   }
   EnsureRootCloudMass();
-  const int nsp = static_cast<int>(cloud_merge_mroot.size());
-  if (nsp > 4) {
-    std::cout << "### FATAL ERROR: MergeCloudsDevice3D supports at most 4 species" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  Real mrootsp[4] = {0.0, 0.0, 0.0, 0.0};
+  // any number of species (the keys sp ncl + cell are 64-bit; the masses a View)
+  const int nsp = std::max(1, std::max(static_cast<int>(cloud_merge_mroot.size()), nspecies));
+  const auto mrootsp = SpeciesRootMass(cloud_merge_mroot, nsp);
   Real mroot_floor = 0.0;
-  for (int sp=0; sp<nsp; ++sp) {
-    mrootsp[sp] = cloud_merge_mroot[sp];
-    mroot_floor = std::max(mroot_floor, mrootsp[sp]);
-  }
+  for (const Real m : cloud_merge_mroot) mroot_floor = std::max(mroot_floor, m);
   const Real rvol = lt.root_dx1*lt.root_dx2*lt.root_dx3;
   // the structure-relative budget: s_t = max over the six neighbour leaves
   const Real bkappa = cloud_merge_budget_kappa;
@@ -2833,7 +2848,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
       kp(p) = pi(PSP,p)*ncl + mm.Cell(pr(IPX,p), pr(IPY,p), pr(IPZ,p), L);
     });
     KeyCSR spc;
-    BuildKeyCSR(kp, 4*ncl, 0, spc);
+    BuildKeyCSR(kp, SpeciesKeyBound(nsp, ncl, 0), 0, spc);   // keys sp ncl + cell
     const int nmax = (npart > 0) ? npart : 1;
     DvceArray2D<Real> nr("q3_nr", nrdata, nmax);
     DvceArray2D<int> ni("q3_ni", nidata, nmax);
@@ -3000,7 +3015,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
         kq(p) = ((pi(PSP,p)*ncl + (static_cast<std::int64_t>(Kc)*m2 + J)*m1 + I) << 6) + sub;
       });
       KeyCSR qsc;
-      BuildKeyCSR(kq, (4*ncl) << 6, 3, qsc);
+      BuildKeyCSR(kq, SpeciesKeyBound(nsp, ncl, 6), 3, qsc);
       DvceArray1D<int> cfirst(Kokkos::view_alloc(Kokkos::WithoutInitializing, "q3_cfirst"),
                               qsc.nu + 1);
       int ncell = 0;
@@ -3022,7 +3037,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
         const std::int64_t cell = kcell % ncl;
         const int I = static_cast<int>(cell % m1), J = static_cast<int>((cell/m1) % m2);
         const int Kc = static_cast<int>(cell/(static_cast<std::int64_t>(m1)*m2));
-        const Real mq = mrootsp[sp]/qden;
+        const Real mq = mrootsp(sp)/qden;
         const Real xcc = lt.x1min + (I + 0.5)*H1, ycc = lt.x2min + (J + 0.5)*H2;
         const Real zcc = lt.x3min + (Kc + 0.5)*H3;
         // cloud_merge_alpha_leaf: the velocity tolerance on the cell size of the leaf

@@ -1774,7 +1774,8 @@ class DustGasDrag {
   // test of the general deposit remap: the particle mass density (TSC on the own
   // block) remapped with the shear offset of time t_test; writes deptest_<tag>_r<rank>.bin
   void DepositRemapTest(const Real t_test, const std::string &tag);
-  void OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments);
+  // species >= 0: the particles of that species (0-based) only
+  void OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments, const int species = -1);
   DvceArray2D<int> oo_block_map;
   DvceArray5D<Real> oo_rho;
   unsigned long long amr_checksum = 0ULL;
@@ -1879,7 +1880,7 @@ class DustGasDrag {
   }
   void CloudDepositImplicit3D(Driver *pdrive, int stage);
   void CloudGatherImplicit3D(Driver *pdrive, int stage);
-  void DepositCloudDensity3D(DvceArray5D<Real> &f);
+  void DepositCloudDensity3D(DvceArray5D<Real> &f, const int species = -1);
   // Gravity uses the physical mass assignment, independently of drag's linear
   // velocity reconstruction. Fields contain owned active leaves; halo exchange
   // is performed internally at the explicitly supplied geometry time.
@@ -1906,11 +1907,17 @@ class DustGasDrag {
   // deposited mass, particle momentum (3), deposited momentum (3) of the last call.
   std::string ScienceRepresentationId() const;
   void ScienceRepresentation(std::ostream &os) const;
-  // mass_only: component 0 alone (bit for bit the same as with the momenta), 1..3 stay zero
+  // mass_only: component 0 alone (bit for bit the same as with the momenta), 1..3 stay zero.
+  // species >= 0: the same deposit of the particles of that species
+  // (0-based) alone; species < 0: all species (dust_total)
   void DepositScienceFields(DvceArray5D<Real> &out, const bool audit = true,
-                            const bool mass_only = false);
+                            const bool mass_only = false, const int species = -1);
   void DepositPointScienceFields(Real geometry_time, DvceArray5D<Real> &out,
-                                 const bool mass_only = false);  // 3-D points
+                                 const bool mass_only = false,
+                                 const int species = -1);  // 3-D points
+  // every species: out(m, 4 s + c) = component c of species s (0-based), the
+  // deposit of DepositScienceFields with that species
+  void DepositSpeciesScienceFields(DvceArray5D<Real> &out);
   double science_audit[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   // particle history (file_type = phst): the 16 global quantities of a row
   // after time and dt (all ranks hold them; the file writes the last two only in runs with G/R);
@@ -2111,6 +2118,7 @@ class DustGasDrag {
   std::shared_ptr<GravityPointTransfer> science_points_;
   DvceArray5D<Real> science_halo_[4], science_work_, science_phst_;
   DvceArray5D<Real> science_mass_;   // work array of the mass-only deposit (no realloc ping-pong)
+  DvceArray5D<Real> science_species_;   // one species of DepositSpeciesScienceFields
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this DustGasDrag
 };
 

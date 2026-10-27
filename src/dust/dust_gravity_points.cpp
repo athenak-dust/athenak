@@ -237,7 +237,7 @@ void DustGasDrag::DepositPointGravityDensity(Real time,DvceArray5D<Real> &owned)
 // plan and buffers (science_points_): an output leaves the coupling's and gravity's
 // transfers untouched.  out(b, 0..3) on the active cells; the ghost cells are zero.
 void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out,
-                                            const bool mass_only) {
+                                            const bool mass_only,const int species) {
   auto *pm=pmy_pack->pmesh;
   if (!pm->three_d || clouds3d || !std::isfinite(time) ||
       !(smr_transfer_mode==DustSMRTransfer::owner_overlap ||
@@ -278,6 +278,7 @@ void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out,
     KOKKOS_LAMBDA(int p,int &invalid) {
       const Real mass=pr(IPM,p);
       if (mass==0) return;   // outflow tombstones
+      if (species>=0 && pi(PSP,p)!=species) return;   // one species
       if (!Kokkos::isfinite(mass)) {++invalid;return;}
       const int b=pi(PGID,p)-gids;
       if (b<0 || b>=nb || !Kokkos::isfinite(pr(IPX,p)) ||

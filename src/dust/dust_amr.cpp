@@ -2192,8 +2192,10 @@ int DustGasDrag::ResetPGIDOwnerOverlap(const char *when) {
 //! second moments sum(rho v_c^2) (the central moments are formed by the caller).  The ghost
 //! cells keep their own deposits (not read).  Stops if the dust mass on the leaves differs from
 //! the particle mass (relative 1e-9): checks the remap of the current mesh at every use.
+//! species >= 0: the particles of that species (0-based) alone.
 
-void DustGasDrag::OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments) {
+void DustGasDrag::OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments,
+                                      const int species) {
   Mesh *pm = pmy_pack->pmesh;
   auto &indcs = pm->mb_indcs;
   const int nmb = pmy_pack->nmb_thispack;
@@ -2224,6 +2226,7 @@ void DustGasDrag::OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments) 
   if (npart > 0) {
     Kokkos::parallel_reduce("dust_oo_deposit", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, int &bad, double &mp) {
+      if (species >= 0 && pi(PSP,p) != species) return;
       const int m = pi(PGID,p) - gids;
       if (m < 0 || m >= nmb) {++bad; return;}
       int ip, jp;

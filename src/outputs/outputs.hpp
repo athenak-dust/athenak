@@ -8,6 +8,7 @@
 //! \file outputs.hpp
 //  \brief provides classes to handle ALL types of data output
 
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -21,7 +22,7 @@
     #error NHISTORY > NREDUCTION in outputs.hpp
 #endif
 
-#define NOUTPUT_CHOICES 165
+#define NOUTPUT_CHOICES 166
 // choices for output variables used in <ouput> blocks in input file
 // TO ADD MORE CHOICES:
 //   - add more strings to array below, change NOUTPUT_CHOICES above appropriately
@@ -104,8 +105,35 @@ static const char *var_choice[NOUTPUT_CHOICES] = {
   // Dust mass and momentum densities with the run's representation (159-164);
   // active cells only.  Not the NGP histogram dust_d.
   "dust_total", "dust_total_rho", "dust_total_mom",
-  "dust_total_mom1", "dust_total_mom2", "dust_total_mom3"
+  "dust_total_mom1", "dust_total_mom2", "dust_total_mom3",
+  // The same per species (165): every species N = 1..nspecies (as
+  // in the input keys), dust_sN_rho, dust_sN_mom1..3.  The single-species names
+  // dust_sN_rho, dust_sN_mom (three components), dust_sN_mom1..3 are matched by
+  // DustSpeciesVariable below (and checked as 165).
+  "dust_species"
 };
+
+// (names provisional) dust_species: 0; dust_sN_rho, dust_sN_mom,
+// dust_sN_mom1..3: N (1-based), and in *comp the part after "dust_sN_"; else -1.
+inline int DustSpeciesVariable(const std::string &name, std::string *comp = nullptr) {
+  if (name == "dust_species") return 0;
+  if (name.compare(0, 6, "dust_s") != 0) return -1;
+  const std::size_t i = 6;
+  std::size_t j = i;
+  while (j < name.size() && std::isdigit(static_cast<unsigned char>(name[j]))) ++j;
+  if (j == i || j - i > 6 || name[i] == '0' || j >= name.size() || name[j] != '_') {
+    return -1;
+  }
+  const std::string c = name.substr(j + 1);
+  if (c != "rho" && c != "mom" && c != "mom1" && c != "mom2" && c != "mom3") return -1;
+  if (comp != nullptr) *comp = c;
+  return std::stoi(name.substr(i, j - i));
+}
+// the name of component c (0 rho, 1..3 mom1..3) of species n (1-based)
+inline std::string DustSpeciesFieldName(const int n, const int c) {
+  return "dust_s" + std::to_string(n) + ((c == 0) ? std::string("_rho")
+                                                  : "_mom" + std::to_string(c));
+}
 
 
 // forward declarations
