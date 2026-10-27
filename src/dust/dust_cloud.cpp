@@ -361,25 +361,87 @@ void DustGasDrag::RequireCloudTable(const char *what) const {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::EnsureNextTag
-//! \brief The first PTAG of created particles, once: the largest tag of all particles + 1.
+//! \brief The first tag of created particles, once: the largest tag of all particles + 1.
 //! It used to be the particle count at the first creation, which repeats tags when
 //! particles were removed before (a resampling at t = 0 before the first split of a run that
 //! starts on the root grid: D6 had 251 tags twice).  Called at the start of every cycle, so
 //! that it is set before anything removes particles; restarts carry the counter.
 
 void DustGasDrag::EnsureNextTag() {
-  if (cloud_next_tag >= 0) return;
+  if (cloud_next_tag_set) return;
+  // Each rank hands out base + rank, then steps by the number of ranks;
+  // base = 1 + the largest live tag (as before), at least the bound of the restart file this run
+  // segment started from (tags of deleted particles are not issued again) and test_tag_start
+  std::uint64_t base = std::max(LiveTagBound(), cloud_tag_floor);
+  base = std::max(base, cloud_test_tag_start);
+  const std::uint64_t rank = static_cast<std::uint64_t>(global_variable::my_rank);
+  if (base > UINT64_MAX - rank) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "dust particle tags: the 64-bit tag space is exhausted (base " << base
+              << ", rank " << rank << ")" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  cloud_next_tag = base + rank;
+  cloud_next_tag_set = true;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::IssueTags
+//! \brief The first of n new tags of this rank (first, first + nranks, ...); the
+//! counter moves on by n*nranks.  Checked: a counter that would pass 2^64 - 1 stops the run.
+
+std::uint64_t DustGasDrag::IssueTags(const std::uint64_t n) {
+  if (!cloud_next_tag_set) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "dust particle tags issued before the counter was set (EnsureNextTag)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const std::uint64_t stride = static_cast<std::uint64_t>(global_variable::nranks);
+  const std::uint64_t first = cloud_next_tag;
+  if (n > 0 && (n > UINT64_MAX/stride || n*stride > UINT64_MAX - first)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "dust particle tags: the 64-bit tag space is exhausted (next tag " << first
+              << ", " << n << " new tags, stride " << stride << ")" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  cloud_next_tag = first + n*stride;
+  return first;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::LiveTagBound, DustGasDrag::IssuedTagBound
+//! \brief Both collective: 1 + the largest tag of the particles of all ranks (0 if
+//! there is none); a bound above every tag issued so far: the largest of LiveTagBound, the
+//! counters of all ranks and the bound this run segment started from.
+
+std::uint64_t DustGasDrag::LiveTagBound() const {
   auto pi = pmy_pack->ppart->prtcl_idata;
   const int npart = pmy_pack->ppart->nprtcl_thispack;
-  int mx = -1;
+  std::uint64_t mx = 0;
   Kokkos::parallel_reduce("dust_max_tag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &m) {if (pi(PTAG,p) > m) m = pi(PTAG,p);}, Kokkos::Max<int>(mx));
-  mx = std::max(mx, -1);
+  KOKKOS_LAMBDA(const int p, std::uint64_t &m) {
+    const std::uint64_t t = GetTag(pi,p);
+    if (t > m) m = t;
+  }, Kokkos::Max<std::uint64_t>(mx));
+  // (2^64 - 1 is never issued: IssueTags stops before the counter passes it)
+  if (npart > 0 && mx == UINT64_MAX) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "dust particle tags: a particle has the tag 2^64 - 1" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  std::uint64_t b = (npart > 0) ? mx + 1 : 0;
 #if MPI_PARALLEL_ENABLED
-  MPI_Allreduce(MPI_IN_PLACE, &mx, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &b, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
 #endif
-  // Each rank hands out mx + 1 + rank, then steps by the number of ranks
-  cloud_next_tag = mx + 1 + global_variable::my_rank;
+  return b;
+}
+
+std::uint64_t DustGasDrag::IssuedTagBound() const {
+  std::uint64_t b = std::max(cloud_tag_floor, cloud_next_tag_set ? cloud_next_tag : 0);
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &b, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+#endif
+  return std::max(b, LiveTagBound());
 }
 
 //----------------------------------------------------------------------------------------
@@ -1022,7 +1084,8 @@ int DustGasDrag::SplitCloudsP1() {
         ii(PLEV,s) = clev | (p1[a].lobe << sh1) | (p2[b].lobe << sh2);
         ii(PGID,s) = owner_gid(cx, cy);
         if (a > 0 || b > 0) {   // the centre keeps the tag
-          ii(PTAG,s) = cloud_next_tag; cloud_next_tag += global_variable::nranks;
+          const std::uint64_t t = IssueTags(1);
+          ii(PTAG,s) = TagLo(t); ii(PTAGH,s) = TagHi(t);
         }
       }
     }
@@ -1149,16 +1212,18 @@ int DustGasDrag::SplitCloudsP1() {
                        vol, kv.second[0], kv.second[4]);
         }
       }
-      std::fprintf(fp, "S %llu %d %.17g %d %d %d %.17g %.17g %.17g %.17g %.17g %.17g %d"
+      std::fprintf(fp, "S %llu %d %.17g %d %llu %d %.17g %.17g %.17g %.17g %.17g %.17g %d"
                    " %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e\n", ev,
-                   pmesh->ncycle, pmesh->time, (clev == lev) ? 1 : 0, pi_h(PTAG,p), code,
+                   pmesh->ncycle, pmesh->time, (clev == lev) ? 1 : 0,
+                   static_cast<unsigned long long>(GetTag(pi_h,p)), code,
                    x, y, pr_h(IPM,p), pr_h(IPVX,p), pr_h(IPVY,p), pr_h(IPVZ,p),
                    nslot - slot0, dmax[0], mmax, dmax[1], dmax[2], dmax[3],
                    static_cast<double>(acc.size()), fam[0], fam[1], fam[2], fam[3]);
       for (int s=slot0; s<nslot; ++s) {
         const int q = s - slot0;
         const bool shifted = !pre_x.empty();
-        std::fprintf(fp, "C %llu %d %d %d %.17g %.17g %.17g\n", ev, q, ii(PTAG,s),
+        std::fprintf(fp, "C %llu %d %llu %d %.17g %.17g %.17g\n", ev, q,
+                     static_cast<unsigned long long>(TagFromWords(ii(PTAG,s), ii(PTAGH,s))),
                      ii(PLEV,s), shifted ? pre_x[q] : rr(IPX,s),
                      shifted ? pre_y[q] : rr(IPY,s), rr(IPM,s));
         if (shifted) {
@@ -1398,7 +1463,10 @@ int DustGasDrag::MergeClouds() {
         r[IPM] = rrow[IPM]*p1[a].frac*p2[b].frac;
         i[PLEV] = lev;
         i[PGID] = owner_gid(cx, cy);
-        if (a > 0 || b > 0) {i[PTAG] = cloud_next_tag; cloud_next_tag += global_variable::nranks;}
+        if (a > 0 || b > 0) {
+          const std::uint64_t t = IssueTags(1);
+          i[PTAG] = TagLo(t); i[PTAGH] = TagHi(t);
+        }
         R.push_back(r); I.push_back(i);
       }
     }

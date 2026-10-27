@@ -50,11 +50,15 @@ void TrackedParticleOutput::LoadOutputData(Mesh *pm) {
   auto &pi = pm->pmb_pack->ppart->prtcl_idata;
   int counter=0;
   int *pcounter = &counter;
-  int ntrack_ = ntrack;
+  // The 64-bit tag of dust particles (words PTAG, PTAGH); cosmic rays: PTAG
+  const std::uint64_t ntrack_ = (ntrack > 0) ? static_cast<std::uint64_t>(ntrack) : 0;
+  const bool hiword = (pm->pmb_pack->ppart->nidata > PTAGH);
   par_for("part_update",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
-    if (pi(PTAG,p) < ntrack_) {
+    const std::uint64_t tag = hiword ? GetTag(pi,p)
+                                     : static_cast<std::uint64_t>(static_cast<std::uint32_t>(pi(PTAG,p)));
+    if (tag < ntrack_) {
       int index = Kokkos::atomic_fetch_add(pcounter,1);
-      tracked_prtcl.d_view(index).tag = pi(PTAG,p);
+      tracked_prtcl.d_view(index).tag = tag;
       tracked_prtcl.d_view(index).x   = pr(IPX,p);
       tracked_prtcl.d_view(index).y   = pr(IPY,p);
       tracked_prtcl.d_view(index).z   = pr(IPZ,p);

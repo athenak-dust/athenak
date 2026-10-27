@@ -354,7 +354,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     for (int d=0; d<3; ++d) vmax = std::max(vmax, fabs(pv[d]));
     for (int n=0; n<ppar->nrdata; ++n) hpr(n,p) = 0.0;
     hpi(PGID,p) = pmbp->gids + lp.local_block;
-    hpi(PTAG,p) = snapshot.tag[lp.source_index];
+    SetTag(hpi, p, static_cast<std::uint64_t>(snapshot.tag[lp.source_index]));
     hpi(PSP,p) = s;
     hpr(IPX,p) = hpr(IPX1,p) = lp.x;
     hpr(IPY,p) = hpr(IPY1,p) = lp.y;

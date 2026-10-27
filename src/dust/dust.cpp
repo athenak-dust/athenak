@@ -107,6 +107,30 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // <dust>/experimental_mpi: refinable clouds on several MPI ranks with the dust
   // halo (dust_halo.cpp); the supported options in CheckMultiRank
   experimental_mpi = pin->GetOrAddBoolean("dust", "experimental_mpi", false);
+  // <dust>/test_tag_start = N (tests only; decimal, < 2^64): the tag counter, when it
+  // is set (EnsureNextTag), issues no tag below N, e.g. 4294967000 to cross 2^32 within a few
+  // splits.  Read only when present, so that the input (and the rst header) of a run without
+  // it does not change; off (0) by default.
+  if (pin->DoesParameterExist("dust", "test_tag_start")) {
+    const std::string v = pin->GetString("dust", "test_tag_start");
+    std::size_t used = 0;
+    unsigned long long t = 0;
+    bool ok = !v.empty() && v.find_first_not_of("0123456789") == std::string::npos;
+    if (ok) {
+      try {t = std::stoull(v, &used, 10);} catch (...) {ok = false;}
+    }
+    if (!ok || used != v.size()) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<dust>/test_tag_start must be a decimal integer below 2^64, not '" << v << "'"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    cloud_test_tag_start = static_cast<std::uint64_t>(t);
+    if (global_variable::my_rank == 0) {
+      std::cout << "# NOTE (dust): test_tag_start = " << cloud_test_tag_start
+                << " (tests only): new tags start at this value or above" << std::endl;
+    }
+  }
   // S3b: refinable clouds on a 3-D mesh (dust_cloud3d.cpp); stage 1: one rank, static
   // mesh, split only.  <dust>/experimental_3d_shear_plain (test): a 3-D shearing box with
   // shear-periodic x1, the cloud supports across the radial boundaries taken in the plain

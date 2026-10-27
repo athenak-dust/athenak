@@ -180,8 +180,10 @@ int DustGasDrag::SplitCloudsP1Device() {
   }
   auto prv = ppar->prtcl_rdata;
   auto piv = ppar->prtcl_idata;
-  // tags of this rank: tag0, tag0 + nranks, ... (unique over the ranks)
-  const int tag0 = cloud_next_tag, tstride = global_variable::nranks;
+  // tags of this rank: tag0, tag0 + nranks, ... (unique over the ranks;
+  // 64-bit, the counter is moved on, with a check, before the fill)
+  const std::uint64_t tag0 = IssueTags(static_cast<std::uint64_t>(ntags));
+  const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
   Kokkos::parallel_for("dust_split_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     if (np(p) == 0) return;
@@ -202,7 +204,8 @@ int DustGasDrag::SplitCloudsP1Device() {
       if (k > 0) {
         for (int c=0; c<nrdata; ++c) prv(c,s) = prv(c,p);
         for (int c=0; c<nidata; ++c) piv(c,s) = piv(c,p);
-        piv(PTAG,s) = tag0 + (tagoff(p) + k - 1)*tstride;   // the centre keeps the tag
+        // the centre keeps the tag
+        SetTag(piv, s, tag0 + static_cast<std::uint64_t>(tagoff(p) + k - 1)*tstride);
       }
       prv(IPX,s) = cx; prv(IPX1,s) = cx;
       prv(IPY,s) = cy; prv(IPY1,s) = cy;
@@ -211,7 +214,6 @@ int DustGasDrag::SplitCloudsP1Device() {
       piv(PGID,s) = gids + NewCloudBlock(lt, cx, cy, lt.Anchor(piv(PGID,s)), ncell12);
     }
   });
-  cloud_next_tag += ntags*global_variable::nranks;
   cloud_split_count += nparent;
   cloud_lobe_split_count += nflag - nparent;
   ppar->nprtcl_thispack = nnew;
@@ -537,7 +539,7 @@ struct PassAudit {
     for (int p=0; p<n; ++p) {
       double *o = &out[static_cast<std::size_t>(p)*9];
       o[0] = hr(IPX,p); o[1] = hr(IPY,p); o[2] = hr(IPM,p); o[3] = hr(IPVX,p);
-      o[4] = hr(IPVY,p); o[5] = hr(IPVZ,p); o[6] = hi(PTAG,p); o[7] = hi(PLEV,p); o[8] = hr(IPTS,p);
+      o[4] = hr(IPVY,p); o[5] = hr(IPVZ,p); o[6] = static_cast<double>(GetTag(hi,p)); o[7] = hi(PLEV,p); o[8] = hr(IPTS,p);
     }
     Raw(compact, name, 'd', {n, 9}, out.data(), out.size()*sizeof(double));
   }
@@ -614,8 +616,8 @@ void BudgetDeposit(const LeafTraversal &lt, const DvceArray2D<Real> &r,
 // a G group's hash in [0, 1) from its new cloud's tag (splitmix64; the same on every
 // rank and in every run), for cloud_merge_budget_thin
 KOKKOS_INLINE_FUNCTION
-Real GroupHash01(const int tag) {
-  std::uint64_t z = static_cast<std::uint64_t>(static_cast<std::uint32_t>(tag)) + 0x9E3779B97F4A7C15ULL;
+Real GroupHash01(const std::uint64_t tag) {   // the 64-bit tag (the same value below 2^31)
+  std::uint64_t z = tag + 0x9E3779B97F4A7C15ULL;
   z = (z ^ (z >> 30))*0xBF58476D1CE4E5B9ULL;
   z = (z ^ (z >> 27))*0x94D049BB133111EBULL;
   z ^= z >> 31;
@@ -798,11 +800,12 @@ int DustGasDrag::MergeCloudsDevice() {
     char meta[1024];
     // stage C and the absorption were removed on 2026-10-20: their fields keep the old defaults
     // (csmax 0.5, cds 0.1, compress 0, absorb 0), so that readers of the audit files still parse
-    std::snprintf(meta, sizeof(meta), "time=%.17g ncycle=%d dt=%.17g npart0=%d merge_pass=%llu next_tag=%d "
+    std::snprintf(meta, sizeof(meta), "time=%.17g ncycle=%d dt=%.17g npart0=%d merge_pass=%llu next_tag=%lld "
                   "nrdata=%d nidata=%d nlev=%d alpha=%.17g K=%d smax=%.17g csmax=%.17g cds=%.17g fmin=%.17g "
                   "stencil_tol=%.17g glag=%d compress=%d absorb=%d B=%d mroot0=%.17g",
                   pmesh->time, pmesh->ncycle, pmesh->dt, npart0,
-                  static_cast<unsigned long long>(cloud_merge_pass), cloud_next_tag, nrdata, nidata, nlev,
+                  static_cast<unsigned long long>(cloud_merge_pass),
+                  cloud_next_tag_set ? static_cast<long long>(cloud_next_tag) : -1LL, nrdata, nidata, nlev,
                   cloud_merge_alpha, cloud_merge_K, cloud_merge_smax, 0.5, 0.1,
                   cloud_merge_min_mass, cloud_merge_stencil_tol, cloud_merge_g_lag, 0,
                   0, B, cloud_merge_mroot.empty() ? -1.0 : cloud_merge_mroot[0]);
@@ -911,7 +914,8 @@ int DustGasDrag::MergeCloudsDevice() {
       }, ntags);
       DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata, nnew);
       DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata, nnew);
-      const int tag0 = cloud_next_tag, tstride = global_variable::nranks;   // tags unique over the ranks
+      const std::uint64_t tag0 = IssueTags(static_cast<std::uint64_t>(ntags));
+      const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
       Kokkos::parallel_for("rel_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
       KOKKOS_LAMBDA(const int p) {
         const int s0 = off(p);
@@ -940,7 +944,7 @@ int DustGasDrag::MergeCloudsDevice() {
             prn(IPM,s) = pr(IPM,p)*a[ja].frac*b[jb].frac;
             pin(PLEV,s) = lev;
             pin(PGID,s) = gids + NewCloudBlock(lt, cx, cy, lt.Anchor(pin(PGID,s)), ncell12);
-            if (k > 0) pin(PTAG,s) = tag0 + (toff(p) + k - 1)*tstride;
+            if (k > 0) SetTag(pin, s, tag0 + static_cast<std::uint64_t>(toff(p) + k - 1)*tstride);
             ++k;
           }
         }
@@ -948,7 +952,6 @@ int DustGasDrag::MergeCloudsDevice() {
       ppar->prtcl_rdata = prn;
       ppar->prtcl_idata = pin;
       ppar->nprtcl_thispack = nnew;
-      cloud_next_tag += ntags*global_variable::nranks;
     }
   }
 
@@ -2474,7 +2477,7 @@ void DustGasDrag::UpdateCloudOrder() {
     Kokkos::parallel_reduce("cloud_order_check", Kokkos::RangePolicy<>(DevExeSpace(), 0, cloud_ord_n),
     KOKKOS_LAMBDA(const int k, int &b) {
       const int p = ord(k);
-      if (p < 0 || p >= npart || pi(PTAG,p) != tg(k)) ++b;
+      if (p < 0 || p >= npart || GetTag(pi,p) != tg(k)) ++b;
     }, bad);
     rebuild = bad > 0;
   }
@@ -2508,16 +2511,16 @@ void DustGasDrag::UpdateCloudOrder() {
   SortFirst(key, npart);
   if (cloud_ord.extent_int(0) < npart) {
     cloud_ord = DvceArray1D<int>();
-    cloud_ord_tag = DvceArray1D<int>();
+    cloud_ord_tag = DvceArray1D<std::uint64_t>();
     cloud_ord = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "cloud_ord"), npart + npart/4);
-    cloud_ord_tag = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "cloud_ord_tag"),
-                                     npart + npart/4);
+    cloud_ord_tag = DvceArray1D<std::uint64_t>(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                                                  "cloud_ord_tag"), npart + npart/4);
   }
   auto ord = cloud_ord; auto tg = cloud_ord_tag;
   Kokkos::parallel_for("cloud_order_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int k) {
     const int p = static_cast<int>(key(k) % np);
-    ord(k) = p; tg(k) = pi(PTAG,p);
+    ord(k) = p; tg(k) = GetTag(pi,p);
   });
   cloud_ord_n = npart;
   ++cloud_ord_builds;
@@ -2698,7 +2701,8 @@ int DustGasDrag::MergeCloudsDevice3D() {
                             nrdata, nnew);
       DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"),
                            nidata, nnew);
-      const int tag0 = cloud_next_tag, tstride = global_variable::nranks;
+      const std::uint64_t tag0 = IssueTags(static_cast<std::uint64_t>(ntags));   // 64-bit tags
+      const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
       Kokkos::parallel_for("rel3d_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
       KOKKOS_LAMBDA(const int p) {
         const int s0 = off(p);
@@ -2734,7 +2738,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
               const int leaf = lt.LeafOwner(cx, cy, cz, lt.Anchor(pin(PGID,s)));
               const int blk = (leaf < 0) ? lt.Anchor(pin(PGID,s)) : leaf/ncell123;
               pin(PGID,s) = gids + ((blk < lt.nmb) ? blk : lt.Anchor(pin(PGID,s)));
-              if (k > 0) pin(PTAG,s) = tag0 + (toff(p) + k - 1)*tstride;
+              if (k > 0) SetTag(pin, s, tag0 + static_cast<std::uint64_t>(toff(p) + k - 1)*tstride);
               ++k;
             }
           }
@@ -2743,7 +2747,6 @@ int DustGasDrag::MergeCloudsDevice3D() {
       ppar->prtcl_rdata = prn;
       ppar->prtcl_idata = pin;
       ppar->nprtcl_thispack = nnew;
-      cloud_next_tag += ntags*global_variable::nranks;
       bdirty = true;
     }
   }
@@ -3223,7 +3226,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
           KOKKOS_LAMBDA(const int k) {
             if (krej(k)) return;
             int bad = 0;
-            const Real u = thin_now ? GroupHash01(ni(PTAG,k)) : 0.0;
+            const Real u = thin_now ? GroupHash01(GetTag(ni,k)) : 0.0;
             lt.ForEachCloudWeight(nr(IPX,k), nr(IPY,k), nr(IPZ,k), ni(PLEV,k),
                                   lt.Anchor(ni(PGID,k)), [&](const int t, const Real w) {
               if (w != 0.0 && lviolg(t) && (!thin_now || u >= lpacc(0,t))) bad = 1;
@@ -3236,7 +3239,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
             const int k = gknew(gid(p));
             if (k < 0 || krej(k)) return;
             int bad = 0;
-            const Real u = thin_now ? GroupHash01(ni(PTAG,k)) : 0.0;
+            const Real u = thin_now ? GroupHash01(GetTag(ni,k)) : 0.0;
             lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p),
                                   lt.Anchor(pi(PGID,p)), [&](const int t, const Real w) {
               if (w != 0.0 && lviolg(t) && (!thin_now || u >= lpacc(0,t))) bad = 1;

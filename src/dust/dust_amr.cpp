@@ -147,6 +147,9 @@ unsigned long long ParticleChecksum(particles::Particles *ppar) {
     }
     for (int q=0; q<nidata; ++q) {
       if (q == PGID) continue;
+      // The high tag word only when it is not 0, so that the sum of a run with tags
+      // below 2^32 is the one of the int32 tags before (any change of the word still shows)
+      if (q == PTAGH && pi(q,p) == 0) continue;
       h = (h ^ static_cast<unsigned long long>(static_cast<unsigned int>(pi(q,p))))*1099511628211ULL;
     }
     s += h;

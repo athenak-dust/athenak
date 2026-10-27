@@ -112,7 +112,7 @@ void WriteBASnapshot(Mesh *pm) {
   }
   for (int p=0; p<npart; ++p) {
     particles.insert(particles.end(), {pr(IPX,p), pr(IPY,p), pr(IPM,p),
-        pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p), static_cast<double>(pi(PTAG,p)),
+        pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p), static_cast<double>(GetTag(pi,p)),
         static_cast<double>(pi(PLEV,p))});
   }
   char number[32];
@@ -1845,7 +1845,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       place(q, x, y, z, vw);
       const int sp = q % nspec;
       pi0(PGID,p) = gids0 + pslot(q);
-      pi0(PTAG,p) = q;
+      SetTag(pi0, p, static_cast<std::uint64_t>(q));
       pi0(PSP,p) = sp;
       pi0(PLEV,p) = seed_leaf ? (mblev0.d_view(pslot(q)) - rootlev0) : 0;
       for (int c=0; c<nrdata; ++c) pr0(c,p) = 0.0;
@@ -2023,7 +2023,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       place(q, x, y, vw);
       const int m = pslot(q);
       pi0(PGID,p) = gids0+m;
-      pi0(PTAG,p) = q;
+      SetTag(pi0, p, static_cast<std::uint64_t>(q));
       pi0(PSP,p) = q % nspec;
       pi0(PLEV,p) = 0;
       for (int c=0; c<nrdata; ++c) pr0(c,p) = 0.0;
@@ -2050,7 +2050,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       // Offset the tag stream before hashing so different seeds generate independent
       // position sets.  XOR with the raw tag is not sufficient: for consecutive tags
       // spanning complete power-of-two ranges it only permutes the same set of keys.
-      std::uint64_t key = static_cast<std::uint64_t>(pi(PTAG,p))
+      std::uint64_t key = GetTag(pi,p)
                         + random_seed*UINT64_C(0x9e3779b97f4a7c15);
       m = static_cast<int>(HashUniform01(key)*static_cast<Real>(nmb));
       if (m > (nmb-1)) {m = nmb-1;}
@@ -2182,7 +2182,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       for (int c=0; c<nrd; ++c) prt(c,p) = 0.0;
       prt(IPX,p) = x; prt(IPY,p) = y; prt(IPZ,p) = z; prt(IPM,p) = mq;
       pit(PGID,p) = gids + qslot(q);
-      pit(PTAG,p) = q;
+      SetTag(pit, p, static_cast<std::uint64_t>(q));
     });
     if (!three_d) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl

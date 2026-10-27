@@ -343,7 +343,7 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
     for (int v=0; v<part->nidata; ++v) pi(v,p) = 0;
     const auto &s = local[p];
     pi(PGID,p) = pack->gids + s.block;
-    pi(PTAG,p) = static_cast<int>(s.tag);
+    SetTag(pi, p, static_cast<std::uint64_t>(s.tag));
     pi(PLEV,p) = 0; pi(PSP,p) = 0;
     pr(IPX,p) = pr(IPX1,p) = s.x[0]; pr(IPY,p) = pr(IPY1,p) = s.x[1];
     pr(IPZ,p) = pr(IPZ1,p) = s.x[2];
