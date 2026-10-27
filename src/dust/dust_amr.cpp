@@ -56,6 +56,8 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -97,6 +99,19 @@ struct DensityTrigger {
   // a fixed dust mass per cell (2-D, the old amr_rho_level_scaling = mass), 1 the same thresholds
   // on every level
   Real level_factor = 1.0;
+  // <dust>/amr_rho_refine_levels = r0 r1 r2 ... sets the refinement
+  // threshold of each level explicitly (level l refines at r_l); a block of level l >= 1 derefines
+  // below (amr_rho_derefine / amr_rho_refine) r_(l-1).  Empty: amr_rho_refine level_factor^l
+  std::vector<Real> refine_levels;
+  Real RefineAt(int l) const {
+    if (refine_levels.empty()) return rho_refine*std::pow(level_factor, l);
+    return (l < static_cast<int>(refine_levels.size())) ? refine_levels[l] :
+                                                           std::numeric_limits<Real>::max();
+  }
+  Real DerefineAt(int l) const {   // for a block of level l >= 1
+    if (refine_levels.empty()) return rho_derefine*std::pow(level_factor, l - 1);
+    return rho_derefine/rho_refine*refine_levels[std::max(0, l - 1)];
+  }
   // With map = block, the block values on the device (default) or on the host; check:
   // both, every value compared (diagnostic)
   bool device = true, device_check = false;
@@ -262,6 +277,25 @@ void SetupDensityTrigger(ParameterInput *pin) {
     }
     trig_.level_factor = pin->GetOrAddReal("dust", "amr_rho_level_factor", fsc);
     if (!(trig_.level_factor >= 1.0)) fatal("<dust>/amr_rho_level_factor must be >= 1");
+    if (pin->DoesParameterExist("dust", "amr_rho_refine_levels")) {
+      std::string lv = pin->GetString("dust", "amr_rho_refine_levels");
+      for (char &c : lv) if (c == ',') c = ' ';
+      std::istringstream in(lv);
+      Real v;
+      while (in >> v) trig_.refine_levels.push_back(v);
+      const int nl = pin->GetOrAddInteger("mesh_refinement", "num_levels", 1) - 1;
+      if (static_cast<int>(trig_.refine_levels.size()) < nl) {
+        fatal("<dust>/amr_rho_refine_levels needs one threshold per refinement level (num_levels - 1)");
+      }
+      for (std::size_t i=0; i<trig_.refine_levels.size(); ++i) {
+        if (!(trig_.refine_levels[i] > 0.0) || (i > 0 && !(trig_.refine_levels[i] > trig_.refine_levels[i-1]))) {
+          fatal("<dust>/amr_rho_refine_levels must be positive and increasing");
+        }
+      }
+      if (std::fabs(trig_.refine_levels[0] - trig_.rho_refine) > 1.0e-12*trig_.rho_refine) {
+        fatal("<dust>/amr_rho_refine_levels must start with amr_rho_refine");
+      }
+    }
   }
   trig_.device = pin->GetOrAddBoolean("dust", "amr_rho_device", true);
   trig_.device_check = pin->GetOrAddBoolean("dust", "amr_rho_device_check", false);
@@ -288,6 +322,12 @@ void SetupDensityTrigger(ParameterInput *pin) {
               << ", derefine below " << trig_.rho_derefine << ", buffer " << trig_.buffer
               << " cells of the block's level, each block on its own leaf cells"
               << "; thresholds x" << trig_.level_factor << " per level" << std::endl;
+    if (!trig_.refine_levels.empty()) {
+      std::cout << "# dust density trigger: per-level thresholds (amr_rho_refine_levels)";
+      for (std::size_t i=0; i<trig_.refine_levels.size(); ++i)
+        std::cout << " L" << i << "->L" << i + 1 << " " << trig_.refine_levels[i];
+      std::cout << "; derefine at " << trig_.rho_derefine/trig_.rho_refine << " of the level below" << std::endl;
+    }
   }
 }
 
@@ -649,11 +689,9 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     }
     const int lev = pm->lloc_eachmb[m + mbs].level;
     const int l = lev - pm->root_level;
-    const Real fr = std::pow(trig_.level_factor, l);
-    const Real fdr = (l > 0) ? std::pow(trig_.level_factor, l - 1) : 1.0;
     int flag = 0;
-    if (qh(m) >= trig_.rho_refine*fr && lev < pm->max_level) flag = 1;
-    else if (qh(m) < trig_.rho_derefine*fdr && lev > pm->root_level) flag = -1;
+    if (qh(m) >= trig_.RefineAt(l) && lev < pm->max_level) flag = 1;
+    else if (lev > pm->root_level && qh(m) < trig_.DerefineAt(l)) flag = -1;
     refine_flag.h_view(m + mbs) = flag;
     if (flag > 0) ++nref;
     if (flag < 0) ++nder;
@@ -743,11 +781,11 @@ void DensityRefinement3DPoint(MeshBlockPack *pmbp) {
   for (int m=0; m<nmb; ++m) {
     const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
     const Real q = (mean > 0.0) ? bh(m)/mean : 0.0;
-    const Real fr = std::pow(trig_.level_factor, l);
-    const Real fd = (l > 0) ? std::pow(trig_.level_factor, l - 1) : 1.0;
+    const Real thr_r = trig_.RefineAt(l);
+    const Real thr_d = (l > 0) ? trig_.DerefineAt(l) : 0.0;
     int flag = 0;
-    if (q >= trig_.rho_refine*fr) flag = 1;
-    else if (l > 0 && q < trig_.rho_derefine*fd) flag = -1;
+    if (q >= thr_r) flag = 1;
+    else if (l > 0 && q < thr_d) flag = -1;
     refine_flag.h_view(m + mbs) = flag;
     if (flag > 0) ++nflag[0];
     if (flag < 0) ++nflag[1];
@@ -1172,10 +1210,10 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     int flag = 0;
     // the thresholds of this block's level (amr_rho_level_factor)
     const int l = lev - pm->root_level;
-    const Real fr = std::pow(trig_.level_factor, l);
-    const Real fd = (l > 0) ? std::pow(trig_.level_factor, l - 1) : 1.0;
-    if (q >= trig_.rho_refine*fr && lev < pm->max_level) flag = 1;
-    else if (q < trig_.rho_derefine*fd && lev > pm->root_level) flag = -1;
+    const Real thr_r = trig_.RefineAt(l);
+    const Real thr_d = (l > 0) ? trig_.DerefineAt(l) : 0.0;
+    if (q >= thr_r && lev < pm->max_level) flag = 1;
+    else if (lev > pm->root_level && q < thr_d) flag = -1;
     refine_flag.h_view(m + mbs) = flag;
     if (flag > 0) ++nref;
     if (flag < 0) ++nder;
