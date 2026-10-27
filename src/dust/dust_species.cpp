@@ -297,15 +297,14 @@ SpeciesTable Parse(ParameterInput *pin) {
   if (t.ppc_total < 1) Fail("no particles: every ppc_N is 0");
   t.equal_ppc = true;
   for (int s=0; s<n; ++s) if (t.ppc[s] != t.ppc[0]) t.equal_ppc = false;
-  // the generic particle module reads <particles>/ppc: the total (a redundant one must agree)
+  // Rixin: the sampling is given once; <particles>/ppc is the legacy key
+  // and is not allowed next to ppc_N / ppc_per_species, not even as their sum.  The particle
+  // module takes the total from this table (RootPpc).
   if (Has(pin, "particles", "ppc")) {
-    const double p = pin->GetReal("particles", "ppc");
-    if (p != static_cast<double>(t.ppc_total)) {
-      Fail("<particles>/ppc = " + pin->GetString("particles", "ppc") + " differs from the sum of "
-           "ppc_N = " + std::to_string(t.ppc_total) + " (leave <particles>/ppc out)");
-    }
-  } else {
-    pin->SetReal("particles", "ppc", static_cast<Real>(t.ppc_total));
+    Fail("<particles>/ppc = " + pin->GetString("particles", "ppc") + " cannot be given with " +
+         (t.powerlaw ? std::string("ppc_per_species") : std::string("ppc_N")) + " (the new "
+         "sampling keys; total " + std::to_string(t.ppc_total) + " per root cell): remove "
+         "<particles>/ppc");
   }
   t.hp = ResolveHp(pin, t);
   return t;
@@ -361,6 +360,110 @@ std::string SpeciesTable::Describe(const std::string &pre) const {
     h << "\n";
   }
   return h.str();
+}
+
+// the restart record species_table: ASCII lines, values with 17 digits
+//   species_table 1
+//   nspecies N
+//   stopping_times <source>          (tau_s_N | stokes_N | powerlaw (...) | taus_N (legacy))
+//   omega_ref <Omega of the Stokes numbers, 0: none>
+//   abundance epsilon | Z | legacy
+//   column_normalization full_profile | domain | -
+//   species <input index> tau_s <t> stokes <St | -> <epsilon | Z | value> <v | -> ppc <n | -> H_p <h | ->
+std::string SpeciesTable::Record() const {
+  std::ostringstream r;
+  r << std::setprecision(17);
+  r << "species_table 1\n";
+  r << "nspecies " << nspecies << "\n";
+  r << "stopping_times " << tau_source << "\n";
+  r << "omega_ref " << omega_ref << "\n";
+  r << "abundance " << abundance << "\n";
+  r << "column_normalization " << (column_normalization.empty() ? "-" : column_normalization) << "\n";
+  const std::string vk = new_init ? abundance : "value";
+  for (int s=0; s<nspecies; ++s) {
+    r << "species " << (s + 1) << " tau_s " << tau_s[s] << " stokes ";
+    if (omega_ref > 0.0) {r << tau_s[s]*omega_ref;} else {r << "-";}
+    r << " " << vk << " ";
+    if (new_init) {r << value[s];} else {r << "-";}
+    r << " ppc ";
+    if (new_init) {r << ppc[s];} else {r << "-";}
+    r << " H_p ";
+    if (!hp.empty()) {r << hp[s];} else {r << "-";}
+    r << "\n";
+  }
+  return r.str();
+}
+
+namespace {
+struct RecordFields {
+  std::vector<std::pair<std::string, std::string>> head;               // in file order
+  std::vector<std::vector<std::pair<std::string, std::string>>> sp;    // per species
+};
+RecordFields ParseRecord(const std::string &text) {
+  RecordFields f;
+  std::istringstream in(text);
+  for (std::string line; std::getline(in, line);) {
+    std::istringstream l(line);
+    std::string k;
+    if (!(l >> k)) continue;
+    if (k == "species") {
+      int n = 0;
+      l >> n;
+      std::vector<std::pair<std::string, std::string>> row;
+      for (std::string a, b; l >> a >> b;) row.emplace_back(a, b);
+      f.sp.push_back(row);
+    } else {
+      std::string rest;
+      std::getline(l, rest);
+      const auto b = rest.find_first_not_of(' ');
+      f.head.emplace_back(k, b == std::string::npos ? "" : rest.substr(b));
+    }
+  }
+  return f;
+}
+std::string Field(const std::vector<std::pair<std::string, std::string>> &v, const std::string &k) {
+  for (const auto &p : v) if (p.first == k) return p.second;
+  return "(none)";
+}
+bool SameValue(const std::string &a, const std::string &b) {
+  if (a == b) return true;
+  char *ea = nullptr, *eb = nullptr;
+  const double x = std::strtod(a.c_str(), &ea), y = std::strtod(b.c_str(), &eb);
+  if (ea == a.c_str() || eb == b.c_str() || *ea != '\0' || *eb != '\0') return false;
+  return std::fabs(x - y) <= 1.0e-12*std::max(std::fabs(x), std::fabs(y));
+}
+}  // namespace
+
+std::string CompareSpeciesRecords(const std::string &file, const std::string &input) {
+  const RecordFields a = ParseRecord(file), b = ParseRecord(input);
+  std::ostringstream d;
+  for (const char *k : {"nspecies", "abundance", "column_normalization", "omega_ref"}) {
+    const std::string x = Field(a.head, k), y = Field(b.head, k);
+    if (!SameValue(x, y)) {
+      d << "  " << k << ": restart file " << x << ", input " << y << "\n";
+    }
+  }
+  if (a.sp.size() != b.sp.size()) return d.str();
+  for (std::size_t s=0; s<a.sp.size(); ++s) {
+    const auto &ra = a.sp[s], &rb = b.sp[s];
+    for (std::size_t q=0; q<std::max(ra.size(), rb.size()); ++q) {
+      const std::string k = (q < ra.size()) ? ra[q].first : rb[q].first;
+      const std::string x = Field(ra, k), y = Field(rb, k);
+      if (!SameValue(x, y)) {
+        d << "  species " << (s + 1) << " (species_id " << s << "): " << k << ": restart file " << x
+          << ", input " << y << "\n";
+      }
+    }
+  }
+  return d.str();
+}
+
+double RootPpc(ParameterInput *pin) {
+  if (pin->DoesBlockExist("dust")) {
+    const SpeciesTable &t = Species(pin);
+    if (t.new_init) return static_cast<double>(t.ppc_total);
+  }
+  return pin->GetOrAddReal("particles", "ppc", 1.0);   // legacy and other particle types
 }
 
 const SpeciesTable &Species(ParameterInput *pin) {

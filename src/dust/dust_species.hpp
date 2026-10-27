@@ -54,7 +54,16 @@ struct SpeciesTable {
   std::vector<int> Offsets() const;  // nspecies + 1 cumulative ppc (blocks layout)
   // "key = value" lines of the resolved table (pbin header, logs; prefix e.g. "# ")
   std::string Describe(const std::string &prefix) const;
+  // the restart record species_table: ASCII, values with 17 digits
+  std::string Record() const;
 };
+
+// the differences of two species_table records, one line per quantity ("" if they agree;
+// numbers to a relative 1e-12, the rest exactly)
+std::string CompareSpeciesRecords(const std::string &file, const std::string &input);
+// the root ppc of the run: the sum of ppc_N with the new keys, else <particles>/ppc (default 1,
+// as the particle module reads it)
+double RootPpc(ParameterInput *pin);
 
 // the table of this run (parsed on the first call; the particles' allocation calls it first)
 const SpeciesTable &Species(ParameterInput *pin);

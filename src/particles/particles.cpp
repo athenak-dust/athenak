@@ -32,11 +32,11 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
   }
 
   // read number of particles per cell, and calculate number of particles this pack
-  // Dust API: with <dust>/ppc_N the resolved species table (parsed here, before
-  // the allocation) sets <particles>/ppc to their sum; the dust use of <particles>/ppc alone is
-  // the legacy input (to be deprecated).  Other particle types retain this generic input.
-  if (pin->DoesBlockExist("dust")) (void) dust::Species(pin);
-  Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
+  // Dust API: with <dust>/ppc_N (or ppc_per_species) the resolved species table
+  // (parsed here, before the allocation) gives the total; <particles>/ppc is then not allowed.
+  // The dust use of <particles>/ppc alone is the legacy input (to be
+  // deprecated); other particle types retain this generic input.
+  Real ppc = static_cast<Real>(dust::RootPpc(pin));
 
   // compute number of particles as real number, since ppc can be < 1
   auto &indcs = pmy_pack->pmesh->mb_indcs;

@@ -407,6 +407,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   {
     const SpeciesTable &st = Species(pin);
     nspecies = st.nspecies;
+    species_record = st.Record();
     taus = DualArray1D<Real>("dust_taus", nspecies);
     taus_max = 0.0;
     taus_min = std::numeric_limits<Real>::max();
@@ -1526,7 +1527,7 @@ void DustGasDrag::SetDefaultMasses(ParameterInput *pin) {
   auto &mbsize = pmy_pack->pmb->mb_size;
   bool three_d = pmy_pack->pmesh->three_d;
   Real rho0 = pin->GetOrAddReal("problem","rho0",1.0);
-  Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
+  Real ppc = static_cast<Real>(RootPpc(pin));   // with the new keys the sum of ppc_N
 
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;

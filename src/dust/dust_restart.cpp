@@ -30,7 +30,11 @@
 //! time-mode resampling schedule from the record resample_clk (origin,
 //! interval, next event); a regrid whose resampling has not run yet
 //! from the record regrid_evt.  Records are found by name, so a file written by a code with
-//! more (or fewer) records is still read.
+//! more (or fewer) records is still read.  The record species_table (written since
+//! 2026-10-27) holds the resolved species table of the run as ASCII lines
+//! (SpeciesTable::Record); a restart resolves the table of its input again and stops on any
+//! difference (nspecies, kind of abundance, normalization, Omega, and per species tau_s,
+//! stokes, epsilon / Z, ppc, H_p); a file without the record is read with a note.
 //!
 //! Several MPI ranks: every rank writes one such section with its particles,
 //! one after the other in rank order; "ranks written" in the head of every section is their
@@ -70,6 +74,7 @@
 #include "mesh/meshblock_pack.hpp"
 #include "particles/particles.hpp"
 #include "dust.hpp"
+#include "dust_species.hpp"
 
 namespace dust {
 
@@ -128,6 +133,8 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   const std::int32_t rb[3] = {global_variable::my_rank, pmy_pack->gids, pmy_pack->nmb_thispack};
   PutRecord(b, "rank_blocks", rb, sizeof(rb));
   PutRecord(b, "merge_pass", &pass, sizeof(pass));
+  // the resolved species table (ASCII, dust_species.cpp)
+  PutRecord(b, "species_table", species_record.data(), species_record.size());
   if (!cloud_merge_mroot.empty()) {
     PutRecord(b, "mroot", cloud_merge_mroot.data(), cloud_merge_mroot.size()*sizeof(Real));
   }
@@ -234,6 +241,19 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
       cloud_next_tag_set = (v[0] != 0);
       cloud_next_tag = v[1];
       cloud_tag_floor = v[2];
+    } else if (name == "species_table") {   // the species may not change
+      species_record_found = true;
+      const std::string diff = CompareSpeciesRecords(std::string(d, static_cast<std::size_t>(n)),
+                                                     species_record);
+      if (!diff.empty()) {
+        if (global_variable::my_rank == 0) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << std::endl
+                    << "the dust species of the input differ from those of the restart file "
+                    << "(record species_table); the species cannot change at a "
+                    << "restart:" << std::endl << diff << std::flush;
+        }
+        std::exit(EXIT_FAILURE);
+      }
     } else if (name == "rank_blocks") {
       std::int32_t v[3]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));   // read by the caller
     } else if (name == "merge_pass") {
@@ -328,6 +348,10 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
                 << "and is ignored" << std::endl;
     }
     at += 16 + sizeof(n) + static_cast<std::size_t>(n);
+  }
+  if (!species_record_found && global_variable::my_rank == 0) {
+    std::cout << "# NOTE (dust restart): the file has no record species_table (written before "
+              << "this record existed): the species of the input are not checked against it" << std::endl;
   }
   // a fixed PC2 / split-BE run does not keep the switching metric of the checkpoint
   if (!NeedsHybridMetric()) InvalidateHybridMetric();

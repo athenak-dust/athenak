@@ -226,7 +226,7 @@ void ProblemGenerator::DustyWave(ParameterInput *pin, const bool restart) {
   bool three_d = pmy_mesh_->three_d;
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2, lnx3 = indcs.nx3;
   auto &taus_ = pdust->taus;
-  Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
+  Real ppc = static_cast<Real>(dust::RootPpc(pin));   // new species keys: sum of ppc_N
 
   // copy per-species data into device-usable array:
   // [s][0,1]=Re,Im dv; [s][2,3]=Re,Im xi; [s][4]=mass factor

@@ -1827,7 +1827,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       }
     }
   }
-  Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
+  Real ppc = static_cast<Real>(dust::RootPpc(pin));   // new species keys: sum of ppc_N
   std::uint64_t random_seed = static_cast<std::uint64_t>(
       pin->GetOrAddInteger("problem","random_seed",1));
   auto &taus_ = pmbp->pdust->taus;

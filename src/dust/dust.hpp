@@ -1795,6 +1795,10 @@ class DustGasDrag {
   // a run and cannot be rebuilt from the particles
   void PackRestartState(std::vector<char> &b) const;
   void UnpackRestartState(const char *p, std::size_t nbytes);
+  // the resolved species table of the input (record species_table); a restart
+  // compares the file's record with it and stops on any difference
+  std::string species_record;
+  bool species_record_found = false;
   int SplitAndMergeClouds();   // returns the number of clouds split
   int SwitchCloudsToLeafLevel();   // instant switch; returns the clouds changed
   int SplitCloudsP1();         // moving-particle P1 split

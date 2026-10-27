@@ -211,7 +211,7 @@ void ProblemGenerator::DustDamping(ParameterInput *pin, const bool restart) {
   int nspec = pmbp->pdust->nspecies;
   std::vector<Real> vdh = InitialDustVelocities(pin, nspec);
   bool has_eps = pin->DoesParameterExist("problem","eps_1");
-  Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
+  Real ppc = static_cast<Real>(dust::RootPpc(pin));   // new species keys: sum of ppc_N
   DualArray2D<Real> spdat("dustdamp_spdat",nspec,2);  // [s][0]=vd, [s][1]=mass factor
   for (int s=0; s<nspec; ++s) {
     spdat.h_view(s,0) = vdh[s];
