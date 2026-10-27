@@ -39,6 +39,7 @@ Only some columns can be read: ``pbin.read(path, columns=["x1", "x2", "mass"])``
 """
 
 import os
+import warnings
 
 import numpy as np
 
@@ -347,6 +348,35 @@ class PbinSnapshot:
             owner[hit] = gid_b[pos[hit]]
         return owner
 
+    def outside_boxes(self):
+        """Particles not inside the half-open box [min, max) of any MeshBlock, with no
+        tolerance: (count, largest distance outside the box of the block found for them).
+        Since the routing snap (de08cc3b) the code keeps
+        every particle inside its block's box; older files may hold particles a round-off
+        outside (split children at a face with coordinate 0)."""
+        n = len(self)
+        if n == 0:
+            return 0, 0.0
+        b = self.blocks
+        owner = self.owner_gid()
+        x = self.position
+        nd = self.ndim
+        lo = np.stack([b[f"x{d+1}min"] for d in range(nd)], axis=1)
+        hi = np.stack([b[f"x{d+1}max"] for d in range(nd)], axis=1)
+        g = np.maximum(owner, 0)
+        xin = x[:, :nd]
+        inside = (owner >= 0) & np.all((xin >= lo[g]) & (xin < hi[g]), axis=1)
+        bad = np.nonzero(~inside)[0]
+        dist = 0.0
+        still = []
+        for p in bad:   # a face rounding of the lookup: try every block (few particles)
+            ok = np.all((xin[p] >= lo) & (xin[p] < hi), axis=1)
+            if not ok.any():
+                still.append(p)
+                dpos = np.maximum(np.maximum(lo[g[p]] - xin[p], xin[p] - hi[g[p]]), 0.0)
+                dist = max(dist, float(dpos.max()))
+        return len(still), dist
+
 
 def topology_hash(level, lx1, lx2, lx3):
     """FNV-1a (64 bit) over (level, lx1, lx2, lx3) as little-endian int64 for every block
@@ -427,14 +457,21 @@ def check(snap, raise_on_error=False):
         for d in range(snap.ndim):
             x = c[f"x{d+1}"]
             lo, hi = float(m[f"x{d+1}min"]), float(m[f"x{d+1}max"])
-            # the code may store a position a round-off below a periodic face (e.g. -1e-28
-            # after a merge or resampling at x = 0): tolerate 1e-12 of the domain length
-            tol = 1e-12 * (hi - lo)
-            inside = x.min() >= lo - tol and x.max() < hi + tol
-            if not (np.all(np.isfinite(x)) and inside):
-                problems.append(f"positions outside [x{d+1}min, x{d+1}max)")
-        if np.any(snap.owner_gid() < 0):
-            problems.append("particles in no MeshBlock")
+            if not np.all(np.isfinite(x)):
+                problems.append(f"non-finite positions x{d+1}")
+        # no tolerance (the routing snap keeps every particle in its block's box); files
+        # written before it may hold particles a round-off outside: a warning with the
+        # count and the largest distance up to 1e-12 of the domain length, else a problem
+        nout, dmax = snap.outside_boxes()
+        if nout > 0:
+            lmin = min(float(m[f"x{d+1}max"]) - float(m[f"x{d+1}min"])
+                       for d in range(snap.ndim))
+            msg = (f"{nout} particles outside the half-open box of their MeshBlock, "
+                   f"by at most {dmax:.3e}")
+            if dmax <= 1e-12 * lmin:
+                warnings.warn(msg + " (round-off; written before the routing snap)")
+            else:
+                problems.append(msg)
     if "id" in c and n > 0 and len(np.unique(c["id"])) != n:
         problems.append(f"{n - len(np.unique(c['id']))} duplicate ids")
     if "shape" in c and n > 0:
