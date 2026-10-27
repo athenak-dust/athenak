@@ -5,8 +5,13 @@
 # against the homologous collapse f(t) with the periodic mean (dust_freefall.cpp); at t = 0.98
 # (density x200) the inner shells (q <= 0.25) agree to ~1e-3 and (E - E0)/|W| ~ -0.4%.
 # Runtime: t = 0 -> 0.98, tens of minutes on 32 CPU cores.
+
 <job>
 basename = FF
+
+<output1>
+file_type = phst
+dt = 0.02
 
 <mesh>
 nghost = 4
@@ -15,11 +20,13 @@ x1min = 0.0
 x1max = 1.0
 ix1_bc = periodic
 ox1_bc = periodic
+
 nx2 = 128
 x2min = 0.0
 x2max = 1.0
 ix2_bc = periodic
 ox2_bc = periodic
+
 nx3 = 128
 x3min = 0.0
 x3max = 1.0
@@ -84,7 +91,3 @@ four_pi_G = 1.0
 vertical_bc = periodic
 rtol = 1e-10
 max_iterations = 300
-
-<output1>
-file_type = phst
-dt = 0.02

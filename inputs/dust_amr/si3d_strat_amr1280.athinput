@@ -10,8 +10,31 @@
 # 1280/H run.  Runtime: t = 0 -> 25 orbits (157.08) is ~1e6 cycles, one to two days on four
 # GPUs.
 # Restart with self-gravity: si3d_strat_amr1280_selfgrav_restart.athinput.
+
 <job>
 basename = st
+
+<output1>
+file_type = hst
+dt = 0.05
+data_format = %.17e
+
+<output2>
+file_type = bin
+variable = hydro_w              # adds dust_total_rho and dust_total_mom1..3 automatically
+dt = 2.0
+
+<output3>
+file_type = rst
+dt = 10.0
+
+<output4>
+file_type = phst
+dt = 0.05
+
+<output5>
+file_type = pbin
+dt = 6.283185307179586          # once per orbit
 
 <mesh>
 nghost = 4
@@ -20,11 +43,13 @@ x1min = -0.1
 x1max = 0.1
 ix1_bc = shear_periodic
 ox1_bc = shear_periodic
+
 nx2 = 64
 x2min = -0.1
 x2max = 0.1
 ix2_bc = periodic
 ox2_bc = periodic
+
 nx3 = 128
 x3min = -0.2
 x3max = 0.2
@@ -107,25 +132,3 @@ cloud_root_random = true
 root_placement = random
 random_seed = 3
 dust_moments_hist = true
-
-<output1>
-file_type = hst
-dt = 0.05
-data_format = %.17e
-
-<output2>
-file_type = bin
-variable = hydro_w              # adds dust_total_rho and dust_total_mom1..3 automatically
-dt = 2.0
-
-<output3>
-file_type = rst
-dt = 10.0
-
-<output4>
-file_type = phst
-dt = 0.05
-
-<output5>
-file_type = pbin
-dt = 6.283185307179586          # once per orbit

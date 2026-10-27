@@ -5,8 +5,18 @@
 # Test: the mode's growth rate (jeans_sigma = 9.0356) and the amplitudes of the gas and dust
 # density and velocity (user history) against the linear solution.
 # Runtime: t = 0 -> 0.5, a few minutes on 32 CPU cores.
+
 <job>
 basename = jeans
+
+<output1>
+file_type = hst
+dt = 0.005
+data_format = %.17e
+
+<output2>
+file_type = phst
+dt = 0.05
 
 <mesh>
 nghost = 4
@@ -15,11 +25,13 @@ x1min = 0.0
 x1max = 1.0
 ix1_bc = periodic
 ox1_bc = periodic
+
 nx2 = 32
 x2min = 0.0
 x2max = 0.25
 ix2_bc = periodic
 ox2_bc = periodic
+
 nx3 = 32
 x3min = 0.0
 x3max = 0.25
@@ -87,12 +99,3 @@ jeans_dg = 8.692041727944386e-07
 jeans_ug = 1.2499677718935327e-06
 jeans_dd = 1e-06
 jeans_vd = 1.4380600220486312e-06
-
-<output1>
-file_type = hst
-dt = 0.005
-data_format = %.17e
-
-<output2>
-file_type = phst
-dt = 0.05

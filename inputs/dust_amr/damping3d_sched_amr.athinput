@@ -5,8 +5,28 @@
 # leaves (refinable_mode = careful_merge; no omega0, so G and R run every 50 cycles).
 # Test: the mean dust and gas velocities follow the analytic damping (user history) to round-off
 # through every refinement and coarsening.  Runtime: t = 0 -> 5, about a minute on one CPU core.
+
 <job>
 basename = DT
+
+<output1>
+file_type = hst
+dt = 0.01
+data_format = %.16e
+
+<output2>
+file_type = phst
+dt = 0.05
+
+<output3>
+file_type = pbin
+dt = 1.0
+
+<output4>
+file_type = bin
+variable = hydro_w              # adds dust_total_rho and dust_total_mom1..3 automatically
+precision = double
+dt = 0.5
 
 <mesh>
 nghost = 4
@@ -15,11 +35,13 @@ x1min = 0.0
 x1max = 1.0
 ix1_bc = periodic
 ox1_bc = periodic
+
 nx2 = 8
 x2min = 0.0
 x2max = 0.25
 ix2_bc = periodic
 ox2_bc = periodic
+
 nx3 = 8
 x3min = 0.0
 x3max = 0.25
@@ -117,22 +139,3 @@ dust_test_v0 = 0.5
 cloud_root_random = true
 root_placement = lattice
 random_seed = 2007
-
-<output1>
-file_type = hst
-dt = 0.01
-data_format = %.16e
-
-<output2>
-file_type = phst
-dt = 0.05
-
-<output3>
-file_type = pbin
-dt = 1.0
-
-<output4>
-file_type = bin
-variable = hydro_w              # adds dust_total_rho and dust_total_mom1..3 automatically
-precision = double
-dt = 0.5

@@ -10,8 +10,14 @@
 # prolongation at the level interface (minmod slopes clip the small mode); the optional amplitude-
 # aware limiter <mesh_refinement>/prolong_amplitude_eps = 1e-3 brings it to about -0.23%.
 # Runtime: t = 0 -> 2 pi is ~3.5e5 cycles, about 15 minutes on 4 CPU ranks.
+
 <job>
 basename = LinA
+
+<output1>
+file_type = hst
+data_format = %.17e
+dt = 0.02617993877991494
 
 <mesh>
 nghost = 4
@@ -20,11 +26,13 @@ x1min = 0.0
 x1max = 0.010471975511965976
 ix1_bc = periodic
 ox1_bc = periodic
+
 nx2 = 64
 x2min = 0.0
 x2max = 0.010471975511965976
 ix2_bc = periodic
 ox2_bc = periodic
+
 nx3 = 1
 x3min = -0.5
 x3max = 0.5
@@ -114,8 +122,3 @@ dvpz_im = -1.1666497869340141e-09
 lattice_shift = -0.25
 lattice_shift_z = -0.125
 seed_after_split = true         # seed the mode after the initial split (no t = 0 sawtooth)
-
-<output1>
-file_type = hst
-data_format = %.17e
-dt = 0.02617993877991494

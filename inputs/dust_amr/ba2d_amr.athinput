@@ -7,8 +7,32 @@
 # Test: the cumulative particle-density distribution on t in [300, 600] against a uniform 2048^2
 # reference (pbin / hydro_w outputs).  Runtime: t = 0 -> 600 is about 7 hours on one GPU;
 # shorten tlim for a first look.
+
 <job>
 basename = BA
+
+<output1>
+file_type = hst
+dt = 0.1
+data_format = %.14e
+
+<output2>
+file_type = phst                # particle history (max rho_p, cloud counts, G/R columns)
+dt = 0.1
+
+<output3>
+file_type = bin
+variable = hydro_w              # adds dust_total_rho and dust_total_mom1..3 automatically
+precision = double
+dt = 1.0
+
+<output4>
+file_type = pbin                # every active cloud: position, velocity, mass, level, tag
+dt = 10.0
+
+<output5>
+file_type = rst
+dt = 25.0
 
 <mesh>
 nghost = 4
@@ -17,11 +41,13 @@ x1min = -1.0
 x1max = 1.0
 ix1_bc = periodic
 ox1_bc = periodic
+
 nx2 = 128
 x2min = -1.0
 x2max = 1.0
 ix2_bc = periodic
 ox2_bc = periodic
+
 nx3 = 1
 x3min = -0.5
 x3max = 0.5
@@ -97,26 +123,3 @@ cloud_root_random = true
 root_placement = random
 random_seed = 2007
 check_equilibrium = false
-
-<output1>
-file_type = hst
-dt = 0.1
-data_format = %.14e
-
-<output2>
-file_type = phst                # particle history (max rho_p, cloud counts, G/R columns)
-dt = 0.1
-
-<output3>
-file_type = bin
-variable = hydro_w              # adds dust_total_rho and dust_total_mom1..3 automatically
-precision = double
-dt = 1.0
-
-<output4>
-file_type = pbin                # every active cloud: position, velocity, mass, level, tag
-dt = 10.0
-
-<output5>
-file_type = rst
-dt = 25.0

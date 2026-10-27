@@ -8,6 +8,19 @@
 # 64 / 256 / 5120), the mesh is checked every 50 cycles, and pbin / phst are written more often.
 # Runtime: t = 140 -> 157 (25 orbits) is about a day on four GPUs; the collapse of the densest
 # clumps sets the time step.
+
+<output2>
+dt = 1.0                        # hydro_w (with dust_total)
+
+<output3>
+dt = 2.0                        # rst
+
+<output4>
+dt = 0.02                       # phst
+
+<output5>
+dt = 1.0                        # pbin
+
 <gravity>
 enabled = true
 source = dust
@@ -26,15 +39,3 @@ ncycle_check = 50
 
 <dust>
 amr_rho_refine_levels = 64 256 5120
-
-<output2>
-dt = 1.0                        # hydro_w (with dust_total)
-
-<output3>
-dt = 2.0                        # rst
-
-<output4>
-dt = 0.02                       # phst
-
-<output5>
-dt = 1.0                        # pbin

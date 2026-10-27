@@ -5,8 +5,28 @@
 # Refinable clouds, refinable_mode = default (G and R every 0.25/Omega).
 # Test: the mean drift velocities of gas and dust (user history) stay at the equilibrium values
 # through the refinement and coarsening.  Runtime: t = 0 -> 4, a few minutes on one CPU core.
+
 <job>
 basename = NSH
+
+<output1>
+file_type = hst
+dt = 0.01
+data_format = %.16e
+
+<output2>
+file_type = phst
+dt = 0.05
+
+<output3>
+file_type = bin
+variable = dust_species         # dust_sN_rho and dust_sN_mom1..3 of every species
+precision = double
+dt = 1.0
+
+<output4>
+file_type = pbin
+dt = 1.0
 
 <mesh>
 nghost = 4
@@ -15,11 +35,13 @@ x1min = -0.5
 x1max = 0.5
 ix1_bc = periodic
 ox1_bc = periodic
+
 nx2 = 64
 x2min = -0.5
 x2max = 0.5
 ix2_bc = periodic
 ox2_bc = periodic
+
 nx3 = 1
 x3min = -0.5
 x3max = 0.5
@@ -108,22 +130,3 @@ rho0 = 1.0
 etavk = 0.05
 cloud_root_random = true
 root_placement = lattice
-
-<output1>
-file_type = hst
-dt = 0.01
-data_format = %.16e
-
-<output2>
-file_type = phst
-dt = 0.05
-
-<output3>
-file_type = bin
-variable = dust_species         # dust_sN_rho and dust_sN_mom1..3 of every species
-precision = double
-dt = 1.0
-
-<output4>
-file_type = pbin
-dt = 1.0

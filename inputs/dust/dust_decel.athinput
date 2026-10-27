@@ -17,6 +17,11 @@ problem   = BS10 particle-gas deceleration test
 <job>
 basename  = dust_decel    # problem ID: basename of output filenames
 
+<output1>
+file_type   = hst         # History output
+dcycle      = 1           # every cycle (velocity evolution for the stiff test)
+data_format = %.14e
+
 <mesh>
 nghost    = 2         # Number of ghost cells
 nx1       = 8         # Number of zones in X1-direction
@@ -83,8 +88,3 @@ lattice   = true          # particles at cell centers (exact ODE reference)
 lat_nx1   = 0             # >0 with lattice=false: uniform particle lattice per block
 lat_nx2   = 1             #   (lat_nx1 x lat_nx2 x lat_nx3 nodes; allows e.g. ppc=1.5
 lat_nx3   = 1             #    with uniform spacing via 12 x 8 on an 8x8 block)
-
-<output1>
-file_type   = hst         # History output
-dcycle      = 1           # every cycle (velocity evolution for the stiff test)
-data_format = %.14e

@@ -7,8 +7,13 @@
 # Test: as the uniform runs (freefall_history.jsonl); the Lagrangian radii of the inner shells
 # should follow the 256^3-like accuracy after the refinement.  Runtime: t = 0 -> 0.98, tens of
 # minutes on 32 CPU cores.
+
 <job>
 basename = FF
+
+<output1>
+file_type = phst
+dt = 0.02
 
 <mesh>
 nghost = 4
@@ -17,11 +22,13 @@ x1min = 0.0
 x1max = 1.0
 ix1_bc = periodic
 ox1_bc = periodic
+
 nx2 = 64
 x2min = 0.0
 x2max = 1.0
 ix2_bc = periodic
 ox2_bc = periodic
+
 nx3 = 64
 x3min = 0.0
 x3max = 1.0
@@ -102,7 +109,3 @@ four_pi_G = 1.0
 vertical_bc = periodic
 rtol = 1e-10
 max_iterations = 300
-
-<output1>
-file_type = phst
-dt = 0.02

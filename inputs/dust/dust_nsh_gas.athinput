@@ -8,6 +8,11 @@ problem   = dust-free NSH gas equilibrium
 <job>
 basename  = dust_nsh_gas
 
+<output1>
+file_type   = hst
+dt          = 0.1
+data_format = %.14e
+
 <mesh>
 nghost    = 2
 nx1       = 32
@@ -62,8 +67,3 @@ user_hist        = false
 check_equilibrium = true
 rho0             = 1.0
 etavk            = 0.05
-
-<output1>
-file_type   = hst
-dt          = 0.1
-data_format = %.14e
