@@ -90,10 +90,9 @@ amr_sched2_x2max = 1.0
 amr_sched2_level = 2
 
 <problem>
-pgen_name = dust_nsh
+pgen_name = dusty_wave_amr
 user_hist = true
 rho0 = 1.0
-dust_test = wave
 amp = 1.0e-6
 wave_n = 1
 cloud_root_random = true

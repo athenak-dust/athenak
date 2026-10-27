@@ -4,7 +4,7 @@
 # Refinable dust clouds, refinable_mode = default (G with alpha 0.2 and the leaf-size tolerance,
 # R every 0.25/Omega; no stage X in a 3-D shearing box).  The dust density trigger in code units
 # refines where rho_d >= 64 on the root level and 256 on level 1 (x4 per level), and lets a block
-# coarsen below one third of its refinement threshold.  WENO-Z + HLLC, Li & Youdin (2018)
+# coarsen below one half of its refinement threshold.  WENO-Z + HLLC, Li & Youdin (2018)
 # vertical gas boundaries (<problem>/vertical_bc = li2018), dust leaves through the x3 faces.
 # Test: particle-layer thickness, maximum rho_p and the onset of strong clumping against a uniform
 # 1280/H run.  Runtime: t = 0 -> 25 orbits (157.08) is ~1e6 cycles, one to two days on four
@@ -94,13 +94,12 @@ amr_rho_buffer = 2
 particle_x3_bc = outflow
 
 <problem>
-pgen_name = dust_nsh
+pgen_name = dust_si_strat
 user_hist = true
 check_equilibrium = false
 rho0 = 1.0
 etavk = 0.05
 H_p_1 = 0.025                   # initial particle-layer thickness (H = 1)
-stratified_dust = true
 stratified_dust_sampling = gaussian
 nsh_vertical = true             # NSH drift equilibrium of each height
 vertical_bc = li2018

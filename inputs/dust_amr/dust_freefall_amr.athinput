@@ -89,7 +89,6 @@ eps_1 = 0.1                     # the fixture's own clouds, replaced by the sphe
 cloud_root_random = true
 random_seed = 2007
 root_placement = lattice
-dust_test = damping
 dust_test_v0 = 0.0
 check_equilibrium = false
 

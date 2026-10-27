@@ -57,13 +57,12 @@ cloud_p1_split = true
 cloud_merge = false
 cloud_resample = false
 <problem>
-pgen_name = dust_nsh
+pgen_name = dusty_wave_amr
 user_hist = true
 rho0 = 1
 eps_1 = 1
 cloud_root_random = true
 root_placement = lattice
-dust_test = wave
 amp = 1e-6
 <output1>
 file_type = hst

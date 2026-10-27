@@ -7,9 +7,9 @@ This branch (`amrSG_dev`) extends the dust module of the uniform-mesh dust branc
 - science outputs for the particles (`pbin`, `phst`) and dust mesh fields in the standard binary output,
 - self-gravity of the dust (and, experimentally, of the gas) with a multigrid Poisson solver that works on refined meshes and in the (stratified) shearing box.
 
-The basics of the dust module (particle set-up, `pusher = imex_dust`, the drag couplings `imex` / `pc2`, back-reaction, the NSH and streaming-instability problem generators) are as on the `dust` branch; see its [README](https://github.com/athenak-dust/athenak/blob/dust/README.md) and the companion repository [athenak-dust/athenak_dust_tests](https://github.com/athenak-dust/athenak_dust_tests). The upstream AthenaK README is kept in [doc/README_upstream.md](doc/README_upstream.md); build the code as described there (CMake, Kokkos submodule, `-D PROBLEM=built_in_pgens`, with `-D Athena_ENABLE_MPI=ON` for several ranks).
+The basics of the dust module (particles, `pusher = imex_dust`, the drag couplings `imex` / `pc2`, back-reaction) are as on the `dust` branch; see its [README](https://github.com/athenak-dust/athenak/blob/dust/README.md) and the companion repository [athenak-dust/athenak_dust_tests](https://github.com/athenak-dust/athenak_dust_tests). The upstream AthenaK README is kept in [doc/README_upstream.md](doc/README_upstream.md); build the code as described there (CMake, Kokkos submodule, `-D PROBLEM=built_in_pgens`, with `-D Athena_ENABLE_MPI=ON` for several ranks).
 
-Example inputs for everything below are in [`inputs/dust_amr/`](inputs/dust_amr); each starts with a comment that says what it tests and how long it runs.
+Example inputs for everything below are in [`inputs/dust_amr/`](inputs/dust_amr); each starts with a comment that says what it tests and how long it runs. Every dust problem has its own problem generator (section 3, Problem generators).
 
 ## 1. Dust species and outputs
 
@@ -27,7 +27,7 @@ All in `<dust>` unless noted; species are numbered `N = 1 .. nspecies` (the part
 - `species_distribution = powerlaw`: `tau_s_min`/`tau_s_max` (or `stokes_min`/`stokes_max`) spaced logarithmically, the total `epsilon` or `Z` split as `t_s^mass_slope`, and `ppc_per_species`.
 - `column_normalization` (with `Z_N`): `redraw` (default; the whole column mass is placed inside the box, draws outside are redrawn), `full_profile` (the Gaussian is cut at the box), or `domain` (the dust mass in the box is `Z` times the gas mass in the box).
 - With `ppc_N` the key `<particles>/ppc` must not be given. The resolved species table is printed at start-up and stored in the restart files; a restart with a different table stops.
-- `dust_nsh`, `dusty_wave` and `dust_damping` take the new keys. `streaming_linear`, `dust_freefall`, `dust_jeans` and `dust_snapshot_clump` take only the legacy abundance and sampling keys (the new stopping-time keys work everywhere except in `dust_jeans`).
+- `dust_nsh`, `dust_si_unstrat`, `dust_si_strat`, `dust_damping_amr`, `dusty_wave_amr`, `dusty_wave` and `dust_damping` take the new keys (`Z_N` only `dust_si_strat`). `streaming_linear`, `dust_freefall`, `dust_jeans` and `dust_snapshot_clump` take only the legacy abundance and sampling keys (the new stopping-time keys work everywhere except in `dust_jeans`).
 
 ### Outputs
 
@@ -106,7 +106,7 @@ amr_density_trigger = true
 amr_rho_units = code            # code: rho_d in code units; mean: rho_d / <rho_d> (default)
 amr_rho_refine = 64             # refine a level-0 block where rho_d >= 64 ...
 amr_rho_level_factor = 4        # ... and a level-l block where rho_d >= 64 * 4^l
-amr_rho_derefine = 32                  # a level-l block coarsens below this * 4^(l-1)
+amr_rho_derefine = 32           # a level-l block coarsens below this * 4^(l-1)
 amr_rho_buffer = 2              # cells of the block's level around the dense cells
 # amr_rho_refine_levels = 64 256 5120   # explicit thresholds per level instead of the factor
 ```
@@ -126,7 +126,21 @@ Scheduled refinement (`amr_sched_n = K` and for `k = 1..K`: `amr_schedk_t0`, `_t
 | [`nsh2d_sched_amr`](inputs/dust_amr/nsh2d_sched_amr.athinput) | 2-D three-species NSH drift equilibrium with a refined square switched on and off; `dust_species` output |
 | [`dust_freefall_u128`](inputs/dust_amr/dust_freefall_u128.athinput), [`dust_freefall_amr`](inputs/dust_amr/dust_freefall_amr.athinput), [`dust_jeans_u128`](inputs/dust_amr/dust_jeans_u128.athinput) | self-gravity validation (section 2) |
 
-The problem generators `dust_freefall` and `dust_jeans` are in `src/pgen/dust_amr/`.
+### Problem generators
+
+Every dust problem has its own problem generator (`<problem>/pgen_name`). The pieces they share (species, NSH drift equilibrium, particle placement, history columns, refinement requests) are in [`src/pgen/dust_amr/dust_setup.hpp`](src/pgen/dust_amr/dust_setup.hpp).
+
+| `pgen_name` | Problem | Example |
+| --- | --- | --- |
+| `dust_nsh` | multi-species NSH drift equilibrium in the 2-D r-z or 3-D shearing box, held to round-off (errors in `<basename>-errs.dat`); perturbations for mesh tests: `two_stream_v`, `blob_amp`, `gas_vx_amp`, `dust_ymode_amp` | `nsh2d_sched_amr` |
+| `dust_si_unstrat` | streaming instability in the unstratified shearing box (e.g. run BA): the NSH equilibrium with the dust at random positions | `ba2d_amr` |
+| `dust_si_strat` | streaming instability in the stratified 3-D shearing box: hydrostatic gas, Gaussian dust layers (`H_p_N` or `dust_hp`, `stratified_dust_sampling = gaussian` or `weight`, `dust_zcut`), the NSH drift of every height (`nsh_vertical`), the vertical boundaries of Li et al. (2018) (`vertical_bc = li2018`) | `si3d_strat_amr1280` |
+| `dust_damping_amr` | drag damping of uniform dust moving through gas at rest (`dust_test_v0`), no rotation | `damping3d_sched_amr` |
+| `dusty_wave_amr` | damped dusty sound wave (`amp`, `wave_n`), no rotation | `dustywave2d_sched_amr` |
+| `dust_freefall` | collapse of a cold dust sphere under its own gravity | `dust_freefall_u128`, `dust_freefall_amr` |
+| `dust_jeans` | linear dusty Jeans mode | `dust_jeans_u128` |
+
+`dust_nsh` is in `src/pgen/tests/`, the others in `src/pgen/dust_amr/`. A key that belongs to another of these problem generators (for example `stratified_dust` in `dust_nsh`) stops the run with the name of the right one. On a refined mesh the particles start as root parents: `<problem>/cloud_root_random = true` places `ppc` parents per root cell over the whole box (`root_placement = random`, `lattice` or `generic`), and each parent is split exactly to the leaves it overlaps. On a uniform mesh (or with `amr_pic = owner_overlap`) the same keys give the same parents as point particles, so uniform and refined runs start from the same samples. Without `cloud_root_random` the particles are point particles on a lattice or at random positions (`particle_placement`). The `<problem>/ba_*` keys (2-D) add the field snapshots and the particle density distribution of [`dust_snapshots.cpp`](src/pgen/dust_amr/dust_snapshots.cpp).
 
 ## 4. Tuning parameters
 

@@ -116,9 +116,9 @@ def main():
         assert ratio > 2.5, (key, ratio)
         result[key] = dict(coarse=coarse, half=fine, max_error_ratio=ratio)
     # Root parents keep the representation consistent when only part of the grid refines.
-    # dust_nsh's dust_test=wave provides the independent damped-wave eigenmode history.
+    # dusty_wave_amr provides the independent damped-wave eigenmode history.
     root = ['problem/cloud_root_random=true', 'problem/root_placement=lattice',
-            'problem/dust_test=wave', 'problem/user_hist=true', 'problem/eps_1=1',
+            'problem/user_hist=true', 'problem/eps_1=1',
             'dust/nspecies=1', 'particles/ppc=1', 'dust/taus_1=0.1',
             'mesh/x2min=-0.25', 'mesh/x2max=0.25',
             'mesh/x3min=-0.25', 'mesh/x3max=0.25',

@@ -181,12 +181,13 @@ void ProblemGenerator::DustJeans(ParameterInput *pin,const bool restart) {
   Real error=0,scale=0;
   for (int q=0;q<4;++q) {error=std::max(error,std::abs(lhs[q]-mode.sigma*state[q]));scale=std::max(scale,std::abs(mode.sigma*state[q]));}
   Require(mode.sigma>0 && error<1.e-11*std::max(scale,Real(1.e-30)),"input vector is not the full-SG eigenpair");
-  // DustNSH supplies the common quiet root lattice, physical masses and IPTS.
+  // dust_damping_amr (dust at rest) supplies the common quiet root lattice, physical masses
+  // and IPTS.
   // Imprint the mode BEFORE any representation split, so mixed RC begins from
   // precisely the same physical parent samples as its own coarse uniform run.
   const bool splitting=pack->pdust->cloud_split_enable;
   pack->pdust->cloud_split_enable=false;
-  DustNSH(pin,restart);
+  DustDampingAMR(pin,restart);
   pack->pdust->cloud_split_enable=splitting;
   user_hist_func=JeansHistory;pgen_final_func=JeansFinal;user_work_in_loop_func=nullptr;
   if (restart) return;

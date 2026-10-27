@@ -914,6 +914,14 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     DustDamping(pin, is_restart);
   } else if (pgen_fun_name.compare("dust_nsh") == 0) {
     DustNSH(pin, is_restart);
+  } else if (pgen_fun_name.compare("dust_si_unstrat") == 0) {
+    DustSIUnstrat(pin, is_restart);
+  } else if (pgen_fun_name.compare("dust_si_strat") == 0) {
+    DustSIStrat(pin, is_restart);
+  } else if (pgen_fun_name.compare("dust_damping_amr") == 0) {
+    DustDampingAMR(pin, is_restart);
+  } else if (pgen_fun_name.compare("dusty_wave_amr") == 0) {
+    DustyWaveAMR(pin, is_restart);
   } else if (pgen_fun_name.compare("dust_freefall") == 0) {
     DustFreeFall(pin, is_restart);
   } else if (pgen_fun_name.compare("dust_jeans") == 0) {

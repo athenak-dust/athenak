@@ -136,7 +136,7 @@ void WriteStreamingSnapshot(Mesh *pm) {
 //----------------------------------------------------------------------------------------
 //! \fn SolveNSH2
 //! \brief Single-species NSH drift equilibrium (specialization of the solver in
-//! dust_nsh.cpp): with tau = taus*omega0 dimensionless and kappa2 = 2*(2-q),
+//! dust_setup.cpp): with tau = taus*omega0 dimensionless and kappa2 = 2*(2-q),
 //! the closed-form solution of the 4x4 linear system.
 
 void SolveNSH2(const Real omega0, const Real qshear, const Real ax,

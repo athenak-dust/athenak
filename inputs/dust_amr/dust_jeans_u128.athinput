@@ -77,7 +77,6 @@ user_hist = true
 check_equilibrium = false
 rho0 = 1.0
 eps_1 = 1.0
-dust_test = damping
 dust_test_v0 = 0.0
 cloud_root_random = true
 root_placement = lattice

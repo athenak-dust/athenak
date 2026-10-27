@@ -285,10 +285,10 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
   if (ff.rep < 0 || ff.rep > 4) Fatal("ff_repr_level must be 0..4");
   ff.tff = M_PI*std::sqrt(3.0/(8.0*ff.rho*ff.fourpig));
   if (!(ff.radius > 0 && ff.rho > 0 && ff.dt > 0 && ff.n >= 1)) Fatal("invalid ff_* parameters");
-  {   // the gas is irrelevant (no drag, no gravity): the damping fixture at rest
+  {   // the gas is irrelevant (no drag, no gravity): dust_damping_amr with the dust at rest
     const bool split = pack->pdust->cloud_split_enable;
     pack->pdust->cloud_split_enable = false;
-    DustNSH(pin, restart);
+    DustDampingAMR(pin, restart);
     pack->pdust->cloud_split_enable = split;
   }
   user_work_in_loop_func = Work;

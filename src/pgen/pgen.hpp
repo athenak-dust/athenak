@@ -73,6 +73,10 @@ class ProblemGenerator {
   void Diffusion(ParameterInput *pin, const bool restart);
   void DustDamping(ParameterInput *pin, const bool restart);
   void DustNSH(ParameterInput *pin, const bool restart);
+  void DustSIUnstrat(ParameterInput *pin, const bool restart);
+  void DustSIStrat(ParameterInput *pin, const bool restart);
+  void DustDampingAMR(ParameterInput *pin, const bool restart);
+  void DustyWaveAMR(ParameterInput *pin, const bool restart);
   void DustFreeFall(ParameterInput *pin, const bool restart);
   void DustJeans(ParameterInput *pin, const bool restart);
   void DustyWave(ParameterInput *pin, const bool restart);
