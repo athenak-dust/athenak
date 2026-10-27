@@ -1849,6 +1849,10 @@ class DustGasDrag {
   void CloudPredictor3D(const bool rate_dep);
   void CloudAdvance3D();
   Real CloudImplicitTime3D(Driver *pdrive, int stage) const;
+  // consistent gas / dust split of the lumped IMEX solve's residual (3-D clouds)
+  void CloudImplicitConsistency3D(Driver *pdrive, int stage);
+  bool imex_consistent_gas = true;
+  DvceArray5D<Real> imex_resid;
   // IMEX stages see the gas in its t^n orbital-advection frame (the remap runs at the end
   // of the last stage): a particle at the lab stage position (x, y) meets the gas stored at
   // y + ImplicitShearShift*x (0 outside the 3-D shearing box and for the hybrid paths)

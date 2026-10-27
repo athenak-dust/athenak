@@ -252,6 +252,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // the log and the damping (as Athena-C) on by default, the dt limit left to the user (off)
   stiff_log = pin->GetOrAddBoolean("dust", "stiff_log", true);
   stiff_thresh = pin->GetOrAddReal("dust", "stiff_thresh", -1.0);
+  // The IMEX gas gets the lumped solve's change plus its mass share of the residual (3-D
+  // clouds; false = the gas takes the clouds' whole impulse, as before)
+  imex_consistent_gas = pin->GetOrAddBoolean("dust", "imex_consistent_gas", true);
   pc2_feedback_damping = pin->GetOrAddBoolean("dust", "pc2_feedback_damping", true);
   if (!(hybrid_enter_zeta > hybrid_exit_zeta && hybrid_exit_zeta >= 0.0 &&
         hybrid_enter_chi > hybrid_exit_chi && hybrid_exit_chi >= 0.0)) {

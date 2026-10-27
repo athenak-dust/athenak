@@ -1060,6 +1060,10 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
   auto &u0 = pmy_pack->phydro->u0;
   auto &dmom_ = dmom;
   Real inv_adt = 1.0/((pdrive->a_impl)*(pmy_pack->pmesh->dt));
+  if (clouds3d && imex_consistent_gas) {
+    CloudImplicitConsistency3D(pdrive, stage);
+    return TaskStatus::complete;
+  }
 
   par_for("dust_pmbr",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {

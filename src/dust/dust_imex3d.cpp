@@ -13,6 +13,7 @@
 #include "mesh/mesh.hpp"
 #include "driver/driver.hpp"
 #include "particles/particles.hpp"
+#include "hydro/hydro.hpp"
 #include "dust.hpp"
 
 namespace dust {
@@ -137,6 +138,71 @@ void DustGasDrag::CloudGatherImplicit3D(Driver *pdrive, int stage) {
     CloudParFor("dust_imex_cloud3d_gather", npart, body);
   }
   if (br) HaloReverseAdd(dmom, 0, 3);
+}
+
+
+// The bound-clump NaN: the local implicit solve is lumped, u*_c = (rho u + P)/(rho + Q)
+// per cell, while each cloud couples to several cells (deposit W, gather from neighbouring u*).  Giving
+// the gas the particles' actual impulse D_c (as PMBR alone does) leaves the gas with D_c - G_c, G_c =
+// rho (u*_c - u_c) the lumped change, which the light gas of a dust-dominated cell feels Q/rho times
+// amplified: the gas there ran away to tens of c_s in a collapsing clump (epsilon ~ 2e4).  Here the gas
+// receives G_c plus its mass share rho/(rho + Q) of the residual, and the clouds of the cell take the
+// rest: r_c = (D_c - G_c)/(rho + Q_c), gas += G_c + rho r_c, v_p += c_p sum_c W_cp r_c.  Total momentum
+// is exact; a gas-dominated cell (Q << rho) is unchanged.  dmom becomes the applied gas rate.
+void DustGasDrag::CloudImplicitConsistency3D(Driver *pdrive, int stage) {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int is = indcs.is, ie = indcs.ie, js = indcs.js, je = indcs.je, ks = indcs.ks, ke = indcs.ke;
+  const int nmb1 = pmy_pack->nmb_thispack - 1;
+  auto &u0 = pmy_pack->phydro->u0;
+  const Real a_dt = DragStep(pdrive);
+  const Real inv_adt = 1.0/((pdrive->a_impl)*(pmy_pack->pmesh->dt));
+  if (imex_resid.extent(0) != ustar.extent(0) || imex_resid.extent(2) != ustar.extent(2) ||
+      imex_resid.extent(3) != ustar.extent(3) || imex_resid.extent(4) != ustar.extent(4)) {
+    Kokkos::realloc(imex_resid, ustar.extent(0), 3, ustar.extent(2), ustar.extent(3), ustar.extent(4));
+  }
+  Kokkos::deep_copy(DevExeSpace(), imex_resid, 0.0);
+  auto res = imex_resid;
+  auto us = ustar;
+  auto qp = qdep;
+  auto dm = dmom;
+  par_for("dust_imex_consistent_gas", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
+  KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+    const Real rho = u0(m,IDN,k,j,i);
+    const Real inv = 1.0/(rho + qp(m,0,k,j,i));
+    for (int c=0; c<3; ++c) {
+      const Real g = rho*us(m,c,k,j,i) - u0(m,IM1+c,k,j,i);
+      const Real r = (dm(m,c,k,j,i) - g)*inv;
+      const Real dgas = g + rho*r;
+      u0(m,IM1+c,k,j,i) += dgas;
+      dm(m,c,k,j,i) = dgas*inv_adt;
+      res(m,c,k,j,i) = r;
+    }
+  });
+  // the residual velocity of each cell back to its clouds, with the deposit's weights and frame
+  auto pr = pmy_pack->ppart->prtcl_rdata;
+  auto pi = pmy_pack->ppart->prtcl_idata;
+  const int npart = pmy_pack->ppart->nprtcl_thispack;
+  const Real sh = ImplicitShearShift(pdrive, stage);
+  UpdateShear3D(pmy_pack->pmesh->time);
+  PackGatherField3D(imex_resid);   // owners' values on the halo blocks
+  const auto lt = leaf_traversal3d;
+  auto gp = gpack3;
+  auto body = KOKKOS_LAMBDA(const int p) {
+    if (pr(IPM,p) <= 0.0) return;
+    Real rv[3] = {0.0, 0.0, 0.0};
+    lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p) + sh*pr(IPX,p), pr(IPZ,p), pi(PLEV,p),
+                          lt.Anchor(pi(PGID,p)),
+    [&](const int target, const Real w) {
+      int b, k, j, i;
+      lt.Decode(target, b, k, j, i);
+      for (int c=0; c<3; ++c) rv[c] += w*gp(b,k,j,i,c);
+    });
+    const Real cj = a_dt/(pr(IPTS,p) + a_dt);
+    pr(IPVX,p) += cj*rv[0]; pr(IPVY,p) += cj*rv[1]; pr(IPVZ,p) += cj*rv[2];
+    // the drag rate of this stage (consumed by the next working stage) includes the correction
+    pr(IPRX,p) += cj*rv[0]/a_dt; pr(IPRY,p) += cj*rv[1]/a_dt; pr(IPRZ,p) += cj*rv[2]/a_dt;
+  };
+  CloudParFor("dust_imex_consistent_dust", npart, body);
 }
 
 }  // namespace dust
