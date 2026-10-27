@@ -390,15 +390,17 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
     }
   };
   const int big = 1 << 20;
-  int nraise = 0, nkeep = 0, nveto = 0, rounds = 0;
-  for (int changed = 1; changed && rounds < 32; ++rounds) {
-    changed = 0;
-    std::vector<int> tmax(2*nzf, -1);   // [face][z]: largest target level on the face
+  // the density trigger's flags of this rank's blocks; refinements forbidden for this regrid
+  std::vector<int> orig(nmb), forbid(nmb, 0);
+  for (int m=0; m<nmb; ++m) orig[m] = refine_flag.h_view(m + mbs);
+  auto targets = [&](bool current) {   // [face][z]: largest target (or current) level on the face
+    std::vector<int> tmax(2*nzf, -1);
     for (int m=0; m<nmb; ++m) {
       const auto &sz = mbsz.h_view(m);
       const int f = face(sz);
       if (f < 0) continue;
-      const int t = pm->lloc_eachmb[m + mbs].level - pm->root_level + std::max(0, refine_flag.h_view(m + mbs));
+      const int t = pm->lloc_eachmb[m + mbs].level - pm->root_level +
+                    (current ? 0 : std::max(0, refine_flag.h_view(m + mbs)));
       int k0, k1; zrange(sz, k0, k1);
       for (int k=k0; k<k1; ++k) tmax[f*nzf + k] = std::max(tmax[f*nzf + k], t);
     }
@@ -407,25 +409,63 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
       MPI_Allreduce(MPI_IN_PLACE, tmax.data(), 2*nzf, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     }
 #endif
-    std::vector<int> cap(2*nzf, big);   // [face][z]: cancel refinements above this target
+    return tmax;
+  };
+  auto any = [](int v) {
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) MPI_Allreduce(MPI_IN_PLACE, &v, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+#endif
+    return v;
+  };
+  // Each round: the trigger's flags without the forbidden refinements, then raise face blocks (or
+  // keep them from derefining) until nothing changes (monotone up); where one level up cannot
+  // satisfy the opposite face, forbid the opposite refinements that cause it (monotone: the set
+  // only grows) and start the round again.  A block whose current level already violates the limit
+  // (an invalid starting mesh, or a 16^3 run prepared for 8x16x8 with amr_shear_face_dmax) is
+  // repaired: raised one level per regrid even if that is not yet enough, and nothing is
+  // forbidden for it (forbidding there could block the repair for good).
+  const auto tcur = targets(true);
+  int rounds = 0;
+  for (bool again = true; again && rounds < 64; ++rounds) {
+    for (int m=0; m<nmb; ++m) refine_flag.h_view(m + mbs) = (forbid[m] && orig[m] > 0) ? 0 : orig[m];
+    for (int up = 1; up; ) {
+      const auto tmax = targets(false);
+      up = 0;
+      for (int m=0; m<nmb; ++m) {
+        const auto &sz = mbsz.h_view(m);
+        const int f = face(sz);
+        if (f < 0) continue;
+        int k0, k1; zrange(sz, k0, k1);
+        auto other_at = [&](int lev) {
+          int o = -1;
+          slots(k0, k1, lev, [&](int k) {o = std::max(o, tmax[(1 - f)*nzf + k]);});
+          return o;
+        };
+        const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
+        int ocur = -1;
+        slots(k0, k1, l, [&](int k) {ocur = std::max(ocur, tcur[(1 - f)*nzf + k]);});
+        const bool repair = omax(l) < ocur;
+        int &flag = refine_flag.h_view(m + mbs);
+        if (flag < 0 && omax(l - 1) < other_at(l - 1)) {flag = 0; up = 1;}
+        if (flag <= 0 && !forbid[m] && l < lmax && omax(l) < other_at(l) &&
+            (repair || omax(l + 1) >= other_at(l + 1))) {flag = 1; up = 1;}
+      }
+      up = any(up);
+    }
+    const auto tmax = targets(false);
+    std::vector<int> cap(2*nzf, big);   // [face][z]: refinements above this target are forbidden
     for (int m=0; m<nmb; ++m) {
       const auto &sz = mbsz.h_view(m);
       const int f = face(sz);
       if (f < 0) continue;
       int k0, k1; zrange(sz, k0, k1);
-      auto other_at = [&](int lev) {
-        int o = -1;
-        slots(k0, k1, lev, [&](int k) {o = std::max(o, tmax[(1 - f)*nzf + k]);});
-        return o;
-      };
+      const int t = pm->lloc_eachmb[m + mbs].level - pm->root_level +
+                    std::max(0, refine_flag.h_view(m + mbs));
       const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
-      int &flag = refine_flag.h_view(m + mbs);
-      if (flag < 0 && omax(l - 1) < other_at(l - 1)) {flag = 0; --nder; ++nkeep; changed = 1;}
-      int t = l + std::max(0, flag);
-      if (omax(t) < other_at(t) && flag <= 0 && l < lmax && omax(l + 1) >= other_at(l + 1)) {
-        flag = 1; ++nref; ++nraise; changed = 1; t = l + 1;
-      }
-      if (omax(t) < other_at(t)) {
+      int o = -1, ocur = -1;
+      slots(k0, k1, t, [&](int k) {o = std::max(o, tmax[(1 - f)*nzf + k]);});
+      slots(k0, k1, l, [&](int k) {ocur = std::max(ocur, tcur[(1 - f)*nzf + k]);});
+      if (omax(t) < o && !(omax(l) < ocur)) {
         const int c = omax(t);
         slots(k0, k1, t, [&](int k) {cap[(1 - f)*nzf + k] = std::min(cap[(1 - f)*nzf + k], c);});
       }
@@ -435,24 +475,26 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
       MPI_Allreduce(MPI_IN_PLACE, cap.data(), 2*nzf, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     }
 #endif
+    int grow = 0;
     for (int m=0; m<nmb; ++m) {
       const auto &sz = mbsz.h_view(m);
       const int f = face(sz);
-      if (f < 0) continue;
-      int &flag = refine_flag.h_view(m + mbs);
-      if (flag <= 0) continue;
+      if (f < 0 || forbid[m] || refine_flag.h_view(m + mbs) <= 0) continue;
       int k0, k1; zrange(sz, k0, k1);
       int c = big;
       for (int k=k0; k<k1; ++k) c = std::min(c, cap[f*nzf + k]);
-      if (pm->lloc_eachmb[m + mbs].level - pm->root_level + 1 > c) {
-        flag = 0; --nref; ++nveto; changed = 1;
-      }
+      if (pm->lloc_eachmb[m + mbs].level - pm->root_level + 1 > c) {forbid[m] = 1; grow = 1;}
     }
-#if MPI_PARALLEL_ENABLED
-    if (global_variable::nranks > 1) {
-      MPI_Allreduce(MPI_IN_PLACE, &changed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    }
-#endif
+    again = any(grow) != 0;
+  }
+  int nraise = 0, nkeep = 0, nveto = 0;
+  for (int m=0; m<nmb; ++m) {
+    const int f0 = orig[m], f1 = refine_flag.h_view(m + mbs);
+    if (f0 == f1) continue;
+    if (f0 > 0) {--nref; ++nveto;}
+    if (f0 < 0) {--nder; if (f1 == 0) ++nkeep;}
+    if (f1 > 0) {++nref; ++nraise;}
+    if (f1 < 0) ++nder;
   }
   int cnt[3] = {nraise, nkeep, nveto};
 #if MPI_PARALLEL_ENABLED
@@ -462,7 +504,7 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
     std::cout << "# dust density trigger: shear-periodic x1 face levels (dmax " << dmax
               << (two_to_one ? ", 2:1" : "") << "): " << cnt[0] << " blocks refined, " << cnt[1]
               << " kept from derefining, " << cnt[2] << " refinements cancelled (" << rounds
-              << " rounds)" << std::endl;
+              << (rounds >= 64 ? " rounds, limit reached" : " rounds") << ")" << std::endl;
   }
 }
 
