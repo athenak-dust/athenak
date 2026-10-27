@@ -39,6 +39,7 @@
 #include <cmath>
 #include <complex>
 #include <iomanip>
+#include <sstream>
 #include <cstdint>
 #include <cstdio>     // fopen(), fprintf()
 #include <unistd.h>   // truncate()
@@ -1883,17 +1884,21 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       });
     }
     if (global_variable::my_rank == 0) {
-      std::cout << std::setprecision(10) << "# dust species masses"
-                << (strat_setup ? ", stratified" : "") << ":" << std::endl;
+      std::ostringstream o;
+      o << std::setprecision(17) << "# dust species masses"
+        << (strat_setup ? ", stratified" : "") << ":\n";
       for (int sp=0; sp<nspec; ++sp) {
-        std::cout << "#   species " << sp + 1 << ": " << spt->abundance << " = " << spt->value[sp];
+        o << "#   species " << sp + 1 << ": " << spt->abundance << " = " << spt->value[sp];
         if (strat_setup) {
-          std::cout << ", H_p = " << hps[sp] << ", midplane epsilon0 = " << eps[sp]
-                    << ", fraction of the profile in the sampling range " << finside[sp];
+          o << ", H_p = " << hps[sp] << ", midplane epsilon0 = " << eps[sp]
+            << ", fraction of the profile in the sampling range " << finside[sp];
         }
-        std::cout << ", target mass " << tgt[sp] << ", particle mass " << act[sp]
-                  << ((domain && allow_rescale) ? " (scaled to the target)" : "") << std::endl;
+        o << ", target mass " << tgt[sp] << ", particle mass " << act[sp] << ", rel_error "
+          << std::setprecision(3) << ((tgt[sp] > 0.0) ? act[sp]/tgt[sp] - 1.0 : 0.0)
+          << std::setprecision(17)
+          << ((domain && allow_rescale) ? " (before the scaling to the target)" : "") << "\n";
       }
+      std::cout << o.str() << std::flush;
     }
   };
 
