@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <limits>
 
 #include "athena.hpp"
 #include "io_wrapper.hpp"
@@ -627,4 +628,27 @@ IOWrapperSizeT IOWrapper::GetPosition(bool single_file_per_rank) {
   int64_t pos = ftell(fh_);
   return pos;
 #endif
+}
+
+// File extent without changing the stream position. Used to bound native restart
+// extension offsets before allocating buffers or passing counts to MPI-IO.
+IOWrapperSizeT IOWrapper::GetSize(bool single_file_per_rank) {
+#if MPI_PARALLEL_ENABLED
+  if (!single_file_per_rank) {
+    MPI_Offset size = -1;
+    if (MPI_File_get_size(fh_, &size) != MPI_SUCCESS || size < 0) {
+      MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+      std::exit(EXIT_FAILURE);
+    }
+    return static_cast<IOWrapperSizeT>(size);
+  }
+  FILE *stream = reinterpret_cast<FILE*>(fh_);
+#else
+  FILE *stream = fh_;
+#endif
+  const auto position = ftello(stream);
+  if (position < 0 || fseeko(stream, 0, SEEK_END) != 0) std::exit(EXIT_FAILURE);
+  const auto size = ftello(stream);
+  if (size < 0 || fseeko(stream, position, SEEK_SET) != 0) std::exit(EXIT_FAILURE);
+  return static_cast<IOWrapperSizeT>(size);
 }

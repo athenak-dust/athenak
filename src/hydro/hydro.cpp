@@ -80,6 +80,15 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     pvisc = nullptr;
   }
 
+  // amplitude-aware ghost prolongation: isothermal hydro only
+  if (ppack->pmesh->pmr != nullptr && ppack->pmesh->pmr->prolong_amp_eps > 0.0 &&
+      peos->eos_data.is_ideal) {
+    std::cout << "### FATAL ERROR in "<< __FILE__ <<" at line " << __LINE__ << std::endl
+              << "<mesh_refinement>/prolong_amplitude_eps requires an isothermal EOS"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
   // Thermal conduction (if requested in input file)
   if (pin->DoesParameterExist("hydro","alpha_iso") ||
       pin->DoesParameterExist("hydro","alpha_aniso") ||
@@ -134,6 +143,29 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   if (pin->DoesBlockExist("shearing_box")) {
     porb_u = new OrbitalAdvectionCC(ppack, pin, (nhydro+nscalars));
     psbox_u = new ShearingBoxCC(ppack, pin, (nhydro+nscalars));
+    // with mesh refinement in 3-D the coarse arrays are sheared too
+    // (fine x1-face blocks with a coarser partner across the boundary prolongate from them)
+    if (ppack->pmesh->multilevel && ppack->pmesh->three_d &&
+        ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
+      psbox_u->coarse_on = true;
+      psbox_u->AllocateBuffers();
+    }
+    // and no flux correction across the shear-periodic x1 boundaries
+    if (ppack->pmesh->multilevel && ppack->pmesh->three_d &&
+        ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
+      pbval_u->skip_shear_x1_flux = true;
+    }
+    // collected ghost zones: AthenaK's prolongation and restriction stay out of the
+    // slots across the shear-periodic faces
+    if (psbox_u->face_levels) pbval_u->skip_shear_x1_prol = true;
+    // matching of the x1 fluxes across the shear-periodic boundary;
+    // default on with mesh refinement (the face columns can differ in level), off on a uniform
+    // mesh (the results there stay those of AthenaK; true makes it conservative too)
+    if (ppack->pmesh->three_d &&
+        ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
+      psbox_u->flux_on = pin->GetOrAddBoolean("shearing_box", "flux_correct",
+                                              ppack->pmesh->multilevel);
+    }
   } else {
     porb_u = nullptr;
     psbox_u = nullptr;
@@ -143,6 +175,9 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   if (evolution_t.compare("stationary") != 0) {
     // determine if FOFC is enabled
     use_fofc = pin->GetOrAddBoolean("hydro","fofc",false);
+    // default: on for device builds (the device memory is not host accessible)
+    x2_face_parallel = pin->GetOrAddBoolean("hydro","x2_face_parallel",
+        !Kokkos::SpaceAccessibility<Kokkos::HostSpace, DevMemSpace>::accessible);
 
     // select reconstruction method (default PLM)
     std::string xorder = pin->GetOrAddString("hydro","reconstruct","plm");
@@ -244,14 +279,9 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
         rsolver_method = Hydro_RSolver::hlle;
       // HLLC solver
       } else if (rsolver.compare("hllc") == 0) {
-        if (peos->eos_data.is_ideal) {
-          rsolver_method = Hydro_RSolver::hllc;
-        } else {
-          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                    << std::endl << "<hydro>/rsolver = hllc cannot be used with "
-                    << "isothermal EOS" << std::endl;
-          std::exit(EXIT_FAILURE);
-        }
+        // ideal gas: HLLC of Toro et al.; isothermal: HLLC_Isothermal (B = 0 limit of
+        // the isothermal HLLD of Mignone 2007), see rsolvers/hllc_hyd.hpp
+        rsolver_method = Hydro_RSolver::hllc;
       // Roe solver
       } else if (rsolver.compare("roe") == 0) {
         rsolver_method = Hydro_RSolver::roe;
@@ -287,6 +317,10 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
       Kokkos::realloc(uflx.x1f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
       Kokkos::realloc(uflx.x2f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
       Kokkos::realloc(uflx.x3f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
+#ifdef ATHENAK_HYDRO_FLUX_PROBE
+      probe_ncycle = pin->GetOrAddInteger("hydro", "probe_ncycle", 0);
+      Kokkos::realloc(probe, 6, ncells1);
+#endif
 
       // allocate array of flags used with FOFC
       if (use_fofc) {

@@ -20,6 +20,7 @@
 #include "mesh/mesh.hpp"
 #include "particles/particles.hpp"
 #include "bvals.hpp"
+#include "dust/dust.hpp"
 
 namespace particles {
 //----------------------------------------------------------------------------------------
@@ -94,9 +95,45 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
   // accessing the sendlist member through `this`) leaves a host pointer in a CUDA
   // lambda and fails as soon as an inter-rank particle is appended or packed.
   auto psendl = sendlist.d_view;
+  // the physical x3 faces: reflect or outflow (see bvals.hpp)
+  const int x3bc = x3bc_dust;
+  constexpr int kLobe3Shift = SMRCompositeTransfer::kCloudLobeShift3;   // dust.hpp
+  auto x3rem = x3_removed.d_view;
+  const Real z3a = meshsize.x3min, z3b = meshsize.x3max;
   par_for("part_update",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     int mylevel = mblev.d_view(m);
+    if (x3bc != 0 && (pr(IPZ,p) < z3a || pr(IPZ,p) >= z3b)) {
+      const bool lo = (pr(IPZ,p) < z3a);
+      if (x3bc == 1) {   // reflect: mirror the position (and the RK register) and the velocity
+        const Real zf = lo ? z3a : z3b;
+        Real z = 2.0*zf - pr(IPZ,p);
+        if (z >= z3b) z = z3b - 1.0e-12*(z3b - z3a);
+        if (z < z3a) z = z3a;
+        pr(IPZ,p) = z;
+        pr(IPVZ,p) = -pr(IPVZ,p);
+        if (has_reg) {
+          pr(IPZ1,p) = 2.0*zf - pr(IPZ1,p); pr(IPVZ1,p) = -pr(IPVZ1,p);
+          // a refinable cloud's x3 lobe mirrors too: lobe 1 <-> 2 (bits
+          // 9-10 of PLEV, dust::SMRCompositeTransfer::kCloudLobeShift3; 0 and 3 are symmetric;
+          // point particles have no lobe bits)
+          const int l3 = (pi(PLEV,p) >> kLobe3Shift) & 3;
+          if (l3 == 1 || l3 == 2) pi(PLEV,p) ^= (3 << kLobe3Shift);
+        }
+      } else {           // outflow: record the mass, park the (now massless) particle at rest
+        Kokkos::atomic_add(&x3rem(0), pr(IPM,p));
+        Kokkos::atomic_add(&x3rem(1), 1.0);
+        pr(IPM,p) = 0.0;
+        const Real dz = mbsize.d_view(m).dx3;
+        const Real z = lo ? (mbsize.d_view(m).x3min + 0.5*dz) : (mbsize.d_view(m).x3max - 0.5*dz);
+        pr(IPZ,p) = z;
+        pr(IPVX,p) = 0.0; pr(IPVY,p) = 0.0; pr(IPVZ,p) = 0.0;
+        if (has_reg) {
+          pr(IPX1,p) = pr(IPX,p); pr(IPY1,p) = pr(IPY,p); pr(IPZ1,p) = z;
+          pr(IPVX1,p) = 0.0; pr(IPVY1,p) = 0.0; pr(IPVZ1,p) = 0.0;
+        }
+      }
+    }
     Real x1 = pr(IPX,p);
     Real x2 = pr(IPY,p);
     Real x3 = pr(IPZ,p);
@@ -111,6 +148,30 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
     int iy = static_cast<int>((x2 - mbsize.d_view(m).x2min + ly)/ly) - 1;
     int iz = static_cast<int>((x3 - mbsize.d_view(m).x3min + lz)/lz) - 1;
 
+    // A particle the offset test keeps in its block (offset 0) may
+    // still lie outside the block's half-open box by round-off: just below a face at coordinate 0
+    // (|x| far below the precision of x - xmin + l), or at xmax after a rounded x - xmin.  Put it
+    // onto the box (the largest value below xmax at the upper face), so that every particle lies
+    // in [xmin, xmax) of its block; the RK register moves with the position.
+    auto snap = [&](const int off, Real &x, const Real xa, const Real xb, const int ip,
+                    const int ir) {
+      if (off != 0) return;
+      Real xs = x;
+      if (x < xa) {
+        xs = xa;
+      } else if (x >= xb) {
+        xs = Kokkos::nextafter(xb, xa);
+      }
+      if (xs != x) {
+        if (has_reg) {pr(ir,p) += xs - x;}
+        pr(ip,p) = xs;
+        x = xs;
+      }
+    };
+    snap(ix, x1, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, IPX, IPX1);
+    if (multi_d) {snap(iy, x2, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, IPY, IPY1);}
+    if (three_d) {snap(iz, x3, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, IPZ, IPZ1);}
+
     // sublock indices for faces and edges with S/AMR
     int fx = (x1 < 0.5*(mbsize.d_view(m).x1min + mbsize.d_view(m).x1max))? 0 : 1;
     int fy = (x2 < 0.5*(mbsize.d_view(m).x2min + mbsize.d_view(m).x2max))? 0 : 1;
@@ -118,10 +179,32 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
     fy = multi_d ? fy : 0;
     fz = three_d ? fz : 0;
 
+    // a particle moves less than one cell per step, so it can only have left for an adjacent
+    // MeshBlock; anything else means it was routed to a wrong MeshBlock before
+    if (abs(ix) > 1 || abs(iy) > 1 || abs(iz) > 1) {
+      Kokkos::printf("Particle routing: p=%d gid=%d x=(%.8e %.8e %.8e) lies more than one "
+                     "MeshBlock away from its MeshBlock x1=[%.6e,%.6e] x2=[%.6e,%.6e] "
+                     "x3=[%.6e,%.6e]\n", p, pi(PGID,p), x1, x2, x3, mbsize.d_view(m).x1min,
+                     mbsize.d_view(m).x1max, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max,
+                     mbsize.d_view(m).x3min, mbsize.d_view(m).x3max);
+      Kokkos::abort("particle outside the MeshBlocks adjacent to its own");
+    }
+
     // only update particle GID if it has crossed MeshBlock boundary
     if ((abs(ix) + abs(iy) + abs(iz)) != 0) {
-      bool cross_in  = shear_x1 && (x1 < meshsize.x1min);
-      bool cross_out = shear_x1 && (x1 > meshsize.x1max);
+      // The particle crossed a Mesh boundary when its block offset points out of
+      // the Mesh (a block on that edge), the same rounding as the destination block above.  A
+      // position test (x < xmin) disagrees with it within round-off of the boundary: a particle
+      // at y = -1e-18 has iy = 0 (it stays in its row), but crossing in x only it was wrapped to
+      // y = ymax while routed to the neighbor in its own row (the next step then aborted)
+      const bool lo1 = (ix < 0) && (mbsize.d_view(m).x1min < meshsize.x1min + 0.5*lx);
+      const bool hi1 = (ix > 0) && (mbsize.d_view(m).x1max > meshsize.x1max - 0.5*lx);
+      const bool lo2 = (iy < 0) && (mbsize.d_view(m).x2min < meshsize.x2min + 0.5*ly);
+      const bool hi2 = (iy > 0) && (mbsize.d_view(m).x2max > meshsize.x2max - 0.5*ly);
+      const bool lo3 = (iz < 0) && (mbsize.d_view(m).x3min < meshsize.x3min + 0.5*lz);
+      const bool hi3 = (iz > 0) && (mbsize.d_view(m).x3max > meshsize.x3max - 0.5*lz);
+      bool cross_in  = shear_x1 && lo1;
+      bool cross_out = shear_x1 && hi1;
       if (cross_in || cross_out) {
         // shear-periodic radial crossing: wrap x, shift y azimuthally by the (folded)
         // shear offset with no velocity change (velocities are shear-relative), wrap
@@ -138,10 +221,10 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
         pr(IPY,p) = ynew;
         if (has_reg) {pr(IPY1,p) += dy;}
         Real lzm = (meshsize.x3max - meshsize.x3min);
-        if (x3 < meshsize.x3min) {
+        if (lo3) {
           pr(IPZ,p) += lzm;
           if (has_reg) {pr(IPZ1,p) += lzm;}
-        } else if (x3 > meshsize.x3max) {
+        } else if (hi3) {
           pr(IPZ,p) -= lzm;
           if (has_reg) {pr(IPZ1,p) -= lzm;}
         }
@@ -162,87 +245,121 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
         nb.dest = 0;
         UpdateGID(pi(PGID,p), nb, myrank, pcounter, psendl, p);
       } else {
+      // first non-empty slot of direction (jx,jy,jz) from slot k on; the search stays among the
+      // subslots of that direction (faces 4, edges 2, corners 1) and returns -1 if all are empty
+      auto filled = [&](int jx, int jy, int jz, int k) {
+        int nd = abs(jx) + abs(jy) + abs(jz);
+        int end = NeighborIndex(jx,jy,jz,0,0) + ((nd == 1) ? 4 : ((nd == 2) ? 2 : 1));
+        for (; k < end; ++k) {
+          if (nghbr.d_view(m,k).gid >= 0) {return k;}
+        }
+        return -1;
+      };
+      // An empty edge or corner slot: the region is covered by a coarser MeshBlock
+      // that is stored only once, under the lower-dimensional direction from which it is
+      // reached (e.g. the x1 face neighbour also covers the x1x2 edge when the x2 crossing
+      // stays inside this MeshBlock's parent).  That direction keeps the components of the
+      // crossing that leave the parent; the parity of the logical location tells which half
+      // of its parent this MeshBlock is.
+      auto coarse_cover = [&](int jx, int jy, int jz) {
+        int l1 = static_cast<int>(floor((mbsize.d_view(m).x1min - meshsize.x1min)/lx + 0.5));
+        int l2 = static_cast<int>(floor((mbsize.d_view(m).x2min - meshsize.x2min)/ly + 0.5));
+        int l3 = static_cast<int>(floor((mbsize.d_view(m).x3min - meshsize.x3min)/lz + 0.5));
+        int kx = (jx == 0 || ((l1 & 1) == ((jx > 0) ? 1 : 0))) ? jx : 0;
+        int ky = (jy == 0 || ((l2 & 1) == ((jy > 0) ? 1 : 0))) ? jy : 0;
+        int kz = (jz == 0 || ((l3 & 1) == ((jz > 0) ? 1 : 0))) ? jz : 0;
+        if ((abs(kx) + abs(ky) + abs(kz)) == 0 || (kx == jx && ky == jy && kz == jz)) {
+          return -1;
+        }
+        return filled(kx, ky, kz, NeighborIndex(kx,ky,kz,0,0));
+      };
+      int indx = -1;
       if (iz == 0) {
         if (iy == 0) {
           // x1 face
-          int indx = NeighborIndex(ix,0,0,0,0);           // neighbor at same level
+          indx = NeighborIndex(ix,0,0,0,0);               // neighbor at same level
           if (nghbr.d_view(m,indx).lev > mylevel) {       // neighbor at finer level
             indx = NeighborIndex(ix,0,0,fy,fz);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}  // neighbor at coarser level
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(ix,0,0,indx);                     // neighbor at coarser level
         } else if (ix == 0) {
           // x2 face
-          int indx = NeighborIndex(0,iy,0,0,0);
+          indx = NeighborIndex(0,iy,0,0,0);
           if (nghbr.d_view(m,indx).lev > mylevel) {
             indx = NeighborIndex(0,iy,0,fx,fz);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(0,iy,0,indx);
         } else {
           // x1x2 edge
-          int indx = NeighborIndex(ix,iy,0,0,0);
+          indx = NeighborIndex(ix,iy,0,0,0);
           if (nghbr.d_view(m,indx).lev > mylevel) {
             indx = NeighborIndex(ix,iy,0,fz,0);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(ix,iy,0,indx);
+          if (indx < 0) {indx = coarse_cover(ix,iy,0);}
         }
       } else if (iy == 0) {
         if (ix == 0) {
           // x3 face
-          int indx = NeighborIndex(0,0,iz,0,0);
+          indx = NeighborIndex(0,0,iz,0,0);
           if (nghbr.d_view(m,indx).lev > mylevel) {
             indx = NeighborIndex(0,0,iz,fx,fy);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(0,0,iz,indx);
         } else {
           // x3x1 edge
-          int indx = NeighborIndex(ix,0,iz,0,0);
+          indx = NeighborIndex(ix,0,iz,0,0);
           if (nghbr.d_view(m,indx).lev > mylevel) {
             indx = NeighborIndex(ix,0,iz,fy,0);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(ix,0,iz,indx);
+          if (indx < 0) {indx = coarse_cover(ix,0,iz);}
         }
       } else {
         if (ix == 0) {
           // x2x3 edge
-          int indx = NeighborIndex(0,iy,iz,0,0);
+          indx = NeighborIndex(0,iy,iz,0,0);
           if (nghbr.d_view(m,indx).lev > mylevel) {
             indx = NeighborIndex(0,iy,iz,fx,0);
           }
-          while (nghbr.d_view(m,indx).gid < 0) {indx++;}
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(0,iy,iz,indx);
+          if (indx < 0) {indx = coarse_cover(0,iy,iz);}
         } else {
           // corners
-          int indx = NeighborIndex(ix,iy,iz,0,0);
-          UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
+          indx = filled(ix,iy,iz,NeighborIndex(ix,iy,iz,0,0));
+          if (indx < 0) {indx = coarse_cover(ix,iy,iz);}
         }
       }
+      if (indx < 0) {
+        Kokkos::printf("Particle routing: p=%d gid=%d x=(%.8e %.8e %.8e) crossed in direction "
+                       "(%d %d %d) and no neighbor MeshBlock covers it\n", p, pi(PGID,p),
+                       x1, x2, x3, ix, iy, iz);
+        Kokkos::abort("no neighbor MeshBlock for a particle");
+      }
+      UpdateGID(pi(PGID,p), nghbr.d_view(m,indx), myrank, pcounter, psendl, p);
 
-      // reset x,y,z positions if particle crosses Mesh boundary using periodic BCs
+      // reset x,y,z positions if particle crosses Mesh boundary using periodic BCs (decided by
+      // the block offsets, lo1/hi1 etc. above, as the destination block)
       // RK position registers must be shifted with the position so the low-storage
       // combination (gam0*x + gam1*x1) stays in a single periodic image
-      if (x1 < meshsize.x1min) {
+      if (lo1) {
         pr(IPX,p) += (meshsize.x1max - meshsize.x1min);
         if (has_reg) {pr(IPX1,p) += (meshsize.x1max - meshsize.x1min);}
-      } else if (x1 > meshsize.x1max) {
+      } else if (hi1) {
         pr(IPX,p) -= (meshsize.x1max - meshsize.x1min);
         if (has_reg) {pr(IPX1,p) -= (meshsize.x1max - meshsize.x1min);}
       }
-      if (x2 < meshsize.x2min) {
+      if (lo2) {
         pr(IPY,p) += (meshsize.x2max - meshsize.x2min);
         if (has_reg) {pr(IPY1,p) += (meshsize.x2max - meshsize.x2min);}
-      } else if (x2 > meshsize.x2max) {
+      } else if (hi2) {
         pr(IPY,p) -= (meshsize.x2max - meshsize.x2min);
         if (has_reg) {pr(IPY1,p) -= (meshsize.x2max - meshsize.x2min);}
       }
-      if (x3 < meshsize.x3min) {
+      if (lo3) {
         pr(IPZ,p) += (meshsize.x3max - meshsize.x3min);
         if (has_reg) {pr(IPZ1,p) += (meshsize.x3max - meshsize.x3min);}
-      } else if (x3 > meshsize.x3max) {
+      } else if (hi3) {
         pr(IPZ,p) -= (meshsize.x3max - meshsize.x3min);
         if (has_reg) {pr(IPZ1,p) -= (meshsize.x3max - meshsize.x3min);}
       }
@@ -250,6 +367,12 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
     }
   });
 #if MPI_PARALLEL_ENABLED
+  // one rank: nothing can leave it, so no count, no copy to the host and no MPI calls
+  // (they made an MPI build about 13% slower than a serial one on one GPU)
+  if (global_variable::nranks == 1) {
+    nprtcl_send = 0;
+    return TaskStatus::complete;
+  }
   // This deep copy also synchronizes completion of the device append kernel.  Copy only
   // the valid prefix to the host; DualView::sync() would copy the full capacity.
   Kokkos::deep_copy(send_count.h_view, send_count.d_view);
@@ -292,6 +415,11 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
 
 TaskStatus ParticlesBoundaryValues::CountSendsAndRecvs() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) {   // one rank: no messages
+    sends_thisrank.clear(); recvs_thisrank.clear();
+    nsends = 0; nrecvs = 0; nprtcl_send = 0; nprtcl_recv = 0;
+    return TaskStatus::complete;
+  }
   // Sort sendlist on host by destrank.
   std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByRank);
   // Copy only the sorted valid prefix back to the device.
@@ -362,6 +490,7 @@ TaskStatus ParticlesBoundaryValues::CountSendsAndRecvs() {
 
 TaskStatus ParticlesBoundaryValues::InitPrtclRecv() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) return TaskStatus::complete;
   // load STL::vector of ParticleMessageData with <sendrank,recvrank,nprtcl_recv> for
   // receives // on this rank. Length will be nrecvs, initially this length is unknown
   recvs_thisrank.clear();
@@ -449,6 +578,7 @@ TaskStatus ParticlesBoundaryValues::InitPrtclRecv() {
 
 TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) return TaskStatus::complete;
   // Figure out how many particles will be sent from this ranks
   nprtcl_send=0;
   for (int n=0; n<nsends; ++n) {
@@ -546,6 +676,11 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
 
 TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) {   // one rank: the count is unchanged
+    pmy_part->pmy_pack->pmesh->nprtcl_thisrank = pmy_part->nprtcl_thispack;
+    pmy_part->pmy_pack->pmesh->nprtcl_eachrank[0] = pmy_part->nprtcl_thispack;
+    return TaskStatus::complete;
+  }
   // Sort sendlist on host by index in particle array
   std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByIndex);
   // Copy only the sorted valid prefix back to the device.
@@ -557,11 +692,14 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
     Kokkos::deep_copy(d_prefix, h_prefix);
   }
 
-  // increase size of particle arrays if needed
+  // increase size of particle arrays if needed.  The arrays keep their capacity (their
+  // extent may exceed the number of particles) and grow with 25% headroom, so that a net
+  // inflow of a few particles does not reallocate them every cycle
   int new_npart = pmy_part->nprtcl_thispack + (nprtcl_recv - nprtcl_send);
-  if (nprtcl_recv > nprtcl_send) {
-    Kokkos::resize(pmy_part->prtcl_idata, pmy_part->nidata, new_npart);
-    Kokkos::resize(pmy_part->prtcl_rdata, pmy_part->nrdata, new_npart);
+  if (new_npart > pmy_part->prtcl_rdata.extent_int(1) ||
+      new_npart > pmy_part->prtcl_idata.extent_int(1)) {
+    Kokkos::resize(pmy_part->prtcl_idata, pmy_part->nidata, new_npart + new_npart/4);
+    Kokkos::resize(pmy_part->prtcl_rdata, pmy_part->nrdata, new_npart + new_npart/4);
   }
 
   // check that particle communications have all completed
@@ -622,30 +760,40 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
   // remaining holes
   int nremain = nprtcl_send - nprtcl_recv;
   if (nremain > 0) {
+    // the (hole, last particle) pairs as before, found on the host; the copies in one kernel
+    // instead of two device copies per pair
     int &npart = pmy_part->nprtcl_thispack;
     int i_last_hole = nprtcl_send-1;
     int i_next_hole = nprtcl_recv;
+    std::vector<int> pairs;
     for (int n=1; n<=nremain; ++n) {
       int nend = npart-n;
       if (nend > sendlist.h_view(i_last_hole).prtcl_indx) {
         // copy particle from end into hole
-        int next_hole = sendlist.h_view(i_next_hole).prtcl_indx;
-        auto rdest = Kokkos::subview(pmy_part->prtcl_rdata, Kokkos::ALL, next_hole);
-        auto rsrc  = Kokkos::subview(pmy_part->prtcl_rdata, Kokkos::ALL, nend);
-        Kokkos::deep_copy(rdest, rsrc);
-        auto idest = Kokkos::subview(pmy_part->prtcl_idata, Kokkos::ALL, next_hole);
-        auto isrc  = Kokkos::subview(pmy_part->prtcl_idata, Kokkos::ALL, nend);
-        Kokkos::deep_copy(idest, isrc);
+        pairs.push_back(sendlist.h_view(i_next_hole).prtcl_indx);
+        pairs.push_back(nend);
         i_next_hole += 1;
       } else {
         // this index contains a hole, so do nothing except find new index of last hole
         i_last_hole -= 1;
       }
     }
-
-    // shrink size of particle data arrays
-    Kokkos::resize(pmy_part->prtcl_idata, pmy_part->nidata, new_npart);
-    Kokkos::resize(pmy_part->prtcl_rdata, pmy_part->nrdata, new_npart);
+    const int npair = static_cast<int>(pairs.size())/2;
+    if (npair > 0) {
+      Kokkos::View<int*, HostMemSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+          hpairs(pairs.data(), pairs.size());
+      DvceArray1D<int> dpairs("prtcl_fill_pairs", pairs.size());
+      Kokkos::deep_copy(dpairs, hpairs);
+      auto &pr = pmy_part->prtcl_rdata;
+      auto &pi = pmy_part->prtcl_idata;
+      const int nrdata = pmy_part->nrdata, nidata = pmy_part->nidata;
+      par_for("prtcl_fill_holes",DevExeSpace(),0,npair-1, KOKKOS_LAMBDA(const int k) {
+        const int dst = dpairs(2*k), src = dpairs(2*k + 1);
+        for (int i=0; i<nrdata; ++i) pr(i,dst) = pr(i,src);
+        for (int i=0; i<nidata; ++i) pi(i,dst) = pi(i,src);
+      });
+    }
+    // the arrays keep their capacity (no shrink)
   }
 
   // Update nparticles_thisrank.  Update cost array (use npart_thismb[nmb]?)
@@ -663,6 +811,7 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
 
 TaskStatus ParticlesBoundaryValues::ClearPrtclSend() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) return TaskStatus::complete;
   bool no_errors=true;
   // wait for all non-blocking sends for vars to finish before continuing
   for (int n=0; n<nsends; ++n) {
@@ -690,6 +839,7 @@ TaskStatus ParticlesBoundaryValues::ClearPrtclSend() {
 
 TaskStatus ParticlesBoundaryValues::ClearPrtclRecv() {
 #if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks == 1) return TaskStatus::complete;
   bool no_errors=true;
   // wait for all non-blocking receives to finish before continuing
   for (int n=0; n<nrecvs; ++n) {

@@ -41,6 +41,9 @@ class SourceTerms {
   // data for constant accel
   Real const_accel_val;   // magnitude of accn
   int const_accel_dir;    // direction of accn
+  bool const_accel2 = false;  // optional second constant accn (e.g. the azimuthal force
+  Real const_accel2_val = 0.0; // that keeps a radially boosted shearing-box equilibrium)
+  int const_accel2_dir = 0;
 
   // data for ISM cooling
   Real hrate;
@@ -61,6 +64,8 @@ class SourceTerms {
   void ApplySrcTerms(DvceArray5D<Real> &i0, const Real bdt);
   void ConstantAccel(const DvceArray5D<Real> &w0, const EOS_Data &eos,
                      const Real bdt, DvceArray5D<Real> &u0);
+  void ConstantAccel(const DvceArray5D<Real> &w0, const EOS_Data &eos,
+                     const Real bdt, DvceArray5D<Real> &u0, const Real g, const int dir);
   void ISMCooling(const DvceArray5D<Real> &w0, const EOS_Data &eos,
                   const Real bdt, DvceArray5D<Real> &u0);
   void RelCooling(const DvceArray5D<Real> &w0, const EOS_Data &eos,

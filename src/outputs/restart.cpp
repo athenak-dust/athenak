@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <utility> // make_pair
+#include <vector>
 
 #include "athena.hpp"
 #include "coordinates/cell_locations.hpp"
@@ -29,6 +30,10 @@
 #include "z4c/z4c.hpp"
 #include "radiation/radiation.hpp"
 #include "srcterms/turb_driver.hpp"
+#include "particles/particles.hpp"
+#include "dust/dust.hpp"
+#include "gravity/self_gravity.hpp"
+#include "gravity/restart.hpp"
 //#include "outputs.hpp"
 
 //----------------------------------------------------------------------------------------
@@ -200,6 +205,12 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
 
   // create string holding input parameters (copy of input file)
+  if (pm->pmb_pack->pgrav != nullptr) {
+    gravity::MarkRestartHeader(pin, single_file_per_rank);
+  } else if (pin->DoesParameterExist("gravity", "restart_record_version")) {
+    // A checkpoint resumed with gravity disabled no longer writes its old section.
+    pin->SetInteger("gravity", "restart_record_version", 0);
+  }
   std::stringstream ost;
   pin->ParameterDump(ost);
   std::string sbuf = ost.str();
@@ -622,6 +633,11 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     offset_myrank += nout1*nout2*nout3*nadm*sizeof(Real); // adm u_adm
     myoffset = offset_myrank;
   }
+
+  // Preserve legacy particle rank sections directly after the fluid arrays, then SG.
+  const IOWrapperSizeT extension_offset = step1size + step2size + step3size +
+      sizeof(IOWrapperSizeT) + data_size*pm->nmb_total;
+  gravity::WriteRestartExtensions(resfile, extension_offset, pm, single_file_per_rank);
 
   // close file, clean up
   resfile.Close(single_file_per_rank);

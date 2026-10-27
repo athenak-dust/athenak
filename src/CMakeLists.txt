@@ -16,6 +16,7 @@ add_executable(
         bvals/buffs_fc.cpp
         bvals/bvals_cc.cpp
         bvals/bvals_dep.cpp
+        bvals/bvals_dep_general.cpp
         bvals/bvals_fc.cpp
         bvals/bvals_part.cpp
         bvals/bvals_tasks.cpp
@@ -39,11 +40,38 @@ add_executable(
 
         driver/driver.cpp
 
+        gravity/sparse_mg.cpp
+        gravity/composite.cpp
+        gravity/mesh_geometry.cpp
+        gravity/geometric_mg.cpp
+        gravity/vacuum_mesh.cpp
+        gravity/vacuum_boundary.cpp
+        gravity/self_gravity.cpp
+        gravity/restart.cpp
+        gravity/slab_boundary.cpp
+        pgen/tests/self_gravity_wave.cpp
+        pgen/dust_amr/dust_freefall.cpp
+        pgen/dust_amr/dust_jeans.cpp
+
         dust/dust.cpp
         dust/dust_newdt.cpp
         dust/dust_pm.cpp
         dust/dust_push.cpp
         dust/dust_solver.cpp
+        dust/dust_cloud.cpp
+        dust/dust_cloud_device.cpp
+        dust/dust_resample.cpp
+        dust/dust_resample_device.cpp
+        dust/dust_leaf.cpp
+        dust/dust_cloud3d.cpp
+        dust/dust_imex3d.cpp
+        dust/dust_gravity.cpp
+        dust/dust_gravity_points.cpp
+        dust/dust_halo.cpp
+        dust/dust_amr.cpp
+        dust/dust_restart.cpp
+        dust/dust_science.cpp
+        dust/dust_species.cpp
         dust/dust_tasks.cpp
 
         dyn_grmhd/dyn_grmhd.cpp
@@ -103,6 +131,8 @@ add_executable(
         outputs/cartgrid.cpp
         outputs/derived_variables.cpp
         outputs/binary.cpp
+        outputs/pbin.cpp
+        outputs/phst.cpp
         outputs/eventlog.cpp
         outputs/formatted_table.cpp
         outputs/history.cpp
@@ -132,8 +162,11 @@ add_executable(
         pgen/tests/lw_implode.cpp
         pgen/tests/orszag_tang.cpp
         pgen/tests/mri3d.cpp
+        pgen/tests/oblique_shock.cpp
+        pgen/tests/iso_collision.cpp
         pgen/tests/shock_tube.cpp
         pgen/tests/shwave.cpp
+        pgen/tests/simple_wave.cpp
         pgen/tests/streaming_linear.cpp
         pgen/tests/rad_beam.cpp
         pgen/tests/rad_linear_wave.cpp
@@ -142,6 +175,7 @@ add_executable(
 
         pgen/unit_tests/eos_compose.cpp
         pgen/unit_tests/gauss_legendre.cpp
+        pgen/unit_tests/prolong_amp_unit.cpp
 
         radiation/radiation.cpp
         radiation/radiation_fluxes.cpp
@@ -158,6 +192,9 @@ add_executable(
         shearing_box/shearing_box.cpp
         shearing_box/shearing_box_cc.cpp
         shearing_box/shearing_box_fc.cpp
+        shearing_box/shearing_box_flux.cpp
+        shearing_box/shearing_box_pull.cpp
+        shearing_box/shearing_box_plan.cpp
         shearing_box/shearing_box_srcterms.cpp
         shearing_box/shearing_box_tasks.cpp
 

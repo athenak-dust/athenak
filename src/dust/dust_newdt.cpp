@@ -119,8 +119,14 @@ TaskStatus DustGasDrag::ComputeNewTimeStep(Driver *pdrive, int stage) {
 
   particles::Particles *ppar = pmy_pack->ppart;
   int npart = ppar->nprtcl_thispack;
+  // as in Athena-C: with stiff_thresh > 0 the next PC2 step keeps
+  // chi = dt*max_rate <= stiff_thresh, from the global max rate of this cycle's predictor (the same
+  // on every rank, also on ranks without particles)
+  const Real dt_stiff = (stiff_thresh > 0.0 && stiff_rate_max > 0.0 &&
+                         coupling == DustCoupling::hybrid && hybrid_mode == HybridMode::pc2) ?
+                        stiff_thresh/stiff_rate_max : std::numeric_limits<float>::max();
   if (npart == 0) {
-    ppar->dtnew = std::numeric_limits<float>::max();
+    ppar->dtnew = dt_stiff;
     return TaskStatus::complete;
   }
 
@@ -145,7 +151,7 @@ TaskStatus DustGasDrag::ComputeNewTimeStep(Driver *pdrive, int stage) {
     }
   }, Kokkos::Min<Real>(dtp));
 
-  ppar->dtnew = dt_cfl*dtp;
+  ppar->dtnew = std::min(dt_cfl*dtp, dt_stiff);
   return TaskStatus::complete;
 }
 

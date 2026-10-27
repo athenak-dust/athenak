@@ -16,11 +16,17 @@
 //! buffers with a scalar loop over neighbors, exactly as in
 //! MeshBoundaryValuesFC::SumBoundaryFluxes().
 //!
-//! Only same-level (uniform grid) exchanges are supported.
+//! The production exchange remains same-level only. An explicitly enabled,
+//! single-rank, static-2-D-SMR test path maps every deposited ghost-cell density to the
+//! active leaf cells that geometrically overlap it. It preserves the integrated
+//! deposited quantity by applying overlap_volume/receiving_volume. This path is a
+//! diagnostic owner-level transfer, not the exact transpose of AthenaK prolongation.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <utility>
 
 #include "athena.hpp"
@@ -28,18 +34,209 @@
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
 #include "bvals.hpp"
+#include "dust/dust_input.hpp"
 
 //----------------------------------------------------------------------------------------
 // MeshBoundaryValuesDep constructor:
 
 MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *pin) :
   MeshBoundaryValues(pp, pin, false) {
-  if (pp->pmesh->multilevel) {
+#if MPI_PARALLEL_ENABLED
+  MPI_Comm_dup(MPI_COMM_WORLD, &comm_dep_);   // the general path
+#endif
+  if (!pp->pmesh->multilevel) return;
+  const dust::AmrPic pic = dust::ResolveAmrPic(pin, true);
+  // a 3-D mesh with refinement and owner_overlap uses the general
+  // remap (DepRemapPlan, bvals_dep_general.cpp), which the dust module sets up; it checks the rest
+  if (pp->pmesh->three_d && pic == dust::AmrPic::owner_overlap) return;
+  // refinable clouds deposit into the leaves directly (2-D and 3-D), and several ranks
+  // are supported only for them (through the dust halo): this exchange is not used then
+  const bool rc = (pic == dust::AmrPic::refinable_cloud);
+  const bool clouds3d = rc && pp->pmesh->three_d;
+  // (the leaf traversal handles the sheared image and the physical x3 faces)
+  const bool shear3d = clouds3d &&
+      (pp->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic ||
+       pp->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic);
+  if (!((pp->pmesh->two_d || clouds3d) && (pp->pmesh->strictly_periodic || shear3d) &&
+        (global_variable::nranks == 1 || rc))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "Additive deposit exchange does not support SMR/AMR"
-              << std::endl;
+              << std::endl << "Additive deposit exchange does not support this "
+              << "SMR/AMR configuration" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  if (rc) {
+    // The composite dust kernels deposit directly into active leaf cells.
+    local_smr_direct_ = true;
+  } else if (pic == dust::AmrPic::owner_overlap) {
+    local_smr_remap_ = true;
+    BuildLocalSMRMap();
+  } else {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "dust on a refined mesh needs <dust>/amr_pic = refinable_cloud "
+              << "or owner_overlap" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void MeshBoundaryValuesDep::BuildLocalSMRMap()
+//! \brief Precompute the active-leaf destinations of every local ghost cell.  This runs
+//! on the device, and only the block itself and its neighbours (each once) are
+//! searched instead of every block, so that a dynamic mesh can rebuild the map after each
+//! regrid; per target block only the cells near the ghost cell are tested.  Blocks narrower
+//! than two ghost depths (the coarse ghost zone then reaches past the finer neighbours) search
+//! every block of the pack, as before.  The overlaps, the
+//! tests and the weights are those of the former full search, so the map is the same (the
+//! order of the targets of a ghost cell may differ, which does not change any sum).
+
+void MeshBoundaryValuesDep::BuildLocalSMRMap() {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int nmb = pmy_pack->nmb_thispack;
+  const int ncells1 = indcs.nx1 + 2*indcs.ng;
+  const int ncells2 = indcs.nx2 + 2*indcs.ng;
+  const int ncells3 = 1;
+  const int is = indcs.is, ie = indcs.ie, js = indcs.js, je = indcs.je, ks = indcs.ks;
+  const int nx1 = indcs.nx1, nx2 = indcs.nx2;
+  if (smr_target_count_.extent_int(0) != nmb) {
+    smr_target_count_ = DvceArray4D<int>("dep_smr_count", nmb, ncells3, ncells2, ncells1);
+    smr_target_index_ = DvceArray5D<int>("dep_smr_index", nmb, ncells3, ncells2, ncells1,
+                                         max_smr_targets_);
+    smr_target_weight_ = DvceArray5D<Real>("dep_smr_weight", nmb, ncells3, ncells2, ncells1,
+                                           max_smr_targets_);
+  }
+  auto count = smr_target_count_;
+  auto index = smr_target_index_;
+  auto weight = smr_target_weight_;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  auto &nghbr = pmy_pack->pmb->nghbr;
+  const int nnghbr = pmy_pack->pmb->nnghbr;
+  const int gids = pmy_pack->gids;
+  auto &meshsize = pmy_pack->pmesh->mesh_size;
+  const Real x1min = meshsize.x1min, x1max = meshsize.x1max;
+  const Real x2min = meshsize.x2min, x2max = meshsize.x2max;
+  const Real lxmesh = x1max - x1min, lymesh = x2max - x2min;
+  constexpr int ntmax = max_smr_targets_;
+  // the ghost zone of a coarse block is 2 ng cells of its finer
+  // neighbours; with blocks narrower than that (e.g. 4^2 cells, ng = 4) it reaches past the
+  // neighbours, so every block of the pack is searched then
+  const bool full = (2*indcs.ng > nx1) || (2*indcs.ng > nx2);
+  const int ncand = full ? nmb : nnghbr;
+  int nmany = 0, nuncovered = 0, nremote = 0;
+  Kokkos::parallel_reduce("DepSMRMap",
+  Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*ncells2*ncells1),
+  KOKKOS_LAMBDA(const int idx, int &many, int &uncovered, int &remote) {
+    const int m = idx/(ncells2*ncells1);
+    const int r = idx - m*(ncells2*ncells1);
+    const int j = r/ncells1, i = r - j*ncells1;
+    if (i >= is && i <= ie && j >= js && j <= je) {count(m,0,j,i) = 0; return;}
+    const Real sdx1 = mbsize.d_view(m).dx1, sdx2 = mbsize.d_view(m).dx2;
+    Real xlo = mbsize.d_view(m).x1min + static_cast<Real>(i - is)*sdx1;
+    Real xhi = xlo + sdx1;
+    Real ylo = mbsize.d_view(m).x2min + static_cast<Real>(j - js)*sdx2;
+    Real yhi = ylo + sdx2;
+    while (0.5*(xlo + xhi) < x1min) {xlo += lxmesh; xhi += lxmesh;}
+    while (0.5*(xlo + xhi) >= x1max) {xlo -= lxmesh; xhi -= lxmesh;}
+    while (0.5*(ylo + yhi) < x2min) {ylo += lymesh; yhi += lymesh;}
+    while (0.5*(ylo + yhi) >= x2max) {ylo -= lymesh; yhi -= lymesh;}
+    int ntarget = 0;
+    Real overlap_sum = 0.0;
+    for (int n=-1; n<ncand; ++n) {   // the block itself, then each neighbour (or block) once
+      int tm = m;
+      if (n >= 0 && full) {
+        if (n == m) continue;
+        tm = n;
+      } else if (n >= 0) {
+        const int g = nghbr.d_view(m,n).gid;
+        if (g < 0 || g == gids + m) continue;
+        bool seen = false;
+        for (int q=0; q<n; ++q) {
+          if (nghbr.d_view(m,q).gid == g) {seen = true; break;}
+        }
+        if (seen) continue;
+        tm = g - gids;
+        if (tm < 0 || tm >= nmb) {++remote; continue;}   // on another rank: not supported
+      }
+      const Real dx1min = mbsize.d_view(tm).x1min, dx1max = mbsize.d_view(tm).x1max;
+      const Real dx2min = mbsize.d_view(tm).x2min, dx2max = mbsize.d_view(tm).x2max;
+      const Real ddx1 = mbsize.d_view(tm).dx1, ddx2 = mbsize.d_view(tm).dx2;
+      if (xhi <= dx1min || xlo >= dx1max || yhi <= dx2min || ylo >= dx2max) continue;
+      // the target cells near the ghost cell (one cell of margin; the tests below decide)
+      const int tj0 = Kokkos::max(0, static_cast<int>(Kokkos::floor((ylo - dx2min)/ddx2)) - 1);
+      const int tj1 = Kokkos::min(nx2 - 1, static_cast<int>(Kokkos::floor((yhi - dx2min)/ddx2)) + 1);
+      const int ti0 = Kokkos::max(0, static_cast<int>(Kokkos::floor((xlo - dx1min)/ddx1)) - 1);
+      const int ti1 = Kokkos::min(nx1 - 1, static_cast<int>(Kokkos::floor((xhi - dx1min)/ddx1)) + 1);
+      for (int tj=tj0; tj<=tj1; ++tj) {
+        Real tylo = dx2min + static_cast<Real>(tj)*ddx2;
+        Real tyhi = tylo + ddx2;
+        Real oy = Kokkos::fmax(0.0, Kokkos::fmin(yhi, tyhi) - Kokkos::fmax(ylo, tylo));
+        if (oy == 0.0) continue;
+        for (int ti=ti0; ti<=ti1; ++ti) {
+          Real txlo = dx1min + static_cast<Real>(ti)*ddx1;
+          Real txhi = txlo + ddx1;
+          Real ox = Kokkos::fmax(0.0, Kokkos::fmin(xhi, txhi) - Kokkos::fmax(xlo, txlo));
+          Real overlap = ox*oy;
+          Real overlap_tol = 1.0e-12*Kokkos::fmin(sdx1*sdx2, ddx1*ddx2);
+          if (overlap <= overlap_tol) continue;
+          if (ntarget >= ntmax) {++many; continue;}
+          index(m,0,j,i,ntarget) = (((tm*ncells3 + ks)*ncells2 + tj + js)*ncells1 + ti + is);
+          weight(m,0,j,i,ntarget) = overlap/(ddx1*ddx2);
+          overlap_sum += overlap;
+          ++ntarget;
+        }
+      }
+    }
+    const Real source_volume = sdx1*sdx2;
+    if (Kokkos::fabs(overlap_sum - source_volume) > 1.0e-10*source_volume) ++uncovered;
+    count(m,0,j,i) = ntarget;
+  }, Kokkos::Sum<int>(nmany), Kokkos::Sum<int>(nuncovered), Kokkos::Sum<int>(nremote));
+  if (nmany > 0 || nuncovered > 0 || nremote > 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "Static-SMR deposit map: " << nmany << " ghost cells overlap too many leaves, "
+              << nuncovered << " are not covered by the block and its neighbours, " << nremote
+              << " neighbours lie on another rank" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MeshBoundaryValuesDep::RemapLocalSMRDeposit()
+//! \brief Add integrated ghost deposits to overlapping active leaf cells.
+
+TaskStatus MeshBoundaryValuesDep::RemapLocalSMRDeposit(DvceArray5D<Real> &a) {
+  int nmb = pmy_pack->nmb_thispack;
+  int nvar = a.extent_int(1);
+  int ncells3 = a.extent_int(2);
+  int ncells2 = a.extent_int(3);
+  int ncells1 = a.extent_int(4);
+  int ncell = nmb*ncells3*ncells2*ncells1;
+  auto counts = smr_target_count_;
+  auto targets = smr_target_index_;
+  auto weights = smr_target_weight_;
+
+  Kokkos::parallel_for("DepSMRRemap", Kokkos::RangePolicy<>(DevExeSpace(),0,ncell),
+  KOKKOS_LAMBDA(const int idx) {
+    int m = idx/(ncells3*ncells2*ncells1);
+    int remainder = idx - m*(ncells3*ncells2*ncells1);
+    int k = remainder/(ncells2*ncells1);
+    remainder -= k*(ncells2*ncells1);
+    int j = remainder/ncells1;
+    int i = remainder - j*ncells1;
+    int count = counts(m,k,j,i);
+    for (int t=0; t<count; ++t) {
+      int encoded = targets(m,k,j,i,t);
+      int ti = encoded % ncells1;
+      encoded /= ncells1;
+      int tj = encoded % ncells2;
+      encoded /= ncells2;
+      int tk = encoded % ncells3;
+      int tm = encoded/ncells3;
+      Real weight = weights(m,k,j,i,t);
+      for (int v=0; v<nvar; ++v) {
+        Kokkos::atomic_add(&a(tm,v,tk,tj,ti), weight*a(m,v,k,j,i));
+      }
+    }
+  });
+  return TaskStatus::complete;
 }
 
 //----------------------------------------------------------------------------------------
@@ -120,6 +317,33 @@ void MeshBoundaryValuesDep::InitRecvIndices(MeshBoundaryBuffer &buf,
 //! Input array must be a 5D Kokkos View dimensioned (nmb, nvar, nx3, nx2, nx1)
 
 TaskStatus MeshBoundaryValuesDep::PackAndSendDeposit(DvceArray5D<Real> &a) {
+  if (General()) {   // pack the source ghost cells of both parts, send them
+    for (int p=0; p<2; ++p) GeneralPack(a, (p == 0) ? plan_->stat : plan_->shr, gsbuf_[p]);
+#if MPI_PARALLEL_ENABLED
+    Kokkos::fence();
+    const int nvar = a.extent_int(1);
+    bool no_errors = true;
+    for (int p=0; p<2; ++p) {
+      const DepRemapMap &map = (p == 0) ? plan_->stat : plan_->shr;
+      for (std::size_t q=0; q<map.send_rank.size(); ++q) {
+        MPI_Request req;
+        int ierr = MPI_Isend(gsbuf_[p].data() + map.send_off[q]*nvar, map.send_cnt[q]*nvar,
+                             MPI_ATHENA_REAL, map.send_rank[q], 31 + p, comm_dep_, &req);
+        if (ierr != MPI_SUCCESS) no_errors = false;
+        gsreq_.push_back(req);
+      }
+    }
+    if (!no_errors) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "MPI error in posting the deposit sends" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+#endif
+    return TaskStatus::complete;
+  }
+  if (local_smr_direct_) return TaskStatus::complete;
+  if (local_smr_remap_) return RemapLocalSMRDeposit(a);
+
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
@@ -230,6 +454,24 @@ TaskStatus MeshBoundaryValuesDep::PackAndSendDeposit(DvceArray5D<Real> &a) {
 //! concurrent accumulation over buffers would race (cf. SumBoundaryFluxes).
 
 TaskStatus MeshBoundaryValuesDep::RecvAndSumDeposit(DvceArray5D<Real> &a) {
+  if (General()) {   // all receives complete, then the two parts in order
+#if MPI_PARALLEL_ENABLED
+    bool done = true;
+    for (auto &r : grreq_) {
+      int test = 1;
+      MPI_Test(&r, &test, MPI_STATUS_IGNORE);
+      if (!test) done = false;
+    }
+    if (!done) return TaskStatus::incomplete;
+#endif
+    GeneralDropRecord(a, plan_->stat);   // dropped ghost deposits beyond an x3 face
+    GeneralApply(a, plan_->stat, grbuf_[0]);
+    GeneralApply(a, plan_->shr, grbuf_[1]);
+    return TaskStatus::complete;
+  }
+  if (local_smr_direct_) return TaskStatus::complete;
+  if (local_smr_remap_) return TaskStatus::complete;
+
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;

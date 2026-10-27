@@ -13,6 +13,8 @@
 #include <utility>
 #include <algorithm>
 #include <cstdio>
+#include <cstdint>
+#include <vector>
 
 #include "athena.hpp"
 #include "geodesic-grid/geodesic_grid.hpp"
@@ -27,6 +29,9 @@
 #include "z4c/z4c.hpp"
 #include "radiation/radiation.hpp"
 #include "srcterms/turb_driver.hpp"
+#include "particles/particles.hpp"
+#include "dust/dust.hpp"
+#include "gravity/restart.hpp"
 #include "pgen.hpp"
 
 
@@ -614,6 +619,9 @@ ProblemGenerator::ProblemGenerator(ParameterInput *pin, Mesh *pm, IOWrapper resf
     myoffset = offset_myrank;
   }
 
+  gravity::ReadRestartExtensions(resfile, headeroffset+data_size*pm->nmb_total,
+                                 pm, pin, single_file_per_rank);
+
   // call problem generator again to re-initialize data, fn ptrs, as needed
   // second argument true since this IS a restart
   CallProblemGenerator(pin, true);
@@ -906,6 +914,10 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     DustDamping(pin, is_restart);
   } else if (pgen_fun_name.compare("dust_nsh") == 0) {
     DustNSH(pin, is_restart);
+  } else if (pgen_fun_name.compare("dust_freefall") == 0) {
+    DustFreeFall(pin, is_restart);
+  } else if (pgen_fun_name.compare("dust_jeans") == 0) {
+    DustJeans(pin, is_restart);
   } else if (pgen_fun_name.compare("dusty_wave") == 0) {
     DustyWave(pin, is_restart);
   } else if (pgen_fun_name.compare("linear_wave") == 0) {
@@ -922,10 +934,18 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     RadiationLinearWave(pin, is_restart);
   } else if (pgen_fun_name.compare("rad_beam") == 0) {
     RadiationBeam(pin, is_restart);
+  } else if (pgen_fun_name.compare("oblique_shock") == 0) {
+    ObliqueShock(pin, is_restart);
+  } else if (pgen_fun_name.compare("iso_collision") == 0) {
+    IsoCollision(pin, is_restart);
   } else if (pgen_fun_name.compare("shock_tube") == 0) {
     ShockTube(pin, is_restart);
+  } else if (pgen_fun_name.compare("simple_wave") == 0) {
+    SimpleWave(pin, is_restart);
   } else if (pgen_fun_name.compare("shwave") == 0) {
     Shwave(pin, is_restart);
+  } else if (pgen_fun_name.compare("self_gravity_wave") == 0) {
+    SelfGravityWave(pin, is_restart);
   } else if (pgen_fun_name.compare("streaming_linear") == 0) {
     StreamingLinear(pin, is_restart);
   } else if (pgen_fun_name.compare("z4c_boosted_puncture") == 0) {
@@ -938,6 +958,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     EOSCompose(pin, is_restart);
   } else if (pgen_fun_name.compare("gauss_legendre") == 0) {
     GaussLegendre(pin, is_restart);
+  } else if (pgen_fun_name.compare("prolong_amp_unit") == 0) {
+    ProlongAmpUnit(pin, is_restart);
 
   } else {
     // name not set on command line or input file, print warning and quit

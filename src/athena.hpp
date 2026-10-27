@@ -8,6 +8,7 @@
 //! \file athena.hpp
 //  \brief contains Athena++ general purpose types, structures, enums, etc.
 
+#include <cstdint>
 #include <string>
 
 #include <Kokkos_Core.hpp>
@@ -65,11 +66,40 @@ enum MetricIndex {I00=0, I01=1, I02=2, I03=3, I11=4, I12=5, I13=6, I22=7, I23=8,
 // second group indexes real data (prtcl_rdata). Columns beyond IPVZ are only allocated
 // for dust particles: (IPX1...IPVZ1) store the stage-1 registers of the low-storage RK
 // integrator, (IPRX...IPRZ) the drag rate R_j recorded at each implicit stage, IPTS the
-// stopping time, and IPM the particle mass.
-enum ParticlesIndex {PGID=0, PTAG=1, PSP=2,
+// stopping time, and IPM the particle mass. PLEV (dust only) is the cloud level of a
+// refinable Lagrangian cloud: its hat cloud has half-width root_dx/2^PLEV.
+//
+// PTAGH (dust only): the particle identity (tag) of a dust particle is an
+// unsigned 64-bit integer held in two int32 columns, PTAG (bits 0-31) and PTAGH (bits
+// 32-63).  Every path that moves, copies, sorts, compacts, exchanges or restarts integer
+// rows carries both words; code that reads or writes a tag uses GetTag / SetTag below.
+// Cosmic-ray particles have no PTAGH column (nidata = 2): their tag is the int32 PTAG.
+enum ParticlesIndex {PGID=0, PTAG=1, PSP=2, PLEV=3, PTAGH=4,
                      IPX=0, IPVX=1, IPY=2, IPVY=3, IPZ=4, IPVZ=5,
                      IPX1=6, IPVX1=7, IPY1=8, IPVY1=9, IPZ1=10, IPVZ1=11,
                      IPRX=12, IPRY=13, IPRZ=14, IPTS=15, IPM=16};
+
+// the 64-bit tag from its two int32 words, and the words of a tag (two's complement, so that
+// a tag below 2^31 has the int32 value it had when tags were int32, and a high word of 0)
+KOKKOS_INLINE_FUNCTION
+std::uint64_t TagFromWords(const int lo, const int hi) {
+  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(hi)) << 32) |
+         static_cast<std::uint64_t>(static_cast<std::uint32_t>(lo));
+}
+KOKKOS_INLINE_FUNCTION
+int TagLo(const std::uint64_t t) {return static_cast<int>(static_cast<std::uint32_t>(t));}
+KOKKOS_INLINE_FUNCTION
+int TagHi(const std::uint64_t t) {return static_cast<int>(static_cast<std::uint32_t>(t >> 32));}
+// the tag of particle p of an integer array (prtcl_idata, a mirror or a copy with its rows)
+template <typename IView>
+KOKKOS_INLINE_FUNCTION
+std::uint64_t GetTag(const IView &pi, const int p) {return TagFromWords(pi(PTAG,p), pi(PTAGH,p));}
+template <typename IView>
+KOKKOS_INLINE_FUNCTION
+void SetTag(const IView &pi, const int p, const std::uint64_t t) {
+  pi(PTAG,p) = TagLo(t);
+  pi(PTAGH,p) = TagHi(t);
+}
 
 // integer constants to specify spatial reconstruction methods
 enum ReconstructionMethod {dc, plm, ppm4, ppmx, wenoz};

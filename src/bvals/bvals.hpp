@@ -20,6 +20,7 @@ enum class BoundaryFlag {undef=-1,block, reflect, inflow, outflow, diode, user, 
                          shear_periodic, vacuum};
 
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 
 #include "athena.hpp"
@@ -39,6 +40,20 @@ class Particles;
 //! \brief calculate an MPI tag for boundary buffer communications.  Note maximum size of
 //! lid that can be encoded is set by (NUM_BITS_LID) macro defined in athena.hpp.
 //! The convention in AthenaK is lid and bufid are both for the *receiving* process.
+//! \fn int ShearSlotOx1(int n)
+//! \brief x1 direction (-1, 0, +1) of neighbour slot n (NeighborIndex layout, 3-D)
+KOKKOS_INLINE_FUNCTION
+int ShearSlotOx1(const int n) {
+  if (n < 4) return -1;
+  if (n < 8) return 1;
+  if (n < 16) return 0;
+  if (n < 24) return ((n - 16) & 2) ? 1 : -1;
+  if (n < 32) return 0;
+  if (n < 40) return ((n - 32) & 2) ? 1 : -1;
+  if (n < 48) return 0;
+  return ((n - 48) & 1) ? 1 : -1;
+}
+
 inline int CreateBvals_MPI_Tag(int lid, int bufid) {
   return (bufid << (NUM_BITS_LID)) | lid;
 }
@@ -134,6 +149,13 @@ class MeshBlockPack;
 
 class MeshBoundaryValues {
  public:
+  // no flux correction across the shear-periodic x1 boundaries (the
+  // neighbour of the unsheared periodic topology is not the sheared one; the uniform shearing box
+  // does no flux correction there either).  Set by Hydro with mesh refinement in 3-D.
+  bool skip_shear_x1_flux=false;
+  // no prolongation or same-level restriction through neighbour slots across a
+  // shear-periodic x1 face: the shearing box collects those ghost zones itself
+  bool skip_shear_x1_prol = false;
   MeshBoundaryValues(MeshBlockPack *ppack, ParameterInput *pin, bool z4c);
   virtual ~MeshBoundaryValues();
 
@@ -182,7 +204,8 @@ class MeshBoundaryValues {
   TaskStatus ClearFluxSend();
 
   // BCs associated with various physics modules
-  static void HydroBCs(MeshBlockPack *pp, DualArray2D<Real> uin, DvceArray5D<Real> u0);
+  static void HydroBCs(MeshBlockPack *pp, DualArray2D<Real> uin, DvceArray5D<Real> u0,
+                       const bool coarse=false);
   static void BFieldBCs(MeshBlockPack *pp, DualArray2D<Real> bin, DvceFaceFld4D<Real> b0);
   static void RadiationBCs(MeshBlockPack *pp,DualArray2D<Real> iin,DvceArray5D<Real> i0);
   static void Z4cBCs(MeshBlockPack *pp, DualArray2D<Real> uin, DvceArray5D<Real> u0,
@@ -223,7 +246,8 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
   // functions to prolongate conserved and primitive CC variables
   void FillCoarseInBndryCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
        bool is_z4c=false);
-  void ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca, bool is_z4c=false);
+  void ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca, bool is_z4c=false,
+                    Real amp_eps=0.0, Real amp_cs=0.0);
   void ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons, DvceArray5D<Real> &prim);
   void PrimToConsFineBndry(const DvceArray5D<Real> &prim, DvceArray5D<Real> &cons);
   void ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,
@@ -237,11 +261,93 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
 //  \brief Derived class implementing an ADDITIVE ghost-zone exchange for cell-centered
 //  fields built by particle deposition: ghost-cell deposits are packed and *added* into
 //  the overlapping active cells of the neighboring MeshBlock (the reverse data flow of
-//  the ordinary copy exchange). Uniform grids only.
+//  the ordinary copy exchange). The experimental single-rank static-SMR path remaps
+//  ghost-cell densities by geometric overlap and receiving-cell volume.
+
+//----------------------------------------------------------------------------------------
+//! \struct DepRemapMap
+//! \brief One part of the general deposit remap: the ghost
+//! deposits added to the overlapping active cells of the blocks of this rank, as a list per
+//! target cell (CSR, sorted by source block gid and source cell: the sums are independent of
+//! the rank layout), and the source ghost cells this rank sends to every other rank.
+
+struct DepRemapMap {
+  int nseg = 0, nent = 0;
+  DvceArray1D<int> seg_tgt;    // target cell m*ncell + cell (active cell of a block here)
+  DvceArray1D<int> seg_ptr;    // nseg+1 offsets into the entries
+  DvceArray1D<int> ent_src;    // >= 0: local source cell m*ncell + cell; < 0: -(recv entry+1)
+  DvceArray1D<Real> ent_w;     // overlap volume / target cell volume
+  int nsend = 0, nrecv = 0;
+  DvceArray1D<int> send_cell;  // local source cells packed for the other ranks (by rank)
+  std::vector<int> send_rank, send_off, send_cnt;   // per peer rank: offset, count (entries)
+  std::vector<int> recv_rank, recv_off, recv_cnt;
+  // ghost cells beyond a physical x3 face that are dropped (x3 mode drop): local
+  // source cells and their volumes, for the record of the dropped deposits
+  int ndrop = 0;
+  DvceArray1D<int> drop_cell;
+  DvceArray1D<Real> drop_vol;
+};
+
+//----------------------------------------------------------------------------------------
+//! \class DepRemapPlan
+//! \brief The additive ghost-deposit exchange of a 3-D mesh with
+//! any levels (static or adaptive refinement), multi-rank, and shear-periodic x1 faces.  Every
+//! ghost cell deposit goes to the active cells it overlaps (volume overlap in the integer cell
+//! units of the finest level: exact, conservative); ghost cells beyond a shear-periodic x1 face
+//! go to the opposite face shifted in x2 by the shear offset (the particles' convention,
+//! bvals_part.cpp).  Built on the host from the global block list (no finest-grid table): the
+//! static part once per mesh, the shear part at every stage.  Shared by the deposit exchanges.
+
+class DepRemapPlan {
+ public:
+  // x3mode (a 3-D mesh with physical x3 faces): 0 periodic x3, 1 the ghost cells beyond
+  // a physical x3 face fold back onto their mirror cells, 2 they are dropped (and recorded)
+  DepRemapPlan(MeshBlockPack *pp, bool shear_x1, Real qshear, Real omega0, int x3mode = 0);
+  void BuildStatic();              // after construction and after every regrid
+  void UpdateShear(Real time);     // the shear part for the offset at time (no-op without shear)
+  bool Shear() const {return shear_x1_;}
+  DepRemapMap stat, shr;
+  int build_seq = 0;               // increases with every BuildStatic
+  Real shear_time = -1.0;
+  // Public because CUDA extended lambdas cannot be enclosed by a private member.
+  void BuildPart(const int part, const double shR, DepRemapMap &map);
+  int shr_builds = 0, shr_updates = 0;   // full builds and weight-only updates of the shear part
+
+ private:
+  // between full builds of the shear part (same integer part of the
+  // offset, and an integer or not) only its weights change: kRecipe doubles per entry say how
+  // to recompute them exactly (bvals_dep_general.cpp, UpdateShearWeights)
+  static constexpr int kRecipe = 8;
+  bool shr_cached_ = false, shr_int_ = false;
+  std::int64_t shr_floor_ = 0;
+  std::vector<double> shr_recipe_;
+  std::vector<Real> shr_hw_;
+  bool UpdateShearWeights(const double shR);
+  MeshBlockPack *pmy_pack;
+  bool shear_x1_;
+  int x3mode_ = 0;
+  Real qshear_, omega0_;
+  std::vector<int> face_gids_[2];  // blocks at the inner / outer x1 face (all ranks)
+};
 
 class MeshBoundaryValuesDep : public MeshBoundaryValues {
  public:
   MeshBoundaryValuesDep(MeshBlockPack *ppack, ParameterInput *pin);
+  ~MeshBoundaryValuesDep();
+
+  // the general 3-D path: the dust module creates the plan and gives it to its
+  // deposit exchanges; then these replace InitRecv / ClearSend / ClearRecv of the base class
+  void SetGeneralPlan(DepRemapPlan *p) {plan_ = p;}
+  bool General() const {return plan_ != nullptr;}
+  TaskStatus InitRecvDep(const int nvar);
+  TaskStatus ClearSendDep();
+  TaskStatus ClearRecvDep();
+  // Public because CUDA extended lambdas cannot be enclosed by a private member.
+  void GeneralPack(DvceArray5D<Real> &a, const DepRemapMap &map, DvceArray1D<Real> &buf);
+  void GeneralApply(DvceArray5D<Real> &a, const DepRemapMap &map,
+                    const DvceArray1D<Real> &buf);
+  void GeneralDropRecord(DvceArray5D<Real> &a, const DepRemapMap &map);
+  std::vector<double> dropped_sum;   // dropped deposits, integrated, per variable
 
   //functions
   void InitSendIndices(MeshBoundaryBuffer &b,int o1,int o2,int o3,int f1,int f2) override;
@@ -251,6 +357,28 @@ class MeshBoundaryValuesDep : public MeshBoundaryValues {
   // pack ghost-region deposits and send; receive and sum into active cells
   TaskStatus PackAndSendDeposit(DvceArray5D<Real> &a);
   TaskStatus RecvAndSumDeposit(DvceArray5D<Real> &a);
+  // Public because CUDA extended lambdas cannot be enclosed by a private member.
+  TaskStatus RemapLocalSMRDeposit(DvceArray5D<Real> &a);
+  // the remap of the owner_overlap path from the current mesh; called again by the dust module
+  // after every regrid of a dynamic mesh
+  void BuildLocalSMRMap();
+  bool LocalSMRRemap() const {return local_smr_remap_;}
+
+ private:
+  static constexpr int max_smr_targets_ = 8;
+  bool local_smr_remap_ = false;
+  bool local_smr_direct_ = false;
+  // general path: buffers and requests of this exchange (static, shear part)
+  DepRemapPlan *plan_ = nullptr;
+  int gen_nvar_ = 0;
+  DvceArray1D<Real> gsbuf_[2], grbuf_[2];   // device buffers given to MPI (as the base class)
+#if MPI_PARALLEL_ENABLED
+  MPI_Comm comm_dep_;
+  std::vector<MPI_Request> gsreq_, grreq_;
+#endif
+  DvceArray4D<int> smr_target_count_;
+  DvceArray5D<int> smr_target_index_;
+  DvceArray5D<Real> smr_target_weight_;
 };
 
 //----------------------------------------------------------------------------------------
@@ -336,6 +464,13 @@ class ParticlesBoundaryValues {
   int nmb_sp_x2=1, nmb_sp_x3=1;        // root-grid MeshBlock counts in x2/x3
   DualArray3D<int> sgid_map;           // destination GID:  (side, lx3, lx2)
   DualArray3D<int> srank_map;          // destination rank: (side, lx3, lx2)
+  void BuildShearMaps();               // also after every regrid
+  // dust particles at the physical x3 faces of a 3-D mesh: 0 periodic,
+  // 1 reflect (mirror position and velocity), 2 outflow (the particle leaves: mass and count added
+  // to x3_removed, mass set to 0, parked at rest in its block; DustGasDrag removes it at the start
+  // of the next cycle)
+  int x3bc_dust = 0;
+  DualArray1D<Real> x3_removed;        // (mass, count) since the last removal
 
   // Data needed to count number of messages and particles to send between ranks
   int nsends; // number of MPI sends to neighboring ranks on this rank

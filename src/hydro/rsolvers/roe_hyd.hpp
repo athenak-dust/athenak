@@ -30,7 +30,8 @@ void RoeFluxAdb(const Real wroe[], const Real du[], const Real wli[],
                        const Real gm1, Real flx[], Real eigenvalues[], int &flag);
 KOKKOS_INLINE_FUNCTION
 void RoeFluxIso(const Real wroe[], const Real du[], const Real wli[],
-                       const Real isocs, Real flx[], Real eigenvalues[], int &flag);
+                       const Real isocs, const Real shear_fix, Real flx[], Real eigenvalues[],
+                       int &flag);
 
 } // namespace roe
 
@@ -134,7 +135,7 @@ void Roe(TeamMember_t const &member, const EOS_Data &eos,
     if (eos.is_ideal) {
       roe::RoeFluxAdb(wroe,du,wli,gm1,flxi,ev,llf_flag);
     } else {
-      roe::RoeFluxIso(wroe,du,wli,iso_cs,flxi,ev,llf_flag);
+      roe::RoeFluxIso(wroe,du,wli,iso_cs,eos.roe_shear_fix,flxi,ev,llf_flag);
     }
 
     //--- Step 5.  Overwrite with upwind flux if flow is supersonic
@@ -319,7 +320,7 @@ void RoeFluxAdb(const Real wroe[], const Real du[], const Real wli[], const Real
 
 KOKKOS_INLINE_FUNCTION
 void RoeFluxIso(const Real wroe[], const Real du[], const Real wli[], const Real iso_cs,
-     Real flx[], Real ev[], int &llf_flag) {
+     const Real shear_fix, Real flx[], Real ev[], int &llf_flag) {
   Real v1 = wroe[IVX];
   Real v2 = wroe[IVY];
   Real v3 = wroe[IVZ];
@@ -346,10 +347,15 @@ void RoeFluxIso(const Real wroe[], const Real du[], const Real wli[], const Real
     a[3]  = du[0]*(0.5 - 0.5*v1/iso_cs);
     a[3] += du[1]*0.5/iso_cs;
 
+    // shear waves: optional Harten entropy fix with d = shear_fix*cs, so that a
+    // stationary shear (v_n = 0) is not left without dissipation
+    Real lsh = fabs(ev[1]);
+    const Real dsh = shear_fix*iso_cs;
+    if (lsh < dsh) lsh = 0.5*(ev[1]*ev[1] + dsh*dsh)/dsh;
     Real coeff[4];
     coeff[0] = -0.5*fabs(ev[0])*a[0];
-    coeff[1] = -0.5*fabs(ev[1])*a[1];
-    coeff[2] = -0.5*fabs(ev[2])*a[2];
+    coeff[1] = -0.5*lsh*a[1];
+    coeff[2] = -0.5*lsh*a[2];
     coeff[3] = -0.5*fabs(ev[3])*a[3];
 
     // compute density in intermediate states and check that it is positive, set flag

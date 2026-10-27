@@ -18,7 +18,7 @@
 //! Required parameters that must be specified in an <output[n]> block are:
 //!   - variable  = [list of currently implemented strings for specifing output variables
 //!                  is defined at start of outputs.hpp file]
-//!   - file_type = tab,vtk,hst,bin,rst
+//!   - file_type = tab,vtk,hst,bin,rst,pbin (pbin takes no variable)
 //!   - dt        = problem time between outputs
 //!
 //! EXAMPLE of an <output[n]> block for a TAB dump:
@@ -39,6 +39,7 @@
 //! comment text: 'NEW_OUTPUT_TYPES'.
 //========================================================================================
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>    // strcmp
@@ -46,8 +47,10 @@
 #include <iostream>
 #include <sstream>
 #include <string>   // std::string, to_string()
+#include <vector>
 
 #include "athena.hpp"
+#include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
 #include "outputs.hpp"
@@ -60,6 +63,7 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
   // and add to linked list of BaseTypeOutputs.
 
   int num_hst=0, num_rst=0, num_log=0; // count # of hst,rst,log outputs
+  int num_phst=0;                       // particle history outputs
   for (auto it = pin->block.begin(); it != pin->block.end(); ++it) {
     if (it->block_name.compare(0, 6, "output") == 0) {
       OutputParameters opar;  // define temporary OutputParameters struct
@@ -89,10 +93,13 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
 
       // set output variable and optional file id (default is output variable name)
       // but only for those output types that use them
+      // (pbin: the complete particle science state; no variable key)
       if (opar.file_type.compare("hst") != 0 &&
           opar.file_type.compare("rst") != 0 &&
           opar.file_type.compare("log") != 0 &&
-          opar.file_type.compare("trk") != 0) {
+          opar.file_type.compare("trk") != 0 &&
+          opar.file_type.compare("pbin") != 0 &&
+          opar.file_type.compare("phst") != 0) {
         opar.variable = pin->GetString(opar.block_name, "variable");
         opar.file_id = pin->GetOrAddString(opar.block_name,"id",opar.variable);
       }
@@ -182,9 +189,20 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       // set output variable and optional file id (default is output variable name)
       if (opar.file_type.compare("hst") != 0 &&
           opar.file_type.compare("rst") != 0 &&
-          opar.file_type.compare("log") != 0) {
+          opar.file_type.compare("log") != 0 &&
+          opar.file_type.compare("pbin") != 0 &&
+          opar.file_type.compare("phst") != 0) {
         opar.variable = pin->GetString(opar.block_name, "variable");
         opar.file_id = pin->GetOrAddString(opar.block_name,"id",opar.variable);
+      }
+      if (opar.file_type.compare("pbin") == 0) {
+        if (pin->DoesParameterExist(opar.block_name, "variable")) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Output block '" << opar.block_name << "': file_type = pbin "
+              << "writes the complete particle state and takes no 'variable'" << std::endl;
+          exit(EXIT_FAILURE);
+        }
+        opar.file_id = pin->GetOrAddString(opar.block_name, "id", "particles");
       }
 
       // check that pdf variables are single variables
@@ -214,8 +232,10 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
         }
       }
 
-      // set optional data format string used in formatted writes
-      opar.data_format = pin->GetOrAddString(opar.block_name, "data_format", "%12.5e");
+      // set optional data format string used in formatted writes (phst: full precision of
+      // the particle counts and sums by default)
+      opar.data_format = pin->GetOrAddString(opar.block_name, "data_format",
+          (opar.file_type.compare("phst") == 0) ? "%.16e" : "%12.5e");
       opar.data_format.insert(0, " "); // prepend with blank to separate columns
 
       // Construct new BaseTypeOutput according to file format
@@ -274,8 +294,26 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       } else if (opar.file_type.compare("bin") == 0) {
         opar.single_file_per_rank = pin->GetOrAddBoolean(opar.block_name,
           "single_file_per_rank", false);
+        // float64 variables on request; float32 stays the default
+        if (pin->DoesParameterExist(opar.block_name, "precision")) {
+          const std::string prec = pin->GetString(opar.block_name, "precision");
+          if (prec != "single" && prec != "double") {
+            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Output block '" << opar.block_name << "': precision must be "
+                << "single or double" << std::endl;
+            exit(EXIT_FAILURE);
+          }
+          opar.bin_double = (prec == "double");
+        }
         pnode = new MeshBinaryOutput(pin,pm,opar);
         pout_list.insert(pout_list.begin(),pnode);
+      } else if (opar.file_type.compare("pbin") == 0) {
+        pnode = new ParticleBinaryOutput(pin,pm,opar);
+        pout_list.insert(pout_list.begin(),pnode);
+      } else if (opar.file_type.compare("phst") == 0) {
+        pnode = new ParticleHistoryOutput(pin,pm,opar);
+        pout_list.insert(pout_list.begin(),pnode);
+        num_phst++;
       } else if (opar.file_type.compare("cart") == 0) {
         pnode = new CartesianGridOutput(pin,pm,opar);
         pout_list.insert(pout_list.begin(),pnode);
@@ -299,10 +337,33 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
     }
   }
 
+  // say once which bin outputs carry the dust fields
+  if (pm->pmb_pack->pdust != nullptr && global_variable::my_rank == 0) {
+    std::vector<BaseTypeOutput*> list(pout_list);   // in the order of the block numbers
+    std::stable_sort(list.begin(), list.end(), [](BaseTypeOutput *a, BaseTypeOutput *b) {
+      return a->out_params.block_number < b->out_params.block_number;
+    });
+    std::string with, without;
+    for (BaseTypeOutput *p : list) {
+      if (p->auto_dust_total) {
+        with += " " + p->out_params.block_name + " (" + p->out_params.variable + ")";
+      } else if (!p->auto_dust_note.empty()) {
+        without += " " + p->out_params.block_name + " (" + p->auto_dust_note + ")";
+      }
+    }
+    if (!with.empty() || !without.empty()) {
+      std::cout << "# dust_total_rho, dust_total_mom1..3 added to the bin outputs:"
+                << (with.empty() ? " none" : with)
+                << (without.empty() ? "" : "; not to:" + without)
+                << " (opt out per block: dust_total = false)" << std::endl;
+    }
+  }
+
   // check there were no more than one history, event log, or restart files requested
-  if (num_hst > 1 || num_rst > 1 || num_log > 1) {
+  if (num_hst > 1 || num_rst > 1 || num_log > 1 || num_phst > 1) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "More than one history, event log, or restart output block found in "
+              << "More than one history, particle history, event log, or restart output "
+              << "block found in "
               << "input file" << std::endl;
     exit(EXIT_FAILURE);
   }

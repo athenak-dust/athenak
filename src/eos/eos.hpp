@@ -31,6 +31,7 @@ struct EOS_Data {
   Real dfloor, pfloor, tfloor, sfloor;  // density, pressure, temperature, entropy floors
   Real gamma_max;    // ceiling on Lorentz factor in SR/GR
   Real sigma_max;    // ceiling on magnetization in MHD
+  Real roe_shear_fix = 0.0;  // Roe (isothermal): minimum shear-wave speed / cs (0 = off)
 
   // IDEAL GAS PRESSURE: converts primitive variable (either internal energy density e
   // or temperature e/d) into pressure.

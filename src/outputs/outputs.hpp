@@ -8,6 +8,7 @@
 //! \file outputs.hpp
 //  \brief provides classes to handle ALL types of data output
 
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -21,7 +22,7 @@
     #error NHISTORY > NREDUCTION in outputs.hpp
 #endif
 
-#define NOUTPUT_CHOICES 154
+#define NOUTPUT_CHOICES 166
 // choices for output variables used in <ouput> blocks in input file
 // TO ADD MORE CHOICES:
 //   - add more strings to array below, change NOUTPUT_CHOICES above appropriately
@@ -98,8 +99,41 @@ static const char *var_choice[NOUTPUT_CHOICES] = {
   "tmunu",
 
   // Particles (151-153)
-  "prtcl_all", "prtcl_d", "dust_d"
+  "prtcl_all", "prtcl_d", "dust_d",
+  // Composite self-gravity (154-158); active cells only
+  "gravity_phi", "gravity_g1", "gravity_g2", "gravity_g3", "gravity",
+  // Dust mass and momentum densities with the run's representation (159-164);
+  // active cells only.  Not the NGP histogram dust_d.
+  "dust_total", "dust_total_rho", "dust_total_mom",
+  "dust_total_mom1", "dust_total_mom2", "dust_total_mom3",
+  // The same per species (165): every species N = 1..nspecies (as
+  // in the input keys), dust_sN_rho, dust_sN_mom1..3.  The single-species names
+  // dust_sN_rho, dust_sN_mom (three components), dust_sN_mom1..3 are matched by
+  // DustSpeciesVariable below (and checked as 165).
+  "dust_species"
 };
+
+// (names provisional) dust_species: 0; dust_sN_rho, dust_sN_mom,
+// dust_sN_mom1..3: N (1-based), and in *comp the part after "dust_sN_"; else -1.
+inline int DustSpeciesVariable(const std::string &name, std::string *comp = nullptr) {
+  if (name == "dust_species") return 0;
+  if (name.compare(0, 6, "dust_s") != 0) return -1;
+  const std::size_t i = 6;
+  std::size_t j = i;
+  while (j < name.size() && std::isdigit(static_cast<unsigned char>(name[j]))) ++j;
+  if (j == i || j - i > 6 || name[i] == '0' || j >= name.size() || name[j] != '_') {
+    return -1;
+  }
+  const std::string c = name.substr(j + 1);
+  if (c != "rho" && c != "mom" && c != "mom1" && c != "mom2" && c != "mom3") return -1;
+  if (comp != nullptr) *comp = c;
+  return std::stoi(name.substr(i, j - i));
+}
+// the name of component c (0 rho, 1..3 mom1..3) of species n (1-based)
+inline std::string DustSpeciesFieldName(const int n, const int c) {
+  return "dust_s" + std::to_string(n) + ((c == 0) ? std::string("_rho")
+                                                  : "_mom" + std::to_string(c));
+}
 
 
 // forward declarations
@@ -144,6 +178,7 @@ struct OutputParameters {
   bool logscale=true, logscale2=true;
   bool mass_weighted=false;
   bool single_file_per_rank=false; // DBF: parameter for single file per rank
+  bool bin_double=false;            // bin: write the variables as float64 (precision = double)
 };
 
 //----------------------------------------------------------------------------------------
@@ -195,7 +230,7 @@ struct HistoryData {
 //! \brief data (tag, pos, vel) output for tracked particles
 
 struct TrackedParticleData {
-  int tag;
+  std::uint64_t tag;   // the 64-bit tag of a dust particle
   Real x,y,z;
   Real vx,vy,vz;
 };
@@ -218,6 +253,12 @@ class BaseTypeOutput {
   // data
   OutputParameters out_params;   // params read from <output> block for this type
   DvceArray5D<Real> derived_var; // array to store output variables computed from u0/b0
+  // a bin output of hydro variables in a dust run also writes
+  // dust_total_rho, dust_total_mom1..3 (dust_total_var, DustGasDrag::DepositScienceFields),
+  // unless <outputN>/dust_total = false; auto_dust_note says why a hydro bin output has none
+  bool auto_dust_total = false;
+  std::string auto_dust_note;
+  DvceArray5D<Real> dust_total_var;
 
   // function which computes derived output variables like vorticity and current density
   void ComputeDerivedVariable(std::string name, Mesh *pm);
@@ -365,6 +406,43 @@ class ParticleVTKOutput : public BaseTypeOutput {
   int npout_total;
   HostArray2D<Real> outpart_rdata;
   HostArray2D<int>  outpart_idata;
+};
+
+//----------------------------------------------------------------------------------------
+//! \class ParticleBinaryOutput
+//  \brief derived BaseTypeOutput class for the self-describing particle science file
+//  (pbin): typed columns of the active particles and a small block directory,
+//  one shared file per output written in parallel (pbin.cpp)
+
+class ParticleBinaryOutput : public BaseTypeOutput {
+ public:
+  ParticleBinaryOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
+  void LoadOutputData(Mesh *pm) override;
+  void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+ protected:
+  DvceArray1D<int> active_;          // indices of this rank's active rows (mass != 0)
+  int nactive_ = 0;                  // number of them
+  long long nzero_ = 0;              // zero-mass rows left out (this rank)
+  long long nbad_mass_ = 0;          // rows with a negative or non-finite mass (this rank)
+  long long nneg_tag_ = 0;           // rows with a negative int32 tag (this rank)
+};
+
+//----------------------------------------------------------------------------------------
+//! \class ParticleHistoryOutput
+//  \brief derived BaseTypeOutput class for the dust particle history
+//  (phst): one text row of global particle quantities per output time in <basename>.phst
+
+class ParticleHistoryOutput : public BaseTypeOutput {
+ public:
+  ParticleHistoryOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
+  void LoadOutputData(Mesh *pm) override;
+  void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+ protected:
+  double row_[16] = {0};
+  bool gr_columns_ = false;     // g_groups, r_removed written (runs with G/R; kept by restarts)
+  bool header_written_ = false;
+  bool skip_ = false;           // a second call in the same cycle (dcycle and the final output)
+  long long last_cycle_ = -1;
 };
 
 //----------------------------------------------------------------------------------------

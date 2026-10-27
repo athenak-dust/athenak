@@ -1,0 +1,109 @@
+# Free fall of a cold uniform dust sphere (as dust_freefall_u128.athinput) on an adaptive mesh:
+# root 64^3 with 16^3 blocks and up to two finer levels (256^3 effective), dust density trigger in
+# code units: refine at rho_d >= 6 on the root level (x8 per level: 48 on level 1), derefine
+# below 2 (x8 per level).  The sphere (rho = 3.7) starts on the root level; the first refinement
+# comes at t ~ 0.5 (density 6), the second at t ~ 0.85.  refinable_mode = split_only (cold single
+# stream: no merging or resampling needed).
+# Test: as the uniform runs (freefall_history.jsonl); the Lagrangian radii of the inner shells
+# should follow the 256^3-like accuracy after the refinement.  Runtime: t = 0 -> 0.98, tens of
+# minutes on 32 CPU cores.
+<job>
+basename = FF
+
+<mesh>
+nghost = 4
+nx1 = 64
+x1min = 0.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 64
+x2min = 0.0
+x2max = 1.0
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 64
+x3min = 0.0
+x3max = 1.0
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<mesh_refinement>
+refinement = adaptive
+num_levels = 3
+ncycle_check = 5
+refinement_interval = 10
+max_nmb_per_rank = 1024         # preallocated per rank: scale it down for many ranks
+
+<amr_criterion0>
+method = user                   # the dust density trigger below
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = -1
+tlim = 0.98
+ndiag = 1
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hlle
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+ppc = 1                         # legacy sampling keys (dust_freefall)
+
+<dust>
+nspecies = 1
+taus_1 = 1.0e20                 # no drag
+back_reaction = false
+deposit = tsc
+dt_cfl = 0.3
+coupling = pc2
+amr_pic = refinable_cloud
+refinable_mode = split_only
+amr_density_trigger = true
+amr_rho_units = code
+amr_rho_refine = 6.0
+amr_rho_derefine = 2.0
+amr_rho_level_factor = 8.0
+amr_rho_buffer = 2
+
+<problem>
+pgen_name = dust_freefall
+ff_radius = 0.2
+ff_n = 1
+ff_dt = 0.02
+rho0 = 1.0
+etavk = 0.0
+eps_1 = 0.1                     # the fixture's own clouds, replaced by the sphere
+cloud_root_random = true
+random_seed = 2007
+root_placement = lattice
+dust_test = damping
+dust_test_v0 = 0.0
+check_equilibrium = false
+
+<gravity>
+enabled = true
+source = dust
+kick = dust
+setup = distributed
+solver = multigrid
+four_pi_G = 1.0
+vertical_bc = periodic
+rtol = 1e-10
+max_iterations = 300
+
+<output1>
+file_type = phst
+dt = 0.02

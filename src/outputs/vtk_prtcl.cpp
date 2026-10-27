@@ -18,6 +18,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <utility>
 
 #include "athena.hpp"
 #include "coordinates/cell_locations.hpp"
@@ -47,17 +48,15 @@ void ParticleVTKOutput::LoadOutputData(Mesh *pm) {
   Kokkos::realloc(outpart_rdata, pp->nrdata, npout_thisrank);
   Kokkos::realloc(outpart_idata, pp->nidata, npout_thisrank);
 
-  // Create mirror view on device of host view of output particle real/int data
-  auto d_outpart_rdata = Kokkos::create_mirror_view(Kokkos::DefaultHostExecutionSpace(),
-                                                    outpart_rdata);
-  auto d_outpart_idata = Kokkos::create_mirror_view(Kokkos::DefaultHostExecutionSpace(),
-                                                    outpart_idata);
-  // Copy particle positions into device mirrors
-  Kokkos::deep_copy(d_outpart_rdata, pp->prtcl_rdata);
-  Kokkos::deep_copy(d_outpart_idata, pp->prtcl_idata);
-  // Copy particle positions from device mirror to host output array
-  Kokkos::deep_copy(outpart_rdata, d_outpart_rdata);
-  Kokkos::deep_copy(outpart_idata, d_outpart_idata);
+  // Copy the live particles to the host output arrays.  The particle arrays may be longer than
+  // the live particles (the 25% headroom of the dust splits and of the particle exchange), so
+  // the whole arrays come to the host first and the first npout_thisrank columns are taken
+  // there (a strided device subview cannot be copied to host memory directly).
+  auto h_rdata = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pp->prtcl_rdata);
+  auto h_idata = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pp->prtcl_idata);
+  const auto live = std::make_pair(0, npout_thisrank);
+  Kokkos::deep_copy(outpart_rdata, Kokkos::subview(h_rdata, Kokkos::ALL, live));
+  Kokkos::deep_copy(outpart_idata, Kokkos::subview(h_idata, Kokkos::ALL, live));
 }
 
 //----------------------------------------------------------------------------------------
@@ -185,7 +184,11 @@ void ParticleVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   bool have_written_pointdata_header = false;
 
   // Write gid of points
+  // the dust tag is 64-bit (words PTAG, PTAGH); ptag holds its float32 value (exact
+  // below 2^24, as before), and PTAGH is not written as a column of its own
+  const bool hiword = (pm->pmb_pack->ppart->nidata > PTAGH);
   for (int n=0; n<(pm->pmb_pack->ppart->nidata); ++n) {
+    if (hiword && n == static_cast<int>(PTAGH)) continue;
     std::stringstream msg;
 
     if (!have_written_pointdata_header) {
@@ -211,8 +214,14 @@ void ParticleVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     header_offset += msg.str().size();
 
     // Loop over particles, load gid into data[]
-    for (int p=0; p<npout_thisrank; ++p) {
-      data[p] = static_cast<float>(outpart_idata(n,p));
+    if (hiword && n == static_cast<int>(PTAG)) {
+      for (int p=0; p<npout_thisrank; ++p) {
+        data[p] = static_cast<float>(TagFromWords(outpart_idata(PTAG,p), outpart_idata(PTAGH,p)));
+      }
+    } else {
+      for (int p=0; p<npout_thisrank; ++p) {
+        data[p] = static_cast<float>(outpart_idata(n,p));
+      }
     }
     // swap data for this variable into big endian order
     if (!big_end) {

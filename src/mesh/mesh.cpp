@@ -20,11 +20,13 @@
 #include "coordinates/cell_locations.hpp"
 #include "refinement_criteria.hpp"
 #include "hydro/hydro.hpp"
+#include "gravity/self_gravity.hpp"
 #include "mhd/mhd.hpp"
 #include "z4c/z4c.hpp"
 #include "diffusion/viscosity.hpp"
 #include "diffusion/resistivity.hpp"
 #include "diffusion/conduction.hpp"
+#include "dust/dust_input.hpp"
 #include "radiation/radiation.hpp"
 #include "particles/particles.hpp"
 #include "srcterms/srcterms.hpp"
@@ -54,6 +56,9 @@ Mesh::Mesh(ParameterInput *pin) :
   dtold(0.),
   dt_last_completed(0.),
   nmb_packs_thisrank(1) {
+  // Native restart serializes the complete root index record, including coarse
+  // fields which are unused at root level. Give those bytes deterministic values.
+  mesh_indcs = RegionIndcs{};
   // Set physical size and number of cells in mesh (root level)
   mesh_size.x1min = pin->GetReal("mesh", "x1min");
   mesh_size.x1max = pin->GetReal("mesh", "x1max");
@@ -177,11 +182,34 @@ Mesh::Mesh(ParameterInput *pin) :
   multilevel = (adaptive || pin->GetString("mesh_refinement","refinement") == "static")
     ?  true : false;
 
-  // FIXME: The shearing box is not currently compatible with SMR/AMR
-  if (multilevel && pin->DoesBlockExist("shearing_box")) {
+  // Shearing box with mesh refinement: in 3-D (shear-periodic x1) hydro, or dust
+  // (refinable clouds or owner_overlap; the dust module checks the rest), no MHD and no other
+  // particles; in 2-D (the r-z shearing box, local source terms) only dust with periodic
+  // boundaries.  A non-dust 2-D input keeps the original fail-closed behaviour.
+  if (global_variable::my_rank == 0 && pin->DoesBlockExist("shearing_box")) {
+    dust::NoteDroppedKey(pin, "shearing_box", "experimental_smr",
+                         "a 3-D shearing box admits mesh refinement");
+    dust::NoteDroppedKey(pin, "shearing_box", "experimental_face_levels",
+                         "the x1-face blocks may always change level along x2");
+    dust::NoteDroppedKey(pin, "shearing_box", "experimental_shear_flux_skip",
+                         "always on with refinement");
+    dust::NoteDroppedKey(pin, "shearing_box", "experimental_oa_flux_correct", "always on");
+    dust::NoteDroppedKey(pin, "shearing_box", "experimental_coarse_shear",
+                         "always on with refinement");
+  }
+  if (multilevel && pin->DoesBlockExist("shearing_box") && three_d &&
+      (pin->DoesBlockExist("mhd") ||
+       (pin->DoesBlockExist("particles") && !pin->DoesBlockExist("dust")))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-        << "Shearing box is not currently compatible with mesh refinement"
-        << std::endl;
+              << "3-D shearing box with mesh refinement: hydro, or hydro with dust (no MHD, "
+              << "no other particles)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (multilevel && pin->DoesBlockExist("shearing_box") && !three_d &&
+      !(pin->DoesBlockExist("dust") && two_d && strictly_periodic)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Shearing box with mesh refinement in 2-D: only the r-z "
+              << "shearing box with dust and periodic boundaries" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
@@ -627,6 +655,10 @@ void Mesh::NewTimeStep(const Real tlim) {
     dt = std::min(dt, (cfl_no)*(pmb_pack->prad->dtnew) );
   }
   // Particles timestep
+  if (pmb_pack->pgrav != nullptr) {
+    // Gravity dtnew already includes its own acceleration/free-fall safety factor.
+    dt = std::min(dt, pmb_pack->pgrav->dtnew);
+  }
   if (pmb_pack->ppart != nullptr) {
     dt = std::min(dt, (pmb_pack->ppart->dtnew) );
   }

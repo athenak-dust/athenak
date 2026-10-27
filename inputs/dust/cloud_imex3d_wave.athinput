@@ -1,0 +1,71 @@
+# Three-dimensional refinable-cloud IMEX2+ damped wave, no gravity or rotation.
+# The root lattice is shared by the uniform and refined-region controls.
+<job>
+basename = cloud_imex3d_wave
+<mesh>
+nghost = 4
+nx1 = 16
+nx2 = 8
+nx3 = 8
+x1min = -0.5
+x1max = 0.5
+x2min = -0.25
+x2max = 0.25
+x3min = -0.25
+x3max = 0.25
+ix1_bc = periodic
+ox1_bc = periodic
+ix2_bc = periodic
+ox2_bc = periodic
+ix3_bc = periodic
+ox3_bc = periodic
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+<time>
+evolution = dynamic
+integrator = imex2+
+cfl_number = 0.2
+tlim = 0.1
+ndiag = 100
+<hydro>
+eos = isothermal
+iso_sound_speed = 1
+reconstruct = wenoz
+rsolver = hlle
+<particles>
+particle_type = dust
+pusher = imex_dust
+ppc = 1
+<dust>
+coupling = imex
+nspecies = 1
+taus_1 = 0.1
+back_reaction = true
+deposit = tsc
+drag_solver = local
+experimental_static_smr = true
+experimental_3d = true
+experimental_mpi = true
+experimental_smr_transfer = refinable_cloud
+cloud_gather_order = 2
+cloud_transition = 2
+cloud_split_device = true
+cloud_split_overlap = true
+cloud_p1_split = true
+cloud_merge = false
+cloud_resample = false
+<problem>
+pgen_name = dust_nsh
+user_hist = true
+rho0 = 1
+eps_1 = 1
+cloud_root_random = true
+root_placement = lattice
+dust_test = wave
+amp = 1e-6
+<output1>
+file_type = hst
+dt = 0.1
+data_format = %.16e

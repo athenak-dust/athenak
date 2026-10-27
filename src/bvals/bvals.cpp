@@ -9,6 +9,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <utility>
 #include <algorithm> // max
 #include <map>
@@ -447,6 +448,7 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
     send_count("send_count",1),
     sgid_map("sgid_map",1,1,1),
     srank_map("srank_map",1,1,1),
+    x3_removed("x3_removed",2),
 #if MPI_PARALLEL_ENABLED
     prtcl_rsendbuf("rsend",1),
     prtcl_rrecvbuf("rrecv",1),
@@ -472,36 +474,78 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
   shear_periodic_x1 =
       (pp->particle_type == ParticleType::dust) &&
       (pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic);
-  if (shear_periodic_x1) {
-    if (pmesh->multilevel) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "Particles with shear-periodic boundaries do not "
-                << "support SMR/AMR" << std::endl;
+  // dust at non-periodic x3 faces of a 3-D mesh: <dust>/particle_x3_bc
+  // (default reflect at a reflecting gas boundary, outflow otherwise)
+  if (pp->particle_type == ParticleType::dust && pmesh->three_d &&
+      pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic) {
+    const bool gas_reflect = (pmesh->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::reflect);
+    const std::string b = pin->GetOrAddString("dust", "particle_x3_bc",
+                                              gas_reflect ? "reflect" : "outflow");
+    if (b == "reflect") {
+      x3bc_dust = 1;
+    } else if (b == "outflow") {
+      x3bc_dust = 2;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<dust>/particle_x3_bc must be reflect or outflow" << std::endl;
       std::exit(EXIT_FAILURE);
     }
+  }
+  Kokkos::deep_copy(x3_removed.h_view, 0.0);
+  Kokkos::deep_copy(x3_removed.d_view, 0.0);
+  if (shear_periodic_x1) {
     qshear_sp = pin->GetReal("shearing_box","qshear");
     omega0_sp = pin->GetReal("shearing_box","omega0");
-    auto &mindcs = pmesh->mesh_indcs;
-    auto &bindcs = pmesh->mb_indcs;
-    int nmbx1 = mindcs.nx1/bindcs.nx1;
-    nmb_sp_x2 = std::max(mindcs.nx2/bindcs.nx2, 1);
-    nmb_sp_x3 = std::max(mindcs.nx3/bindcs.nx3, 1);
-    sgid_map = DualArray3D<int>("sgid_map", 2, nmb_sp_x3, nmb_sp_x2);
-    srank_map = DualArray3D<int>("srank_map", 2, nmb_sp_x3, nmb_sp_x2);
-    for (int m=0; m<(pmesh->nmb_total); ++m) {
-      auto &ll = pmesh->lloc_eachmb[m];
-      if (ll.lx1 == 0) {                // MeshBlocks at the inner x1 boundary
-        sgid_map.h_view(0,ll.lx3,ll.lx2) = m;
-        srank_map.h_view(0,ll.lx3,ll.lx2) = pmesh->rank_eachmb[m];
-      }
-      if (ll.lx1 == (nmbx1-1)) {        // MeshBlocks at the outer x1 boundary
-        sgid_map.h_view(1,ll.lx3,ll.lx2) = m;
-        srank_map.h_view(1,ll.lx3,ll.lx2) = pmesh->rank_eachmb[m];
+    BuildShearMaps();
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void ParticlesBoundaryValues::BuildShearMaps()
+//! \brief The (side, x3, x2) -> gid/rank maps of the MeshBlocks at the two shear-periodic x1
+//! faces, used to route particles that cross them.  On a mesh
+//! with refinement the maps are at the granularity of the blocks of the finest level (every face
+//! block fills the entries it covers; a table of the face blocks, not of cells).  Called by the
+//! constructor and again by the dust module after every regrid.
+
+void particles::ParticlesBoundaryValues::BuildShearMaps() {
+  Mesh *pmesh = pmy_part->pmy_pack->pmesh;
+  const int nl = pmesh->multilevel ? (pmesh->max_level - pmesh->root_level) : 0;
+  nmb_sp_x2 = std::max(pmesh->nmb_rootx2, 1) << nl;
+  nmb_sp_x3 = pmesh->three_d ? (std::max(pmesh->nmb_rootx3, 1) << nl) : 1;
+  sgid_map = DualArray3D<int>("sgid_map", 2, nmb_sp_x3, nmb_sp_x2);
+  srank_map = DualArray3D<int>("srank_map", 2, nmb_sp_x3, nmb_sp_x2);
+  Kokkos::deep_copy(sgid_map.h_view, -1);
+  for (int m=0; m<(pmesh->nmb_total); ++m) {
+    auto &ll = pmesh->lloc_eachmb[m];
+    const int sh = nl - (ll.level - pmesh->root_level);
+    const std::int32_t nmbx1 = pmesh->nmb_rootx1 << (ll.level - pmesh->root_level);
+    const int w2 = 1 << sh, w3 = pmesh->three_d ? (1 << sh) : 1;
+    for (int side=0; side<2; ++side) {
+      if (!((side == 0 && ll.lx1 == 0) || (side == 1 && ll.lx1 == nmbx1 - 1))) continue;
+      const int b2 = static_cast<int>(ll.lx2) << sh;
+      const int b3 = pmesh->three_d ? (static_cast<int>(ll.lx3) << sh) : 0;
+      for (int c=b3; c<b3 + w3; ++c) {
+        for (int b=b2; b<b2 + w2; ++b) {
+          sgid_map.h_view(side,c,b) = m;
+          srank_map.h_view(side,c,b) = pmesh->rank_eachmb[m];
+        }
       }
     }
-    Kokkos::deep_copy(sgid_map.d_view, sgid_map.h_view);
-    Kokkos::deep_copy(srank_map.d_view, srank_map.h_view);
   }
+  for (int side=0; side<2; ++side) {
+    for (int c=0; c<nmb_sp_x3; ++c) {
+      for (int b=0; b<nmb_sp_x2; ++b) {
+        if (sgid_map.h_view(side,c,b) < 0) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << "shear-periodic particle map: x1 face not covered by MeshBlocks" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+      }
+    }
+  }
+  Kokkos::deep_copy(sgid_map.d_view, sgid_map.h_view);
+  Kokkos::deep_copy(srank_map.d_view, srank_map.h_view);
 }
 
 //----------------------------------------------------------------------------------------

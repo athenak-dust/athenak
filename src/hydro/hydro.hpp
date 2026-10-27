@@ -102,10 +102,21 @@ class Hydro {
   // following used for FOFC
   DvceArray4D<bool> fofc;  // flag for each cell to indicate if FOFC is needed
   bool use_fofc = false;   // flag to enable FOFC
+  // x2 fluxes: one team per row of faces (m, k, j), which reconstructs the two rows next to
+  // the face itself, instead of one team per (m, k) that walks j and reuses the left states
+  // (on a GPU the walk leaves most of the device idle; the x2 flux was 5x slower than x1)
+  bool x2_face_parallel = false;
+#ifdef ATHENAK_HYDRO_FLUX_PROBE
+  // diagnostic: x1 face states and fluxes of MeshBlock 0, row (ks,js),
+  // written to flux_probe.txt for every stage of the first probe_ncycle cycles
+  int probe_ncycle = 0;
+  DvceArray2D<Real> probe;  // (6, ncells1): wl_d, wl_vx, wr_d, wr_vx, F_mass, F_mom1
+#endif
   DvceArray5D<Real> utest;  // scratch array for FOFC
 
   // container to hold names of TaskIDs
   HydroTaskIDs id;
+  bool flux_unpacked = false;   // the flux correction of this stage is already unpacked
 
   // functions...
   void AssembleHydroTasks(std::map<std::string, std::shared_ptr<TaskList>> tl);

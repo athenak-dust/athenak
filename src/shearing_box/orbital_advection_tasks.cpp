@@ -35,7 +35,7 @@ TaskStatus OrbitalAdvection::InitRecv() {
       // indices of x2-face buffers in nghbr view
       int nnghbr;
       if (n==0) {nnghbr=8;} else {nnghbr=12;}
-      if (nghbr.h_view(m,nnghbr).gid >= 0) {
+      if (nghbr.h_view(m,nnghbr).gid >= 0 && xlev.h_view(m,n) == 0) {
         // rank of neighboring MeshBlock sending data
         int srank = nghbr.h_view(m,nnghbr).rank;
 
@@ -53,6 +53,43 @@ TaskStatus OrbitalAdvection::InitRecv() {
           int ierr = MPI_Irecv(recv_ptr.data(), data_size, MPI_ATHENA_REAL, srank, tag,
                                comm_orb_advect, &(recvbuf[n].vars_req[m]));
           if (ierr != MPI_SUCCESS) {no_errors=false;}
+        }
+      }
+    }
+  }
+  // x2 faces with a level change: the rows from a coarser neighbour (into the
+  // receive buffer itself), from four finer neighbours (one message each) and their fluxes
+  if (any_mixed) {
+    const int my_rank = global_variable::my_rank;
+    const int nk = pmy_pack->pmesh->mb_indcs.nx3, ni = pmy_pack->pmesh->mb_indcs.nx1;
+    const int sfc = nvar_oa*(nk/2)*nrow*(ni/2), sff = nvar_oa*(nk/2)*(ni/2);
+    for (int m=0; m<nmb; ++m) {
+      for (int n=0; n<2; ++n) {
+        const int base = (n == 0) ? 8 : 12;
+        if (xlev.h_view(m,n) == 1) {
+          const int slot = xslot.h_view(m,n);
+          const int srank = nghbr.h_view(m,slot).rank;
+          if (srank != my_rank) {
+            using Kokkos::ALL;
+            auto recv_ptr = Kokkos::subview(recvbuf[n].vars, m, ALL, ALL, ALL, ALL);
+            int ierr = MPI_Irecv(recv_ptr.data(), recv_ptr.size(), MPI_ATHENA_REAL, srank,
+                                 CreateBvals_MPI_Tag(m, slot), comm_orb_advect,
+                                 &(mrreq[n][4*m]));
+            if (ierr != MPI_SUCCESS) {no_errors=false;}
+          }
+        } else if (xlev.h_view(m,n) == 2) {
+          for (int sf=0; sf<4; ++sf) {
+            const int srank = nghbr.h_view(m,base+sf).rank;
+            if (srank == my_rank) continue;
+            int ierr = MPI_Irecv(Kokkos::subview(mrecv[n], m, sf, Kokkos::ALL).data(), sfc,
+                                 MPI_ATHENA_REAL, srank, CreateBvals_MPI_Tag(m, base+sf),
+                                 comm_orb_advect, &(mrreq[n][4*m+sf]));
+            if (ierr != MPI_SUCCESS) {no_errors=false;}
+            ierr = MPI_Irecv(Kokkos::subview(frecv[n], m, sf, Kokkos::ALL).data(), sff,
+                             MPI_ATHENA_REAL, srank, CreateBvals_MPI_Tag(m, 16+base+sf),
+                             comm_orb_advect, &(frreq[n][4*m+sf]));
+            if (ierr != MPI_SUCCESS) {no_errors=false;}
+          }
         }
       }
     }
@@ -84,10 +121,19 @@ TaskStatus OrbitalAdvection::ClearRecv() {
       // indices of x2-face buffers in nghbr view
       int nnghbr;
       if (n==0) {nnghbr=8;} else {nnghbr=12;}
-      if ( (nghbr.h_view(m,nnghbr).gid >= 0) &&
+      if ( (nghbr.h_view(m,nnghbr).gid >= 0) && xlev.h_view(m,n) == 0 &&
            (nghbr.h_view(m,nnghbr).rank != global_variable::my_rank) ) {
         int ierr = MPI_Wait(&(recvbuf[n].vars_req[m]), MPI_STATUS_IGNORE);
         if (ierr != MPI_SUCCESS) {no_errors=false;}
+      }
+    }
+  }
+  // the mixed-level receives (null requests return at once)
+  if (any_mixed) {
+    for (int n=0; n<2; ++n) {
+      for (int r=0; r<4*nmb; ++r) {
+        if (MPI_Wait(&(mrreq[n][r]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
+        if (MPI_Wait(&(frreq[n][r]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
       }
     }
   }
@@ -118,10 +164,19 @@ TaskStatus OrbitalAdvection::ClearSend() {
       // indices of x2-face buffers in nghbr view
       int nnghbr;
       if (n==0) {nnghbr=8;} else {nnghbr=12;}
-      if ( (nghbr.h_view(m,nnghbr).gid >= 0) &&
+      if ( (nghbr.h_view(m,nnghbr).gid >= 0) && xlev.h_view(m,n) == 0 &&
            (nghbr.h_view(m,nnghbr).rank != global_variable::my_rank) ) {
         int ierr = MPI_Wait(&(sendbuf[n].vars_req[m]), MPI_STATUS_IGNORE);
         if (ierr != MPI_SUCCESS) {no_errors=false;}
+      }
+    }
+  }
+  // the mixed-level sends
+  if (any_mixed) {
+    for (int n=0; n<2; ++n) {
+      for (int r=0; r<4*nmb; ++r) {
+        if (MPI_Wait(&(msreq[n][r]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
+        if (MPI_Wait(&(fsreq[n][r]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
       }
     }
   }

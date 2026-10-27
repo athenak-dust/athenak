@@ -122,6 +122,7 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
 
     auto &w0 = pmbp->phydro->w0;
     auto &nscal = pmbp->phydro->nscalars;
+    bool ideal = eos.is_ideal;   // isothermal primitives have no IEN slot
     auto shk_dir_ = shk_dir;
     par_for("pgen_shock1", DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(int m,int k, int j, int i) {
@@ -149,7 +150,7 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
         w0(m,ivx,k,j,i) = wl.vx*u0l;
         w0(m,ivy,k,j,i) = wl.vy*u0l;
         w0(m,ivz,k,j,i) = wl.vz*u0l;
-        w0(m,IEN,k,j,i) = wl.e;
+        if (ideal) w0(m,IEN,k,j,i) = wl.e;
         for (int r=0; r<nscal; ++r) {
           w0(m,IYF+r,k,j,i) = yl;
         }
@@ -158,7 +159,7 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
         w0(m,ivx,k,j,i) = wr.vx*u0r;
         w0(m,ivy,k,j,i) = wr.vy*u0r;
         w0(m,ivz,k,j,i) = wr.vz*u0r;
-        w0(m,IEN,k,j,i) = wr.e;
+        if (ideal) w0(m,IEN,k,j,i) = wr.e;
         for (int r=0; r<nscal; ++r) {
           w0(m,IYF+r,k,j,i) = yr;
         }

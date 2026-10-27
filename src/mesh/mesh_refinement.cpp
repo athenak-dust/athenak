@@ -17,6 +17,7 @@
 #include <cmath>     // abs
 #include <algorithm> // sort
 #include <utility>   // pair
+#include <vector>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -26,11 +27,15 @@
 #include "refinement_criteria.hpp"
 
 #include "hydro/hydro.hpp"
+#include "shearing_box/shearing_box.hpp"
+#include "shearing_box/orbital_advection.hpp"
+#include "dust/dust.hpp"
 #include "mhd/mhd.hpp"
 #include "radiation/radiation.hpp"
 #include "coordinates/adm.hpp"
 #include "z4c/z4c.hpp"
 #include "z4c/z4c_amr.hpp"
+#include "gravity/self_gravity.hpp"
 #include "prolongation.hpp"
 #include "restriction.hpp"
 
@@ -65,6 +70,19 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
     // read prolongate primitives flag
     if (pin->DoesParameterExist("mesh_refinement", "prolong_primitives")) {
       prolong_prims = pin->GetBoolean("mesh_refinement", "prolong_primitives");
+    }
+    prolong_amp_eps = pin->GetOrAddReal("mesh_refinement", "prolong_amplitude_eps", 0.0);
+    coarse_physical_bcs = pin->GetOrAddBoolean("mesh_refinement", "coarse_physical_bcs", true);
+    if (prolong_amp_eps > 0.0) {
+      if (pm->adaptive || prolong_prims) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<mesh_refinement>/prolong_amplitude_eps (diagnostic) is "
+                  << "wired only into the static-mesh ghost prolongation of conserved "
+                  << "hydro variables (no AMR, no prolong_primitives)" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      prolong_amp_count = DvceArray1D<int64_t>("prolong_amp_count", 30);
+      Kokkos::deep_copy(prolong_amp_count, 0);
     }
   }
 
@@ -148,14 +166,49 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
 
   // Refine/derefine mesh and evolved data, set boundary conditions/timestep on new mesh
   if (nnew != 0 || ndel != 0) { // at least one (de)refinement flagged
-    RedistAndRefineMeshBlocks(pin, nnew, ndel);
+    if (pmy_mesh->pmb_pack->pdust != nullptr) pmy_mesh->pmb_pack->pdust->BeforeRegrid(nnew, ndel);
+    {
+      auto *pd = pmy_mesh->pmb_pack->pdust;   // dust profile timer (counters on the pack)
+      double dummy_t = 0.0; long long dummy_c = 0;
+      ProfTimer pt(pd ? pd->prof_time[pd->kProfRegridMesh] : dummy_t,
+                         pd ? pd->prof_count[pd->kProfRegridMesh] : dummy_c);
+      RedistAndRefineMeshBlocks(pin, nnew, ndel);
+      if (pmy_mesh->stop_max_nmb) return;   // (dropped: the run stops, see there)
 
-    // Mark one mesh-topology update event (AMR and any resulting load balancing).
-    pmy_mesh->MarkMeshUpdated();
+      // Mark one mesh-topology update event (AMR and any resulting load balancing).
+      pmy_mesh->MarkMeshUpdated();
 
-    pdriver->InitBoundaryValuesAndPrimitives(pmy_mesh);
+      // the shearing box lists of x1-face blocks and its buffers on the new
+      // mesh, before the boundary values are exchanged again
+      if (pmy_mesh->pmb_pack->phydro != nullptr &&
+          pmy_mesh->pmb_pack->phydro->psbox_u != nullptr) {
+        auto *ps = pmy_mesh->pmb_pack->phydro->psbox_u;
+        ps->BuildBoundaryLists();
+        ps->AllocateBuffers();
+      }
+      // the orbital advection's x2 faces with a level change
+      if (pmy_mesh->pmb_pack->phydro != nullptr &&
+          pmy_mesh->pmb_pack->phydro->porb_u != nullptr) {
+        pmy_mesh->pmb_pack->phydro->porb_u->BuildMixedLists();
+      }
+
+      pdriver->InitBoundaryValuesAndPrimitives(pmy_mesh);
+    }
 
     MeshBlockPack* pmbp = pmy_mesh->pmb_pack;
+    // dust on the new mesh: leaf maps, PGID, particle time step.  Done
+    // here and not at the next cycle because outputs may follow the last regrid of a run.
+    if (pmbp->pdust != nullptr) {
+      auto *pd = pmbp->pdust;
+      ProfTimer pt(pd->prof_time[pd->kProfRebuild], pd->prof_count[pd->kProfRebuild]);
+      pmbp->pdust->RebuildAfterRegrid(pdriver, pin);
+    }
+    // Gravity sources may consume dust on the new leaves. Complete the particle
+    // routing/representation rebuild before invalidating and sampling the field.
+    if (pmbp->pgrav != nullptr) {
+      pmbp->pgrav->Invalidate();
+      pmbp->pgrav->Solve(pmy_mesh->time);
+    }
     if (pmbp->phydro != nullptr) {
       (void) pmbp->phydro->NewTimeStep(pdriver, pdriver->nexp_stages);
     }
@@ -466,15 +519,44 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   new_nmb_eachrank = new int[global_variable::nranks];
 
   for (int i=0; i<new_nmb; i++) {new_cost_eachmb[i] = 1.0;}
+  // dust: the clouds of each block in the cost (<dust>/load_balance_cloud_weight)
+  if (pm->pmb_pack->pdust != nullptr) {
+    pm->pmb_pack->pdust->RegridCosts(newtoold, new_lloc_eachmb, new_nmb, new_cost_eachmb);
+  }
   pm->LoadBalance(new_cost_eachmb, new_rank_eachmb, new_gids_eachrank, new_nmb_eachrank,
                   new_nmb_total);
-  if (new_nmb_eachrank[global_variable::my_rank] > pm->nmb_maxperrank) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-        << "Number of MeshBlocks in this rank on new tree = "
-        << new_nmb_eachrank[global_variable::my_rank] << " on rank = "
-        << global_variable::my_rank <<" exceeds <mesh_refinement>/max_nmb_per_rank = "
-        << pm->nmb_maxperrank << std::endl;
-    std::exit(EXIT_FAILURE);
+  // more MeshBlocks on some rank than max_nmb_per_rank (the
+  // arrays are allocated for that many): instead of exiting at once, every rank (the counts are
+  // the same everywhere) drops this regrid, keeps the old mesh and its data (nothing of the Mesh
+  // has changed yet; the tree is not used again) and asks the driver to stop, which writes the
+  // final outputs, a restart file among them.  Restart with a larger max_nmb_per_rank.
+  {
+    int worst = 0, worst_rank = 0;
+    for (int r=0; r<global_variable::nranks; ++r) {
+      if (new_nmb_eachrank[r] > worst) {worst = new_nmb_eachrank[r]; worst_rank = r;}
+    }
+    if (worst > pm->nmb_maxperrank) {
+      if (global_variable::my_rank == 0) {
+        std::cout << "### WARNING in " << __FILE__ << " at line " << __LINE__ << std::endl
+            << "cycle " << pm->ncycle << ": the new tree would put " << worst
+            << " MeshBlocks on rank " << worst_rank << ", more than <mesh_refinement>/"
+            << "max_nmb_per_rank = " << pm->nmb_maxperrank << "; the regrid is dropped and the "
+            << "run stops with its outputs (restart file): restart with a larger value"
+            << std::endl;
+      }
+      delete [] new_lloc_eachmb; delete [] newtoold; delete [] oldtonew;
+      delete [] new_cost_eachmb; delete [] new_rank_eachmb; delete [] new_gids_eachrank;
+      delete [] new_nmb_eachrank;
+      new_lloc_eachmb = nullptr; newtoold = nullptr; oldtonew = nullptr;
+      new_cost_eachmb = nullptr; new_rank_eachmb = nullptr; new_gids_eachrank = nullptr;
+      new_nmb_eachrank = nullptr;
+      // undo this cycle's age
+      // increment of CheckForRefinement: the restart file stores the ages, and the pending check
+      // replayed after the restart increments them again (else the replay sees ages one too high)
+      for (int m=0; m<pm->nmb_total; ++m) {ncyc_since_ref(m) -= 1;}
+      pm->stop_max_nmb = true;
+      return;
+    }
   }
 
   // UpdateMeshBlockTree function can refine/de-refine MBs to ensure resolution jump is

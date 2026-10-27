@@ -38,6 +38,21 @@ set(PROBLEM built_in_pgens CACHE STRING "Name of problem generator function")
 
 #------ set macros exported to config.hpp ------------------------------------------------
 
+# source revision recorded in self-describing outputs (e.g. pbin headers); taken when
+# CMake configures the build (re-run cmake to refresh it after a checkout)
+set(ATHENA_SOURCE_COMMIT "unknown")
+find_package(Git QUIET)
+if (GIT_FOUND)
+  execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty --abbrev=12 --exclude=*
+                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                  OUTPUT_VARIABLE ATHENA_GIT_DESCRIBE
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+                  RESULT_VARIABLE ATHENA_GIT_RESULT)
+  if (ATHENA_GIT_RESULT EQUAL 0 AND NOT "${ATHENA_GIT_DESCRIBE}" STREQUAL "")
+    set(ATHENA_SOURCE_COMMIT "${ATHENA_GIT_DESCRIBE}")
+  endif()
+endif()
+
 # set single precision macro (true/false)
 if (Athena_SINGLE_PRECISION)
   set(SINGLE_PRECISION_ENABLED 1)
@@ -249,6 +264,46 @@ target_include_directories(athena PUBLIC
 )
 
 configure_file(config.hpp.in config.hpp)
+
+# Explicit, lightweight numerical regression target; omitted from normal builds.
+add_executable(gravity_geometry_check EXCLUDE_FROM_ALL
+  tst/test_suite/gravity/geometry_manufactured.cpp
+  src/gravity/mesh_geometry.cpp src/gravity/composite.cpp src/gravity/vacuum_mesh.cpp)
+target_include_directories(gravity_geometry_check PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(gravity_geometry_check PRIVATE Kokkos::kokkos)
+if (ENABLE_MPI)
+  target_link_libraries(gravity_geometry_check PRIVATE MPI::MPI_CXX)
+endif()
+
+add_executable(gravity_coarse_check EXCLUDE_FROM_ALL
+  tst/test_suite/gravity/coarse_grid.cpp
+  src/gravity/sparse_mg.cpp src/gravity/geometric_mg.cpp
+  src/gravity/mesh_geometry.cpp src/gravity/composite.cpp src/gravity/vacuum_mesh.cpp)
+target_include_directories(gravity_coarse_check PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(gravity_coarse_check PRIVATE Kokkos::kokkos)
+if (ENABLE_MPI)
+  target_link_libraries(gravity_coarse_check PRIVATE MPI::MPI_CXX)
+endif()
+
+add_executable(gravity_slab_window_check EXCLUDE_FROM_ALL
+  tst/test_suite/gravity/slab_window.cpp src/gravity/slab_boundary.cpp src/globals.cpp)
+target_include_directories(gravity_slab_window_check PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(gravity_slab_window_check PRIVATE Kokkos::kokkos)
+if (ENABLE_MPI)
+  target_link_libraries(gravity_slab_window_check PRIVATE MPI::MPI_CXX)
+endif()
+
+add_executable(gravity_solver_scaling_check EXCLUDE_FROM_ALL
+  tst/test_suite/gravity/solver_scaling.cpp src/gravity/sparse_mg.cpp)
+target_include_directories(gravity_solver_scaling_check PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(gravity_solver_scaling_check PRIVATE Kokkos::kokkos)
+if (ENABLE_MPI)
+  target_link_libraries(gravity_solver_scaling_check PRIVATE MPI::MPI_CXX)
+endif()
 
 install( TARGETS athena DESTINATION bin )
 

@@ -18,12 +18,16 @@
 #include "mesh/mesh.hpp"
 #include "outputs/outputs.hpp"
 #include "hydro/hydro.hpp"
+#include "eos/eos.hpp"
 #include "mhd/mhd.hpp"
 #include "z4c/z4c.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "ion-neutral/ion-neutral.hpp"
 #include "radiation/radiation.hpp"
 #include "driver.hpp"
+#include "dust/dust.hpp"
+#include "gravity/self_gravity.hpp"
+#include "gravity/restart.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
@@ -60,6 +64,8 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
   tlim(-1.0),
   nlim(-1),
   ndiag(1),
+  nimp_stages(0),
+  nexp_stages(0),
   pwall_clock_(ptimer),
   wall_time(wtlim),
   nmb_updated_(0),
@@ -312,6 +318,16 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   //---- Step 1.  Set conserved variables in ghost zones for all physics
   InitBoundaryValuesAndPrimitives(pmesh);
 
+  // A restarted dynamic dust mesh gets its cooldown ages back and redoes the mesh check
+  // that followed the outputs of the restart cycle, before the time step; refinable
+  // clouds get their MeshBlock ids from their positions (any mesh)
+  if (res_flag) gravity::ResumeRestart(pmesh, this, pin);
+  // Phi is a derived elliptic field. Recompute from the restored density and
+  // physical time; never carry a pre-regrid potential or an old shear phase.
+  if (pmesh->pmb_pack->pgrav != nullptr) {
+    pmesh->pmb_pack->pgrav->Solve(pmesh->time);
+  }
+
   //---- Step 2.  Compute time step (if problem involves time evolution)
   hydro::Hydro *phydro = pmesh->pmb_pack->phydro;
   mhd::MHD *pmhd = pmesh->pmb_pack->pmhd;
@@ -387,28 +403,98 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       elapsed_time = UpdateWallClock();
     }
     while ((pmesh->time < tlim) && (pmesh->ncycle < nlim || nlim < 0) &&
-           (elapsed_time < wall_time)) {
+           (elapsed_time < wall_time) && !pmesh->stop_max_nmb) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
+
+      // Problem work may change density (e.g. Li2018 mass normalization).
+      // Apply it before gravity samples the source or performs either kick.
+      if (pmesh->pgen->user_work_in_loop_func != nullptr) {
+        (pmesh->pgen->user_work_in_loop_func)(pmesh);
+      }
+
+      // Symmetric gravity split around hydro, with symmetric orbital halfsteps
+      // for gravity-enabled 3D boxes. The gravity-disabled task path is unchanged.
+      // Checkpoints occur only after both half-kicks. The kick leaves density and
+      // internal energy unchanged; primitives and ghost values must be refreshed.
+      auto *pgrav = pmesh->pmb_pack->pgrav;
+      const bool matter_prepared = pgrav != nullptr && pmesh->pmb_pack->pdust != nullptr;
+      if (matter_prepared) ExecuteTaskList(pmesh, "before_timeintegrator", 0);
+      if (pgrav != nullptr) {
+        if (pgrav->UsesOrbitalSplit()) pgrav->SetHydroBoundaryTime(pmesh->time);
+        pgrav->Solve(pmesh->time);
+        // the shear-phase host assembly for the closing solve overlaps the step
+        pgrav->PrefetchPhase(pmesh->time + pmesh->dt);
+        pgrav->BeginEnergyStep();   // energy_source = flux / diag; else no-op
+        pgrav->KickMatter(0.5*pmesh->dt);
+        InitBoundaryValuesAndPrimitives(pmesh);
+        if (pgrav->UsesOrbitalSplit()) {
+          pgrav->OrbitalStep(0.5*pmesh->dt);
+          pgrav->SetHydroBoundaryTime(pmesh->time+0.5*pmesh->dt);
+          InitBoundaryValuesAndPrimitives(pmesh);
+        }
+      }
 
       // Execute TaskLists
       // Work before time integrator indicated by "0" in stage
-      ExecuteTaskList(pmesh, "before_timeintegrator", 0);
+      if (!matter_prepared) ExecuteTaskList(pmesh, "before_timeintegrator", 0);
+
+      const int gravity_dfloor = pmesh->ecounter.neos_dfloor;
+      const int gravity_efloor = pmesh->ecounter.neos_efloor;
+      const int gravity_tfloor = pmesh->ecounter.neos_tfloor;
 
       // time-integrator tasks for each stage of integrator
       for (int stage=1; stage<=(nexp_stages); ++stage) {
         ExecuteTaskList(pmesh, "before_stagen", stage);
         ExecuteTaskList(pmesh, "stagen", stage);
         ExecuteTaskList(pmesh, "after_stagen", stage);
+        if (pgrav != nullptr) pgrav->AccumulateMassFlux(gam0[stage-1], beta[stage-1]*pmesh->dt);
       }
 
       // Work after time integrator indicated by "1" in stage
       ExecuteTaskList(pmesh, "after_timeintegrator", 1);
+
+      if (pgrav != nullptr) {
+        if (pgrav->UsesOrbitalSplit()) {
+          // The last RK stage already filled midpoint ghosts. C2P can still
+          // alter conserved cells through floors; then refresh collectively.
+          // Scalar clipping has no event counter, so retain the refresh there.
+          int changed = (pmesh->ecounter.neos_dfloor != gravity_dfloor ||
+                         pmesh->ecounter.neos_efloor != gravity_efloor ||
+                         pmesh->ecounter.neos_tfloor != gravity_tfloor ||
+                         pmesh->pmb_pack->phydro->nscalars > 0) ? 1 : 0;
+#if MPI_PARALLEL_ENABLED
+          if (global_variable::nranks > 1) {
+            MPI_Allreduce(MPI_IN_PLACE, &changed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+          }
+#endif
+          if (changed) InitBoundaryValuesAndPrimitives(pmesh);
+          pgrav->OrbitalStep(0.5*pmesh->dt);
+          pgrav->SetHydroBoundaryTime(pmesh->time+pmesh->dt);
+          // Gravity needs only active cells. Preserve any post-remap EOS floor
+          // correction without another exchange/prolongation; the final kick
+          // is followed by the complete boundary/primitive refresh below.
+          auto *hydro = pmesh->pmb_pack->phydro;
+          const auto &ind = pmesh->mb_indcs;
+          hydro->peos->ConsToPrim(hydro->u0, hydro->w0, false,
+              ind.is, ind.ie, ind.js, ind.je, ind.ks, ind.ke);
+        }
+        pgrav->Solve(pmesh->time+pmesh->dt);
+        pgrav->KickMatter(0.5*pmesh->dt);
+        pgrav->EndEnergyStep();     // energy_source = flux / diag; else no-op
+      }
 
       // Work outside of TaskLists:
       // increment time, ncycle, etc.
       pmesh->time = pmesh->time + pmesh->dt;
       pmesh->ncycle++;
       pmesh->dt_last_completed = pmesh->dt;
+      if (pgrav != nullptr) {
+        InitBoundaryValuesAndPrimitives(pmesh);
+        pgrav->ClearHydroBoundaryTime();
+        (void) pmesh->pmb_pack->phydro->NewTimeStep(this, nexp_stages);
+        if (pmesh->pmb_pack->pdust != nullptr)
+          (void) pmesh->pmb_pack->pdust->ComputeNewTimeStep(this,nexp_stages);
+      }
       nmb_updated_ += pmesh->nmb_total;
       npart_updated_ += pmesh->nprtcl_total;
       // load balancing efficiency
@@ -421,7 +507,10 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
             static_cast<float>(pmesh->nmb_total);
       }
 
-      // Test for/make outputs
+      // Test for/make outputs.  A restart file written here is followed by
+      // the mesh check of this cycle, which the dust module records in the file.
+      if (pmesh->pmb_pack->pdust != nullptr) pmesh->pmb_pack->pdust->amr_check_after_output = true;
+      if (pmesh->pmb_pack->pgrav != nullptr) pmesh->pmb_pack->pgrav->amr_check_after_output = true;
       for (auto &out : pout->pout_list) {
         // compare at floating point (32-bit) precision to reduce effect of round off
         float time_32 = static_cast<float>(pmesh->time);
@@ -436,8 +525,19 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         }
       }
 
+      if (pmesh->pmb_pack->pdust != nullptr) pmesh->pmb_pack->pdust->amr_check_after_output = false;
+      if (pmesh->pmb_pack->pgrav != nullptr) pmesh->pmb_pack->pgrav->amr_check_after_output = false;
+
       // AMR
-      if (pmesh->adaptive) {pmesh->pmr->AdaptiveMeshRefinement(this, pin);}
+      if (pmesh->adaptive) {
+        if (pmesh->pmb_pack->pdust != nullptr) {   // dust profile timer
+          auto *pd = pmesh->pmb_pack->pdust;
+          ProfTimer pt(pd->prof_time[pd->kProfAmr], pd->prof_count[pd->kProfAmr]);
+          pmesh->pmr->AdaptiveMeshRefinement(this, pin);
+        } else {
+          pmesh->pmr->AdaptiveMeshRefinement(this, pin);
+        }
+      }
       // compute new timestep AFTER all Meshblocks refined/derefined
       pmesh->NewTimeStep(tlim);
 
@@ -446,6 +546,14 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         elapsed_time = UpdateWallClock();
       }
     }  // end while
+    // a dropped regrid (max_nmb_per_rank): the restart file of the final outputs
+    // marks this cycle's mesh check as pending, so a restart with a larger limit redoes it first
+    if (pmesh->stop_max_nmb && pmesh->pmb_pack->pdust != nullptr) {
+      pmesh->pmb_pack->pdust->amr_check_after_output = true;
+    }
+    if (pmesh->stop_max_nmb && pmesh->pmb_pack->pgrav != nullptr) {
+      pmesh->pmb_pack->pgrav->amr_check_after_output = true;
+    }
   }    // end of (time_evolution != tstatic) clause
   return;
 }
@@ -478,10 +586,36 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
                     MPI_COMM_WORLD);
     }
 #endif
+    // switch summary of the amplitude-aware prolongation
+    if (pmesh->pmr != nullptr && pmesh->pmr->prolong_amp_eps > 0.0 &&
+        global_variable::my_rank == 0) {
+      auto c = Kokkos::create_mirror_view_and_copy(HostMemSpace(),
+                                                   pmesh->pmr->prolong_amp_count);
+      const char *dn[3] = {"x1", "x2", "x3"};
+      for (int d=0; d<3; ++d) {
+        if (c(10*d) == 0) continue;
+        const double n = static_cast<double>(c(10*d));
+        auto frac = [](int64_t a, int64_t b) {
+          return (b > 0) ? static_cast<double>(a)/static_cast<double>(b) : 0.0;};
+        std::cout << "# PROLONG_AMP_SUMMARY eps=" << pmesh->pmr->prolong_amp_eps
+                  << " dir=" << dn[d] << " cell_dirs=" << c(10*d)
+                  << " center=" << c(10*d+1)/n << " mixed=" << c(10*d+2)/n
+                  << " mc=" << c(10*d+3)/n
+                  << " var_stencils_mixed=" << c(10*d+4)
+                  << " (MC!=central " << frac(c(10*d+5), c(10*d+4)) << ")"
+                  << " var_stencils_mc=" << c(10*d+6)
+                  << " (MC!=central " << frac(c(10*d+7), c(10*d+6)) << ")";
+        if (d == 0) std::cout << " positivity_scaled_cells=" << c(8);
+        std::cout << std::endl;
+      }
+    }
     if (global_variable::my_rank == 0) {
       // Print diagnostic messages related to the end of the simulation
       OutputCycleDiagnostics(pmesh);
-      if (pmesh->ncycle == nlim) {
+      if (pmesh->stop_max_nmb) {
+        std::cout << std::endl << "Terminating on max_nmb_per_rank (a regrid would exceed it; "
+                  << "restart file written: restart with a larger value)" << std::endl;
+      } else if (pmesh->ncycle == nlim) {
         std::cout << std::endl << "Terminating on cycle limit" << std::endl;
       } else if (pmesh->time >= tlim) {
         std::cout << std::endl << "Terminating on time limit" << std::endl;

@@ -59,7 +59,11 @@ void Mesh::LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb)
     }
     mycost += clist[i];
     rlist[i] = j;
-    if (mycost >= targetcost && j>0) {
+    // also move on when the blocks left (0..i-1) are just enough for the
+    // ranks left (0..j-1).  With very uneven costs (cloud-weighted, <dust>/load_balance_cloud_weight)
+    // the greedy fill from the end could give every block to the high ranks and none to the low ones
+    // (an empty rank: negative local ids, invalid MPI tags).  Uniform costs never get here.
+    if ((mycost >= targetcost || i <= j) && j>0) {
       j--;
       totalcost -= mycost;
       mycost = 0.0;

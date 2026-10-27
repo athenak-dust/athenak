@@ -30,6 +30,7 @@
 #include "srcterms/turb_driver.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "gravity/self_gravity.hpp"
 #include "units/units.hpp"
 #include "meshblock_pack.hpp"
 
@@ -53,6 +54,7 @@ MeshBlockPack::MeshBlockPack(Mesh *pm, int igids, int igide) :
 // MeshBlock destructor
 
 MeshBlockPack::~MeshBlockPack() {
+  if (pgrav  != nullptr) {delete pgrav;}
   if (pdust  != nullptr) {delete pdust;}
   if (ppart  != nullptr) {delete ppart;}
   if (pnr    != nullptr) {delete pnr;}
@@ -263,6 +265,12 @@ void MeshBlockPack::AddPhysics(ParameterInput *pin) {
     }
   } else {
     pdust = nullptr;
+  }
+
+  // Optional composite self-gravity. Merely having an old <gravity> block does
+  // not enable it; disabled runs retain their existing tasks and update path.
+  if (pin->DoesBlockExist("gravity") && pin->GetOrAddBoolean("gravity", "enabled", false)) {
+    pgrav = new gravity::SelfGravity(this, pin);
   }
 
   // Check that at least ONE is requested and initialized.

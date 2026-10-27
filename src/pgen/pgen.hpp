@@ -20,6 +20,8 @@ using UserBoundaryFnPtr = void (*)(Mesh* pm);
 using UserSrctermFnPtr = void (*)(Mesh* pm, const Real bdt);
 using UserRefinementFnPtr = void (*)(MeshBlockPack* pmbp);
 using UserHistoryFnPtr = void (*)(HistoryData *pdata, Mesh *pm);
+// user work done once per cycle (like Athena++'s UserWorkInLoop)
+using UserWorkInLoopFnPtr = void (*)(Mesh *pm);
 
 //----------------------------------------------------------------------------------------
 //! \class ProblemGenerator
@@ -50,9 +52,17 @@ class ProblemGenerator {
   ProblemFinalizeFnPtr pgen_final_func=nullptr;
   // function pointer for user-enrolled BCs.  Called in ApplyPhysicalBCs in task list
   UserBoundaryFnPtr user_bcs_func=nullptr;
+  // optional: user BCs on the coarse arrays (coarse_u0, coarse indices) before the
+  // ghost prolongation; without it user faces of the coarse arrays get zero gradient
+  UserBoundaryFnPtr user_bcs_coarse_func=nullptr;
   UserSrctermFnPtr user_srcs_func=nullptr;
   UserRefinementFnPtr user_ref_func=nullptr;
   UserHistoryFnPtr user_hist_func=nullptr;
+  // called by the driver at the start of every cycle, before the integrator
+  UserWorkInLoopFnPtr user_work_in_loop_func=nullptr;
+  // true if user_work_in_loop_func never changes particle positions, masses, levels
+  // or anchors (then <gravity>/kdk_reuse may keep the dust field across it)
+  bool user_work_keeps_particles=false;
 
   // predefined problem generator functions (default test suite)
   void CallProblemGenerator(ParameterInput *pin, bool is_restart);
@@ -63,14 +73,20 @@ class ProblemGenerator {
   void Diffusion(ParameterInput *pin, const bool restart);
   void DustDamping(ParameterInput *pin, const bool restart);
   void DustNSH(ParameterInput *pin, const bool restart);
+  void DustFreeFall(ParameterInput *pin, const bool restart);
+  void DustJeans(ParameterInput *pin, const bool restart);
   void DustyWave(ParameterInput *pin, const bool restart);
   void LinearWave(ParameterInput *pin, const bool restart);
   void LWImplode(ParameterInput *pin, const bool restart);
   void Monopole(ParameterInput *pin, const bool restart);
   void MRI3d(ParameterInput *pin, const bool restart);
   void OrszagTang(ParameterInput *pin, const bool restart);
+  void ObliqueShock(ParameterInput *pin, const bool restart);
+  void IsoCollision(ParameterInput *pin, const bool restart);
   void ShockTube(ParameterInput *pin, const bool restart);
+  void SimpleWave(ParameterInput *pin, const bool restart);
   void Shwave(ParameterInput *pin, const bool restart);
+  void SelfGravityWave(ParameterInput *pin, const bool restart);
   void StreamingLinear(ParameterInput *pin, const bool restart);
   void RadiationLinearWave(ParameterInput *pin, const bool restart);
   void RadiationBeam(ParameterInput *pin, const bool restart);
@@ -80,6 +96,7 @@ class ProblemGenerator {
   // predefined problem generator functions for unit tests
   void EOSCompose(ParameterInput *pin, const bool restart);
   void GaussLegendre(ParameterInput *pin, const bool restart);
+  void ProlongAmpUnit(ParameterInput *pin, const bool restart);
 
   // Generic error output function (using difference u0-u1)
   void OutputErrors(ParameterInput *pin, Mesh *pm);

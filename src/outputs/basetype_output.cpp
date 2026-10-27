@@ -21,6 +21,7 @@
 #include "eos/eos.hpp"
 #include "globals.hpp"
 #include "hydro/hydro.hpp"
+#include "gravity/self_gravity.hpp"
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "coordinates/adm.hpp"
@@ -28,6 +29,7 @@
 #include "z4c/z4c.hpp"
 #include "srcterms/srcterms.hpp"
 #include "srcterms/turb_driver.hpp"
+#include "dust/dust.hpp"
 #include "outputs.hpp"
 
 #if MPI_PARALLEL_ENABLED
@@ -47,7 +49,9 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
   if (out_params.file_type.compare("hst") == 0 ||
       out_params.file_type.compare("rst") == 0 ||
       out_params.file_type.compare("log") == 0 ||
-      out_params.file_type.compare("trk") == 0) {return;}
+      out_params.file_type.compare("trk") == 0 ||
+      out_params.file_type.compare("pbin") == 0 ||
+      out_params.file_type.compare("phst") == 0) {return;}
 
   // initialize vector containing number of output MBs per rank
   noutmbs.assign(global_variable::nranks, 0);
@@ -57,6 +61,8 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
   for (int i=0; i<(NOUTPUT_CHOICES); ++i) {
     if (out_params.variable.compare(var_choice[i]) == 0) {ivar = i;}
   }
+  // dust_sN_rho, dust_sN_mom(1..3): checked as dust_species (165)
+  if (ivar < 0 && DustSpeciesVariable(out_params.variable) > 0) ivar = 165;
   if (ivar < 0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
        << "Variable '" << out_params.variable << "' in block '" << out_params.block_name
@@ -64,6 +70,12 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     std::exit(EXIT_FAILURE);
   }
 
+  if (ivar >= 154 && ivar <= 158 &&
+      (pm->pmb_pack->pgrav == nullptr || out_params.include_gzs)) {
+    std::cerr << "### FATAL ERROR: gravity output requires gravity/enabled=true "
+              << "and active cells only (include_gzs=false)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   // check that appropriate physics is defined for requested output variable
   // TODO(@user): Index limits of variable choices below may change if more choices added
   if ((ivar<16) && (pm->pmb_pack->phydro == nullptr)) {
@@ -168,6 +180,25 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl << "Input file is likely missing corresponding block" << std::endl;
     exit(EXIT_FAILURE);
   }
+  // dust_total, dust_total_rho, dust_total_mom(1..3): a dust module, active
+  // cells
+  if ((ivar >= 159) && (ivar <= 165) &&
+      (pm->pmb_pack->pdust == nullptr || out_params.include_gzs)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+       << "Output variable '" << out_params.variable << "' in <output> block '"
+       << out_params.block_name << "' needs a <dust> block and active cells only "
+       << "(ghost_zones = false)" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  // dust_sN_*: N = 1..nspecies
+  if (ivar == 165 &&
+      DustSpeciesVariable(out_params.variable) > pm->pmb_pack->pdust->nspecies) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+       << "Output variable '" << out_params.variable << "' in <output> block '"
+       << out_params.block_name << "': the run has " << pm->pmb_pack->pdust->nspecies
+       << " dust species (<dust>/nspecies)" << std::endl;
+    exit(EXIT_FAILURE);
+  }
   if ((ivar==153) && (pm->pmb_pack->pdust == nullptr)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
        << "Output variable 'dust_d' requested in <output> block '"
@@ -191,6 +222,23 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
 
 
   for (const auto& variable : variables) {
+    if (variable == "gravity" || variable == "gravity_phi" ||
+        variable == "gravity_g1" || variable == "gravity_g2" || variable == "gravity_g3") {
+      if (pm->pmb_pack->pgrav == nullptr || out_params.include_gzs) {
+        std::cerr << "### FATAL ERROR: gravity output requires enabled gravity and active cells"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      if (variable == "gravity" || variable == "gravity_phi") {
+        outvars.emplace_back("phi",0,&(pm->pmb_pack->pgrav->phi));
+      }
+      for (int d = 0; d < 3; ++d) {
+        const std::string name = "gravity_g"+std::to_string(d+1);
+        if (variable == "gravity" || variable == name) {
+          outvars.emplace_back(name,d,&(pm->pmb_pack->pgrav->acceleration));
+        }
+      }
+    }
     // hydro (lab-frame) density
     if (variable.compare("hydro_u_d") == 0 ||
         variable.compare("hydro_u") == 0 ||
@@ -718,6 +766,80 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     outvars.emplace_back("dustd",0,&(derived_var));
   }
 
+  // with dust, every bin output of hydro variables carries the
+  // dust mass and momentum densities too (dust_total_var; not with ghost zones); opt out per
+  // block with dust_total = false.  The key is read only when given, so a restart file whose
+  // output blocks lack it (older files included) gets the default.
+  // (only the full sets hydro_w and hydro_u; single components and derived
+  // variables get nothing)
+  if (out_params.file_type.compare("bin") == 0 && pm->pmb_pack->pdust != nullptr &&
+      (out_params.variable.compare("hydro_w") == 0 ||
+       out_params.variable.compare("hydro_u") == 0)) {
+    bool want = true;
+    if (pin->DoesParameterExist(out_params.block_name, "dust_total")) {
+      want = pin->GetBoolean(out_params.block_name, "dust_total");
+    }
+    if (!want) {
+      auto_dust_note = "dust_total = false";
+    } else if (out_params.include_gzs) {
+      auto_dust_note = "ghost_zones = true";
+    } else {
+      auto_dust_total = true;
+      outvars.emplace_back("dust_total_rho",0,&(dust_total_var));
+      outvars.emplace_back("dust_total_mom1",1,&(dust_total_var));
+      outvars.emplace_back("dust_total_mom2",2,&(dust_total_var));
+      outvars.emplace_back("dust_total_mom3",3,&(dust_total_var));
+    }
+  }
+
+  // dust mass and momentum densities on the active cells with the run's
+  // representation (DustGasDrag::DepositScienceFields): derived_var(m, 0..3)
+  // (dust_total: all four; dust_total_rho; dust_total_mom: the three momenta; dust_total_momN:
+  // one component, like hydro_u_m1)
+  if (out_params.variable.compare(0, 10, "dust_total") == 0) {
+    const std::string &v = out_params.variable;
+    out_params.contains_derived = true;
+    out_params.n_derived += 4;
+    if (v == "dust_total" || v == "dust_total_rho") {
+      outvars.emplace_back("dust_total_rho",0,&(derived_var));
+    }
+    for (int c=1; c<=3; ++c) {
+      const std::string name = "dust_total_mom" + std::to_string(c);
+      if (v == "dust_total" || v == "dust_total_mom" || v == name) {
+        outvars.emplace_back(name,c,&(derived_var));
+      }
+    }
+  }
+  // the same per species, only where asked for (never added to
+  // hydro outputs): dust_species, every species s in derived_var(m, 4(s-1) + c) (c = 0
+  // rho, 1..3 mom1..3); dust_sN_rho, dust_sN_mom, dust_sN_momC: species N in
+  // derived_var(m, 0..3)
+  {
+    std::string comp;
+    const int nsel = DustSpeciesVariable(out_params.variable, &comp);
+    if (nsel == 0) {
+      const int nsp = pm->pmb_pack->pdust->nspecies;
+      out_params.contains_derived = true;
+      out_params.n_derived += 4*nsp;
+      for (int n=1; n<=nsp; ++n) {
+        for (int c=0; c<4; ++c) {
+          outvars.emplace_back(DustSpeciesFieldName(n, c), 4*(n-1) + c, &(derived_var));
+        }
+      }
+    } else if (nsel > 0) {
+      out_params.contains_derived = true;
+      out_params.n_derived += 4;
+      if (comp == "rho") {
+        outvars.emplace_back(DustSpeciesFieldName(nsel, 0), 0, &(derived_var));
+      }
+      for (int c=1; c<=3; ++c) {
+        if (comp == "mom" || comp == "mom" + std::to_string(c)) {
+          outvars.emplace_back(DustSpeciesFieldName(nsel, c), c, &(derived_var));
+        }
+      }
+    }
+  }
+
   // initialize vector containing number of output MBs per rank
   noutmbs.assign(global_variable::nranks, 0);
 }
@@ -832,6 +954,10 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
   // Calculate derived variables, if required
   if (out_params.contains_derived) {
     ComputeDerivedVariable(out_params.variable, pm);
+  }
+  // the dust fields appended to a bin output of hydro variables
+  if (auto_dust_total) {
+    pm->pmb_pack->pdust->DepositScienceFields(dust_total_var);
   }
 
   // Now copy data to host (outarray) over all variables and MeshBlocks

@@ -52,6 +52,18 @@ SourceTerms::SourceTerms(std::string block, MeshBlockPack *pp, ParameterInput *p
     }
   }
 
+  // (1b) optional second constant acceleration
+  const_accel2 = pin->GetOrAddBoolean(block, "const_accel2", false);
+  if (const_accel2) {
+    const_accel2_val = pin->GetReal(block, "const_accel2_val");
+    const_accel2_dir = pin->GetInteger(block, "const_accel2_dir");
+    if (const_accel2_dir < 1 || const_accel2_dir > 3) {
+      std::cout << "### FATAL ERROR in "<< __FILE__ <<" at line " << __LINE__ << std::endl
+                << "const_accel2_dir must be 1,2, or 3" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+
   // (2) Optically thin ISM cooling
   if (ism_cooling) {
     hrate = pin->GetReal(block, "hrate");
@@ -92,6 +104,7 @@ void SourceTerms::ApplySrcTerms(const DvceArray5D<Real> &w0, const EOS_Data &eos
                                 const Real bdt, DvceArray5D<Real> &u0) {
   // NOTE source terms must be computed using primitive (w0) and NOT conserved (u0) vars
   if (const_accel) ConstantAccel(w0, eos_data,  bdt, u0);
+  if (const_accel2) ConstantAccel(w0, eos_data,  bdt, u0, const_accel2_val, const_accel2_dir);
   if (ism_cooling) ISMCooling(w0, eos_data, bdt, u0);
   if (rel_cooling) RelCooling(w0, eos_data, bdt, u0);
   return;
@@ -109,14 +122,17 @@ void SourceTerms::ApplySrcTerms(DvceArray5D<Real> &i0, const Real bdt) {
 
 void SourceTerms::ConstantAccel(const DvceArray5D<Real> &w0, const EOS_Data &eos_data,
                                 const Real bdt, DvceArray5D<Real> &u0) {
+  ConstantAccel(w0, eos_data, bdt, u0, const_accel_val, const_accel_dir);
+}
+
+void SourceTerms::ConstantAccel(const DvceArray5D<Real> &w0, const EOS_Data &eos_data,
+                                const Real bdt, DvceArray5D<Real> &u0, const Real g,
+                                const int dir) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
   int ks = indcs.ks, ke = indcs.ke;
   int nmb1 = pmy_pack->nmb_thispack - 1;
-
-  Real &g = const_accel_val;
-  int &dir = const_accel_dir;
 
   par_for("const_acc", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {

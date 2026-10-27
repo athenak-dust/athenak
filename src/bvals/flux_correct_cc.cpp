@@ -44,6 +44,8 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx) {
   auto &rbuf = recvbuf;
   auto &one_d = pmy_pack->pmesh->one_d;
   auto &two_d = pmy_pack->pmesh->two_d;
+  const bool skip_shr_ = skip_shear_x1_flux;
+  auto &mbbcs = pmy_pack->pmb->mb_bcs;
 
   // Outer loop over (# of MeshBlocks)*(# of neighbors)*(# of variables)
   Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr*nvar), Kokkos::AUTO);
@@ -71,8 +73,12 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx) {
     int dm = nghbr.d_view(m,n).gid - mbgid.d_view(0);
     int dn = nghbr.d_view(m,n).dest;
 
-    // only pack buffers when neighbor is at coarser level
-    if ((nghbr.d_view(m,n).gid >=0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
+    // only pack buffers when neighbor is at coarser level (and not across the
+    // shear-periodic x1 boundaries)
+    const bool skip_shr = skip_shr_ && n < 8 &&
+        mbbcs.d_view(m, (n < 4) ? BoundaryFace::inner_x1 : BoundaryFace::outer_x1) ==
+        BoundaryFlag::shear_periodic;
+    if ((nghbr.d_view(m,n).gid >=0) && (nghbr.d_view(m,n).lev < mblev.d_view(m)) && !skip_shr) {
       // x1faces
       if (n<8) {
         // i-index is fixed for flux correction on x1faces
@@ -161,7 +167,9 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx) {
     for (int n=0; n<nnghbr; ++n) {
       if ( (nghbr.h_view(m,n).gid >=0) &&
            (nghbr.h_view(m,n).lev < mblev.h_view(m)) &&
-           ((n<16) || ((n>=24) && (n<32))) ) {
+           ((n<16) || ((n>=24) && (n<32))) && !(skip_shear_x1_flux && n < 8 &&
+            pmy_pack->pmb->mb_bcs.h_view(m, (n < 4) ? BoundaryFace::inner_x1 :
+                                         BoundaryFace::outer_x1) == BoundaryFlag::shear_periodic) ) {
         // index and rank of destination Neighbor
         int dn = nghbr.h_view(m,n).dest;
         int drank = nghbr.h_view(m,n).rank;
@@ -213,7 +221,9 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx) {
     for (int n=0; n<nnghbr; ++n) {
       if ( (nghbr.h_view(m,n).gid >=0) &&
            (nghbr.h_view(m,n).lev > mblev.h_view(m)) &&
-           ((n<16) || ((n>=24) && (n<32))) ) {
+           ((n<16) || ((n>=24) && (n<32))) && !(skip_shear_x1_flux && n < 8 &&
+            pmy_pack->pmb->mb_bcs.h_view(m, (n < 4) ? BoundaryFace::inner_x1 :
+                                         BoundaryFace::outer_x1) == BoundaryFlag::shear_periodic) ) {
         if (nghbr.h_view(m,n).rank != global_variable::my_rank) {
           int test;
           int ierr = MPI_Test(&(rbuf[n].flux_req[m]), &test, MPI_STATUS_IGNORE);
@@ -239,6 +249,8 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx) {
   //----- STEP 2: buffers have all completed, so unpack
 
   int nvar = flx.x1f.extent_int(1); // TODO(@user): 2nd idx from L of in arr must be NVAR
+  const bool skip_shr_ = skip_shear_x1_flux;
+  auto &mbbcs = pmy_pack->pmb->mb_bcs;
 
   // Outer loop over (# of MeshBlocks)*(# of neighbors)*(# of variables)
   Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr*nvar), Kokkos::AUTO);
@@ -261,8 +273,12 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx) {
     const int nkj  = nk*nj;
     const int nki  = nk*ni;
 
-    // only unpack buffers for faces when neighbor is at finer level
-    if ((nghbr.d_view(m,n).gid >=0) && (nghbr.d_view(m,n).lev > mblev.d_view(m))) {
+    // only unpack buffers for faces when neighbor is at finer level (and not across the
+    // shear-periodic x1 boundaries)
+    const bool skip_shr = skip_shr_ && n < 8 &&
+        mbbcs.d_view(m, (n < 4) ? BoundaryFace::inner_x1 : BoundaryFace::outer_x1) ==
+        BoundaryFlag::shear_periodic;
+    if ((nghbr.d_view(m,n).gid >=0) && (nghbr.d_view(m,n).lev > mblev.d_view(m)) && !skip_shr) {
       //x1 faces
       if (n<8) {
         Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkj), [&](const int idx) {
@@ -315,7 +331,9 @@ TaskStatus MeshBoundaryValuesCC::InitFluxRecv(const int nvars) {
       // this is the only thing different from BoundaryValuesFC::InitRecvFlux()
       if ( (nghbr.h_view(m,n).gid >=0) &&
            (nghbr.h_view(m,n).lev > pmy_pack->pmb->mb_lev.h_view(m)) &&
-           ((n<16) || ((n>=24) && (n<32))) ) {
+           ((n<16) || ((n>=24) && (n<32))) && !(skip_shear_x1_flux && n < 8 &&
+            pmy_pack->pmb->mb_bcs.h_view(m, (n < 4) ? BoundaryFace::inner_x1 :
+                                         BoundaryFace::outer_x1) == BoundaryFlag::shear_periodic) ) {
         // rank of destination buffer
         int drank = nghbr.h_view(m,n).rank;
 

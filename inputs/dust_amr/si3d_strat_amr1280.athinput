@@ -1,0 +1,132 @@
+# 3-D stratified streaming instability in the shearing box (ou24-like set-up: Stokes number 0.314,
+# Z = 0.02, initial H_p = 0.025 H, eta v_K = 0.05 c_s), box 0.2 H x 0.2 H x 0.4 H.
+# Root 64 x 64 x 128 (320/H) with 16^3 blocks, adaptive refinement to 1280/H (num_levels = 3).
+# Refinable dust clouds, refinable_mode = default (G with alpha 0.2 and the leaf-size tolerance,
+# R every 0.25/Omega; no stage X in a 3-D shearing box).  The dust density trigger in code units
+# refines where rho_d >= 64 on the root level and 256 on level 1 (x4 per level), and lets a block
+# coarsen below one third of its refinement threshold.  WENO-Z + HLLC, Li & Youdin (2018)
+# vertical gas boundaries (<problem>/vertical_bc = li2018), dust leaves through the x3 faces.
+# Test: particle-layer thickness, maximum rho_p and the onset of strong clumping against a uniform
+# 1280/H run.  Runtime: t = 0 -> 25 orbits (157.08) is ~1e6 cycles, one to two days on four
+# GPUs.
+# Restart with self-gravity: si3d_strat_amr1280_selfgrav_restart.athinput.
+<job>
+basename = st
+
+<mesh>
+nghost = 4
+nx1 = 64
+x1min = -0.1
+x1max = 0.1
+ix1_bc = shear_periodic
+ox1_bc = shear_periodic
+nx2 = 64
+x2min = -0.1
+x2max = 0.1
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 128
+x3min = -0.2
+x3max = 0.2
+ix3_bc = user                   # <problem>/vertical_bc
+ox3_bc = user
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<mesh_refinement>
+refinement = adaptive
+num_levels = 3
+ncycle_check = 10
+refinement_interval = 100
+max_nmb_per_rank = 2048         # preallocated per rank: 2048 for 4 ranks (GPUs); scale it down for more ranks
+
+<amr_criterion0>
+method = user                   # the dust density trigger below
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.225
+nlim = -1
+tlim = 157.07963267948966       # 25 orbits
+ndiag = 1
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hllc
+
+<hydro_srcterms>
+const_accel = true
+const_accel_val = 0.1           # 2 Omega eta v_K
+const_accel_dir = 1
+
+<shearing_box>
+qshear = 1.5
+omega0 = 1.0
+stratified = true
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+
+<dust>
+nspecies = 1
+stokes_1 = 0.314
+Z_1 = 0.02                      # column ratio (column_normalization = redraw, the default)
+ppc_1 = 1                       # root clouds per root cell
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+coupling = pc2
+amr_pic = refinable_cloud
+refinable_mode = default
+amr_density_trigger = true
+amr_rho_units = code
+amr_rho_refine = 64.0
+amr_rho_derefine = 32
+amr_rho_level_factor = 4.0
+amr_rho_buffer = 2
+particle_x3_bc = outflow
+
+<problem>
+pgen_name = dust_nsh
+user_hist = true
+check_equilibrium = false
+rho0 = 1.0
+etavk = 0.05
+H_p_1 = 0.025                   # initial particle-layer thickness (H = 1)
+stratified_dust = true
+stratified_dust_sampling = gaussian
+nsh_vertical = true             # NSH drift equilibrium of each height
+vertical_bc = li2018
+cloud_root_random = true
+root_placement = random
+random_seed = 3
+dust_moments_hist = true
+
+<output1>
+file_type = hst
+dt = 0.05
+data_format = %.17e
+
+<output2>
+file_type = bin
+variable = hydro_w              # adds dust_total_rho and dust_total_mom1..3 automatically
+dt = 2.0
+
+<output3>
+file_type = rst
+dt = 10.0
+
+<output4>
+file_type = phst
+dt = 0.05
+
+<output5>
+file_type = pbin
+dt = 6.283185307179586          # once per orbit

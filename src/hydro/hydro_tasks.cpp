@@ -25,8 +25,14 @@
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
 #include "hydro/hydro.hpp"
+#include "gravity/self_gravity.hpp"
 
 namespace hydro {
+namespace {
+bool GravityOrbitalSplit(MeshBlockPack *pack) {
+  return pack->pgrav != nullptr && pack->pgrav->UsesOrbitalSplit();
+}
+}  // namespace
 //----------------------------------------------------------------------------------------
 //! \fn  void Hydro::AssembleHydroTasks
 //! \brief Adds hydro tasks to appropriate task lists used by time integrators.
@@ -85,6 +91,7 @@ void Hydro::AssembleHydroTasks(std::map<std::string, std::shared_ptr<TaskList>> 
 //! initialize all boundary receive status flags to waiting (with or without MPI).
 
 TaskStatus Hydro::InitRecv(Driver *pdrive, int stage) {
+  flux_unpacked = false;   // RecvFlux unpacks the flux correction once per stage
   // post receives for U
   TaskStatus tstat = pbval_u->InitRecv(nhydro+nscalars);
   if (tstat != TaskStatus::complete) return tstat;
@@ -98,7 +105,7 @@ TaskStatus Hydro::InitRecv(Driver *pdrive, int stage) {
 
   // with orbital advection post receives for U
   // only execute for (last stage) AND (3D OR 2d_r_phi)
-  if (porb_u != nullptr) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack)) {
     if ((stage == pdrive->nexp_stages) &&
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
       tstat = porb_u->InitRecv();
@@ -115,7 +122,14 @@ TaskStatus Hydro::InitRecv(Driver *pdrive, int stage) {
       if (stage == pdrive->nexp_stages) {
         time += pmy_pack->pmesh->dt;
       }
+      // Residual hydro has one fixed sheared coordinate frame after OAhalf.
+      // This override also applies to stage=-1 during primitive/ghost refresh.
+      if (pmy_pack->pgrav != nullptr) {
+        time = pmy_pack->pgrav->HydroBoundaryTime(time);
+      }
       tstat = psbox_u->InitRecv(time);
+      // the pieces of the shear flux matching with this yshear; posts its receives
+      if (stage >= 0 && psbox_u->flux_on) psbox_u->PlanFluxMatch();
     }
   }
 
@@ -211,6 +225,12 @@ TaskStatus Hydro::SendFlux(Driver *pdrive, int stage) {
   if (pmy_pack->pmesh->multilevel) {
     tstat = pbval_u->PackAndSendFluxCC(uflx);
   }
+  // matching of the x1 fluxes across the shear-periodic boundary; here and
+  // not as separate tasks, so that every task list that sends the fluxes (the dust module
+  // assembles its own hydro list) includes it
+  if (tstat == TaskStatus::complete && psbox_u != nullptr && psbox_u->flux_on) {
+    tstat = psbox_u->SendFluxMatch(uflx);
+  }
   return tstat;
 }
 
@@ -222,8 +242,17 @@ TaskStatus Hydro::SendFlux(Driver *pdrive, int stage) {
 TaskStatus Hydro::RecvFlux(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
   // Only execute BoundaryValues function with SMR/SMR
-  if (pmy_pack->pmesh->multilevel) {
+  // once per stage: while the shear flux matching below is still waiting this task
+  // is called again, and the unpack must not run each time (on several nodes it did, thousands
+  // of extra kernels)
+  if (pmy_pack->pmesh->multilevel && !flux_unpacked) {
     tstat = pbval_u->RecvAndUnpackFluxCC(uflx);
+    if (tstat != TaskStatus::complete) return tstat;
+  }
+  flux_unpacked = true;
+  // the shear flux matching (after the flux correction: different faces)
+  if (psbox_u != nullptr && psbox_u->flux_on) {
+    tstat = psbox_u->RecvFluxMatch(uflx, recon_method);
   }
   return tstat;
 }
@@ -262,7 +291,7 @@ TaskStatus Hydro::HydroSrcTerms(Driver *pdrive, int stage) {
 
 TaskStatus Hydro::SendU_OA(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
-  if (porb_u != nullptr) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack)) {
     // only execute if (last stage) AND (3D OR 2d_r_phi)
     if ((stage == pdrive->nexp_stages) &&
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
@@ -279,11 +308,14 @@ TaskStatus Hydro::SendU_OA(Driver *pdrive, int stage) {
 
 TaskStatus Hydro::RecvU_OA(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
-  if (porb_u != nullptr) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack)) {
     // only execute if (last stage) AND (3D OR 2d_r_phi)
     if ((stage == pdrive->nexp_stages) &&
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
       tstat = porb_u->RecvAndUnpackCC(u0, recon_method);
+      // the remap fluxes through x2 faces with a level change go to the coarser
+      // side (applied in RestrictU); here and not as a separate task (see SendFlux)
+      if (tstat == TaskStatus::complete) tstat = porb_u->SendFluxCC();
     }
   }
   return tstat;
@@ -294,6 +326,15 @@ TaskStatus Hydro::RecvU_OA(Driver *pdrive, int stage) {
 //! \brief Wrapper task list function to restrict conserved vars
 
 TaskStatus Hydro::RestrictU(Driver *pdrive, int stage) {
+  // the coarser side of an x2 face with a level change takes the finer side's
+  // orbital-advection fluxes (sent at the end of RecvU_OA), before the restriction
+  // Stage zero is also used by initialization/static field checks, before any
+  // orbital-advection flux exchange has been posted.
+  if (stage > 0 && porb_u != nullptr && !GravityOrbitalSplit(pmy_pack) &&
+      stage == pdrive->nexp_stages && pmy_pack->pmesh->three_d) {
+    TaskStatus tstat = porb_u->RecvFluxCC(u0);
+    if (tstat != TaskStatus::complete) return tstat;
+  }
   // Only execute Mesh function with SMR/SMR
   if (pmy_pack->pmesh->multilevel) {
     pmy_pack->pmesh->pmr->RestrictCC(u0, coarse_u0);
@@ -328,7 +369,16 @@ TaskStatus Hydro::SendU_Shr(Driver *pdrive, int stage) {
   if (psbox_u != nullptr) {
     // only execute if (3D OR 2d_r_phi)
     if (pmy_pack->pmesh->three_d || psbox_u->shearing_box_r_phi) {
+      // collected ghost zones: the senders' slopes read their x3 ghost rows,
+      // which at a physical x3 boundary are otherwise set only after this exchange (one stage
+      // old); set them now (the boundary conditions run again after the exchange, as usual)
+      if (psbox_u->face_levels &&
+          pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic) {
+        (void) ApplyPhysicalBCs(pdrive, stage);
+      }
       tstat = psbox_u->PackAndSendCC(u0, recon_method);
+      // the coarse arrays, before the prolongation of the fine x1 ghost zones
+      if (psbox_u->coarse_on) {tstat = psbox_u->PackAndSendCoarseCC(coarse_u0, recon_method);}
     }
   }
   return tstat;
@@ -345,6 +395,9 @@ TaskStatus Hydro::RecvU_Shr(Driver *pdrive, int stage) {
     // only execute if (3D OR 2d_r_phi)
     if (pmy_pack->pmesh->three_d || psbox_u->shearing_box_r_phi) {
       tstat = psbox_u->RecvAndUnpackCC(u0);
+      if (tstat == TaskStatus::complete && psbox_u->coarse_on) {
+        tstat = psbox_u->RecvAndUnpackCoarseCC(coarse_u0);
+      }
     }
   }
   return tstat;
@@ -376,10 +429,24 @@ TaskStatus Hydro::ApplyPhysicalBCs(Driver *pdrive, int stage) {
 TaskStatus Hydro::Prolongate(Driver *pdrive, int stage) {
   if (pmy_pack->pmesh->multilevel) {  // only prolongate with SMR/AMR
     pbval_u->FillCoarseInBndryCC(u0, coarse_u0);
+    // physical boundary values of the coarse arrays.  AthenaK left them
+    // unset, and the prolongation next to a physical boundary reads them for its slopes (a
+    // finer block beside a coarser one along a physical face, e.g. x3 of a stratified disc)
+    Mesh *pm = pmy_pack->pmesh;
+    if (!pm->strictly_periodic && pm->pmr->coarse_physical_bcs) {
+      pbval_u->HydroBCs(pmy_pack, pbval_u->u_in, coarse_u0, true);
+      if (pm->pgen->user_bcs && pm->pgen->user_bcs_coarse_func != nullptr) {
+        (pm->pgen->user_bcs_coarse_func)(pm);
+      }
+    }
     if (pmy_pack->pmesh->pmr->prolong_prims) {
       pbval_u->ConsToPrimCoarseBndry(coarse_u0, coarse_w0);
       pbval_u->ProlongateCC(w0, coarse_w0);
       pbval_u->PrimToConsFineBndry(w0, u0);
+    } else if (pmy_pack->pmesh->pmr->prolong_amp_eps > 0.0) {
+      // amplitude-aware prolongation
+      pbval_u->ProlongateCC(u0, coarse_u0, false, pmy_pack->pmesh->pmr->prolong_amp_eps,
+                            peos->eos_data.iso_cs);
     } else {
       pbval_u->ProlongateCC(u0, coarse_u0);
     }
@@ -427,7 +494,7 @@ TaskStatus Hydro::ClearSend(Driver *pdrive, int stage) {
 
   // with orbital advection check sends of U complete
   // only execute when (shearing box defined) AND (last stage) AND (3D OR 2d_r_phi)
-  if (porb_u != nullptr) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack)) {
     if ((stage == pdrive->nexp_stages) &&
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
       tstat = porb_u->ClearSend();
@@ -441,6 +508,11 @@ TaskStatus Hydro::ClearSend(Driver *pdrive, int stage) {
     if (((stage >= 0) || (stage == -4)) &&
         (pmy_pack->pmesh->three_d || psbox_u->shearing_box_r_phi)) {
       tstat = psbox_u->ClearSend();
+      if (tstat != TaskStatus::complete) return tstat;
+    }
+    // the shear flux matching of this stage
+    if (stage >= 0 && psbox_u->flux_on) {
+      tstat = psbox_u->ClearFluxMatch();
       if (tstat != TaskStatus::complete) return tstat;
     }
   }
@@ -474,7 +546,7 @@ TaskStatus Hydro::ClearRecv(Driver *pdrive, int stage) {
 
   // with orbital advection check receives of U complete
   // only execute when (shearing box defined) AND (last stage) AND (3D OR 2d_r_phi)
-  if (porb_u != nullptr) {
+  if (porb_u != nullptr && !GravityOrbitalSplit(pmy_pack)) {
     if ((stage == pdrive->nexp_stages) &&
         (pmy_pack->pmesh->three_d || porb_u->shearing_box_r_phi)) {
       tstat = porb_u->ClearRecv();

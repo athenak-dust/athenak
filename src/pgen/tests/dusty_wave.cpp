@@ -44,6 +44,7 @@
 #include "hydro/hydro.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "outputs/outputs.hpp"
 
 // functions for error output and user history
@@ -102,8 +103,17 @@ void WaveSetup(ParameterInput *pin, MeshBlockPack *pmbp, Mesh *pmesh,
   eps.resize(nspec);
   ts.resize(nspec);
   bool has_eps = pin->DoesParameterExist("problem","eps_1");
+  // new species keys: epsilon_N of the resolved species table
+  const dust::SpeciesTable &spt = dust::Species(pin);
+  if (spt.new_init && spt.abundance != "epsilon") {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "the dusty wave needs epsilon_N (Z_N belongs to stratified set-ups)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   for (int s=0; s<nspec; ++s) {
-    if (has_eps) {
+    if (spt.new_init) {
+      eps[s] = spt.value[s];
+    } else if (has_eps) {
       eps[s] = pin->GetReal("problem","eps_" + std::to_string(s+1));
     } else {
       eps[s] = pdust->dust_to_gas/static_cast<Real>(nspec);
@@ -194,19 +204,29 @@ void ProblemGenerator::DustyWave(ParameterInput *pin, const bool restart) {
   int npart_permb = npart/nmb;
   int ncells = indcs.nx1*indcs.nx2*indcs.nx3;
   int ppc_int = npart_permb/ncells;
-  if ((npart_permb != ppc_int*ncells) || (ppc_int % nspec != 0)) {
+  const dust::SpeciesTable &spt = dust::Species(pin);
+  const bool nkeys = spt.new_init;
+  if ((npart_permb != ppc_int*ncells) ||
+      (nkeys ? (ppc_int != spt.ppc_total) : (ppc_int % nspec != 0))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "Dusty wave requires <particles>/ppc to be an integer multiple of "
-              << "<dust>/nspecies" << std::endl;
+              << "<dust>/nspecies (new keys: the sum of ppc_N)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  // slot -> species of a cell (interleaved as the legacy layout for equal ppc_N, else blocks)
+  const int ptot = nkeys ? spt.ppc_total : 1;
+  DualArray1D<int> slot("dwave_slot", ptot);
+  for (int k=0; k<ptot; ++k) {int sp = 0, kk = 0; if (nkeys) spt.SlotSpecies(k, sp, kk); slot.h_view(k) = sp;}
+  slot.template modify<HostMemSpace>();
+  slot.template sync<DevExeSpace>();
+  auto slotd = slot.d_view;
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
   auto gids = pmbp->gids;
   bool three_d = pmy_mesh_->three_d;
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2, lnx3 = indcs.nx3;
   auto &taus_ = pdust->taus;
-  Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
+  Real ppc = static_cast<Real>(dust::RootPpc(pin));   // new species keys: sum of ppc_N
 
   // copy per-species data into device-usable array:
   // [s][0,1]=Re,Im dv; [s][2,3]=Re,Im xi; [s][4]=mass factor
@@ -217,6 +237,9 @@ void ProblemGenerator::DustyWave(ParameterInput *pin, const bool restart) {
     damp.h_view(s,2) = xi[s].real();
     damp.h_view(s,3) = xi[s].imag();
     damp.h_view(s,4) = eps[s]*rho0*static_cast<Real>(nspec)/ppc;
+    if (nkeys && !spt.equal_ppc) {
+      damp.h_view(s,4) = (spt.ppc[s] > 0) ? eps[s]*rho0/static_cast<Real>(spt.ppc[s]) : 0.0;
+    }
   }
   damp.template modify<HostMemSpace>();
   damp.template sync<DevExeSpace>();
@@ -227,7 +250,7 @@ void ProblemGenerator::DustyWave(ParameterInput *pin, const bool restart) {
     pi(PGID,p) = gids + m;
     int q = p - m*npart_permb;
     int c = q/ppc_int;
-    int s = (q % ppc_int) % nspec;
+    int s = nkeys ? slotd(q % ppc_int) : (q % ppc_int) % nspec;
     int i = c % lnx1;
     int j = (c/lnx1) % lnx2;
     int k = c/(lnx1*lnx2);
