@@ -19,7 +19,9 @@
 //! whose point lies inside ff_radius of the centre, mass rho_s dx^3/ff_n^3, at rest; then the
 //! usual initial split to the leaves.  Diagnostics every ff_dt (and at the end), rank 0, one line
 //! "# FREEFALL {json}" and freefall_history.jsonl: the Lagrangian radii r_q (radius about the
-//! centre of mass that holds the mass fraction q) over f(t) r_q(0); kinetic and potential energy
+//! centre of mass that holds the mass fraction q) over f(t) r_q(0), of the particle centres and of
+//! the clouds expanded by repeated P1 splits to ff_repr_level (no jump at a refinement); kinetic and
+//! potential energy
 //! W = 1/2 sum rho_d (phi - <phi>) V over the leaf cells, the energy drift (K + W - E0)/|W0|; the
 //! centre of mass; the peak deposited density; the leaf blocks per level.
 
@@ -55,7 +57,8 @@ struct FreeFall {
   bool have0 = false;
   Real e0 = 0.0, w0 = 0.0;
   std::vector<Real> q = {0.02, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9};
-  std::vector<Real> rq0;
+  std::vector<Real> rq0, rqm0;
+  int rep = 0;       // ff_repr_level: the level the clouds are expanded to for rqm
 } ff;
 
 void Fatal(const std::string &msg) {
@@ -91,6 +94,37 @@ int Owner(MeshBlockPack *pack, const std::array<Real, 3> &p) {
   return -1;
 }
 
+// radii holding the mass fractions ff.q of the (r, m) pairs (all on rank 0 after Gatherv)
+std::vector<Real> Quantiles(const std::vector<double> &rm_local, Real mass) {
+  std::vector<double> all;
+#if MPI_PARALLEL_ENABLED
+  int cnt = static_cast<int>(rm_local.size());
+  std::vector<int> counts(global_variable::nranks), displ(global_variable::nranks, 0);
+  MPI_Gather(&cnt, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+  if (global_variable::my_rank == 0) {
+    for (int r=1; r<global_variable::nranks; ++r) displ[r] = displ[r-1] + counts[r-1];
+    all.resize(displ.back() + counts.back());
+  }
+  MPI_Gatherv(rm_local.data(), cnt, MPI_DOUBLE, all.data(), counts.data(), displ.data(),
+              MPI_DOUBLE, 0, MPI_COMM_WORLD);
+#else
+  all = rm_local;
+#endif
+  std::vector<Real> rq(ff.q.size(), 0.0);
+  if (global_variable::my_rank != 0) return rq;
+  const std::size_t nall = all.size()/2;
+  std::vector<std::pair<double, double>> v(nall);
+  for (std::size_t p=0; p<nall; ++p) v[p] = {all[2*p], all[2*p+1]};
+  std::sort(v.begin(), v.end());
+  double cum = 0.0;
+  std::size_t iq = 0;
+  for (std::size_t p=0; p<nall && iq<ff.q.size(); ++p) {
+    cum += v[p].second;
+    while (iq < ff.q.size() && cum >= ff.q[iq]*mass) {rq[iq] = v[p].first; ++iq;}
+  }
+  return rq;
+}
+
 void Observe(Mesh *pm) {
   auto *pack = pm->pmb_pack;
   auto *dust = pack->pdust;
@@ -120,7 +154,7 @@ void Observe(Mesh *pm) {
       }
   }
   // particles: mass, mass-weighted position, kinetic energy, max speed
-  Real a[6] = {0, 0, 0, 0, 0, 0};
+  Real a[7] = {0, 0, 0, 0, 0, 0, 0};
   Real vmax = 0.0;
   const int np = part->nprtcl_thispack;
   for (int p=0; p<np; ++p) {
@@ -130,49 +164,57 @@ void Observe(Mesh *pm) {
     a[4] += 0.5*m*v2; a[5] += m*(pr(IPVX,p) + pr(IPVY,p) + pr(IPVZ,p));
     vmax = std::max(vmax, std::sqrt(v2));
   }
+  a[6] = np;
 #if MPI_PARALLEL_ENABLED
   MPI_Allreduce(MPI_IN_PLACE, s, 8, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, a, 6, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, a, 7, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
   MPI_Allreduce(MPI_IN_PLACE, &peak, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
   MPI_Allreduce(MPI_IN_PLACE, &vmax, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
 #endif
   const Real mass = a[0], cm[3] = {a[1]/mass, a[2]/mass, a[3]/mass};
   const Real kin = a[4];
   const Real pot = 0.5*(s[2] - s[0]*s[1]/s[3]);   // 1/2 sum rho (phi - <phi>) V
-  // Lagrangian radii about the centre of mass: (r, m) of all particles on rank 0
+  // Lagrangian radii about the centre of mass: of the particle centres (rq), and of every cloud
+  // expanded into the points of repeated P1 splits down to the level ff_repr_level (per direction
+  // offsets -h/2, 0, +h/2 with weights 1/4, 1/2, 1/4, h the half-width; the children of an actual
+  // split sit exactly on these points, so these radii (rqm) do not jump at a refinement; lobes of
+  // clouds at block edges are ignored)
   std::vector<double> rm(2*static_cast<std::size_t>(np));
   for (int p=0; p<np; ++p) {
     const Real dx = pr(IPX,p) - cm[0], dy = pr(IPY,p) - cm[1], dz = pr(IPZ,p) - cm[2];
     rm[2*p] = std::sqrt(dx*dx + dy*dy + dz*dz); rm[2*p+1] = pr(IPM,p);
   }
-  std::vector<double> all;
-#if MPI_PARALLEL_ENABLED
-  int cnt = 2*np;
-  std::vector<int> counts(global_variable::nranks), displ(global_variable::nranks, 0);
-  MPI_Gather(&cnt, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
-  if (global_variable::my_rank == 0) {
-    for (int r=1; r<global_variable::nranks; ++r) displ[r] = displ[r-1] + counts[r-1];
-    all.resize(displ.back() + counts.back());
+  const std::vector<Real> rq = Quantiles(rm, mass);
+  const Real rdx[3] = {(pm->mesh_size.x1max - pm->mesh_size.x1min)/pm->mesh_indcs.nx1,
+                       (pm->mesh_size.x2max - pm->mesh_size.x2min)/pm->mesh_indcs.nx2,
+                       (pm->mesh_size.x3max - pm->mesh_size.x3min)/pm->mesh_indcs.nx3};
+  std::vector<std::vector<std::pair<Real, Real>>> table(ff.rep + 1);   // [depth]: (offset/h, weight)
+  table[0] = {{0.0, 1.0}};
+  for (int d=1; d<=ff.rep; ++d) {
+    const Real sc = 1.0/static_cast<Real>(1 << d);
+    for (const auto &e : table[d-1]) {
+      table[d].push_back({e.first - sc, 0.25*e.second});
+      table[d].push_back({e.first, 0.5*e.second});
+      table[d].push_back({e.first + sc, 0.25*e.second});
+    }
   }
-  MPI_Gatherv(rm.data(), cnt, MPI_DOUBLE, all.data(), counts.data(), displ.data(), MPI_DOUBLE, 0,
-              MPI_COMM_WORLD);
-#else
-  all = rm;
-#endif
+  std::vector<double> cm2;
+  for (int p=0; p<np; ++p) {
+    const int lev = pi(PLEV,p) & 15;
+    const int depth = std::max(0, ff.rep - lev);
+    const Real h[3] = {rdx[0]/(1 << lev), rdx[1]/(1 << lev), rdx[2]/(1 << lev)};
+    const auto &t = table[depth];
+    for (const auto &ez : t) for (const auto &ey : t) for (const auto &ex : t) {
+      const Real x = pr(IPX,p) + ex.first*h[0] - cm[0], y = pr(IPY,p) + ey.first*h[1] - cm[1];
+      const Real z = pr(IPZ,p) + ez.first*h[2] - cm[2];
+      cm2.push_back(std::sqrt(x*x + y*y + z*z));
+      cm2.push_back(pr(IPM,p)*ex.second*ey.second*ez.second);
+    }
+  }
+  const std::vector<Real> rqm = Quantiles(cm2, mass);
   if (global_variable::my_rank != 0) return;
-  const std::size_t nall = all.size()/2;
-  std::vector<std::pair<double, double>> v(nall);
-  for (std::size_t p=0; p<nall; ++p) v[p] = {all[2*p], all[2*p+1]};
-  std::sort(v.begin(), v.end());
-  std::vector<Real> rq(ff.q.size(), 0.0);
-  double cum = 0.0;
-  std::size_t iq = 0;
-  for (std::size_t p=0; p<nall && iq<ff.q.size(); ++p) {
-    cum += v[p].second;
-    while (iq < ff.q.size() && cum >= ff.q[iq]*mass) {rq[iq] = v[p].first; ++iq;}
-  }
   if (!ff.have0) {
-    ff.rq0 = rq; ff.e0 = kin + pot; ff.w0 = pot; ff.have0 = true;
+    ff.rq0 = rq; ff.rqm0 = rqm; ff.e0 = kin + pot; ff.w0 = pot; ff.have0 = true;
   }
   const auto fv = Homologous(pm->time);
   std::ostringstream o;
@@ -182,6 +224,12 @@ void Observe(Mesh *pm) {
   for (std::size_t n=0; n<rq.size(); ++n) {
     o << (n ? "," : "") << ((fv.first > 0 && ff.rq0[n] > 0) ? rq[n]/(fv.first*ff.rq0[n]) : -1.0);
   }
+  o << "],\"rqm_over_f_rqm0\":[";
+  for (std::size_t n=0; n<rqm.size(); ++n) {
+    o << (n ? "," : "") << ((fv.first > 0 && ff.rqm0[n] > 0) ? rqm[n]/(fv.first*ff.rqm0[n]) : -1.0);
+  }
+  o << "],\"rqm\":[";
+  for (std::size_t n=0; n<rqm.size(); ++n) o << (n ? "," : "") << rqm[n];
   o << "],\"rq\":[";
   for (std::size_t n=0; n<rq.size(); ++n) o << (n ? "," : "") << rq[n];
   o << "],\"K\":" << kin << ",\"W\":" << pot << ",\"dE_over_W0\":" << (kin + pot - ff.e0)/std::fabs(ff.w0)
@@ -189,7 +237,7 @@ void Observe(Mesh *pm) {
     << cm[1] - ff.y << "," << cm[2] - ff.z << "],\"momentum_sum\":" << a[5] << ",\"vmax\":" << vmax
     << ",\"rho_peak\":" << peak << ",\"rho_uniform_analytic\":"
     << ((fv.first > 0) ? ff.rho/(fv.first*fv.first*fv.first) : -1.0)
-    << ",\"particles\":" << nall << ",\"blocks_per_level\":[" << s[4] << "," << s[5] << "," << s[6]
+    << ",\"particles\":" << static_cast<long long>(a[6]) << ",\"blocks_per_level\":[" << s[4] << "," << s[5] << "," << s[6]
     << "," << s[7] << "],\"residual\":" << grav->last_solve.relative_residual << "}";
   std::cout << "# FREEFALL " << o.str() << std::endl;
   std::ofstream out("freefall_history.jsonl", std::ios::app);
@@ -227,6 +275,8 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
   ff.z = pin->GetOrAddReal("problem", "ff_z", 0.5*(box.x3min + box.x3max));
   ff.dt = pin->GetOrAddReal("problem", "ff_dt", 0.02);
   ff.n = pin->GetOrAddInteger("problem", "ff_n", 1);
+  ff.rep = pin->GetOrAddInteger("problem", "ff_repr_level", pmy_mesh_->max_level - pmy_mesh_->root_level);
+  if (ff.rep < 0 || ff.rep > 4) Fatal("ff_repr_level must be 0..4");
   ff.tff = M_PI*std::sqrt(3.0/(8.0*ff.rho*ff.fourpig));
   if (!(ff.radius > 0 && ff.rho > 0 && ff.dt > 0 && ff.n >= 1)) Fatal("invalid ff_* parameters");
   {   // the gas is irrelevant (no drag, no gravity): the damping fixture at rest
