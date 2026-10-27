@@ -2793,6 +2793,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
   const Real omega = is_shearing_box ? omega0 : 0.0;
   const Real alpha = cloud_merge_alpha, fmin = cloud_merge_min_mass;
   const bool exact_ts = cloud_merge_exact_ts;
+  const bool alpha_leaf = cloud_merge_alpha_leaf;
   double qtot[8] = {0.0};   // X families, mass; G groups, pieces, mass; deferred, residual pieces
   for (int lev=1; lev<=nlev; ++lev) {
     const int L = lev - 1;
@@ -3007,6 +3008,14 @@ int DustGasDrag::MergeCloudsDevice3D() {
         const Real mq = mrootsp[sp]/qden;
         const Real xcc = lt.x1min + (I + 0.5)*H1, ycc = lt.x2min + (J + 0.5)*H2;
         const Real zcc = lt.x3min + (Kc + 0.5)*H3;
+        // cloud_merge_alpha_leaf: the velocity tolerance on the cell size of the leaf
+        // that holds this level-L cell (the gas resolution there), alpha H_leaf/tau, H_leaf = 2^(L -
+        // leaf level) H; the default keeps alpha H/tau
+        Real hfac = 1.0;
+        if (alpha_leaf) {
+          const int am0 = lt.Anchor(pi(PGID,qsc.list(qsc.start(u0))));
+          for (int Lc=L-1; Lc>=0 && lt.MergeOK(xcc, ycc, zcc, Lc, 0, am0); --Lc) hfac *= 2.0;
+        }
         Real gM[8], vlo[8][3], vhi[8][3];
         Real xlo[8], xhi[8], ylo[8], yhi[8], zlo[8], zhi[8], gts[8];
         int gg[8], gfirst[8], gn[8], nopen = 0;
@@ -3038,7 +3047,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
             const Real v[3] = {pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p)};
             const Real ts = pr(IPTS,p);
             const Real tau = (omega > 0.0) ? Kokkos::fmin(ts, 1.0/omega) : ts;
-            const Real tolv = alpha*H/tau;
+            const Real tolv = alpha*hfac*H/tau;
             int j = -1;
             for (int o=0; o<nopen && j<0; ++o) {
               if (gts[o] != ts) continue;

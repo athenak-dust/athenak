@@ -1463,6 +1463,7 @@ class DustGasDrag {
                                       // indistinguishable at the coarser level
   int cloud_merge_buffer = 2;         // merge cells lie at least this many cells (of the
                                       // target level) from any finer leaf
+  bool cloud_merge_alpha_leaf = false;   // 3-D G tolerance on the leaf cell size
   Real cloud_merge_alpha = 0.2;       // residual velocity tolerance alpha*H/tau_c,
                                       // tau_c = min(t_s, 1/Omega)
   int cloud_merge_interval = 10;      // cycles between coarsening passes
