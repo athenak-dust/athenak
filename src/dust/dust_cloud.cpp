@@ -77,20 +77,6 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   const int nvirt = pin->GetOrAddInteger("dust", "cloud_virtual_levels", 0);
   int nlev = nlev_mesh + nvirt;
 
-  // The virtual finest-grid table (cloud_target, cloud_level) is read
-  // only by the host paths and the checks; the production device paths use the actual leaves
-  // (LeafTraversal).  <dust>/cloud_table = auto (default: built when one of its users is set),
-  // true or false.  The table supports the root and two levels of refinement; without it the
-  // levels are limited by the cloud code (4 bits) only.
-  // The level-native traversal of the table (already off by default; the
-  // production kernels use the actual leaves) and its check are gone; the table
-  // itself stays (host split, host merge, leaf check, other controls)
-  RemovedKey(pin, "cloud_native_transfer", KeyFalse(pin, "cloud_native_transfer"),
-             "the level-native traversal");
-  RemovedKey(pin, "cloud_native_check",
-             !pin->DoesParameterExist("dust", "cloud_native_check") ||
-             pin->GetInteger("dust", "cloud_native_check") <= 0,
-             "the check of the level-native traversal");
   // cloud_halo_coarser (test): levels a cloud may be coarser than the block of its centre, for the
   // reach of the halo (-1: from the split rule); the per-cycle check widens it where needed
   cloud_halo_coarser = pin->GetOrAddInteger("dust", "cloud_halo_coarser", -1);
@@ -113,24 +99,12 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     cloud_sort_interval = pin->GetOrAddInteger("dust", "cloud_sort_interval", sortdef ? 64 : 0);
   }
   {
-    // The Morton sort order is gone; linear (default) and
-    // random (a test tool) stay
-    // (Codex review of the cleanup: without sorting, cloud_sort_interval = 0, the order never
-    // acted; morton is then accepted)
-    RemovedKey(pin, "cloud_sort_order", cloud_sort_interval <= 0 ||
-               !pin->DoesParameterExist("dust", "cloud_sort_order") ||
-               pin->GetString("dust", "cloud_sort_order") != "morton",
-               "the Morton order of the particle sort");
     const std::string so = pin->GetOrAddString("dust", "cloud_sort_order", "linear");
-    if (so != "linear" && so != "random" && !(so == "morton" && cloud_sort_interval <= 0)) {
+    if (so != "linear" && so != "random") {
       std::cout << "### FATAL ERROR: <dust>/cloud_sort_order must be linear or random" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     cloud_sort_random = (so == "random");   // diagnostic: a random permutation
-    // The diagnostic sort before the split, R and merge of the cycle
-    // is gone; the sort runs after them
-    RemovedKey(pin, "cloud_sort_at_start", cloud_sort_interval <= 0 || KeyFalse(pin, "cloud_sort_at_start"),
-               "the sort at the start of the cycle");
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
     // The cell-sorted index is on by default (every 8 cycles) where the two
     // production cloud kernels run (hybrid / PC2 coupling, linear gather); 0 turns it off (the
@@ -746,7 +720,7 @@ int DustGasDrag::SplitAndMergeClouds() {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::SplitCloudsP1
-//! \brief Moving-particle P1 split (<dust>/cloud_p1_split), called by
+//! \brief Moving-particle P1 split, called by
 //! SplitAndMergeClouds.  A plain level-l cloud whose support lies on finer leaves is
 //! split, but along each direction an edge child is separated only if the lattice
 //! neighbour on that side (the virtual level-l cloud one parent spacing H away) would

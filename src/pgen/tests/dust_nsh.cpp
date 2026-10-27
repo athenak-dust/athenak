@@ -1240,10 +1240,6 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   ba_fields_ = pin->GetOrAddBoolean("problem", "ba_fields", false);
   ba_ppdf_ = pin->GetOrAddBoolean("problem", "ba_ppdf", false);
   ba_fields_write_ = pin->GetOrAddBoolean("problem", "ba_fields_write", true);
-  // The several-rank field writer on one rank (test) is gone
-  dust::RemovedKey(pin, "ba_fields_global_test",
-                   !ba_fields_ || dust::KeyFalse(pin, "ba_fields_global_test", "problem"),
-                   "the several-rank field writer on one rank (test)", "problem");
   ba_ppdf_nref_ = pin->GetOrAddInteger("problem", "ba_ppdf_nref", 128);
   if (ba_ppdf_ && !ba_fields_) {
     std::cerr << "ba_ppdf is written with the BA field snapshots: set ba_fields = true"

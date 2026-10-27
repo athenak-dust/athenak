@@ -29,8 +29,6 @@
 
 namespace dust {
 
-// (RemovedKey and KeyFalse, the guards of removed keys: dust.hpp)
-
 //----------------------------------------------------------------------------------------
 // constructor: parses input, validates configuration, allocates deposit fields and
 // boundary communication objects
@@ -502,33 +500,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         std::exit(EXIT_FAILURE);
       }
       cloud_split_slack = pin->GetOrAddReal("dust", "cloud_split_slack", 0.02);
-      // The research gather / deposit variants are gone with their
-      // general PC2 kernels: the leaf's own gas velocity in the gas-side drag and the drag
-      // deposited as two-scale children over finer leaves, and the deformable clouds
-      // that carried dv/dx
-      RemovedKey(pin, "cloud_deform", KeyFalse(pin, "cloud_deform"),
-                 "the deformable clouds");
-      RemovedKey(pin, "cloud_force_local", KeyFalse(pin, "cloud_force_local"),
-                 "the gas-side drag with the leaf's own velocity");
-      RemovedKey(pin, "cloud_force_children", KeyFalse(pin, "cloud_force_children"),
-                 "the drag deposited as two-scale children");
-      // The fixed gather level (a diagnostic) is gone
-      RemovedKey(pin, "cloud_gather_level",
-                 !pin->DoesParameterExist("dust", "cloud_gather_level") ||
-                 pin->GetInteger("dust", "cloud_gather_level") < 0, "the fixed gather level");
-      // Rixin: the production split is the default: the moving P1 split, splitting on
-      // the first overlap with finer leaves (cloud_split_overlap, dust_cloud.cpp), with the P1
-      // transition clouds of mode 2 and the linear gather that mode needs.  Inputs written
-      // before 2026-10-17 that leave these keys out get the new values.
-      // The old 3x3 two-scale host split (cloud_p1_split = false,
-      // with its coincident-child merging, cloud_merge_tolerance, and the transition
-      // clouds) is gone; the key stays, true is its only value.
-      // cloud_merge_tolerance acted only there and is ignored.
-      RemovedKey(pin, "cloud_p1_split",
-                 !pin->DoesParameterExist("dust", "cloud_p1_split") ||
-                 pin->GetBoolean("dust", "cloud_p1_split"),
-                 "the 3x3 two-scale host split without P1");
-      cloud_p1_split = pin->GetOrAddBoolean("dust", "cloud_p1_split", true);
       cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order", 2);
       cloud_transition = pin->GetOrAddInteger("dust", "cloud_transition",
                                               cloud_gather_order == 2 ? 2 : 1);
@@ -539,17 +510,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << "requires cloud_gather_order=2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      // The old-rule lobe release at the exit edge is gone
-      RemovedKey(pin, "cloud_p1_release_exit", KeyFalse(pin, "cloud_p1_release_exit"),
-                 "the lobe release at the exit edge");
       // The Kokkos P1 split on every backend (Codex review; it runs on CPUs
       // too); the host split needs the finite fine-grid table (few levels, one rank) and stays a
       // reference, selected explicitly
       cloud_split_device = pin->GetOrAddBoolean("dust", "cloud_split_device", true);
-      // The node-convention prolongation of the host P1 split
-      // (lattice Ai) is gone; the host P1 split, its log and the oracle stay
-      RemovedKey(pin, "cloud_split_interp", KeyFalse(pin, "cloud_split_interp"),
-                 "the node-convention prolongation of the host P1 split");
       // Test switch: false keeps every cloud at its level whatever the mesh
       cloud_split_enable = pin->GetOrAddBoolean("dust", "cloud_split_enable", true);
       // G (quantum merge under the pass budget): on in default and careful_merge (a full AMR
@@ -569,24 +533,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_min_mass = pin->GetOrAddReal("dust", "cloud_merge_min_mass", 0.5);
       cloud_merge_nc = pin->GetOrAddBoolean("dust", "cloud_merge_nc", true);
       cloud_merge_lobe_wait = pin->GetOrAddInteger("dust", "cloud_merge_lobe_wait", 0);
-      // The absorption of merge residuals (tent orphans;
-      // quantum G residuals) and the D3 row first-moment matching of the tent
-      // merge are gone.  Without merging they did nothing, so any value passes
-      // then.  cloud_merge_d3_iter and cloud_absorb_budget (the absorption's own budget)
-      // acted only through these switches and are ignored.
-      RemovedKey(pin, "cloud_merge_absorb", !cloud_merge || KeyFalse(pin, "cloud_merge_absorb"),
-                 "the absorption of merge residuals");
-      RemovedKey(pin, "cloud_merge_d3", !cloud_merge || KeyFalse(pin, "cloud_merge_d3"),
-                 "the D3 first-moment matching of the tent merge");
       // Quantum G and several ranks exist only in the Kokkos merge
       cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", true);
-      // The end time of the merge passes (a diagnostic) is
-      // gone
-      // (Codex review of the cleanup: without G the key never acted, any value is accepted)
-      RemovedKey(pin, "cloud_merge_tstop", !cloud_merge ||
-                 !pin->DoesParameterExist("dust", "cloud_merge_tstop") ||
-                 pin->GetReal("dust", "cloud_merge_tstop") < 0.0,
-                 "the end time of the merge passes");
       // Merge schedule in physical time, burst after derefinement
       {
         Real om = 0.0;
@@ -665,13 +613,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_budget_kappa = preset_real("cloud_merge_budget_kappa", careful ? 1.0 : 0.0);
       cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
       cloud_merge_budget_thin = pin->GetOrAddBoolean("dust", "cloud_merge_budget_thin", false);
-      // The test offset of the pass budget is gone; it
-      // acted only with quantum G and the pass budget on
-      RemovedKey(pin, "cloud_merge_budget_prior",
-                 !cloud_merge || cloud_merge_mode != 1 || cloud_merge_budget <= 0.0 ||
-                 !pin->DoesParameterExist("dust", "cloud_merge_budget_prior") ||
-                 pin->GetReal("dust", "cloud_merge_budget_prior") == 0.0,
-                 "the budget used in advance (cloud_merge_budget_prior)");
       cloud_merge_budget_x = pin->GetOrAddBoolean("dust", "cloud_merge_budget_x", false);
       // R (resampling) on in default and careful_merge, with the production clock below; off in
       // split_only
@@ -749,22 +690,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_resample_cold_alpha = preset_real("cloud_resample_cold_alpha", careful ? 0.05 : 0.0);
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       // Patches inside one MeshBlock of min(cloud_resample_patch 2^level,
-      // cloud_resample_patch_cells)^2 of its cells (cloud_resample_patches = block).
-      // The patches of cloud_resample_patch^2 root cells (root)
-      // are gone
-      {
-        // (Codex review of the cleanup: without R the key never acted, root is then accepted)
-        RemovedKey(pin, "cloud_resample_patches", !cloud_resample ||
-                   !pin->DoesParameterExist("dust", "cloud_resample_patches") ||
-                   pin->GetString("dust", "cloud_resample_patches") != "root",
-                   "the resampling on root-cell patches");
-        const std::string pm = pin->GetOrAddString("dust", "cloud_resample_patches", "block");
-        if (pm != "block" && !(pm == "root" && !cloud_resample)) {
-          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                    << "<dust>/cloud_resample_patches must be block" << std::endl;
-          std::exit(EXIT_FAILURE);
-        }
-      }
+      // cloud_resample_patch_cells)^2 of its cells
       cloud_resample_patch_cells = pin->GetOrAddInteger("dust", "cloud_resample_patch_cells", 4);   // cap
       // A block patch, or a quadrant of one, holding more than this many pool clouds
       // (of one species) is split into its four quadrants, recursively down to single cells;
@@ -846,46 +772,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         std::cout << "# NOTE (dust): cloud_resample_m0 is the root cloud mass of every species "
                   << "(leave it unset for the per-species masses of the initial clouds)" << std::endl;
       }
-      // Clouds at their cap stay out of the pool; false (they stayed
-      // in it and could only lose mass) is gone (the restart files written between
-      // eec962b0 and 902dd0bd carry false)
-      // (Codex review of the cleanup: without R the key never acted, any value is accepted)
-      RemovedKey(pin, "cloud_resample_skip_at_cap", !cloud_resample ||
-                 !pin->DoesParameterExist("dust", "cloud_resample_skip_at_cap") ||
-                 pin->GetBoolean("dust", "cloud_resample_skip_at_cap"),
-                 "keeping the clouds at their cap in the resampling pool");
-      // Resampling after every regrid, default on.  The older key
-      // (cloud_resample_after_refine: refine only, default off) maps onto it, so the inputs of
-      // earlier runs keep their meaning for "false" (no extra resampling).
-      {
-        const bool has_new = pin->DoesParameterExist("dust", "cloud_resample_after_regrid");
-        const bool has_old = pin->DoesParameterExist("dust", "cloud_resample_after_refine");
-        // both keys: the new one decides.  A restart file of a run that read the old key carries
-        // the old one and the new one added here, and a restart may change the new one (Codex
-        // review)
-        if (has_new && has_old && global_variable::my_rank == 0 &&
-            pin->GetBoolean("dust", "cloud_resample_after_regrid") !=
-            pin->GetBoolean("dust", "cloud_resample_after_refine")) {
-          std::cout << "# NOTE (dust): cloud_resample_after_regrid = "
-                    << (pin->GetBoolean("dust", "cloud_resample_after_regrid") ? "true" : "false")
-                    << " is used; the old key cloud_resample_after_refine is ignored" << std::endl;
-        }
-        // Rixin: default false (was true): no G or R after the regrids, the
-        // scheduled ones (G and R every 0.25 / omega0) cover them; a regrid every ~40 cycles made the
-        // per-regrid R latency-bound and the largest single cost on several GPUs
-        bool dflt = false;
-        if (has_old && !has_new) {
-          dflt = pin->GetBoolean("dust", "cloud_resample_after_refine");
-          if (global_variable::my_rank == 0) {
-            std::cout << "# NOTE (dust): cloud_resample_after_refine = " << (dflt ? "true" : "false")
-                      << " is read as cloud_resample_after_regrid = " << (dflt ? "true" : "false")
-                      << " (after every regrid, refine or derefine, once the particle "
-                      << "work of the regrid is done)" << std::endl;
-          }
-        }
-        cloud_resample_after_regrid = pin->GetOrAddBoolean("dust", "cloud_resample_after_regrid",
-                                                           dflt);
-      }
+      // Resampling after every regrid.  Rixin: default
+      // false: no G or R after the regrids, the scheduled ones (G and R every 0.25 / omega0) cover
+      // them; a regrid every ~40 cycles made the per-regrid R latency-bound
+      cloud_resample_after_regrid = pin->GetOrAddBoolean("dust", "cloud_resample_after_regrid",
+                                                         false);
       // The resampling after a regrid only on the blocks the regrid made and their
       // neighbours (the scheduled resampling stays global)
       // Rixin: default true (false reproduces the earlier runs).  The
@@ -924,11 +815,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << " cloud_gather_order = 2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      // Stage C of quantum G (same-level compression in the fine
-      // interior) is gone; its sub-keys cloud_compress_smax, cloud_compress_ds and
-      // cloud_compress_buffer acted only through it and are ignored
-      RemovedKey(pin, "cloud_compress", KeyFalse(pin, "cloud_compress"),
-                 "stage C of quantum G");
       // (2026-10-20: quantum is the default mode now, so its requirements apply only when G is on;
       // cloud_merge = false with the default mode is a run without G, not an error)
       if (cloud_merge && cloud_merge_mode == 1 &&
@@ -948,12 +834,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << " and cloud_merge_interval >= 1" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      // The x1-only presplit of root clouds is gone
-      RemovedKey(pin, "cloud_presplit_x1", KeyFalse(pin, "cloud_presplit_x1"),
-                 "the x1-only presplit of root clouds");
       if (cloud_transition == 0) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_p1_split requires cloud_transition=1 or 2 "
+                  << std::endl << "the P1 split requires cloud_transition=1 or 2 "
                   << "(the gather used for transition clouds)" << std::endl;
         std::exit(EXIT_FAILURE);
       }

@@ -751,12 +751,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     pmy_mesh_->nprtcl_thisrank = nlattice;
     pmy_mesh_->nprtcl_eachrank[global_variable::my_rank] = nlattice;
     pmy_mesh_->nprtcl_total = nlattice;
-    // <problem>/graded_split_layers (the graded normal transition of
-    // a static refined region, a diagnostic) is gone
-    dust::RemovedKey(pin, "graded_split_layers",
-                     !pin->DoesParameterExist("problem", "graded_split_layers") ||
-                     pin->GetInteger("problem", "graded_split_layers") < 0,
-                     "the graded static split transition", "problem");
     {
       // one pass per refinement level: children of the first pass may lie inside a
       // still finer region (the tag counter is set collectively first)

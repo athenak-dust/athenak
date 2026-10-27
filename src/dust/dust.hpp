@@ -1136,25 +1136,6 @@ struct DustGasDragTaskIDs {
 namespace dust {
 struct GravityPointTransfer;
 
-// 2026-10-20 cleanup: a key whose option was removed.  An input or
-// restart file that still writes it is accepted when the value asks for the behaviour that
-// remains (keeps: usually the old default); otherwise the run stops instead of silently running
-// another method.  The removed paths still run in the version tagged pre-cleanup-20261020.
-// The guard sits where the key used to be read; block: the input block (<dust> or <problem>).
-inline void RemovedKey(ParameterInput *pin, const char *key, const bool keeps, const char *what,
-                       const char *block = "dust") {
-  if (!pin->DoesParameterExist(block, key) || keeps) return;
-  std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-            << "<" << block << ">/" << key << " = " << pin->GetString(block, key) << ": " << what
-            << " was removed on 2026-10-20 (it runs in the version tagged pre-cleanup-20261020)"
-            << std::endl;
-  std::exit(EXIT_FAILURE);
-}
-// the key is absent or false
-inline bool KeyFalse(ParameterInput *pin, const char *key, const char *block = "dust") {
-  return !pin->DoesParameterExist(block, key) || !pin->GetBoolean(block, key);
-}
-
 // Particle deposits need atomic updates on parallel execution spaces because stencil
 // footprints overlap.  Kokkos::Serial has only one worker, however, so its generic
 // compare-and-swap atomic adds synchronization overhead without providing protection.
@@ -1310,7 +1291,7 @@ class DustGasDrag {
   std::uint64_t IssueTags(const std::uint64_t n);   // the first of n new tags of this rank
   std::uint64_t LiveTagBound() const; // collective: 1 + the largest live tag (0: no particle)
   std::uint64_t IssuedTagBound() const;   // collective: above every tag issued so far
-  bool cloud_p1_split = true;         // moving-particle P1 split: edge children
+  // moving-particle P1 split: edge children
                                       // separate only where the neighbour parent splits,
                                       // no merging (requires cloud_transition > 0); the
                                       // only split since 2026-10-20 (the old 3x3 one is gone)

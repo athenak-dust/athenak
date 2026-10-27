@@ -30,11 +30,10 @@
 //! DensityRefinement() is the minimal dust-density request: at the
 //! check (end of the cycle, after the outputs, before the regrid) the dust mass of the
 //! particles at their new positions is deposited on the current leaves with the exact cloud
-//! integrals (the transfer of the coupling and of the field outputs).  amr_rho_map = block
-//! (as the AthenaK criteria): a block is judged on the maximum of
+//! integrals (the transfer of the coupling and of the field outputs).  As the AthenaK
+//! criteria, a block is judged on the maximum of
 //! rho_d / mean over its own leaf cells, widened by amr_rho_buffer cells of its own level
-//! (periodic; the cells of neighbouring blocks, from the halo on several ranks).  (The root-grid
-//! map, amr_rho_map = root, was removed.)  A block whose value
+//! (periodic; the cells of neighbouring blocks, from the halo on several ranks).  A block whose value
 //! reaches amr_rho_refine is flagged for
 //! refinement, one that stays below amr_rho_derefine (< amr_rho_refine, hysteresis) for
 //! derefinement.
@@ -111,12 +110,10 @@ struct DensityTrigger {
     if (refine_levels.empty()) return rho_derefine*std::pow(level_factor, l - 1);
     return rho_derefine/rho_refine*refine_levels[std::max(0, l - 1)];
   }
-  // With map = block, the block values on the device (default) or on the host; check:
-  // both, every value compared (diagnostic)
+  // The block values on the device (default) or on the host
   bool device = true;
   // <dust>/amr_shear_face_limit = on (the default: the 2:1 rule of
   // all other neighbours, within what the face exchange can fill) | off (ShearFaceLevelLimit).
-  // Rixin: auto and amr_shear_face_dmax (for 8x16x8 blocks) were removed (16^3 blocks)
   bool shear_face_limit = true;
 };
 DensityTrigger trig_;
@@ -254,46 +251,10 @@ void SetupDensityTrigger(ParameterInput *pin) {
     }
   }
   {
-    // Rixin: each block on its own leaf cells, as the AthenaK criteria.
-    // The root-grid map (root) is gone
-    RemovedKey(pin, "amr_rho_map",
-               !pin->DoesParameterExist("dust", "amr_rho_map") ||
-               pin->GetString("dust", "amr_rho_map") != "root",
-               "the root-grid map of the density trigger");
-    const std::string mp = pin->GetOrAddString("dust", "amr_rho_map", "block");
-    if (mp != "block") fatal("<dust>/amr_rho_map must be block");
-  }
-  {
     // The thresholds grow by amr_rho_level_factor per level (1:
     // the same on every level; 4: a fixed dust mass per cell in 2-D; 2 follows the growth of the
-    // peak density with resolution in the 2048^2 run).  The older
-    // amr_rho_level_scaling (none / mass) is folded into it: none is factor 1, mass factor 4 (2-D,
-    // the trigger is 2-D only), the same threshold rule.  An input with the old key only gets that
-    // factor (one note).  With both keys the factor wins, as before the fold (Codex review of the
-    // cleanup: mass next to factor 2 was a valid input); a note says the alias is ignored.
-    Real fsc = 1.0;
-    const bool has_sc = pin->DoesParameterExist("dust", "amr_rho_level_scaling");
-    const bool has_f = pin->DoesParameterExist("dust", "amr_rho_level_factor");
-    if (has_sc) {
-      const std::string sc = pin->GetString("dust", "amr_rho_level_scaling");
-      if (sc == "mass") {
-        fsc = 4.0;
-      } else if (sc != "none") {
-        fatal("<dust>/amr_rho_level_scaling (folded into amr_rho_level_factor) must be none or mass");
-      }
-      if (has_f && pin->GetReal("dust", "amr_rho_level_factor") != fsc &&
-          global_variable::my_rank == 0) {
-        std::cout << "# NOTE (dust): amr_rho_level_scaling = " << sc << " is ignored, the given "
-                  << "amr_rho_level_factor = " << pin->GetString("dust", "amr_rho_level_factor")
-                  << " is used (as before the key was folded into it on 2026-10-20)" << std::endl;
-      }
-      if (!has_f && global_variable::my_rank == 0) {
-        std::cout << "# NOTE (dust): amr_rho_level_scaling = " << sc << " is read as "
-                  << "amr_rho_level_factor = " << fsc << " (the key was folded into "
-                  << "amr_rho_level_factor on 2026-10-20)" << std::endl;
-      }
-    }
-    trig_.level_factor = pin->GetOrAddReal("dust", "amr_rho_level_factor", fsc);
+    // peak density with resolution in the 2048^2 run)
+    trig_.level_factor = pin->GetOrAddReal("dust", "amr_rho_level_factor", 1.0);
     if (!(trig_.level_factor >= 1.0)) fatal("<dust>/amr_rho_level_factor must be >= 1");
     if (pin->DoesParameterExist("dust", "amr_rho_refine_levels")) {
       std::string lv = pin->GetString("dust", "amr_rho_refine_levels");
@@ -319,22 +280,10 @@ void SetupDensityTrigger(ParameterInput *pin) {
   {
     // Rixin: default on (the shear-periodic x1 faces follow the 2:1 rule of all other
     // neighbours, within what the face exchange can fill); auto = only the exchange's limit
-    std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
-    // restart files of 2026-10-27 and earlier carry the then default "auto" (and dmax = -1): read
-    // them as the current default; a value set by hand otherwise must be on or off
-    if (sfl == "auto") {
-      if (global_variable::my_rank == 0)
-        std::cout << "# NOTE (dust): amr_shear_face_limit = auto (an older default, e.g. from a restart "
-                  << "file) is read as on" << std::endl;
-      sfl = "on";
-      pin->SetString("dust", "amr_shear_face_limit", sfl);
-    }
+    const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
     if (sfl == "on") trig_.shear_face_limit = true;
     else if (sfl == "off") trig_.shear_face_limit = false;
-    else fatal("<dust>/amr_shear_face_limit must be on or off (auto was removed on 2026-10-27)");
-    if (pin->DoesParameterExist("dust", "amr_shear_face_dmax") &&
-        pin->GetInteger("dust", "amr_shear_face_dmax") >= 0)
-      fatal("<dust>/amr_shear_face_dmax was removed on 2026-10-27 (it served the 8x16x8 conversion)");
+    else fatal("<dust>/amr_shear_face_limit must be on or off");
   }
   if (!(trig_.rho_derefine >= 0.0 && trig_.rho_derefine < trig_.rho_refine) || trig_.buffer < 0) {
     fatal("amr_density_trigger needs 0 <= amr_rho_derefine < amr_rho_refine and amr_rho_buffer >= 0");
@@ -1072,7 +1021,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     const Real want = (ex1 - ex0)*(ey1 - ey0);
     if (std::fabs(area - want) > 1.0e-9*want || nbad > 0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "amr_rho_map = block: the buffer of block " << m + mbs << " (" << trig_.buffer
+                << "density trigger: the buffer of block " << m + mbs << " (" << trig_.buffer
                 << " cells) is not covered by the local and halo blocks (covered area "
                 << area << " of " << want << ", " << nbad << " non-finite cells)" << std::endl;
       std::exit(EXIT_FAILURE);
@@ -1161,7 +1110,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       const Real want = (ex1 - ex0)*(ey1 - ey0);   // as in BlockValue
       if (std::fabs(ad_h(m) - want) > 1.0e-9*want || bd_h(m) > 0) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "amr_rho_map = block: the buffer of block " << m + mbs << " (" << trig_.buffer
+                  << "density trigger: the buffer of block " << m + mbs << " (" << trig_.buffer
                   << " cells) is not covered by the local and halo blocks (covered area "
                   << ad_h(m) << " of " << want << ", " << bd_h(m) << " non-finite cells)" << std::endl;
         std::exit(EXIT_FAILURE);
