@@ -36,7 +36,7 @@ class OrbitalAdvection {
   MPI_Comm comm_orb_advect;
 #endif
 
-  // x2-face neighbours on another level (stage S2).  xlev(m,n) for the lower
+  // x2-face neighbours on another level.  xlev(m,n) for the lower
   // (n=0) and upper (n=1) x2 face: 0 a neighbour on the same level, 1 a coarser neighbour,
   // 2 four finer neighbours.  A coarser sender prolongates (limited linear, as ProlongCC) and
   // a finer sender restricts the rows into the receiver's buffer, so the remap itself is the

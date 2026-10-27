@@ -43,7 +43,7 @@
 
 // User-defined history function (only used for compressible Hydro and MHD cases)
 void ShwaveHistory(HistoryData *pdata, Mesh *pm);
-// (S1') scheduled refinement bands (whole x2) for adaptive shearing-box tests
+// scheduled refinement bands (whole x2) for adaptive shearing-box tests
 void ShwaveBands(MeshBlockPack *pmbp);
 namespace {
 struct ShwaveBand {Real t0, t1, x1a, x1b, x2a, x2b, x3a, x3b; int level;};
@@ -75,7 +75,7 @@ void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
   Real amp = pin->GetReal("problem", "amp");
   int ipert = pin->GetInteger("problem", "ipert");
 
-  // (S1') <problem>/band_n bands of refinement for tests of the adaptive
+  // <problem>/band_n bands of refinement for tests of the adaptive
   // shearing box: bandK_t0, _t1, _x1min, _x1max, _x3min, _x3max, _level; a
   // block whose centre is inside an active band is wanted at its level (whole x2)
   shw_bands.clear();
@@ -85,7 +85,7 @@ void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
     ShwaveBand bd;
     bd.t0 = pin->GetReal("problem", k + "t0"); bd.t1 = pin->GetReal("problem", k + "t1");
     bd.x1a = pin->GetReal("problem", k + "x1min"); bd.x1b = pin->GetReal("problem", k + "x1max");
-    // (S2) a box limited in x2 as well (default: the whole x2)
+    // a box limited in x2 as well (default: the whole x2)
     bd.x2a = pin->GetOrAddReal("problem", k + "x2min", pmy_mesh_->mesh_size.x2min);
     bd.x2b = pin->GetOrAddReal("problem", k + "x2max", pmy_mesh_->mesh_size.x2max);
     bd.x3a = pin->GetOrAddReal("problem", k + "x3min", pmy_mesh_->mesh_size.x3min);
@@ -470,7 +470,7 @@ void ShwaveHistory(HistoryData *pdata, Mesh *pm) {
 
 //----------------------------------------------------------------------------------------
 //! \fn void ShwaveBands()
-//! \brief Refinement request of the bands (S1'): refine a block whose centre
+//! \brief refinement request of the bands: refine a block whose centre
 //! lies in an active band below its level, derefine one outside every active band (or above the
 //! level they want).  (Boxes may be limited in x2; the blocks on the shear-periodic x1
 //! faces are merged into columns along x2 by the mesh refinement.)

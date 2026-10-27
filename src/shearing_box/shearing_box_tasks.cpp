@@ -6,7 +6,7 @@
 //! \file shearing_box_tasks.cpp
 //! \brief functions included in task lists to post/clear non-blocking MPI calls for
 //! shearing box, and flux correction steps with shearing box boundaries.
-//! (S1') The pieces of the integer shift are computed once
+//! The pieces of the integer shift are computed once
 //! (ShearingBox::Pieces) for the MeshBlock arrays and, with mesh refinement, for the coarse
 //! arrays (coarse_on); the MPI posts and waits below loop over both.
 
@@ -146,7 +146,8 @@ TaskStatus ShearingBox::InitRecv(Real time) {
   Real lx = (mesh_size.x1max - mesh_size.x1min);
   yshear = (qshear*omega0)*lx*time;
 
-  // collected ghost zones: plan with this yshear and post their receives
+  // x1-face blocks on several levels (face_levels): collected ghost zones; plan with
+  // this yshear and post their receives
   if (face_levels) {
     PlanPull();
     return TaskStatus::complete;

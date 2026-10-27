@@ -184,7 +184,7 @@ void ParticleVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   bool have_written_pointdata_header = false;
 
   // Write gid of points
-  // The dust tag is 64-bit (words PTAG, PTAGH); ptag holds its float32 value (exact
+  // the dust tag is 64-bit (words PTAG, PTAGH); ptag holds its float32 value (exact
   // below 2^24, as before), and PTAGH is not written as a column of its own
   const bool hiword = (pm->pmb_pack->ppart->nidata > PTAGH);
   for (int n=0; n<(pm->pmb_pack->ppart->nidata); ++n) {

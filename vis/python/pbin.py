@@ -6,8 +6,7 @@ A pbin file holds the active dust particles of one output time as typed columns
 species, and for refinable clouds a uint16 shape code), a small directory of the
 MeshBlocks, and a text header with the run's complete input parameters, the
 representation rule of the dust mass, the velocity frame and the column
-directory.  The file can be read alone (without any code of the dust
-project).  Only numpy is needed.
+directory.  The file can be read alone.  Only numpy is needed.
 
 Format version 2 may store a particle quantity once in the header ([constants])
 instead of as a column: with one species and species_fixed stopping times the
@@ -366,8 +365,8 @@ class PbinSnapshot:
     def outside_boxes(self):
         """Particles not inside the half-open box [min, max) of any MeshBlock, with no
         tolerance: (count, largest distance outside the box of the block found for them).
-        Since the routing snap (de08cc3b) the code keeps
-        every particle inside its block's box; older files may hold particles a round-off
+        The code now snaps particle positions when routing them, so it keeps every
+        particle inside its block's box; older files may hold particles a round-off
         outside (split children at a face with coordinate 0)."""
         n = len(self)
         if n == 0:

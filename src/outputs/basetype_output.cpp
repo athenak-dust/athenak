@@ -766,11 +766,11 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     outvars.emplace_back("dustd",0,&(derived_var));
   }
 
-  // With dust, every bin output of hydro variables carries the
+  // with dust, every bin output of hydro variables carries the
   // dust mass and momentum densities too (dust_total_var; not with ghost zones); opt out per
   // block with dust_total = false.  The key is read only when given, so a restart file whose
   // output blocks lack it (older files included) gets the default.
-  // (Rixin: only the full sets hydro_w and hydro_u; single components and derived
+  // (only the full sets hydro_w and hydro_u; single components and derived
   // variables get nothing)
   if (out_params.file_type.compare("bin") == 0 && pm->pmb_pack->pdust != nullptr &&
       (out_params.variable.compare("hydro_w") == 0 ||

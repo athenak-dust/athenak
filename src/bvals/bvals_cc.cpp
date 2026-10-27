@@ -315,7 +315,7 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
   auto recvoff = recv_agg_offset_;
 #endif
 
-  // (S2c) with the collected shearing-box ghost zones the x1 ghosts across a
+  // with the collected shearing-box ghost zones the x1 ghosts across a
   // shear-periodic face are not unpacked: they keep the last collected (sheared) values, which
   // the next collection uses for its x slopes
   const bool skip_shr = skip_shear_x1_prol && pmy_pack->pmesh->three_d;

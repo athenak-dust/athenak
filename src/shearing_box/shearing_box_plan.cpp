@@ -4,7 +4,7 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file shearing_box_plan.cpp
-//! \brief The block-local part of the shear-exchange plans (S2d).
+//! \brief The block-local part of the shear-exchange plans.
 //! BuildCandidates (per regrid): for every local block on a shear-periodic x1 face, the blocks
 //! of the opposite face that overlap it in x3 by at least a margin of nghost cells of the root
 //! level's coarse array (2 nghost root cells; a superset of every exchange's partners).  The

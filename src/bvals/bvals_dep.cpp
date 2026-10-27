@@ -42,18 +42,18 @@
 MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *pin) :
   MeshBoundaryValues(pp, pin, false) {
 #if MPI_PARALLEL_ENABLED
-  MPI_Comm_dup(MPI_COMM_WORLD, &comm_dep_);   // for the general path
+  MPI_Comm_dup(MPI_COMM_WORLD, &comm_dep_);   // the general path
 #endif
   if (!pp->pmesh->multilevel) return;
   const dust::AmrPic pic = dust::ResolveAmrPic(pin, true);
-  // A 3-D mesh with refinement and owner_overlap (stage S3a) uses the general
+  // a 3-D mesh with refinement and owner_overlap uses the general
   // remap (DepRemapPlan, bvals_dep_general.cpp), which the dust module sets up; it checks the rest
   if (pp->pmesh->three_d && pic == dust::AmrPic::owner_overlap) return;
-  // refinable clouds deposit into the leaves directly (in 2-D and in 3-D); several
-  // ranks only for them (the dust halo): this exchange is not used then
+  // refinable clouds deposit into the leaves directly (2-D and 3-D), and several ranks
+  // are supported only for them (through the dust halo): this exchange is not used then
   const bool rc = (pic == dust::AmrPic::refinable_cloud);
   const bool clouds3d = rc && pp->pmesh->three_d;
-  // (the sheared image and physical x3 faces in the leaf traversal)
+  // (the leaf traversal handles the sheared image and the physical x3 faces)
   const bool shear3d = clouds3d &&
       (pp->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic ||
        pp->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic);
@@ -80,8 +80,8 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
 
 //----------------------------------------------------------------------------------------
 //! \fn void MeshBoundaryValuesDep::BuildLocalSMRMap()
-//! \brief Precompute the active-leaf destinations of every local ghost cell
-//! on the device; only the block itself and its neighbours (each once) are
+//! \brief Precompute the active-leaf destinations of every local ghost cell.  This runs
+//! on the device, and only the block itself and its neighbours (each once) are
 //! searched instead of every block, so that a dynamic mesh can rebuild the map after each
 //! regrid; per target block only the cells near the ghost cell are tested.  Blocks narrower
 //! than two ghost depths (the coarse ghost zone then reaches past the finer neighbours) search
@@ -116,7 +116,7 @@ void MeshBoundaryValuesDep::BuildLocalSMRMap() {
   const Real x2min = meshsize.x2min, x2max = meshsize.x2max;
   const Real lxmesh = x1max - x1min, lymesh = x2max - x2min;
   constexpr int ntmax = max_smr_targets_;
-  // Codex review: the ghost zone of a coarse block is 2 ng cells of its finer
+  // the ghost zone of a coarse block is 2 ng cells of its finer
   // neighbours; with blocks narrower than that (e.g. 4^2 cells, ng = 4) it reaches past the
   // neighbours, so every block of the pack is searched then
   const bool full = (2*indcs.ng > nx1) || (2*indcs.ng > nx2);

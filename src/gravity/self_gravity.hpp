@@ -59,7 +59,7 @@ class SelfGravity {
   // <gravity>/energy_source = kick (default) | flux | diag.  The half-kicks change
   // the gas energy by the kinetic-energy change of the cell-centred momentum kick, sum rho v.g dt;
   // the potential energy W = 1/2 sum rho phi V changes with the face mass fluxes, so total
-  // K + U + W drifts (12.3% / 5.4% at 32^3 / 64^3, all of it this mismatch).  flux
+  // K + U + W drifts (12.3% / 5.4% at 32^3 / 64^3 in a test, all from this).  flux
   // replaces, at the end of each step, the gas energy of the two kicks by the face work
   //   -1/2 sum_d [S_{i+1/2}(phibar_{i+1} - phibar_i) + S_{i-1/2}(phibar_i - phibar_{i-1})]/dx_d,
   // S the time-integrated RK mass flux and phibar = (phi^n + phi^{n+1})/2 (the difference goes
@@ -155,7 +155,7 @@ class SelfGravity {
   DvceArray1D<int> physical_rows_;
   DvceArray1D<Real> cached_source_;  // physical source cells, independent of MG padding
   DvceArray5D<Real> extra_density_;
-  // the energy_source = flux / diag work arrays and the phibar ghost exchange
+  // The energy_source = flux / diag work arrays and the phibar ghost exchange
   DvceArray5D<Real> energy_phi_old_, energy_phibar_, energy_kick_, energy_mflx_[3], energy_cdummy_;
   MeshBoundaryValuesCC *energy_bval_ = nullptr;
   ParameterInput *pin_ = nullptr;

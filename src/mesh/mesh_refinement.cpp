@@ -168,7 +168,7 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
   if (nnew != 0 || ndel != 0) { // at least one (de)refinement flagged
     if (pmy_mesh->pmb_pack->pdust != nullptr) pmy_mesh->pmb_pack->pdust->BeforeRegrid(nnew, ndel);
     {
-      auto *pd = pmy_mesh->pmb_pack->pdust;   // profile (the counters stay on the pack)
+      auto *pd = pmy_mesh->pmb_pack->pdust;   // dust profile timer (counters on the pack)
       double dummy_t = 0.0; long long dummy_c = 0;
       ProfTimer pt(pd ? pd->prof_time[pd->kProfRegridMesh] : dummy_t,
                          pd ? pd->prof_count[pd->kProfRegridMesh] : dummy_c);
@@ -178,7 +178,7 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
       // Mark one mesh-topology update event (AMR and any resulting load balancing).
       pmy_mesh->MarkMeshUpdated();
 
-      // S1': the shearing box lists of x1-face blocks and its buffers on the new
+      // the shearing box lists of x1-face blocks and its buffers on the new
       // mesh, before the boundary values are exchanged again
       if (pmy_mesh->pmb_pack->phydro != nullptr &&
           pmy_mesh->pmb_pack->phydro->psbox_u != nullptr) {
@@ -186,7 +186,7 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
         ps->BuildBoundaryLists();
         ps->AllocateBuffers();
       }
-      // S2: the orbital advection's x2 faces with a level change
+      // the orbital advection's x2 faces with a level change
       if (pmy_mesh->pmb_pack->phydro != nullptr &&
           pmy_mesh->pmb_pack->phydro->porb_u != nullptr) {
         pmy_mesh->pmb_pack->phydro->porb_u->BuildMixedLists();
@@ -519,13 +519,13 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   new_nmb_eachrank = new int[global_variable::nranks];
 
   for (int i=0; i<new_nmb; i++) {new_cost_eachmb[i] = 1.0;}
-  // dust (2026-10-21): the clouds of each block in the cost (<dust>/load_balance_cloud_weight)
+  // dust: the clouds of each block in the cost (<dust>/load_balance_cloud_weight)
   if (pm->pmb_pack->pdust != nullptr) {
     pm->pmb_pack->pdust->RegridCosts(newtoold, new_lloc_eachmb, new_nmb, new_cost_eachmb);
   }
   pm->LoadBalance(new_cost_eachmb, new_rank_eachmb, new_gids_eachrank, new_nmb_eachrank,
                   new_nmb_total);
-  // Rixin: more MeshBlocks on some rank than max_nmb_per_rank (the
+  // more MeshBlocks on some rank than max_nmb_per_rank (the
   // arrays are allocated for that many): instead of exiting at once, every rank (the counts are
   // the same everywhere) drops this regrid, keeps the old mesh and its data (nothing of the Mesh
   // has changed yet; the tree is not used again) and asks the driver to stop, which writes the
@@ -550,7 +550,7 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
       new_lloc_eachmb = nullptr; newtoold = nullptr; oldtonew = nullptr;
       new_cost_eachmb = nullptr; new_rank_eachmb = nullptr; new_gids_eachrank = nullptr;
       new_nmb_eachrank = nullptr;
-      // Undo this cycle's age
+      // undo this cycle's age
       // increment of CheckForRefinement: the restart file stores the ages, and the pending check
       // replayed after the restart increments them again (else the replay sees ages one too high)
       for (int m=0; m<pm->nmb_total; ++m) {ncyc_since_ref(m) -= 1;}

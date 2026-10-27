@@ -103,7 +103,7 @@ void WaveSetup(ParameterInput *pin, MeshBlockPack *pmbp, Mesh *pmesh,
   eps.resize(nspec);
   ts.resize(nspec);
   bool has_eps = pin->DoesParameterExist("problem","eps_1");
-  // new keys: epsilon_N of the resolved species table
+  // new species keys: epsilon_N of the resolved species table
   const dust::SpeciesTable &spt = dust::Species(pin);
   if (spt.new_init && spt.abundance != "epsilon") {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl

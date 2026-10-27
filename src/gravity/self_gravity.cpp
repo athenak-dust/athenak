@@ -127,7 +127,7 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     orbital_split_ = pm->three_d && evolution == "dynamic" && !coupled_dust_;
   }
   {
-    // Rixin: we need gas only, dust only (particle self-gravity, as AthenaSG's
+    // Gas only, dust only (particle self-gravity, as AthenaSG's
     // PARTICLE_SELF_GRAVITY), or gas + dust (AthenaSG's PLUS_GAS_SELF_GRAVITY).  kick chooses the
     // matter the field acts on (AthenaSG: PARTICLE_SELF_GRAVITY_ON_GAS / _AS_FEEDBACK let the gas feel
     // the particles' field); the default is the matter of the source.
@@ -139,7 +139,7 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     };
     const std::string src = pin->GetOrAddString("gravity", "source", coupled_dust_ ? "dust" : "gas");
     parse("source", src, source_gas_, source_dust_);
-    // Rixin: the gas as a gravity source needs further development (the gas
+    // The gas as a gravity source needs further development (the gas
     // energy of the kicks; the flux form exists only for one level and periodic boxes): source =
     // gas or both stops unless <gravity>/experimental_gas_source = true (tests, development)
     if (source_gas_ && !pin->GetOrAddBoolean("gravity", "experimental_gas_source", false))
@@ -188,7 +188,7 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   profile_ = pin->GetOrAddBoolean("gravity", "profile", false);
   phase_threads_ = pin->GetOrAddInteger("gravity", "phase_threads", 0);
   if (phase_threads_ < 0) Fail("gravity/phase_threads must be nonnegative");
-  // host workers of a full hierarchy setup (0: every affinity CPU in device
+  // Host workers of a full hierarchy setup (0: every affinity CPU in device
   // builds, one in CPU builds; the coefficients do not depend on it)
   setup_threads_ = pin->GetOrAddInteger("gravity", "setup_threads", 0);
   if (setup_threads_ < 0) Fail("gravity/setup_threads must be nonnegative");
@@ -220,7 +220,7 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     // representation changes); reuse_check adds the fresh deposit, the true residual of
     // the reused potential and a full regather for comparison (diagnostic only)
     kdk_reuse_ = pin->GetOrAddBoolean("gravity", "kdk_reuse", false);
-    // initial guess of a solve at a new time: previous (default: the last accepted
+    // Initial guess of a solve at a new time: previous (default: the last accepted
     // potential) or extrapolate (linear in time from the last two; the converged field then
     // differs from the default within the solver tolerance)
     const std::string guess = pin->GetOrAddString("gravity", "guess", "previous");
@@ -1146,7 +1146,7 @@ void SelfGravity::Solve(Real time) {
   const int n = pack_->nmb_thispack*ind.nx1*ind.nx2*ind.nx3;
   const int solver_n = solution_.extent_int(0);
   if (kdk_reuse_ && KdkReuseAllowed(time,shift)) {
-    // keep phi, the cell accelerations, the source and the boundary state of the
+    // Keep phi, the cell accelerations, the source and the boundary state of the
     // last solve; regather only the clouds whose gather inputs changed since
     ++reuse_count_;
     ++cache_hit_count;
@@ -1196,8 +1196,7 @@ void SelfGravity::Solve(Real time) {
   auto extra = extra_density_;
   Kokkos::deep_copy(extra,0.0);
   if (extra_source_) extra_source_(time,extra);
-  // The dust density is deposited when dust is a source, or when dust is kicked (the
-  // forced-PC2 drag bound in UpdateTimeStep reads it)
+  // The dust density is deposited when dust is a source, or when dust is kicked
   if (coupled_dust_ && (source_dust_ || kick_dust_)) {
     auto *dust=pack_->pdust;
     if (!dust->stopping_times_initialized ||
@@ -1630,9 +1629,9 @@ void SelfGravity::UpdateTimeStep() {
   if (coupled_dust_ && kick_dust_)
     limit=std::min(limit,pack_->pdust->GravityAccelerationTimeStep(particle_acceleration_));
   dtnew = gravity_cfl_*limit;
-  // Rixin: no PC2 drag limit here: the time-step rule of the dust coupling is the
-  // same with and without gravity (the optional <dust>/stiff_thresh of DustGasDrag::NewTimeStep; off by
-  // default).  The fixed limit 0.25 t_s/(1 + eps) of 7537944e made dt 7-10 times smaller than the gas
-  // CFL step in the 3-D amr1280 clumps (eps ~ 4000), where PC2 without gravity ran stably with chi <= 2.2.
+  // No PC2 drag limit here: the time-step rule of the dust coupling is the same with and
+  // without gravity (the optional <dust>/stiff_thresh of DustGasDrag::NewTimeStep; off by
+  // default).  A fixed limit 0.25 t_s/(1 + eps) made dt 7-10 times smaller than the gas
+  // CFL step in dense 3-D clumps (eps ~ 4000), where PC2 without gravity was stable.
 }
 }  // namespace gravity

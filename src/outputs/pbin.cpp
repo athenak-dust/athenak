@@ -77,7 +77,7 @@ namespace {
 
 constexpr char kMagic[9] = "AKPBIN01";
 constexpr char kEnd[9] = "AKPBEND1";
-constexpr std::uint32_t kVersion = 2;   // 1: no [constants] (2026-10-27, first files)
+constexpr std::uint32_t kVersion = 2;   // 1: no [constants] (first files)
 constexpr std::uint64_t kAlign = 64;
 constexpr std::uint64_t kPreamble = 64;
 constexpr std::uint64_t kFooter = 16;

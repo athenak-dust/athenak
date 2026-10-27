@@ -32,9 +32,9 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
   }
 
   // read number of particles per cell, and calculate number of particles this pack
-  // Dust API: with <dust>/ppc_N (or ppc_per_species) the resolved species table
-  // (parsed here, before the allocation) gives the total; <particles>/ppc is then not allowed.
-  // The dust use of <particles>/ppc alone is the legacy input (to be
+  // Dust: with <dust>/ppc_N (or ppc_per_species) the resolved species table
+  // (parsed here, before the allocation) gives the total; <particles>/ppc is then not
+  // allowed.  The dust use of <particles>/ppc alone is the legacy input (to be
   // deprecated); other particle types retain this generic input.
   Real ppc = static_cast<Real>(dust::RootPpc(pin));
 

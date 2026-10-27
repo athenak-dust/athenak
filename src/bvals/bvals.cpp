@@ -474,7 +474,7 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
   shear_periodic_x1 =
       (pp->particle_type == ParticleType::dust) &&
       (pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic);
-  // dust at non-periodic x3 faces of a 3-D mesh (stage S3c): <dust>/particle_x3_bc
+  // dust at non-periodic x3 faces of a 3-D mesh: <dust>/particle_x3_bc
   // (default reflect at a reflecting gas boundary, outflow otherwise)
   if (pp->particle_type == ParticleType::dust && pmesh->three_d &&
       pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic) {
@@ -503,7 +503,7 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
 //----------------------------------------------------------------------------------------
 //! \fn void ParticlesBoundaryValues::BuildShearMaps()
 //! \brief The (side, x3, x2) -> gid/rank maps of the MeshBlocks at the two shear-periodic x1
-//! faces, used to route particles that cross them.  Stage S3a: on a mesh
+//! faces, used to route particles that cross them.  On a mesh
 //! with refinement the maps are at the granularity of the blocks of the finest level (every face
 //! block fills the entries it covers; a table of the face blocks, not of cells).  Called by the
 //! constructor and again by the dust module after every regrid.

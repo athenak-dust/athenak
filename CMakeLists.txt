@@ -38,7 +38,7 @@ set(PROBLEM built_in_pgens CACHE STRING "Name of problem generator function")
 
 #------ set macros exported to config.hpp ------------------------------------------------
 
-# source revision recorded in self-describing outputs (pbin); taken when
+# source revision recorded in self-describing outputs (e.g. pbin headers); taken when
 # CMake configures the build (re-run cmake to refresh it after a checkout)
 set(ATHENA_SOURCE_COMMIT "unknown")
 find_package(Git QUIET)

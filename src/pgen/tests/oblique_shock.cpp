@@ -4,8 +4,8 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file oblique_shock.cpp
-//! \brief Isothermal planar shock travelling at an angle to the grid (an
-//! oblique-shock robustness test).  Upstream rho1 at rest on the side n.x > x0 + vs t,
+//! \brief Isothermal planar shock travelling at an angle to the grid (a
+//! robustness test).  Upstream rho1 at rest on the side n.x > x0 + vs t,
 //! with n = (cos theta, sin theta); shock speed vs = mach*cs; downstream rho2 = mach^2 rho1
 //! moving with u2 = vs (1 - 1/mach^2) along n.  Cell averages of rho and M by 4x4
 //! sub-sampling of the step.  With ix1/ox1/ix2/ox2_bc = user the ghost cells are set to the

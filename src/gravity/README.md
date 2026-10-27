@@ -5,17 +5,17 @@ rows affected by the changing shear phase. Vertical isolation uses a coarsened
 vacuum exterior, retaining the nonzero mean sheet field. The reference backend
 remains available explicitly for accuracy comparisons.
 
-**Post-review fixes accepted:** `2b4adc3c` and `7566e314` make the
+**Post-review fixes:** `2b4adc3c` and `7566e314` make the
 optional direct isolated boundary continuous through shear remaps and prevent
 extreme-scale FGMRES norms from falsely certifying convergence. CPU 1/2/8-rank
 regressions and a run on four distinct GB200 GPUs pass, including
 the actual WENO-Z physical SMR and dynamic AMR cases below. The same-job large
-SMR baseline/fixed active float64 maximum difference is4.90e-13. Gravity stage
-time including setup amortization is73.48/73.57ms per step; this single pair
+SMR baseline/fixed active float64 maximum difference is 4.90e-13. Gravity stage
+time including setup amortization is 73.48/73.57 ms per step; this single pair
 shows no material regression, not a precise performance difference. The older
 30112e27 measurements remain labelled with their original provenance.
 
-**Accepted hydro baseline (2026-10-26):** the numerical implementation at
+**Accepted hydro baseline:** the numerical implementation at
 `30112e27` has passed native WENO-Z physical SMR, dynamic AMR, changed-rank
 restart and four-distinct-GB200 checks. The final coarse-grid repair gives
 full-period vacuum cells a periodic reconstruction and rejects extra terminal
@@ -36,9 +36,9 @@ changed-rank2->4 restart differences were below2e-15.
 This completes the implemented hydro feature set and its engineering regression
 checks. Long nonlinear self-gravitating application validation and deposited
 dust gravity/particle gathering remain separate work. Density-weighted total
-self-force is convergent, not exactly zero. Rixin: decided not to include the
-cuSPARSE experiment in the final module: the adapter, dependency and runtime
-selectors are absent from this branch.
+self-force is convergent, not exactly zero. A cuSPARSE experiment is not part
+of this module: the adapter, dependency and runtime selectors are absent from
+this branch.
 
 The following timings are historical benchmarks with earlier operators and
 different meshes/time-step windows, retained for provenance:
@@ -49,9 +49,7 @@ the same binary and normal CFL=0.3 through 1.02 shear wraps measures **118.4 ms
 per step**, including eight hierarchy refreshes. Source, shear updates, failed
 attempts, refreshes, accepted solves and force evaluation are included; initial
 topology setup is separate. The short fixed-step benchmark does not establish
-normal-CFL production cost. Both allocate 18 CPU cores per rank. Exact workloads
-and versions are recorded under
-the internal run records.
+normal-CFL production cost. Both allocate 18 CPU cores per rank.
 
 This module is developed on `selfgrav-amr-shear`, originally from dust
 development commit `6c466d6d`. Merge `06c8fc23` incorporates the stable fixes
@@ -396,9 +394,6 @@ operator. CPU coefficients and matrix application, and short WENO histories,
 are unchanged by this parallelization. See the frozen experiment records for
 the distinction between the complete reference batch and the later thread-count
 comparison; results from earlier binaries are not relabeled as later executions.
-
-Detailed provenance, bounded test batches, and outstanding requirements are in
-the internal run records.
 
 References: [Athena++ AMR multigrid](https://arxiv.org/abs/2302.13903),
 [its conservative interface formula](https://github.com/PrincetonUniversity/athena/blob/main/src/gravity/mg_gravity.cpp).

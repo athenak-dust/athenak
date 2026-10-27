@@ -4,8 +4,8 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_selfforce.cpp
-//! \brief The spurious self-force of dust
-//! clouds through the production chain deposit -> multigrid -> force -> gather.  The gather is the
+//! \brief Test of the spurious self-force of dust clouds through the production chain
+//! deposit -> multigrid -> force -> gather.  The gather is the
 //! exact transpose of the deposit, so on a uniform mesh the self-force of a cloud vanishes (the
 //! force operator is antisymmetric and commutes with the Laplacian); at a coarse-fine interface it
 //! does not.  The dust_nsh damping fixture sets up the mesh, gas and clouds; at the final time the
@@ -134,7 +134,7 @@ void SelfForceFinal(ParameterInput *pin, Mesh *pm) {
 }  // namespace
 
 void ProblemGenerator::DustSelfForce(ParameterInput *pin, const bool restart) {
-  dust::RequireLegacySpeciesInit(pin, "dust_selfforce");
+  dust::RequireLegacySpeciesInit(pin, "dust_selfforce");  // legacy species keys only
   sf.mode = pin->GetOrAddString("problem", "sf_mode", "single");
   if (sf.mode != "single" && sf.mode != "pair") {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl

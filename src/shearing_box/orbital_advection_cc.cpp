@@ -332,7 +332,7 @@ TaskStatus OrbitalAdvectionCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
 
 //----------------------------------------------------------------------------------------
 //! \fn void OrbitalAdvectionCC::PackMixedCC()
-//! \brief The rows for x2 neighbours on another level (stage S2), at the
+//! \brief the rows for x2 neighbours on another level, at the
 //! receiver's resolution and in the layout of its receive buffer (row r of the lower buffer
 //! [0] is adjacent to the face at r = nrow-1, of the upper buffer [1] at r = 0).
 //!  * A finer block restricts 2x2x2 cells into its quarter (x1 half fx, x3 half fz) of the
@@ -447,7 +447,7 @@ void OrbitalAdvectionCC::PackMixedCC(DvceArray5D<Real> &a) {
 
 //----------------------------------------------------------------------------------------
 //! \fn void OrbitalAdvectionCC::UnpackMixedCC()
-//! \brief The restricted rows that finer neighbours on other ranks sent: into their
+//! \brief the restricted rows that finer neighbours on other ranks sent: into their
 //! quarter of the receive buffer
 
 void OrbitalAdvectionCC::UnpackMixedCC() {
@@ -479,7 +479,7 @@ void OrbitalAdvectionCC::UnpackMixedCC() {
 
 //----------------------------------------------------------------------------------------
 //! \fn TaskStatus OrbitalAdvectionCC::SendFluxCC()
-//! \brief A block with a coarser x2 neighbour sends its remap fluxes through that
+//! \brief a block with a coarser x2 neighbour sends its remap fluxes through that
 //! face, summed over 2x2 cells and divided by 8 (the coarse cell's content units: a coarse
 //! column has 4 fine columns of half the width in x2), to the coarser block
 
@@ -547,7 +547,7 @@ TaskStatus OrbitalAdvectionCC::SendFluxCC() {
 
 //----------------------------------------------------------------------------------------
 //! \fn TaskStatus OrbitalAdvectionCC::RecvFluxCC()
-//! \brief A block with finer x2 neighbours replaces its remap flux through that
+//! \brief a block with finer x2 neighbours replaces its remap flux through that
 //! face by theirs: the cell next to the face changes by the difference
 
 TaskStatus OrbitalAdvectionCC::RecvFluxCC(DvceArray5D<Real> &a) {

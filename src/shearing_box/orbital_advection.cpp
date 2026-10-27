@@ -40,7 +40,7 @@ OrbitalAdvection::OrbitalAdvection(MeshBlockPack *ppack, ParameterInput *pin) :
   Real xmax = fabs(ppack->pmesh->mesh_size.x1max);
   maxjshift = static_cast<int>((ppack->pmesh->cfl_no)*std::max(xmin,xmax)) + 1;
 
-  // S2: x2 neighbours on another level are allowed (BuildMixedLists,
+  // x2 neighbours on another level are allowed (BuildMixedLists,
   // called by the derived classes, which know the number of variables)
   any_mixed = false;
   nvar_oa = 0;
@@ -84,7 +84,7 @@ OrbitalAdvection::~OrbitalAdvection() {
 
 //----------------------------------------------------------------------------------------
 //! \fn void OrbitalAdvection::BuildMixedLists()
-//! \brief S2: which x2 faces of the blocks of this rank have a
+//! \brief which x2 faces of the blocks of this rank have a
 //! neighbour on another level (xlev), the slot of a coarser neighbour, and the buffers and MPI
 //! requests of the mixed-level exchange.  Called by the derived constructors and after every
 //! regrid (the neighbour lists must be current).
