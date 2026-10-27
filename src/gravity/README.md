@@ -1,75 +1,24 @@
-# Hydro self-gravity with AMR and shearing boundaries
+# Self-gravity with AMR and shearing boundaries
 
-The default solver uses distributed geometric multigrid and updates only the
-rows affected by the changing shear phase. Vertical isolation uses a coarsened
-vacuum exterior, retaining the nonzero mean sheet field. The reference backend
-remains available explicitly for accuracy comparisons.
+This module solves the Poisson equation for the self-gravity of the dust and/or the gas on the
+active leaves of static and adaptive meshes, including the shear-periodic x1 boundaries of the
+3-D shearing box, with periodic or isolated vertical boundaries. It uses distributed geometric
+multigrid (FGMRES with a multigrid preconditioner); in a shearing box only the operator rows that
+change with the shear phase are updated. It is off unless `<gravity>/enabled = true`.
 
-**Post-review fixes:** `2b4adc3c` and `7566e314` make the
-optional direct isolated boundary continuous through shear remaps and prevent
-extreme-scale FGMRES norms from falsely certifying convergence. CPU 1/2/8-rank
-regressions and a run on four distinct GB200 GPUs pass, including
-the actual WENO-Z physical SMR and dynamic AMR cases below. The same-job large
-SMR baseline/fixed active float64 maximum difference is 4.90e-13. Gravity stage
-time including setup amortization is 73.48/73.57 ms per step; this single pair
-shows no material regression, not a precise performance difference. The older
-30112e27 measurements remain labelled with their original provenance.
+- Sources: `<gravity>/source = dust` (the default when dust is present), `gas` or `both`. The gas
+  as a source is experimental and needs `<gravity>/experimental_gas_source = true`.
+- Dust: 3-D refinable clouds and TSC point particles. The dust mass is deposited with the same
+  representation as the drag coupling, and the force is gathered back the same way; the kicks
+  bracket the step (kick-drift-kick).
+- Scope: 2-D/3-D Cartesian Newtonian hydro with dust, SMR and dynamic AMR, restarts, MPI and GPU.
+  MHD, radiation and relativistic modules are rejected. Shear-periodic gravity requires 3-D.
+  The distributed setup requires power-of-two MeshBlock dimensions; the isolated vacuum backend
+  has the additional root-grid restrictions described below.
 
-**Accepted hydro baseline:** the numerical implementation at
-`30112e27` has passed native WENO-Z physical SMR, dynamic AMR, changed-rank
-restart and four-distinct-GB200 checks. The final coarse-grid repair gives
-full-period vacuum cells a periodic reconstruction and rejects extra terminal
-nullspaces using zero-column and scale-relative LU checks. FGMRES still accepts
-only the current true residual. Exact prolongation-query and halo reuse avoid
-repeated geometry/communication setup without changing coefficients.
-
-The latest physical gas meshes contain a genuinely localized x/y/z octant:
-root64x64x128, blocks32 cubed, locally refined to the spacing of uniform
-128x128x256. Static SMR has30 blocks/983040 physical cells; dynamic AMR follows
-16->30->16. Four-GB200 runs at CFL0.3 to t0.68 took119.86/89.40 application seconds,
-with1452/1110 steps respectively. The maximum-rank gravity-stage sums including
-initial topology setup amortization were72.94/69.13ms per step. These different
-mesh/time-step histories are not a pure algorithm speedup. CPU2rank/CUDA4rank
-active float64 differences on the matched small dynamic case were1.55e-15;
-changed-rank2->4 restart differences were below2e-15.
-
-This completes the implemented hydro feature set and its engineering regression
-checks. Long nonlinear self-gravitating application validation and deposited
-dust gravity/particle gathering remain separate work. Density-weighted total
-self-force is convergent, not exactly zero. A cuSPARSE experiment is not part
-of this module: the adapter, dependency and runtime selectors are absent from
-this branch.
-
-The following timings are historical benchmarks with earlier operators and
-different meshes/time-step windows, retained for provenance:
-
-On four GB200 GPUs, the 4.19-million-physical-cell WENO-Z disk benchmark measures
-about **40.5 ms of gravity work per step at fixed dt=1e-4**. A follow-up using
-the same binary and normal CFL=0.3 through 1.02 shear wraps measures **118.4 ms
-per step**, including eight hierarchy refreshes. Source, shear updates, failed
-attempts, refreshes, accepted solves and force evaluation are included; initial
-topology setup is separate. The short fixed-step benchmark does not establish
-normal-CFL production cost. Both allocate 18 CPU cores per rank.
-
-This module is developed on `selfgrav-amr-shear`, originally from dust
-development commit `6c466d6d`. Merge `06c8fc23` incorporates the stable fixes
-through `530be393`, including ordinary-periodic-x1 mass conservation with AMR;
-the original pre-review version remains available at `1661775b`.
-It is disabled unless `<gravity>/enabled = true`.
-It solves on the actual active AMR leaves, including shearing-periodic faces;
-it does not substitute a uniform fine-grid volume solve.
-
-The implemented scope is hydro + multigrid + AMR + shearing box, including dynamic
-refine/derefine, restart, MPI and GPU. Gravity boundaries can be periodic, or
-horizontally shearing-periodic/periodic with vertical isolation. Gas outflow and
-isolated gravitational potential are separate choices.
-Future deposited dust density and particle force gathering can reuse the same
-field solver. Current support is 2D/3D Cartesian Newtonian hydro with one pack per
-rank; particles/dust, MHD, radiation
-and relativistic modules are rejected when this feature is enabled. Shearing-
-periodic gravity requires 3D hydro; 2D periodic-x1 gravity remains supported.
-Distributed setup requires power-of-two active MeshBlock dimensions. The
-isolated vacuum backend has additional root-grid restrictions described below.
+For dust runs, the main `README.md` (section "Dust self-gravity") lists the input keys and the
+validated settings. The sections below describe the solver options, the discrete operator and
+the coupling.
 
 ## Running
 
@@ -259,9 +208,9 @@ Per-rank gravity restart files are explicitly unsupported. Legacy checkpoints
 without the record remain readable but cannot recover missing AMR ages/phase;
 the reader reports that limitation.
 
-`SetExtraDensitySource` is the future source interface: a callback fills an
-additional active-cell density at each solve. Particle deposit/gather and its
-time coupling remain the responsibility of the future dust implementation.
+`SetExtraDensitySource` is the source interface: a callback fills an additional
+active-cell density at each solve. The dust module uses it for the deposited dust
+mass, and gathers the force back to the particles with its own transfer.
 
 ## Validation and limitations
 

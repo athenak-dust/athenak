@@ -177,7 +177,7 @@ blocks.
 
 | Input | Set-up |
 | --- | --- |
-| [`lina_smr_careful_merge`](inputs/dust_amr/lina_smr_careful_merge.athinput) | LinA linear SI mode on a nested static mesh (64^2 root, central square at 128^2), `careful_merge`, to t = 2 pi; growth-rate error about -0.40% (uniform 64^2: -0.24%, 128^2: -0.059%) |
+| [`lina_smr_careful_merge`](inputs/dust_amr/lina_smr_careful_merge.athinput) | LinA linear SI mode on a nested static mesh (64^2 root, central square at 128^2), `careful_merge`, to t = 2 pi; growth-rate error about -0.40% (uniform 64^2: -0.24%, 128^2: -0.059%); with `<mesh_refinement>/prolong_amplitude_eps = 1e-3` (amplitude-aware gas prolongation) about -0.23% |
 | [`ba2d_amr`](inputs/dust_amr/ba2d_amr.athinput) | 2-D BA streaming instability (tau_s = 1, eps = 0.2), root 128^2, 5 levels, density trigger 10 * 2^l / 3.3 * 2^(l-1), `default`, to t = 600 |
 | [`si3d_strat_amr1280`](inputs/dust_amr/si3d_strat_amr1280.athinput) | 3-D stratified SI, root 320/H, AMR to 1280/H, trigger 64 / 256 (code units), WENO-Z + HLLC, Li & Youdin (2018) vertical boundaries, to 25 orbits |
 | [`si3d_strat_amr1280_selfgrav_restart`](inputs/dust_amr/si3d_strat_amr1280_selfgrav_restart.athinput) | restart of the run above with dust self-gravity and a fourth level at rho_d >= 5120 |

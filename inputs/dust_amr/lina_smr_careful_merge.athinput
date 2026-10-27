@@ -6,7 +6,9 @@
 # analytic rate 0.4190091.  Expected: growth-rate error about -0.40% (uniform TSC: 64^2 -0.24%,
 # 128^2 -0.059%), about 13,300 particles at the end.  The production refinable_mode = default
 # (G and R without the quiet gates) destroys this linear mode; use careful_merge or split_only
-# for quiet linear tests.
+# for quiet linear tests.  Most of the error above the coarse uniform grid comes from the gas
+# prolongation at the level interface (minmod slopes clip the small mode); the optional amplitude-
+# aware limiter <mesh_refinement>/prolong_amplitude_eps = 1e-3 brings it to about -0.23%.
 # Runtime: t = 0 -> 2 pi is ~3.5e5 cycles, about 15 minutes on 4 CPU ranks.
 <job>
 basename = LinA
