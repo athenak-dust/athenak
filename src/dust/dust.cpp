@@ -248,10 +248,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   hybrid_enter_chi  = pin->GetOrAddReal("dust", "hybrid_enter_chi", 0.5);
   hybrid_exit_zeta  = pin->GetOrAddReal("dust", "hybrid_exit_zeta", 0.25);
   hybrid_exit_chi   = pin->GetOrAddReal("dust", "hybrid_exit_chi", 0.25);
-  // PC2 feedback stiffness monitor, optional dt limit and predictor damping (all off by default)
-  stiff_log = pin->GetOrAddBoolean("dust", "stiff_log", false);
+  // PC2 feedback stiffness monitor, optional dt limit and predictor damping.  Rixin:
+  // the log and the damping (as Athena-C) on by default, the dt limit left to the user (off)
+  stiff_log = pin->GetOrAddBoolean("dust", "stiff_log", true);
   stiff_thresh = pin->GetOrAddReal("dust", "stiff_thresh", -1.0);
-  pc2_feedback_damping = pin->GetOrAddBoolean("dust", "pc2_feedback_damping", false);
+  pc2_feedback_damping = pin->GetOrAddBoolean("dust", "pc2_feedback_damping", true);
   if (!(hybrid_enter_zeta > hybrid_exit_zeta && hybrid_exit_zeta >= 0.0 &&
         hybrid_enter_chi > hybrid_exit_chi && hybrid_exit_chi >= 0.0)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
