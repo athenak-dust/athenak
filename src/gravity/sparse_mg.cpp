@@ -5,6 +5,7 @@
 #include "gravity/sparse_mg.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -14,7 +15,15 @@
 #include <unordered_map>
 
 namespace gravity {
+PhaseUpdateTimes &PhaseTimes() {
+  static PhaseUpdateTimes times;
+  return times;
+}
 namespace {
+double HostSeconds() {
+  return std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 using Vector = DvceArray1D<Real>;
 using Indices = DvceArray1D<int>;
 
@@ -445,7 +454,12 @@ struct SparseMultigrid::Impl {
             +slots.size()*sizeof(decltype(op.phase_ghost_slots)::value_type)));
   }
 
-  bool UpdatePhase(Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal = false) {
+  // Host only: validation, pattern comparison, next ghost list and remapped columns of a
+  // compact update, from op's state after its previous update (op is only read).
+  PhaseRowPlan Plan(const Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal) const {
+    PhaseRowPlan plan;
+    plan.prepared = true;
+    plan.version = op.phase_updates.updates;
     bool valid = op.phase_configured && a.global_rows == op.global_rows
         && a.global_cols == op.global_cols && a.row_begin == op.row_begin
         && a.rows == op.phase_rows_host && a.rowptr.size() == a.rows.size()+1
@@ -466,32 +480,67 @@ struct SparseMultigrid::Impl {
             && std::isfinite(Real(1)/diagonal);
       }
     }
-    Require(valid,"invalid compact phase CSR, ownership, row set, or smoothing diagonal");
-    const bool same = a.rowptr == op.phase_rowptr_host && a.colidx == op.phase_columns_host;
-    if (!same) ++op.phase_updates.local_pattern_changes;
-    std::vector<GlobalIndex> next_ghosts;
+    plan.valid = valid;
+    if (!valid) return plan;
+    plan.same = a.rowptr == op.phase_rowptr_host && a.colidx == op.phase_columns_host;
+    if (plan.same) return plan;
     const auto begin = op.input_partition[rank], end = op.input_partition[rank+1];
-    if (!same) {
-      next_ghosts = op.phase_base_ghosts;
-      std::vector<GlobalIndex> extra;
-      for (GlobalIndex j : a.colidx) {
-        if (j >= begin && j < end) continue;
-        const auto slot = op.phase_ghost_slots.find(j);
-        if (slot == op.phase_ghost_slots.end()
-            || slot->second >= static_cast<int>(op.phase_base_ghosts.size())) extra.push_back(j);
-      }
-      std::sort(extra.begin(),extra.end());
-      extra.erase(std::unique(extra.begin(),extra.end()),extra.end());
-      next_ghosts.insert(next_ghosts.end(),extra.begin(),extra.end());
+    const int base = static_cast<int>(op.phase_base_ghosts.size());
+    plan.ghosts = op.phase_base_ghosts;
+    std::vector<GlobalIndex> extra;
+    for (GlobalIndex j : a.colidx) {
+      if (j >= begin && j < end) continue;
+      const auto slot = op.phase_ghost_slots.find(j);
+      if (slot == op.phase_ghost_slots.end() || slot->second >= base) extra.push_back(j);
     }
-    const auto &ghosts = same ? op.ghost_ids : next_ghosts;
+    std::sort(extra.begin(),extra.end());
+    extra.erase(std::unique(extra.begin(),extra.end()),extra.end());
+    plan.ghosts.insert(plan.ghosts.end(),extra.begin(),extra.end());
+    // The slot of a ghost is its position in the next list: a base ghost keeps its
+    // current (prefix) slot, an extra one follows the base in sorted order.
+    plan.columns.resize(a.colidx.size());
+    for (size_t k = 0; k < a.colidx.size(); ++k) {
+      const GlobalIndex j = a.colidx[k];
+      if (j >= begin && j < end) { plan.columns[k] = static_cast<int>(j-begin); continue; }
+      const auto slot = op.phase_ghost_slots.find(j);
+      const int position = slot != op.phase_ghost_slots.end() && slot->second < base ? slot->second
+          : base+static_cast<int>(std::lower_bound(extra.begin(),extra.end(),j)-extra.begin());
+      plan.columns[k] = op.inputs+position;
+    }
+    return plan;
+  }
+
+  bool UpdatePhase(Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal = false,
+                   const PhaseRowPlan *given = nullptr) {
+    auto &times = PhaseTimes();
+    double clock = HostSeconds();
+    auto lap = [&clock](double &bucket) {
+      const double now = HostSeconds(); bucket += now-clock; clock = now;
+    };
+    ++times.calls;
+    PhaseRowPlan computed;
+    const PhaseRowPlan *plan = given;
+    if (plan == nullptr || !plan->prepared || plan->version != op.phase_updates.updates) {
+      computed = Plan(op,a,smoothing_diagonal);
+      plan = &computed;
+    } else {
+      ++times.planned;
+    }
+    lap(times.validate);
+    Require(plan->valid,"invalid compact phase CSR, ownership, row set, or smoothing diagonal");
+    lap(times.mpi);
+    const bool same = plan->same;
+    if (!same) ++op.phase_updates.local_pattern_changes;
+    const auto &ghosts = same ? op.ghost_ids : plan->ghosts;
     const int local_ghost_change = ghosts != op.ghost_ids;
     int global_ghost_change = local_ghost_change;
+    lap(times.ghosts);
 #if MPI_PARALLEL_ENABLED
     // A remote rank may change requests addressed to this rank even when our
     // own CSR/ghost list is unchanged. Every rank must rebuild the send plan.
     MPI_Allreduce(MPI_IN_PLACE,&global_ghost_change,1,MPI_INT,MPI_MAX,comm);
 #endif
+    lap(times.mpi);
     op.phase_updates.local_ghost_changes += local_ghost_change;
     op.phase_updates.global_ghost_changes += global_ghost_change;
     if (global_ghost_change) {
@@ -500,20 +549,20 @@ struct SparseMultigrid::Impl {
     } else {
       ++op.phase_updates.halo_reuses;
     }
+    lap(times.halo);
     if (local_ghost_change) BuildGhostSlots(op);
+    lap(times.ghosts);
     // No MPI occurs below this point: CSR/value uploads are local decisions.
     if (same) {
       auto host = Kokkos::create_mirror_view(op.phase_values);
       for (size_t k = 0; k < a.values.size(); ++k) host(k) = a.values[k];
       Kokkos::deep_copy(op.phase_values,host);
       ++op.phase_updates.value_updates;
+      ++times.value_only;
+      lap(times.upload);
     } else {
-      std::vector<int> columns(a.colidx.size());
-      for (size_t k = 0; k < a.colidx.size(); ++k) {
-        const GlobalIndex j = a.colidx[k];
-        columns[k] = j >= begin && j < end ? static_cast<int>(j-begin)
-            : op.inputs+op.phase_ghost_slots.at(j);
-      }
+      const auto &columns = plan->columns;
+      lap(times.remap);
       if (op.phase_rowptr.size() == a.rowptr.size()) {
         auto host = Kokkos::create_mirror_view(op.phase_rowptr);
         for (size_t k = 0; k < a.rowptr.size(); ++k) host(k) = a.rowptr[k];
@@ -526,6 +575,7 @@ struct SparseMultigrid::Impl {
       op.phase_rowptr_host = a.rowptr;
       op.phase_columns_host = a.colidx;
       ++op.phase_updates.structure_rebuilds;
+      lap(times.upload);
     }
     op.phase_active = true;
     ++op.phase_updates.updates;
@@ -1309,8 +1359,11 @@ void SparseMultigrid::ConfigureFinePhaseRows(const std::vector<int> &rows) {
   std::vector<GlobalIndex>().swap(impl_->current_columns);
 }
 void SparseMultigrid::UpdateFinePhaseRows(const CsrRowUpdate &a) {
+  UpdateFinePhaseRowsPlanned(a,nullptr);
+}
+void SparseMultigrid::UpdateFinePhaseRowsPlanned(const CsrRowUpdate &a, const PhaseRowPlan *plan) {
   const bool smooth = impl_->levels.size() > 1;
-  const bool same = impl_->UpdatePhase(impl_->current_a,a,smooth);
+  const bool same = impl_->UpdatePhase(impl_->current_a,a,smooth,plan);
   if (smooth) impl_->UpdatePhaseDiagonal(impl_->current_a,impl_->levels[0].inverse_diagonal,
                                         impl_->fine_diagonal_dirty);
   impl_->fine_diagonal_dirty = false;
@@ -1336,19 +1389,41 @@ void SparseMultigrid::ConfigureHierarchyPhaseRows(
   impl_->terminal_phase_changes = changes != 0;
   impl_->hierarchy_phase_configured = true;
 }
+void SparseMultigrid::PrepareHierarchyPhaseRows(const std::vector<CsrRowUpdate> &a,
+    const std::vector<CsrRowUpdate> &p, std::vector<PhaseRowPlan> &a_plans,
+    std::vector<PhaseRowPlan> &p_plans) const {
+  a_plans.clear(); p_plans.clear();
+  if (!impl_->hierarchy_phase_configured || a.size() != impl_->levels.size()
+      || p.size()+1 != a.size()) return;   // the update itself reports the inconsistency
+  a_plans.reserve(a.size()); p_plans.reserve(p.size());
+  a_plans.push_back(impl_->Plan(impl_->current_a,a[0],impl_->levels.size() > 1));
+  for (size_t l = 1; l < a.size(); ++l)
+    a_plans.push_back(impl_->Plan(impl_->levels[l].a,a[l],l+1 < a.size()));
+  for (size_t l = 0; l < p.size(); ++l)
+    p_plans.push_back(impl_->Plan(impl_->levels[l].p,p[l],false));
+}
 void SparseMultigrid::UpdateHierarchyPhaseRows(const std::vector<CsrRowUpdate> &a,
-                                              const std::vector<CsrRowUpdate> &p) {
+                                              const std::vector<CsrRowUpdate> &p,
+                                              const std::vector<PhaseRowPlan> *a_plans,
+                                              const std::vector<PhaseRowPlan> *p_plans) {
   impl_->Require(impl_->hierarchy_phase_configured && a.size() == impl_->levels.size()
       && p.size()+1 == a.size(),"unconfigured or inconsistent compact hierarchy update");
+  if (a_plans && a_plans->size() != a.size()) a_plans = nullptr;
+  if (p_plans && p_plans->size() != p.size()) p_plans = nullptr;
   const bool terminal_full_update = a.size() == 1 && impl_->fine_diagonal_dirty;
-  UpdateFinePhaseRows(a[0]);
+  UpdateFinePhaseRowsPlanned(a[0],a_plans ? &(*a_plans)[0] : nullptr);
   for (size_t l = 1; l < a.size(); ++l) {
     auto &level = impl_->levels[l]; const bool smooth = l+1 < a.size();
-    impl_->UpdatePhase(level.a,a[l],smooth);
+    impl_->UpdatePhase(level.a,a[l],smooth,a_plans ? &(*a_plans)[l] : nullptr);
+    const double t0 = HostSeconds();
     if (smooth) impl_->UpdatePhaseDiagonal(level.a,level.inverse_diagonal);
+    PhaseTimes().diagonal += HostSeconds()-t0;
   }
-  for (size_t l = 0; l < p.size(); ++l) impl_->UpdatePhase(impl_->levels[l].p,p[l]);
+  for (size_t l = 0; l < p.size(); ++l)
+    impl_->UpdatePhase(impl_->levels[l].p,p[l],false,p_plans ? &(*p_plans)[l] : nullptr);
+  const double t0 = HostSeconds();
   if (impl_->terminal_phase_changes || terminal_full_update) impl_->UpdateTerminal(a.back());
+  PhaseTimes().terminal += HostSeconds()-t0;
 }
 SolveStats SparseMultigrid::Solve(const Vector &rhs, const Vector &x, Real tolerance,
                                  int max_iterations, int restart) {
@@ -1434,8 +1509,11 @@ StorageStats DistributedOperator::Storage() const {
 void DistributedOperator::ConfigurePhaseRows(const std::vector<int> &rows) {
   impl_->backend->ConfigurePhase(impl_->op,rows);
 }
-void DistributedOperator::UpdatePhaseRows(const CsrRowUpdate &a) {
-  impl_->backend->UpdatePhase(impl_->op,a);
+void DistributedOperator::UpdatePhaseRows(const CsrRowUpdate &a, const PhaseRowPlan *plan) {
+  impl_->backend->UpdatePhase(impl_->op,a,false,plan);
+}
+PhaseRowPlan DistributedOperator::PreparePhaseRows(const CsrRowUpdate &a) const {
+  return impl_->backend->Plan(impl_->op,a,false);
 }
 FineOperatorStats DistributedOperator::PhaseUpdates() const { return impl_->op.phase_updates; }
 void DistributedOperator::Apply(const Vector &x, const Vector &result) {

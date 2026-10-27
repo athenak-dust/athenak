@@ -41,6 +41,7 @@
 
 #include "athena.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "globals.hpp"
 #include "gravity/self_gravity.hpp"
 #include "hydro/hydro.hpp"
@@ -257,6 +258,7 @@ void Final(ParameterInput *, Mesh *pm) {Observe(pm);}
 }  // namespace
 
 void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
+  dust::RequireLegacySpeciesInit(pin, "dust_freefall");
   auto *pack = pmy_mesh_->pmb_pack;
   if (pack->pdust == nullptr || pack->ppart == nullptr || pack->pgrav == nullptr ||
       !pmy_mesh_->three_d || !pack->pdust->Clouds3D() || pack->pdust->nspecies != 1) {
@@ -290,6 +292,7 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
     pack->pdust->cloud_split_enable = split;
   }
   user_work_in_loop_func = Work;
+  user_work_keeps_particles = true;   // Observe only reads the particles
   pgen_final_func = Final;
   const Real lx = box.x1max - box.x1min, ly = box.x2max - box.x2min, lz = box.x3max - box.x3min;
   const int nx = pmy_mesh_->mesh_indcs.nx1, ny = pmy_mesh_->mesh_indcs.nx2,
@@ -343,7 +346,7 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
     for (int v=0; v<part->nidata; ++v) pi(v,p) = 0;
     const auto &s = local[p];
     pi(PGID,p) = pack->gids + s.block;
-    pi(PTAG,p) = static_cast<int>(s.tag);
+    SetTag(pi, p, static_cast<std::uint64_t>(s.tag));
     pi(PLEV,p) = 0; pi(PSP,p) = 0;
     pr(IPX,p) = pr(IPX1,p) = s.x[0]; pr(IPY,p) = pr(IPY1,p) = s.x[1];
     pr(IPZ,p) = pr(IPZ1,p) = s.x[2];

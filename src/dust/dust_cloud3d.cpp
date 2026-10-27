@@ -1350,7 +1350,9 @@ int DustGasDrag::SplitCloudsP1Device3D() {
   }
   auto prv = ppar->prtcl_rdata;
   auto piv = ppar->prtcl_idata;
-  const int tag0 = cloud_next_tag, tstride = global_variable::nranks;
+  // 64-bit tags, the counter moved on (checked) before the fill
+  const std::uint64_t tag0 = IssueTags(static_cast<std::uint64_t>(ntags));
+  const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
   Kokkos::parallel_for("dust_split3d_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     if (np(p) == 0) return;
@@ -1372,7 +1374,7 @@ int DustGasDrag::SplitCloudsP1Device3D() {
       if (k > 0) {
         for (int q=0; q<nrdata; ++q) prv(q,s) = prv(q,p);
         for (int q=0; q<nidata; ++q) piv(q,s) = piv(q,p);
-        piv(PTAG,s) = tag0 + (tagoff(p) + k - 1)*tstride;
+        SetTag(piv, s, tag0 + static_cast<std::uint64_t>(tagoff(p) + k - 1)*tstride);
       }
       prv(IPX,s) = cx; prv(IPX1,s) = cx;
       prv(IPY,s) = cy; prv(IPY1,s) = cy;
@@ -1386,7 +1388,6 @@ int DustGasDrag::SplitCloudsP1Device3D() {
       piv(PGID,s) = gids + NewCloudBlock3(lt, cx, cy, cz, lt.Anchor(piv(PGID,s)), ncell123);
     }
   });
-  cloud_next_tag += ntags*global_variable::nranks;
   cloud_split_count += nparent;
   cloud_lobe_split_count += nflag - nparent;
   ppar->nprtcl_thispack = nnew;

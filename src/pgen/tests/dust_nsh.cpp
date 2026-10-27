@@ -39,6 +39,7 @@
 #include <cmath>
 #include <complex>
 #include <iomanip>
+#include <sstream>
 #include <cstdint>
 #include <cstdio>     // fopen(), fprintf()
 #include <unistd.h>   // truncate()
@@ -57,6 +58,7 @@
 #include "hydro/hydro.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "outputs/outputs.hpp"
 
 // functions for error output and user history
@@ -112,7 +114,7 @@ void WriteBASnapshot(Mesh *pm) {
   }
   for (int p=0; p<npart; ++p) {
     particles.insert(particles.end(), {pr(IPX,p), pr(IPY,p), pr(IPM,p),
-        pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p), static_cast<double>(pi(PTAG,p)),
+        pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p), static_cast<double>(GetTag(pi,p)),
         static_cast<double>(pi(PLEV,p))});
   }
   char number[32];
@@ -896,6 +898,25 @@ struct RootPlacement {
   Real kwv = 0.0;
   Real xir[4] = {0.0, 0.0, 0.0, 0.0}, xii[4] = {0.0, 0.0, 0.0, 0.0};
   Real dvr[4] = {0.0, 0.0, 0.0, 0.0}, dvi[4] = {0.0, 0.0, 0.0, 0.0};
+  // unequal ppc_N: the slots of a root cell in species blocks, every species on its
+  // own sub-lattice (sslot, skk: species and index within it of slot k; sppc, snside: per
+  // species); legacy and equal ppc_N: the interleaved layout, species q % nspec
+  bool blocks = false;
+  DvceArray1D<int> sslot, skk, sppc, snside;
+  // per-species H_p of the Gaussian sampling (empty: the single hp)
+  DvceArray1D<Real> shp;
+  KOKKOS_INLINE_FUNCTION int Species(const int q) const {
+    return blocks ? sslot(q % ppc) : q % nspec;
+  }
+  // the slot of parent q within its root cell, on the sub-lattice of its species
+  KOKKOS_INLINE_FUNCTION void Slot(const int k, int &kl, int &pp, int &ns) const {
+    if (blocks) {
+      const int sp = sslot(k);
+      kl = skk(k); pp = sppc(sp); ns = snside(sp);
+    } else {
+      kl = k; pp = ppc; ns = nside;
+    }
+  }
   KOKKOS_INLINE_FUNCTION void Base(const int q, Real &x, Real &y) const {
     if (mode == 0) {
       std::uint64_t key = static_cast<std::uint64_t>(q) + seed*UINT64_C(0x9e3779b97f4a7c15);
@@ -903,14 +924,16 @@ struct RootPlacement {
       y = x2min + HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7))*ly;
       return;
     }
-    const int c = q/ppc, k = q - c*ppc;
+    const int c = q/ppc, k0 = q - c*ppc;
+    int k, pp, ns;
+    Slot(k0, k, pp, ns);
     const int ci = c % nc1, cj = c/nc1;
     Real fx, fy;
     if (mode == 1) {
-      fx = (static_cast<Real>(k % nside) + 0.5)/nside;
-      fy = (static_cast<Real>(k/nside) + 0.5)/nside;
+      fx = (static_cast<Real>(k % ns) + 0.5)/ns;
+      fy = (static_cast<Real>(k/ns) + 0.5)/ns;
     } else {
-      fx = (static_cast<Real>(k) + 0.5)/ppc;
+      fx = (static_cast<Real>(k) + 0.5)/pp;
       const Real g = (static_cast<Real>(k) + 0.5)*0.6180339887498949;
       fy = g - Kokkos::floor(g);
     }
@@ -923,7 +946,7 @@ struct RootPlacement {
     Base(q, x0, y);
     x = x0; vx = 0.0;
     if (kwv != 0.0) {
-      const int s = q % nspec;
+      const int s = Species(q);
       const Real c = Kokkos::cos(kwv*x0), sn = Kokkos::sin(kwv*x0);
       x = x0 + xir[s]*c - xii[s]*sn;
       vx = dvr[s]*c - dvi[s]*sn;
@@ -948,12 +971,13 @@ struct RootPlacement {
       y = x2min + HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7))*ly;
       if (gauss) {
         z = 0.0;
+        const Real hps = (shp.extent_int(0) > 0) ? shp(Species(q)) : hp;
         for (int t=0; t<64; ++t) {
           const std::uint64_t kz = key + UINT64_C(0x58f38ded6f7c55b5) +
                                    static_cast<std::uint64_t>(t)*UINT64_C(0x2545f4914f6cdd1d);
           const Real u1 = Kokkos::fmax(HashUniform01(kz), 1.0e-300);
           const Real u2 = HashUniform01(kz + UINT64_C(0x1d8e4e27c47d124f));
-          const Real zz = hp*Kokkos::sqrt(-2.0*Kokkos::log(u1))*Kokkos::cos(2.0*M_PI*u2);
+          const Real zz = hps*Kokkos::sqrt(-2.0*Kokkos::log(u1))*Kokkos::cos(2.0*M_PI*u2);
           if (zz >= x3min && zz < x3min + lz && (zcut <= 0.0 || Kokkos::fabs(zz) < zcut)) {
             z = zz;
             break;
@@ -964,15 +988,17 @@ struct RootPlacement {
       z = x3min + HashUniform01(key + UINT64_C(0x58f38ded6f7c55b5))*lz;
       return;
     }
-    const int c = q/ppc, k = q - c*ppc;
+    const int c = q/ppc, k0 = q - c*ppc;
+    int k, pp, ns;
+    Slot(k0, k, pp, ns);
     const int ci = c % nc1, cj = (c/nc1) % nc2, ck = c/(nc1*nc2);
     Real fx, fy, fz;
     if (mode == 1) {
-      fx = (static_cast<Real>(k % nside) + 0.5)/nside;
-      fy = (static_cast<Real>((k/nside) % nside) + 0.5)/nside;
-      fz = (static_cast<Real>(k/(nside*nside)) + 0.5)/nside;
+      fx = (static_cast<Real>(k % ns) + 0.5)/ns;
+      fy = (static_cast<Real>((k/ns) % ns) + 0.5)/ns;
+      fz = (static_cast<Real>(k/(ns*ns)) + 0.5)/ns;
     } else {
-      fx = (static_cast<Real>(k) + 0.5)/ppc;
+      fx = (static_cast<Real>(k) + 0.5)/pp;
       const Real g1 = (static_cast<Real>(k) + 0.5)*0.7548776662466927;
       const Real g2 = (static_cast<Real>(k) + 0.5)*0.5698402909980532;
       fy = g1 - Kokkos::floor(g1);
@@ -988,7 +1014,7 @@ struct RootPlacement {
     Base3(q, x0, y, z);
     x = x0; vx = 0.0;
     if (kwv != 0.0) {
-      const int s = q % nspec;
+      const int s = Species(q);
       const Real c = Kokkos::cos(kwv*x0), sn = Kokkos::sin(kwv*x0);
       x = x0 + xir[s]*c - xii[s]*sn;
       vx = dvr[s]*c - dvi[s]*sn;
@@ -1147,6 +1173,10 @@ void SolveNSH(const Real omega0, const Real qshear, const Real ax,
 //! \fn ReadNSHParams
 //! \brief Reads the shearing-box and active dust-mixture parameters.
 
+// the midplane ratios of the new species keys as the problem generator resolved
+// them (Z_N converted); empty before (a restarted run: epsilon_N directly, Z_N recomputed there)
+std::vector<Real> nsh_eps_resolved;
+
 void ReadNSHParams(ParameterInput *pin, MeshBlockPack *pmbp,
                    Real &omega0, Real &qshear, Real &etavk,
                    std::vector<Real> &eps, std::vector<Real> &taus) {
@@ -1167,6 +1197,11 @@ void ReadNSHParams(ParameterInput *pin, MeshBlockPack *pmbp,
       eps[s] = pdust->dust_to_gas/static_cast<Real>(ns);
     }
     taus[s] = pdust->taus.h_view(s);
+  }
+  if (pdust != nullptr && dust::Species(pin).new_init) {
+    const dust::SpeciesTable &spt = dust::Species(pin);
+    for (int s=0; s<ns; ++s) eps[s] = static_cast<Real>(spt.value[s]);
+    if (static_cast<int>(nsh_eps_resolved.size()) == ns) eps = nsh_eps_resolved;
   }
 }
 
@@ -1323,6 +1358,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       user_bcs_func = LiVerticalBCs;
       user_bcs_coarse_func = LiVerticalBCsCoarse;
       user_work_in_loop_func = LiRenormalize;
+      user_work_keeps_particles = true;   // it rescales the gas density only
       if (restart) {   // the initial mean density and the running total from the restart file
         livbc_.mean0 = pin->GetReal("problem", "vbc_mean0");
         livbc_.dm = pin->GetOrAddReal("problem", "vbc_dm", 0.0);
@@ -1428,6 +1464,79 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   }
   int nspec = static_cast<int>(eps.size());
   Real ax = 2.0*omega0*etavk;
+  // the new species keys: abundances (epsilon_N, or Z_N converted to the midplane
+  // ratio below), per-species ppc and H_p from the resolved table; legacy inputs untouched
+  const dust::SpeciesTable *spt = dust_active ? &dust::Species(pin) : nullptr;
+  const bool new_init = (spt != nullptr) && spt->new_init;
+  const bool strat_setup = new_init && pmy_mesh_->three_d &&
+      pin->GetOrAddBoolean("problem", "stratified_dust", false) &&
+      pin->DoesBlockExist("shearing_box") &&
+      pin->GetOrAddBoolean("shearing_box", "stratified", false);
+  std::vector<Real> hps;            // per-species H_p (new keys, stratified)
+  std::vector<Real> finside;        // fraction of each species' Gaussian inside its sampling range
+  Real mg_box = 0.0;                // the initial gas mass of the box (Z with domain)
+  if (new_init) {
+    if (spt->abundance == "Z" && !strat_setup) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "Z_N (column ratios) need the stratified 3-D set-up (<problem>/stratified_dust "
+                << "and <shearing_box>/stratified); use epsilon_N otherwise" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    for (int sp=0; sp<nspec; ++sp) eps[sp] = static_cast<Real>(spt->value[sp]);
+    if (strat_setup) {
+      const Real hg = pmbp->phydro->peos->eos_data.iso_cs/omega0;
+      const auto hv = dust::SpeciesHp(pin, *spt, hg, false);
+      hps.assign(hv.begin(), hv.end());
+      const auto &ms = pmy_mesh_->mesh_size;
+      const bool gs = pin->GetOrAddString("problem", "stratified_dust_sampling", "weight") ==
+                      "gaussian";
+      const Real zc = gs ? pin->GetOrAddReal("problem", "dust_zcut", 0.0) : 0.0;
+      const Real zlo = (zc > 0.0) ? std::max(ms.x3min, -zc) : ms.x3min;
+      const Real zhi = (zc > 0.0) ? std::min(ms.x3max, zc) : ms.x3max;
+      finside.resize(nspec);
+      for (int sp=0; sp<nspec; ++sp) {
+        const Real r2 = std::sqrt(2.0)*hps[sp];
+        finside[sp] = 0.5*(std::erf(zhi/r2) - std::erf(zlo/r2));
+      }
+      if (spt->abundance == "Z" && spt->column_normalization == "domain") {
+        // the gas mass of the box as the initialisation below sets it (cell centres)
+        const Real rho0g = pin->GetOrAddReal("problem", "rho0", 1.0);
+        auto &ind = pmy_mesh_->mb_indcs;
+        auto &mbs = pmbp->pmb->mb_size;
+        const int ks0 = ind.ks, nz3 = ind.nx3, nx = ind.nx1, ny = ind.nx2;
+        const int nmbl = pmbp->nmb_thispack;
+        double mg = 0.0;
+        Kokkos::parallel_reduce("nsh_gas_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmbl*nz3),
+        KOKKOS_LAMBDA(const int q, double &a) {
+          const int m = q/nz3, k = q % nz3;
+          const Real z = CellCenterX(k, nz3, mbs.d_view(m).x3min, mbs.d_view(m).x3max);
+          const Real rho = rho0g*exp(-0.5*z*z/(hg*hg));
+          a += static_cast<double>(rho)*mbs.d_view(m).dx1*mbs.d_view(m).dx2*mbs.d_view(m).dx3*nx*ny;
+        }, mg);
+        (void)ks0;
+#if MPI_PARALLEL_ENABLED
+        MPI_Allreduce(MPI_IN_PLACE, &mg, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+        mg_box = mg;
+      }
+      if (spt->abundance == "Z") {
+        // the midplane ratio of each Gaussian: full_profile Z H_g/H_p (the whole column), domain
+        // the column that puts Z M_gas(box) into the sampling range
+        const Real rho0g = pin->GetOrAddReal("problem", "rho0", 1.0);
+        const Real area = (ms.x1max - ms.x1min)*(ms.x2max - ms.x2min);
+        for (int sp=0; sp<nspec; ++sp) {
+          if (spt->column_normalization == "full_profile") {
+            eps[sp] = static_cast<Real>(spt->value[sp])*hg/hps[sp];
+          } else {
+            eps[sp] = static_cast<Real>(spt->value[sp])*mg_box/
+                      (rho0g*std::sqrt(2.0*M_PI)*hps[sp]*finside[sp]*area);
+          }
+        }
+      }
+    }
+  }
+
+  if (new_init) nsh_eps_resolved = eps;   // the reference of DustNSHErrors
 
   // the radial forcing must be applied to the gas by the standard const_accel source
   // term (so that dust particles do not feel it); verify the input file sets it up
@@ -1469,7 +1578,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       std::exit(EXIT_FAILURE);
     }
     const Real hg = pmbp->phydro->peos->eos_data.iso_cs/omega0;
-    const Real hpz = pin->GetOrAddReal("problem", "dust_hp", hg);
+    // the new keys: per-species H_p, and a truncated profile is not renormalised
+    const Real hpz = new_init ? hps[0] : pin->GetOrAddReal("problem", "dust_hp", hg);
     const auto &ms = pmy_mesh_->mesh_size;
     const int nt = std::max(4097, 64*pmy_mesh_->mesh_indcs.nx3 + 1);
     nshtab.nt = nt;
@@ -1482,11 +1592,15 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // same total dust mass (higher by 1/erf inside, zero outside)
     const Real zcut = pin->GetOrAddReal("problem", "dust_zcut", 0.0);
     const Real fcut = (zcut > 0.0) ? 1.0/std::erf(zcut/(std::sqrt(2.0)*hpz)) : 1.0;
+    std::vector<Real> as(nspec, a), fcs(nspec, fcut);
+    if (new_init) {
+      for (int s=0; s<nspec; ++s) {as[s] = 1.0/(hps[s]*hps[s]) - 1.0/(hg*hg); fcs[s] = 1.0;}
+    }
     std::vector<Real> ez(nspec), vxz(nspec, 0.0), vpz(nspec, 0.0);
     for (int n=0; n<nt; ++n) {
       const Real z = nshtab.z0 + n*nshtab.dz;
       const bool in = (zcut <= 0.0 || std::fabs(z) < zcut);
-      for (int s=0; s<nspec; ++s) ez[s] = in ? eps[s]*fcut*std::exp(-0.5*z*z*a) : 0.0;
+      for (int s=0; s<nspec; ++s) ez[s] = in ? eps[s]*fcs[s]*std::exp(-0.5*z*z*as[s]) : 0.0;
       Real gx = 0.0, gp = 0.0;
       SolveNSH(omega0, qshear, ax, ez, taus, gx, gp, vxz, vpz);
       th(n,0) = gx; th(n,1) = gp;
@@ -1650,26 +1764,67 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   int npart_permb = npart/nmb;
   int ncells = indcs.nx1*indcs.nx2*indcs.nx3;
   int ppc_int = npart_permb/ncells;
-  if ((!random_placement &&
-       ((npart_permb != ppc_int*ncells) || (ppc_int % nspec != 0))) ||
-      (random_placement && (npart % nspec != 0))) {
+  // the new keys: ppc_total = sum of ppc_N particles per cell; equal ppc_N keep the
+  // legacy interleaved layout, unequal ones put each species in a block of slots
+  const bool sblocks = new_init && !spt->equal_ppc;
+  const int ptot = new_init ? spt->ppc_total : nspec;
+  const bool bad_layout = new_init ?
+      ((!random_placement && ((npart_permb != ppc_int*ncells) || (ppc_int != ptot))) ||
+       (random_placement && (npart % ptot != 0))) :
+      ((!random_placement &&
+        ((npart_permb != ppc_int*ncells) || (ppc_int % nspec != 0))) ||
+       (random_placement && (npart % nspec != 0)));
+  if (bad_layout) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "NSH lattice placement requires <particles>/ppc to be an integer "
               << "multiple of <dust>/nspecies; random placement requires the total "
               << "number of particles per rank to be divisible by <dust>/nspecies"
-              << std::endl;
+              << " (new keys: the sum of ppc_N per cell)" << std::endl;
     std::exit(EXIT_FAILURE);
+  }
+  // the slot layout of a cell (q % ptot -> species and index within it) and, per species, its
+  // ppc and the side of its square / cubic sub-lattice (0 if it is not a square / cube)
+  DualArray1D<int> lay_s("nsh_lay_s", std::max(1, ptot)), lay_k("nsh_lay_k", std::max(1, ptot));
+  DualArray1D<int> lay_ppc("nsh_lay_ppc", nspec), lay_n2("nsh_lay_n2", nspec);
+  DualArray1D<int> lay_n3("nsh_lay_n3", nspec);
+  for (int k=0; k<ptot; ++k) {
+    int sp = k % nspec, kk = k/nspec;
+    if (new_init) spt->SlotSpecies(k, sp, kk);
+    lay_s.h_view(k) = sp; lay_k.h_view(k) = kk;
+  }
+  for (int sp=0; sp<nspec; ++sp) {
+    const int pp = new_init ? spt->ppc[sp] : 1;
+    const int n2 = static_cast<int>(std::lround(std::sqrt(static_cast<double>(pp))));
+    const int n3 = static_cast<int>(std::lround(std::cbrt(static_cast<double>(pp))));
+    lay_ppc.h_view(sp) = pp;
+    lay_n2.h_view(sp) = (n2*n2 == pp) ? n2 : 0;
+    lay_n3.h_view(sp) = (n3*n3*n3 == pp) ? n3 : 0;
+  }
+  for (auto *a : {&lay_s, &lay_k, &lay_ppc, &lay_n2, &lay_n3}) {
+    a->template modify<HostMemSpace>();
+    a->template sync<DevExeSpace>();
   }
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2, lnx3 = indcs.nx3;
   // <problem>/lattice_sub: in 3-D the ppc particles of a cell on an n^3 sub-lattice
   // (offsets (a + 1/2)/n) instead of all at the cell centre; ppc = n^3 times nspecies
   int nsub = 1;
   if (pin->GetOrAddBoolean("problem", "lattice_sub", false)) {
-    nsub = static_cast<int>(std::lround(std::cbrt(static_cast<double>(ppc_int/nspec))));
-    if (!three_d || nsub*nsub*nsub*nspec != ppc_int) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "lattice_sub: 3-D and ppc = n^3 * nspecies" << std::endl;
-      std::exit(EXIT_FAILURE);
+    if (sblocks) {   // every species on its own cubic sub-lattice
+      bool ok = three_d;
+      for (int sp=0; sp<nspec; ++sp) ok = ok && (lay_n3.h_view(sp) > 0);
+      if (!ok) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "lattice_sub with unequal ppc_N: 3-D and every ppc_N a cube" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      nsub = 2;   // (> 1: the sub-lattice is on; the side is per species)
+    } else {
+      nsub = static_cast<int>(std::lround(std::cbrt(static_cast<double>(ppc_int/nspec))));
+      if (!three_d || nsub*nsub*nsub*nspec != ppc_int) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "lattice_sub: 3-D and ppc = n^3 * nspecies" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
     }
   }
   Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
@@ -1681,10 +1836,79 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   for (int s=0; s<nspec; ++s) {
     spdat.h_view(s,0) = vx[s];
     spdat.h_view(s,1) = vp[s];
-    spdat.h_view(s,2) = eps[s]*rho0*static_cast<Real>(nspec)/ppc;
+    // unequal ppc_N: eps_s rho0/ppc_s; legacy and equal ppc_N: the same value
+    // as eps_s rho0 nspec/ppc, written as before (bit for bit the legacy masses)
+    spdat.h_view(s,2) = sblocks ? eps[s]*rho0/static_cast<Real>(spt->ppc[s])
+                                : eps[s]*rho0*static_cast<Real>(nspec)/ppc;
   }
   spdat.template modify<HostMemSpace>();
   spdat.template sync<DevExeSpace>();
+  // the new species keys: per species the target and the actual dust mass (all
+  // ranks) in the log; Z with column_normalization = domain is scaled to Z M_gas(box) exactly
+  auto species_audit = [&](const bool allow_rescale) {
+    if (!new_init) return;
+    auto prs = ppar->prtcl_rdata;
+    auto pis = ppar->prtcl_idata;
+    const int np = ppar->nprtcl_thispack;
+    std::vector<double> act(nspec, 0.0);
+    for (int sp=0; sp<nspec; ++sp) {
+      double a = 0.0;
+      Kokkos::parallel_reduce("nsh_species_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, np),
+      KOKKOS_LAMBDA(const int p, double &v) {if (pis(PSP,p) == sp) v += prs(IPM,p);}, a);
+      act[sp] = a;
+    }
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, act.data(), nspec, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+    const auto &ms = pmy_mesh_->mesh_size;
+    const Real area = (ms.x1max - ms.x1min)*(ms.x2max - ms.x2min);
+    const Real vbox = three_d ? area*(ms.x3max - ms.x3min) : area;
+    const bool domain = (spt->abundance == "Z" && spt->column_normalization == "domain");
+    std::vector<double> tgt(nspec);
+    for (int sp=0; sp<nspec; ++sp) {
+      if (!strat_setup) {
+        tgt[sp] = eps[sp]*rho0*vbox;
+      } else if (domain) {
+        tgt[sp] = spt->value[sp]*mg_box;
+      } else {
+        tgt[sp] = eps[sp]*rho0*std::sqrt(2.0*M_PI)*hps[sp]*finside[sp]*area;
+      }
+    }
+    // the scaling corrects a real mismatch (the weight-sampled lattice); a gaussian sample has the
+    // target already, and its sum here is only accurate to round-off (serial: N eps)
+    bool rescale = false;
+    for (int sp=0; sp<nspec; ++sp) {
+      if (act[sp] > 0.0 && std::fabs(act[sp]/tgt[sp] - 1.0) > 1.0e-11) rescale = true;
+    }
+    if (domain && allow_rescale && rescale) {
+      DualArray1D<Real> fac("nsh_species_rescale", nspec);
+      for (int sp=0; sp<nspec; ++sp) fac.h_view(sp) = (act[sp] > 0.0) ? tgt[sp]/act[sp] : 1.0;
+      fac.template modify<HostMemSpace>();
+      fac.template sync<DevExeSpace>();
+      auto f = fac.d_view;
+      par_for("nsh_species_rescale", DevExeSpace(), 0, np-1, KOKKOS_LAMBDA(const int p) {
+        prs(IPM,p) *= f(pis(PSP,p));
+      });
+    }
+    if (global_variable::my_rank == 0) {
+      std::ostringstream o;
+      o << std::setprecision(17) << "# dust species masses"
+        << (strat_setup ? ", stratified" : "") << ":\n";
+      for (int sp=0; sp<nspec; ++sp) {
+        o << "#   species " << sp + 1 << ": " << spt->abundance << " = " << spt->value[sp];
+        if (strat_setup) {
+          o << ", H_p = " << hps[sp] << ", midplane epsilon0 = " << eps[sp]
+            << ", fraction of the profile in the sampling range " << finside[sp];
+        }
+        o << ", target mass " << tgt[sp] << ", particle mass " << act[sp] << ", rel_error "
+          << std::setprecision(3) << ((tgt[sp] > 0.0) ? act[sp]/tgt[sp] - 1.0 : 0.0)
+          << std::setprecision(17)
+          << ((domain && allow_rescale && rescale) ? " (before the scaling to the target)" : "")
+          << "\n";
+      }
+      std::cout << o.str() << std::flush;
+    }
+  };
 
   // the 3-D history errors (DustNSHHistory), with the root parents (cloud_root_random)
   if (dtest && three_d && nspec == 1 && cloud_root_random) {
@@ -1726,10 +1950,18 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     place.mode = (rp == "lattice") ? 1 : ((rp == "generic") ? 2 : 0);
     place.ppc = static_cast<int>(ppc);
     place.nside = static_cast<int>(std::lround(std::cbrt(ppc)));
+    bool lattice_ok = (place.nside*place.nside*place.nside == place.ppc);
+    if (sblocks) {   // every species on its own lattice: every ppc_N a cube
+      lattice_ok = true;
+      for (int sp=0; sp<nspec; ++sp) lattice_ok = lattice_ok && (lay_n3.h_view(sp) > 0);
+      place.blocks = true;
+      place.sslot = lay_s.d_view; place.skk = lay_k.d_view;
+      place.sppc = lay_ppc.d_view; place.snside = lay_n3.d_view;
+    }
     if ((rp != "random" && rp != "lattice" && rp != "generic") ||
-        (place.mode == 1 && place.nside*place.nside*place.nside != place.ppc)) {
-      std::cerr << "<problem>/root_placement must be random, lattice (ppc a cube) or generic"
-                << std::endl;
+        (place.mode == 1 && !lattice_ok)) {
+      std::cerr << "<problem>/root_placement must be random, lattice (ppc a cube; with unequal "
+                << "ppc_N every ppc_N a cube) or generic" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     place.nc1 = nc1; place.nc2 = nc2; place.nspec = nspec; place.seed = random_seed;
@@ -1749,15 +1981,29 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
         std::exit(EXIT_FAILURE);
       }
       place.gauss = true;
-      place.hp = pin->GetOrAddReal("problem", "dust_hp", pmbp->phydro->peos->eos_data.iso_cs/omega0);
+      if (new_init) {   // per-species H_p
+        DualArray1D<Real> hd("nsh_species_hp", nspec);
+        for (int sp=0; sp<nspec; ++sp) hd.h_view(sp) = hps[sp];
+        hd.template modify<HostMemSpace>();
+        hd.template sync<DevExeSpace>();
+        place.shp = hd.d_view;
+        place.hp = hps[0];
+      } else {
+        place.hp = pin->GetOrAddReal("problem", "dust_hp",
+                                     pmbp->phydro->peos->eos_data.iso_cs/omega0);
+      }
       // truncation: the same total dust mass (the equal masses are unchanged, all
       // samples inside), so the dust density inside is higher by 1/erf(zcut/(sqrt(2) Hp)); the
       // NSH(z) table uses the same profile (nsh_vertical)
       place.zcut = pin->GetOrAddReal("problem", "dust_zcut", 0.0);
       if (place.zcut > 0.0 && global_variable::my_rank == 0) {
-        std::cout << "# dust_zcut: Gaussian truncated to |z| < " << place.zcut
-                  << ", density inside x " << 1.0/std::erf(place.zcut/(std::sqrt(2.0)*place.hp))
-                  << std::endl;
+        std::cout << "# dust_zcut: Gaussian truncated to |z| < " << place.zcut;
+        if (new_init) {   // the profile is cut, not renormalised
+          std::cout << ", the mass of the profile inside only (new species keys)" << std::endl;
+        } else {
+          std::cout << ", density inside x " << 1.0/std::erf(place.zcut/(std::sqrt(2.0)*place.hp))
+                    << std::endl;
+        }
       }
     } else if (pin->GetOrAddReal("problem", "dust_zcut", 0.0) > 0.0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -1828,8 +2074,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // exp(-z^2/2 Hp^2), dust_vz0 added to vz), before the split
     const bool strat = pin->GetOrAddBoolean("problem", "stratified_dust", false) &&
                        pin->GetOrAddBoolean("shearing_box", "stratified", false);
-    const Real shp = strat ? pin->GetOrAddReal("problem", "dust_hp",
-                                               pmbp->phydro->peos->eos_data.iso_cs/omega0) : 1.0;
+    const Real shp = (strat && !new_init) ? pin->GetOrAddReal("problem", "dust_hp",
+        pmbp->phydro->peos->eos_data.iso_cs/omega0) : 1.0;
     const Real svz0 = strat ? pin->GetOrAddReal("problem", "dust_vz0", 0.0) : 0.0;
     // a uniform dust vz on the root parents of any 3-D set-up; with
     // dust_test_vz_mirror its sign follows z (a state mirrored about z = 0, the image of a box
@@ -1838,6 +2084,18 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     const bool tvzm = pin->GetOrAddBoolean("problem", "dust_test_vz_mirror", false);
     const bool gsamp = place.gauss;
     const Real gfac = std::sqrt(2.0*M_PI)*place.hp/place.lz;
+    // per species: the Gaussian factor of the equal masses and the H_p of the weights (legacy:
+    // the single values; per species, the Gaussian masses times the fraction of
+    // the profile inside the sampling range, so a truncated profile carries less mass)
+    DualArray1D<Real> sgf("nsh_species_gfac", nspec), shpv("nsh_species_hpw", nspec);
+    for (int sp=0; sp<nspec; ++sp) {
+      sgf.h_view(sp) = new_init && strat ? std::sqrt(2.0*M_PI)*hps[sp]/place.lz*finside[sp] : gfac;
+      shpv.h_view(sp) = new_init && strat ? hps[sp] : shp;
+    }
+    sgf.template modify<HostMemSpace>(); sgf.template sync<DevExeSpace>();
+    shpv.template modify<HostMemSpace>(); shpv.template sync<DevExeSpace>();
+    auto sgfd = sgf.d_view;
+    auto shpd = shpv.d_view;
     auto mblev0 = pmbp->pmb->mb_lev;
     const int rootlev0 = pmy_mesh_->root_level;
     const bool nshz = nsh_vertical;
@@ -1847,9 +2105,9 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       if (p < 0) return;
       Real x, y, z, vw;
       place(q, x, y, z, vw);
-      const int sp = q % nspec;
+      const int sp = place.Species(q);
       pi0(PGID,p) = gids0 + pslot(q);
-      pi0(PTAG,p) = q;
+      SetTag(pi0, p, static_cast<std::uint64_t>(q));
       pi0(PSP,p) = sp;
       pi0(PLEV,p) = seed_leaf ? (mblev0.d_view(pslot(q)) - rootlev0) : 0;
       for (int c=0; c<nrdata; ++c) pr0(c,p) = 0.0;
@@ -1865,7 +2123,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       if (strat) {
         // gaussian: the equal mass eps rho0 sqrt(2 pi) Hp Lx Ly / (parents of the
         // species) = (the uniform root mass) sqrt(2 pi) Hp / Lz
-        pr0(IPM,p) *= gsamp ? gfac : exp(-0.5*z*z/(shp*shp));
+        pr0(IPM,p) *= gsamp ? sgfd(sp) : exp(-0.5*z*z/(shpd(sp)*shpd(sp)));
         pr0(IPVZ,p) = svz0; pr0(IPVZ1,p) = svz0;
       }
       if (nshz) {   // the NSH drift at the height of the parent
@@ -1881,10 +2139,14 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     });
     if (strat && global_variable::my_rank == 0) {
       std::cout << "# stratified dust (3-D root " << (canonical_root ? "particles" : "clouds")
-                << "): Hp = " << shp << ", vz0 = " << svz0 << ", sampling "
+                << "): Hp = ";
+      if (new_init) {for (int sp=0; sp<nspec; ++sp) std::cout << (sp ? "/" : "") << hps[sp];}
+      else std::cout << shp;
+      std::cout << ", vz0 = " << svz0 << ", sampling "
                 << (gsamp ? "gaussian (equal masses)" : "weight") << (nshz ? ", NSH(z)" : "")
                 << std::endl;
     }
+    species_audit(true);   // before the split
     // the tag counter is set collectively before the splits
     if (!canonical_root) {
       pmbp->pdust->EnsureNextTag();
@@ -1967,10 +2229,18 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       place.mode = (rp == "lattice") ? 1 : ((rp == "generic") ? 2 : 0);
       place.ppc = static_cast<int>(ppc);
       place.nside = static_cast<int>(std::lround(std::sqrt(ppc)));
+      bool lattice_ok = (place.nside*place.nside == place.ppc);
+      if (sblocks) {   // every species on its own lattice: every ppc_N a square
+        lattice_ok = true;
+        for (int sp=0; sp<nspec; ++sp) lattice_ok = lattice_ok && (lay_n2.h_view(sp) > 0);
+        place.blocks = true;
+        place.sslot = lay_s.d_view; place.skk = lay_k.d_view;
+        place.sppc = lay_ppc.d_view; place.snside = lay_n2.d_view;
+      }
       if ((rp != "random" && rp != "lattice" && rp != "generic") ||
-          (place.mode == 1 && place.nside*place.nside != place.ppc)) {
-        std::cerr << "<problem>/root_placement must be random, lattice (ppc a square) or "
-                  << "generic" << std::endl;
+          (place.mode == 1 && !lattice_ok)) {
+        std::cerr << "<problem>/root_placement must be random, lattice (ppc a square; with "
+                  << "unequal ppc_N every ppc_N a square) or generic" << std::endl;
         std::exit(EXIT_FAILURE);
       }
       place.nc1 = transfer.ncoarse1;
@@ -2027,19 +2297,21 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       place(q, x, y, vw);
       const int m = pslot(q);
       pi0(PGID,p) = gids0+m;
-      pi0(PTAG,p) = q;
-      pi0(PSP,p) = q % nspec;
+      SetTag(pi0, p, static_cast<std::uint64_t>(q));
+      const int sq = place.Species(q);
+      pi0(PSP,p) = sq;
       pi0(PLEV,p) = 0;
       for (int c=0; c<nrdata; ++c) pr0(c,p) = 0.0;
       pr0(IPX,p) = x; pr0(IPX1,p) = x;
       pr0(IPY,p) = y; pr0(IPY1,p) = y;
-      pr0(IPTS,p) = taus_.d_view(q % nspec);
-      pr0(IPM,p) = spdat.d_view(q % nspec,2)*mass_unit;
-      pr0(IPVX,p) = spdat.d_view(q % nspec,0) + vw;
-      pr0(IPVZ,p) = spdat.d_view(q % nspec,1);
+      pr0(IPTS,p) = taus_.d_view(sq);
+      pr0(IPM,p) = spdat.d_view(sq,2)*mass_unit;
+      pr0(IPVX,p) = spdat.d_view(sq,0) + vw;
+      pr0(IPVZ,p) = spdat.d_view(sq,1);
       pr0(IPVX1,p) = pr0(IPVX,p);
       pr0(IPVZ1,p) = pr0(IPVZ,p);
     });
+    species_audit(true);   // before the split
     // the tag counter is set collectively before the splits
     if (!canonical_root) pmbp->pdust->EnsureNextTag();
     if (!canonical_root) pmbp->pdust->SplitToLeaves();
@@ -2048,13 +2320,14 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
               << (canonical_root ? " particles" : " particles after P1 presplit")
               << std::endl;
   } else {
+  auto lsd = lay_s.d_view, lkd = lay_k.d_view, ln3d = lay_n3.d_view;
   par_for("nsh_part", DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m, s;
     if (random_placement) {
       // Offset the tag stream before hashing so different seeds generate independent
       // position sets.  XOR with the raw tag is not sufficient: for consecutive tags
       // spanning complete power-of-two ranges it only permutes the same set of keys.
-      std::uint64_t key = static_cast<std::uint64_t>(pi(PTAG,p))
+      std::uint64_t key = GetTag(pi,p)
                         + random_seed*UINT64_C(0x9e3779b97f4a7c15);
       m = static_cast<int>(HashUniform01(key)*static_cast<Real>(nmb));
       if (m > (nmb-1)) {m = nmb-1;}
@@ -2070,13 +2343,13 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       // Stripe species by the local particle index. Unlike PTAG % nspec, this remains
       // balanced when <particles>/assign_tag=rank_order and nranks shares a factor with
       // nspec. The divisibility check above guarantees equal counts in this pack.
-      s = p % nspec;
+      s = sblocks ? lsd(p % ptot) : p % nspec;   // the slot layout
     } else {
       m = p/npart_permb;
       if (m > (nmb-1)) {m = nmb-1;}
       int q = p - m*npart_permb;
       int c = q/ppc_int;
-      s = (q % ppc_int) % nspec;
+      s = sblocks ? lsd(q % ppc_int) : (q % ppc_int) % nspec;
       int i = c % lnx1;
       int j = (c/lnx1) % lnx2;
       int k = c/(lnx1*lnx2);
@@ -2087,11 +2360,13 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       pr(IPZ,p) = three_d ?
           CellCenterX(k, lnx3, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max) : 0.0;
       if (nsub > 1) {   // the sub-lattice point of this particle (species cycle fastest)
-        const int r = (q % ppc_int)/nspec;
-        const int a = r % nsub, b = (r/nsub) % nsub, cc = r/(nsub*nsub);
-        pr(IPX,p) += ((a + 0.5)/nsub - 0.5)*mbsize.d_view(m).dx1;
-        pr(IPY,p) += ((b + 0.5)/nsub - 0.5)*mbsize.d_view(m).dx2;
-        pr(IPZ,p) += ((cc + 0.5)/nsub - 0.5)*mbsize.d_view(m).dx3;
+        // (unequal ppc_N: the cubic sub-lattice of the particle's species)
+        const int r = sblocks ? lkd(q % ppc_int) : (q % ppc_int)/nspec;
+        const int ns = sblocks ? ln3d(s) : nsub;
+        const int a = r % ns, b = (r/ns) % ns, cc = r/(ns*ns);
+        pr(IPX,p) += ((a + 0.5)/ns - 0.5)*mbsize.d_view(m).dx1;
+        pr(IPY,p) += ((b + 0.5)/ns - 0.5)*mbsize.d_view(m).dx2;
+        pr(IPZ,p) += ((cc + 0.5)/ns - 0.5)*mbsize.d_view(m).dx3;
       }
     }
     pi(PGID,p) = gids + m;
@@ -2186,7 +2461,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       for (int c=0; c<nrd; ++c) prt(c,p) = 0.0;
       prt(IPX,p) = x; prt(IPY,p) = y; prt(IPZ,p) = z; prt(IPM,p) = mq;
       pit(PGID,p) = gids + qslot(q);
-      pit(PTAG,p) = q;
+      SetTag(pit, p, static_cast<std::uint64_t>(q));
     });
     if (!three_d) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -2215,7 +2490,12 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       std::exit(EXIT_FAILURE);
     }
     const Real hgas = pmbp->phydro->peos->eos_data.iso_cs/omega0;
-    const Real hp = pin->GetOrAddReal("problem", "dust_hp", hgas);
+    // the new keys: per-species H_p; legacy: the single dust_hp
+    const Real hp = new_init ? hps[0] : pin->GetOrAddReal("problem", "dust_hp", hgas);
+    DualArray1D<Real> hpv("nsh_strat_hp", nspec);
+    for (int sp=0; sp<nspec; ++sp) hpv.h_view(sp) = new_init ? hps[sp] : hp;
+    hpv.template modify<HostMemSpace>(); hpv.template sync<DevExeSpace>();
+    auto hpd = hpv.d_view;
     const Real vz0 = pin->GetOrAddReal("problem", "dust_vz0", 0.0);
     auto &prs = ppar->prtcl_rdata;
     auto &pis = ppar->prtcl_idata;
@@ -2223,7 +2503,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     const NSHTableZ ntab = nshtab;
     par_for("strat_dust", DevExeSpace(), 0, ppar->nprtcl_thispack-1, KOKKOS_LAMBDA(const int p) {
       const Real z = prs(IPZ,p);
-      prs(IPM,p) *= exp(-0.5*z*z/(hp*hp));
+      const Real h = hpd(pis(PSP,p));
+      prs(IPM,p) *= exp(-0.5*z*z/(h*h));
       prs(IPVZ,p) += vz0;
       if (nshz) {   // the NSH drift at the height of the particle
         const int s = pis(PSP,p);
@@ -2236,6 +2517,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
                 << std::endl;
     }
   }
+  if (!cloud_root_random) species_audit(true);   // lattice / random placement
 
   // two cold streams along x2 for the multi-stream regrid test; the
   // particles below the midplane get +two_stream_v added to their x2 velocity, the others

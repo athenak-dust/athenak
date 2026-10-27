@@ -16,6 +16,7 @@
 #include "mesh/mesh.hpp"
 #include "bvals/bvals.hpp"
 #include "particles.hpp"
+#include "dust/dust_species.hpp"
 
 namespace particles {
 //----------------------------------------------------------------------------------------
@@ -31,8 +32,10 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
   }
 
   // read number of particles per cell, and calculate number of particles this pack
-  // Dust API: dust use of <particles>/ppc is to be deprecated after
-  // <dust>/ppc_N is implemented. Other particle types retain this generic input.
+  // Dust API: with <dust>/ppc_N the resolved species table (parsed here, before
+  // the allocation) sets <particles>/ppc to their sum; the dust use of <particles>/ppc alone is
+  // the legacy input (to be deprecated).  Other particle types retain this generic input.
+  if (pin->DoesBlockExist("dust")) (void) dust::Species(pin);
   Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
 
   // compute number of particles as real number, since ppc can be < 1
@@ -95,7 +98,9 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
         // azimuthal velocity lives in IPVZ, matching gas IM3), plus the RK registers
         // (x1,v1), the recorded drag rate R_j, stopping time, and mass
         nrdata = 17;
-        nidata = 4;   // PGID, PTAG, PSP (species index), PLEV (cloud level)
+        // PGID, PTAG, PSP (species index), PLEV (cloud level), PTAGH (high word of the
+        // 64-bit tag)
+        nidata = 5;
         break;
       }
     default:
@@ -130,9 +135,11 @@ void Particles::CreateParticleTags(ParameterInput *pin) {
     }
 
     auto &pi = prtcl_idata;
+    const bool hiword = (nidata > PTAGH);   // dust: the 64-bit tag, high word 0
     par_for("ptags",DevExeSpace(),0,(nprtcl_thispack-1),
     KOKKOS_LAMBDA(const int p) {
       pi(PTAG,p) = tagstart + p;
+      if (hiword) pi(PTAGH,p) = 0;
     });
 
   // tags are assigned sequentially across ranks
@@ -140,9 +147,11 @@ void Particles::CreateParticleTags(ParameterInput *pin) {
     int myrank = global_variable::my_rank;
     int nranks = global_variable::nranks;
     auto &pi = prtcl_idata;
+    const bool hiword = (nidata > PTAGH);
     par_for("ptags",DevExeSpace(),0,(nprtcl_thispack-1),
     KOKKOS_LAMBDA(const int p) {
       pi(PTAG,p) = myrank + nranks*p;
+      if (hiword) pi(PTAGH,p) = 0;
     });
 
   // tag algorithm not recognized, so quit with error

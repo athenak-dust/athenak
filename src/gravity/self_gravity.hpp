@@ -39,6 +39,18 @@ class SelfGravity {
   SelfGravity &operator=(const SelfGravity &) = delete;
 
   void Solve(Real time);
+  // Start the HOST assembly of the shear-phase rows for a later Solve(time) in a
+  // background thread, overlapping the matter step. The next phase update uses it only if
+  // its shift, topology and geometry are still exactly those of the request; otherwise it
+  // is discarded and assembled again. The assembly is the same code on the same data, so
+  // the operator coefficients are bitwise those of the synchronous path.
+  void PrefetchPhase(Real time);
+  // kdk_reuse helpers; public only because NVCC device lambdas require it
+  bool KdkReuseAllowed(Real time, Real shift);
+  void RememberReuseState();
+  void ReuseCheck(Real time, long long regathered);
+  bool ExtrapolateGuess(Real time, int solver_n);
+  void RecordGuess(Real time, bool extrapolation_history);
   // Symmetric half-kicks around the existing hydro/OA update. Density does not
   // change during a kick; ideal-gas internal energy is preserved exactly.
   void KickHydro(Real dt);
@@ -93,6 +105,10 @@ class SelfGravity {
   std::uint64_t phase_update_count = 0, preconditioner_refresh_count = 0;
 
  private:
+  struct PhaseAssembly;
+  Real ShearShift(Real time) const;
+  void AssemblePhase(Real shear_offset, PhaseAssembly &out);
+  void JoinPrefetch();
   void Rebuild(Real shear_offset);
   void RebuildDistributed(Real shear_offset);
   void UpdatePhase(Real shear_offset);
@@ -109,6 +125,24 @@ class SelfGravity {
   std::vector<std::unique_ptr<MeshGeometry>> coarse_geometry_;
   std::vector<std::vector<int>> prolongation_phase_rows_;
   std::vector<GravityPatch> solver_patches_;
+  std::unique_ptr<PhaseAssembly> prefetch_;
+  // <gravity>/kdk_reuse (default off): the opening solve of a step keeps the
+  // closing field of the previous step when nothing but exact representation changes
+  // (split, lobe release, migration, reordering) happened in between; see KdkReuseAllowed.
+  bool kdk_reuse_ = false, reuse_check_ = false, reuse_valid_ = false;
+  std::uint64_t reuse_epoch_ = 0, reuse_count_ = 0, reuse_regathered_ = 0;
+  Real reuse_check_max_residual_ = 0, reuse_check_max_source_ = 0, reuse_check_max_gather_ = 0;
+  DvceArray1D<Real> reuse_gas_;  // gas density of the source cells (gas sources only)
+  Real last_physical_mass_ = 0;
+  // <gravity>/guess = extrapolate (default previous): linear extrapolation in time of
+  // the last two accepted potentials as the initial guess of a solve at a new time
+  bool guess_extrapolate_ = false, guess_prev_valid_ = false, guess_cur_valid_ = false;
+  DvceArray1D<Real> guess_prev_, guess_tmp_;
+  Real guess_t_prev_ = 0, guess_t_cur_ = 0;
+  int guess_topology_ = -1;
+  std::uint64_t guess_extrapolations_ = 0;
+  bool prefetch_enabled_ = false;
+  std::uint64_t geometry_epoch_ = 0, prefetch_used_ = 0, prefetch_discarded_ = 0;
   CompositeDomain solver_domain_;
   bool solver_neumann_z_ = false, hierarchy_fresh_ = true;
   std::unique_ptr<DistributedOperator> force_[3];
@@ -131,7 +165,7 @@ class SelfGravity {
   std::vector<GlobalIndex> partition_;
   int topology_ = -1, max_iterations_, restart_;
   int slab_modes_x_ = 0, slab_modes_y_ = 0;
-  int phase_threads_ = 0;
+  int phase_threads_ = 0, setup_threads_ = 0;
   bool phase_serial_only_ = false;
   Real phase_ = 0, tolerance_, gravity_cfl_;
   bool phase_valid_ = false, report_each_solve_;

@@ -147,6 +147,9 @@ unsigned long long ParticleChecksum(particles::Particles *ppar) {
     }
     for (int q=0; q<nidata; ++q) {
       if (q == PGID) continue;
+      // The high tag word only when it is not 0, so that the sum of a run with tags
+      // below 2^32 is the one of the int32 tags before (any change of the word still shows)
+      if (q == PTAGH && pi(q,p) == 0) continue;
       h = (h ^ static_cast<unsigned long long>(static_cast<unsigned int>(pi(q,p))))*1099511628211ULL;
     }
     s += h;
@@ -1826,6 +1829,7 @@ void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_ll
 //! over the leaves add up to one and point into existing blocks.
 
 void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
+  ++gravity_mass_epoch;   // a new mesh (the gravity field is rebuilt anyway)
   const bool oo = (smr_transfer_mode == DustSMRTransfer::owner_overlap);
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud && !oo) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl

@@ -60,6 +60,9 @@ class ProblemGenerator {
   UserHistoryFnPtr user_hist_func=nullptr;
   // Called by the driver at the start of every cycle, before the integrator
   UserWorkInLoopFnPtr user_work_in_loop_func=nullptr;
+  // True if user_work_in_loop_func never changes particle positions, masses, levels
+  // or anchors (then <gravity>/kdk_reuse may keep the dust field across it)
+  bool user_work_keeps_particles=false;
 
   // predefined problem generator functions (default test suite)
   void CallProblemGenerator(ParameterInput *pin, bool is_restart);

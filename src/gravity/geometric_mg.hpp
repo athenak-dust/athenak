@@ -47,6 +47,13 @@ struct GeometricSystem {
   std::vector<std::size_t> quadratic_interface_fallbacks;
 };
 
+// Host wall-clock seconds of the hierarchy construction phases since the last reset;
+// for <gravity>/profile output only.
+struct HierarchyBuildTimes {
+  double geometry = 0, fine_system = 0, transfers = 0, coarse_system = 0;
+};
+HierarchyBuildTimes &BuildTimes();
+
 // Rediscretized FV A, tensor-linear P, and explicit integrated-residual child-sum
 // R. This is R=P0^T, not P^T. Coarsening halves even patch counts, then merges
 // complete geometric sibling patch families. Setup stops at <=128 global cells.
@@ -56,9 +63,11 @@ struct GeometricSystem {
 // neumann_z=true instead, exterior-center potentials are phi_adjacent+h*q,
 // boundary columns contain outward derivatives q, correction fills reflect, and
 // the constant nullspace is retained. This requires domain.isolated_z=true.
+// threads: host workers of the setup (BuildSystem, transfers) of every geometry
+// (MeshGeometry::SetSetupThreads semantics; 1 = serial). The coefficients do not depend on it.
 GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     const CompositeDomain &domain, int rank, int nranks, bool neumann_z = false,
-    bool fine_forces = true);
+    bool fine_forces = true, int threads = 1);
 
 // Both geometries must already have the current phase. Visits only the fixed
 // local P dependency list discovered during the original transfer construction.

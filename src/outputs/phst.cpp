@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "athena.hpp"
@@ -32,6 +33,7 @@
 #include "mesh/mesh.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "outputs.hpp"
 
 namespace {
@@ -95,6 +97,12 @@ void ParticleHistoryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       std::fprintf(fp, "# source_commit = %s; representation = %s; ndim = %d; nspecies = %d\n",
                    ATHENA_SOURCE_COMMIT, pd->ScienceRepresentationId().c_str(),
                    pm->three_d ? 3 : 2, pd->nspecies);
+      {  // the resolved species table
+        std::istringstream tl(dust::Species(pin).Describe(""));
+        std::string line;
+        std::getline(tl, line);   // nspecies is on the line above
+        while (std::getline(tl, line)) std::fprintf(fp, "# species: %s\n", line.c_str());
+      }
       if (pd->is_shearing_box) {
         std::fprintf(fp, "# velocity_frame = shear_relative: velocities relative to the "
                      "background shear -q Omega x1 (q = %.17g, Omega = %.17g); azimuthal "

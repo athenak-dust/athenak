@@ -10,7 +10,7 @@
 //! MeshBlock; it has no particles.  One section is appended after the MeshBlock data:
 //!
 //!   char[8]  "AKPRST01"
-//!   int32    version (1), sizeof(Real), sizeof(int), ranks written (1), nrdata, nidata
+//!   int32    version (2), sizeof(Real), sizeof(int), ranks written (1), nrdata, nidata
 //!   uint64   bytes of the whole section (this head and the end marker included)
 //!   int64    number of particles
 //!   Real     particle time step (Particles::dtnew)
@@ -40,6 +40,17 @@
 //! keeps the particles of its blocks, takes the records of section 0 and starts the tag counter
 //! anew.  Files without the section (written before this, or by runs without particles) are
 //! still readable by runs without particles.
+//!
+//! Version 2: the tag of a dust particle is an unsigned 64-bit
+//! integer in two int columns, PTAG (bits 0-31) and PTAGH (bits 32-63, the last column), so a
+//! dust section has nidata = 5 (version 1: 4).  The int32 record next_tag is replaced by
+//! tag_state, uint64[3] = {counter set (0/1), next tag of the writing rank, bound}, bound being
+//! above every tag issued in the whole history of the run (the largest of the counters of all
+//! ranks, the live tags + 1 and the bound the run started from; the same in every section).  A
+//! run that does not take its own section back (another rank count or block layout) starts
+//! its new tags at the bound, so that no tag of a deleted particle is issued again.  Version 1
+//! files are still read: the high words are 0 and the counter is the int32 record next_tag;
+//! such a run on other ranks starts again from the largest live tag, as before.
 
 #include <algorithm>
 #include <cstdint>
@@ -64,7 +75,7 @@ namespace dust {
 
 namespace {
 const char kMagic[9] = "AKPRST01";
-constexpr std::int32_t kVersion = 1;
+constexpr std::int32_t kVersion = 2;   // 64-bit tags (version 1: int32 tags)
 constexpr std::size_t kHeadBytes = 8 + 6*sizeof(std::int32_t) + sizeof(std::uint64_t);
 
 void Put(std::vector<char> &b, const void *p, std::size_t n) {
@@ -94,6 +105,9 @@ void PutRecord(std::vector<char> &b, const char *name, const void *p, std::size_
 
 std::size_t ParticleRestartHeadBytes() {return kHeadBytes;}
 
+// the versions this code reads (1: int32 tags, 2: 64-bit tags)
+bool ParticleRestartVersionKnown(const std::int32_t version) {return version == 1 || version == 2;}
+
 std::uint64_t ParticleRestartSectionBytes(const char *head) {
   if (std::memcmp(head, kMagic, 8) != 0) return 0;
   std::uint64_t n = 0;
@@ -106,8 +120,10 @@ std::uint64_t ParticleRestartSectionBytes(const char *head) {
 //! \brief The dust records of the restart section (see the file header).
 
 void DustGasDrag::PackRestartState(std::vector<char> &b) const {
-  const std::int32_t tag = cloud_next_tag, pass = cloud_merge_pass;
-  PutRecord(b, "next_tag", &tag, sizeof(tag));
+  const std::int32_t pass = cloud_merge_pass;
+  // the 64-bit tag counter of this rank and the bound of all tags issued (collective)
+  const std::uint64_t ts[3] = {cloud_next_tag_set ? 1ULL : 0ULL, cloud_next_tag, IssuedTagBound()};
+  PutRecord(b, "tag_state", ts, sizeof(ts));
   // the blocks of the rank that writes this section
   const std::int32_t rb[3] = {global_variable::my_rank, pmy_pack->gids, pmy_pack->nmb_thispack};
   PutRecord(b, "rank_blocks", rb, sizeof(rb));
@@ -209,8 +225,15 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
     auto want = [&](std::size_t size) {
       if (static_cast<std::size_t>(n) != size) Broken("dust record " + name + " has an unexpected size");
     };
-    if (name == "next_tag") {
-      std::int32_t v; want(sizeof(v)); std::memcpy(&v, d, sizeof(v)); cloud_next_tag = v;
+    if (name == "next_tag") {   // version 1: the int32 counter (-1: not set)
+      std::int32_t v; want(sizeof(v)); std::memcpy(&v, d, sizeof(v));
+      cloud_next_tag_set = (v >= 0);
+      cloud_next_tag = (v >= 0) ? static_cast<std::uint64_t>(v) : 0;
+    } else if (name == "tag_state") {   // version 2
+      std::uint64_t v[3]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));
+      cloud_next_tag_set = (v[0] != 0);
+      cloud_next_tag = v[1];
+      cloud_tag_floor = v[2];
     } else if (name == "rank_blocks") {
       std::int32_t v[3]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));   // read by the caller
     } else if (name == "merge_pass") {
@@ -372,6 +395,7 @@ struct Section {
   const char *state = nullptr;
   std::int32_t nstate = 0;
   const char *rows = nullptr;   // nrdata rows of Real, then nidata rows of int
+  int nidata = 0;               // int rows of the file (version 1 dust: PTAGH missing)
 };
 Section ParseSection(const std::vector<char> &buf, const int nsec, const int nrdata, const int nidata) {
   if (buf.size() < kHeadBytes + 8 || std::memcmp(buf.data(), kMagic, 8) != 0 ||
@@ -380,9 +404,13 @@ Section ParseSection(const std::vector<char> &buf, const int nsec, const int nrd
   }
   std::int32_t head[6];
   std::memcpy(head, buf.data() + 8, sizeof(head));
-  if (head[0] != kVersion || head[1] != static_cast<std::int32_t>(sizeof(Real)) ||
+  // version 2 has this run's columns; version 1 too, or (dust) all but the last one,
+  // PTAGH, whose high words are then 0
+  const bool columns_ok = (head[5] == nidata) ||
+      (head[0] == 1 && nidata == static_cast<int>(PTAGH) + 1 && head[5] == static_cast<int>(PTAGH));
+  if (!ParticleRestartVersionKnown(head[0]) || head[1] != static_cast<std::int32_t>(sizeof(Real)) ||
       head[2] != static_cast<std::int32_t>(sizeof(int)) || head[3] != nsec ||
-      head[4] != nrdata || head[5] != nidata) {
+      head[4] != nrdata || !columns_ok) {
     Broken("version, type sizes, rank count or the number of particle columns do not match "
            "this run (file: version " + std::to_string(head[0]) + ", Real " +
            std::to_string(head[1]) + " bytes, int " + std::to_string(head[2]) + " bytes, ranks " +
@@ -391,12 +419,13 @@ Section ParseSection(const std::vector<char> &buf, const int nsec, const int nrd
            ", nidata " + std::to_string(nidata) + ")");
   }
   Section s;
+  s.nidata = head[5];
   std::size_t at = kHeadBytes;
   std::memcpy(&s.np, buf.data() + at, sizeof(s.np)); at += sizeof(s.np);
   std::memcpy(&s.dtnew, buf.data() + at, sizeof(s.dtnew)); at += sizeof(s.dtnew);
   std::memcpy(&s.nstate, buf.data() + at, sizeof(s.nstate)); at += sizeof(s.nstate);
   const std::size_t need = at + static_cast<std::size_t>(s.nstate) +
-      static_cast<std::size_t>(s.np)*(nrdata*sizeof(Real) + nidata*sizeof(int)) + 8;
+      static_cast<std::size_t>(s.np)*(nrdata*sizeof(Real) + s.nidata*sizeof(int)) + 8;
   if (s.np < 0 || s.nstate < 0 || need != buf.size()) Broken("sizes inside the section are inconsistent");
   s.state = buf.data() + at;
   s.rows = buf.data() + at + s.nstate;
@@ -477,7 +506,11 @@ void UnpackParticleRestart(MeshBlockPack *pmbp, const int nsec,
       for (const auto p : sel) rc[c].push_back(row[p]);
     }
     for (int c=0; c<nidata; ++c) {
-      std::memcpy(irow.data(), ip + static_cast<std::size_t>(c)*s.np*sizeof(int), s.np*sizeof(int));
+      if (c < s.nidata) {
+        std::memcpy(irow.data(), ip + static_cast<std::size_t>(c)*s.np*sizeof(int), s.np*sizeof(int));
+      } else {   // a column the file does not have (PTAGH of version 1): 0
+        std::fill(irow.begin(), irow.end(), 0);
+      }
       for (const auto p : sel) ic[c].push_back(irow[p]);
     }
     nread += s.np;
@@ -498,9 +531,14 @@ void UnpackParticleRestart(MeshBlockPack *pmbp, const int nsec,
       }
       take(s, false);
     }
-    // the counters of the sections were per rank: the tag counter starts again from the largest
-    // tag (EnsureNextTag, collectively at the first cycle)
-    if (pmbp->pdust != nullptr) pmbp->pdust->cloud_next_tag = -1;
+    // the counters of the sections were per rank: the tag counter starts again (EnsureNextTag,
+    // collectively at the first cycle): at the bound of all tags issued before
+    // (version 2, record tag_state of section 0, the same in all), version 1 from the largest
+    // live tag
+    if (pmbp->pdust != nullptr) {
+      pmbp->pdust->cloud_next_tag_set = false;
+      pmbp->pdust->cloud_next_tag = 0;
+    }
   }
   const std::int64_t np = rc.empty() ? 0 : static_cast<std::int64_t>(rc[0].size());
   const bool clouds = pmbp->pdust != nullptr &&
@@ -539,7 +577,10 @@ void UnpackParticleRestart(MeshBlockPack *pmbp, const int nsec,
               << (exact ? "(each rank its own)" : "(sorted by block)") << " (" << nrdata
               << " real and " << nidata << " integer columns), particle dt " << dtnew;
     if (pmbp->pdust != nullptr) {
-      std::cout << ", next cloud tag " << pmbp->pdust->cloud_next_tag << ", merge pass "
+      std::cout << ", next cloud tag ";
+      if (pmbp->pdust->cloud_next_tag_set) {std::cout << pmbp->pdust->cloud_next_tag;}
+      else {std::cout << "unset";}
+      std::cout << " (tag bound " << pmbp->pdust->cloud_tag_floor << "), merge pass "
                 << pmbp->pdust->cloud_merge_pass;
     }
     std::cout << std::endl;
