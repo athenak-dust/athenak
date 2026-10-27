@@ -18,7 +18,7 @@
 //! Required parameters that must be specified in an <output[n]> block are:
 //!   - variable  = [list of currently implemented strings for specifing output variables
 //!                  is defined at start of outputs.hpp file]
-//!   - file_type = tab,vtk,hst,bin,rst
+//!   - file_type = tab,vtk,hst,bin,rst,pbin (pbin takes no variable)
 //!   - dt        = problem time between outputs
 //!
 //! EXAMPLE of an <output[n]> block for a TAB dump:
@@ -89,10 +89,12 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
 
       // set output variable and optional file id (default is output variable name)
       // but only for those output types that use them
+      // (pbin: the complete particle science state; no variable key)
       if (opar.file_type.compare("hst") != 0 &&
           opar.file_type.compare("rst") != 0 &&
           opar.file_type.compare("log") != 0 &&
-          opar.file_type.compare("trk") != 0) {
+          opar.file_type.compare("trk") != 0 &&
+          opar.file_type.compare("pbin") != 0) {
         opar.variable = pin->GetString(opar.block_name, "variable");
         opar.file_id = pin->GetOrAddString(opar.block_name,"id",opar.variable);
       }
@@ -182,9 +184,19 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       // set output variable and optional file id (default is output variable name)
       if (opar.file_type.compare("hst") != 0 &&
           opar.file_type.compare("rst") != 0 &&
-          opar.file_type.compare("log") != 0) {
+          opar.file_type.compare("log") != 0 &&
+          opar.file_type.compare("pbin") != 0) {
         opar.variable = pin->GetString(opar.block_name, "variable");
         opar.file_id = pin->GetOrAddString(opar.block_name,"id",opar.variable);
+      }
+      if (opar.file_type.compare("pbin") == 0) {
+        if (pin->DoesParameterExist(opar.block_name, "variable")) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Output block '" << opar.block_name << "': file_type = pbin "
+              << "writes the complete particle state and takes no 'variable'" << std::endl;
+          exit(EXIT_FAILURE);
+        }
+        opar.file_id = pin->GetOrAddString(opar.block_name, "id", "particles");
       }
 
       // check that pdf variables are single variables
@@ -274,7 +286,21 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       } else if (opar.file_type.compare("bin") == 0) {
         opar.single_file_per_rank = pin->GetOrAddBoolean(opar.block_name,
           "single_file_per_rank", false);
+        // float64 variables on request; float32 stays the default
+        if (pin->DoesParameterExist(opar.block_name, "precision")) {
+          const std::string prec = pin->GetString(opar.block_name, "precision");
+          if (prec != "single" && prec != "double") {
+            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Output block '" << opar.block_name << "': precision must be "
+                << "single or double" << std::endl;
+            exit(EXIT_FAILURE);
+          }
+          opar.bin_double = (prec == "double");
+        }
         pnode = new MeshBinaryOutput(pin,pm,opar);
+        pout_list.insert(pout_list.begin(),pnode);
+      } else if (opar.file_type.compare("pbin") == 0) {
+        pnode = new ParticleBinaryOutput(pin,pm,opar);
         pout_list.insert(pout_list.begin(),pnode);
       } else if (opar.file_type.compare("cart") == 0) {
         pnode = new CartesianGridOutput(pin,pm,opar);

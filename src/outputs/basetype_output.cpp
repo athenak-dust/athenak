@@ -48,7 +48,8 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
   if (out_params.file_type.compare("hst") == 0 ||
       out_params.file_type.compare("rst") == 0 ||
       out_params.file_type.compare("log") == 0 ||
-      out_params.file_type.compare("trk") == 0) {return;}
+      out_params.file_type.compare("trk") == 0 ||
+      out_params.file_type.compare("pbin") == 0) {return;}
 
   // initialize vector containing number of output MBs per rank
   noutmbs.assign(global_variable::nranks, 0);
@@ -65,7 +66,8 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     std::exit(EXIT_FAILURE);
   }
 
-  if (ivar >= 154 && (pm->pmb_pack->pgrav == nullptr || out_params.include_gzs)) {
+  if (ivar >= 154 && ivar <= 158 &&
+      (pm->pmb_pack->pgrav == nullptr || out_params.include_gzs)) {
     std::cerr << "### FATAL ERROR: gravity output requires gravity/enabled=true "
               << "and active cells only (include_gzs=false)" << std::endl;
     std::exit(EXIT_FAILURE);
@@ -172,6 +174,15 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << "Output of particles requested in <output> block '"
        << out_params.block_name << "' but particle object not constructed."
        << std::endl << "Input file is likely missing corresponding block" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  // dust_total, dust_total_rho, dust_total_mom: a dust module, active cells
+  if ((ivar >= 159) && (ivar <= 161) &&
+      (pm->pmb_pack->pdust == nullptr || out_params.include_gzs)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+       << "Output variable '" << out_params.variable << "' in <output> block '"
+       << out_params.block_name << "' needs a <dust> block and active cells only "
+       << "(ghost_zones = false)" << std::endl;
     exit(EXIT_FAILURE);
   }
   if ((ivar==153) && (pm->pmb_pack->pdust == nullptr)) {
@@ -739,6 +750,23 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     out_params.contains_derived = true;
     out_params.n_derived += 1;
     outvars.emplace_back("dustd",0,&(derived_var));
+  }
+
+  // dust mass and momentum densities on the active cells with the run's
+  // representation (DustGasDrag::DepositScienceFields): derived_var(m, 0..3)
+  if (out_params.variable.compare("dust_total") == 0 ||
+      out_params.variable.compare("dust_total_rho") == 0 ||
+      out_params.variable.compare("dust_total_mom") == 0) {
+    out_params.contains_derived = true;
+    out_params.n_derived += 4;
+    if (out_params.variable.compare("dust_total_mom") != 0) {
+      outvars.emplace_back("dust_total_rho",0,&(derived_var));
+    }
+    if (out_params.variable.compare("dust_total_rho") != 0) {
+      outvars.emplace_back("dust_total_mom1",1,&(derived_var));
+      outvars.emplace_back("dust_total_mom2",2,&(derived_var));
+      outvars.emplace_back("dust_total_mom3",3,&(derived_var));
+    }
   }
 
   // initialize vector containing number of output MBs per rank

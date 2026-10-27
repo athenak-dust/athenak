@@ -231,6 +231,88 @@ void DustGasDrag::DepositPointGravityDensity(Real time,DvceArray5D<Real> &owned)
     KOKKOS_LAMBDA(int b,int k,int j,int i) {destination(b,0,k,j,i)=field(b,0,k,j,i);});
 }
 
+// Science output: the mass and momentum densities of 3-D point particles with
+// the coupling's owner-block stencil (<dust>/deposit) and the conservative ghost-deposit remap
+// of DepRemapPlan (any levels, shear-periodic x1, physical x3 faces folded back).  Its own
+// plan and buffers (science_points_): an output leaves the coupling's and gravity's
+// transfers untouched.  out(b, 0..3) on the active cells; the ghost cells are zero.
+void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out) {
+  auto *pm=pmy_pack->pmesh;
+  if (!pm->three_d || clouds3d || !std::isfinite(time) ||
+      !(smr_transfer_mode==DustSMRTransfer::owner_overlap ||
+        (smr_transfer_mode==DustSMRTransfer::none && !pm->multilevel)))
+    PointFail("science fields of point particles need a 3-D mesh with "
+              "experimental_smr_transfer = none (uniform) or owner_overlap");
+  if (!science_points_) science_points_=std::make_shared<GravityPointTransfer>();
+  auto &state=*science_points_;
+  const int seq=pm->GetAMRLoadBalanceUpdateSeq();
+  if (!state.plan) {
+    const bool shear=pm->mesh_bcs[BoundaryFace::inner_x1]==BoundaryFlag::shear_periodic;
+    const bool physical=pm->mesh_bcs[BoundaryFace::inner_x3]!=BoundaryFlag::periodic;
+    state.plan.reset(new DepRemapPlan(pmy_pack,shear,qshear,omega0,physical ? 1 : 0));
+    state.mesh_seq=seq;
+  } else if (state.mesh_seq!=seq) {
+    state.plan->BuildStatic();
+    state.mesh_seq=seq;
+  }
+  state.plan->UpdateShear(time);
+  const auto ind=pm->mb_indcs;
+  const int nb=pmy_pack->nmb_thispack,gids=pmy_pack->gids;
+  const int ni=ind.nx1+2*ind.ng,nj=ind.nx2+2*ind.ng,nk=ind.nx3+2*ind.ng;
+  const char *names[4]={"science_point_rho","science_point_m1","science_point_m2",
+                        "science_point_m3"};
+  for (int c=0;c<4;++c) {
+    Resize(science_halo_[c],names[c],nb,1,nk,nj,ni);
+    Kokkos::deep_copy(science_halo_[c],0.0);
+  }
+  auto f0=science_halo_[0],f1=science_halo_[1],f2=science_halo_[2],f3=science_halo_[3];
+  auto size=pmy_pack->pmb->mb_size.d_view;
+  auto pr=pmy_pack->ppart->prtcl_rdata;
+  auto pi=pmy_pack->ppart->prtcl_idata;
+  const int np=pmy_pack->ppart->nprtcl_thispack;
+  const int scheme=static_cast<int>(deposit);
+  int bad=0;
+  Kokkos::parallel_reduce("science_point_deposit",Kokkos::RangePolicy<DevExeSpace>(0,np),
+    KOKKOS_LAMBDA(int p,int &invalid) {
+      const Real mass=pr(IPM,p);
+      if (mass==0) return;   // outflow tombstones
+      if (!Kokkos::isfinite(mass)) {++invalid;return;}
+      const int b=pi(PGID,p)-gids;
+      if (b<0 || b>=nb || !Kokkos::isfinite(pr(IPX,p)) ||
+          !Kokkos::isfinite(pr(IPY,p)) || !Kokkos::isfinite(pr(IPZ,p))) {++invalid;return;}
+      const auto s=size(b);
+      int ip,jp,kp;Real wx[3],wy[3],wz[3];
+      PMWeights(pr(IPX,p),s.x1min,s.x1max,ind.nx1,ind.is,scheme,ip,wx);
+      PMWeights(pr(IPY,p),s.x2min,s.x2max,ind.nx2,ind.js,scheme,jp,wy);
+      PMWeights(pr(IPZ,p),s.x3min,s.x3max,ind.nx3,ind.ks,scheme,kp,wz);
+      if (ip<1 || ip>=ni-1 || jp<1 || jp>=nj-1 || kp<1 || kp>=nk-1) {++invalid;return;}
+      const Real density=mass/(s.dx1*s.dx2*s.dx3);
+      const Real v1=pr(IPVX,p),v2=pr(IPVY,p),v3=pr(IPVZ,p);
+      for (int c=0;c<3;++c) for (int j=0;j<3;++j) for (int i=0;i<3;++i) {
+        const Real w=density*wz[c]*wy[j]*wx[i];
+        if (w==0) continue;
+        const int kk=kp+c-1,jj=jp+j-1,ii=ip+i-1;
+        DepositAdd(&f0(b,0,kk,jj,ii),w);
+        DepositAdd(&f1(b,0,kk,jj,ii),w*v1);
+        DepositAdd(&f2(b,0,kk,jj,ii),w*v2);
+        DepositAdd(&f3(b,0,kk,jj,ii),w*v3);
+      }
+    },bad);
+  CheckPointParticles(bad);
+  for (int c=0;c<4;++c) {
+    state.DepositMap(state.plan->stat,science_halo_[c]);
+    if (state.plan->Shear()) state.DepositMap(state.plan->shr,science_halo_[c]);
+  }
+  auto o=out;
+  par_for("science_point_owned",DevExeSpace(),0,nb-1,ind.ks,ind.ke,ind.js,ind.je,ind.is,ind.ie,
+    KOKKOS_LAMBDA(int b,int k,int j,int i) {
+      o(b,0,k,j,i)=f0(b,0,k,j,i);
+      o(b,1,k,j,i)=f1(b,0,k,j,i);
+      o(b,2,k,j,i)=f2(b,0,k,j,i);
+      o(b,3,k,j,i)=f3(b,0,k,j,i);
+    });
+}
+
 void DustGasDrag::GatherPointGravityAcceleration(Real time,const DvceArray5D<Real> &owned,
                                                 DvceArray2D<Real> &result) {
   PreparePointGravity(time);

@@ -1880,6 +1880,18 @@ class DustGasDrag {
                                 DvceArray2D<Real> &particle_acceleration);
   void KickGravity(Real dt, const DvceArray2D<Real> &particle_acceleration);
   Real GravityAccelerationTimeStep(const DvceArray2D<Real> &particle_acceleration);
+  // Science output (dust_science.cpp).  The representation of the dust
+  // mass (an id and "key = value" lines for the pbin header), and the dust mass and momentum
+  // densities on the active cells of this rank's MeshBlocks with that representation:
+  // out(m, 0..3, k, j, i) = rho_d, rho_d v1, rho_d v2, rho_d v3 (velocities as stored,
+  // i.e. shear-relative in a shearing box); ghost cells are zero.  Read-only for the run state;
+  // collective (halo / ghost-deposit exchanges).  science_audit: global particle mass,
+  // deposited mass, particle momentum (3), deposited momentum (3) of the last call.
+  std::string ScienceRepresentationId() const;
+  void ScienceRepresentation(std::ostream &os) const;
+  void DepositScienceFields(DvceArray5D<Real> &out);
+  void DepositPointScienceFields(Real geometry_time, DvceArray5D<Real> &out);  // 3-D points
+  double science_audit[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   void CheckClouds3D();   // the restrictions of 3-D stage 1
   void WrapParticles3D();
   int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
@@ -2040,6 +2052,10 @@ class DustGasDrag {
  private:
   DvceArray5D<Real> gravity_density_halo_, gravity_acceleration_halo_;
   std::shared_ptr<GravityPointTransfer> gravity_points_;
+  // science output: its own ghost-deposit transfer (3-D points) and work arrays, so that an
+  // output never touches the coupling's or gravity's exchange state
+  std::shared_ptr<GravityPointTransfer> science_points_;
+  DvceArray5D<Real> science_halo_[4], science_work_;
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this DustGasDrag
 };
 

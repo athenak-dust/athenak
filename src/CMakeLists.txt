@@ -73,6 +73,7 @@ add_executable(
         dust/dust_halo.cpp
         dust/dust_amr.cpp
         dust/dust_restart.cpp
+        dust/dust_science.cpp
         dust/dust_tasks.cpp
 
         dyn_grmhd/dyn_grmhd.cpp
@@ -132,6 +133,7 @@ add_executable(
         outputs/cartgrid.cpp
         outputs/derived_variables.cpp
         outputs/binary.cpp
+        outputs/pbin.cpp
         outputs/eventlog.cpp
         outputs/formatted_table.cpp
         outputs/history.cpp

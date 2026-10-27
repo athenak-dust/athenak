@@ -29,6 +29,7 @@
 #include "radiation/radiation.hpp"
 #include "radiation/radiation_tetrad.hpp"
 #include "particles/particles.hpp"
+#include "dust/dust.hpp"
 #include "outputs.hpp"
 #include "utils/current.hpp"
 
@@ -1304,6 +1305,12 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
       }
       Kokkos::atomic_add(&ddens(m,0,kp,jp,ip), pr(IPM,p)/vol);
     });
+  }
+  // dust mass and momentum densities with the run's representation, from the
+  // particles of this time (collective: halo / ghost-deposit exchanges)
+  if (name.compare("dust_total") == 0 || name.compare("dust_total_rho") == 0 ||
+      name.compare("dust_total_mom") == 0) {
+    pm->pmb_pack->pdust->DepositScienceFields(derived_var);
   }
   i_dv = i_dv % n_dv; // reset derived variable index
 }

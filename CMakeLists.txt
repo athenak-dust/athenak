@@ -38,6 +38,21 @@ set(PROBLEM built_in_pgens CACHE STRING "Name of problem generator function")
 
 #------ set macros exported to config.hpp ------------------------------------------------
 
+# source revision recorded in self-describing outputs (pbin); taken when
+# CMake configures the build (re-run cmake to refresh it after a checkout)
+set(ATHENA_SOURCE_COMMIT "unknown")
+find_package(Git QUIET)
+if (GIT_FOUND)
+  execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --dirty --abbrev=12 --exclude=*
+                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                  OUTPUT_VARIABLE ATHENA_GIT_DESCRIBE
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+                  RESULT_VARIABLE ATHENA_GIT_RESULT)
+  if (ATHENA_GIT_RESULT EQUAL 0 AND NOT "${ATHENA_GIT_DESCRIBE}" STREQUAL "")
+    set(ATHENA_SOURCE_COMMIT "${ATHENA_GIT_DESCRIBE}")
+  endif()
+endif()
+
 # set single precision macro (true/false)
 if (Athena_SINGLE_PRECISION)
   set(SINGLE_PRECISION_ENABLED 1)

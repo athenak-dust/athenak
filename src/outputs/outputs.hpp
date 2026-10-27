@@ -21,7 +21,7 @@
     #error NHISTORY > NREDUCTION in outputs.hpp
 #endif
 
-#define NOUTPUT_CHOICES 159
+#define NOUTPUT_CHOICES 162
 // choices for output variables used in <ouput> blocks in input file
 // TO ADD MORE CHOICES:
 //   - add more strings to array below, change NOUTPUT_CHOICES above appropriately
@@ -100,7 +100,10 @@ static const char *var_choice[NOUTPUT_CHOICES] = {
   // Particles (151-153)
   "prtcl_all", "prtcl_d", "dust_d",
   // Composite self-gravity (154-158); active cells only
-  "gravity_phi", "gravity_g1", "gravity_g2", "gravity_g3", "gravity"
+  "gravity_phi", "gravity_g1", "gravity_g2", "gravity_g3", "gravity",
+  // Dust mass and momentum densities with the run's representation (159-161);
+  // active cells only.  Not the NGP histogram dust_d.
+  "dust_total", "dust_total_rho", "dust_total_mom"
 };
 
 
@@ -146,6 +149,7 @@ struct OutputParameters {
   bool logscale=true, logscale2=true;
   bool mass_weighted=false;
   bool single_file_per_rank=false; // DBF: parameter for single file per rank
+  bool bin_double=false;            // bin: write the variables as float64 (precision = double)
 };
 
 //----------------------------------------------------------------------------------------
@@ -367,6 +371,25 @@ class ParticleVTKOutput : public BaseTypeOutput {
   int npout_total;
   HostArray2D<Real> outpart_rdata;
   HostArray2D<int>  outpart_idata;
+};
+
+//----------------------------------------------------------------------------------------
+//! \class ParticleBinaryOutput
+//  \brief derived BaseTypeOutput class for the self-describing particle science file (pbin,
+//  readable on its own): typed columns of the active particles and a small block directory,
+//  one shared file per output written in parallel (pbin.cpp)
+
+class ParticleBinaryOutput : public BaseTypeOutput {
+ public:
+  ParticleBinaryOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
+  void LoadOutputData(Mesh *pm) override;
+  void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+ protected:
+  DvceArray1D<int> active_;          // indices of this rank's active rows (mass != 0)
+  int nactive_ = 0;                  // number of them
+  long long nzero_ = 0;              // zero-mass rows left out (this rank)
+  long long nbad_mass_ = 0;          // rows with a negative or non-finite mass (this rank)
+  long long nneg_tag_ = 0;           // rows with a negative int32 tag (this rank)
 };
 
 //----------------------------------------------------------------------------------------
