@@ -1823,7 +1823,7 @@ int DustGasDrag::ResetPGIDOwnerOverlap(const char *when) {
     std::exit(EXIT_FAILURE);
   }
   if (when != nullptr && global_variable::my_rank == 0) {
-    std::cout << "# dust (owner_overlap): MeshBlock ids set from the positions at the " << when << ": "
+    std::cout << "# dust: MeshBlock ids set from the positions at the " << when << ": "
               << nchanged << " of " << npart << " changed" << std::endl;
   }
   return nchanged;

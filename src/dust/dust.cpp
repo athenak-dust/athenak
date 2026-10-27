@@ -217,8 +217,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       !pin->GetOrAddBoolean("dust", "allow_cfl_above_third_3d", false)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "3-D dust: <time>/cfl_number = " << pin->GetReal("time", "cfl_number")
-              << " exceeds 1/3, the stability limit of the 3-D RK2 + PLM gas update"
-              << "; use cfl_number <= 0.3 (or <dust>/allow_cfl_above_third_3d = true for an "
+              << " exceeds 1/3, the stability limit of the 3-D RK2 + PLM gas update; "
+              << "use cfl_number <= 0.3 (or <dust>/allow_cfl_above_third_3d = true for an "
               << "integrator that allows more)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -736,7 +736,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << "<dust>/cloud_launch_bounds = " << pin->GetString("dust", "cloud_launch_bounds")
                   << ", but this binary was built with DUST_CLOUD_LAUNCH_BOUNDS = "
                   << DUST_CLOUD_LAUNCH_BOUNDS << " (the launch bound of the cloud kernels is a "
-                  << "compile-time choice since 2026-10-20: rebuild with "
+                  << "compile-time choice: rebuild with "
                   << "-DDUST_CLOUD_LAUNCH_BOUNDS=<n> in CMAKE_CXX_FLAGS, or drop the key)" << std::endl;
         std::exit(EXIT_FAILURE);
       }

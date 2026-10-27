@@ -349,8 +349,8 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
     at += 16 + sizeof(n) + static_cast<std::size_t>(n);
   }
   if (!species_record_found && global_variable::my_rank == 0) {
-    std::cout << "# NOTE (dust restart): the file has no record species_table (written before "
-              << "this record existed): the species of the input are not checked against it" << std::endl;
+    std::cout << "# NOTE (dust restart): the file has no record species_table (written by "
+              << "an older version): the species of the input are not checked against it" << std::endl;
   }
   // a fixed PC2 / split-BE run does not keep the switching metric of the checkpoint
   if (!NeedsHybridMetric()) InvalidateHybridMetric();

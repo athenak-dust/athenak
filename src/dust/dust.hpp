@@ -1260,7 +1260,7 @@ class DustGasDrag {
   // the PC2 feedback stiffness (after Bai 2010 §2.4 and Athena-C)
   // chi = dt max_cells sum_p w m_p/(t_s,p V rho_g) (= Bai's chi when t_s >= dt), from the stage-1
   // predictor deposit qdep[4], computed when the damping, the dt limit or the particle history
-  // (phst: chi_max, dt_stiff_min) needs it; stiff_thresh > 0: dt <= stiff_thresh/max rate (as AthenaSG new_dt.c; < 0 = off, the default);
+  // (phst: chi_max, dt_stiff_min) needs it; stiff_thresh > 0: dt <= stiff_thresh/max rate (as in Athena-C; < 0 = off, the default);
   // pc2_feedback_damping (default on, as Athena-C): scale each cell's predictor feedback by
   // 1/max(1, chi_cell); the stage-2 correction subtracts the scaled predictor, so momentum stays exact
   Real stiff_thresh = -1.0;
