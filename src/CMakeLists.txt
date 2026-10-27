@@ -40,6 +40,21 @@ add_executable(
 
         driver/driver.cpp
 
+        gravity/sparse_mg.cpp
+        gravity/composite.cpp
+        gravity/mesh_geometry.cpp
+        gravity/geometric_mg.cpp
+        gravity/vacuum_mesh.cpp
+        gravity/vacuum_boundary.cpp
+        gravity/self_gravity.cpp
+        gravity/restart.cpp
+        gravity/slab_boundary.cpp
+        pgen/tests/self_gravity_wave.cpp
+        pgen/tests/dust_gravity_transfer.cpp
+        pgen/tests/dust_selfforce.cpp
+        pgen/tests/dust_freefall.cpp
+        pgen/tests/dust_jeans.cpp
+
         dust/dust.cpp
         dust/dust_newdt.cpp
         dust/dust_pm.cpp
@@ -52,6 +67,9 @@ add_executable(
         dust/dust_resample_device.cpp
         dust/dust_leaf.cpp
         dust/dust_cloud3d.cpp
+        dust/dust_imex3d.cpp
+        dust/dust_gravity.cpp
+        dust/dust_gravity_points.cpp
         dust/dust_halo.cpp
         dust/dust_amr.cpp
         dust/dust_restart.cpp

@@ -162,9 +162,10 @@ TaskStatus DustGasDrag::UpdateParticleGIDs(Driver *pdrive, int stage) {
   MigTimer timer(mpi_time[1], mpi_time[2]);
   // several ranks: clouds made at the start of the cycle may keep a block across a periodic
   // boundary
-  // (the positions after the push, at the end of the step)
+  // PC2 uses the end time; IMEX compensates background drift in later stages
+  // with the same crossing-offset time as the established point-particle path.
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
-    FrameToBlock(pmy_pack->pmesh->time + pmy_pack->pmesh->dt);
+    FrameToBlock(ShearRouteTime(pdrive, stage));
   }
   // point particles crossing a shear-periodic x1 face, the offset of their time
   if (shear_route_point) {ShiftShearCrossings(ShearRouteTime(pdrive, stage));}

@@ -92,11 +92,16 @@ int main(int argc, char *argv[]) {
     return(0);
   }
 #else  // no OpenMP
-  if (MPI_SUCCESS != MPI_Init(&argc, &argv)) {
+  // Gravity can assemble host rows with std::thread even in GPU/Serial builds.
+  // MPI remains confined to this main thread; MULTIPLE is not needed here.
+  int mpiprv;
+  if (MPI_SUCCESS != MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &mpiprv)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "MPI Initialization failed." << std::endl;
-    return(0);
+    return(EXIT_FAILURE);
   }
+  // Modules that start workers check the provided support before doing so.
+  // A serial run can still use a library providing only SINGLE.
 #endif  // OPENMP_PARALLEL_ENABLED
   // Get process id (rank) in MPI_COMM_WORLD
   if (MPI_SUCCESS != MPI_Comm_rank(MPI_COMM_WORLD, &(global_variable::my_rank))) {

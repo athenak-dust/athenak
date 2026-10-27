@@ -37,6 +37,7 @@
 #include "coordinates/adm.hpp"
 #include "z4c/z4c.hpp"
 #include "z4c/z4c_amr.hpp"
+#include "gravity/self_gravity.hpp"
 #include "prolongation.hpp"
 #include "restriction.hpp"
 
@@ -212,6 +213,12 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
       auto *pd = pmbp->pdust;
       ProfTimer pt(pd->prof_time[pd->kProfRebuild], pd->prof_count[pd->kProfRebuild]);
       pmbp->pdust->RebuildAfterRegrid(pdriver, pin);
+    }
+    // Gravity sources may consume dust on the new leaves. Complete the particle
+    // routing/representation rebuild before invalidating and sampling the field.
+    if (pmbp->pgrav != nullptr) {
+      pmbp->pgrav->Invalidate();
+      pmbp->pgrav->Solve(pmy_mesh->time);
     }
     if (pmbp->phydro != nullptr) {
       (void) pmbp->phydro->NewTimeStep(pdriver, pdriver->nexp_stages);

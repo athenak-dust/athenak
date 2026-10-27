@@ -70,6 +70,10 @@ class ProblemGenerator {
   void Diffusion(ParameterInput *pin, const bool restart);
   void DustDamping(ParameterInput *pin, const bool restart);
   void DustNSH(ParameterInput *pin, const bool restart);
+  void DustGravityTransfer(ParameterInput *pin, const bool restart);
+  void DustSelfForce(ParameterInput *pin, const bool restart);
+  void DustFreeFall(ParameterInput *pin, const bool restart);
+  void DustJeans(ParameterInput *pin, const bool restart);
   void DustyWave(ParameterInput *pin, const bool restart);
   void LinearWave(ParameterInput *pin, const bool restart);
   void LWImplode(ParameterInput *pin, const bool restart);
@@ -81,6 +85,7 @@ class ProblemGenerator {
   void ShockTube(ParameterInput *pin, const bool restart);
   void SimpleWave(ParameterInput *pin, const bool restart);
   void Shwave(ParameterInput *pin, const bool restart);
+  void SelfGravityWave(ParameterInput *pin, const bool restart);
   void StreamingLinear(ParameterInput *pin, const bool restart);
   void RadiationLinearWave(ParameterInput *pin, const bool restart);
   void RadiationBeam(ParameterInput *pin, const bool restart);

@@ -1,0 +1,107 @@
+<job>
+basename = jeans
+
+<mesh>
+nghost = 4
+nx1 = 16
+nx2 = 8
+nx3 = 8
+x1min = 0.0
+x1max = 1.0
+x2min = 0.0
+x2max = 0.25
+x3min = 0.0
+x3max = 0.25
+ix1_bc = periodic
+ox1_bc = periodic
+ix2_bc = periodic
+ox2_bc = periodic
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.225
+nlim = -1
+tlim = 0.5
+ndiag = 10
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hllc
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+ppc = 8
+
+<dust>
+nspecies = 1
+taus_1 = 0.1
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+drag_solver = local
+coupling = pc2
+experimental_mpi = true
+experimental_static_smr = true
+experimental_3d = true
+experimental_smr_transfer = refinable_cloud
+cloud_gather_order = 2
+cloud_transition = 2
+cloud_p1_split = true
+cloud_split_overlap = true
+cloud_split_device = true
+cloud_merge = false
+cloud_resample = false
+
+<gravity>
+source = both                    # the default is dust
+experimental_gas_source = true   # the gas as a source is experimental for now
+enabled = true
+setup = distributed
+solver = multigrid
+four_pi_G = 50.0
+vertical_bc = periodic
+rtol = 1e-11
+max_iterations = 150
+gmres_restart = 24
+phase_threads = 1
+profile = true
+report_each_solve = false
+
+<problem>
+pgen_name = dust_jeans
+user_hist = true
+check_equilibrium = false
+rho0 = 1.0
+eps_1 = 1.0
+dust_test = damping
+dust_test_v0 = 0.0
+cloud_root_random = true
+root_placement = lattice
+particle_placement = random
+jeans_phase = 0.37
+jeans_sigma = 9.035597601378303
+jeans_dg = 8.692041727944386e-07
+jeans_ug = 1.2499677718935327e-06
+jeans_dd = 1e-06
+jeans_vd = 1.4380600220486312e-06
+
+<output1>
+file_type = hst
+dt = 0.005
+data_format = %.17e
+
+<output2>
+file_type = bin
+variable = hydro_u
+dt = 0.5

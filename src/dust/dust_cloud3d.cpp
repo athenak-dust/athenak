@@ -156,8 +156,9 @@ void DustGasDrag::CheckClouds3D() {
   if (global_variable::nranks != 1 && !experimental_mpi) {
     bad.push_back("several MPI ranks without <dust>/experimental_mpi");
   }
-  if (!(coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2)) {
-    bad.push_back("a coupling other than PC2 (coupling = pc2)");
+  if (!(coupling == DustCoupling::imex ||
+        (coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2))) {
+    bad.push_back("a coupling other than PC2 or IMEX (coupling = pc2 / imex)");
   }
   if (drag_solver != DustDragSolver::local) bad.push_back("drag_solver other than local");
   if (cloud_gather_order != 2 || analytic_gather.on) {
@@ -202,7 +203,7 @@ void DustGasDrag::CheckClouds3D() {
     std::exit(EXIT_FAILURE);
   }
   if (global_variable::my_rank == 0) {
-    std::cout << "# NOTE (dust): 3-D refinable clouds (PC2; static or adaptive mesh; "
+    std::cout << "# NOTE (dust): 3-D refinable clouds (PC2 / IMEX; static or adaptive mesh; "
               << global_variable::nranks << " MPI rank" << (global_variable::nranks > 1 ? "s" : "")
               << ")" << std::endl;
   }

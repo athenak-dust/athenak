@@ -20,6 +20,7 @@
 #include "coordinates/cell_locations.hpp"
 #include "refinement_criteria.hpp"
 #include "hydro/hydro.hpp"
+#include "gravity/self_gravity.hpp"
 #include "mhd/mhd.hpp"
 #include "z4c/z4c.hpp"
 #include "diffusion/viscosity.hpp"
@@ -54,6 +55,9 @@ Mesh::Mesh(ParameterInput *pin) :
   dtold(0.),
   dt_last_completed(0.),
   nmb_packs_thisrank(1) {
+  // Native restart serializes the complete root index record, including coarse
+  // fields which are unused at root level. Give those bytes deterministic values.
+  mesh_indcs = RegionIndcs{};
   // Set physical size and number of cells in mesh (root level)
   mesh_size.x1min = pin->GetReal("mesh", "x1min");
   mesh_size.x1max = pin->GetReal("mesh", "x1max");
@@ -678,6 +682,10 @@ void Mesh::NewTimeStep(const Real tlim) {
     dt = std::min(dt, (cfl_no)*(pmb_pack->prad->dtnew) );
   }
   // Particles timestep
+  if (pmb_pack->pgrav != nullptr) {
+    // Gravity dtnew already includes its own acceleration/free-fall safety factor.
+    dt = std::min(dt, pmb_pack->pgrav->dtnew);
+  }
   if (pmb_pack->ppart != nullptr) {
     dt = std::min(dt, (pmb_pack->ppart->dtnew) );
   }

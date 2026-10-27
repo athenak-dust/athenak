@@ -254,6 +254,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // the log and the damping (as Athena-C) on by default, the dt limit left to the user (off)
   stiff_log = pin->GetOrAddBoolean("dust", "stiff_log", true);
   stiff_thresh = pin->GetOrAddReal("dust", "stiff_thresh", -1.0);
+  // The IMEX gas gets the lumped solve's change plus its mass share of the residual (3-D
+  // clouds; false = the gas takes the clouds' whole impulse, as before)
+  imex_consistent_gas = pin->GetOrAddBoolean("dust", "imex_consistent_gas", true);
   pc2_feedback_damping = pin->GetOrAddBoolean("dust", "pc2_feedback_damping", true);
   if (!(hybrid_enter_zeta > hybrid_exit_zeta && hybrid_exit_zeta >= 0.0 &&
         hybrid_enter_chi > hybrid_exit_chi && hybrid_exit_chi >= 0.0)) {
@@ -475,11 +478,12 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       if (!multilevel && !((pmy_pack->pmesh->two_d || clouds3d) &&
                            (pmy_pack->pmesh->strictly_periodic || shear_plain3d || shear3d ||
                             x3phys3d) &&
-                           global_variable::nranks == 1 &&
+                           (global_variable::nranks == 1 || (clouds3d && experimental_mpi)) &&
                            drag_solver == DustDragSolver::local)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "refinable_cloud on a uniform mesh requires a 2-D, "
-                  << "strictly periodic, single-rank mesh and drag_solver=local"
+                  << std::endl << "refinable_cloud on a uniform mesh requires supported "
+                  << "2-D/3-D cloud geometry and drag_solver=local; several ranks require "
+                  << "3-D clouds and experimental_mpi=true"
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }

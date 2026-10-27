@@ -1284,6 +1284,7 @@ struct DustGasDragTaskIDs {
 };
 
 namespace dust {
+struct GravityPointTransfer;
 
 // 2026-10-20 cleanup: a key whose option was removed.  An input or
 // restart file that still writes it is accepted when the value asks for the behaviour that
@@ -1848,7 +1849,37 @@ class DustGasDrag {
   void PackGasGather3D(const DvceArray5D<Real> &u);
   void CloudPredictor3D(const bool rate_dep);
   void CloudAdvance3D();
+  Real CloudImplicitTime3D(Driver *pdrive, int stage) const;
+  // consistent gas / dust split of the lumped IMEX solve's residual (3-D clouds)
+  void CloudImplicitConsistency3D(Driver *pdrive, int stage);
+  bool imex_consistent_gas = true;
+  DvceArray5D<Real> imex_resid;
+  // IMEX stages see the gas in its t^n orbital-advection frame (the remap runs at the end
+  // of the last stage): a particle at the lab stage position (x, y) meets the gas stored at
+  // y + ImplicitShearShift*x (0 outside the 3-D shearing box and for the hybrid paths)
+  Real ImplicitShearShift(Driver *pdrive, int stage) const {
+    if (!is_shearing_box || !pmy_pack->pmesh->three_d || coupling != DustCoupling::imex) return 0.0;
+    return qshear*omega0*(CloudImplicitTime3D(pdrive, stage) - pmy_pack->pmesh->time);
+  }
+  void CloudDepositImplicit3D(Driver *pdrive, int stage);
+  void CloudGatherImplicit3D(Driver *pdrive, int stage);
   void DepositCloudDensity3D(DvceArray5D<Real> &f);
+  // Gravity uses the physical mass assignment, independently of drag's linear
+  // velocity reconstruction. Fields contain owned active leaves; halo exchange
+  // is performed internally at the explicitly supplied geometry time.
+  bool GravityTransferSupported() const;
+  bool PointGravityTransferSupported() const;
+  void PreparePointGravity(Real geometry_time);
+  void DepositPointGravityDensity(Real geometry_time, DvceArray5D<Real> &owned_density);
+  void GatherPointGravityAcceleration(Real geometry_time,
+                                     const DvceArray5D<Real> &owned_acceleration,
+                                     DvceArray2D<Real> &particle_acceleration);
+  void DepositGravityDensity(Real geometry_time, DvceArray5D<Real> &owned_density);
+  void GatherGravityAcceleration(Real geometry_time,
+                                const DvceArray5D<Real> &owned_acceleration,
+                                DvceArray2D<Real> &particle_acceleration);
+  void KickGravity(Real dt, const DvceArray2D<Real> &particle_acceleration);
+  Real GravityAccelerationTimeStep(const DvceArray2D<Real> &particle_acceleration);
   void CheckClouds3D();   // the restrictions of 3-D stage 1
   void WrapParticles3D();
   int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
@@ -2007,6 +2038,8 @@ class DustGasDrag {
   TaskStatus ClearDep(Driver *pdrive, int stage);
 
  private:
+  DvceArray5D<Real> gravity_density_halo_, gravity_acceleration_halo_;
+  std::shared_ptr<GravityPointTransfer> gravity_points_;
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this DustGasDrag
 };
 

@@ -18,6 +18,7 @@
 #include "mesh/mesh.hpp"
 #include "outputs/outputs.hpp"
 #include "hydro/hydro.hpp"
+#include "eos/eos.hpp"
 #include "mhd/mhd.hpp"
 #include "z4c/z4c.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
@@ -25,6 +26,8 @@
 #include "radiation/radiation.hpp"
 #include "driver.hpp"
 #include "dust/dust.hpp"
+#include "gravity/self_gravity.hpp"
+#include "gravity/restart.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
@@ -61,6 +64,8 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
   tlim(-1.0),
   nlim(-1),
   ndiag(1),
+  nimp_stages(0),
+  nexp_stages(0),
   pwall_clock_(ptimer),
   wall_time(wtlim),
   nmb_updated_(0),
@@ -316,8 +321,11 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   // A restarted dynamic dust mesh gets its cooldown ages back and the
   // mesh check that followed the outputs of the restart cycle, before the time step;
   // refinable clouds get their MeshBlock ids from their positions (any mesh)
-  if (res_flag && pmesh->pmb_pack->pdust != nullptr) {
-    pmesh->pmb_pack->pdust->ResumeAmrAfterRestart(this, pin);
+  if (res_flag) gravity::ResumeRestart(pmesh, this, pin);
+  // Phi is a derived elliptic field. Recompute from the restored density and
+  // physical time; never carry a pre-regrid potential or an old shear phase.
+  if (pmesh->pmb_pack->pgrav != nullptr) {
+    pmesh->pmb_pack->pgrav->Solve(pmesh->time);
   }
 
   //---- Step 2.  Compute time step (if problem involves time evolution)
@@ -398,32 +406,93 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
            (elapsed_time < wall_time) && !pmesh->stop_max_nmb) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
 
-      // Problem work at the start of every cycle, before the time integrator
-      // (e.g. the mass renormalisation of the Li et al. 2018 outflow boundaries).  At the start,
-      // not after the step: a restarted run then sees exactly the state of the continued one
+      // Problem work may change density (e.g. Li2018 mass normalization).
+      // Apply it before gravity samples the source or performs either kick.
       if (pmesh->pgen->user_work_in_loop_func != nullptr) {
         (pmesh->pgen->user_work_in_loop_func)(pmesh);
       }
 
+      // Symmetric gravity split around hydro, with symmetric orbital halfsteps
+      // for gravity-enabled 3D boxes. The gravity-disabled task path is unchanged.
+      // Checkpoints occur only after both half-kicks. The kick leaves density and
+      // internal energy unchanged; primitives and ghost values must be refreshed.
+      auto *pgrav = pmesh->pmb_pack->pgrav;
+      const bool matter_prepared = pgrav != nullptr && pmesh->pmb_pack->pdust != nullptr;
+      if (matter_prepared) ExecuteTaskList(pmesh, "before_timeintegrator", 0);
+      if (pgrav != nullptr) {
+        if (pgrav->UsesOrbitalSplit()) pgrav->SetHydroBoundaryTime(pmesh->time);
+        pgrav->Solve(pmesh->time);
+        pgrav->BeginEnergyStep();   // a no-op unless energy_source = flux / diag
+        pgrav->KickMatter(0.5*pmesh->dt);
+        InitBoundaryValuesAndPrimitives(pmesh);
+        if (pgrav->UsesOrbitalSplit()) {
+          pgrav->OrbitalStep(0.5*pmesh->dt);
+          pgrav->SetHydroBoundaryTime(pmesh->time+0.5*pmesh->dt);
+          InitBoundaryValuesAndPrimitives(pmesh);
+        }
+      }
+
       // Execute TaskLists
       // Work before time integrator indicated by "0" in stage
-      ExecuteTaskList(pmesh, "before_timeintegrator", 0);
+      if (!matter_prepared) ExecuteTaskList(pmesh, "before_timeintegrator", 0);
+
+      const int gravity_dfloor = pmesh->ecounter.neos_dfloor;
+      const int gravity_efloor = pmesh->ecounter.neos_efloor;
+      const int gravity_tfloor = pmesh->ecounter.neos_tfloor;
 
       // time-integrator tasks for each stage of integrator
       for (int stage=1; stage<=(nexp_stages); ++stage) {
         ExecuteTaskList(pmesh, "before_stagen", stage);
         ExecuteTaskList(pmesh, "stagen", stage);
         ExecuteTaskList(pmesh, "after_stagen", stage);
+        if (pgrav != nullptr) pgrav->AccumulateMassFlux(gam0[stage-1], beta[stage-1]*pmesh->dt);
       }
 
       // Work after time integrator indicated by "1" in stage
       ExecuteTaskList(pmesh, "after_timeintegrator", 1);
+
+      if (pgrav != nullptr) {
+        if (pgrav->UsesOrbitalSplit()) {
+          // The last RK stage already filled midpoint ghosts. C2P can still
+          // alter conserved cells through floors; then refresh collectively.
+          // Scalar clipping has no event counter, so retain the refresh there.
+          int changed = (pmesh->ecounter.neos_dfloor != gravity_dfloor ||
+                         pmesh->ecounter.neos_efloor != gravity_efloor ||
+                         pmesh->ecounter.neos_tfloor != gravity_tfloor ||
+                         pmesh->pmb_pack->phydro->nscalars > 0) ? 1 : 0;
+#if MPI_PARALLEL_ENABLED
+          if (global_variable::nranks > 1) {
+            MPI_Allreduce(MPI_IN_PLACE, &changed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+          }
+#endif
+          if (changed) InitBoundaryValuesAndPrimitives(pmesh);
+          pgrav->OrbitalStep(0.5*pmesh->dt);
+          pgrav->SetHydroBoundaryTime(pmesh->time+pmesh->dt);
+          // Gravity needs only active cells. Preserve any post-remap EOS floor
+          // correction without another exchange/prolongation; the final kick
+          // is followed by the complete boundary/primitive refresh below.
+          auto *hydro = pmesh->pmb_pack->phydro;
+          const auto &ind = pmesh->mb_indcs;
+          hydro->peos->ConsToPrim(hydro->u0, hydro->w0, false,
+              ind.is, ind.ie, ind.js, ind.je, ind.ks, ind.ke);
+        }
+        pgrav->Solve(pmesh->time+pmesh->dt);
+        pgrav->KickMatter(0.5*pmesh->dt);
+        pgrav->EndEnergyStep();     // a no-op unless energy_source = flux / diag
+      }
 
       // Work outside of TaskLists:
       // increment time, ncycle, etc.
       pmesh->time = pmesh->time + pmesh->dt;
       pmesh->ncycle++;
       pmesh->dt_last_completed = pmesh->dt;
+      if (pgrav != nullptr) {
+        InitBoundaryValuesAndPrimitives(pmesh);
+        pgrav->ClearHydroBoundaryTime();
+        (void) pmesh->pmb_pack->phydro->NewTimeStep(this, nexp_stages);
+        if (pmesh->pmb_pack->pdust != nullptr)
+          (void) pmesh->pmb_pack->pdust->ComputeNewTimeStep(this,nexp_stages);
+      }
       nmb_updated_ += pmesh->nmb_total;
       npart_updated_ += pmesh->nprtcl_total;
       // load balancing efficiency
@@ -439,6 +508,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // Test for/make outputs.  A restart file written here is followed by
       // the mesh check of this cycle, which the dust module records in the file.
       if (pmesh->pmb_pack->pdust != nullptr) pmesh->pmb_pack->pdust->amr_check_after_output = true;
+      if (pmesh->pmb_pack->pgrav != nullptr) pmesh->pmb_pack->pgrav->amr_check_after_output = true;
       for (auto &out : pout->pout_list) {
         // compare at floating point (32-bit) precision to reduce effect of round off
         float time_32 = static_cast<float>(pmesh->time);
@@ -454,6 +524,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       }
 
       if (pmesh->pmb_pack->pdust != nullptr) pmesh->pmb_pack->pdust->amr_check_after_output = false;
+      if (pmesh->pmb_pack->pgrav != nullptr) pmesh->pmb_pack->pgrav->amr_check_after_output = false;
 
       // AMR
       if (pmesh->adaptive) {
@@ -477,6 +548,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
     // marks this cycle's mesh check as pending, so a restart with a larger limit redoes it first
     if (pmesh->stop_max_nmb && pmesh->pmb_pack->pdust != nullptr) {
       pmesh->pmb_pack->pdust->amr_check_after_output = true;
+    }
+    if (pmesh->stop_max_nmb && pmesh->pmb_pack->pgrav != nullptr) {
+      pmesh->pmb_pack->pgrav->amr_check_after_output = true;
     }
   }    // end of (time_evolution != tstatic) clause
   return;

@@ -1281,7 +1281,10 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   }
   bool check_equilibrium =
       pin->GetOrAddBoolean("problem","check_equilibrium",!random_placement);
-  pgen_final_func = check_equilibrium ? DustNSHErrors : nullptr;
+  // Drag-only tests do not have an NSH equilibrium or a shearing-box block.
+  // Install this consistently before the restart branch returns as well.
+  const bool drag_test = pin->GetOrAddString("problem", "dust_test", "none") != "none";
+  pgen_final_func = check_equilibrium && !drag_test ? DustNSHErrors : nullptr;
   // Keep this enrolled in dust-free runs as well so an otherwise unchanged input
   // with user_hist=true remains valid; the callback emits no dust columns in that mode.
   user_hist_func = DustNSHHistory;
@@ -1364,11 +1367,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
 #if MPI_PARALLEL_ENABLED
       MPI_Allreduce(MPI_IN_PLACE, &np, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
 #endif
-      if (np == 0) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "restart of a dust run without particles in the restart file" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
+      // The typed restart reader already distinguishes a missing/corrupt
+      // particle extension from valid zero-count sections. All dust may have
+      // left an outflow domain; that is a legitimate gas-only continuation.
+      if (np == 0 && global_variable::my_rank == 0)
+        std::cout << "# dust restart: valid empty particle population restored" << std::endl;
     }
     return;
   }
