@@ -34,7 +34,7 @@
 //! Only the active rows are written: the capacity tail of the particle arrays and the
 //! zero-mass rows (outflow tombstones, removed at the start of the next cycle) are left out;
 //! the restart-only columns (RK registers, drag rates) are not part of the science state.  The
-//! integer tag (int32 PTAG in this code) is promoted to uint64 without change.  Version 2:
+//! 64-bit tag (PTAG low word, PTAGH high word) is written as uint64.  Version 2:
 //! with one species and species_fixed stopping times the species and
 //! stopping_time columns are constants of the header, provided every active row holds exactly
 //! species 0 and tau_s of species 0 (checked; otherwise both stay columns); with several
@@ -201,7 +201,7 @@ void ParticleBinaryOutput::LoadOutputData(Mesh *pm) {
     const Real m = pr(IPM,p);
     if (m == 0.0) {++z; return;}
     if (!(m > 0.0) || !Kokkos::isfinite(m)) ++b;
-    if (pi(PTAG,p) < 0) ++t;
+    if (pi(PTAGH,p) < 0) ++t;   // a tag >= 2^63: never issued
   }, Kokkos::Sum<long long>(nzero), Kokkos::Sum<long long>(nbad), Kokkos::Sum<long long>(nneg));
   nzero_ = nzero;
   nbad_mass_ = nbad;
@@ -285,7 +285,7 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     cols.push_back(c);
   };
   const bool sbox = pd->is_shearing_box;
-  col("particles", "id", "u8", 8, "numerical sample identity: PTAG (int32) promoted to uint64; "
+  col("particles", "id", "u8", 8, "numerical sample identity: the 64-bit tag; "
       "split / merge / resampling create and remove samples, an id is not a grain lineage");
   const char *species_meaning = "species_id (0-based; input index N = species_id + 1)";
   const char *ts_meaning = "stopping time t_s (code time)";
@@ -376,8 +376,8 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     h << "zero_mass_rows_excluded = " << anomalies[0] << "\n";
     h << "invalid_mass_rows = " << anomalies[1] << "  # negative or non-finite mass "
       << "(written)\n";
-    h << "negative_tag_rows = " << anomalies[2] << "  # int32 tags below zero (written as "
-      << "uint64 of the int64 value)\n";
+    h << "negative_tag_rows = " << anomalies[2] << "  # tags >= 2^63 (high word below zero; "
+      << "never issued; the key keeps its version-1 name)\n";
     if (clouds) h << "shape_unknown_bit_rows = " << anomalies[3] << "\n";
     h << "owner = not stored: the MeshBlock whose half-open box [min, max) holds the position "
       << "(blocks table)\n";
@@ -496,7 +496,7 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       DvceArray1D<std::uint64_t> d("pbin_id", nidx);
       Kokkos::parallel_for("pbin_pack_id", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
       KOKKOS_LAMBDA(const int q) {
-        d(q) = static_cast<std::uint64_t>(static_cast<std::int64_t>(pi(PTAG, idx(q))));
+        d(q) = GetTag(pi, idx(q));
       });
       auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
       WriteAt(file, h.data(), nbytes, off);
@@ -595,7 +595,7 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     if (anomalies[1] > 0 || anomalies[2] > 0 || anomalies[3] > 0) {
       std::cout << "### WARNING (pbin " << fname << "): " << anomalies[1]
                 << " rows with a negative or non-finite mass, " << anomalies[2]
-                << " negative tags, " << anomalies[3] << " unknown shape bits" << std::endl;
+                << " tags >= 2^63, " << anomalies[3] << " unknown shape bits" << std::endl;
     }
   }
 

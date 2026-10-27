@@ -75,7 +75,7 @@ void SelfForceFinal(ParameterInput *pin, Mesh *pm) {
       pr(IPZ,c) = pr(IPZ1,c) = sf.z;
       pr(IPM,c) = sf.mass;
       pr(IPTS,c) = dust->taus.h_view(0);
-      pi(PLEV,c) = sf.level; pi(PSP,c) = 0; pi(PTAG,c) = c;
+      pi(PLEV,c) = sf.level; pi(PSP,c) = 0; SetTag(pi, c, static_cast<std::uint64_t>(c));
       // points: the leaf block (on this rank) that contains the probe
       for (int b=0; b<pack->nmb_thispack; ++b) {
         const auto sz = pack->pmb->mb_size.h_view(b);

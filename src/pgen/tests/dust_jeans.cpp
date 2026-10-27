@@ -212,7 +212,7 @@ void ProblemGenerator::DustJeans(ParameterInput *pin,const bool restart) {
     const Real x0=pr(IPX,p),theta=mode.k*x0+mode.phase;
     const Real x=x0-mode.dd/(mode.k*mode.eps*mode.rho)*std::sin(theta);
     const Real vx=-mode.vd*std::sin(theta);
-    audit<<pi(PTAG,p)<<','<<x0<<','<<pr(IPY,p)<<','<<pr(IPZ,p)<<','<<pr(IPM,p)<<','<<x<<','<<vx<<'\n';
+    audit<<GetTag(pi,p)<<','<<x0<<','<<pr(IPY,p)<<','<<pr(IPZ,p)<<','<<pr(IPM,p)<<','<<x<<','<<vx<<'\n';
     pr(IPX,p)=pr(IPX1,p)=x;pr(IPVX,p)=pr(IPVX1,p)=vx;
     pr(IPVY,p)=pr(IPVY1,p)=pr(IPVZ,p)=pr(IPVZ1,p)=0;
   }

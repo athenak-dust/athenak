@@ -109,7 +109,7 @@ void WriteStreamingSnapshot(Mesh *pm) {
   }
   for (int p=0; p<npart; ++p) {
     particles.insert(particles.end(), {pr(IPX,p), pr(IPY,p), pr(IPM,p),
-        pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p), static_cast<double>(pi(PTAG,p)),
+        pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p), static_cast<double>(GetTag(pi,p)),
         static_cast<double>(pi(PLEV,p))});
   }
   char number[32];
@@ -454,7 +454,8 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
         const Real y0 = size.x2min + (j + 0.5)*hy;
         const Real z0 = size.x3min + (kk + lshiftz + (kp + 0.5)/static_cast<Real>(npar1d))*hz;
         hi(PGID,p) = pmbp->gids + m;
-        hi(PTAG,p) = p*global_variable::nranks + global_variable::my_rank;   // unique over ranks
+        SetTag(hi, p, static_cast<std::uint64_t>(p)*global_variable::nranks +
+                      global_variable::my_rank);   // unique over ranks
         hi(PSP,p) = 0;
         hi(PLEV,p) = 0;
         for (int col=0; col<ppar->nrdata; ++col) hr(col,p) = 0.0;
@@ -821,7 +822,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
                   + (static_cast<Real>(jp) + 0.5)/static_cast<Real>(npar1d))*hz;
         hi(PGID,p) = gids + m;
         // unique over the ranks (one rank: p)
-        hi(PTAG,p) = p*global_variable::nranks + global_variable::my_rank;
+        SetTag(hi, p, static_cast<std::uint64_t>(p)*global_variable::nranks + global_variable::my_rank);
         hi(PSP,p) = 0;
         hi(PLEV,p) = 0;
         for (int col=0; col<ppar->nrdata; ++col) hr(col,p) = 0.0;
@@ -1294,7 +1295,8 @@ void RunMergeReplay(ParameterInput *pin, Mesh *pm, const Real taus0) {
   auto hi = Kokkos::create_mirror_view(pi);
   auto &mbsize = pmbp->pmb->mb_size;
   const int nmb = pmbp->nmb_thispack, gids = pmbp->gids;
-  int maxtag = -1, njit = 0;
+  std::uint64_t tagbound = 0;   // 1 + the largest tag
+  int njit = 0;
   for (int s=0; s<np; ++s) {
     const double *q = &raw[8*static_cast<size_t>(order[s])];
     for (int col=0; col<ppar->nrdata; ++col) hr(col,s) = 0.0;
@@ -1317,9 +1319,10 @@ void RunMergeReplay(ParameterInput *pin, Mesh *pm, const Real taus0) {
         owner = mb; break;
       }
     }
-    hi(PGID,s) = gids + owner; hi(PTAG,s) = static_cast<int>(q[6]); hi(PSP,s) = 0;
+    hi(PGID,s) = gids + owner; hi(PSP,s) = 0;
+    SetTag(hi, s, static_cast<std::uint64_t>(q[6]));
     hi(PLEV,s) = code;
-    maxtag = std::max(maxtag, hi(PTAG,s));
+    tagbound = std::max(tagbound, GetTag(hi,s) + 1);
   }
   Kokkos::deep_copy(pr, hr);
   Kokkos::deep_copy(pi, hi);
@@ -1327,7 +1330,8 @@ void RunMergeReplay(ParameterInput *pin, Mesh *pm, const Real taus0) {
   pm->nprtcl_thisrank = np;
   pm->nprtcl_eachrank[global_variable::my_rank] = np;
   pm->nprtcl_total = np;
-  pdust->cloud_next_tag = maxtag + 1;
+  pdust->cloud_next_tag = tagbound;
+  pdust->cloud_next_tag_set = true;
   pm->time = t0;
   pm->ncycle = cyc0;
   std::cout << "# merge_replay: " << fname << " t=" << t0 << " cycle=" << cyc0 << " particles="
@@ -1426,7 +1430,10 @@ void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
     return std::strtod(meta.c_str() + at + key.size() + 1, nullptr);
   };
   const int np = static_cast<int>(n1r);
-  if (n0r != ppar->nrdata || n0i != ppar->nidata || n1i != n1r || np <= 0 || gas.empty()) {
+  // (an audit file written before the 64-bit tags has no PTAGH row: high words 0)
+  const bool no_hi = (n0i == PTAGH && ppar->nidata == PTAGH + 1);
+  if (n0r != ppar->nrdata || (n0i != ppar->nidata && !no_hi) || n1i != n1r || np <= 0 ||
+      gas.empty()) {
     std::cout << "### FATAL ERROR: merge_audit_replay: incompatible sections in " << fname << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -1439,7 +1446,7 @@ void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
   for (int c=0; c<ppar->nrdata; ++c)
     for (int p=0; p<np; ++p) hr(c,p) = rpr[static_cast<std::size_t>(c)*np + p];
   for (int c=0; c<ppar->nidata; ++c)
-    for (int p=0; p<np; ++p) hi(c,p) = ipi[static_cast<std::size_t>(c)*np + p];
+    for (int p=0; p<np; ++p) hi(c,p) = (c < n0i) ? ipi[static_cast<std::size_t>(c)*np + p] : 0;
   Kokkos::deep_copy(pr, hr);
   Kokkos::deep_copy(pi, hi);
   ppar->nprtcl_thispack = np;
@@ -1475,7 +1482,11 @@ void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
   pm->dt = get("dt");   // the frozen feedback diagnostic scales with dt
   pm->ncycle = static_cast<int>(get("ncycle"));
   pdust->cloud_merge_pass = static_cast<int>(get("merge_pass"));
-  pdust->cloud_next_tag = static_cast<int>(get("next_tag"));
+  {
+    const double nt = get("next_tag");   // -1: not set
+    pdust->cloud_next_tag_set = (nt >= 0.0);
+    pdust->cloud_next_tag = (nt >= 0.0) ? static_cast<std::uint64_t>(nt) : 0;
+  }
   const Real mroot = get("mroot0");
   pdust->cloud_merge_mroot.clear();
   if (mroot > 0.0) pdust->cloud_merge_mroot.push_back(mroot);

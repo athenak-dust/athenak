@@ -144,8 +144,11 @@ void ReadRestartExtensions(IOWrapper &file, std::uint64_t offset, Mesh *pm,
         // Do this for every section, even when the MPI decomposition is unchanged.
         std::int32_t columns[6];
         std::memcpy(columns, head.data()+8, sizeof(columns));
-        if (columns[0] != 1 || columns[1] != sizeof(Real) || columns[2] != sizeof(int) ||
-            columns[4] < 1 || columns[5] < 1) Broken("invalid particle section types");
+        // (dust_restart.cpp: version 1 int32 tags, version 2 64-bit tags)
+        if (!dust::ParticleRestartVersionKnown(columns[0]) || columns[1] != sizeof(Real) ||
+            columns[2] != sizeof(int) || columns[4] < 1 || columns[5] < 1) {
+          Broken("invalid particle section types");
+        }
         std::vector<char> fixed(sizeof(std::int64_t)+sizeof(Real)+sizeof(std::int32_t));
         read(fixed.data(), fixed.size(), Add(offset, head.size()));
         std::int64_t count;

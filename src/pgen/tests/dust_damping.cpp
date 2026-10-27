@@ -455,7 +455,7 @@ void DustDampingErrors(ParameterInput *pin, Mesh *pm) {
                               Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
       KOKKOS_LAMBDA(const int &p, Real &sum_, Real &mn_, Real &mx_) {
         if (pi(PSP,p) == s) {
-          int t = pi(PTAG,p);
+          int t = static_cast<int>(GetTag(pi,p));
           int m0 = t/npart_permb;
           int q = t - m0*npart_permb;
           int c = q/ppc_int;

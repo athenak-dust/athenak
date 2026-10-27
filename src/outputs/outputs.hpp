@@ -202,7 +202,7 @@ struct HistoryData {
 //! \brief data (tag, pos, vel) output for tracked particles
 
 struct TrackedParticleData {
-  int tag;
+  std::uint64_t tag;   // the 64-bit tag of a dust particle
   Real x,y,z;
   Real vx,vy,vz;
 };

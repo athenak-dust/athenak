@@ -61,7 +61,7 @@ void CheckTransfer(ParameterInput *pin,Mesh *pm) {
     Kokkos::deep_copy(test_codes,particles->prtcl_idata);
     for (int p=0;p<npart;++p) {
       using T=::SMRCompositeTransfer;
-      const unsigned int pattern=static_cast<unsigned int>(test_codes(PTAG,p))%64;
+      const unsigned int pattern=static_cast<unsigned int>(GetTag(test_codes,p)%64);
       const int level=std::max(1,T::CloudLevel(test_codes(PLEV,p)));
       test_codes(PLEV,p)=level | ((pattern&3)<<T::kCloudLobeShift1) |
           (((pattern>>2)&3)<<T::kCloudLobeShift2) |
@@ -246,7 +246,7 @@ void ProblemGenerator::DustGravityTransfer(ParameterInput *pin,const bool restar
     auto pi=pack->ppart->prtcl_idata;
     Kokkos::parallel_for("gravity_test_unequal_particle_masses",
       Kokkos::RangePolicy<DevExeSpace>(0,pack->ppart->nprtcl_thispack),KOKKOS_LAMBDA(int p) {
-        const unsigned int tag=static_cast<unsigned int>(pi(PTAG,p));
+        const std::uint64_t tag=GetTag(pi,p);
         pr(IPM,p)*=.5+1.5*static_cast<Real>(tag%17)/17;
       });
   }

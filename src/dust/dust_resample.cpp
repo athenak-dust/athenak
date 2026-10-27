@@ -38,6 +38,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -405,7 +406,7 @@ void DumpResampleState(particles::Particles *ppar, Mesh *pmesh, const char *when
   rows.reserve(static_cast<std::size_t>(nc)*n);
   for (int p=0; p<n; ++p) {
     rows.insert(rows.end(), {pr(IPX,p), pr(IPY,p), pr(IPM,p), pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p),
-                             static_cast<double>(pi(PTAG,p)), static_cast<double>(pi(PLEV,p))});
+                             static_cast<double>(GetTag(pi,p)), static_cast<double>(pi(PLEV,p))});
     if (species) rows.push_back(static_cast<double>(pi(PSP,p)));
   }
   char name[64];
@@ -454,6 +455,64 @@ void AppendScreenLog(const int ncycle, const double time, const long long npatch
 }
 
 }  // namespace
+
+//----------------------------------------------------------------------------------------
+//! \fn dust::PoolInTagOrder
+//! \brief For cloud_resample_order = tag, with 64-bit tags: the pool
+//! (the particles p with slot(p) >= 0, npool of them) in (tag, p) order; on return slot(p) is
+//! the rank of p and pofs(k) the particle of rank k.  While tag*npart + p fits into an int64
+//! (every tag below 2^63/npart) one int64 key per particle is sorted, which gives the order
+//! of the int32 key (tag + 2^31)*npart + p used before; above, a (tag, p) pair is sorted with
+//! a comparator.  Both are the same strict order, so the result does not depend on the path.
+
+struct PoolTagKey {std::uint64_t tag; int p;};
+struct PoolTagKeyLess {
+  KOKKOS_INLINE_FUNCTION
+  bool operator()(const PoolTagKey &a, const PoolTagKey &b) const {
+    return (a.tag < b.tag) || (a.tag == b.tag && a.p < b.p);
+  }
+};
+
+void PoolInTagOrder(const DvceArray2D<int> &pi, const DvceArray1D<int> &slot, const int npart,
+                    const int npool, const DvceArray1D<int> &pofs) {
+  std::uint64_t tmax = 0;
+  Kokkos::parallel_reduce("rs_tagmax", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p, std::uint64_t &m) {
+    if (slot(p) >= 0 && GetTag(pi,p) > m) m = GetTag(pi,p);
+  }, Kokkos::Max<std::uint64_t>(tmax));
+  const std::int64_t np64 = npart;
+  const std::uint64_t fit = static_cast<std::uint64_t>(
+      (std::numeric_limits<std::int64_t>::max() - (np64 - 1))/np64);
+  if (tmax <= fit) {
+    DvceArray1D<std::int64_t> tk(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_tagkey"), npool);
+    Kokkos::parallel_for("rs_tagkey", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      if (slot(p) < 0) return;
+      tk(slot(p)) = static_cast<std::int64_t>(GetTag(pi,p))*np64 + p;
+    });
+    Kokkos::sort(tk);
+    Kokkos::parallel_for("rs_tagslot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int k) {
+      const int p = static_cast<int>(tk(k) % np64);
+      slot(p) = k; pofs(k) = p;
+    });
+  } else {
+    Kokkos::View<PoolTagKey*, DevMemSpace> tk(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                                                 "rs_tagpair"), npool);
+    Kokkos::parallel_for("rs_tagpair", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      if (slot(p) < 0) return;
+      tk(slot(p)).tag = GetTag(pi,p);
+      tk(slot(p)).p = p;
+    });
+    Kokkos::sort(tk, PoolTagKeyLess());
+    Kokkos::parallel_for("rs_tagpslot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+    KOKKOS_LAMBDA(const int k) {
+      const int p = tk(k).p;
+      slot(p) = k; pofs(k) = p;
+    });
+  }
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ResampleDue
@@ -656,7 +715,8 @@ void DustGasDrag::StressResamplePool() {
     auto prv = ppar->prtcl_rdata;
     auto piv = ppar->prtcl_idata;
     EnsureNextTag();
-    const int tag0 = cloud_next_tag, tstride = global_variable::nranks;   // tags unique over the ranks
+    const std::uint64_t tag0 = IssueTags(static_cast<std::uint64_t>(nextra));
+    const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
     const auto transfer = smr_transfer;
     Kokkos::parallel_for("rs_stress_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
@@ -672,11 +732,10 @@ void DustGasDrag::StressResamplePool() {
         const int s = npart + off(p) + k;
         for (int c=0; c<nrdata; ++c) prv(c,s) = prv(c,p);
         for (int c=0; c<nidata; ++c) piv(c,s) = piv(c,p);
-        piv(PTAG,s) = tag0 + (off(p) + k)*tstride;
+        SetTag(piv, s, tag0 + static_cast<std::uint64_t>(off(p) + k)*tstride);
         prv(IPX,s) += dx; prv(IPX1,s) += dx;
       }
     });
-    cloud_next_tag += nextra*global_variable::nranks;
     ppar->nprtcl_thispack = nnew;
     pmesh->nprtcl_thisrank = nnew;
     pmesh->nprtcl_eachrank[global_variable::my_rank] = nnew;
@@ -967,21 +1026,21 @@ int DustGasDrag::ResampleClouds(const bool local) {
     // With cloud_resample_order = tag the pool is put in PTAG order, so that the streaming
     // order inside a patch does not depend on where the particles sit in the arrays (storage
     // sorting, several ranks); the CSR offsets follow the slots
-    DvceArray1D<std::int64_t> tk(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_tagkey"), npool);
     DvceArray1D<int> pofs(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pofs"), npool);
-    const std::int64_t np64 = npart, tshift = std::int64_t(1) << 31, side = std::int64_t(1) << 20;
     // position: rows of y, then x, 2^20 per side of the domain (cloud_resample_order = position)
     const bool bypos = cloud_resample_pos_order;
-    if (bypos && static_cast<double>(side)*side*np64 >= 9.0e18) {
-      std::cout << "### FATAL ERROR: cloud_resample_order = position: too many particles" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    const Real px0 = transfer.x1min, py0 = transfer.x2min;
-    const Real plx = transfer.x1max - transfer.x1min, ply = transfer.x2max - transfer.x2min;
-    Kokkos::parallel_for("rs_tagkey", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      if (slot(p) < 0) return;
-      if (bypos) {
+    if (bypos) {
+      DvceArray1D<std::int64_t> tk(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_poskey"), npool);
+      const std::int64_t np64 = npart, side = std::int64_t(1) << 20;
+      if (static_cast<double>(side)*side*np64 >= 9.0e18) {
+        std::cout << "### FATAL ERROR: cloud_resample_order = position: too many particles" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      const Real px0 = transfer.x1min, py0 = transfer.x2min;
+      const Real plx = transfer.x1max - transfer.x1min, ply = transfer.x2max - transfer.x2min;
+      Kokkos::parallel_for("rs_poskey", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p) {
+        if (slot(p) < 0) return;
         const Real x = SMRCompositeTransfer::WrapPosition(pr(IPX,p), transfer.x1min, transfer.x1max);
         const Real y = SMRCompositeTransfer::WrapPosition(pr(IPY,p), transfer.x2min, transfer.x2max);
         std::int64_t ix = static_cast<std::int64_t>((x - px0)/plx*side);
@@ -989,16 +1048,16 @@ int DustGasDrag::ResampleClouds(const bool local) {
         ix = (ix < 0) ? 0 : ((ix >= side) ? side - 1 : ix);
         iy = (iy < 0) ? 0 : ((iy >= side) ? side - 1 : iy);
         tk(slot(p)) = (iy*side + ix)*np64 + p;
-      } else {
-        tk(slot(p)) = (static_cast<std::int64_t>(pi(PTAG,p)) + tshift)*np64 + p;
-      }
-    });
-    Kokkos::sort(tk);
-    Kokkos::parallel_for("rs_tagslot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int k) {
-      const int p = static_cast<int>(tk(k) % np64);
-      slot(p) = k; pofs(k) = p;
-    });
+      });
+      Kokkos::sort(tk);
+      Kokkos::parallel_for("rs_posslot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int k) {
+        const int p = static_cast<int>(tk(k) % np64);
+        slot(p) = k; pofs(k) = p;
+      });
+    } else {
+      PoolInTagOrder(pi, slot, npart, npool, pofs);   // 64-bit tags
+    }
     Kokkos::parallel_scan("rs_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
     KOKKOS_LAMBDA(const int a, int &upd, const bool final) {
       const int p = pofs(a);
@@ -1081,8 +1140,9 @@ int DustGasDrag::ResampleClouds(const bool local) {
       }
       // the clouds were moved to the rank of their block before (MigrateClouds)
       if (b >= nmbp_) {
-        Kokkos::printf("resampling: cloud p=%d tag=%d x=%.17g y=%.17g PGID=%d anchor=%d leaf=%d "
-                       "block=%d of %d (code %d, m=%.6e)\n", p, pi(PTAG,p), xp, yp, pi(PGID,p), am,
+        Kokkos::printf("resampling: cloud p=%d tag=%llu x=%.17g y=%.17g PGID=%d anchor=%d leaf=%d "
+                       "block=%d of %d (code %d, m=%.6e)\n", p,
+                       static_cast<unsigned long long>(GetTag(pi,p)), xp, yp, pi(PGID,p), am,
                        t, b, nmbp_, code, pr(IPM,p));
         Kokkos::abort("resampling: a cloud in a block of another rank");
       }
@@ -1817,20 +1877,8 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
     upd += (cnt(p) >= 0) ? 1 : 0;
   }, npool);
   if (cloud_resample_tag_order && npool > 1) {   // the pool in PTAG order
-    DvceArray1D<std::int64_t> tk(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_tagkey"), npool);
     DvceArray1D<int> pofs(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pofs"), npool);
-    const std::int64_t np64 = npart, tshift = std::int64_t(1) << 31;
-    Kokkos::parallel_for("rs3_tagkey", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      if (slot(p) < 0) return;
-      tk(slot(p)) = (static_cast<std::int64_t>(pi(PTAG,p)) + tshift)*np64 + p;
-    });
-    Kokkos::sort(tk);
-    Kokkos::parallel_for("rs3_tagslot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int k) {
-      const int p = static_cast<int>(tk(k) % np64);
-      slot(p) = k; pofs(k) = p;
-    });
+    PoolInTagOrder(pi, slot, npart, npool, pofs);   // 64-bit tags
     Kokkos::parallel_scan("rs3_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
     KOKKOS_LAMBDA(const int a, int &upd, const bool final) {
       const int p = pofs(a);
