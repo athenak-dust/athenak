@@ -258,7 +258,7 @@ void Final(ParameterInput *, Mesh *pm) {Observe(pm);}
 }  // namespace
 
 void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
-  dust::RequireLegacySpeciesInit(pin, "dust_freefall");
+  dust::RequireLegacySpeciesInit(pin, "dust_freefall");  // legacy species keys only
   auto *pack = pmy_mesh_->pmb_pack;
   if (pack->pdust == nullptr || pack->ppart == nullptr || pack->pgrav == nullptr ||
       !pmy_mesh_->three_d || !pack->pdust->Clouds3D() || pack->pdust->nspecies != 1) {
@@ -268,7 +268,7 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
       pin->GetString("gravity", "source") != "dust" || pin->GetString("gravity", "kick") != "dust") {
     Fatal("needs etavk = 0, <gravity>/source = kick = dust");
   }
-  // With drag (back_reaction = true, a finite taus_1) the sphere collapses through the
+  // with drag (back_reaction = true, a finite taus_1) the sphere collapses through the
   // gas; f(t) then is only the drag-free reference, and runs are compared with each other
   // (AMR against uniform fine)
   ff.fourpig = pin->GetReal("gravity", "four_pi_G");
