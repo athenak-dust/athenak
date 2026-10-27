@@ -1630,28 +1630,9 @@ void SelfGravity::UpdateTimeStep() {
   if (coupled_dust_ && kick_dust_)
     limit=std::min(limit,pack_->pdust->GravityAccelerationTimeStep(particle_acceleration_));
   dtnew = gravity_cfl_*limit;
-  if (coupled_dust_ && kick_dust_ && pack_->pdust->coupling==DustCoupling::hybrid &&
-      pack_->pdust->hybrid_force_mode==HybridForceMode::pc2) {
-    // Forced PC2 is a resolved-drag method: its gas feedback predictor is not
-    // unconditionally stable for dt/t_s or high dust loading. A conservative
-    // bound on the local relaxation rate is (1+rho_d/rho_g)/min(t_s).
-    // IMEX has no such explicit restriction. Keep legacy gravity-off behavior.
-    const Real stopping=pack_->pdust->taus_min;
-    auto dust_density=dust_density_;
-    auto gas=pack_->phydro->u0;
-    Real drag_limit=std::numeric_limits<Real>::max();
-    Kokkos::parallel_reduce("gravity_resolved_pc2_timestep",
-        Kokkos::RangePolicy<DevExeSpace>(0,n),KOKKOS_LAMBDA(int q,Real &minimum) {
-      int t=q;
-      const int i=t%ind.nx1+ind.is;t/=ind.nx1;
-      const int j=t%ind.nx2+ind.js;t/=ind.nx2;
-      const int k=t%ind.nx3+ind.ks;t/=ind.nx3;
-      if (dust_density(t,0,k,j,i)>0) {
-        const Real eps=dust_density(t,0,k,j,i)/gas(t,IDN,k,j,i);
-        minimum=fmin(minimum,stopping/(1+eps));
-      }
-    },Kokkos::Min<Real>(drag_limit));
-    dtnew=std::min(dtnew,Real(.25)*drag_limit);
-  }
+  // Rixin: no PC2 drag limit here: the time-step rule of the dust coupling is the
+  // same with and without gravity (the optional <dust>/stiff_thresh of DustGasDrag::NewTimeStep; off by
+  // default).  The fixed limit 0.25 t_s/(1 + eps) of 7537944e made dt 7-10 times smaller than the gas
+  // CFL step in the 3-D amr1280 clumps (eps ~ 4000), where PC2 without gravity ran stably with chi <= 2.2.
 }
 }  // namespace gravity
