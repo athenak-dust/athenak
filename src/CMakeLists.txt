@@ -52,6 +52,7 @@ add_executable(
         pgen/tests/self_gravity_wave.cpp
         pgen/tests/dust_gravity_transfer.cpp
         pgen/tests/dust_selfforce.cpp
+        pgen/tests/dust_freefall.cpp
         pgen/tests/dust_jeans.cpp
 
         dust/dust.cpp

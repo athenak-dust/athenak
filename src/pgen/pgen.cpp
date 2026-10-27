@@ -918,6 +918,8 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     DustGravityTransfer(pin, is_restart);
   } else if (pgen_fun_name.compare("dust_selfforce") == 0) {
     DustSelfForce(pin, is_restart);
+  } else if (pgen_fun_name.compare("dust_freefall") == 0) {
+    DustFreeFall(pin, is_restart);
   } else if (pgen_fun_name.compare("dust_jeans") == 0) {
     DustJeans(pin, is_restart);
   } else if (pgen_fun_name.compare("dusty_wave") == 0) {
