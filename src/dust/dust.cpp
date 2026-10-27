@@ -453,7 +453,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           {"cloud_split_device", "true", "false"}, {"cloud_merge_device", "true", "false"},
           {"cloud_merge_mode", "quantum", "tent"}, {"cloud_merge_stencil", "false", "true"},
           {"cloud_merge", "true", "false"}, {"cloud_merge_schedule", "time if omega0", "cycle"},
-          {"cloud_merge_alpha", "0.05", "0.2"}, {"cloud_merge_budget", "0.3", "-1"},
+          {"cloud_merge_alpha", "0.05 (3-D: 0.2 since 2026-10-27)", "0.2"}, {"cloud_merge_budget", "0.3", "-1"},
           {"cloud_resample", "true", "false"}, {"cloud_resample_schedule", "time if omega0", "cycle"},
           {"cloud_resample_eta", "1.5", "2.0"},
           // Rixin: chose G and R on their schedules only, both every 0.25 / omega0
@@ -547,10 +547,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge = pin->GetOrAddBoolean("dust", "cloud_merge", true);
       cloud_merge_buffer = pin->GetOrAddInteger("dust", "cloud_merge_buffer", 2);
       // Rixin: production alpha
-      cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha", 0.05);
+      // 0.2 in 3-D (0.05 in 2-D); alpha H / tau lets the merged cloud's
+      // velocity error move its mass by at most alpha cells within one damping time
+      cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha",
+                                            pmy_pack->pmesh->three_d ? 0.2 : 0.05);
       // The 3-D G velocity tolerance on the cell size of the leaf
-      // that holds the merge cell (alpha 2^gap H / tau when the leaf is gap levels coarser)
-      cloud_merge_alpha_leaf = pin->GetOrAddBoolean("dust", "cloud_merge_alpha_leaf", false);
+      // that holds the merge cell (alpha 2^gap H / tau when the leaf is gap levels coarser);
+      // Rixin: on by default
+      cloud_merge_alpha_leaf = pin->GetOrAddBoolean("dust", "cloud_merge_alpha_leaf", true);
       cloud_merge_interval = pin->GetOrAddInteger("dust", "cloud_merge_interval", 10);
       cloud_merge_min_mass = pin->GetOrAddReal("dust", "cloud_merge_min_mass", 0.5);
       cloud_merge_nc = pin->GetOrAddBoolean("dust", "cloud_merge_nc", true);
@@ -655,6 +659,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_budget_kappa = quiet_real("cloud_merge_budget_kappa",
                                             cloud_quiet_protection ? 1.0 : 0.0);
       cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
+      cloud_merge_budget_thin = pin->GetOrAddBoolean("dust", "cloud_merge_budget_thin", false);
       // The test offset of the pass budget is gone; it
       // acted only with quantum G and the pass budget on
       RemovedKey(pin, "cloud_merge_budget_prior",
