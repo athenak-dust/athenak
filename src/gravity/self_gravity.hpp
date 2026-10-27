@@ -45,6 +45,10 @@ class SelfGravity {
   // is discarded and assembled again. The assembly is the same code on the same data, so
   // the operator coefficients are bitwise those of the synchronous path.
   void PrefetchPhase(Real time);
+  // kdk_reuse helpers; public only because NVCC device lambdas require it
+  bool KdkReuseAllowed(Real time, Real shift);
+  void RememberReuseState();
+  void ReuseCheck(Real time, long long regathered);
   // Symmetric half-kicks around the existing hydro/OA update. Density does not
   // change during a kick; ideal-gas internal energy is preserved exactly.
   void KickHydro(Real dt);
@@ -120,6 +124,14 @@ class SelfGravity {
   std::vector<std::vector<int>> prolongation_phase_rows_;
   std::vector<GravityPatch> solver_patches_;
   std::unique_ptr<PhaseAssembly> prefetch_;
+  // <gravity>/kdk_reuse (default off): the opening solve of a step keeps the
+  // closing field of the previous step when nothing but exact representation changes
+  // (split, lobe release, migration, reordering) happened in between; see KdkReuseAllowed.
+  bool kdk_reuse_ = false, reuse_check_ = false, reuse_valid_ = false;
+  std::uint64_t reuse_epoch_ = 0, reuse_count_ = 0, reuse_regathered_ = 0;
+  Real reuse_check_max_residual_ = 0, reuse_check_max_source_ = 0, reuse_check_max_gather_ = 0;
+  DvceArray1D<Real> reuse_gas_;  // gas density of the source cells (gas sources only)
+  Real last_physical_mass_ = 0;
   bool prefetch_enabled_ = false;
   std::uint64_t geometry_epoch_ = 0, prefetch_used_ = 0, prefetch_discarded_ = 0;
   CompositeDomain solver_domain_;

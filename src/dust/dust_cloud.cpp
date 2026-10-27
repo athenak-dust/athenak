@@ -744,6 +744,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
 //! owner block.  Returns the number of clouds whose level changed.
 
 int DustGasDrag::SwitchCloudsToLeafLevel() {
+  ++gravity_mass_epoch;   // new cloud widths change the deposit
   particles::Particles *ppar = pmy_pack->ppart;
   const int npart = ppar->nprtcl_thispack;
   if (npart == 0) return 0;
@@ -1271,6 +1272,7 @@ int DustGasDrag::SplitCloudsP1() {
 //! part of the fitted velocity gradient and the residual part.  Host prototype for a
 //! single rank, like SplitCloudsP1; the algorithm only looks at a centre's tent support.
 int DustGasDrag::MergeClouds() {
+  ++gravity_mass_epoch;   // G changes the deposited mass (gravity field reuse)
   if (clouds3d) return MergeCloudsDevice3D();
   if (cloud_merge_device) return MergeCloudsDevice();
   RequireCloudTable("the host merge pass (cloud_merge_device = false)");

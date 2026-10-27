@@ -91,7 +91,9 @@ void DustGasDrag::DepositGravityDensity(Real time, DvceArray5D<Real> &owned) {
 }
 
 void DustGasDrag::GatherGravityAcceleration(Real time,
-    const DvceArray5D<Real> &owned,DvceArray2D<Real> &particle_acceleration) {
+    const DvceArray5D<Real> &owned,DvceArray2D<Real> &particle_acceleration,bool record) {
+  ++gravity_halo_fills_;   // any earlier recording no longer matches the halo field
+  gravity_gather_nsnap_=-1;
   if (PointGravityTransferSupported()) {
     GatherPointGravityAcceleration(time,owned,particle_acceleration);return;
   }
@@ -145,6 +147,96 @@ void DustGasDrag::GatherGravityAcceleration(Real time,
     for (int d=0;d<3;++d) if (!Kokkos::isfinite(result(d,p))) ++invalid;
   },bad);
   CheckParticles(bad);
+  if (record) {
+    RecordGravityGather(time);
+    gravity_gather_target_=particle_acceleration.data();
+  }
+}
+
+void DustGasDrag::RecordGravityGather(Real time) {
+  auto *particles=pmy_pack->ppart;
+  const int npart=particles->nprtcl_thispack;
+  if (gravity_gather_rsnap_.extent_int(1)<npart) {
+    gravity_gather_rsnap_=DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+        "gravity_gather_rsnap"),4,npart);
+    gravity_gather_isnap_=DvceArray2D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+        "gravity_gather_isnap"),2,npart);
+  }
+  auto rs=gravity_gather_rsnap_;
+  auto is=gravity_gather_isnap_;
+  auto pr=particles->prtcl_rdata;
+  auto pi=particles->prtcl_idata;
+  Kokkos::parallel_for("gravity_gather_record",Kokkos::RangePolicy<DevExeSpace>(0,npart),
+    KOKKOS_LAMBDA(int p) {
+      rs(0,p)=pr(IPX,p); rs(1,p)=pr(IPY,p); rs(2,p)=pr(IPZ,p); rs(3,p)=pr(IPM,p);
+      is(0,p)=pi(PLEV,p); is(1,p)=pi(PGID,p);
+    });
+  gravity_gather_nsnap_=npart;
+  gravity_gather_time_=time;
+  gravity_gather_fill_=gravity_halo_fills_;
+}
+
+long long DustGasDrag::RegatherGravityAccelerationChanged(Real time,
+    DvceArray2D<Real> &particle_acceleration) {
+  if (PointGravityTransferSupported() || !GravityTransferSupported()
+      || gravity_gather_nsnap_<0 || time!=gravity_gather_time_
+      || gravity_gather_fill_!=gravity_halo_fills_
+      || particle_acceleration.data()!=gravity_gather_target_
+      || particle_acceleration.extent_int(0)!=3
+      || particle_acceleration.extent_int(1)!=gravity_gather_nsnap_) return -1;
+  UpdateShear3D(time);
+  const auto lt=leaf_traversal3d;
+  const auto ind=pmy_pack->pmesh->mb_indcs;
+  const int nmb=pmy_pack->nmb_thispack;
+  const int ni=ind.nx1+2*ind.ng, nj=ind.nx2+2*ind.ng, nk=ind.nx3+2*ind.ng;
+  if (gravity_acceleration_halo_.extent_int(0)!=lt.nfld ||
+      gravity_acceleration_halo_.extent_int(1)!=3 || gravity_acceleration_halo_.extent_int(2)!=nk ||
+      gravity_acceleration_halo_.extent_int(3)!=nj || gravity_acceleration_halo_.extent_int(4)!=ni)
+    GravityTransferFail("selective gravity regather: the exchanged field does not fit the mesh");
+  auto field=gravity_acceleration_halo_;
+  auto *particles=pmy_pack->ppart;
+  const int npart=particles->nprtcl_thispack, gids=pmy_pack->gids, nold=gravity_gather_nsnap_;
+  auto old=particle_acceleration;
+  auto result=old;
+  if (npart!=nold) result=DvceArray2D<Real>("gravity_particle_acceleration",3,npart);
+  const bool copy=npart!=nold;
+  auto rs=gravity_gather_rsnap_;
+  auto is=gravity_gather_isnap_;
+  auto pr=particles->prtcl_rdata;
+  auto pi=particles->prtcl_idata;
+  int bad=0, changed=0;
+  Kokkos::parallel_reduce("gravity_dust_regather",
+      Kokkos::RangePolicy<DevExeSpace>(0,npart),KOKKOS_LAMBDA(int p,int &invalid,int &count) {
+    if (p<nold && rs(0,p)==pr(IPX,p) && rs(1,p)==pr(IPY,p) && rs(2,p)==pr(IPZ,p) &&
+        rs(3,p)==pr(IPM,p) && is(0,p)==pi(PLEV,p) && is(1,p)==pi(PGID,p)) {
+      if (copy) for (int d=0;d<3;++d) result(d,p)=old(d,p);
+      return;
+    }
+    ++count;
+    // the body of GatherGravityAcceleration for this cloud
+    for (int d=0;d<3;++d) result(d,p)=0;
+    const Real mass=pr(IPM,p);
+    if (!(mass>=0) || !Kokkos::isfinite(mass)) {++invalid;return;}
+    if (mass==0) return;
+    if (!Kokkos::isfinite(pr(IPX,p)) || !Kokkos::isfinite(pr(IPY,p)) ||
+        !Kokkos::isfinite(pr(IPZ,p))) {++invalid;return;}
+    const int anchor=pi(PGID,p)-gids;
+    if (anchor<0 || anchor>=nmb) {++invalid;return;}
+    Real sum=0;
+    lt.ForEachCloudWeight(pr(IPX,p),pr(IPY,p),pr(IPZ,p),pi(PLEV,p),anchor,
+      [&](int target,Real weight) {
+        int b,k,j,i;lt.Decode(target,b,k,j,i);
+        for (int d=0;d<3;++d) result(d,p)+=weight*field(b,d,k,j,i);
+        sum+=weight;
+      });
+    if (!Kokkos::isfinite(sum) || fabs(sum-1)>Real(1.e-9)) ++invalid;
+    for (int d=0;d<3;++d) if (!Kokkos::isfinite(result(d,p))) ++invalid;
+  },bad,changed);
+  CheckParticles(bad);
+  particle_acceleration=result;
+  RecordGravityGather(time);
+  gravity_gather_target_=particle_acceleration.data();
+  return changed;
 }
 
 void DustGasDrag::KickGravity(Real dt,const DvceArray2D<Real> &acceleration) {

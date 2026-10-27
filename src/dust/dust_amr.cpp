@@ -1826,6 +1826,7 @@ void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_ll
 //! over the leaves add up to one and point into existing blocks.
 
 void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
+  ++gravity_mass_epoch;   // a new mesh (the gravity field is rebuilt anyway)
   const bool oo = (smr_transfer_mode == DustSMRTransfer::owner_overlap);
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud && !oo) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl

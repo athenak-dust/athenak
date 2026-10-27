@@ -29,6 +29,7 @@
 #include "parameter_input.hpp"
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
+#include "pgen/pgen.hpp"
 
 namespace gravity {
 namespace {
@@ -205,6 +206,12 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
 #endif
     prefetch_enabled_ = pin->GetOrAddBoolean("gravity", "phase_prefetch", device_build)
                         && !phase_serial_only_;
+    // KDK reuse of the closing field at the next opening solve (default off: the
+    // reused field differs from a re-solve by the deposit round-off of the exact
+    // representation changes); reuse_check adds the fresh deposit, the true residual of
+    // the reused potential and a full regather for comparison (diagnostic only)
+    kdk_reuse_ = pin->GetOrAddBoolean("gravity", "kdk_reuse", false);
+    reuse_check_ = pin->GetOrAddBoolean("gravity", "reuse_check", false);
   }
   setup_ = pin->GetOrAddString("gravity", "setup", "distributed");
   if (setup_ != "reference" && setup_ != "distributed") {
@@ -261,6 +268,13 @@ SelfGravity::~SelfGravity() {
   JoinPrefetch();
   prefetch_.reset();
   delete energy_bval_;
+  if (reuse_check_ && global_variable::my_rank == 0) {
+    std::cout << std::setprecision(6) << "# SG_REUSE_CHECK_SUMMARY reuses=" << reuse_count_
+              << " max_reused_relative_residual=" << reuse_check_max_residual_
+              << " rtol=" << tolerance_
+              << " max_source_relative_difference=" << reuse_check_max_source_
+              << " max_regather_difference=" << reuse_check_max_gather_ << '\n';
+  }
   if (global_variable::my_rank == 0) {
     std::cout << std::setprecision(16) << "# SELF_GRAVITY_SUMMARY solves=" << solve_count
               << " cache_hits=" << cache_hit_count
@@ -268,7 +282,8 @@ SelfGravity::~SelfGravity() {
               << " linear_attempts=" << solve_count-cache_hit_count+preconditioner_refresh_count
               << " phase_updates=" << phase_update_count
               << " preconditioner_refreshes=" << preconditioner_refresh_count
-              << " rebuilds=" << rebuild_count << " phase_prefetch_used=" << prefetch_used_
+              << " rebuilds=" << rebuild_count << " kdk_reuses=" << reuse_count_
+              << " phase_prefetch_used=" << prefetch_used_
               << " phase_prefetch_discarded=" << prefetch_discarded_
               << " iterations=" << last_solve.iterations
               << " relative_residual=" << last_solve.relative_residual
@@ -277,6 +292,7 @@ SelfGravity::~SelfGravity() {
 }
 
 void SelfGravity::Invalidate() {
+  reuse_valid_ = false;
   topology_ = -1;
   phase_valid_ = false;
   field_cache_valid_ = false;
@@ -874,9 +890,169 @@ void SelfGravity::RememberSource(const DvceArray1D<Real> &physical_source) {
   Kokkos::deep_copy(cached_source_,physical_source);
 }
 
+// The field of the last accepted solve may serve the opening kick of the next step
+// when that solve was at this very time on the same mesh, phase, operator and constant, no
+// source callback exists, the gas density (a gas source) is bitwise unchanged, and the dust
+// module reports no mass-changing operation (G, R, instant switch, regrid) since; problem
+// loop work must declare that it keeps the particles. What remains possible in between are
+// the exact representation changes (split, lobe release, migration, reordering, removal of
+// massless outflow clouds), which change the deposit only by round-off.
+bool SelfGravity::KdkReuseAllowed(Real time, Real shift) {
+  auto *pm = pack_->pmesh;
+  bool ok = kdk_reuse_ && reuse_valid_ && field_cache_valid_ && phase_valid_
+      && time == last_time && shift == phase_ && phase_ == cached_phase_
+      && topology_ == pm->GetAMRLoadBalanceUpdateSeq() && topology_ == cached_topology_
+      && four_pi_G == cached_four_pi_G_ && mg_->FineUpdates().updates == cached_operator_updates_
+      && !extra_source_;
+  if (ok && coupled_dust_ && (source_dust_ || kick_dust_))
+    ok = pack_->pdust->gravity_mass_epoch == reuse_epoch_;
+  if (ok && pm->pgen->user_work_in_loop_func != nullptr && !pm->pgen->user_work_keeps_particles)
+    ok = false;
+  int changed = ok ? 0 : 1;
+  if (ok && source_gas_) {
+    const auto ind = pm->mb_indcs;
+    const int n = pack_->nmb_thispack*ind.nx1*ind.nx2*ind.nx3;
+    if (reuse_gas_.extent_int(0) != n) {
+      changed = 1;
+    } else {
+      auto u = pack_->phydro->u0;
+      auto gas = reuse_gas_;
+      Kokkos::parallel_reduce("sg_reuse_gas_check",Kokkos::RangePolicy<DevExeSpace>(0,n),
+      KOKKOS_LAMBDA(const int q, int &count) {
+        int t = q;
+        const int i = t%ind.nx1+ind.is; t /= ind.nx1;
+        const int j = t%ind.nx2+ind.js; t /= ind.nx2;
+        const int k = t%ind.nx3+ind.ks; t /= ind.nx3;
+        count += u(t,IDN,k,j,i) != gas(q);
+      },changed);
+    }
+  }
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE,&changed,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
+#endif
+  return changed == 0;
+}
+
+void SelfGravity::RememberReuseState() {
+  if (!kdk_reuse_) return;
+  reuse_valid_ = true;
+  if (coupled_dust_) reuse_epoch_ = pack_->pdust->gravity_mass_epoch;
+  if (source_gas_) {
+    const auto ind = pack_->pmesh->mb_indcs;
+    const int n = pack_->nmb_thispack*ind.nx1*ind.nx2*ind.nx3;
+    if (reuse_gas_.extent_int(0) != n) reuse_gas_ = DvceArray1D<Real>("sg_reuse_gas",n);
+    auto u = pack_->phydro->u0;
+    auto gas = reuse_gas_;
+    Kokkos::parallel_for("sg_reuse_gas_copy",Kokkos::RangePolicy<DevExeSpace>(0,n),
+    KOKKOS_LAMBDA(const int q) {
+      int t = q;
+      const int i = t%ind.nx1+ind.is; t /= ind.nx1;
+      const int j = t%ind.nx2+ind.js; t /= ind.nx2;
+      const int k = t%ind.nx3+ind.ks; t /= ind.nx3;
+      gas(q) = u(t,IDN,k,j,i);
+    });
+  }
+}
+
+// Diagnostic of a reuse: the fresh source against the kept one, the true residual of the
+// kept potential for the fresh right-hand side (the acceptance test of the solve it
+// replaces: <= rtol means that solve would have taken zero iterations), and a full regather
+// against the selective one. Nothing computed here enters the kept field.
+void SelfGravity::ReuseCheck(Real time, long long regathered) {
+  auto *pm = pack_->pmesh;
+  const auto ind = pm->mb_indcs;
+  const int n = pack_->nmb_thispack*ind.nx1*ind.nx2*ind.nx3;
+  const int solver_n = solution_.extent_int(0);
+  DvceArray5D<Real> fresh_dust;
+  if (coupled_dust_ && source_dust_) pack_->pdust->DepositGravityDensity(time,fresh_dust);
+  DvceArray1D<Real> fresh("sg_check_source",n), b("sg_check_rhs",solver_n),
+      work("sg_check_work",solver_n), x("sg_check_phi",solver_n);
+  auto u = pack_->phydro->u0;
+  auto rows = physical_rows_;
+  auto volume = volume_;
+  auto kept = physical_source_;
+  const bool dust_source = coupled_dust_ && source_dust_, gas_source = source_gas_;
+  Real mass = 0, diff = 0, size = 0;
+  Kokkos::parallel_reduce("sg_check_fresh_source",Kokkos::RangePolicy<DevExeSpace>(0,n),
+  KOKKOS_LAMBDA(const int q, Real &sum, Real &dmax, Real &smax) {
+    int t = q;
+    const int i = t%ind.nx1+ind.is; t /= ind.nx1;
+    const int j = t%ind.nx2+ind.js; t /= ind.nx2;
+    const int k = t%ind.nx3+ind.ks; t /= ind.nx3;
+    fresh(q) = (gas_source ? u(t,IDN,k,j,i) : Real(0))
+               +(dust_source ? fresh_dust(t,0,k,j,i) : Real(0));
+    sum += fresh(q)*volume(rows(q));
+    dmax = fmax(dmax,fabs(fresh(q)-kept(q)));
+    smax = fmax(smax,fabs(kept(q)));
+  },mass,Kokkos::Max<Real>(diff),Kokkos::Max<Real>(size));
+  Real maxima[2] = {diff,size};
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE,maxima,2,MPI_ATHENA_REAL,MPI_MAX,MPI_COMM_WORLD);
+#endif
+  const Real global_mass = Sum(mass);
+  Real total_volume = (pm->mesh_size.x1max-pm->mesh_size.x1min)*
+                      (pm->mesh_size.x2max-pm->mesh_size.x2min);
+  if (pm->three_d) total_volume *= pm->mesh_size.x3max-pm->mesh_size.x3min;
+  const Real mean = vertical_bc_ == "isolated" ? 0 : global_mass/total_volume;
+  const Real fourpig = four_pi_G;
+  Kokkos::deep_copy(b,0.0);
+  Kokkos::deep_copy(work,0.0);
+  Kokkos::parallel_for("sg_check_rhs",Kokkos::RangePolicy<DevExeSpace>(0,n),
+  KOKKOS_LAMBDA(const int q) {
+    const int row = rows(q);
+    work(row) = fresh(q);
+    b(row) = -fourpig*(fresh(q)-mean)*volume(row);
+  });
+  if (slab_ || vacuum_) {
+    DvceArray1D<Real> values("sg_check_boundary",boundary_values_.extent(0));
+    if (vacuum_) vacuum_->GPUFill(four_pi_G,global_mass,values);
+    else slab_->Compute(work,four_pi_G,values);
+    boundary_rhs_op_->Apply(values,work);
+    Kokkos::parallel_for("sg_check_add_boundary",Kokkos::RangePolicy<DevExeSpace>(0,solver_n),
+    KOKKOS_LAMBDA(const int q) { b(q) += work(q); });
+    // restore the boundary state of the kept field (flux of the vacuum gauge)
+    if (vacuum_) vacuum_->GPUFill(four_pi_G,last_physical_mass_,values);
+  }
+  Kokkos::deep_copy(x,solution_);
+  SolveStats residual;
+  try {
+    residual = mg_->Solve(b,x,tolerance_,0,restart_);
+  } catch (const std::exception &e) { Fail(e.what()); }
+  Real gather_diff = 0;
+  long long npart = 0;
+  if (coupled_dust_ && kick_dust_) {
+    DvceArray2D<Real> full;
+    pack_->pdust->GatherGravityAcceleration(time,acceleration,full);
+    auto kept_acc = particle_acceleration_;
+    npart = full.extent_int(1);
+    if (kept_acc.extent_int(1) != full.extent_int(1)) Fail("reuse check: particle count mismatch");
+    Kokkos::parallel_reduce("sg_check_regather",Kokkos::RangePolicy<DevExeSpace>(0,npart),
+    KOKKOS_LAMBDA(const int p, Real &dmax) {
+      for (int d = 0; d < 3; ++d) dmax = fmax(dmax,fabs(full(d,p)-kept_acc(d,p)));
+    },Kokkos::Max<Real>(gather_diff));
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE,&gather_diff,1,MPI_ATHENA_REAL,MPI_MAX,MPI_COMM_WORLD);
+#endif
+  }
+  const Real source_rel = maxima[1] > 0 ? maxima[0]/maxima[1] : maxima[0];
+  reuse_check_max_residual_ = std::max(reuse_check_max_residual_,residual.relative_residual);
+  reuse_check_max_source_ = std::max(reuse_check_max_source_,source_rel);
+  reuse_check_max_gather_ = std::max(reuse_check_max_gather_,gather_diff);
+  if (global_variable::my_rank == 0) {
+    std::cout << std::setprecision(6) << "# SG_REUSE_CHECK time=" << std::setprecision(12) << time
+              << std::setprecision(6) << " reused_relative_residual=" << residual.relative_residual
+              << " rtol=" << tolerance_
+              << " would_iterate=" << (residual.relative_residual > tolerance_)
+              << " source_max_abs_difference=" << maxima[0] << " source_max=" << maxima[1]
+              << " mass_difference=" << global_mass-last_physical_mass_
+              << " regathered_rank0=" << regathered << " clouds_rank0=" << npart
+              << " regather_max_difference=" << gather_diff << '\n';
+  }
+}
+
 void SelfGravity::UpdateDustField(Real time) {
   if (coupled_dust_ && kick_dust_)
-    pack_->pdust->GatherGravityAcceleration(time,acceleration,particle_acceleration_);
+    pack_->pdust->GatherGravityAcceleration(time,acceleration,particle_acceleration_,kdk_reuse_);
 }
 
 void SelfGravity::Solve(Real time) {
@@ -893,6 +1069,51 @@ void SelfGravity::Solve(Real time) {
   const auto ind = pm->mb_indcs;
   const int n = pack_->nmb_thispack*ind.nx1*ind.nx2*ind.nx3;
   const int solver_n = solution_.extent_int(0);
+  if (kdk_reuse_ && KdkReuseAllowed(time,shift)) {
+    // keep phi, the cell accelerations, the source and the boundary state of the
+    // last solve; regather only the clouds whose gather inputs changed since
+    ++reuse_count_;
+    ++cache_hit_count;
+    ++solve_count;
+    last_time = time;
+    last_solve_was_cached = true;
+    const double t_reuse = ProfileTime(profile_);
+    long long regathered = 0;
+    if (coupled_dust_ && (source_dust_ || kick_dust_)) {
+      auto *dust = pack_->pdust;
+      if (!dust->stopping_times_initialized ||
+          dust->stopping_time_mode == DustStoppingTimeMode::dynamic)
+        dust->RefreshStoppingTimeMaximum();
+    }
+    if (coupled_dust_ && kick_dust_) {
+      if (pack_->pdust->PointGravityTransferSupported()) {
+        UpdateDustField(time);
+        regathered = particle_acceleration_.extent_int(1);
+      } else {
+        regathered = pack_->pdust->RegatherGravityAccelerationChanged(time,particle_acceleration_);
+        if (regathered < 0) {   // no matching recorded gather: gather in full
+          UpdateDustField(time);
+          regathered = particle_acceleration_.extent_int(1);
+        }
+      }
+      reuse_regathered_ += regathered;
+    }
+    const double t_gather = ProfileTime(profile_);
+    if (reuse_check_) ReuseCheck(time,regathered);
+    UpdateTimeStep();
+    if (profile_) {
+      std::cout << std::setprecision(10) << "# SG_PROFILE_SOLVE rank="
+                << global_variable::my_rank << " solve=" << solve_count
+                << " time=" << time << " phase=" << shift << " rebuilds=" << rebuild_count
+                << " setup_s=" << t_setup-t0 << " source_s=0 deposit_s=0 boundary_s=0 solve_s=0"
+                << " force_s=" << ProfileTime(true)-t_reuse << " field_s=0"
+                << " gather_s=" << t_gather-t_reuse
+                << " iterations=0 matvecs=0 vcycles=0 residual=" << last_solve.relative_residual
+                << " cached=1 kdk_reused=1 regathered=" << regathered
+                << " cache_hits=" << cache_hit_count << " kdk_reuses=" << reuse_count_ << '\n';
+    }
+    return;
+  }
   auto rows = physical_rows_;
   auto physical_source = physical_source_;
   auto u = pack_->phydro->u0;
@@ -950,6 +1171,7 @@ void SelfGravity::Solve(Real time) {
     // A resampling/split can preserve the complete leaf source while changing
     // particle locations, shape codes or count. Reuse phi, not stale gathered g.
     if (coupled_dust_) {UpdateDustField(time); UpdateTimeStep();}
+    RememberReuseState();
     if (profile_) {
       std::cout << std::setprecision(10) << "# SG_PROFILE_SOLVE rank="
                 << global_variable::my_rank << " solve=" << solve_count
@@ -1108,6 +1330,8 @@ void SelfGravity::Solve(Real time) {
   cached_four_pi_G_ = four_pi_G;
   cached_operator_updates_ = mg_->FineUpdates().updates;
   field_cache_valid_ = true;
+  last_physical_mass_ = global_physical_mass;
+  RememberReuseState();
   if (profile_) {
     const auto storage = mg_->Storage();
     const auto updates = mg_->FineUpdates();
