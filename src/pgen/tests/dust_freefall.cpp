@@ -9,6 +9,7 @@
 //!
 //! Physics: <gravity>/source = dust, kick = dust (the gas neither feels nor makes gravity); no
 //! drag (back_reaction = false and taus_1 >> t_ff); no shear.  The gas stays uniform at rest.
+//! (With drag on, the same set-up is a dust-gas collapse without an analytic solution.)
 //! The gravity solver is periodic: it removes the mean source rhobar = M/V_box, so a uniform
 //! sphere stays uniform and every shell collapses homologously, r(t) = f(t) r(0), with
 //!   f'' = -(4 pi G rho_s/3)/f^2 + (4 pi G rhobar/3) f,   f(0) = 1, f'(0) = 0
@@ -261,10 +262,12 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
     Fatal("needs 3D refinable clouds (one species) and <gravity>");
   }
   if (pin->GetOrAddReal("problem", "etavk", 0.0) != 0.0 ||
-      pin->GetString("gravity", "source") != "dust" || pin->GetString("gravity", "kick") != "dust" ||
-      pin->GetBoolean("dust", "back_reaction")) {
-    Fatal("needs etavk = 0, <gravity>/source = kick = dust, <dust>/back_reaction = false");
+      pin->GetString("gravity", "source") != "dust" || pin->GetString("gravity", "kick") != "dust") {
+    Fatal("needs etavk = 0, <gravity>/source = kick = dust");
   }
+  // With drag (back_reaction = true, a finite taus_1) the sphere collapses through the
+  // gas; f(t) then is only the drag-free reference, and runs are compared with each other
+  // (AMR against uniform fine)
   ff.fourpig = pin->GetReal("gravity", "four_pi_G");
   ff.radius = pin->GetOrAddReal("problem", "ff_radius", 0.25);
   // default: t_ff = 1 without the mean
