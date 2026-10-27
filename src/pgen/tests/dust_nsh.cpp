@@ -1157,6 +1157,8 @@ void ReadNSHParams(ParameterInput *pin, MeshBlockPack *pmbp,
   etavk  = pin->GetReal("problem","etavk");
   eps.resize(ns);
   taus.resize(ns);
+  // <problem>/eps_N: to be deprecated after the shared epsilon_N/Z_N species
+  // API is implemented; preserve this pgen's reference-density meaning.
   bool has_eps = pin->DoesParameterExist("problem","eps_1");
   for (int s=0; s<ns; ++s) {
     if (has_eps) {
@@ -1409,6 +1411,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   if (dtest) {
     const int ns = pmbp->pdust->nspecies;
     eps.resize(ns); taus.resize(ns);
+    // <problem>/eps_N: to be deprecated with the shared species API.
+    // Keep damping/wave compatibility identical to the NSH reader above.
     const bool has_eps = pin->DoesParameterExist("problem", "eps_1");
     for (int s=0; s<ns; ++s) {
       eps[s] = has_eps ? pin->GetReal("problem", "eps_" + std::to_string(s+1))

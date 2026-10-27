@@ -242,6 +242,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   stopping_times_initialized = false;
   dt_cfl        = pin->GetOrAddReal("dust","dt_cfl",0.5);
+  // Dust API: to be deprecated after epsilon[_N]/Z[_N] is implemented.
+  // Retain the existing dust_to_gas semantics for legacy inputs and restarts.
   dust_to_gas   = pin->GetOrAddReal("dust","dust_to_gas",0.01);
 
   hybrid_enter_zeta = pin->GetOrAddReal("dust", "hybrid_enter_zeta", 0.5);
@@ -369,6 +371,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
 
   // per-species stopping times: <dust>/nspecies and taus_1, taus_2, ...
+  // taus_N: to be deprecated after the tau_s_N compatibility alias is implemented.
+  // The new spelling is a design proposal; keep this reader operational meanwhile.
   nspecies = pin->GetOrAddInteger("dust","nspecies",1);
   if (nspecies < 1) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl

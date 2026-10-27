@@ -31,6 +31,8 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
   }
 
   // read number of particles per cell, and calculate number of particles this pack
+  // Dust API: dust use of <particles>/ppc is to be deprecated after
+  // <dust>/ppc_N is implemented. Other particle types retain this generic input.
   Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
 
   // compute number of particles as real number, since ppc can be < 1
