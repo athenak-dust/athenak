@@ -40,8 +40,19 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   // faces.  PlanPull picks the receivers by position (the blocks on the x1
   // faces) but the senders from the shear-periodic boundary lists, so with periodic x1 the face
   // blocks got collected x1 ghosts without any sender and the gas mass leaked through the x1 faces
-  face_levels = ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic &&
+  // The face-centred (MHD) shearing-box exchange has no collected (pull) version: with MHD the
+  // shearing box keeps the original two-step exchange, which supports a uniform mesh only.
+  const bool mhd = pin->DoesBlockExist("mhd");
+  face_levels = !mhd &&
+                ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic &&
                 ppack->pmesh->mesh_bcs[BoundaryFace::outer_x1] == BoundaryFlag::shear_periodic;
+  if (mhd && ppack->pmesh->multilevel &&
+      ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "MHD in a shearing box with shear-periodic x1 boundaries supports a uniform mesh "
+              << "only (no SMR/AMR)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   report_timing = pin->GetOrAddBoolean("shearing_box", "report_timing", false);
   // with face_levels, non-periodic x3 needs the physical boundary values of the coarse
   // arrays for the corners the collected ghost zones leave to them; dust
