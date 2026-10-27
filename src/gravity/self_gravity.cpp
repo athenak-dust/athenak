@@ -4,6 +4,7 @@
 #include "gravity/self_gravity.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -75,7 +76,11 @@ struct SelfGravity::PhaseAssembly {
   std::uint64_t epoch = 0;
   LocalCompositeUpdate fine;               // fine.matrix is moved into a[0]
   std::vector<CsrRowUpdate> a, p;
-  double fine_s = 0, coarse_s = 0, prolongation_s = 0;
+  // host-only update plans of every operator (validation, patterns, ghosts, columns)
+  std::vector<PhaseRowPlan> a_plans, p_plans;
+  std::array<PhaseRowPlan,3> force_plans, boundary_force_plans;
+  PhaseRowPlan boundary_rhs_plan;
+  double fine_s = 0, coarse_s = 0, prolongation_s = 0, plan_s = 0;
   std::thread worker;
   std::exception_ptr error;
 };
@@ -722,10 +727,23 @@ void SelfGravity::AssemblePhase(Real shear_offset, PhaseAssembly &out) {
         global_variable::my_rank,prolongation_phase_rows_[l]));
   }
   const auto assembled = Clock::now();
+  // The host part of every operator update, read-only on the idle operators
+  mg_->PrepareHierarchyPhaseRows(out.a,out.p,out.a_plans,out.p_plans);
+  for (int d = 0; d < 3; ++d) {
+    out.force_plans[d] = d < solver_domain_.ndim ?
+        force_[d]->PreparePhaseRows(out.fine.acceleration[d]) : PhaseRowPlan{};
+  }
+  if (slab_ || vacuum_) {
+    out.boundary_rhs_plan = boundary_rhs_op_->PreparePhaseRows(out.fine.boundary_rhs);
+    for (int d = 0; d < 3; ++d)
+      out.boundary_force_plans[d] = boundary_force_[d]->PreparePhaseRows(out.fine.boundary_acceleration[d]);
+  }
+  const auto planned = Clock::now();
   out.shift = shear_offset;
   out.fine_s = seconds(begin,fine_assembled);
   out.coarse_s = seconds(fine_assembled,coarse_assembled);
   out.prolongation_s = seconds(coarse_assembled,assembled);
+  out.plan_s = seconds(assembled,planned);
 }
 
 void SelfGravity::JoinPrefetch() {
@@ -778,19 +796,25 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
     auto &a = job.a;
     auto &p = job.p;
     const double assembled = ProfileTime(profile_);
-    mg_->UpdateHierarchyPhaseRows(a,p);
+    mg_->UpdateHierarchyPhaseRows(a,p,&job.a_plans,&job.p_plans);
     for (int d = 0; d < solver_domain_.ndim; ++d) {
-      force_[d]->UpdatePhaseRows(update.acceleration[d]);
+      force_[d]->UpdatePhaseRows(update.acceleration[d],&job.force_plans[d]);
     }
     if (slab_ || vacuum_) {
-      boundary_rhs_op_->UpdatePhaseRows(update.boundary_rhs);
-      for (int d = 0; d < 3; ++d) boundary_force_[d]->UpdatePhaseRows(update.boundary_acceleration[d]);
+      boundary_rhs_op_->UpdatePhaseRows(update.boundary_rhs,&job.boundary_rhs_plan);
+      for (int d = 0; d < 3; ++d)
+        boundary_force_[d]->UpdatePhaseRows(update.boundary_acceleration[d],&job.boundary_force_plans[d]);
       if (slab_) slab_->SetShearOffset(shear_offset);
     }
-    // Release the host CSR rows (the next assembly builds new ones).
+    // Release the host CSR rows and plans (the next assembly builds new ones).
     job.fine = LocalCompositeUpdate{};
     std::vector<CsrRowUpdate>().swap(job.a);
     std::vector<CsrRowUpdate>().swap(job.p);
+    std::vector<PhaseRowPlan>().swap(job.a_plans);
+    std::vector<PhaseRowPlan>().swap(job.p_plans);
+    for (auto &plan : job.force_plans) plan = PhaseRowPlan{};
+    for (auto &plan : job.boundary_force_plans) plan = PhaseRowPlan{};
+    job.boundary_rhs_plan = PhaseRowPlan{};
     solver_domain_.shear_offset = shear_offset;
     phase_ = shear_offset;
     field_cache_valid_ = false;
@@ -808,6 +832,7 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
                 << " fine_assembly_s=" << job.fine_s
                 << " coarse_assembly_s=" << job.coarse_s
                 << " prolongation_assembly_s=" << job.prolongation_s
+                << " plan_s=" << job.plan_s << " op_planned=" << PhaseTimes().planned
                 << " operators_s=" << ProfileTime(true)-assembled
                 << " op_validate_s=" << PhaseTimes().validate
                 << " op_ghosts_s=" << PhaseTimes().ghosts << " op_mpi_s=" << PhaseTimes().mpi
