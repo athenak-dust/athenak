@@ -100,9 +100,13 @@ struct DensityTrigger {
   // With map = block, the block values on the device (default) or on the host; check:
   // both, every value compared (diagnostic)
   bool device = true, device_check = false;
-  // <dust>/amr_shear_face_limit = auto (the shear-periodic x1 faces at most one level
-  // apart when the blocks are too narrow in x1 for a 2-level face exchange), on (always), off
-  int shear_face_limit = 0;   // 0 auto, 1 on, -1 off
+  // <dust>/amr_shear_face_limit = on (the default: the 2:1 rule
+  // of all other neighbours, and within what the face exchange can fill), auto (only the exchange's
+  // limit, and only when some level could exceed it), off (ShearFaceLevelLimit)
+  int shear_face_limit = 1;   // 0 auto, 1 on (default since 2026-10-27), -1 off
+  // <dust>/amr_shear_face_dmax >= 0 caps the exchange's dmax (a 16^3 run that will be
+  // converted to 8x16x8 blocks: 1); -1 = from the block shape
+  int shear_face_dmax = -1;
 };
 DensityTrigger trig_;
 // Per-block audit of the trigger
@@ -284,11 +288,14 @@ void SetupDensityTrigger(ParameterInput *pin) {
   trig_.device = pin->GetOrAddBoolean("dust", "amr_rho_device", true);
   trig_.device_check = pin->GetOrAddBoolean("dust", "amr_rho_device_check", false);
   {
-    const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "auto");
+    // Rixin: default on (the shear-periodic x1 faces follow the 2:1 rule of all other
+    // neighbours, within what the face exchange can fill); auto = only the exchange's limit
+    const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
     if (sfl == "auto") trig_.shear_face_limit = 0;
     else if (sfl == "on") trig_.shear_face_limit = 1;
     else if (sfl == "off") trig_.shear_face_limit = -1;
     else fatal("<dust>/amr_shear_face_limit must be auto, on or off");
+    trig_.shear_face_dmax = pin->GetOrAddInteger("dust", "amr_shear_face_dmax", -1);
   }
   audit_ = pin->GetOrAddBoolean("dust", "amr_trigger_audit", false);
   audit_max_ = pin->GetOrAddInteger("dust", "amr_trigger_audit_max", 40);
@@ -316,27 +323,51 @@ void SetupDensityTrigger(ParameterInput *pin) {
 
 //----------------------------------------------------------------------------------------
 //! \fn ShearFaceLevelLimit
-//! \brief Across the shear-periodic x1 faces the shearing-box face exchange
-//! (experimental_face_levels) needs nghost*2^d cells along x1 for a level jump d; with blocks of
-//! fewer than 4 nghost cells (8x16x8 with nghost = 4) only d <= 1 works.  The trigger flags of the
-//! blocks touching one x1 face are raised (or kept from derefining) to at least the largest target
-//! level on the opposite face over the same x3 range, minus one (any x2: the faces slide).  The
-//! targets are level + max(flag, 0) (a block at the finest allowed level is reached only through
-//! its own flag, so the 2:1 balance of the tree cannot add a second level there).
+//! \brief The levels across the shear-periodic x1 faces.  The tree's 2:1
+//! balance does not see these neighbours (they slide with the shear), so the trigger keeps them
+//! within what the shearing-box face exchange (experimental_face_levels) can fill.  A face block
+//! at level l receives its x1 ghosts at level l and, above the root level, those of its coarse
+//! array at l - 1; an opposite block finer by d needs nghost*2^d <= nx1 (and nx2, nx3 divisible
+//! by 2^d).  With dmax the largest such d, the opposite face may be at most
+//!   omax(l) = dmax (l = 0),  l + dmax - 1 (l > 0)
+//! (8x16x8, nghost 4: dmax = 1, a block above the root may not face a finer one; 16^3: dmax = 2).
+//! amr_shear_face_limit = on adds the 2:1 rule of all other neighbours, omax(l) <= l + 1.
+//! Targets are level + max(flag, 0).  A face block whose target is below what the opposite face
+//! needs is refined (or kept from derefining); if one level up is not enough, the refinement of
+//! the opposite blocks above omax of its target is cancelled instead.  Repeated until nothing
+//! changes (the current mesh is assumed valid, so cancelling always succeeds).  Not covered: the
+//! tree's 2:1 balance after the trigger can refine further face blocks, up to lmax - 1; omax(l) >=
+//! dmax for every l, so this is safe while lmax <= dmax + 1 (8x16x8: up to 3 levels, 16^3: up to
+//! 4); with more levels the exchange may stop with its own error.
 void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
   Mesh *pm = pmbp->pmesh;
   if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) return;
   if (trig_.shear_face_limit < 0) return;
-  if (trig_.shear_face_limit == 0 && 4*pm->mb_indcs.ng <= pm->mb_indcs.nx1) return;   // d = 2 works
+  const auto &ind = pm->mb_indcs;
+  int dmax = 0;
+  while (ind.ng*(1 << (dmax + 1)) <= ind.nx1 && ind.nx2 % (1 << (dmax + 1)) == 0 &&
+         ind.nx3 % (1 << (dmax + 1)) == 0) ++dmax;
+  if (trig_.shear_face_dmax >= 0) dmax = std::min(dmax, trig_.shear_face_dmax);
+  const bool two_to_one = (trig_.shear_face_limit == 1);
+  auto omax = [dmax, two_to_one](int l) {
+    int o = (l == 0) ? dmax : l + dmax - 1;
+    if (two_to_one) o = std::min(o, l + 1);
+    return o;
+  };
+  const int lmax = pm->max_level - pm->root_level;
+  // auto: only when some level could face a level it cannot take
+  if (!two_to_one) {
+    bool need = false;
+    for (int l=0; l<=lmax; ++l) need = need || (omax(l) < lmax);
+    if (!need) return;
+  }
   auto &refine_flag = pm->pmr->refine_flag;
   auto &mbsz = pmbp->pmb->mb_size;
   const int nmb = pmbp->nmb_thispack, mbs = pmbp->gids;
-  const int lmax = pm->max_level - pm->root_level;
   const Real z0 = pm->mesh_size.x3min, lz = pm->mesh_size.x3max - pm->mesh_size.x3min;
   const Real x0 = pm->mesh_size.x1min, x1 = pm->mesh_size.x1max;
   const int nzf = pm->mesh_indcs.nx3 << lmax;   // x3 cells of the finest level
   const Real dzf = lz/nzf;
-  std::vector<int> tmax(2*nzf, -1);   // [face][z]: largest target level of the blocks on the face
   auto zrange = [&](const RegionSize &sz, int &k0, int &k1) {
     k0 = std::max(0, static_cast<int>(std::floor((sz.x3min - z0)/dzf + 0.5)));
     k1 = std::min(nzf, static_cast<int>(std::floor((sz.x3max - z0)/dzf + 0.5)));
@@ -345,45 +376,93 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
     const Real tol = 1.0e-9*(x1 - x0);
     return (std::fabs(sz.x1min - x0) < tol) ? 0 : ((std::fabs(sz.x1max - x1) < tol) ? 1 : -1);
   };
-  for (int m=0; m<nmb; ++m) {
-    const auto &sz = mbsz.h_view(m);
-    const int f = face(sz);
-    if (f < 0) continue;
-    const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
-    const int t = l + std::max(0, refine_flag.h_view(m + mbs));
-    int k0, k1; zrange(sz, k0, k1);
-    for (int k=k0; k<k1; ++k) tmax[f*nzf + k] = std::max(tmax[f*nzf + k], t);
-  }
-#if MPI_PARALLEL_ENABLED
-  if (global_variable::nranks > 1) {
-    MPI_Allreduce(MPI_IN_PLACE, tmax.data(), 2*nzf, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-  }
-#endif
-  int nraise = 0, nkeep = 0;
-  for (int m=0; m<nmb; ++m) {
-    const auto &sz = mbsz.h_view(m);
-    const int f = face(sz);
-    if (f < 0) continue;
-    int k0, k1; zrange(sz, k0, k1);
-    int other = -1;
-    for (int k=k0; k<k1; ++k) other = std::max(other, tmax[(1 - f)*nzf + k]);
-    const int need = other - 1;
-    const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
-    int &flag = refine_flag.h_view(m + mbs);
-    if (l < need && flag <= 0 && l < lmax) {
-      if (flag < 0) --nder;
-      flag = 1; ++nref; ++nraise;
-    } else if (flag < 0 && l - 1 < need) {
-      flag = 0; --nder; ++nkeep;
+  // the receivers' x3 rows include nghost ghost rows at the receiver's level (the coarse array's,
+  // one level coarser, above the root): a block at level lev reads the opposite face over
+  // [k0 - e, k1 + e), e = nghost 2^(lmax - lev + 1) finest cells (2^(lmax) at the root), periodic in
+  // x3 or cut at the x3 boundaries as the exchange does (shearing_box_pull.cpp, "pieces")
+  const bool zper = (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic);
+  auto slots = [&](int k0, int k1, int lev, auto &&fn) {
+    const int e = ind.ng << (lmax - lev + ((lev > 0) ? 1 : 0));
+    for (int kk=k0 - e; kk<k1 + e; ++kk) {
+      int k = kk;
+      if (zper) {k = ((k % nzf) + nzf) % nzf;} else if (k < 0 || k >= nzf) {continue;}
+      fn(k);
     }
-  }
-  int cnt[2] = {nraise, nkeep};
+  };
+  const int big = 1 << 20;
+  int nraise = 0, nkeep = 0, nveto = 0, rounds = 0;
+  for (int changed = 1; changed && rounds < 32; ++rounds) {
+    changed = 0;
+    std::vector<int> tmax(2*nzf, -1);   // [face][z]: largest target level on the face
+    for (int m=0; m<nmb; ++m) {
+      const auto &sz = mbsz.h_view(m);
+      const int f = face(sz);
+      if (f < 0) continue;
+      const int t = pm->lloc_eachmb[m + mbs].level - pm->root_level + std::max(0, refine_flag.h_view(m + mbs));
+      int k0, k1; zrange(sz, k0, k1);
+      for (int k=k0; k<k1; ++k) tmax[f*nzf + k] = std::max(tmax[f*nzf + k], t);
+    }
 #if MPI_PARALLEL_ENABLED
-  if (global_variable::nranks > 1) MPI_Allreduce(MPI_IN_PLACE, cnt, 2, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    if (global_variable::nranks > 1) {
+      MPI_Allreduce(MPI_IN_PLACE, tmax.data(), 2*nzf, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    }
 #endif
-  if (cnt[0] + cnt[1] > 0 && global_variable::my_rank == 0) {
-    std::cout << "# dust density trigger: shear-periodic x1 faces at most one level apart: "
-              << cnt[0] << " blocks refined, " << cnt[1] << " kept from derefining" << std::endl;
+    std::vector<int> cap(2*nzf, big);   // [face][z]: cancel refinements above this target
+    for (int m=0; m<nmb; ++m) {
+      const auto &sz = mbsz.h_view(m);
+      const int f = face(sz);
+      if (f < 0) continue;
+      int k0, k1; zrange(sz, k0, k1);
+      auto other_at = [&](int lev) {
+        int o = -1;
+        slots(k0, k1, lev, [&](int k) {o = std::max(o, tmax[(1 - f)*nzf + k]);});
+        return o;
+      };
+      const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
+      int &flag = refine_flag.h_view(m + mbs);
+      if (flag < 0 && omax(l - 1) < other_at(l - 1)) {flag = 0; --nder; ++nkeep; changed = 1;}
+      int t = l + std::max(0, flag);
+      if (omax(t) < other_at(t) && flag <= 0 && l < lmax && omax(l + 1) >= other_at(l + 1)) {
+        flag = 1; ++nref; ++nraise; changed = 1; t = l + 1;
+      }
+      if (omax(t) < other_at(t)) {
+        const int c = omax(t);
+        slots(k0, k1, t, [&](int k) {cap[(1 - f)*nzf + k] = std::min(cap[(1 - f)*nzf + k], c);});
+      }
+    }
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      MPI_Allreduce(MPI_IN_PLACE, cap.data(), 2*nzf, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    }
+#endif
+    for (int m=0; m<nmb; ++m) {
+      const auto &sz = mbsz.h_view(m);
+      const int f = face(sz);
+      if (f < 0) continue;
+      int &flag = refine_flag.h_view(m + mbs);
+      if (flag <= 0) continue;
+      int k0, k1; zrange(sz, k0, k1);
+      int c = big;
+      for (int k=k0; k<k1; ++k) c = std::min(c, cap[f*nzf + k]);
+      if (pm->lloc_eachmb[m + mbs].level - pm->root_level + 1 > c) {
+        flag = 0; --nref; ++nveto; changed = 1;
+      }
+    }
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      MPI_Allreduce(MPI_IN_PLACE, &changed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    }
+#endif
+  }
+  int cnt[3] = {nraise, nkeep, nveto};
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) MPI_Allreduce(MPI_IN_PLACE, cnt, 3, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  if (cnt[0] + cnt[1] + cnt[2] > 0 && global_variable::my_rank == 0) {
+    std::cout << "# dust density trigger: shear-periodic x1 face levels (dmax " << dmax
+              << (two_to_one ? ", 2:1" : "") << "): " << cnt[0] << " blocks refined, " << cnt[1]
+              << " kept from derefining, " << cnt[2] << " refinements cancelled (" << rounds
+              << " rounds)" << std::endl;
   }
 }
 
