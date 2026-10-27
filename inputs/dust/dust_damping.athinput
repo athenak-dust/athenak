@@ -56,7 +56,7 @@ rsolver     = hlle        # Riemann-solver to be used
 <particles>
 particle_type = dust      # dust particles
 pusher        = imex_dust # pushed by the DustGasDrag module inside the IMEX stages
-ppc           = 1.0       # one particle per cell (required for lattice placement)
+ppc           = 3.0       # one particle of each species per cell (lattice: a multiple of nspecies)
 
 <dust>
 nspecies      = 3         # number of dust species
