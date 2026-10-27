@@ -5,6 +5,7 @@
 #include "gravity/geometric_mg.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -298,17 +299,30 @@ void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
   if (expected_r <= static_cast<size_t>(std::numeric_limits<int>::max())) {
     r.colidx.reserve(expected_r); r.values.reserve(expected_r);
   }
-  Row row; row.reserve(64);
-  {
+  // Both loops are pure per row (the average cache only memoizes queries), so
+  // consecutive row chunks of several workers, concatenated in order, give the serial CSR.
+  struct PartP {
+    LocalCsr p;
+    std::vector<int> phase_rows;
+    TransferDiagnostics diagnostics;
+    ProlongationCacheStats cache;
+  };
+  struct PartR {
+    LocalCsr r;
+    Real volume_defect = 0;
+  };
+  auto prolongation = [&](GlobalIndex first, GlobalIndex last, PartP &part) {
+    Row row; row.reserve(64);
     AverageCache cache(coarse);
-    for (GlobalIndex i = p.row_begin; i < fine_end; ++i) {
+    auto &diag = part.diagnostics;
+    for (GlobalIndex i = first; i < last; ++i) {
       const auto cell = fine.Cell(i);
       bool images = false, shear_images = false;
       ProlongationRow(fine,coarse,domain,i,row,images,shear_images,cache);
       // Before the first x-image traversal, geometry routing is phase independent.
       // Thus a row that can depend on phase records this traversal at every phase,
       // even if its final coefficients cancel. No A-row dependency is assumed.
-      if (shear_images) phase_rows.push_back(static_cast<int>(i-p.row_begin));
+      if (shear_images) part.phase_rows.push_back(static_cast<int>(i-p.row_begin));
       Real constant = 0.; std::array<Real,3> linear{};
       for (const auto &v : row) {
         constant += v.second;
@@ -318,51 +332,139 @@ void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
         }
       }
       if (!domain.isolated_z || neumann_z)
-        diagnostics.constant_defect = std::max(diagnostics.constant_defect,std::abs(constant-Real(1)));
+        diag.constant_defect = std::max(diag.constant_defect,std::abs(constant-Real(1)));
       if (!images) {
-        ++diagnostics.interior_linear_rows;
+        ++diag.interior_linear_rows;
         for (int d = 0; d < domain.ndim; ++d)
-          diagnostics.interior_linear_defect = std::max(diagnostics.interior_linear_defect,
-                                                      std::abs(linear[d]-cell.center[d]));
+          diag.interior_linear_defect = std::max(diag.interior_linear_defect,
+                                                 std::abs(linear[d]-cell.center[d]));
       }
-      Append(p,row);
+      Append(part.p,row);
     }
-    cache_statistics = cache.Statistics();
-  }  // Free the P-query cache before constructing R or uploading either matrix.
-  for (GlobalIndex i = r.row_begin; i < coarse_end; ++i) {
-    const auto cell = coarse.Cell(i); std::array<Real,3> lo{}, hi{};
-    double volume = 1.;
-    for (int d = 0; d < domain.ndim; ++d) {
-      lo[d] = cell.center[d]-.5*cell.width[d]; hi[d] = cell.center[d]+.5*cell.width[d];
-      volume *= cell.width[d];
-    }
-    row.clear(); double covered = 0.;
-    for (GlobalIndex child : fine.QueryBox(lo,hi)) {
-      const auto c = fine.Cell(child); double v = 1.;
+    part.cache = cache.Statistics();
+  };  // Each worker frees its P-query cache before R is built.
+  auto restriction = [&](GlobalIndex first, GlobalIndex last, PartR &part) {
+    Row row; row.reserve(64);
+    for (GlobalIndex i = first; i < last; ++i) {
+      const auto cell = coarse.Cell(i); std::array<Real,3> lo{}, hi{};
+      double volume = 1.;
       for (int d = 0; d < domain.ndim; ++d) {
-        if (c.center[d]-.5*c.width[d] < lo[d]-cell.width[d]*1.e-8 ||
-            c.center[d]+.5*c.width[d] > hi[d]+cell.width[d]*1.e-8)
-          throw std::runtime_error("Gravity restriction encountered a partial fine child");
-        v *= c.width[d];
+        lo[d] = cell.center[d]-.5*cell.width[d]; hi[d] = cell.center[d]+.5*cell.width[d];
+        volume *= cell.width[d];
       }
-      covered += v; Add(row,child,1.);
+      row.clear(); double covered = 0.;
+      for (GlobalIndex child : fine.QueryBox(lo,hi)) {
+        const auto c = fine.Cell(child); double v = 1.;
+        for (int d = 0; d < domain.ndim; ++d) {
+          if (c.center[d]-.5*c.width[d] < lo[d]-cell.width[d]*1.e-8 ||
+              c.center[d]+.5*c.width[d] > hi[d]+cell.width[d]*1.e-8)
+            throw std::runtime_error("Gravity restriction encountered a partial fine child");
+          v *= c.width[d];
+        }
+        covered += v; Add(row,child,1.);
+      }
+      part.volume_defect = std::max(part.volume_defect,
+          static_cast<Real>(std::abs(covered-volume)/volume));
+      if (std::abs(covered-volume) > volume*1.e-7)
+        throw std::runtime_error("Gravity restriction children do not cover parent volume");
+      Append(part.r,row);
     }
-    diagnostics.restriction_volume_defect = std::max(diagnostics.restriction_volume_defect,
-        static_cast<Real>(std::abs(covered-volume)/volume));
-    if (std::abs(covered-volume) > volume*1.e-7)
-      throw std::runtime_error("Gravity restriction children do not cover parent volume");
-    Append(r,row);
+  };
+  auto parallel = [](int workers, auto &&task) {
+    std::vector<std::exception_ptr> errors(workers);
+    auto run = [&](int w) {
+      try { task(w); } catch (...) { errors[w] = std::current_exception(); }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(workers-1);
+    try {
+      for (int w = 1; w < workers; ++w) threads.emplace_back(run,w);
+    } catch (...) { for (auto &thread : threads) thread.join(); throw; }
+    run(0);
+    for (auto &thread : threads) thread.join();
+    for (const auto &error : errors) if (error) std::rethrow_exception(error);
+  };
+  auto join = [](LocalCsr &destination, LocalCsr &source) {
+    const int offset = static_cast<int>(destination.values.size());
+    if (destination.values.size()+source.values.size() >
+        static_cast<size_t>(std::numeric_limits<int>::max()))
+      throw std::overflow_error("Gravity transfer CSR exceeds 32-bit local offsets");
+    for (size_t i = 1; i < source.rowptr.size(); ++i)
+      destination.rowptr.push_back(offset+source.rowptr[i]);
+    destination.colidx.insert(destination.colidx.end(),source.colidx.begin(),source.colidx.end());
+    destination.values.insert(destination.values.end(),source.values.begin(),source.values.end());
+    source = LocalCsr{};
+  };
+  const int threads = fine.SetupThreads();
+  // consecutive chunks (>= 512 rows, up to 16 per worker) taken in any order, joined in order
+  auto chunking = [threads](GlobalIndex rows, int &workers, int &chunks) {
+    workers = static_cast<int>(std::max<GlobalIndex>(1,std::min<GlobalIndex>(threads,rows/4096)));
+    chunks = static_cast<int>(std::max<GlobalIndex>(workers,
+        std::min<GlobalIndex>(16*static_cast<GlobalIndex>(workers),rows/512)));
+  };
+  {
+    const GlobalIndex rows = fine_end-p.row_begin;
+    int workers = 1, chunks = 1;
+    chunking(rows,workers,chunks);
+    std::vector<PartP> parts(chunks);
+    std::atomic<int> next{0};
+    parallel(workers,[&](int) {
+      for (int c = next++; c < chunks; c = next++)
+        prolongation(p.row_begin+rows*c/chunks,p.row_begin+rows*(c+1)/chunks,parts[c]);
+    });
+    cache_statistics = ProlongationCacheStats{};
+    for (auto &part : parts) {
+      join(p,part.p);
+      phase_rows.insert(phase_rows.end(),part.phase_rows.begin(),part.phase_rows.end());
+      diagnostics.constant_defect = std::max(diagnostics.constant_defect,
+                                             part.diagnostics.constant_defect);
+      diagnostics.interior_linear_defect = std::max(diagnostics.interior_linear_defect,
+                                                    part.diagnostics.interior_linear_defect);
+      diagnostics.interior_linear_rows += part.diagnostics.interior_linear_rows;
+      AddCacheStats(cache_statistics,part.cache);
+    }
+  }
+  {
+    const GlobalIndex rows = coarse_end-r.row_begin;
+    int workers = 1, chunks = 1;
+    chunking(rows,workers,chunks);
+    std::vector<PartR> parts(chunks);
+    std::atomic<int> next{0};
+    parallel(workers,[&](int) {
+      for (int c = next++; c < chunks; c = next++)
+        restriction(r.row_begin+rows*c/chunks,r.row_begin+rows*(c+1)/chunks,parts[c]);
+    });
+    for (auto &part : parts) {
+      join(r,part.r);
+      diagnostics.restriction_volume_defect = std::max(diagnostics.restriction_volume_defect,
+                                                       part.volume_defect);
+    }
   }
 }
 }  // namespace
 
+HierarchyBuildTimes &BuildTimes() {
+  static HierarchyBuildTimes times;
+  return times;
+}
+
 GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     const CompositeDomain &domain, int rank, int nranks, bool neumann_z,
-    bool fine_forces) {
+    bool fine_forces, int threads) {
+  auto &times = BuildTimes();
+  auto now = []() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  double clock = now();
+  auto lap = [&](double &bucket) { const double t = now(); bucket += t-clock; clock = t; };
   GeometricSystem out;
   out.fine_geometry.reset(new MeshGeometry(std::move(patches),domain,rank,nranks,neumann_z));
   MeshGeometry *fine = out.fine_geometry.get();
+  fine->SetSetupThreads(threads);
+  lap(times.geometry);
   out.fine = fine->BuildSystem(fine_forces);
+  lap(times.fine_system);
   out.quadratic_interface_fallbacks.push_back(out.fine.quadratic_interface_fallbacks);
   out.hierarchy.constant_nullspace = !domain.isolated_z || neumann_z;
   out.hierarchy.matrices.push_back(std::move(out.fine.matrix));
@@ -375,11 +477,15 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
       throw std::runtime_error("Gravity geometric coarsening did not reduce global rows");
     std::unique_ptr<MeshGeometry> coarse(new MeshGeometry(std::move(coarse_patches),domain,
                                                         rank,nranks,neumann_z,true));
+    coarse->SetSetupThreads(threads);
+    lap(times.geometry);
     LocalCsr p, r; TransferDiagnostics check; std::vector<int> phase_rows;
     ProlongationCacheStats cache_statistics;
     Transfers(*fine,*coarse,domain,rank,p,r,check,neumann_z,phase_rows,cache_statistics);
+    lap(times.transfers);
     out.initial_prolongation_cache.push_back(cache_statistics);
     auto system = coarse->BuildSystem(false);
+    lap(times.coarse_system);
     out.quadratic_interface_fallbacks.push_back(system.quadratic_interface_fallbacks);
     out.hierarchy.matrices.push_back(std::move(system.matrix));
     out.hierarchy.row_partitions.push_back(coarse->RowPartition());

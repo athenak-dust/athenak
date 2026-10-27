@@ -96,6 +96,28 @@ struct FineOperatorStats {
   std::uint64_t host_map_entries = 0, host_map_buckets = 0, host_map_peak_bytes = 0;
 };
 
+// The host-only part of a compact phase-row update of one operator (validation,
+// pattern comparison, next ghost list, remapped device columns), computed from the
+// operator's state after its previous update. Preparing reads the operator only, so it may
+// run in another thread while the operator is idle; an update given a plan whose version
+// no longer matches the operator recomputes it.
+struct PhaseRowPlan {
+  bool prepared = false, valid = false, same = false;
+  std::uint64_t version = 0;
+  std::vector<GlobalIndex> ghosts;
+  std::vector<int> columns;
+};
+
+// Host wall-clock seconds spent in compact phase-row updates (all operators of this
+// process) since the last reset; for <gravity>/profile output only. Device work is
+// counted where a host copy or MPI call waits for it.
+struct PhaseUpdateTimes {
+  double validate = 0, ghosts = 0, mpi = 0, halo = 0, remap = 0, upload = 0;
+  double diagonal = 0, terminal = 0;
+  std::uint64_t calls = 0, value_only = 0, planned = 0;
+};
+PhaseUpdateTimes &PhaseTimes();
+
 // Restarted flexible GMRES preconditioned by the supplied multigrid V-cycle. The
 // production path accepts independent A/P/R; the legacy adapter uses Galerkin R=P^T.
 // Supports nonsymmetric conservative FV operators without assuming CG symmetry.
@@ -138,13 +160,21 @@ class SparseMultigrid {
   // the entire effective fine diagonal once. A single-level hierarchy has no
   // smoother and retains its cached terminal LU.
   void UpdateFinePhaseRows(const CsrRowUpdate &matrix);
+  void UpdateFinePhaseRowsPlanned(const CsrRowUpdate &matrix, const PhaseRowPlan *plan);
   // Complete current-phase V-cycle: independent compact A and P dependency
   // lists, unchanged physical child-sum R, and current terminal factorization.
   // Terminal ownership must contain <=128 global rows. No fine host CSR retained.
   void ConfigureHierarchyPhaseRows(const std::vector<std::vector<int>> &a_rows,
                                   const std::vector<std::vector<int>> &p_rows);
   void UpdateHierarchyPhaseRows(const std::vector<CsrRowUpdate> &a,
-                               const std::vector<CsrRowUpdate> &p);
+                               const std::vector<CsrRowUpdate> &p,
+                               const std::vector<PhaseRowPlan> *a_plans = nullptr,
+                               const std::vector<PhaseRowPlan> *p_plans = nullptr);
+  // Host only, no MPI/device work: the plans of UpdateHierarchyPhaseRows(a, p).
+  void PrepareHierarchyPhaseRows(const std::vector<CsrRowUpdate> &a,
+                                 const std::vector<CsrRowUpdate> &p,
+                                 std::vector<PhaseRowPlan> &a_plans,
+                                 std::vector<PhaseRowPlan> &p_plans) const;
   SolveStats Solve(const DvceArray1D<Real> &rhs, const DvceArray1D<Real> &x,
                    Real tolerance, int max_iterations, int restart = 24);
   // Collective diagnostics; arguments contain owned rows only. Level zero uses
@@ -191,7 +221,8 @@ class DistributedOperator {
   void Apply(const DvceArray1D<Real> &x, const DvceArray1D<Real> &result);
   StorageStats Storage() const;
   void ConfigurePhaseRows(const std::vector<int> &rows);
-  void UpdatePhaseRows(const CsrRowUpdate &matrix);
+  void UpdatePhaseRows(const CsrRowUpdate &matrix, const PhaseRowPlan *plan = nullptr);
+  PhaseRowPlan PreparePhaseRows(const CsrRowUpdate &matrix) const;  // host only
   FineOperatorStats PhaseUpdates() const;
 
  private:

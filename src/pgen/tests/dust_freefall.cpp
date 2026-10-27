@@ -290,6 +290,7 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
     pack->pdust->cloud_split_enable = split;
   }
   user_work_in_loop_func = Work;
+  user_work_keeps_particles = true;   // Observe only reads the particles
   pgen_final_func = Final;
   const Real lx = box.x1max - box.x1min, ly = box.x2max - box.x2min, lz = box.x3max - box.x3min;
   const int nx = pmy_mesh_->mesh_indcs.nx1, ny = pmy_mesh_->mesh_indcs.nx2,

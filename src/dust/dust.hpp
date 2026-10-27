@@ -1879,9 +1879,10 @@ class DustGasDrag {
                                      const DvceArray5D<Real> &owned_acceleration,
                                      DvceArray2D<Real> &particle_acceleration);
   void DepositGravityDensity(Real geometry_time, DvceArray5D<Real> &owned_density);
+  // record: keep each cloud's gather inputs for RegatherGravityAccelerationChanged
   void GatherGravityAcceleration(Real geometry_time,
                                 const DvceArray5D<Real> &owned_acceleration,
-                                DvceArray2D<Real> &particle_acceleration);
+                                DvceArray2D<Real> &particle_acceleration, bool record = false);
   void KickGravity(Real dt, const DvceArray2D<Real> &particle_acceleration);
   Real GravityAccelerationTimeStep(const DvceArray2D<Real> &particle_acceleration);
   // Science output (dust_science.cpp).  The representation of the dust
@@ -1913,6 +1914,19 @@ class DustGasDrag {
   Real phst_dt_stiff_min = -1.0;   // smallest stiff_thresh/max_rate of the interval (-1: none)
   unsigned long long phst_g_events = 0;   // coarsening events (G groups, X families), this rank
   unsigned long long phst_r_removed = 0;  // particles removed by resampling, this rank
+  // <gravity>/kdk_reuse: after a recording GatherGravityAcceleration into the same
+  // array, at the same time and with no other gather since (the exchanged field is still
+  // that one), recompute only the clouds whose gather inputs (position, mass, level code,
+  // anchor) changed since (split children, released lobes, migrated or reordered clouds);
+  // the others keep their bitwise identical values.  Returns the number of clouds gathered
+  // again, or -1 (nothing done) when the recorded state does not match: then the caller
+  // gathers in full.  Refinable clouds only.
+  long long RegatherGravityAccelerationChanged(Real geometry_time,
+                                               DvceArray2D<Real> &particle_acceleration);
+  void RecordGravityGather(Real time);   // (public for NVCC device lambdas)
+  // incremented by every operation that may change the deposited dust mass other
+  // than by an exact refinement or reordering (G, R, the instant switch, a regrid)
+  std::uint64_t gravity_mass_epoch = 0;
   void CheckClouds3D();   // the restrictions of 3-D stage 1
   void WrapParticles3D();
   int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
@@ -2072,6 +2086,12 @@ class DustGasDrag {
 
  private:
   DvceArray5D<Real> gravity_density_halo_, gravity_acceleration_halo_;
+  DvceArray2D<Real> gravity_gather_rsnap_;   // x, y, z, mass at the last gather
+  DvceArray2D<int> gravity_gather_isnap_;    // level code, anchor (PGID)
+  int gravity_gather_nsnap_ = -1;
+  Real gravity_gather_time_ = 0;
+  std::uint64_t gravity_halo_fills_ = 0, gravity_gather_fill_ = 0;
+  const Real *gravity_gather_target_ = nullptr;
   std::shared_ptr<GravityPointTransfer> gravity_points_;
   // science output: its own ghost-deposit transfer (3-D points) and work arrays, so that an
   // output never touches the coupling's or gravity's exchange state

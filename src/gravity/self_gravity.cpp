@@ -4,6 +4,7 @@
 #include "gravity/self_gravity.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <sys/resource.h>
+#include <thread>
 
 #include "mesh/mesh.hpp"
 #include "coordinates/coordinates.hpp"
@@ -28,6 +30,7 @@
 #include "parameter_input.hpp"
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
+#include "pgen/pgen.hpp"
 
 namespace gravity {
 namespace {
@@ -65,6 +68,22 @@ struct ExactSourceDifference {
   }
 };
 }  // namespace
+
+// Host-only products of one shear-phase assembly (fine A/forces/boundary, coarse A, P).
+struct SelfGravity::PhaseAssembly {
+  Real shift = 0;
+  int topology = -1;
+  std::uint64_t epoch = 0;
+  LocalCompositeUpdate fine;               // fine.matrix is moved into a[0]
+  std::vector<CsrRowUpdate> a, p;
+  // host-only update plans of every operator (validation, patterns, ghosts, columns)
+  std::vector<PhaseRowPlan> a_plans, p_plans;
+  std::array<PhaseRowPlan,3> force_plans, boundary_force_plans;
+  PhaseRowPlan boundary_rhs_plan;
+  double fine_s = 0, coarse_s = 0, prolongation_s = 0, plan_s = 0;
+  std::thread worker;
+  std::exception_ptr error;
+};
 
 SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack) {
   auto *pm = pack->pmesh;
@@ -169,6 +188,10 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   profile_ = pin->GetOrAddBoolean("gravity", "profile", false);
   phase_threads_ = pin->GetOrAddInteger("gravity", "phase_threads", 0);
   if (phase_threads_ < 0) Fail("gravity/phase_threads must be nonnegative");
+  // host workers of a full hierarchy setup (0: every affinity CPU in device
+  // builds, one in CPU builds; the coefficients do not depend on it)
+  setup_threads_ = pin->GetOrAddInteger("gravity", "setup_threads", 0);
+  if (setup_threads_ < 0) Fail("gravity/setup_threads must be nonnegative");
 #if MPI_PARALLEL_ENABLED
   int mpi_thread_level = MPI_THREAD_SINGLE, mpi_main_thread = 0;
   MPI_Query_thread(&mpi_thread_level);
@@ -182,6 +205,30 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
       std::cout << "# SG_PHASE_THREADS auto_capped=1 mpi_thread_level=" << mpi_thread_level << '\n';
   }
 #endif
+  {
+    // Overlap the next phase's host assembly with the matter step. Default on in
+    // device builds (the host is otherwise idle there), off in CPU builds (its cores run ranks).
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
+    const bool device_build = true;
+#else
+    const bool device_build = false;
+#endif
+    prefetch_enabled_ = pin->GetOrAddBoolean("gravity", "phase_prefetch", device_build)
+                        && !phase_serial_only_;
+    // KDK reuse of the closing field at the next opening solve (default off: the
+    // reused field differs from a re-solve by the deposit round-off of the exact
+    // representation changes); reuse_check adds the fresh deposit, the true residual of
+    // the reused potential and a full regather for comparison (diagnostic only)
+    kdk_reuse_ = pin->GetOrAddBoolean("gravity", "kdk_reuse", false);
+    // initial guess of a solve at a new time: previous (default: the last accepted
+    // potential) or extrapolate (linear in time from the last two; the converged field then
+    // differs from the default within the solver tolerance)
+    const std::string guess = pin->GetOrAddString("gravity", "guess", "previous");
+    if (guess != "previous" && guess != "extrapolate")
+      Fail("<gravity>/guess must be previous or extrapolate");
+    guess_extrapolate_ = guess == "extrapolate";
+    reuse_check_ = pin->GetOrAddBoolean("gravity", "reuse_check", false);
+  }
   setup_ = pin->GetOrAddString("gravity", "setup", "distributed");
   if (setup_ != "reference" && setup_ != "distributed") {
     Fail("gravity/setup must be reference or distributed");
@@ -234,7 +281,16 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
 }
 
 SelfGravity::~SelfGravity() {
+  JoinPrefetch();
+  prefetch_.reset();
   delete energy_bval_;
+  if (reuse_check_ && global_variable::my_rank == 0) {
+    std::cout << std::setprecision(6) << "# SG_REUSE_CHECK_SUMMARY reuses=" << reuse_count_
+              << " max_reused_relative_residual=" << reuse_check_max_residual_
+              << " rtol=" << tolerance_
+              << " max_source_relative_difference=" << reuse_check_max_source_
+              << " max_regather_difference=" << reuse_check_max_gather_ << '\n';
+  }
   if (global_variable::my_rank == 0) {
     std::cout << std::setprecision(16) << "# SELF_GRAVITY_SUMMARY solves=" << solve_count
               << " cache_hits=" << cache_hit_count
@@ -242,13 +298,18 @@ SelfGravity::~SelfGravity() {
               << " linear_attempts=" << solve_count-cache_hit_count+preconditioner_refresh_count
               << " phase_updates=" << phase_update_count
               << " preconditioner_refreshes=" << preconditioner_refresh_count
-              << " rebuilds=" << rebuild_count << " iterations=" << last_solve.iterations
+              << " rebuilds=" << rebuild_count << " kdk_reuses=" << reuse_count_
+              << " extrapolated_guesses=" << guess_extrapolations_
+              << " phase_prefetch_used=" << prefetch_used_
+              << " phase_prefetch_discarded=" << prefetch_discarded_
+              << " iterations=" << last_solve.iterations
               << " relative_residual=" << last_solve.relative_residual
               << " source_mean=" << last_source_mean << " time=" << last_time << '\n';
   }
 }
 
 void SelfGravity::Invalidate() {
+  reuse_valid_ = false;
   topology_ = -1;
   phase_valid_ = false;
   field_cache_valid_ = false;
@@ -289,6 +350,8 @@ void SelfGravity::OrbitalStep(Real dt) {
 }
 
 void SelfGravity::Rebuild(Real shear_offset) {
+  JoinPrefetch();
+  ++geometry_epoch_;
   if (setup_ == "distributed") {
     RebuildDistributed(shear_offset);
     return;
@@ -446,6 +509,7 @@ void SelfGravity::Rebuild(Real shear_offset) {
 
 void SelfGravity::RebuildDistributed(Real shear_offset) {
   const double t0 = ProfileTime(profile_);
+  BuildTimes() = HierarchyBuildTimes{};
   auto *pm = pack_->pmesh;
   const auto ind = pm->mb_indcs;
   const int rank = global_variable::my_rank, nranks = global_variable::nranks;
@@ -495,7 +559,8 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
   }
   const double t_geometry = ProfileTime(profile_);
   try {
-    auto setup = BuildGeometricHierarchy(std::move(patches),domain,rank,nranks,solver_neumann_z_);
+    auto setup = BuildGeometricHierarchy(std::move(patches),domain,rank,nranks,solver_neumann_z_,
+                                         true,phase_serial_only_ ? 1 : setup_threads_);
     const double t_assembly = ProfileTime(profile_);
     const auto old_partition = partition_;
     partition_ = setup.fine.row_partition;
@@ -608,6 +673,10 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
                     setup.quadratic_interface_fallbacks.end(),std::size_t(0))
                 << " fine_quadratic_interface_fallbacks=" << setup.fine.quadratic_interface_fallbacks
                 << " geometry_s=" << t_geometry-t0 << " assembly_s=" << t_assembly-t_geometry
+                << " assembly_geometry_s=" << BuildTimes().geometry
+                << " assembly_fine_s=" << BuildTimes().fine_system
+                << " assembly_transfers_s=" << BuildTimes().transfers
+                << " assembly_coarse_s=" << BuildTimes().coarse_system
                 << " operators_s=" << t_operators-t_assembly
                 << " slab_setup_s=" << t_slab-t_operators
                 << " boundary_setup_s=" << t_slab-t_operators
@@ -626,35 +695,126 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
   }
 }
 
+Real SelfGravity::ShearShift(Real time) const {
+  auto *pm = pack_->pmesh;
+  if (pm->mesh_bcs[0] != BoundaryFlag::shear_periodic) return 0;
+  const auto *ps = pack_->phydro->psbox_u;
+  const Real ly = pm->mesh_size.x2max-pm->mesh_size.x2min;
+  return std::fmod(-ps->qshear*ps->omega0*(pm->mesh_size.x1max-pm->mesh_size.x1min)*time, ly);
+}
+
+// Host only: no MPI, no device work. Touches geometry_/coarse_geometry_ (their phase
+// caches), so at most one assembly runs at a time (JoinPrefetch before any other use).
+void SelfGravity::AssemblePhase(Real shear_offset, PhaseAssembly &out) {
+  using Clock = std::chrono::steady_clock;
+  auto seconds = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double>(b-a).count();
+  };
+  const auto begin = Clock::now();
+  out.fine = geometry_->BuildPhaseUpdate(shear_offset);
+  const auto fine_assembled = Clock::now();
+  out.a.clear(); out.p.clear();
+  out.a.reserve(coarse_geometry_.size()+1); out.a.push_back(std::move(out.fine.matrix));
+  for (auto &coarse : coarse_geometry_)
+    out.a.push_back(std::move(coarse->BuildPhaseUpdate(shear_offset,false).matrix));
+  const auto coarse_assembled = Clock::now();
+  out.p.reserve(coarse_geometry_.size());
+  auto current_domain = solver_domain_;
+  current_domain.shear_offset = shear_offset;
+  for (size_t l = 0; l < coarse_geometry_.size(); ++l) {
+    const auto &fine = l == 0 ? *geometry_ : *coarse_geometry_[l-1];
+    out.p.push_back(BuildProlongationPhaseUpdate(fine,*coarse_geometry_[l],current_domain,
+        global_variable::my_rank,prolongation_phase_rows_[l]));
+  }
+  const auto assembled = Clock::now();
+  // The host part of every operator update, read-only on the idle operators
+  mg_->PrepareHierarchyPhaseRows(out.a,out.p,out.a_plans,out.p_plans);
+  for (int d = 0; d < 3; ++d) {
+    out.force_plans[d] = d < solver_domain_.ndim ?
+        force_[d]->PreparePhaseRows(out.fine.acceleration[d]) : PhaseRowPlan{};
+  }
+  if (slab_ || vacuum_) {
+    out.boundary_rhs_plan = boundary_rhs_op_->PreparePhaseRows(out.fine.boundary_rhs);
+    for (int d = 0; d < 3; ++d)
+      out.boundary_force_plans[d] = boundary_force_[d]->PreparePhaseRows(out.fine.boundary_acceleration[d]);
+  }
+  const auto planned = Clock::now();
+  out.shift = shear_offset;
+  out.fine_s = seconds(begin,fine_assembled);
+  out.coarse_s = seconds(fine_assembled,coarse_assembled);
+  out.prolongation_s = seconds(coarse_assembled,assembled);
+  out.plan_s = seconds(assembled,planned);
+}
+
+void SelfGravity::JoinPrefetch() {
+  if (prefetch_ && prefetch_->worker.joinable()) prefetch_->worker.join();
+}
+
+void SelfGravity::PrefetchPhase(Real time) {
+  if (!prefetch_enabled_ || setup_ != "distributed" || !geometry_
+      || pack_->pmesh->mesh_bcs[0] != BoundaryFlag::shear_periodic || !std::isfinite(time)) return;
+  const Real shift = ShearShift(time);
+  if (!phase_valid_ || topology_ != pack_->pmesh->GetAMRLoadBalanceUpdateSeq()
+      || shift == phase_) return;
+  JoinPrefetch();
+  if (!prefetch_) prefetch_ = std::make_unique<PhaseAssembly>();
+  auto *job = prefetch_.get();
+  job->error = nullptr;
+  job->topology = topology_;
+  job->epoch = geometry_epoch_;
+  job->shift = shift;
+  job->worker = std::thread([this,job,shift]() {
+    try { AssemblePhase(shift,*job); } catch (...) { job->error = std::current_exception(); }
+  });
+}
+
 void SelfGravity::UpdatePhase(Real shear_offset) {
   const double begin = ProfileTime(profile_);
+  PhaseTimes() = PhaseUpdateTimes{};
   try {
-    auto update = geometry_->BuildPhaseUpdate(shear_offset);
-    const double fine_assembled = ProfileTime(profile_);
-    std::vector<CsrRowUpdate> a;
-    a.reserve(coarse_geometry_.size()+1); a.push_back(std::move(update.matrix));
-    for (auto &coarse : coarse_geometry_)
-      a.push_back(std::move(coarse->BuildPhaseUpdate(shear_offset,false).matrix));
-    const double coarse_assembled = ProfileTime(profile_);
-    std::vector<CsrRowUpdate> p;
-    p.reserve(coarse_geometry_.size());
-    auto current_domain = solver_domain_;
-    current_domain.shear_offset = shear_offset;
-    for (size_t l = 0; l < coarse_geometry_.size(); ++l) {
-      const auto &fine = l == 0 ? *geometry_ : *coarse_geometry_[l-1];
-      p.push_back(BuildProlongationPhaseUpdate(fine,*coarse_geometry_[l],current_domain,
-          global_variable::my_rank,prolongation_phase_rows_[l]));
+    // A prefetched assembly counts only if it was made for exactly this shift on the
+    // current geometry; anything else is discarded and assembled again here.
+    double wait_s = 0;
+    bool prefetched = false;
+    if (prefetch_ && prefetch_->worker.joinable()) {
+      const auto t_wait = std::chrono::steady_clock::now();
+      prefetch_->worker.join();
+      wait_s = std::chrono::duration<double>(std::chrono::steady_clock::now()-t_wait).count();
+      prefetched = prefetch_->shift == shear_offset && prefetch_->epoch == geometry_epoch_
+                   && prefetch_->topology == topology_;
+      // The same assembly would fail here too; a mismatched request is simply redone.
+      if (prefetched && prefetch_->error) std::rethrow_exception(prefetch_->error);
+      prefetch_->error = nullptr;
+      if (prefetched) ++prefetch_used_; else ++prefetch_discarded_;
     }
+    if (!prefetched) {
+      if (!prefetch_) prefetch_ = std::make_unique<PhaseAssembly>();
+      AssemblePhase(shear_offset,*prefetch_);
+    }
+    auto &job = *prefetch_;
+    auto &update = job.fine;
+    auto &a = job.a;
+    auto &p = job.p;
     const double assembled = ProfileTime(profile_);
-    mg_->UpdateHierarchyPhaseRows(a,p);
+    mg_->UpdateHierarchyPhaseRows(a,p,&job.a_plans,&job.p_plans);
     for (int d = 0; d < solver_domain_.ndim; ++d) {
-      force_[d]->UpdatePhaseRows(update.acceleration[d]);
+      force_[d]->UpdatePhaseRows(update.acceleration[d],&job.force_plans[d]);
     }
     if (slab_ || vacuum_) {
-      boundary_rhs_op_->UpdatePhaseRows(update.boundary_rhs);
-      for (int d = 0; d < 3; ++d) boundary_force_[d]->UpdatePhaseRows(update.boundary_acceleration[d]);
+      boundary_rhs_op_->UpdatePhaseRows(update.boundary_rhs,&job.boundary_rhs_plan);
+      for (int d = 0; d < 3; ++d)
+        boundary_force_[d]->UpdatePhaseRows(update.boundary_acceleration[d],&job.boundary_force_plans[d]);
       if (slab_) slab_->SetShearOffset(shear_offset);
     }
+    // Release the host CSR rows and plans (the next assembly builds new ones).
+    job.fine = LocalCompositeUpdate{};
+    std::vector<CsrRowUpdate>().swap(job.a);
+    std::vector<CsrRowUpdate>().swap(job.p);
+    std::vector<PhaseRowPlan>().swap(job.a_plans);
+    std::vector<PhaseRowPlan>().swap(job.p_plans);
+    for (auto &plan : job.force_plans) plan = PhaseRowPlan{};
+    for (auto &plan : job.boundary_force_plans) plan = PhaseRowPlan{};
+    job.boundary_rhs_plan = PhaseRowPlan{};
     solver_domain_.shear_offset = shear_offset;
     phase_ = shear_offset;
     field_cache_valid_ = false;
@@ -667,11 +827,20 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
                 << " phase_updates=" << phase_update_count
                 << " assembly_workers=" << geometry_->PhaseThreads()
                 << " phase_threads_config=" << phase_threads_
+                << " prefetched=" << prefetched << " prefetch_wait_s=" << wait_s
                 << " assembly_s=" << assembled-begin
-                << " fine_assembly_s=" << fine_assembled-begin
-                << " coarse_assembly_s=" << coarse_assembled-fine_assembled
-                << " prolongation_assembly_s=" << assembled-coarse_assembled
+                << " fine_assembly_s=" << job.fine_s
+                << " coarse_assembly_s=" << job.coarse_s
+                << " prolongation_assembly_s=" << job.prolongation_s
+                << " plan_s=" << job.plan_s << " op_planned=" << PhaseTimes().planned
                 << " operators_s=" << ProfileTime(true)-assembled
+                << " op_validate_s=" << PhaseTimes().validate
+                << " op_ghosts_s=" << PhaseTimes().ghosts << " op_mpi_s=" << PhaseTimes().mpi
+                << " op_halo_s=" << PhaseTimes().halo << " op_remap_s=" << PhaseTimes().remap
+                << " op_upload_s=" << PhaseTimes().upload
+                << " op_diagonal_s=" << PhaseTimes().diagonal
+                << " op_terminal_s=" << PhaseTimes().terminal
+                << " op_calls=" << PhaseTimes().calls << " op_value_only=" << PhaseTimes().value_only
                 << " value_updates=" << counters.value_updates
                 << " structure_rebuilds=" << counters.structure_rebuilds
                 << " fine_halo_rebuilds=" << counters.halo_rebuilds
@@ -685,8 +854,10 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
 }
 
 void SelfGravity::RefreshHierarchy() {
+  JoinPrefetch();
   auto refreshed = BuildGeometricHierarchy(solver_patches_,solver_domain_,
-      global_variable::my_rank,global_variable::nranks,solver_neumann_z_,false);
+      global_variable::my_rank,global_variable::nranks,solver_neumann_z_,false,
+      phase_serial_only_ ? 1 : setup_threads_);
   if (refreshed.hierarchy.row_partitions[0] != partition_
       || refreshed.hierarchy.matrices[0].LocalRows() != solution_.extent_int(0)) {
     Fail("hierarchy-only refresh changed fine ownership; full rebuild required");
@@ -756,21 +927,214 @@ void SelfGravity::RememberSource(const DvceArray1D<Real> &physical_source) {
   Kokkos::deep_copy(cached_source_,physical_source);
 }
 
+// The field of the last accepted solve may serve the opening kick of the next step
+// when that solve was at this very time on the same mesh, phase, operator and constant, no
+// source callback exists, the gas density (a gas source) is bitwise unchanged, and the dust
+// module reports no mass-changing operation (G, R, instant switch, regrid) since; problem
+// loop work must declare that it keeps the particles. What remains possible in between are
+// the exact representation changes (split, lobe release, migration, reordering, removal of
+// massless outflow clouds), which change the deposit only by round-off.
+bool SelfGravity::KdkReuseAllowed(Real time, Real shift) {
+  auto *pm = pack_->pmesh;
+  bool ok = kdk_reuse_ && reuse_valid_ && field_cache_valid_ && phase_valid_
+      && time == last_time && shift == phase_ && phase_ == cached_phase_
+      && topology_ == pm->GetAMRLoadBalanceUpdateSeq() && topology_ == cached_topology_
+      && four_pi_G == cached_four_pi_G_ && mg_->FineUpdates().updates == cached_operator_updates_
+      && !extra_source_;
+  if (ok && coupled_dust_ && (source_dust_ || kick_dust_))
+    ok = pack_->pdust->gravity_mass_epoch == reuse_epoch_;
+  if (ok && pm->pgen->user_work_in_loop_func != nullptr && !pm->pgen->user_work_keeps_particles)
+    ok = false;
+  int changed = ok ? 0 : 1;
+  if (ok && source_gas_) {
+    const auto ind = pm->mb_indcs;
+    const int n = pack_->nmb_thispack*ind.nx1*ind.nx2*ind.nx3;
+    if (reuse_gas_.extent_int(0) != n) {
+      changed = 1;
+    } else {
+      auto u = pack_->phydro->u0;
+      auto gas = reuse_gas_;
+      Kokkos::parallel_reduce("sg_reuse_gas_check",Kokkos::RangePolicy<DevExeSpace>(0,n),
+      KOKKOS_LAMBDA(const int q, int &count) {
+        int t = q;
+        const int i = t%ind.nx1+ind.is; t /= ind.nx1;
+        const int j = t%ind.nx2+ind.js; t /= ind.nx2;
+        const int k = t%ind.nx3+ind.ks; t /= ind.nx3;
+        count += u(t,IDN,k,j,i) != gas(q);
+      },changed);
+    }
+  }
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE,&changed,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
+#endif
+  return changed == 0;
+}
+
+void SelfGravity::RememberReuseState() {
+  if (!kdk_reuse_) return;
+  reuse_valid_ = true;
+  if (coupled_dust_) reuse_epoch_ = pack_->pdust->gravity_mass_epoch;
+  if (source_gas_) {
+    const auto ind = pack_->pmesh->mb_indcs;
+    const int n = pack_->nmb_thispack*ind.nx1*ind.nx2*ind.nx3;
+    if (reuse_gas_.extent_int(0) != n) reuse_gas_ = DvceArray1D<Real>("sg_reuse_gas",n);
+    auto u = pack_->phydro->u0;
+    auto gas = reuse_gas_;
+    Kokkos::parallel_for("sg_reuse_gas_copy",Kokkos::RangePolicy<DevExeSpace>(0,n),
+    KOKKOS_LAMBDA(const int q) {
+      int t = q;
+      const int i = t%ind.nx1+ind.is; t /= ind.nx1;
+      const int j = t%ind.nx2+ind.js; t /= ind.nx2;
+      const int k = t%ind.nx3+ind.ks; t /= ind.nx3;
+      gas(q) = u(t,IDN,k,j,i);
+    });
+  }
+}
+
+// Diagnostic of a reuse: the fresh source against the kept one, the true residual of the
+// kept potential for the fresh right-hand side (the acceptance test of the solve it
+// replaces: <= rtol means that solve would have taken zero iterations), and a full regather
+// against the selective one. Nothing computed here enters the kept field.
+void SelfGravity::ReuseCheck(Real time, long long regathered) {
+  auto *pm = pack_->pmesh;
+  const auto ind = pm->mb_indcs;
+  const int n = pack_->nmb_thispack*ind.nx1*ind.nx2*ind.nx3;
+  const int solver_n = solution_.extent_int(0);
+  DvceArray5D<Real> fresh_dust;
+  if (coupled_dust_ && source_dust_) pack_->pdust->DepositGravityDensity(time,fresh_dust);
+  DvceArray1D<Real> fresh("sg_check_source",n), b("sg_check_rhs",solver_n),
+      work("sg_check_work",solver_n), x("sg_check_phi",solver_n);
+  auto u = pack_->phydro->u0;
+  auto rows = physical_rows_;
+  auto volume = volume_;
+  auto kept = physical_source_;
+  const bool dust_source = coupled_dust_ && source_dust_, gas_source = source_gas_;
+  Real mass = 0, diff = 0, size = 0;
+  Kokkos::parallel_reduce("sg_check_fresh_source",Kokkos::RangePolicy<DevExeSpace>(0,n),
+  KOKKOS_LAMBDA(const int q, Real &sum, Real &dmax, Real &smax) {
+    int t = q;
+    const int i = t%ind.nx1+ind.is; t /= ind.nx1;
+    const int j = t%ind.nx2+ind.js; t /= ind.nx2;
+    const int k = t%ind.nx3+ind.ks; t /= ind.nx3;
+    fresh(q) = (gas_source ? u(t,IDN,k,j,i) : Real(0))
+               +(dust_source ? fresh_dust(t,0,k,j,i) : Real(0));
+    sum += fresh(q)*volume(rows(q));
+    dmax = fmax(dmax,fabs(fresh(q)-kept(q)));
+    smax = fmax(smax,fabs(kept(q)));
+  },mass,Kokkos::Max<Real>(diff),Kokkos::Max<Real>(size));
+  Real maxima[2] = {diff,size};
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE,maxima,2,MPI_ATHENA_REAL,MPI_MAX,MPI_COMM_WORLD);
+#endif
+  const Real global_mass = Sum(mass);
+  Real total_volume = (pm->mesh_size.x1max-pm->mesh_size.x1min)*
+                      (pm->mesh_size.x2max-pm->mesh_size.x2min);
+  if (pm->three_d) total_volume *= pm->mesh_size.x3max-pm->mesh_size.x3min;
+  const Real mean = vertical_bc_ == "isolated" ? 0 : global_mass/total_volume;
+  const Real fourpig = four_pi_G;
+  Kokkos::deep_copy(b,0.0);
+  Kokkos::deep_copy(work,0.0);
+  Kokkos::parallel_for("sg_check_rhs",Kokkos::RangePolicy<DevExeSpace>(0,n),
+  KOKKOS_LAMBDA(const int q) {
+    const int row = rows(q);
+    work(row) = fresh(q);
+    b(row) = -fourpig*(fresh(q)-mean)*volume(row);
+  });
+  if (slab_ || vacuum_) {
+    DvceArray1D<Real> values("sg_check_boundary",boundary_values_.extent(0));
+    if (vacuum_) vacuum_->GPUFill(four_pi_G,global_mass,values);
+    else slab_->Compute(work,four_pi_G,values);
+    boundary_rhs_op_->Apply(values,work);
+    Kokkos::parallel_for("sg_check_add_boundary",Kokkos::RangePolicy<DevExeSpace>(0,solver_n),
+    KOKKOS_LAMBDA(const int q) { b(q) += work(q); });
+    // restore the boundary state of the kept field (flux of the vacuum gauge)
+    if (vacuum_) vacuum_->GPUFill(four_pi_G,last_physical_mass_,values);
+  }
+  Kokkos::deep_copy(x,solution_);
+  SolveStats residual;
+  try {
+    residual = mg_->Solve(b,x,tolerance_,0,restart_);
+  } catch (const std::exception &e) { Fail(e.what()); }
+  Real gather_diff = 0;
+  long long npart = 0;
+  if (coupled_dust_ && kick_dust_) {
+    DvceArray2D<Real> full;
+    pack_->pdust->GatherGravityAcceleration(time,acceleration,full);
+    auto kept_acc = particle_acceleration_;
+    npart = full.extent_int(1);
+    if (kept_acc.extent_int(1) != full.extent_int(1)) Fail("reuse check: particle count mismatch");
+    Kokkos::parallel_reduce("sg_check_regather",Kokkos::RangePolicy<DevExeSpace>(0,npart),
+    KOKKOS_LAMBDA(const int p, Real &dmax) {
+      for (int d = 0; d < 3; ++d) dmax = fmax(dmax,fabs(full(d,p)-kept_acc(d,p)));
+    },Kokkos::Max<Real>(gather_diff));
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE,&gather_diff,1,MPI_ATHENA_REAL,MPI_MAX,MPI_COMM_WORLD);
+#endif
+  }
+  const Real source_rel = maxima[1] > 0 ? maxima[0]/maxima[1] : maxima[0];
+  reuse_check_max_residual_ = std::max(reuse_check_max_residual_,residual.relative_residual);
+  reuse_check_max_source_ = std::max(reuse_check_max_source_,source_rel);
+  reuse_check_max_gather_ = std::max(reuse_check_max_gather_,gather_diff);
+  if (global_variable::my_rank == 0) {
+    std::cout << std::setprecision(6) << "# SG_REUSE_CHECK time=" << std::setprecision(12) << time
+              << std::setprecision(6) << " reused_relative_residual=" << residual.relative_residual
+              << " rtol=" << tolerance_
+              << " would_iterate=" << (residual.relative_residual > tolerance_)
+              << " source_max_abs_difference=" << maxima[0] << " source_max=" << maxima[1]
+              << " mass_difference=" << global_mass-last_physical_mass_
+              << " regathered_rank0=" << regathered << " clouds_rank0=" << npart
+              << " regather_max_difference=" << gather_diff << '\n';
+  }
+}
+
+// solution_ holds the accepted potential of time guess_t_cur_ on this mesh. For a
+// solve at a new time, keep that vector (guess_tmp_) and replace the guess by
+// x + r (x - x_prev), r = (t - t_cur)/(t_cur - t_prev). Returns whether it did.
+bool SelfGravity::ExtrapolateGuess(Real time, int solver_n) {
+  if (!guess_extrapolate_ || !guess_cur_valid_ || guess_topology_ != topology_
+      || time == guess_t_cur_ || solution_.extent_int(0) != solver_n) return false;
+  if (guess_tmp_.extent_int(0) != solver_n) {
+    guess_tmp_ = DvceArray1D<Real>("sg_guess_tmp",solver_n);
+    guess_prev_ = DvceArray1D<Real>("sg_guess_prev",solver_n);
+    guess_prev_valid_ = false;
+  }
+  Kokkos::deep_copy(guess_tmp_,solution_);
+  if (!guess_prev_valid_ || guess_t_cur_ == guess_t_prev_) return false;
+  const Real r = (time-guess_t_cur_)/(guess_t_cur_-guess_t_prev_);
+  if (!std::isfinite(r) || !(r > 0) || r > 4) return false;
+  auto x = solution_, cur = guess_tmp_, prev = guess_prev_;
+  Kokkos::parallel_for("sg_guess_extrapolate",Kokkos::RangePolicy<DevExeSpace>(0,solver_n),
+  KOKKOS_LAMBDA(const int q) { x(q) = cur(q)+r*(cur(q)-prev(q)); });
+  ++guess_extrapolations_;
+  return true;
+}
+
+// After an accepted solve at time: the previous accepted potential (guess_tmp_, kept by
+// ExtrapolateGuess) becomes x_prev when the solve was at a new time on the same mesh.
+void SelfGravity::RecordGuess(Real time, bool extrapolation_history) {
+  if (!guess_extrapolate_) return;
+  if (extrapolation_history) {
+    std::swap(guess_prev_,guess_tmp_);
+    guess_t_prev_ = guess_t_cur_;
+    guess_prev_valid_ = true;
+  } else if (guess_topology_ != topology_ || guess_prev_.extent_int(0) != solution_.extent_int(0)) {
+    guess_prev_valid_ = false;
+  }
+  if (time != guess_t_cur_ && !extrapolation_history) guess_prev_valid_ = false;
+  guess_t_cur_ = time;
+  guess_cur_valid_ = true;
+  guess_topology_ = topology_;
+}
+
 void SelfGravity::UpdateDustField(Real time) {
   if (coupled_dust_ && kick_dust_)
-    pack_->pdust->GatherGravityAcceleration(time,acceleration,particle_acceleration_);
+    pack_->pdust->GatherGravityAcceleration(time,acceleration,particle_acceleration_,kdk_reuse_);
 }
 
 void SelfGravity::Solve(Real time) {
   const double t0 = ProfileTime(profile_);
   auto *pm = pack_->pmesh;
-  Real shift = 0;
-  if (pm->mesh_bcs[0] == BoundaryFlag::shear_periodic) {
-    const auto *ps = pack_->phydro->psbox_u;
-    const Real ly = pm->mesh_size.x2max-pm->mesh_size.x2min;
-    shift = std::fmod(-ps->qshear*ps->omega0*
-                     (pm->mesh_size.x1max-pm->mesh_size.x1min)*time, ly);
-  }
+  const Real shift = ShearShift(time);
   if (!phase_valid_ || topology_ != pm->GetAMRLoadBalanceUpdateSeq()) {
     Rebuild(shift);
   } else if (shift != phase_) {
@@ -781,6 +1145,51 @@ void SelfGravity::Solve(Real time) {
   const auto ind = pm->mb_indcs;
   const int n = pack_->nmb_thispack*ind.nx1*ind.nx2*ind.nx3;
   const int solver_n = solution_.extent_int(0);
+  if (kdk_reuse_ && KdkReuseAllowed(time,shift)) {
+    // keep phi, the cell accelerations, the source and the boundary state of the
+    // last solve; regather only the clouds whose gather inputs changed since
+    ++reuse_count_;
+    ++cache_hit_count;
+    ++solve_count;
+    last_time = time;
+    last_solve_was_cached = true;
+    const double t_reuse = ProfileTime(profile_);
+    long long regathered = 0;
+    if (coupled_dust_ && (source_dust_ || kick_dust_)) {
+      auto *dust = pack_->pdust;
+      if (!dust->stopping_times_initialized ||
+          dust->stopping_time_mode == DustStoppingTimeMode::dynamic)
+        dust->RefreshStoppingTimeMaximum();
+    }
+    if (coupled_dust_ && kick_dust_) {
+      if (pack_->pdust->PointGravityTransferSupported()) {
+        UpdateDustField(time);
+        regathered = particle_acceleration_.extent_int(1);
+      } else {
+        regathered = pack_->pdust->RegatherGravityAccelerationChanged(time,particle_acceleration_);
+        if (regathered < 0) {   // no matching recorded gather: gather in full
+          UpdateDustField(time);
+          regathered = particle_acceleration_.extent_int(1);
+        }
+      }
+      reuse_regathered_ += regathered;
+    }
+    const double t_gather = ProfileTime(profile_);
+    if (reuse_check_) ReuseCheck(time,regathered);
+    UpdateTimeStep();
+    if (profile_) {
+      std::cout << std::setprecision(10) << "# SG_PROFILE_SOLVE rank="
+                << global_variable::my_rank << " solve=" << solve_count
+                << " time=" << time << " phase=" << shift << " rebuilds=" << rebuild_count
+                << " setup_s=" << t_setup-t0 << " source_s=0 deposit_s=0 boundary_s=0 solve_s=0"
+                << " force_s=" << ProfileTime(true)-t_reuse << " field_s=0"
+                << " gather_s=" << t_gather-t_reuse
+                << " iterations=0 matvecs=0 vcycles=0 residual=" << last_solve.relative_residual
+                << " cached=1 kdk_reused=1 regathered=" << regathered
+                << " cache_hits=" << cache_hit_count << " kdk_reuses=" << reuse_count_ << '\n';
+    }
+    return;
+  }
   auto rows = physical_rows_;
   auto physical_source = physical_source_;
   auto u = pack_->phydro->u0;
@@ -796,6 +1205,7 @@ void SelfGravity::Solve(Real time) {
       dust->RefreshStoppingTimeMaximum();
     dust->DepositGravityDensity(time,dust_density_);
   }
+  const double t_deposit = ProfileTime(profile_);
   if (extra.extent(0) < static_cast<std::size_t>(pack_->nmb_thispack)
       || extra.extent(1) < 1 || extra.extent(2) <= static_cast<std::size_t>(ind.ke)
       || extra.extent(3) <= static_cast<std::size_t>(ind.je)
@@ -837,11 +1247,13 @@ void SelfGravity::Solve(Real time) {
     // A resampling/split can preserve the complete leaf source while changing
     // particle locations, shape codes or count. Reuse phi, not stale gathered g.
     if (coupled_dust_) {UpdateDustField(time); UpdateTimeStep();}
+    RememberReuseState();
     if (profile_) {
       std::cout << std::setprecision(10) << "# SG_PROFILE_SOLVE rank="
                 << global_variable::my_rank << " solve=" << solve_count
                 << " time=" << time << " phase=" << shift << " rebuilds=" << rebuild_count
                 << " setup_s=" << t_setup-t0 << " source_s=" << t_source-t_setup
+                << " deposit_s=" << t_deposit-t_setup
                 << " boundary_s=0 solve_s=0 force_s=0 iterations=0 matvecs=0 vcycles=0"
                 << " residual=" << last_solve.relative_residual
                 << " cached=1 residual_cached=1 cache_hits=" << cache_hit_count
@@ -884,6 +1296,11 @@ void SelfGravity::Solve(Real time) {
   SolveStats cached_attempt;
   double cached_attempt_s = 0, hierarchy_refresh_s = 0, fresh_attempt_s = 0;
   bool refreshed = false;
+  // guess = extrapolate: the history step is valid when solution_ holds the
+  // accepted potential of the last solve time on this mesh (kept in guess_tmp_)
+  const bool guess_history = guess_extrapolate_ && guess_cur_valid_ && guess_topology_ == topology_
+      && time != guess_t_cur_ && solution_.extent_int(0) == solver_n;
+  const bool extrapolated = ExtrapolateGuess(time,solver_n);
   try {
     const double attempt_begin = ProfileTime(true);
     last_solve = mg_->Solve(rhs_,solution_,tolerance_,attempt_cap,restart_);
@@ -938,6 +1355,7 @@ void SelfGravity::Solve(Real time) {
   }
   hierarchy_fresh_ = false;
   const double t_solve = ProfileTime(profile_);
+  RecordGuess(time,guess_history);
   auto sol = solution_;
   Real gauge = 0;
   if (vacuum_) gauge = vacuum_->GaugeShift(solution_);
@@ -982,15 +1400,20 @@ void SelfGravity::Solve(Real time) {
       });
     }
   }
+  const double t_acceleration = ProfileTime(profile_);
   ++solve_count;
   last_time = time;
   UpdateDustField(time);
+  const double t_gather = ProfileTime(profile_);
   UpdateTimeStep();
+  const double t_timestep = ProfileTime(profile_);
   cached_phase_ = phase_;
   cached_topology_ = topology_;
   cached_four_pi_G_ = four_pi_G;
   cached_operator_updates_ = mg_->FineUpdates().updates;
   field_cache_valid_ = true;
+  last_physical_mass_ = global_physical_mass;
+  RememberReuseState();
   if (profile_) {
     const auto storage = mg_->Storage();
     const auto updates = mg_->FineUpdates();
@@ -998,11 +1421,14 @@ void SelfGravity::Solve(Real time) {
               << global_variable::my_rank << " solve=" << solve_count
               << " time=" << time << " phase=" << shift << " rebuilds=" << rebuild_count
               << " setup_s=" << t_setup-t0 << " source_s=" << t_source-t_setup
+              << " deposit_s=" << t_deposit-t_setup
               << " boundary_s=" << t_boundary-t_source << " solve_s=" << t_solve-t_boundary
               << " force_s=" << ProfileTime(true)-t_solve
+              << " field_s=" << t_acceleration-t_solve << " gather_s=" << t_gather-t_acceleration
+              << " timestep_s=" << t_timestep-t_gather
               << " iterations=" << last_solve.iterations
               << " matvecs=" << last_solve.matrix_applications
-              << " vcycles=" << last_solve.vcycles
+              << " vcycles=" << last_solve.vcycles << " extrapolated_guess=" << extrapolated
               << " residual=" << last_solve.relative_residual
               << " cached=0 residual_cached=0 cache_hits=" << cache_hit_count
               << " physical_mass=" << global_physical_mass

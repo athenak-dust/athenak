@@ -692,6 +692,7 @@ void DustGasDrag::StressResamplePool() {
 }
 
 int DustGasDrag::ResampleClouds(const bool local) {
+  ++gravity_mass_epoch;   // R changes the deposited mass (gravity field reuse)
   if (clouds3d) return ResampleClouds3D(local);
   using Clock = std::chrono::steady_clock;
   auto seconds = [](const Clock::time_point &a) {

@@ -1323,6 +1323,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       user_bcs_func = LiVerticalBCs;
       user_bcs_coarse_func = LiVerticalBCsCoarse;
       user_work_in_loop_func = LiRenormalize;
+      user_work_keeps_particles = true;   // it rescales the gas density only
       if (restart) {   // the initial mean density and the running total from the restart file
         livbc_.mean0 = pin->GetReal("problem", "vbc_mean0");
         livbc_.dm = pin->GetOrAddReal("problem", "vbc_dm", 0.0);

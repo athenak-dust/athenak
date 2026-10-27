@@ -82,6 +82,11 @@ class MeshGeometry {
   // only assemble host rows; callers must not concurrently use this geometry.
   void SetPhaseThreads(int threads);
   int PhaseThreads() const;  // actual workers, including the calling thread
+  // Host workers of a full setup (BuildSystem, transfers; default 1). 0 selects every
+  // affinity CPU in device builds (the host is otherwise idle during a rebuild), one in CPU
+  // builds. The coefficients do not depend on it.
+  void SetSetupThreads(int threads);
+  int SetupThreads() const;
   // Requires initial BuildSystem or PhaseRows. Only PhaseRows are visited;
   // physical topology and sample ownership stay fixed across arbitrary phases.
   // false updates only A, without boundary/force CSR allocation or assembly.
