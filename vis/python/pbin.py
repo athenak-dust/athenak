@@ -120,7 +120,8 @@ def read_header(path):
         if version not in SUPPORTED_VERSIONS:
             raise PbinError(f"{path}: format version {version} not supported")
         vals = np.frombuffer(pre[16:64], bo + "u8")
-        text_bytes, data_start, data_bytes, n_particles, n_blocks = (int(v) for v in vals[:5])
+        text_bytes, data_start, data_bytes, n_particles, n_blocks = \
+            (int(v) for v in vals[:5])
         f.seek(data_start + data_bytes)
         foot = f.read(FOOTER)
         if len(foot) < FOOTER or foot[:8] != END:
@@ -243,7 +244,7 @@ class PbinSnapshot:
 
     def root_dx(self):
         r = self.header["representation"]
-        return np.array([float(r["root_dx1"]), float(r["root_dx2"]), float(r["root_dx3"])])
+        return np.array([float(r[f"root_dx{d}"]) for d in (1, 2, 3)])
 
     def cloud_half_width(self):
         """(N,3) half-width ell of the hat along each direction, root_dx * 2**-level (the
@@ -257,8 +258,8 @@ class PbinSnapshot:
         return ell
 
     def cloud_width(self):
-        """(N,3) full support width of every cloud: 2 ell without a lobe, 3 ell with a lower
-        or upper lobe, 4 ell with both."""
+        """(N,3) full support width of every cloud: 2 ell without a lobe, 3 ell with a
+        lower or upper lobe, 4 ell with both."""
         lo, hi = self.cloud_support()
         return hi - lo
 
@@ -347,7 +348,8 @@ def read(path, columns=None):
     cols, blocks = {}, {}
     with open(path, "rb") as f:
         for c in coldir:
-            if c["table"] == "particles" and columns is not None and c["name"] not in columns:
+            if (c["table"] == "particles" and columns is not None
+                    and c["name"] not in columns):
                 continue
             f.seek(pre["data_start"] + c["offset"])
             arr = np.fromfile(f, dtype=np.dtype(c["dtype"]), count=c["count"])
@@ -394,10 +396,11 @@ def check(snap, raise_on_error=False):
         for d in range(snap.ndim):
             x = c[f"x{d+1}"]
             lo, hi = float(m[f"x{d+1}min"]), float(m[f"x{d+1}max"])
-            # the code may store a position a round-off below a periodic face (e.g. -1e-28 after
-            # a merge or resampling at x = 0): tolerate 1e-12 of the domain length
+            # the code may store a position a round-off below a periodic face (e.g. -1e-28
+            # after a merge or resampling at x = 0): tolerate 1e-12 of the domain length
             tol = 1e-12 * (hi - lo)
-            if not (np.all(np.isfinite(x)) and x.min() >= lo - tol and x.max() < hi + tol):
+            inside = x.min() >= lo - tol and x.max() < hi + tol
+            if not (np.all(np.isfinite(x)) and inside):
                 problems.append(f"positions outside [x{d+1}min, x{d+1}max)")
         if np.any(snap.owner_gid() < 0):
             problems.append("particles in no MeshBlock")
