@@ -446,6 +446,7 @@ void SelfGravity::Rebuild(Real shear_offset) {
 
 void SelfGravity::RebuildDistributed(Real shear_offset) {
   const double t0 = ProfileTime(profile_);
+  BuildTimes() = HierarchyBuildTimes{};
   auto *pm = pack_->pmesh;
   const auto ind = pm->mb_indcs;
   const int rank = global_variable::my_rank, nranks = global_variable::nranks;
@@ -608,6 +609,10 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
                     setup.quadratic_interface_fallbacks.end(),std::size_t(0))
                 << " fine_quadratic_interface_fallbacks=" << setup.fine.quadratic_interface_fallbacks
                 << " geometry_s=" << t_geometry-t0 << " assembly_s=" << t_assembly-t_geometry
+                << " assembly_geometry_s=" << BuildTimes().geometry
+                << " assembly_fine_s=" << BuildTimes().fine_system
+                << " assembly_transfers_s=" << BuildTimes().transfers
+                << " assembly_coarse_s=" << BuildTimes().coarse_system
                 << " operators_s=" << t_operators-t_assembly
                 << " slab_setup_s=" << t_slab-t_operators
                 << " boundary_setup_s=" << t_slab-t_operators
@@ -628,6 +633,7 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
 
 void SelfGravity::UpdatePhase(Real shear_offset) {
   const double begin = ProfileTime(profile_);
+  PhaseTimes() = PhaseUpdateTimes{};
   try {
     auto update = geometry_->BuildPhaseUpdate(shear_offset);
     const double fine_assembled = ProfileTime(profile_);
@@ -672,6 +678,13 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
                 << " coarse_assembly_s=" << coarse_assembled-fine_assembled
                 << " prolongation_assembly_s=" << assembled-coarse_assembled
                 << " operators_s=" << ProfileTime(true)-assembled
+                << " op_validate_s=" << PhaseTimes().validate
+                << " op_ghosts_s=" << PhaseTimes().ghosts << " op_mpi_s=" << PhaseTimes().mpi
+                << " op_halo_s=" << PhaseTimes().halo << " op_remap_s=" << PhaseTimes().remap
+                << " op_upload_s=" << PhaseTimes().upload
+                << " op_diagonal_s=" << PhaseTimes().diagonal
+                << " op_terminal_s=" << PhaseTimes().terminal
+                << " op_calls=" << PhaseTimes().calls << " op_value_only=" << PhaseTimes().value_only
                 << " value_updates=" << counters.value_updates
                 << " structure_rebuilds=" << counters.structure_rebuilds
                 << " fine_halo_rebuilds=" << counters.halo_rebuilds
@@ -796,6 +809,7 @@ void SelfGravity::Solve(Real time) {
       dust->RefreshStoppingTimeMaximum();
     dust->DepositGravityDensity(time,dust_density_);
   }
+  const double t_deposit = ProfileTime(profile_);
   if (extra.extent(0) < static_cast<std::size_t>(pack_->nmb_thispack)
       || extra.extent(1) < 1 || extra.extent(2) <= static_cast<std::size_t>(ind.ke)
       || extra.extent(3) <= static_cast<std::size_t>(ind.je)
@@ -842,6 +856,7 @@ void SelfGravity::Solve(Real time) {
                 << global_variable::my_rank << " solve=" << solve_count
                 << " time=" << time << " phase=" << shift << " rebuilds=" << rebuild_count
                 << " setup_s=" << t_setup-t0 << " source_s=" << t_source-t_setup
+                << " deposit_s=" << t_deposit-t_setup
                 << " boundary_s=0 solve_s=0 force_s=0 iterations=0 matvecs=0 vcycles=0"
                 << " residual=" << last_solve.relative_residual
                 << " cached=1 residual_cached=1 cache_hits=" << cache_hit_count
@@ -982,10 +997,13 @@ void SelfGravity::Solve(Real time) {
       });
     }
   }
+  const double t_acceleration = ProfileTime(profile_);
   ++solve_count;
   last_time = time;
   UpdateDustField(time);
+  const double t_gather = ProfileTime(profile_);
   UpdateTimeStep();
+  const double t_timestep = ProfileTime(profile_);
   cached_phase_ = phase_;
   cached_topology_ = topology_;
   cached_four_pi_G_ = four_pi_G;
@@ -998,8 +1016,11 @@ void SelfGravity::Solve(Real time) {
               << global_variable::my_rank << " solve=" << solve_count
               << " time=" << time << " phase=" << shift << " rebuilds=" << rebuild_count
               << " setup_s=" << t_setup-t0 << " source_s=" << t_source-t_setup
+              << " deposit_s=" << t_deposit-t_setup
               << " boundary_s=" << t_boundary-t_source << " solve_s=" << t_solve-t_boundary
               << " force_s=" << ProfileTime(true)-t_solve
+              << " field_s=" << t_acceleration-t_solve << " gather_s=" << t_gather-t_acceleration
+              << " timestep_s=" << t_timestep-t_gather
               << " iterations=" << last_solve.iterations
               << " matvecs=" << last_solve.matrix_applications
               << " vcycles=" << last_solve.vcycles

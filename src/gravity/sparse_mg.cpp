@@ -5,6 +5,7 @@
 #include "gravity/sparse_mg.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -14,7 +15,15 @@
 #include <unordered_map>
 
 namespace gravity {
+PhaseUpdateTimes &PhaseTimes() {
+  static PhaseUpdateTimes times;
+  return times;
+}
 namespace {
+double HostSeconds() {
+  return std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 using Vector = DvceArray1D<Real>;
 using Indices = DvceArray1D<int>;
 
@@ -446,6 +455,12 @@ struct SparseMultigrid::Impl {
   }
 
   bool UpdatePhase(Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal = false) {
+    auto &times = PhaseTimes();
+    double clock = HostSeconds();
+    auto lap = [&clock](double &bucket) {
+      const double now = HostSeconds(); bucket += now-clock; clock = now;
+    };
+    ++times.calls;
     bool valid = op.phase_configured && a.global_rows == op.global_rows
         && a.global_cols == op.global_cols && a.row_begin == op.row_begin
         && a.rows == op.phase_rows_host && a.rowptr.size() == a.rows.size()+1
@@ -466,7 +481,9 @@ struct SparseMultigrid::Impl {
             && std::isfinite(Real(1)/diagonal);
       }
     }
+    lap(times.validate);
     Require(valid,"invalid compact phase CSR, ownership, row set, or smoothing diagonal");
+    lap(times.mpi);
     const bool same = a.rowptr == op.phase_rowptr_host && a.colidx == op.phase_columns_host;
     if (!same) ++op.phase_updates.local_pattern_changes;
     std::vector<GlobalIndex> next_ghosts;
@@ -487,11 +504,13 @@ struct SparseMultigrid::Impl {
     const auto &ghosts = same ? op.ghost_ids : next_ghosts;
     const int local_ghost_change = ghosts != op.ghost_ids;
     int global_ghost_change = local_ghost_change;
+    lap(times.ghosts);
 #if MPI_PARALLEL_ENABLED
     // A remote rank may change requests addressed to this rank even when our
     // own CSR/ghost list is unchanged. Every rank must rebuild the send plan.
     MPI_Allreduce(MPI_IN_PLACE,&global_ghost_change,1,MPI_INT,MPI_MAX,comm);
 #endif
+    lap(times.mpi);
     op.phase_updates.local_ghost_changes += local_ghost_change;
     op.phase_updates.global_ghost_changes += global_ghost_change;
     if (global_ghost_change) {
@@ -500,13 +519,17 @@ struct SparseMultigrid::Impl {
     } else {
       ++op.phase_updates.halo_reuses;
     }
+    lap(times.halo);
     if (local_ghost_change) BuildGhostSlots(op);
+    lap(times.ghosts);
     // No MPI occurs below this point: CSR/value uploads are local decisions.
     if (same) {
       auto host = Kokkos::create_mirror_view(op.phase_values);
       for (size_t k = 0; k < a.values.size(); ++k) host(k) = a.values[k];
       Kokkos::deep_copy(op.phase_values,host);
       ++op.phase_updates.value_updates;
+      ++times.value_only;
+      lap(times.upload);
     } else {
       std::vector<int> columns(a.colidx.size());
       for (size_t k = 0; k < a.colidx.size(); ++k) {
@@ -514,6 +537,7 @@ struct SparseMultigrid::Impl {
         columns[k] = j >= begin && j < end ? static_cast<int>(j-begin)
             : op.inputs+op.phase_ghost_slots.at(j);
       }
+      lap(times.remap);
       if (op.phase_rowptr.size() == a.rowptr.size()) {
         auto host = Kokkos::create_mirror_view(op.phase_rowptr);
         for (size_t k = 0; k < a.rowptr.size(); ++k) host(k) = a.rowptr[k];
@@ -526,6 +550,7 @@ struct SparseMultigrid::Impl {
       op.phase_rowptr_host = a.rowptr;
       op.phase_columns_host = a.colidx;
       ++op.phase_updates.structure_rebuilds;
+      lap(times.upload);
     }
     op.phase_active = true;
     ++op.phase_updates.updates;
@@ -1345,10 +1370,14 @@ void SparseMultigrid::UpdateHierarchyPhaseRows(const std::vector<CsrRowUpdate> &
   for (size_t l = 1; l < a.size(); ++l) {
     auto &level = impl_->levels[l]; const bool smooth = l+1 < a.size();
     impl_->UpdatePhase(level.a,a[l],smooth);
+    const double t0 = HostSeconds();
     if (smooth) impl_->UpdatePhaseDiagonal(level.a,level.inverse_diagonal);
+    PhaseTimes().diagonal += HostSeconds()-t0;
   }
   for (size_t l = 0; l < p.size(); ++l) impl_->UpdatePhase(impl_->levels[l].p,p[l]);
+  const double t0 = HostSeconds();
   if (impl_->terminal_phase_changes || terminal_full_update) impl_->UpdateTerminal(a.back());
+  PhaseTimes().terminal += HostSeconds()-t0;
 }
 SolveStats SparseMultigrid::Solve(const Vector &rhs, const Vector &x, Real tolerance,
                                  int max_iterations, int restart) {

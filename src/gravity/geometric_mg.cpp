@@ -356,13 +356,27 @@ void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
 }
 }  // namespace
 
+HierarchyBuildTimes &BuildTimes() {
+  static HierarchyBuildTimes times;
+  return times;
+}
+
 GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     const CompositeDomain &domain, int rank, int nranks, bool neumann_z,
     bool fine_forces) {
+  auto &times = BuildTimes();
+  auto now = []() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  double clock = now();
+  auto lap = [&](double &bucket) { const double t = now(); bucket += t-clock; clock = t; };
   GeometricSystem out;
   out.fine_geometry.reset(new MeshGeometry(std::move(patches),domain,rank,nranks,neumann_z));
   MeshGeometry *fine = out.fine_geometry.get();
+  lap(times.geometry);
   out.fine = fine->BuildSystem(fine_forces);
+  lap(times.fine_system);
   out.quadratic_interface_fallbacks.push_back(out.fine.quadratic_interface_fallbacks);
   out.hierarchy.constant_nullspace = !domain.isolated_z || neumann_z;
   out.hierarchy.matrices.push_back(std::move(out.fine.matrix));
@@ -375,11 +389,14 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
       throw std::runtime_error("Gravity geometric coarsening did not reduce global rows");
     std::unique_ptr<MeshGeometry> coarse(new MeshGeometry(std::move(coarse_patches),domain,
                                                         rank,nranks,neumann_z,true));
+    lap(times.geometry);
     LocalCsr p, r; TransferDiagnostics check; std::vector<int> phase_rows;
     ProlongationCacheStats cache_statistics;
     Transfers(*fine,*coarse,domain,rank,p,r,check,neumann_z,phase_rows,cache_statistics);
+    lap(times.transfers);
     out.initial_prolongation_cache.push_back(cache_statistics);
     auto system = coarse->BuildSystem(false);
+    lap(times.coarse_system);
     out.quadratic_interface_fallbacks.push_back(system.quadratic_interface_fallbacks);
     out.hierarchy.matrices.push_back(std::move(system.matrix));
     out.hierarchy.row_partitions.push_back(coarse->RowPartition());

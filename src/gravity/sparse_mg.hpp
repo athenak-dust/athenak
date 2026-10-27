@@ -96,6 +96,16 @@ struct FineOperatorStats {
   std::uint64_t host_map_entries = 0, host_map_buckets = 0, host_map_peak_bytes = 0;
 };
 
+// Host wall-clock seconds spent in compact phase-row updates (all operators of this
+// process) since the last reset; for <gravity>/profile output only. Device work is
+// counted where a host copy or MPI call waits for it.
+struct PhaseUpdateTimes {
+  double validate = 0, ghosts = 0, mpi = 0, halo = 0, remap = 0, upload = 0;
+  double diagonal = 0, terminal = 0;
+  std::uint64_t calls = 0, value_only = 0;
+};
+PhaseUpdateTimes &PhaseTimes();
+
 // Restarted flexible GMRES preconditioned by the supplied multigrid V-cycle. The
 // production path accepts independent A/P/R; the legacy adapter uses Galerkin R=P^T.
 // Supports nonsymmetric conservative FV operators without assuming CG symmetry.

@@ -47,6 +47,13 @@ struct GeometricSystem {
   std::vector<std::size_t> quadratic_interface_fallbacks;
 };
 
+// Host wall-clock seconds of the hierarchy construction phases since the last reset;
+// for <gravity>/profile output only.
+struct HierarchyBuildTimes {
+  double geometry = 0, fine_system = 0, transfers = 0, coarse_system = 0;
+};
+HierarchyBuildTimes &BuildTimes();
+
 // Rediscretized FV A, tensor-linear P, and explicit integrated-residual child-sum
 // R. This is R=P0^T, not P^T. Coarsening halves even patch counts, then merges
 // complete geometric sibling patch families. Setup stops at <=128 global cells.
