@@ -39,7 +39,7 @@
 //! refinement, one that stays below amr_rho_derefine (< amr_rho_refine, hysteresis) for
 //! derefinement.
 //! The sibling, 2:1 and refinement_interval rules of MeshRefinement apply as usual.  Each
-//! check writes a line to dust_trigger_log.txt.
+//! check decides the refinement flags.
 //!
 //! For the comparison with the old transfer, the old owner_overlap
 //! transfer also runs on the dynamic mesh, one rank.  Point particles, TSC on the block that
@@ -113,7 +113,7 @@ struct DensityTrigger {
   }
   // With map = block, the block values on the device (default) or on the host; check:
   // both, every value compared (diagnostic)
-  bool device = true, device_check = false;
+  bool device = true;
   // <dust>/amr_shear_face_limit = on (the default: the 2:1 rule of
   // all other neighbours, within what the face exchange can fill) | off (ShearFaceLevelLimit).
   // Rixin: auto and amr_shear_face_dmax (for 8x16x8 blocks) were removed (16^3 blocks)
@@ -121,9 +121,6 @@ struct DensityTrigger {
 };
 DensityTrigger trig_;
 // Per-block audit of the trigger
-bool audit_ = false;
-int audit_max_ = 40, audit_dumps_ = 0;
-std::vector<long long> audit_prev_;   // (level, lx1, lx2, applied flag) of the previous check, flattened
 
 // Order-independent 64-bit sum over the particles of a hash of every real column and of every
 // integer column except PGID: equal before and after a regrid exactly when no particle was
@@ -319,7 +316,6 @@ void SetupDensityTrigger(ParameterInput *pin) {
     }
   }
   trig_.device = pin->GetOrAddBoolean("dust", "amr_rho_device", true);
-  trig_.device_check = pin->GetOrAddBoolean("dust", "amr_rho_device_check", false);
   {
     // Rixin: default on (the shear-periodic x1 faces follow the 2:1 rule of all other
     // neighbours, within what the face exchange can fill); auto = only the exchange's limit
@@ -340,8 +336,6 @@ void SetupDensityTrigger(ParameterInput *pin) {
         pin->GetInteger("dust", "amr_shear_face_dmax") >= 0)
       fatal("<dust>/amr_shear_face_dmax was removed on 2026-10-27 (it served the 8x16x8 conversion)");
   }
-  audit_ = pin->GetOrAddBoolean("dust", "amr_trigger_audit", false);
-  audit_max_ = pin->GetOrAddInteger("dust", "amr_trigger_audit_max", 40);
   if (!(trig_.rho_derefine >= 0.0 && trig_.rho_derefine < trig_.rho_refine) || trig_.buffer < 0) {
     fatal("amr_density_trigger needs 0 <= amr_rho_derefine < amr_rho_refine and amr_rho_buffer >= 0");
   }
@@ -730,21 +724,6 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
   ShearFaceLevelLimit(pmbp, nref, nder);
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
-  if (global_variable::my_rank == 0) {
-    std::vector<int> perlev(pm->max_level - pm->root_level + 1, 0);
-    for (int g=0; g<pm->nmb_total; ++g) ++perlev[pm->lloc_eachmb[g].level - pm->root_level];
-    std::string pl;
-    for (std::size_t l=0; l<perlev.size(); ++l) pl += (l ? "/" : "") + std::to_string(perlev[l]);
-    char buf[512];
-    std::snprintf(buf, sizeof(buf), "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d %s\n", pm->ncycle,
-                  pm->time, qmax, nmb, nref, nder, vfine/vbox, (mtot > 0.0) ? mfine/mtot : 0.0,
-                  nlev[0], nlev[1], nlev[2], pl.c_str());
-    pd->trig_log_line = buf;
-    if (pd->trig_log_first) {
-      pd->trig_log_first = false;
-      pd->WriteTriggerLog();
-    }
-  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -826,43 +805,9 @@ void DensityRefinement3DPoint(MeshBlockPack *pmbp) {
   (void) nflag;
 }
 
-// header of dust_rank_log.txt (amr_profile, several ranks): regrid lines and check lines
-static const char *kRankLogHeader =
-    "# regrid ncycle time t_transfer_build t_route t_halo_check (s, slowest rank) | per rank: "
-    "blocks particles halo_blocks; since 2026-10-25 also lines 'c ncycle time | per rank: blocks "
-    "particles' at every check of the density trigger\n";
-
-//----------------------------------------------------------------------------------------
-//! \fn RankBalanceLog
-//! \brief With amr_profile on several ranks, the blocks and particles
-//! of every rank at each check of the density trigger (every ncycle_check cycles).  The regrid
-//! line holds the counts right after the regrid, before the clouds of newly refined blocks
-//! split; these lines show the balance after the split.  Diagnostic only.
-
-static void RankBalanceLog(MeshBlockPack *pmbp) {
-#if MPI_PARALLEL_ENABLED
-  if (!ProfOn() || global_variable::nranks <= 1 || pmbp->ppart == nullptr) return;
-  const int nr = global_variable::nranks;
-  int mine[2] = {pmbp->nmb_thispack, pmbp->ppart->nprtcl_thispack};
-  std::vector<int> all(2*nr, 0);
-  MPI_Gather(mine, 2, MPI_INT, all.data(), 2, MPI_INT, 0, MPI_COMM_WORLD);
-  if (global_variable::my_rank != 0) return;
-  std::FILE *fp = AppendLog("dust_rank_log.txt");
-  if (fp == nullptr) return;
-  if (LogEmpty(fp)) std::fputs(kRankLogHeader, fp);
-  std::fprintf(fp, "c %d %.10g |", pmbp->pmesh->ncycle, pmbp->pmesh->time);
-  for (int r=0; r<nr; ++r) std::fprintf(fp, " %d %d", all[2*r], all[2*r + 1]);
-  std::fprintf(fp, "\n");
-  std::fflush(fp);
-#else
-  (void) pmbp;
-#endif
-}
-
 void DensityRefinement(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
   DustGasDrag *pdust = pmbp->pdust;
-  RankBalanceLog(pmbp);
   // 3-D point particles here; 3-D refinable clouds below
   if (pm->three_d && !(pdust != nullptr && pdust->Clouds3D())) {
     DensityRefinement3DPoint(pmbp);
@@ -968,7 +913,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   // On the device the field stays there (the host copy only for the host path and
   // the comparison)
   const bool dev_blocks = trig_.device;
-  const bool host_f = !dev_blocks || trig_.device_check;
+  const bool host_f = !dev_blocks;
   decltype(Kokkos::create_mirror_view_and_copy(HostMemSpace(), f)) fhf;
   if (host_f) fhf = Kokkos::create_mirror_view_and_copy(HostMemSpace(), f);
   lap(DustGasDrag::kProfTrigCopy);
@@ -1206,9 +1151,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     ad_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ad);
     bd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bd);
   }
-  int nref = 0, nder = 0, nmis = 0;
-  std::vector<Real> qblk(nmb, 0.0);
-  std::vector<int> rawf(nmb, 0), appf(nmb, 0);
+  int nref = 0, nder = 0;
   for (int m=0; m<nmb; ++m) {
     const auto &sz = mbsize.h_view(m);
     Real q = 0.0;
@@ -1224,16 +1167,6 @@ void DensityRefinement(MeshBlockPack *pmbp) {
         std::exit(EXIT_FAILURE);
       }
       q = qd_h(m);
-      if (trig_.device_check) {
-        const Real qh = BlockValue(m, sz.x1min, sz.x1max, sz.x2min, sz.x2max, sz.dx1, sz.dx2);
-        if (qh != q) {
-          if (nmis < 5) {
-            std::cout << "# amr_rho_device_check: block " << m + mbs << " device " << q << " host "
-                      << qh << std::endl;
-          }
-          ++nmis;
-        }
-      }
     } else {
       q = BlockValue(m, sz.x1min, sz.x1max, sz.x2min, sz.x2max, sz.dx1, sz.dx2);
     }
@@ -1248,98 +1181,10 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     refine_flag.h_view(m + mbs) = flag;
     if (flag > 0) ++nref;
     if (flag < 0) ++nder;
-    // what CheckForRefinement keeps after this request: no change within refinement_interval
-    // cycles of the block's last change (its age was incremented before this call)
-    qblk[m] = q; rawf[m] = flag;
-    appf[m] = (pm->pmr->ncyc_since_ref(m + mbs) < pm->pmr->refinement_interval) ? 0 : flag;
   }
   lap(DustGasDrag::kProfTrigBlocks);
-  if (nmis > 0) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "amr_rho_device_check: " << nmis << " block values differ between device and host"
-              << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
-  // Audit: per-block lines every check; the pre-regrid state (blocks and particles)
-  // at the checks whose applied flags differ from those of the previous check
-  if (audit_ && global_variable::my_rank == 0) {
-    std::vector<long long> cur;
-    for (int m=0; m<nmb; ++m) {
-      const auto &ll = pm->lloc_eachmb[m + mbs];
-      cur.insert(cur.end(), {ll.level, ll.lx1, ll.lx2, appf[m]});
-    }
-    std::FILE *fb = std::fopen("dust_trigger_blocks.txt", "a");
-    if (fb != nullptr) {
-      std::fseek(fb, 0, SEEK_END);
-      if (std::ftell(fb) == 0) {
-        std::fprintf(fb, "# ncycle time level lx1 lx2 q raw_flag applied_flag age\n");
-      }
-      for (int m=0; m<nmb; ++m) {
-        const auto &ll = pm->lloc_eachmb[m + mbs];
-        std::fprintf(fb, "%d %.17g %d %d %d %.17g %d %d %d\n", pm->ncycle, pm->time, ll.level, ll.lx1,
-                     ll.lx2, qblk[m], rawf[m], appf[m], pm->pmr->ncyc_since_ref(m + mbs));
-      }
-      std::fclose(fb);
-    }
-    if (cur != audit_prev_ && audit_dumps_ < audit_max_) {
-      ++audit_dumps_;
-      char name[64];
-      std::snprintf(name, sizeof(name), "trigger_audit.%08d.bin", pm->ncycle);
-      std::FILE *fd = std::fopen(name, "wb");
-      if (fd != nullptr) {
-        auto prh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
-        auto pih = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pi);
-        std::fprintf(fd, "AthenaK trigger audit v1\n%.17g %d %d %d %d %d %.17g %.17g %.17g %.17g %.17g %.17g %d %d\n",
-                     pm->time, pm->ncycle, nmb, npart, nr1, nr2, x0, pm->mesh_size.x1max, y0,
-                     pm->mesh_size.x2max, trig_.rho_refine, trig_.rho_derefine, trig_.buffer,
-                     pm->pmr->refinement_interval);
-        std::vector<double> row(13);
-        for (int m=0; m<nmb; ++m) {
-          const auto &ll = pm->lloc_eachmb[m + mbs];
-          const auto &sz = mbsize.h_view(m);
-          row = {static_cast<double>(ll.level), static_cast<double>(ll.lx1), static_cast<double>(ll.lx2),
-                 sz.x1min, sz.x1max, sz.x2min, sz.x2max, static_cast<double>(nx1), static_cast<double>(nx2),
-                 qblk[m], static_cast<double>(rawf[m]), static_cast<double>(appf[m]),
-                 static_cast<double>(pm->pmr->ncyc_since_ref(m + mbs))};
-          std::fwrite(row.data(), sizeof(double), row.size(), fd);
-        }
-        for (int p=0; p<npart; ++p) {
-          const double r4[4] = {prh(IPX,p), prh(IPY,p), prh(IPM,p), static_cast<double>(pih(PLEV,p))};
-          std::fwrite(r4, sizeof(double), 4, fd);
-        }
-        std::fclose(fd);
-      }
-    }
-    audit_prev_ = cur;
-  }
-  // several ranks (Codex review): the log holds totals over the ranks
-  int nblk = nmb, nflag[2] = {nref, nder};
-#if MPI_PARALLEL_ENABLED
-  if (global_variable::nranks > 1) {
-    nblk = pm->nmb_total;
-    MPI_Allreduce(MPI_IN_PLACE, nflag, 2, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-  }
-#endif
-  if (global_variable::my_rank == 0) {
-    // Rixin: the line of this check, written only if the mesh changes after it (BeforeRegrid)
-    // and for the first check of the run; the state between two regrids is that of the last line
-    const Real vbox = (pm->mesh_size.x1max - x0)*(pm->mesh_size.x2max - y0);
-    // the blocks of every level, from the global block list
-    std::vector<int> perlev(pm->max_level - pm->root_level + 1, 0);
-    for (int g=0; g<pm->nmb_total; ++g) ++perlev[pm->lloc_eachmb[g].level - pm->root_level];
-    std::string pl;
-    for (std::size_t l=0; l<perlev.size(); ++l) pl += (l ? "/" : "") + std::to_string(perlev[l]);
-    char buf[512];
-    std::snprintf(buf, sizeof(buf), "%d %.17g %.6e %d %d %d %.6e %.6e %d %d %d %s\n", pm->ncycle, pm->time,
-                  qmax, nblk, nflag[0], nflag[1], vfine/vbox, mfine/mtot, nlev[0], nlev[1], nlev[2], pl.c_str());
-    pdust->trig_log_line = buf;
-    if (pdust->trig_log_first) {
-      pdust->trig_log_first = false;
-      pdust->WriteTriggerLog();
-    }
-  }
   lap(DustGasDrag::kProfTrigLog);
 }
 
@@ -1687,23 +1532,7 @@ int DustGasDrag::RouteOO3D() {
 //! \brief Called by MeshRefinement::AdaptiveMeshRefinement before the mesh changes: the
 //! particle count and checksum that RebuildAfterRegrid must find again.
 
-void DustGasDrag::WriteTriggerLog() {
-  if (global_variable::my_rank != 0 || trig_log_line.empty()) return;
-  std::FILE *fp = AppendLog("dust_trigger_log.txt");
-  if (fp == nullptr) return;
-  if (LogEmpty(fp)) {
-    std::fprintf(fp, "# ncycle time max_rho/mean (code units with amr_rho_units = code) blocks flag_refine flag_derefine fine_volume_share "
-                 "fine_dust_mass_share clouds_root clouds_finer_plain clouds_lobed "
-                 "blocks_per_level(0/1/...); since 2026-10-21 a line only for the check before each "
-                 "regrid (and the first check)\n");
-  }
-  std::fputs(trig_log_line.c_str(), fp);
-  std::fflush(fp);
-  trig_log_line.clear();
-}
-
 void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
-  WriteTriggerLog();   // the check that led to this regrid (2026-10-21)
   amr_npart_before = pmy_pack->ppart->nprtcl_thispack;
   amr_regrid_nnew = nnew;
   amr_regrid_ndel = ndel;
@@ -1871,12 +1700,6 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       Kokkos::Sum<double>(msum));
     }
   } else {
-  // 2026-10-21 (scaling): with amr_profile, the parts of the rebuild and the blocks and particles
-  // of every rank after each regrid (dust_rank_log.txt, rank 0)
-  using RClock = std::chrono::steady_clock;
-  const bool rlog = ProfOn() && global_variable::nranks > 1;
-  auto rnow = [&]() {if (rlog) Kokkos::fence(); return RClock::now();};
-  auto r0 = rnow();
   BuildRefinableCloudTransfer(pin);
   // Cloud IMEX exchanges u* at each working stage. PC2 did not read this shear
   // object, whose topology must follow the same regrid as the cloud/gas lists.
@@ -1886,38 +1709,12 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   }
   // Shear-periodic x1: the particle routing across the radial faces on the new mesh
   if (ppar->pbval_part->shear_periodic_x1) ppar->pbval_part->BuildShearMaps();
-  auto r1 = rnow(), r2 = r1, r3 = r1;
   // Several ranks: the particles follow their blocks to the ranks that hold
   // them on the new mesh (load balancing may move blocks anywhere)
   if (global_variable::nranks > 1) {
     RouteToOwnerBlocks("regrid");
-    r2 = rnow();
     CheckHaloReach("regrid");   // clouds one level behind the new mesh
-    r3 = rnow();
   }
-#if MPI_PARALLEL_ENABLED
-  if (rlog) {
-    const int nr = global_variable::nranks;
-    double tl[3] = {std::chrono::duration<double>(r1 - r0).count(),
-                    std::chrono::duration<double>(r2 - r1).count(),
-                    std::chrono::duration<double>(r3 - r2).count()};
-    MPI_Allreduce(MPI_IN_PLACE, tl, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    int mine[3] = {pmy_pack->nmb_thispack, ppar->nprtcl_thispack, halo_.hslot1 - halo_.hslot0};
-    std::vector<int> all(3*nr, 0);
-    MPI_Gather(mine, 3, MPI_INT, all.data(), 3, MPI_INT, 0, MPI_COMM_WORLD);
-    if (global_variable::my_rank == 0) {
-      std::FILE *fp = AppendLog("dust_rank_log.txt");
-      if (fp != nullptr) {
-        if (LogEmpty(fp)) std::fputs(kRankLogHeader, fp);
-        std::fprintf(fp, "%d %d %.10g %.4e %.4e %.4e |", amr_regrids + 1, pmesh->ncycle, pmesh->time,
-                     tl[0], tl[1], tl[2]);
-        for (int r=0; r<nr; ++r) std::fprintf(fp, " %d %d %d", all[3*r], all[3*r + 1], all[3*r + 2]);
-        std::fprintf(fp, "\n");
-        std::fflush(fp);
-      }
-    }
-  }
-#endif
   npart = ppar->nprtcl_thispack;
   // Every regrid is an event, handled at the start of the next cycle after
   // its split (HandleRegridEvent); refine / derefine from the blocks actually created and
@@ -2045,24 +1842,10 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   }
 #endif
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = AppendLog("dust_amr_log.txt");
-    if (fp != nullptr) {
-      if (LogEmpty(fp)) {
-        std::fprintf(fp, "# regrid ncycle time blocks blocks_above_root particles particle_mass "
-                     "max|sum_w-1| dt_particles checksum\n");
-      }
-      std::fprintf(fp, "%d %d %.17g %d %d %lld %.17g %.3e %.9e %llu\n", amr_regrids, pmesh->ncycle,
-                   pmesh->time, nblk, nlev1, nprt, msum, dwmax, dtp, check);
-      std::fflush(fp);
-    }
     std::cout << "# dust regrid " << amr_regrids << " cycle=" << pmesh->ncycle << " time="
               << pmesh->time << " blocks=" << nblk << " (above root " << nlev1 << ", created "
               << amr_regrid_nnew << ", deleted " << amr_regrid_ndel << ") particles="
               << nprt << " max|sum w - 1|=" << dwmax << std::endl;
-  }
-  // The leaf traversal also right after a regrid (old clouds on the new mesh)
-  if (cloud_leaf_check > 0) {
-    if (clouds3d) {CheckLeafTraversal3D(256);} else {CheckLeafTraversal();}
   }
 }
 

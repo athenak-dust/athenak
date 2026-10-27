@@ -421,7 +421,8 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
 //! \fn DustGasDrag::UpdateStiffness
 //! \brief The PC2 feedback stiffness of this cycle, chi = dt max_cells
 //! sum_p w m_p/(t_s,p V rho_g) from the stage-1 predictor deposit qdep[4] (u0 still holds the
-//! start-of-step gas at this point), reduced over all ranks; one log line per cycle on rank 0.
+//! start-of-step gas at this point), reduced over all ranks (the particle history, phst, reads
+//! its interval maximum).
 
 void DustGasDrag::UpdateStiffness(const Real dt) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -450,18 +451,6 @@ void DustGasDrag::UpdateStiffness(const Real dt) {
     if (stiff_thresh > 0.0 && rate > 0.0) {
       const Real d = stiff_thresh/rate;
       phst_dt_stiff_min = (phst_dt_stiff_min < 0.0) ? d : std::min(phst_dt_stiff_min, d);
-    }
-  }
-  if (stiff_log && global_variable::my_rank == 0) {
-    std::FILE *fp = AppendLog("dust_stiffness_log.txt");
-    if (fp != nullptr) {
-      if (LogEmpty(fp)) {
-        std::fprintf(fp, "# PC2 feedback stiffness per cycle. ncycle time dt "
-                     "chi=dt*max(sum w m/(t_s V rho_g)) dt_limit=stiff_thresh/max_rate\n");
-      }
-      std::fprintf(fp, "%d %.10g %.6e %.6e %.6e\n", pmy_pack->pmesh->ncycle, pmy_pack->pmesh->time,
-                   dt, stiff_chi_last, (stiff_thresh > 0.0 && rate > 0.0) ? stiff_thresh/rate : -1.0);
-      std::fflush(fp);
     }
   }
 }
@@ -597,147 +586,8 @@ TaskStatus DustGasDrag::GasImplicitSolve(Driver *pdrive, int stage) {
     ustar_(m,1,k,j,i) = (u0(m,IM2,k,j,i) + qd2)*denom;
     ustar_(m,2,k,j,i) = (u0(m,IM3,k,j,i) + qd3)*denom;
   });
-  if (test_ustar_linear) {   // test: the known linear field on the active cells
-    auto &mbsize = pmy_pack->pmb->mb_size;
-    auto &ms = pmy_pack->pmesh->mesh_size;
-    UstarLinearField fld;
-    fld.x0 = 0.5*(ms.x1min + ms.x1max); fld.y0 = 0.5*(ms.x2min + ms.x2max);
-    fld.lx = ms.x1max - ms.x1min; fld.ly = ms.x2max - ms.x2min;
-    par_for("dust_ustar_test",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
-    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-      const Real x = mbsize.d_view(m).x1min + (i - is + 0.5)*mbsize.d_view(m).dx1;
-      const Real y = mbsize.d_view(m).x2min + (j - js + 0.5)*mbsize.d_view(m).dx2;
-      for (int c=0; c<3; ++c) ustar_(m,c,k,j,i) = fld.Value(c, x, y);
-    });
-  }
 
   return TaskStatus::complete;
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::CheckUstarLinear
-//! \brief Test (<dust>/test_ustar_linear): with u* the known linear field on the
-//! active cells, after its ghost exchange and the packing (PackGatherField, with the halo):
-//! (1) on every leaf cell of this rank's blocks, the packed value and the two central
-//! differences against the exact ones (the edge cells read the ghosts: same level, restricted
-//! or prolongated); (2) for every cloud, the linear gather from the packed field against the
-//! same gather from the exact values (same weights and moments; the halo slots included).
-//! Cells within 5.5 cells of their level and clouds within 6 root cells of the domain edge are left
-//! out (the field is not periodic; a prolongated ghost reads the slope of its coarse cell).  One line per call on rank 0 with the largest differences over all ranks.
-
-void DustGasDrag::CheckUstarLinear(const int stage) {
-  auto &indcs = pmy_pack->pmesh->mb_indcs;
-  const int is = indcs.is, js = indcs.js, ks = indcs.ks, nx1 = indcs.nx1, nx2 = indcs.nx2;
-  const int nmb = pmy_pack->nmb_thispack;
-  auto &mbsize = pmy_pack->pmb->mb_size;
-  auto &ms = pmy_pack->pmesh->mesh_size;
-  UstarLinearField fld;
-  fld.x0 = 0.5*(ms.x1min + ms.x1max); fld.y0 = 0.5*(ms.x2min + ms.x2max);
-  fld.lx = ms.x1max - ms.x1min; fld.ly = ms.x2max - ms.x2min;
-  const Real x1min = ms.x1min, x1max = ms.x1max, x2min = ms.x2min, x2max = ms.x2max;
-  const Real rdx = fld.lx/pmy_pack->pmesh->mesh_indcs.nx1, rdy = fld.ly/pmy_pack->pmesh->mesh_indcs.nx2;
-  auto gp = gpack;
-  // (1) the leaf cells of this rank
-  Real ev = 0.0, ex = 0.0, ey = 0.0;
-  int ncell = 0, nbad_cell = 0, nbad_cloud = 0;
-  const int ncb = nx1*nx2;
-  Kokkos::parallel_reduce("dust_ustar_check_cells", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*ncb),
-  KOKKOS_LAMBDA(const int idx, Real &v, Real &sx, Real &sy, int &n, int &bad) {
-    const int m = idx/ncb, j = (idx % ncb)/nx1 + js, i = idx % nx1 + is;
-    const Real dx = mbsize.d_view(m).dx1, dy = mbsize.d_view(m).dx2;
-    const Real x = mbsize.d_view(m).x1min + (i - is + 0.5)*dx, y = mbsize.d_view(m).x2min + (j - js + 0.5)*dy;
-    // the edge rows: a central difference reads one cell further, and a prolongated ghost uses the slope
-    // of its coarse cell, which reads one coarse cell further (across the periodic edge the test field
-    // jumps): 5.5 cells of the cell's level
-    if (x - 5.5*dx < x1min || x + 5.5*dx > x1max || y - 5.5*dy < x2min || y + 5.5*dy > x2max) return;
-    ++n;
-    for (int q=0; q<9; ++q) if (!Kokkos::isfinite(gp(m,ks,j,i,q))) {++bad; return;}   // fmax drops NaN
-    for (int c=0; c<3; ++c) {
-      v = fmax(v, fabs(gp(m,ks,j,i,c) - fld.Value(c, x, y)));
-      sx = fmax(sx, fabs(gp(m,ks,j,i,3+c) - 2.0*dx*fld.Bx(c)));
-      sy = fmax(sy, fabs(gp(m,ks,j,i,6+c) - 2.0*dy*fld.By(c)));
-    }
-  }, Kokkos::Max<Real>(ev), Kokkos::Max<Real>(ex), Kokkos::Max<Real>(ey), Kokkos::Sum<int>(ncell),
-     Kokkos::Sum<int>(nbad_cell));
-  // (2) the clouds
-  particles::Particles *ppar = pmy_pack->ppart;
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  const int npart = ppar->nprtcl_thispack;
-  auto transfer = smr_transfer;
-  auto lt = leaf_traversal;
-  const int ncells1 = ustar.extent_int(4), ncells2 = ustar.extent_int(3);
-  const int tmode = cloud_transition;
-  const Real mx = 6.0*rdx, my = 6.0*rdy;
-  Real eg = 0.0, ua = 0.0;
-  int nchk = 0;
-  Kokkos::parallel_reduce("dust_ustar_check_clouds", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, Real &e, Real &u, int &n, int &bad) {
-    const Real x0 = pr(IPX,p), y0 = pr(IPY,p);
-    if (x0 - mx < x1min || x0 + mx > x1max || y0 - my < x2min || y0 + my > x2max) return;
-    ++n;
-    const int glev = SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode);
-    Real ug[3] = {0.0, 0.0, 0.0}, ux[3] = {0.0, 0.0, 0.0};
-    lt.ForEachCloudMoment(x0, y0, glev, lt.Anchor(pi(PGID,p)),
-    [&](const int target, const Real w, const Real m1x, const Real m1y) {
-      const int ti = target % ncells1, tj = (target/ncells1) % ncells2, tm = target/(ncells1*ncells2);
-      const Real dx1 = lt.box(tm,2), dx2 = lt.box(tm,3);
-      const Real xc = lt.box(tm,0) + (ti - is + 0.5)*dx1, yc = lt.box(tm,1) + (tj - js + 0.5)*dx2;
-      const Real cx = 0.5*(m1x + transfer.MinImage1(x0 - xc)*w)/dx1;
-      const Real cy = 0.5*(m1y + transfer.MinImage2(y0 - yc)*w)/dx2;
-      for (int c=0; c<3; ++c) {
-        ug[c] += w*gp(tm,ks,tj,ti,c) + cx*gp(tm,ks,tj,ti,3+c) + cy*gp(tm,ks,tj,ti,6+c);
-        ux[c] += w*fld.Value(c, xc, yc) + cx*2.0*dx1*fld.Bx(c) + cy*2.0*dx2*fld.By(c);
-      }
-    });
-    for (int c=0; c<3; ++c) {
-      if (!Kokkos::isfinite(ug[c])) {++bad; return;}
-      e = fmax(e, fabs(ug[c] - ux[c])); u = fmax(u, fabs(ux[c]));
-    }
-  }, Kokkos::Max<Real>(eg), Kokkos::Max<Real>(ua), Kokkos::Sum<int>(nchk), Kokkos::Sum<int>(nbad_cloud));
-  // the worst cells (test output): where the differences exceed 1e-12
-  if (ex > 1.0e-12 || ey > 1.0e-12 || ev > 1.0e-12) {
-    auto gph = Kokkos::create_mirror_view_and_copy(HostMemSpace(), gp);
-    int shown = 0;
-    for (int m=0; m<nmb && shown < 6; ++m) {
-      const auto &sz = mbsize.h_view(m);
-      const auto &ll = pmy_pack->pmesh->lloc_eachmb[pmy_pack->gids + m];
-      for (int j=js; j<js+nx2 && shown < 6; ++j) {
-        for (int i=is; i<is+nx1 && shown < 6; ++i) {
-          const Real x = sz.x1min + (i - is + 0.5)*sz.dx1, y = sz.x2min + (j - js + 0.5)*sz.dx2;
-          if (x - 5.5*sz.dx1 < x1min || x + 5.5*sz.dx1 > x1max || y - 5.5*sz.dx2 < x2min ||
-              y + 5.5*sz.dx2 > x2max) continue;
-          for (int c=0; c<3; ++c) {
-            const Real d1 = gph(m,ks,j,i,3+c) - 2.0*sz.dx1*fld.Bx(c);
-            const Real d2 = gph(m,ks,j,i,6+c) - 2.0*sz.dx2*fld.By(c);
-            const Real d0 = gph(m,ks,j,i,c) - fld.Value(c, x, y);
-            if (std::fabs(d0) > 1.0e-12 || std::fabs(d1) > 1.0e-12 || std::fabs(d2) > 1.0e-12) {
-              std::printf("#   rank %d block gid %d level %d lx (%d,%d) cell (%d,%d) x %.6f y %.6f comp %d: "
-                          "value %.3e x1diff %.3e x2diff %.3e\n", global_variable::my_rank,
-                          pmy_pack->gids + m, ll.level, ll.lx1, ll.lx2, i - is, j - js, x, y, c, d0, d1, d2);
-              ++shown;
-              break;
-            }
-          }
-        }
-      }
-    }
-  }
-  Real mxv[5] = {ev, ex, ey, eg, ua};
-  long long cnt[4] = {ncell, nchk, nbad_cell, nbad_cloud};
-#if MPI_PARALLEL_ENABLED
-  if (global_variable::nranks > 1) {
-    MPI_Allreduce(MPI_IN_PLACE, mxv, 5, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
-    MPI_Allreduce(MPI_IN_PLACE, cnt, 4, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-  }
-#endif
-  if (global_variable::my_rank == 0) {
-    std::printf("# DUST_USTAR_CHECK cycle %d stage %d: %lld leaf cells, max |value - exact| %.3e, "
-                "|x1 difference - exact| %.3e, |x2 difference - exact| %.3e; %lld clouds, "
-                "max |gather - exact| %.3e (largest |u| %.3e); non-finite cells %lld clouds %lld\n",
-                pmy_pack->pmesh->ncycle, stage, cnt[0], mxv[0], mxv[1], mxv[2], cnt[1], mxv[3], mxv[4],
-                cnt[2], cnt[3]);
-  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -796,7 +646,6 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
     // impulse is deposited with the cloud's own weights.
     const bool linear = (cloud_gather_order == 2);
     PackGatherField(ustar);
-    if (test_ustar_linear) CheckUstarLinear(stage);   // test
     auto gp = gpack;
     auto gk_body = KOKKOS_LAMBDA(const int p) {
       // the gather's leaf weights are the deposit's when the shapes agree: keep them

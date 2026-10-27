@@ -64,7 +64,6 @@
 // functions for error output and user history
 void DustNSHErrors(ParameterInput *pin, Mesh *pm);
 void DustNSHHistory(HistoryData *pdata, Mesh *pm);
-void RunAuditReplay(ParameterInput *pin, Mesh *pm);   // streaming_linear.cpp
 // the outflow vertical boundaries of Li et al. (2018) and the mass renormalisation
 void LiVerticalBCs(Mesh *pm);
 void LiVerticalBCsCoarse(Mesh *pm);
@@ -2601,29 +2600,6 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   if (three_d) {dtnew = std::min(dtnew, msize.h_view(0).dx3/vmax);}
   ppar->dtnew = dtnew;
 
-  // <problem>/merge_audit_replay = audit-format entry state (diagnostic): one
-  // merge pass from a saved state, then exit
-  if (!pin->GetOrAddString("problem", "merge_audit_replay", "").empty()) {
-    RunAuditReplay(pin, pmy_mesh_);
-    // the replayed particles get their MeshBlock ids from their positions
-    // (the audit file does not carry valid ones for this mesh)
-    if (pmbp->pdust != nullptr &&
-        pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
-      pmbp->pdust->ResetPGIDFromPositions("audit replay");
-    }
-    // only reached with merge_audit_restart: the run continues from the restored time, so the BA
-    // outputs are numbered by time and resume at the next multiple of their interval
-    // (numbering from zero would write one file per history call until it caught up)
-    if (ba_fields_) {
-      ba_field_number_ = static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_field_dt_));
-      ba_field_k_ = ba_field_number_;
-    }
-    if (ba_snapshots_) {
-      ba_snapshot_number_ =
-          static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_snapshot_dt_));
-      ba_snapshot_k_ = ba_snapshot_number_;
-    }
-  }
   return;
 }
 

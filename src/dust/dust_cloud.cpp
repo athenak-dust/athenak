@@ -91,19 +91,12 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
              !pin->DoesParameterExist("dust", "cloud_native_check") ||
              pin->GetInteger("dust", "cloud_native_check") <= 0,
              "the check of the level-native traversal");
-  // cloud_leaf_check compares the actual-leaf traversal with the table
-  cloud_leaf_check = pin->GetOrAddInteger("dust", "cloud_leaf_check", 0);
-  // cloud_particle_dump (diagnostic): at the start of cycle N every rank writes its particles
-  // (dust_particles.cNNNNNNNN[.rRRRR].bin), to compare runs on different numbers of ranks
-  cloud_particle_dump = pin->GetOrAddInteger("dust", "cloud_particle_dump", -1);
   // cloud_halo_coarser (test): levels a cloud may be coarser than the block of its centre, for the
   // reach of the halo (-1: from the split rule); the per-cycle check widens it where needed
   cloud_halo_coarser = pin->GetOrAddInteger("dust", "cloud_halo_coarser", -1);
-  cloud_halo_test_shrink = pin->GetOrAddInteger("dust", "cloud_halo_test_shrink", 0);
   // cloud_halo_strips: exchange only the cells of each halo block that this rank's clouds can reach
-  // (false: whole blocks); the guard (test) checks that nothing outside them is read or written
+  // (false: whole blocks)
   cloud_halo_strips = pin->GetOrAddBoolean("dust", "cloud_halo_strips", true);   // Rixin: default true
-  cloud_halo_strip_guard = pin->GetOrAddBoolean("dust", "cloud_halo_strip_guard", false);
   // Every cloud_sort_interval cycles (0: never) the particle arrays are reordered
   // by block, cell in the block (row by row) and old position, after
   // the split, resampling and merge pass of the cycle (SortParticles).
@@ -151,9 +144,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   }
   std::string users;
   auto user = [&](const bool on, const char *name) {if (on) users += std::string(" ") + name;};
-  user(cloud_leaf_check > 0, "cloud_leaf_check");
   user(!cloud_split_device, "cloud_split_device=false (host split)");
-  user(cloud_split_log, "cloud_split_log (host split)");
   user(cloud_merge && !cloud_merge_device, "cloud_merge_device=false (host merge)");
   const std::string mode = pin->GetOrAddString("dust", "cloud_table", "auto");
   bool table = !users.empty();
@@ -369,9 +360,8 @@ void DustGasDrag::EnsureNextTag() {
   if (cloud_next_tag_set) return;
   // Each rank hands out base + rank, then steps by the number of ranks;
   // base = 1 + the largest live tag (as before), at least the bound of the restart file this run
-  // segment started from (tags of deleted particles are not issued again) and test_tag_start
+  // segment started from (tags of deleted particles are not issued again)
   std::uint64_t base = std::max(LiveTagBound(), cloud_tag_floor);
-  base = std::max(base, cloud_test_tag_start);
   const std::uint64_t rank = static_cast<std::uint64_t>(global_variable::my_rank);
   if (base > UINT64_MAX - rank) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -440,39 +430,6 @@ std::uint64_t DustGasDrag::IssuedTagBound() const {
   MPI_Allreduce(MPI_IN_PLACE, &b, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
 #endif
   return std::max(b, LiveTagBound());
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::DumpParticles
-//! \brief Diagnostic (<dust>/cloud_particle_dump): this rank's particles, as
-//! int32 magic 0x44505031, npart, nrdata, nidata, ncycle, int32 nranks, double time, then the
-//! real columns (column by column) and the integer columns.
-
-void DustGasDrag::DumpParticles() {
-  particles::Particles *ppar = pmy_pack->ppart;
-  const int npart = ppar->nprtcl_thispack, nr = ppar->nrdata, ni = ppar->nidata;
-  auto rh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_rdata);
-  auto ih = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_idata);
-  char name[64];
-  std::snprintf(name, sizeof(name), "dust_particles.c%08d.bin", pmy_pack->pmesh->ncycle);
-  std::FILE *f = std::fopen(RankFile(name).c_str(), "wb");
-  if (f == nullptr) return;
-  const std::int32_t head[6] = {0x44505031, npart, nr, ni, pmy_pack->pmesh->ncycle,
-                                global_variable::nranks};
-  const double t = pmy_pack->pmesh->time;
-  std::fwrite(head, sizeof(head), 1, f);
-  std::fwrite(&t, sizeof(t), 1, f);
-  std::vector<double> col(npart);
-  for (int c=0; c<nr; ++c) {
-    for (int p=0; p<npart; ++p) col[p] = rh(c,p);
-    std::fwrite(col.data(), sizeof(double), npart, f);
-  }
-  std::vector<std::int32_t> icol(npart);
-  for (int c=0; c<ni; ++c) {
-    for (int p=0; p<npart; ++p) icol[p] = ih(c,p);
-    std::fwrite(icol.data(), sizeof(std::int32_t), npart, f);
-  }
-  std::fclose(f);
 }
 
 //----------------------------------------------------------------------------------------
@@ -635,7 +592,6 @@ void DustGasDrag::FrameToBlock(const Real tpos) {
 TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) return TaskStatus::complete;
   ProfTimer prof_all(prof_time[kProfRefineClouds], prof_count[kProfRefineClouds]);
-  if (cloud_particle_dump >= 0 && pmy_pack->pmesh->ncycle == cloud_particle_dump) DumpParticles();
   UpdateShear3D(pmy_pack->pmesh->time);   // the positions at the start of the step
   EnsureNextTag();
   {
@@ -692,9 +648,6 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   }
 #endif
   CheckHaloReach("refine");   // before this cycle's gathers and deposits
-  if (cloud_leaf_check > 0 && pmy_pack->pmesh->ncycle % cloud_leaf_check == 0) {
-    if (clouds3d) {CheckLeafTraversal3D(256);} else {CheckLeafTraversal();}
-  }
   if (cloud_sort_interval > 0 &&
       pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
     ProfTimer pt(prof_time[kProfSort], prof_count[kProfSort]);
@@ -715,7 +668,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
 //! whatever the phase of cloud_merge_burst_interval).  Then one resampling: a scheduled
 //! resampling of this cycle is the same one (its event number advances as usual); otherwise
 //! the schedule is not touched.  The event is done even if nothing could be resampled.  One
-//! line per event in regrid_event_log.txt and in the log.
+//! line per event in the log.
 
 void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   Mesh *pmesh = pmy_pack->pmesh;
@@ -767,18 +720,6 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   }
 #endif
   if (global_variable::my_rank == 0) {
-    std::FILE *fp = AppendLog("regrid_event_log.txt");
-    if (fp != nullptr) {
-      if (LogEmpty(fp)) {
-        std::fprintf(fp, "# event regrid ncycle time created deleted kind merge_pass "
-                     "with_scheduled_resampling npart_before npart_after_merge "
-                     "npart_after_resampling removed t_merge t_resampling\n");
-      }
-      std::fprintf(fp, "%lld %d %d %.17g %d %d %s %s %d %lld %lld %lld %lld %.4e %.4e\n",
-                   amr_event_handled, amr_event_regrid, pmesh->ncycle, pmesh->time, nnew, ndel,
-                   kind, why, scheduled ? 1 : 0, nn[0], nn[1], nn[2], nn[3], tt[0], tt[1]);
-      std::fflush(fp);
-    }
     std::cout << "# regrid event " << amr_event_handled << ": regrid "
               << amr_event_regrid << ", " << kind << " (created " << nnew << ", deleted " << ndel
               << "), cycle " << pmesh->ncycle << ", time " << pmesh->time << ": merge pass "
@@ -818,11 +759,10 @@ int DustGasDrag::SplitAndMergeClouds() {
 //! attributes, so independent streams and stopping times are preserved.
 
 int DustGasDrag::SplitCloudsP1() {
-  if (cloud_split_device && !cloud_split_log && !split_oracle) {
+  if (cloud_split_device) {
     return clouds3d ? SplitCloudsP1Device3D() : SplitCloudsP1Device();
   }
-  RequireCloudTable("the host P1 split (cloud_split_device = false, cloud_split_log or a "
-                    "split oracle)");
+  RequireCloudTable("the host P1 split (cloud_split_device = false)");
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   int npart = ppar->nprtcl_thispack;
@@ -870,44 +810,6 @@ int DustGasDrag::SplitCloudsP1() {
   // host copy of the transfer for the eligibility tests (views point to host mirrors)
   auto level_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), transfer.cloud_level);
   EnsureNextTag();
-  // diagnostic split log (<dust>/cloud_split_log): one S line per event (parent state
-  // and the largest leaf change of deposited density and momentum density), C lines for
-  // its pieces, W lines (leaf centre, volume, mass before/after) for the first events,
-  // and one G line per call with the global mass and momentum before and after
-  const bool logsplit = cloud_split_log;
-  constexpr unsigned long long kLogWeightEvents = 200;
-  std::FILE *fp = nullptr;
-  auto &mbsize = pmy_pack->pmb->mb_size;
-  auto &indcs = pmesh->mb_indcs;
-  if (logsplit) {
-    fp = std::fopen("cloud_split_events.txt", "a");
-    if (fp == nullptr) {
-      std::cout << "### FATAL ERROR: cannot open cloud_split_events.txt" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    if (cloud_split_event == 0) {
-      std::fprintf(fp, "# S ev ncycle time lobe_release ptag pcode px py pm pvx pvy pvz"
-                   " npieces max|drho| max(rho_parent) max|djx| max|djy| max|djz| nleaf"
-                   " fam_dm fam_dpx fam_dpy fam_dpz\n# C ev k tag code x y m\n"
-                   "# W ev leaf_x1 leaf_x2 leaf_vol m_before m_after\n"
-                   "# O ev k shift_x shift_y (split_oracle; C lines then give pre-shift positions)\n"
-                   "# P ncycle time nevent nleaf max|drho| rms|drho| max|dFx| max|dFy|"
-                   " max|dFz| rms|dF| net_dM (whole call: deposit of all flagged clouds before"
-                   " vs all pieces after, leaf densities; dF = (dj - u_gas drho)/t_s, the change"
-                   " of the drag source density on the gas)\n"
-                   "# G ncycle time nflag npart_before npart_after M_before M_after"
-                   " PX_b PX_a PY_b PY_a PZ_b PZ_a\n");
-      if (cloud_split_log_leaves) {
-        std::fprintf(fp, "# V ncycle time nleaf vol_touched vol_domain"
-                     " sqrt(sum V drho^2/vol_domain) sqrt(sum V |dm|^2/vol_domain)"
-                     " (cloud_split_log_leaves; dm = t_s dF = dj - u_gas drho, the momentum"
-                     " the changed deposit holds relative to the gas)\n"
-                     "# D ncycle leaf_x1 leaf_x2 leaf_vol drho dm_x dm_y dm_z (one per"
-                     " leaf touched by the call, before the P line)\n");
-      }
-    }
-  }
-
   const Real x1min = transfer.x1min, x2min = transfer.x2min;
   const Real len1 = transfer.x1max - transfer.x1min;
   const Real len2 = transfer.x2max - transfer.x2min;
@@ -989,13 +891,10 @@ int DustGasDrag::SplitCloudsP1() {
   }
 
   // call-level leaf deposit of all flagged clouds (side 0) and all their pieces (side 1)
-  std::unordered_map<int, std::array<Real,8>> pass_acc;
-  int nevent_call = 0;
 
   unsigned long long nparent = 0, nlobe = 0;
   for (int p=0; p<npart; ++p) {
     if (!flag_h(p)) continue;
-    ++nevent_call;
     const int code = pi_h(PLEV,p);
     const int lev = SMRCompositeTransfer::CloudLevel(code);
     const Real x = pr_h(IPX,p), y = pr_h(IPY,p);
@@ -1023,7 +922,6 @@ int DustGasDrag::SplitCloudsP1() {
       ++nlobe;
     }
     const Real e1 = transfer.CloudHalfWidth1(clev), e2 = transfer.CloudHalfWidth2(clev);
-    const int slot0 = nslot;
     for (int b=0; b<n2; ++b) {
       for (int a=0; a<n1; ++a) {
         int s = nslot++;
@@ -1042,215 +940,6 @@ int DustGasDrag::SplitCloudsP1() {
         }
       }
     }
-    // diagnostic position oracle (<problem>/split_oracle): give the pieces of an in-run
-    // event the prescribed family-relative displacement, evaluated at their mass
-    // centroids (lobe: -/+ ell/3), minus its mass-weighted mean, so that the event's
-    // mass centroid is unchanged; velocities are not touched.  pre_x/pre_y keep the
-    // pre-shift positions for the split log (lineage needs the lattice offsets).
-    std::vector<Real> pre_x, pre_y, shift_x, shift_y;
-    if (split_oracle && pmesh->time > 0.0) {
-      const int np = nslot - slot0;
-      pre_x.resize(np); pre_y.resize(np); shift_x.resize(np); shift_y.resize(np);
-      Real mt = 0.0, mx = 0.0, my = 0.0;
-      for (int q=0; q<np; ++q) {
-        const int s = slot0 + q, pc = ii(PLEV,s);
-        const Real e1c = transfer.CloudHalfWidth1(pc), e2c = transfer.CloudHalfWidth2(pc);
-        const int l1 = SMRCompositeTransfer::CloudLobe1(pc);
-        const int l2 = SMRCompositeTransfer::CloudLobe2(pc);
-        const Real cn = split_oracle_node ? 0.0 : 1.0;   // node convention: no centroid shift
-        const Real cx = rr(IPX,s) + cn*((l1 == 1) ? -e1c/3.0 : ((l1 == 2) ? e1c/3.0 : 0.0));
-        const Real cy = rr(IPY,s) + cn*((l2 == 1) ? -e2c/3.0 : ((l2 == 2) ? e2c/3.0 : 0.0));
-        split_oracle(pmesh->time, cx, cy, shift_x[q], shift_y[q]);
-        mt += rr(IPM,s); mx += rr(IPM,s)*shift_x[q]; my += rr(IPM,s)*shift_y[q];
-      }
-      if (split_oracle_velocity) {
-        // family-relative velocity at the same centroids, mass-weighted mean removed
-        std::vector<Real> dv1(np), dv2(np), dv3(np);
-        Real m1 = 0.0, m2 = 0.0, m3 = 0.0;
-        for (int q=0; q<np; ++q) {
-          const int s = slot0 + q, pc = ii(PLEV,s);
-          const Real e1c = transfer.CloudHalfWidth1(pc), e2c = transfer.CloudHalfWidth2(pc);
-          const int l1 = SMRCompositeTransfer::CloudLobe1(pc);
-          const int l2 = SMRCompositeTransfer::CloudLobe2(pc);
-          const Real cn = split_oracle_node ? 0.0 : 1.0;
-          const Real cx = rr(IPX,s) + cn*((l1 == 1) ? -e1c/3.0 : ((l1 == 2) ? e1c/3.0 : 0.0));
-          const Real cy = rr(IPY,s) + cn*((l2 == 1) ? -e2c/3.0 : ((l2 == 2) ? e2c/3.0 : 0.0));
-          split_oracle_velocity(pmesh->time, cx, cy, dv1[q], dv2[q], dv3[q]);
-          m1 += rr(IPM,s)*dv1[q]; m2 += rr(IPM,s)*dv2[q]; m3 += rr(IPM,s)*dv3[q];
-        }
-        if (split_oracle_node && split_oracle_node_meanfree < 1) {
-          // relative to the centre piece (slot0, at the parent's node)
-          m1 = mt*dv1[0]; m2 = mt*dv2[0]; m3 = mt*dv3[0];
-        }
-        for (int q=0; q<np; ++q) {
-          const int s = slot0 + q;
-          rr(IPVX,s) += dv1[q] - m1/mt; rr(IPVX1,s) = rr(IPVX,s);
-          rr(IPVY,s) += dv2[q] - m2/mt; rr(IPVY1,s) = rr(IPVY,s);
-          rr(IPVZ,s) += dv3[q] - m3/mt; rr(IPVZ1,s) = rr(IPVZ,s);
-        }
-      }
-      if (split_oracle_node && split_oracle_node_meanfree < 2) {
-        mx = mt*shift_x[0]; my = mt*shift_y[0];
-      }
-      for (int q=0; q<np; ++q) {
-        const int s = slot0 + q;
-        pre_x[q] = rr(IPX,s); pre_y[q] = rr(IPY,s);
-        shift_x[q] -= mx/mt; shift_y[q] -= my/mt;
-        Real nx = wrap(rr(IPX,s) + shift_x[q], x1min, len1);
-        Real ny = wrap(rr(IPY,s) + shift_y[q], x2min, len2);
-        rr(IPX,s) = nx; rr(IPX1,s) = nx;
-        rr(IPY,s) = ny; rr(IPY1,s) = ny;
-        ii(PGID,s) = owner_gid(nx, ny);
-      }
-    }
-    if (logsplit) {
-      // audit of this event: leaf deposit of mass and momentum by the cloud before and
-      // by its pieces after the split, at the same instant, with the deposit's weights
-      // and active-leaf map (side 0 = before, 1 = after)
-      std::unordered_map<int, std::array<Real,8>> acc;
-      auto add = [&](Real px, Real py, int pcode, Real m, Real vx, Real vy, Real vz,
-                     int side) {
-        int i0, j0;
-        Real w1[SMRCompositeTransfer::kMaxCloudStencil];
-        Real w2[SMRCompositeTransfer::kMaxCloudStencil];
-        int m1 = SMRCompositeTransfer::CloudWeights1D(wrap(px, x1min, len1),
-                     transfer.CloudHalfWidth1(pcode), x1min, fdx1, i0, w1,
-                     SMRCompositeTransfer::CloudLobe1(pcode));
-        int m2 = SMRCompositeTransfer::CloudWeights1D(wrap(py, x2min, len2),
-                     transfer.CloudHalfWidth2(pcode), x2min, fdx2, j0, w2,
-                     SMRCompositeTransfer::CloudLobe2(pcode));
-        for (int b=0; b<m2; ++b) {
-          int fj = SMRCompositeTransfer::WrapIndex(j0 + b, nfine2);
-          for (int a=0; a<m1; ++a) {
-            Real w = w2[b]*w1[a];
-            if (w == 0.0) continue;
-            auto &q = acc[target_h(fj, SMRCompositeTransfer::WrapIndex(i0 + a, nfine1))];
-            q[4*side] += m*w;
-            q[4*side+1] += m*w*vx;
-            q[4*side+2] += m*w*vy;
-            q[4*side+3] += m*w*vz;
-            auto &qq = pass_acc[target_h(fj, SMRCompositeTransfer::WrapIndex(i0 + a, nfine1))];
-            qq[4*side] += m*w;
-            qq[4*side+1] += m*w*vx;
-            qq[4*side+2] += m*w*vy;
-            qq[4*side+3] += m*w*vz;
-          }
-        }
-      };
-      const unsigned long long ev = cloud_split_event++;
-      add(x, y, code, pr_h(IPM,p), pr_h(IPVX,p), pr_h(IPVY,p), pr_h(IPVZ,p), 0);
-      Real fam[4] = {-pr_h(IPM,p), -pr_h(IPM,p)*pr_h(IPVX,p), -pr_h(IPM,p)*pr_h(IPVY,p),
-                     -pr_h(IPM,p)*pr_h(IPVZ,p)};
-      for (int s=slot0; s<nslot; ++s) {
-        add(rr(IPX,s), rr(IPY,s), ii(PLEV,s), rr(IPM,s), rr(IPVX,s), rr(IPVY,s),
-            rr(IPVZ,s), 1);
-        fam[0] += rr(IPM,s);
-        fam[1] += rr(IPM,s)*rr(IPVX,s);
-        fam[2] += rr(IPM,s)*rr(IPVY,s);
-        fam[3] += rr(IPM,s)*rr(IPVZ,s);
-      }
-      Real dmax[4] = {0.0, 0.0, 0.0, 0.0}, mmax = 0.0;
-      for (auto &kv : acc) {
-        int tm = kv.first/(ncells1*ncells2);
-        Real vol = mbsize.h_view(tm).dx1*mbsize.h_view(tm).dx2;
-        for (int c=0; c<4; ++c) {
-          dmax[c] = std::max(dmax[c], std::fabs(kv.second[4+c] - kv.second[c])/vol);
-        }
-        mmax = std::max(mmax, kv.second[0]/vol);
-        if (ev < kLogWeightEvents) {
-          int ti = kv.first % ncells1, tj = (kv.first/ncells1) % ncells2;
-          std::fprintf(fp, "W %llu %.17g %.17g %.17g %.17g %.17g\n", ev,
-                       mbsize.h_view(tm).x1min + (ti - indcs.is + 0.5)*mbsize.h_view(tm).dx1,
-                       mbsize.h_view(tm).x2min + (tj - indcs.js + 0.5)*mbsize.h_view(tm).dx2,
-                       vol, kv.second[0], kv.second[4]);
-        }
-      }
-      std::fprintf(fp, "S %llu %d %.17g %d %llu %d %.17g %.17g %.17g %.17g %.17g %.17g %d"
-                   " %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e\n", ev,
-                   pmesh->ncycle, pmesh->time, (clev == lev) ? 1 : 0,
-                   static_cast<unsigned long long>(GetTag(pi_h,p)), code,
-                   x, y, pr_h(IPM,p), pr_h(IPVX,p), pr_h(IPVY,p), pr_h(IPVZ,p),
-                   nslot - slot0, dmax[0], mmax, dmax[1], dmax[2], dmax[3],
-                   static_cast<double>(acc.size()), fam[0], fam[1], fam[2], fam[3]);
-      for (int s=slot0; s<nslot; ++s) {
-        const int q = s - slot0;
-        const bool shifted = !pre_x.empty();
-        std::fprintf(fp, "C %llu %d %llu %d %.17g %.17g %.17g\n", ev, q,
-                     static_cast<unsigned long long>(TagFromWords(ii(PTAG,s), ii(PTAGH,s))),
-                     ii(PLEV,s), shifted ? pre_x[q] : rr(IPX,s),
-                     shifted ? pre_y[q] : rr(IPY,s), rr(IPM,s));
-        if (shifted) {
-          std::fprintf(fp, "O %llu %d %.17g %.17g\n", ev, q, shift_x[q], shift_y[q]);
-        }
-      }
-    }
-  }
-  if (logsplit) {
-    // whole call: net leaf change of the deposited dust density and of the drag source
-    // density on the gas, dF = (dj - u drho)/t_s (single species), u the gas velocity of
-    // the leaf
-    {
-      auto u0_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pmy_pack->phydro->u0);
-      const Real ts0 = taus.h_view(0);
-      const int ks = indcs.ks;
-      Real drmax = 0.0, dr2 = 0.0, dfmax[3] = {0.0, 0.0, 0.0}, df2 = 0.0, dmnet = 0.0;
-      // volume-weighted sums for the V line (cloud_split_log_leaves)
-      Real vtouch = 0.0, vdr2 = 0.0, vdm2 = 0.0;
-      for (auto &kv : pass_acc) {
-        const int tm = kv.first/(ncells1*ncells2);
-        const int ti = kv.first % ncells1, tj = (kv.first/ncells1) % ncells2;
-        const Real vol = mbsize.h_view(tm).dx1*mbsize.h_view(tm).dx2;
-        const Real drho = (kv.second[4] - kv.second[0])/vol;
-        const Real rg = u0_h(tm,IDN,ks,tj,ti);
-        const Real ug[3] = {u0_h(tm,IM1,ks,tj,ti)/rg, u0_h(tm,IM2,ks,tj,ti)/rg,
-                            u0_h(tm,IM3,ks,tj,ti)/rg};
-        drmax = std::max(drmax, std::fabs(drho)); dr2 += drho*drho;
-        dmnet += kv.second[4] - kv.second[0];
-        Real dm[3];
-        for (int c=0; c<3; ++c) {
-          dm[c] = (kv.second[5+c] - kv.second[1+c])/vol - ug[c]*drho;
-          const Real df = dm[c]/ts0;
-          dfmax[c] = std::max(dfmax[c], std::fabs(df)); df2 += df*df;
-        }
-        if (cloud_split_log_leaves) {
-          vtouch += vol; vdr2 += vol*drho*drho;
-          vdm2 += vol*(dm[0]*dm[0] + dm[1]*dm[1] + dm[2]*dm[2]);
-          std::fprintf(fp, "D %d %.17g %.17g %.17g %.9e %.9e %.9e %.9e\n", pmesh->ncycle,
-                       mbsize.h_view(tm).x1min + (ti - indcs.is + 0.5)*mbsize.h_view(tm).dx1,
-                       mbsize.h_view(tm).x2min + (tj - indcs.js + 0.5)*mbsize.h_view(tm).dx2,
-                       vol, drho, dm[0], dm[1], dm[2]);
-        }
-      }
-      if (cloud_split_log_leaves) {
-        const Real vdom = len1*len2;
-        std::fprintf(fp, "V %d %.17g %d %.9e %.9e %.9e %.9e\n", pmesh->ncycle, pmesh->time,
-                     static_cast<int>(pass_acc.size()), vtouch, vdom, std::sqrt(vdr2/vdom),
-                     std::sqrt(vdm2/vdom));
-      }
-      const Real nl = std::max<Real>(1.0, static_cast<Real>(pass_acc.size()));
-      std::fprintf(fp, "P %d %.17g %d %d %.6e %.6e %.6e %.6e %.6e %.6e %.6e\n",
-                   pmesh->ncycle, pmesh->time, nevent_call,
-                   static_cast<int>(pass_acc.size()), drmax, std::sqrt(dr2/nl), dfmax[0],
-                   dfmax[1], dfmax[2], std::sqrt(df2/nl), dmnet);
-    }
-    // global totals of mass and momentum before and after this call
-    Real tot[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    for (int p=0; p<npart; ++p) {
-      tot[0] += pr_h(IPM,p);
-      tot[2] += pr_h(IPM,p)*pr_h(IPVX,p);
-      tot[4] += pr_h(IPM,p)*pr_h(IPVY,p);
-      tot[6] += pr_h(IPM,p)*pr_h(IPVZ,p);
-    }
-    for (int s=0; s<nslot; ++s) {
-      tot[1] += rr(IPM,s);
-      tot[3] += rr(IPM,s)*rr(IPVX,s);
-      tot[5] += rr(IPM,s)*rr(IPVY,s);
-      tot[7] += rr(IPM,s)*rr(IPVZ,s);
-    }
-    std::fprintf(fp, "G %d %.17g %d %d %d %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
-                 pmesh->ncycle, pmesh->time, nflag, npart, nslot, tot[0], tot[1], tot[2],
-                 tot[3], tot[4], tot[5], tot[6], tot[7]);
-    std::fclose(fp);
   }
   cloud_split_count += nparent;
   cloud_lobe_split_count += nlobe;
@@ -1814,23 +1503,6 @@ int DustGasDrag::MergeClouds() {
   cloud_far_release += nrelease;
   cloud_coarsen_dk_grad += dk_grad;
   cloud_coarsen_dk_res += dk_res;
-  // one line per pass: counts, energy removed, conservation and the mass by cloud type
-  std::FILE *fp = AppendLog(RankFile("cloud_merge_log.txt"));
-  if (fp != nullptr) {
-    if (LogEmpty(fp)) {
-      std::fprintf(fp, "# ncycle time npart_before npart_after far_releases commits"
-                   " contributions rejected(tolerance/min mass) pending dK_grad dK_res M_b M_a"
-                   " PX_b PX_a PY_b PY_a PZ_b PZ_a m_level0 m_level1 m_level2 m_lobed"
-                   " nc_shifts nc_skipped\n");
-    }
-    std::fprintf(fp, "%d %.17g %d %d %llu %llu %llu %llu %llu %.9e %.9e %.17g %.17g %.17g"
-                 " %.17g %.17g %.17g %.17g %.17g %.9e %.9e %.9e %.9e %llu %llu\n", pmesh->ncycle,
-                 pmesh->time, npart, nnew, nrelease, nevents, nin, nreject, npending, dk_grad,
-                 dk_res,
-                 tb[0], ta[0], tb[1], ta[1], tb[2], ta[2], tb[3], ta[3], mlev[0], mlev[1],
-                 mlev[2], mlobe, nc_shift, nc_skip);
-    std::fflush(fp);
-  }
   return static_cast<int>(nevents);
 }
 

@@ -1068,11 +1068,8 @@ struct DustHalo {
   DvceArray1D<Real> sbuf, rbuf;
   long long nblk_send = 0, nblk_recv = 0;   // blocks in the lists (for the log)
   // the rectangle [i0, i1) x [j0, j1) x [k0, k1) (interior cell indices; 2-D: k0 = 0, k1 = 1) of
-  // every halo slot that this rank receives, by halo slot (slot - nmb); and the guard of the
-  // strips (test)
+  // every halo slot that this rank receives, by halo slot (slot - nmb)
   std::vector<std::array<int, 6>> rect;
-  DvceArray2D<int> rect_d;
-  bool guard = false;
 #if MPI_PARALLEL_ENABLED
   MPI_Comm comm = MPI_COMM_NULL;
   bool comm_set = false;
@@ -1114,17 +1111,6 @@ struct ProfTimer {
     Kokkos::fence();
     acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     ++cnt;
-  }
-};
-
-// the known velocity field of <dust>/test_ustar_linear: each component linear in x1 and x2
-struct UstarLinearField {
-  Real x0 = 0.0, y0 = 0.0, lx = 1.0, ly = 1.0;
-  KOKKOS_INLINE_FUNCTION Real A(const int c) const {return (c == 0) ? 0.1 : ((c == 1) ? -0.2 : 0.05);}
-  KOKKOS_INLINE_FUNCTION Real Bx(const int c) const {return ((c == 0) ? 0.3 : ((c == 1) ? -0.7 : 0.2))/lx;}
-  KOKKOS_INLINE_FUNCTION Real By(const int c) const {return ((c == 0) ? -0.4 : ((c == 1) ? 0.25 : 0.6))/ly;}
-  KOKKOS_INLINE_FUNCTION Real Value(const int c, const Real x, const Real y) const {
-    return A(c) + Bx(c)*(x - x0) + By(c)*(y - y0);
   }
 };
 
@@ -1292,18 +1278,17 @@ class DustGasDrag {
   bool hybrid_have_metric = false;
   // Following Bai 2010 §2.4 and Athena-C, the PC2 feedback stiffness
   // chi = dt max_cells sum_p w m_p/(t_s,p V rho_g) (= Bai's chi when t_s >= dt), from the stage-1
-  // predictor deposit qdep[4].  stiff_log (default on): one line per cycle (dust_stiffness_log.txt);
-  // stiff_thresh > 0: dt <= stiff_thresh/max rate (as AthenaSG new_dt.c; < 0 = off, the default);
+  // predictor deposit qdep[4], computed when the damping, the dt limit or the particle history
+  // (phst: chi_max, dt_stiff_min) needs it; stiff_thresh > 0: dt <= stiff_thresh/max rate (as AthenaSG new_dt.c; < 0 = off, the default);
   // pc2_feedback_damping (default on, as Athena-C): scale each cell's predictor feedback by
   // 1/max(1, chi_cell); the stage-2 correction subtracts the scaled predictor, so momentum stays exact
-  bool stiff_log = true;
   Real stiff_thresh = -1.0;
   bool pc2_feedback_damping = true;
   Real stiff_rate_max = 0.0;       // max_cells sum w m/(t_s V rho_g) of the last PC2 predictor (global)
   Real stiff_chi_last = 0.0;       // dt * stiff_rate_max of that cycle
   Real stiff_chi_run_max = 0.0;    // largest chi of this run (since the start or restart)
   bool StiffnessActive() const {
-    return stiff_log || stiff_thresh > 0.0 || pc2_feedback_damping;
+    return stiff_thresh > 0.0 || pc2_feedback_damping || phst_track;
   }
   void UpdateStiffness(const Real dt);
   unsigned long long hybrid_pc2_cycles = 0;
@@ -1321,7 +1306,6 @@ class DustGasDrag {
   bool cloud_next_tag_set = false;    // ... once set (EnsureNextTag, or a restart file)
   std::uint64_t cloud_tag_floor = 0;  // every tag issued before this run segment is below it
                                       // (the bound of a restart file; 0 without one)
-  std::uint64_t cloud_test_tag_start = 0;   // <dust>/test_tag_start (tests only)
   void EnsureNextTag();               // ... largest tag + 1, once
   std::uint64_t IssueTags(const std::uint64_t n);   // the first of n new tags of this rank
   std::uint64_t LiveTagBound() const; // collective: 1 + the largest live tag (0: no particle)
@@ -1372,7 +1356,6 @@ class DustGasDrag {
   int amr_regrid_nnew = 0, amr_regrid_ndel = 0;  // of the regrid in progress (BeforeRegrid)
   void HandleRegridEvent(const bool merge_due);
   bool cloud_merge_nc = true;         // merge-side node convention
-  bool cloud_merge_pending_log = false;  // log why designated centres did not commit
   int cloud_merge_lobe_wait = 0;      // a centre waits while an unreleased lobed cloud is near
                                       // (1: reach H + ell, 2: reach per lobe direction)
   std::vector<Real> cloud_merge_mroot; // per species: root-level cloud mass (set on first pass)
@@ -1384,9 +1367,6 @@ class DustGasDrag {
   Real cloud_merge_smax = 1.0;        // stage G group position extent (units of the target cell)
   int cloud_merge_K = 4;              // open groups per cell walk (1..8)
   bool cloud_merge_exact_ts = true;   // merged clouds keep the common ts of their members
-  Real cloud_audit_t0 = -1.0;          // merge audit (diagnostic): dump every merge pass in
-  Real cloud_audit_t1 = -1.0;          // [t0, t1]; stages in full when the pass changed anything
-  bool cloud_audit_compact = true;     // quiet passes: compact particle + gas snapshot
   bool cloud_merge_xprotect = false;   // stage X's waiting candidates are not
                                        // walked by G in the same pass
   Real cloud_merge_budget = -1.0;      // > 0, one budget of leaf mass / momentum
@@ -1403,13 +1383,11 @@ class DustGasDrag {
                                        // root cloud mass per root-cell volume (the name is
                                        // from the absorption budget)
   int cloud_merge_budget_evals = 4;    // ... evaluations per stage before the rest is rejected
-  bool cloud_audit_rejected = false;   // full audit file when G groups were budget-rejected
   bool cloud_merge_budget_x = false;   // stage X is also decided by the pass budget
   // test option: 3-D G budget by thinning instead of rejecting every group on a
   // violating leaf: a group survives a violating leaf when its hash u in [0, 1) is below
   // 0.9/(change/budget) of that leaf; the last evaluation round uses the strict rule
   bool cloud_merge_budget_thin = false;
-  bool cloud_audit_only = false;       // a merge pass writes its entry audit and returns
   bool cloud_resample = false;         // conservative same-level resampling in the code
   int cloud_resample_interval = 625;   // ... cycles between resamplings
   Real cloud_resample_eta = 2.0;       // ... mass cap eta m0 / 4^level (<= 0: no cap)
@@ -1432,17 +1410,9 @@ class DustGasDrag {
   int cloud_resample_device_mid = 0;   // ... patches of 65..mid clouds in a middle
   int cloud_resample_device_mid_team = 128;   //     bucket with teams of this many threads (0: off)
   int cloud_resample_device_wide_team = 512;  // ... large-bucket team (1024: a 1024-thread kernel)
-  bool cloud_resample_compare = false; // ... diagnostic: host and device on the same pool, compared
-  bool cloud_resample_patch_stats = false;   // diagnostic: patches by level and size
-  bool cloud_resample_feedback_check = false;   // ... diagnostic: AuditFeedback before / after
-  int cloud_resample_stress = 0;       // ... diagnostic: coincident copies, every N-th
-  int cloud_resample_stress_copies = 0;   //     candidate; K copies of the first one
-  bool cloud_resample_stress_done = false;
   bool cloud_resample_tag_order = false;   // ... pool in PTAG order (else array order)
   bool cloud_resample_pos_order = false;   // ... pool in position order instead
-  void StressResamplePool();
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
-  std::vector<int> cloud_resample_dump;     // cycles whose resampling writes the particle table before and after
   unsigned long long cloud_resample_pass = 0, cloud_resample_removed = 0;
   // resampling at planned physical times t0 + k dt instead of every N cycles
   bool cloud_resample_by_time = false;      // <dust>/cloud_resample_schedule = time
@@ -1457,7 +1427,6 @@ class DustGasDrag {
   bool cloud_resample_clock_restored = false;  // ... which had a time-mode schedule record:
   Real cloud_resample_t0_file = 0.0, cloud_resample_dt_file = 0.0;  // its origin, interval
   long long cloud_resample_next_file = -1;  // ... and next event
-  Real cloud_resample_tprev = -1.0;         // ... start time of the previous cycle (log only)
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
                                       // neighbourhood is in the merge zone: the outer band is
                                       // left to stage X (found in the LinA tests)
@@ -1469,37 +1438,13 @@ class DustGasDrag {
                                       // cells beyond the refined gas
   DvceArray1D<int> split_np, split_off;  // device split work arrays, kept between cycles
   bool cloud_split_enable = true;     // test only: false = no splitting at all
-  bool cloud_split_device = false;    // P1 split on the device; the split log,
-                                      // and split_oracle keep the host path
-  bool cloud_split_log = false;       // diagnostic: log every P1 split event (parent,
-                                      // children, leaf deposit audit) to a text file
-  bool cloud_split_log_leaves = false; // diagnostic (with cloud_split_log): per split call,
-                                      // a V line (volume-weighted norms of the net leaf
-                                      // change) and a D line per touched leaf
+  bool cloud_split_device = false;    // P1 split on the device; false: the host split
   // Diagnostic prescribed gas (set by a problem generator, e.g. <problem>/prescribed_gas
   // of streaming_linear): fills the gas conserved variables of every cell, ghosts
   // included, with a prescribed state at time t.  With PC2 and back_reaction=false the
   // stage-2 midpoint gas velocity seen by the dust is formed from the prescribed states
   // at t and t+dt, and the gas is reset to the prescribed state at the end of each step.
   std::function<void(Real, DvceArray5D<Real>&)> prescribed_gas;
-  // Diagnostic position oracle (set by a problem generator, <problem>/split_oracle of
-  // streaming_linear): the exact dust displacement (dx, dz) at position (x, z) and time t,
-  // used to place the pieces of in-run P1 splits and lobe releases (SplitCloudsP1).
-  std::function<void(Real, Real, Real, Real&, Real&)> split_oracle;
-  // Optional velocity part of the oracle (<problem>/split_oracle_velocity): the exact dust
-  // velocity perturbation (dvx, dvz, dvphi) at (x, z, t); the pieces get its family-relative
-  // part (mass-weighted mean removed, so the event momentum is unchanged).
-  std::function<void(Real, Real, Real, Real&, Real&, Real&)> split_oracle_velocity;
-  // Node convention of the oracle (<problem>/split_oracle_node): the pieces take the
-  // prescribed displacement (and velocity) at their nodes relative to the centre piece,
-  // which keeps the parent's state; the event's mass centroid then moves by the P1
-  // difference at a lobe release instead of being preserved.
-  bool split_oracle_node = false;
-  // Conservation variants of the node convention (<problem>/split_oracle_node_meanfree):
-  // 1 removes the mass-weighted mean of the nodal velocity increments (event momentum
-  // conserved), 2 also that of the nodal displacement increments (event mass first
-  // moment conserved); 0 keeps both relative to the centre piece.
-  int split_oracle_node_meanfree = 0;
   // Diagnostic analytic gather (<problem>/analytic_gather of streaming_linear): the PC2
   // midpoint gas velocity seen by each particle is replaced by the analytic eigenmode at
   // t+dt/2 and the predicted midpoint position, with the response of the
@@ -1671,7 +1616,6 @@ class DustGasDrag {
   long long x3_outflow_count = 0;
   int MergeClouds();
   int MergeCloudsDevice();    // device version of MergeClouds
-  void AuditFeedback(DvceArray2D<Real> &fb);   // frozen-gas predictor feedback
   int ResampleClouds(const bool local = false);   // returns the number of clouds removed;
                               // local: only clouds anchored in blocks new since the
                               // regrid and their neighbours
@@ -1715,7 +1659,6 @@ class DustGasDrag {
   std::vector<int> shear3d_face_[2], shear3d_reach_;
   void UpdateShear3D(const Real time);
   void BuildLeafTraversal3D();
-  void CheckLeafTraversal3D(const int nsample);
   int SplitCloudsP1Device3D();
   void PackGatherField3D(const DvceArray5D<Real> &vel);
   void PackGasGather3D(const DvceArray5D<Real> &u);
@@ -1809,7 +1752,6 @@ class DustGasDrag {
   int RouteToOwnerBlocks3D(const char *when);
   int MergeCloudsDevice3D();   // 3-D stage 2b (dust_cloud_device.cpp)
   int ResampleClouds3D(const bool local);   // 3-D stage 2c (dust_resample.cpp)
-  int cloud_leaf_check = 0;           // diagnostic: every this many cycles, leaf vs table
   // timing diagnostic: storage order of the particles
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)
   bool cloud_sort_random = false;     // diagnostic: a random permutation instead
@@ -1829,11 +1771,6 @@ class DustGasDrag {
   void BuildLeafTraversal();
   // multi-rank refinable clouds: the gid of every block slot of the leaf traversal,
   // the halo lists and the exchanges (dust_halo.cpp)
-  // test (Codex review): u* set to a known linear field before its ghost
-  // exchange; the packed gather field on the leaf cells and every cloud's linear gather are compared
-  // with the exact values (CheckUstarLinear).  skip_exchange (negative control, one rank): no u*
-  // ghost exchange
-  bool test_ustar_linear = false, test_ustar_skip_exchange = false;
   // the buffer of the density trigger (amr_rho_map = block), cells of a block's level: part of the
   // reach of the halo, so that the strips hold the buffer cells (Codex review)
   int halo_trigger_cells = 0;
@@ -1845,7 +1782,6 @@ class DustGasDrag {
                   kProfN};   // kProfTrig*: trigger parts
   double prof_time[kProfN] = {0.0};
   long long prof_count[kProfN] = {0};
-  void CheckUstarLinear(const int stage);
   std::vector<int> leaf_slot_gid;
   DvceArray1D<int> leaf_slot_gid_d, leaf_slot_rank_d;   // gid and rank of every block slot
   DustHalo halo_;
@@ -1855,9 +1791,6 @@ class DustGasDrag {
   DvceArray5D<Real> trig_f3;          // the 3-D leaf densities of the trigger
   // Rixin: dust_trigger_log.txt gets the line of a check only when the mesh changes after
   // it (BeforeRegrid writes the pending line) and the first check of the run
-  std::string trig_log_line;
-  bool trig_log_first = true;
-  void WriteTriggerLog();   // the pending line, rank 0 (dust_amr.cpp)
   DvceArray1D<Real> trig_q, trig_area;
   DvceArray1D<int> trig_bad, trig_fine;
   DvceArray2D<int> trig_rect;
@@ -1869,9 +1802,7 @@ class DustGasDrag {
   // (HaloReach), the widenings found by CheckHaloReach (kept until the mesh changes), and the
   // furthest a support may extend beyond each block
   int cloud_halo_coarser = -1;         // test: levels a cloud may be coarser than its block (-1: auto)
-  int cloud_halo_test_shrink = 0;      // test: the rule's reach divided by 2^this (forces widenings)
   bool cloud_halo_strips = true;       // exchange only the reachable cells of each block
-  bool cloud_halo_strip_guard = false; // test: NaN outside the strips before forward, zero check before reverse
   std::vector<std::int64_t> halo_need_, halo_reach_, halo_allow_;
   int halo_need_seq_ = -1;
   DvceArray1D<std::int64_t> halo_allow_d_;
@@ -1886,8 +1817,6 @@ class DustGasDrag {
   // own split (DustHalo::tsec)
   double mpi_time[4] = {0.0, 0.0, 0.0, 0.0};
   unsigned long long mpi_count[4] = {0, 0, 0, 0};
-  int cloud_particle_dump = -1;       // diagnostic: cycle at whose start the particles are written
-  void DumpParticles();
   void HaloForwardPack(DvceArray5D<Real> &gp);
   void HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int nc);
   void HaloForward5D(DvceArray5D<Real> &f, const int c0, const int nc);
@@ -1897,8 +1826,6 @@ class DustGasDrag {
   void HaloReverseAddFlags(DvceArray1D<int> &f);
   void RequireCloudTable(const char *what) const;   // fatal without the table
   void EnsureRootCloudMass();          // cloud_merge_mroot once (merge pass, resampling caps)
-  void CheckLeafTraversal();
-  void CheckLeafEligibility();        // called by CheckLeafTraversal
 
   // ...in "before_timeintegrator" list
   TaskStatus GammaSwitch(Driver *pdrive, int stage);

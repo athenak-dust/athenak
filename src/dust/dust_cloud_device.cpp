@@ -486,114 +486,6 @@ struct CellLists {
 
 namespace {
 
-// merge-pass audit (diagnostic): named sections of one merge pass.  Each section is a header line
-// "S <name> <type d|i|c> <ndim> <dims...> <nbytes>\n" followed by the raw row-major bytes.
-struct PassAudit {
-  bool on = false;
-  std::vector<char> full, compact;
-  template <typename T>
-  static char Code() {
-    if constexpr (std::is_same_v<T, double>) return 'd';
-    else if constexpr (std::is_same_v<T, int>) return 'i';
-    else if constexpr (std::is_same_v<T, std::int64_t>) return 'l';   // 64-bit cell keys
-    else return 'c';
-  }
-  static void Raw(std::vector<char> &buf, const std::string &name, const char type,
-                  const std::vector<long long> &shape, const void *ptr, const std::size_t bytes) {
-    std::string h = "S " + name + " " + type + " " + std::to_string(shape.size());
-    for (auto d : shape) h += " " + std::to_string(d);
-    h += " " + std::to_string(bytes) + "\n";
-    buf.insert(buf.end(), h.begin(), h.end());
-    const char *c = static_cast<const char*>(ptr);
-    buf.insert(buf.end(), c, c + bytes);
-  }
-  template <typename T>
-  void Add1(const std::string &name, const DvceArray1D<T> &v, const int n) {
-    if (!on) return;
-    auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), v);
-    std::vector<T> out(static_cast<std::size_t>(n));
-    for (int i=0; i<n; ++i) out[i] = h(i);
-    Raw(full, name, Code<T>(), {n}, out.data(), out.size()*sizeof(T));
-  }
-  template <typename T>
-  void Add2(const std::string &name, const DvceArray2D<T> &v, const int n0, const int n1) {
-    if (!on) return;
-    auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), v);
-    std::vector<T> out(static_cast<std::size_t>(n0)*n1);
-    for (int i=0; i<n0; ++i)
-      for (int j=0; j<n1; ++j) out[static_cast<std::size_t>(i)*n1 + j] = h(i,j);
-    Raw(full, name, Code<T>(), {n0, n1}, out.data(), out.size()*sizeof(T));
-  }
-  void Text(const std::string &name, const std::string &t) {
-    if (!on) return;
-    Raw(full, name, 'c', {static_cast<long long>(t.size())}, t.data(), t.size());
-    Raw(compact, name, 'c', {static_cast<long long>(t.size())}, t.data(), t.size());
-  }
-  // particle state (x, y, m, vx, vy, vz, tag, code, ts) for the compact file
-  void Compact(const std::string &name, const DvceArray2D<Real> &pr, const DvceArray2D<int> &pi,
-               const int n) {
-    if (!on) return;
-    auto hr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pr);
-    auto hi = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pi);
-    std::vector<double> out(static_cast<std::size_t>(n)*9);
-    for (int p=0; p<n; ++p) {
-      double *o = &out[static_cast<std::size_t>(p)*9];
-      o[0] = hr(IPX,p); o[1] = hr(IPY,p); o[2] = hr(IPM,p); o[3] = hr(IPVX,p);
-      o[4] = hr(IPVY,p); o[5] = hr(IPVZ,p); o[6] = static_cast<double>(GetTag(hi,p)); o[7] = hi(PLEV,p); o[8] = hr(IPTS,p);
-    }
-    Raw(compact, name, 'd', {n, 9}, out.data(), out.size()*sizeof(double));
-  }
-  void Gas(MeshBlockPack *pack) {
-    if (!on) return;
-    auto &ind = pack->pmesh->mb_indcs;
-    auto gas = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pack->phydro->u0);
-    std::vector<double> cells;
-    for (int m=0; m<pack->nmb_thispack; ++m) {
-      const auto &size = pack->pmb->mb_size.h_view(m);
-      for (int j=ind.js; j<=ind.je; ++j) {
-        for (int i=ind.is; i<=ind.ie; ++i) {
-          cells.insert(cells.end(), {size.x1min + (i-ind.is+0.5)*size.dx1,
-              size.x2min + (j-ind.js+0.5)*size.dx2, size.dx1, size.dx2,
-              gas(m,IDN,ind.ks,j,i), gas(m,IM1,ind.ks,j,i), gas(m,IM2,ind.ks,j,i),
-              gas(m,IM3,ind.ks,j,i)});
-        }
-      }
-    }
-    const long long nc = static_cast<long long>(cells.size()/8);
-    Raw(full, "gas", 'd', {nc, 8}, cells.data(), cells.size()*sizeof(double));
-    Raw(compact, "gas", 'd', {nc, 8}, cells.data(), cells.size()*sizeof(double));
-    // the whole array with ghost cells, for the replay (the linear gather reads them)
-    Raw(full, "gas_full", 'd', {static_cast<long long>(gas.extent(0)), static_cast<long long>(gas.extent(1)),
-        static_cast<long long>(gas.extent(2)), static_cast<long long>(gas.extent(3)),
-        static_cast<long long>(gas.extent(4))}, gas.data(), gas.span()*sizeof(Real));
-  }
-  // per active cell, in the order of "gas": the four feedback components of AuditFeedback
-  void Feedback(const std::string &name, const DvceArray2D<Real> &fb, MeshBlockPack *pack) {
-    if (!on) return;
-    auto &ind = pack->pmesh->mb_indcs;
-    const int nc1 = ind.nx1 + 2*ind.ng, nc2 = ind.nx2 + 2*ind.ng;
-    auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), fb);
-    std::vector<double> out;
-    for (int m=0; m<pack->nmb_thispack; ++m)
-      for (int j=ind.js; j<=ind.je; ++j)
-        for (int i=ind.is; i<=ind.ie; ++i)
-          for (int c=0; c<4; ++c) out.push_back(h(c, (m*nc2 + j)*nc1 + i));
-    Raw(full, name, 'd', {static_cast<long long>(out.size()/4), 4}, out.data(), out.size()*sizeof(double));
-  }
-  void Write(const int ncycle, const bool all) {
-    if (!on) return;
-    char fn[64];
-    std::snprintf(fn, sizeof(fn), "audit.%08d.bin", ncycle);
-    std::FILE *f = std::fopen(fn, "wb");
-    if (f == nullptr) return;
-    const char *head = all ? "AthenaK merge audit v1 full\n" : "AthenaK merge audit v1 compact\n";
-    std::fputs(head, f);
-    const auto &b = all ? full : compact;
-    std::fwrite(b.data(), 1, b.size(), f);
-    std::fclose(f);
-  }
-};
-
 // sign * (mass, momentum) of the live clouds 0..n-1 of (r, i) on the leaves, with the
 // production cloud weights
 void BudgetDeposit(const LeafTraversal &lt, const DvceArray2D<Real> &r,
@@ -643,72 +535,6 @@ Real BudgetRatio(const Real beta, const Real mfloor, const Real vmin, const Real
 
 }  // namespace
 
-//----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::AuditFeedback
-//! \brief Diagnostic: the PC2 predictor's feedback of the current
-//! particles on the frozen gas u0, with the production linear gather (leaf reconstruction
-//! from the block's own cells, ghosts included; cloud_gather_order = 2, cloud_transition as
-//! set) and the cloud-weight deposit, as DepositDrag's refinable-cloud predictor without
-//! the force variants: per leaf target, fb(0..2) = -dt (m/ts) w (u~ - v)/V, fb(3) = (m/ts) w/V.
-void DustGasDrag::AuditFeedback(DvceArray2D<Real> &fb) {
-  particles::Particles *ppar = pmy_pack->ppart;
-  auto &pr = ppar->prtcl_rdata;
-  auto &pi = ppar->prtcl_idata;
-  const int npart = ppar->nprtcl_thispack;
-  auto &indcs = pmy_pack->pmesh->mb_indcs;
-  const int is = indcs.is, js = indcs.js, ks = indcs.ks;
-  auto &mbsize = pmy_pack->pmb->mb_size;
-  const Real dt = pmy_pack->pmesh->dt;
-  auto &uold = pmy_pack->phydro->u0;
-  auto transfer = smr_transfer;
-  const auto lt = leaf_traversal;   // the actual leaves
-  const int ncells1 = qdep.extent_int(4), ncells2 = qdep.extent_int(3);
-  const int tmode = cloud_transition;
-  fb = DvceArray2D<Real>("audit_fb", 4, pmy_pack->nmb_thispack*ncells2*ncells1);
-  auto fb_ = fb;
-  par_for("audit_feedback", DevExeSpace(), 0, npart - 1, KOKKOS_LAMBDA(const int p) {
-    if (pr(IPM,p) <= 0.0) return;
-    const Real xp = pr(IPX,p), yp = pr(IPY,p);
-    const int lev = pi(PLEV,p);
-    Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-    lt.ForEachCloudMoment(xp, yp, SMRCompositeTransfer::GatherCode(lev, tmode), lt.Anchor(pi(PGID,p)),
-    [&](const int target, const Real w, const Real m1x, const Real m1y) {
-      const int ti = target % ncells1;
-      const int remainder = target/ncells1;
-      const int tj = remainder % ncells2;
-      const int tm = remainder/ncells2;
-      const Real dx1 = mbsize.d_view(tm).dx1, dx2 = mbsize.d_view(tm).dx2;
-      const Real xc = mbsize.d_view(tm).x1min + (ti - is + 0.5)*dx1;
-      const Real yc = mbsize.d_view(tm).x2min + (tj - js + 0.5)*dx2;
-      const Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
-      const Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
-      const Real invrho = 1.0/uold(tm,IDN,ks,tj,ti);
-      const Real rip = 1.0/uold(tm,IDN,ks,tj,ti+1), rim = 1.0/uold(tm,IDN,ks,tj,ti-1);
-      const Real rjp = 1.0/uold(tm,IDN,ks,tj+1,ti), rjm = 1.0/uold(tm,IDN,ks,tj-1,ti);
-      ugx += w*uold(tm,IM1,ks,tj,ti)*invrho
-           + cx*(uold(tm,IM1,ks,tj,ti+1)*rip - uold(tm,IM1,ks,tj,ti-1)*rim)
-           + cy*(uold(tm,IM1,ks,tj+1,ti)*rjp - uold(tm,IM1,ks,tj-1,ti)*rjm);
-      ugy += w*uold(tm,IM2,ks,tj,ti)*invrho
-           + cx*(uold(tm,IM2,ks,tj,ti+1)*rip - uold(tm,IM2,ks,tj,ti-1)*rim)
-           + cy*(uold(tm,IM2,ks,tj+1,ti)*rjp - uold(tm,IM2,ks,tj-1,ti)*rjm);
-      ugz += w*uold(tm,IM3,ks,tj,ti)*invrho
-           + cx*(uold(tm,IM3,ks,tj,ti+1)*rip - uold(tm,IM3,ks,tj,ti-1)*rim)
-           + cy*(uold(tm,IM3,ks,tj+1,ti)*rjp - uold(tm,IM3,ks,tj-1,ti)*rjm);
-    });
-    const Real mass_rate = pr(IPM,p)/pr(IPTS,p);
-    const Real gx = -dt*mass_rate*(ugx - pr(IPVX,p));
-    const Real gy = -dt*mass_rate*(ugy - pr(IPVY,p));
-    const Real gz = -dt*mass_rate*(ugz - pr(IPVZ,p));
-    lt.ForEachCloudWeight(xp, yp, lev, lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
-      const int tm = target/(ncells1*ncells2);
-      const Real inv_volume = 1.0/(mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2);
-      Kokkos::atomic_add(&fb_(0,target), inv_volume*w*gx);
-      Kokkos::atomic_add(&fb_(1,target), inv_volume*w*gy);
-      Kokkos::atomic_add(&fb_(2,target), inv_volume*w*gz);
-      Kokkos::atomic_add(&fb_(3,target), inv_volume*w*mass_rate);
-    });
-  });
-}
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::EnsureRootCloudMass
@@ -818,38 +644,6 @@ int DustGasDrag::MergeCloudsDevice() {
   const int gids = pmy_pack->gids;
   const int ncell12 = qdep.extent_int(4)*qdep.extent_int(3);
   const int B = cloud_merge_buffer;
-  PassAudit audit;
-  audit.on = cloud_audit_t1 > 0.0 && pmesh->time >= cloud_audit_t0 && pmesh->time <= cloud_audit_t1;
-  if (audit.on) {
-    char meta[1024];
-    // stage C and the absorption were removed on 2026-10-20: their fields keep the old defaults
-    // (csmax 0.5, cds 0.1, compress 0, absorb 0), so that readers of the audit files still parse
-    std::snprintf(meta, sizeof(meta), "time=%.17g ncycle=%d dt=%.17g npart0=%d merge_pass=%llu next_tag=%lld "
-                  "nrdata=%d nidata=%d nlev=%d alpha=%.17g K=%d smax=%.17g csmax=%.17g cds=%.17g fmin=%.17g "
-                  "stencil_tol=%.17g glag=%d compress=%d absorb=%d B=%d mroot0=%.17g",
-                  pmesh->time, pmesh->ncycle, pmesh->dt, npart0,
-                  static_cast<unsigned long long>(cloud_merge_pass),
-                  cloud_next_tag_set ? static_cast<long long>(cloud_next_tag) : -1LL, nrdata, nidata, nlev,
-                  cloud_merge_alpha, cloud_merge_K, cloud_merge_smax, 0.5, 0.1,
-                  cloud_merge_min_mass, cloud_merge_stencil_tol, cloud_merge_g_lag, 0,
-                  0, B, cloud_merge_mroot.empty() ? -1.0 : cloud_merge_mroot[0]);
-    audit.Text("meta", meta);
-    audit.Add2("a0_pr", ppar->prtcl_rdata, nrdata, npart0);
-    audit.Add2("a0_pi", ppar->prtcl_idata, nidata, npart0);
-    audit.Compact("a0_c9", ppar->prtcl_rdata, ppar->prtcl_idata, npart0);
-    audit.Gas(pmy_pack);
-    if (cloud_gather_order == 2) {
-      DvceArray2D<Real> fb;
-      AuditFeedback(fb);
-      audit.Feedback("fb_a0", fb, pmy_pack);
-    }
-  }
-  // cloud_audit_only (diagnostic): the pass only writes its entry state (particles, gas with ghost cells,
-  // frozen feedback) and changes nothing
-  if (cloud_audit_only) {
-    audit.Write(pmesh->ncycle, true);
-    return 0;
-  }
   EnsureNextTag();
 
   // level-L cell keys and the merge-cell mask on the actual leaves
@@ -865,16 +659,6 @@ int DustGasDrag::MergeCloudsDevice() {
     mm.n2[L] = transfer.ncoarse2 << L;
   }
 
-  // totals before
-  Real tb[4] = {0.0, 0.0, 0.0, 0.0};
-  {
-    auto pr = ppar->prtcl_rdata;
-    Kokkos::parallel_reduce("merge_tot_b", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart0),
-    KOKKOS_LAMBDA(const int p, Real &a, Real &b, Real &c, Real &d) {
-      const Real m = pr(IPM,p);
-      a += m; b += m*pr(IPVX,p); c += m*pr(IPVY,p); d += m*pr(IPVZ,p);
-    }, tb[0], tb[1], tb[2], tb[3]);
-  }
 
   // one field-error budget for the whole pass (stage G, and X with
   // cloud_merge_budget_x; stage C and the absorption were removed on 2026-10-20).  lent:
@@ -980,10 +764,6 @@ int DustGasDrag::MergeCloudsDevice() {
   }
 
   if (nrelease > 0) bdirty = true;
-  if (audit.on) {
-    audit.Add2("a1_pr", ppar->prtcl_rdata, nrdata, ppar->nprtcl_thispack);
-    audit.Add2("a1_pi", ppar->prtcl_idata, nidata, ppar->nprtcl_thispack);
-  }
   // root-level cloud mass per species (first pass, as the host; shared with the resampling).
   // Several ranks: every rank gets here (the pass returns early only when no rank has particles)
   // and the value is reduced over them
@@ -1127,9 +907,9 @@ int DustGasDrag::MergeCloudsDevice() {
       if (cloud_merge_stencil) {
         DvceArray1D<int> owner("q_owner", npart);
         Kokkos::deep_copy(owner, -1);
-        DvceArray1D<int> xknew("audit_xknew", (audit.on || xgate) ? npart : 1);
-        if (audit.on || xgate) Kokkos::deep_copy(xknew, -1);
-        const bool aud = audit.on || xgate;
+        DvceArray1D<int> xknew("dust_xknew", xgate ? npart : 1);
+        if (xgate) Kokkos::deep_copy(xknew, -1);
+        const bool aud = xgate;
         DvceArray2D<double> xfam("q_xfam", 4, xgate ? nmax : 1);
         const Real dtol = cloud_merge_stencil_tol;
         const Real vn1 = H1*H1/6.0, vn2 = H2*H2/6.0, vo1 = ell1*ell1/6.0, vo2 = ell2*ell2/6.0;
@@ -1223,7 +1003,6 @@ int DustGasDrag::MergeCloudsDevice() {
         if (xgate) {
           int nx = 0;
           Kokkos::deep_copy(nx, Kokkos::subview(nnew, 0));
-          if (audit.on) audit.Add2("x" + std::to_string(lev) + "_nr0", nr, nrdata, nx > 0 ? nx : 0);
           if (nx > 0) {
             Kokkos::Timer btimer;
             const Real beta = cloud_merge_budget;
@@ -1336,17 +1115,6 @@ int DustGasDrag::MergeCloudsDevice() {
             xgb[0] += rg_; xgb[1] += rp_; xgb[2] += rm_; xgb[3] += nev;
           }
         }
-        if (audit.on) {
-          int nx = 0;
-          Kokkos::deep_copy(nx, Kokkos::subview(nnew, 0));
-          const std::string l = std::to_string(lev);
-          if (xgate) audit.Add1("x" + l + "_xrej", xrej, nx > 0 ? nx : 0);
-          audit.Add2("x" + l + "_pr", pr, nrdata, npart);
-          audit.Add1("x" + l + "_owner", owner, npart);
-          audit.Add1("x" + l + "_xknew", xknew, npart);
-          audit.Add2("x" + l + "_nr", nr, nrdata, nx > 0 ? nx : 0);
-          audit.Add2("x" + l + "_ni", ni, nidata, nx > 0 ? nx : 0);
-        }
       }
       // ---- protect stage X's waiting candidates.  A read-only pass over the
       // pieces that survived stage X: a centre whose 9-point stencil is complete by stage X's own
@@ -1405,7 +1173,6 @@ int DustGasDrag::MergeCloudsDevice() {
           if (xwait(p)) {n += 1.0; m += pr(IPM,p);}
         }, wn, wm);
         xwtot[0] += wn; xwtot[1] += wm;
-        if (audit.on) audit.Add1("x" + std::to_string(lev) + "_xwait", xwait, npart);
       }
       // ---- the leaf change made so far in this pass (release, stage X, coarser
       // levels), from the actual state: live pieces and the new clouds of stage X, minus the entry
@@ -1758,24 +1525,6 @@ int DustGasDrag::MergeCloudsDevice() {
           lrej[0] += rg_; lrej[1] += rp_; lrej[2] += rm_; lrej[3] += nev;
           if (rg_ < static_cast<double>(k1 - k0)) bdirty = true;
         }
-        if (audit.on) {
-          int ng = 0, nn = 0;
-          Kokkos::deep_copy(ng, Kokkos::subview(ngroup, 0));
-          Kokkos::deep_copy(nn, Kokkos::subview(nnew, 0));
-          const std::string t = "g" + std::to_string(lev);
-          audit.Add2(t + "_pr", pr, nrdata, npart);
-          audit.Add1(t + "_kq", kq, npart);
-          audit.Add1(t + "_gid", gid, npart);
-          audit.Add1(t + "_gknew", gknew, ng);
-          audit.Add1(t + "_gkey", gkey, ng);
-          audit.Add1(t + "_nkind", nkind, nn);
-          audit.Add2(t + "_acc", acc, 8, nn);
-          audit.Add2(t + "_nr", nr, nrdata, nn);
-          audit.Add2(t + "_ni", ni, nidata, nn);
-          audit.Add1(t + "_gres", gres, npart);
-          audit.Add1(t + "_krej", krej, nn);   // also marks the finalized state
-          if (pbud) audit.Add1(t + "_gbrej", gbrej, npart);
-        }
       }
       int ncommit = 0;
       Kokkos::deep_copy(ncommit, Kokkos::subview(nnew, 0));
@@ -1792,13 +1541,6 @@ int DustGasDrag::MergeCloudsDevice() {
           Kokkos::atomic_add(&qc(11), M*vn1 - (acc(3,k) - acc(1,k)*acc(1,k)/M + M*vF1));
           Kokkos::atomic_add(&qc(12), M*vn2 - (acc(4,k) - acc(2,k)*acc(2,k)/M + M*vF2));
         });
-      }
-      if (audit.on) {
-        const std::string l = std::to_string(lev);
-        audit.Add1("f" + l + "_nkind", nkind, ncommit);
-        audit.Add2("f" + l + "_nr", nr, nrdata, ncommit);
-        audit.Add2("f" + l + "_ni", ni, nidata, ncommit);
-        audit.Add2("f" + l + "_acc", acc, 8, ncommit);
       }
       auto qch = Kokkos::create_mirror_view_and_copy(HostMemSpace(), qc);
       for (int c=0; c<24; ++c) qtot[c] += qch(c);
@@ -2221,82 +1963,15 @@ int DustGasDrag::MergeCloudsDevice() {
     ppar->nprtcl_thispack = ntot;
   }
 
-  // totals after, mass by cloud type, counters; the log line of the host version
   const int nfinal = ppar->nprtcl_thispack;
-  Real ta[4] = {0.0, 0.0, 0.0, 0.0}, ml[4] = {0.0, 0.0, 0.0, 0.0};
-  {
-    auto pr = ppar->prtcl_rdata;
-    auto pi = ppar->prtcl_idata;
-    Kokkos::parallel_reduce("merge_tot_a", Kokkos::RangePolicy<>(DevExeSpace(), 0, nfinal),
-    KOKKOS_LAMBDA(const int p, Real &a, Real &b, Real &c, Real &d, Real &l0, Real &l1, Real &l2,
-                  Real &lob) {
-      const Real m = pr(IPM,p);
-      a += m; b += m*pr(IPVX,p); c += m*pr(IPVY,p); d += m*pr(IPVZ,p);
-      const int code = pi(PLEV,p);
-      const int l = SMRCompositeTransfer::CloudLevel(code);
-      if (l == 0) l0 += m; else if (l == 1) l1 += m; else l2 += m;
-      if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) lob += m;
-    }, ta[0], ta[1], ta[2], ta[3], ml[0], ml[1], ml[2], ml[3]);
-  }
-  // pass-end check: the final state deposited again against the entry reference (not the running
-  // ledger): largest |dM| / (beta Mf), largest |dP| / (beta Mf vref), leaves over the budget; and the
-  // plain fine pieces still sitting in merge cells of the next-coarser level
-  double bend[4] = {0.0, 0.0, 0.0, 0.0}, fim[2] = {0.0, 0.0};
-  if (cloud_merge_mode == 1 && (pbud || cloud_merge_xprotect)) {
-    auto pr = ppar->prtcl_rdata;
-    auto pi = ppar->prtcl_idata;
-    Kokkos::parallel_reduce("budget_fine_left", Kokkos::RangePolicy<>(DevExeSpace(), 0, nfinal),
-    KOKKOS_LAMBDA(const int p, double &n, double &m) {
-      const int code = pi(PLEV,p);
-      const int l = SMRCompositeTransfer::CloudLevel(code);
-      if (l == 0 || SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) return;
-      if (mm.In(pr(IPX,p), pr(IPY,p), l - 1, lt.Anchor(pi(PGID,p)))) {n += 1.0; m += pr(IPM,p);}
-    }, fim[0], fim[1]);
-  }
-  if (pbud) {
-    Kokkos::Timer btimer;
-    DvceArray2D<Real> lfin("budget_lfin", 4, nbt);
-    BudgetDeposit(lt, ppar->prtcl_rdata, ppar->prtcl_idata, nfinal, 1.0, lfin);
-    HaloReverseAddFlat(lfin, 4);   // statistics over this rank's leaves
-    const Real beta = cloud_merge_budget;
-    const int n12 = qdep.extent_int(4)*qdep.extent_int(3);
-    const Real bfloor = cloud_absorb_floor*mroot_floor/(transfer.root_dx1*transfer.root_dx2);
-    const Real bvmin = alpha*Kokkos::min(mm.dx1[nlev-1], mm.dx2[nlev-1])*((omega > 0.0) ? omega : 0.0);
-    double rmx = 0.0, rpx = 0.0, nover = 0.0, s2 = 0.0, sv = 0.0;
-    Kokkos::parallel_reduce("budget_end_rms", Kokkos::RangePolicy<>(DevExeSpace(), 0, nown),
-    KOKKOS_LAMBDA(const int t, double &a, double &b) {
-      if (lent(0,t) <= 0.0 && lfin(0,t) <= 0.0) return;
-      const int tb_ = t/n12;
-      const Real vol = lt.box(tb_,2)*lt.box(tb_,3);
-      const Real r = (lfin(0,t) - lent(0,t))/Kokkos::fmax(lent(0,t), bfloor*vol);
-      a += vol*r*r; b += vol;
-    }, s2, sv);
-    bend[3] = (sv > 0.0) ? std::sqrt(s2/sv) : 0.0;
-    Kokkos::parallel_reduce("budget_end", Kokkos::RangePolicy<>(DevExeSpace(), 0, nown),
-    KOKKOS_LAMBDA(const int t, double &a, double &b, double &c) {
-      const int tb_ = t/n12;
-      const Real vol = lt.box(tb_,2)*lt.box(tb_,3);
-      Real rp = 0.0;
-      const Real rm = BudgetRatio(beta, bfloor*vol, bvmin, lent(0,t), lent(1,t), lent(2,t), lent(3,t),
-          lfin(0,t) - lent(0,t), lfin(1,t) - lent(1,t), lfin(2,t) - lent(2,t), lfin(3,t) - lent(3,t), rp);
-      if (rm > a) a = rm;
-      if (rp > b) b = rp;
-      if (rm > 1.0 + 1.0e-9 || rp > 1.0 + 1.0e-9) c += 1.0;
-    }, Kokkos::Max<double>(rmx), Kokkos::Max<double>(rpx), nover);
-    Kokkos::fence();
-    tbud += btimer.seconds();
-    bend[0] = rmx; bend[1] = rpx; bend[2] = nover;
-  }
   Kokkos::fence();
-  const double tpass_s = tpass.seconds();
   pmesh->nprtcl_thisrank = nfinal;
   pmesh->nprtcl_eachrank[global_variable::my_rank] = nfinal;
   pmesh->nprtcl_total = nfinal;
   auto ic = Kokkos::create_mirror_view_and_copy(HostMemSpace(), icnt);
   auto dkh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), dk);
-  const unsigned long long nevents = ic(0) + q_events, nin = ic(1) + q_in, nreject = ic(2), npending = ic(3);
+  const unsigned long long nevents = ic(0) + q_events, nin = ic(1) + q_in, nreject = ic(2);
   ++cloud_merge_pass;
-  const unsigned long long nc_shift = ic(4), nc_skip = ic(5);
   cloud_coarsen_events += nevents;
   if (phst_track) phst_g_events += nevents;
   cloud_coarsen_in += nin;
@@ -2304,76 +1979,6 @@ int DustGasDrag::MergeCloudsDevice() {
   cloud_far_release += nrelease;
   cloud_coarsen_dk_grad += dkh(0);
   cloud_coarsen_dk_res += dkh(1);
-  std::FILE *fp = AppendLog(RankFile("cloud_merge_log.txt"));
-  if (fp != nullptr) {
-    if (LogEmpty(fp)) {
-      std::fprintf(fp, "# ncycle time npart_before npart_after far_releases commits"
-                   " contributions rejected(tolerance/min mass) pending dK_grad dK_res M_b M_a"
-                   " PX_b PX_a PY_b PY_a PZ_b PZ_a m_level0 m_level1 m_level2 m_lobed"
-                   " nc_shifts nc_skipped (device)\n");
-    }
-    std::fprintf(fp, "%d %.17g %d %d %d %llu %llu %llu %llu %.9e %.9e %.17g %.17g %.17g"
-                 " %.17g %.17g %.17g %.17g %.17g %.9e %.9e %.9e %.9e %llu %llu", pmesh->ncycle,
-                 pmesh->time, npart0, nfinal, nrelease, nevents, nin, nreject, npending, dkh(0),
-                 dkh(1), tb[0], ta[0], tb[1], ta[1], tb[2], ta[2], tb[3], ta[3], ml[0], ml[1],
-                 ml[2], ml[3], nc_shift, nc_skip);
-    // (the D3 and orphan-absorption columns that followed here with cloud_merge_d3 /
-    // cloud_merge_absorb went with those options on 2026-10-20)
-    // pending-reason columns: not ready (mask), lobe wait, over limit, tolerance, min mass
-    // quantum-mode columns: X families, mass, dK, dSx, dSy; G groups, pieces, mass,
-    // deferred, residual pieces, dK, dSx, dSy; C groups, pieces, mass, rejected (dS), dK, dSx, dSy,
-    // residual pieces, deferred (stage C was removed on 2026-10-20: its columns are zero)
-    if (cloud_merge_mode == 1) {
-      for (int c=0; c<22; ++c) std::fprintf(fp, " %.9e", qtot[c]);
-    }
-    // columns of the protections (only when they are on): waiting pieces and mass; absorptions
-    // rejected by the budget, their mass, evaluations (zero since the absorption was removed)
-    if (cloud_merge_mode == 1 && (pbud || cloud_merge_xprotect)) {
-      std::fprintf(fp, " %.0f %.9e %.0f %.9e %.0f", xwtot[0], xwtot[1], budtot[0], budtot[1], budtot[2]);
-      // pass-budget columns: G rejected groups, pieces, mass, evaluations; C the same (zero);
-      // stages at the evaluation limit; pass-end check: largest mass ratio, momentum ratio,
-      // leaves over; fine pieces left in merge cells and their mass; seconds of the pass and of
-      // the budget kernels
-      std::fprintf(fp, " %.0f %.0f %.9e %.0f %.0f %.0f %.9e %.0f %.0f %.6e %.6e %.0f %.0f %.9e %.6e %.6e %.6e",
-                   gcb[0][0], gcb[0][1], gcb[0][2], gcb[0][3], gcb[1][0], gcb[1][1], gcb[1][2], gcb[1][3],
-                   bcap, bend[0], bend[1], bend[2], fim[0], fim[1], tpass_s, tbud, bend[3]);
-      // stage-X budget columns: X families rejected by the budget, their pieces and mass, evaluations
-      std::fprintf(fp, " %.0f %.0f %.9e %.0f", xgb[0], xgb[1], xgb[2], xgb[3]);
-    }
-    if (cloud_merge_pending_log) std::fprintf(fp, " %llu %llu %llu %llu %llu", static_cast<unsigned long long>(ic(6)),
-        static_cast<unsigned long long>(ic(7)), static_cast<unsigned long long>(ic(8)),
-        static_cast<unsigned long long>(ic(9)), static_cast<unsigned long long>(ic(10)));
-    std::fprintf(fp, "\n");
-    std::fflush(fp);
-  }
-  if (audit.on) {
-    audit.Add2("z_pr", ppar->prtcl_rdata, nrdata, nfinal);
-    audit.Add2("z_pi", ppar->prtcl_idata, nidata, nfinal);
-    if (cloud_gather_order == 2) {
-      DvceArray2D<Real> fb;
-      AuditFeedback(fb);
-      audit.Feedback("fb_z", fb, pmy_pack);
-    }
-    // absorbed, absorbed_mass, C, Crej, budget_rejected*, budget (the absorption budget) and
-    // C_brej* belong to stage C and the absorption, removed on 2026-10-20: zero (budget: -1)
-    char tail[2048];
-    std::snprintf(tail, sizeof(tail), "nrelease=%d nfinal=%d absorbed=%.0f absorbed_mass=%.17g X=%.0f G=%.0f "
-                  "Gres=%.0f C=%.0f Crej=%.0f xwait=%.0f xwait_mass=%.17g budget_rejected=%.0f "
-                  "budget_rejected_mass=%.17g budget_evals=%.0f xprotect=%d budget=%.17g "
-                  "pass_budget=%.17g G_brej=%.0f G_brej_pieces=%.0f G_brej_mass=%.17g G_evals=%.0f "
-                  "C_brej=%.0f C_brej_pieces=%.0f C_brej_mass=%.17g C_evals=%.0f budget_cap=%.0f "
-                  "end_ratio_M=%.17g end_ratio_P=%.17g end_over=%.0f fine_left=%.0f fine_left_mass=%.17g "
-                  "t_pass=%.6e t_budget=%.6e end_rms_M=%.17g",
-                  nrelease, nfinal, 0.0, 0.0, qtot[0], qtot[5],
-                  qtot[9], qtot[13], qtot[16], xwtot[0], xwtot[1], budtot[0], budtot[1], budtot[2],
-                  cloud_merge_xprotect ? 1 : 0, -1.0, cloud_merge_budget, gcb[0][0],
-                  gcb[0][1], gcb[0][2], gcb[0][3], gcb[1][0], gcb[1][1], gcb[1][2], gcb[1][3], bcap,
-                  bend[0], bend[1], bend[2], fim[0], fim[1], tpass_s, tbud, bend[3]);
-    audit.Text("tail", tail);
-    const bool changed = nrelease > 0 || qtot[0] + qtot[5] > 0.0 ||
-                         nfinal != npart0 || (cloud_audit_rejected && gcb[0][0] + xgb[0] > 0.0);
-    if (changed || cloud_audit_compact) audit.Write(pmesh->ncycle, changed);
-  }
   (void) sh1; (void) sh2;
   return static_cast<int>(nevents);
 }
@@ -2455,25 +2060,6 @@ void DustGasDrag::SortParticles() {
   sort_spare_i = pi;
   Kokkos::fence();
   const double t_move = t.seconds();
-  // the log stays open (buffered; flushed at exit): opening and closing it in every call cost
-  // about 1 ms per call on a parallel file system, more than the sort
-  static std::FILE *fp = nullptr;
-  if (global_variable::my_rank == 0) {
-    if (fp == nullptr) {
-      fp = std::fopen(RankFile("cloud_sort_log.txt").c_str(), "a");
-      if (fp != nullptr) {
-        std::fseek(fp, 0, SEEK_END);
-        if (std::ftell(fp) == 0) {
-          std::fprintf(fp, "# cloud sort: ncycle time particles moved t_keys t_sort t_move (s, fenced); "
-                       "order linear\n");
-        }
-      }
-    }
-    if (fp != nullptr) {
-      std::fprintf(fp, "%d %.17g %d %d %.4e %.4e %.4e\n", pmy_pack->pmesh->ncycle,
-                   pmy_pack->pmesh->time, npart, moved, t_key, t_sort, t_move);
-    }
-  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -2547,20 +2133,6 @@ void DustGasDrag::UpdateCloudOrder() {
   cloud_ord_n = npart;
   ++cloud_ord_builds;
   Kokkos::fence();
-  static std::FILE *fp = nullptr;   // open once, buffered (see SortParticles)
-  if (global_variable::my_rank == 0) {
-    if (fp == nullptr) {
-      fp = std::fopen(RankFile("cloud_order_log.txt").c_str(), "a");
-      if (fp != nullptr) {
-        std::fseek(fp, 0, SEEK_END);
-        if (std::ftell(fp) == 0) std::fprintf(fp, "# cloud order: ncycle time particles build seconds (fenced)\n");
-      }
-    }
-    if (fp != nullptr) {
-      std::fprintf(fp, "%d %.17g %d %llu %.4e\n", pmy_pack->pmesh->ncycle, pmy_pack->pmesh->time,
-                   npart, static_cast<unsigned long long>(cloud_ord_builds), t.seconds());
-    }
-  }
 }
 
 //========================================================================================
@@ -2632,7 +2204,7 @@ struct MergeMask3D {
 //! by the pass number) into level-L clouds of the quantum m_root / 8^L, position and velocity
 //! bounding boxes, K open groups; the pass budget (with the structure-relative beta over the
 //! six neighbour leaves) accepts or rejects whole groups; the compaction.
-//! One rank (stage 2); no audit, no stage-X budget, no X protection.  Returns the merges.
+//! One rank (stage 2); no stage-X budget, no X protection.  Returns the merges.
 
 int DustGasDrag::MergeCloudsDevice3D() {
   particles::Particles *ppar = pmy_pack->ppart;
@@ -2661,16 +2233,6 @@ int DustGasDrag::MergeCloudsDevice3D() {
     mm.n1[L] = nc1 << L; mm.n2[L] = nc2 << L; mm.n3[L] = nc3 << L;
   }
   Kokkos::Timer tpass;
-  // totals before
-  Real tb[4] = {0.0, 0.0, 0.0, 0.0};
-  {
-    auto pr = ppar->prtcl_rdata;
-    Kokkos::parallel_reduce("merge3d_tot_b", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart0),
-    KOKKOS_LAMBDA(const int p, Real &a, Real &b, Real &c, Real &d) {
-      const Real m = pr(IPM,p);
-      a += m; b += m*pr(IPVX,p); c += m*pr(IPVY,p); d += m*pr(IPVZ,p);
-    }, tb[0], tb[1], tb[2], tb[3]);
-  }
   // the pass budget: lent the entry leaf fields, lcum the change so far
   // leaves of the halo blocks included (several ranks); only the owner of a leaf judges it
   const bool pbud = cloud_merge_budget > 0.0;
@@ -3331,44 +2893,8 @@ int DustGasDrag::MergeCloudsDevice3D() {
     ppar->prtcl_idata = pin;
     ppar->nprtcl_thispack = ntot;
   }
-  // totals after, the final state against the entry reference, the log
   const int nfinal = ppar->nprtcl_thispack;
-  Real ta[4] = {0.0, 0.0, 0.0, 0.0};
-  {
-    auto pr = ppar->prtcl_rdata;
-    Kokkos::parallel_reduce("merge3d_tot_a", Kokkos::RangePolicy<>(DevExeSpace(), 0, nfinal),
-    KOKKOS_LAMBDA(const int p, Real &a, Real &b, Real &c, Real &d) {
-      const Real m = pr(IPM,p);
-      a += m; b += m*pr(IPVX,p); c += m*pr(IPVY,p); d += m*pr(IPVZ,p);
-    }, ta[0], ta[1], ta[2], ta[3]);
-  }
-  double bend[3] = {0.0, 0.0, 0.0};
-  if (pbud) {
-    DvceArray2D<Real> lfin("budget3d_lfin", 4, nbt);
-    BudgetDeposit3D(lt, ppar->prtcl_rdata, ppar->prtcl_idata, nfinal, 1.0, lfin);
-    HaloReverseAddFlat(lfin, 4);   // statistics over this rank's leaves
-    const Real beta = cloud_merge_budget;
-    const Real bfloor = cloud_absorb_floor*mroot_floor/rvol;
-    const Real Hf = Kokkos::min(mm.dx1[nlev-1], Kokkos::min(mm.dx2[nlev-1], mm.dx3[nlev-1]));
-    const Real bvmin = alpha*Hf*((omega > 0.0) ? omega : 0.0);
-    double rmx = 0.0, rpx = 0.0, nover = 0.0;
-    Kokkos::parallel_reduce("budget3d_end", Kokkos::RangePolicy<>(DevExeSpace(), 0, nown),
-    KOKKOS_LAMBDA(const int t, double &a, double &b, double &c) {
-      const int tb_ = t/ncell123;
-      const Real vol = lt.box(tb_,3)*lt.box(tb_,4)*lt.box(tb_,5);
-      const Real bt = (bkappa > 0.0) ? lbeta(t) : beta;
-      Real rp = 0.0;
-      const Real rm = BudgetRatio(bt, bfloor*vol, bvmin, lent(0,t), lent(1,t), lent(2,t),
-          lent(3,t), lfin(0,t) - lent(0,t), lfin(1,t) - lent(1,t), lfin(2,t) - lent(2,t),
-          lfin(3,t) - lent(3,t), rp);
-      if (rm > a) a = rm;
-      if (rp > b) b = rp;
-      if (rm > 1.0 + 1.0e-9 || rp > 1.0 + 1.0e-9) c += 1.0;
-    }, Kokkos::Max<double>(rmx), Kokkos::Max<double>(rpx), nover);
-    bend[0] = rmx; bend[1] = rpx; bend[2] = nover;
-  }
   Kokkos::fence();
-  const double tpass_s = tpass.seconds();
   pmesh->nprtcl_thisrank = nfinal;
   pmesh->nprtcl_eachrank[global_variable::my_rank] = nfinal;
   pmesh->nprtcl_total = nfinal;
@@ -3378,23 +2904,6 @@ int DustGasDrag::MergeCloudsDevice3D() {
   if (phst_track) phst_g_events += nevents;
   cloud_coarsen_in += static_cast<unsigned long long>(27.0*qtot[0] + qtot[3] - gcb[1]);
   cloud_far_release += nrelease;
-  std::FILE *fp = AppendLog(RankFile("cloud_merge_log3d.txt"));   // one per rank
-  if (fp != nullptr) {
-    if (LogEmpty(fp)) {
-      std::fprintf(fp, "# 3-D merge pass. ncycle time npart_before npart_after "
-                   "far_releases X_families X_mass G_groups G_pieces G_mass G_deferred G_residual "
-                   "G_rejected G_rejected_pieces G_rejected_mass budget_evals budget_capped "
-                   "end_max_dm end_max_dp end_leaves_over M_b M_a PX_b PX_a PY_b PY_a PZ_b PZ_a "
-                   "t_pass\n");
-    }
-    std::fprintf(fp, "%d %.17g %d %d %d %.0f %.9e %.0f %.0f %.9e %.0f %.0f %.0f %.0f %.9e %.0f "
-                 "%.0f %.6e %.6e %.0f %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.4e\n",
-                 pmesh->ncycle, pmesh->time, npart0, nfinal, nrelease, qtot[0], qtot[1],
-                 qtot[2] - gcb[0], qtot[3] - gcb[1], qtot[4] - gcb[2], qtot[5], qtot[6],
-                 gcb[0], gcb[1], gcb[2], gcb[3], bcap, bend[0], bend[1], bend[2], tb[0], ta[0],
-                 tb[1], ta[1], tb[2], ta[2], tb[3], ta[3], tpass_s);
-    std::fflush(fp);
-  }
   return static_cast<int>(nevents);
 }
 

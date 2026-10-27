@@ -7,8 +7,6 @@
 //! \brief Stage S3b: refinable clouds on a 3-D mesh.  The 2-D paths
 //! are not touched; in 3-D these replace them:
 //!  - BuildLeafTraversal3D: the block geometry of LeafTraversal3D (dust_leaf3d.hpp);
-//!  - CheckLeafTraversal3D: the traversal against a brute-force integration over the finest
-//!    cells (weights, first moments, the split eligibility);
 //!  - SplitCloudsP1Device3D: the moving P1 split, the 2-D rules along each of three directions;
 //!  - CloudPredictor3D / CloudAdvance3D: the two production PC2 cloud kernels (linear gather);
 //!  - DepositCloudDensity3D: dust density and momentum on the leaves (diagnostics).
@@ -154,19 +152,14 @@ void DustGasDrag::CheckClouds3D() {
   }
   // G (stage 2b): the device quantum pass with the pass budget (MergeCloudsDevice3D)
   if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_budget_x ||
-                      cloud_merge_xprotect || cloud_audit_t1 > 0.0 || cloud_audit_only)) {
-    bad.push_back("merging other than the device quantum G (no stage-X budget, X protection, "
-                  "audits)");
+                      cloud_merge_xprotect)) {
+    bad.push_back("merging other than the device quantum G (no stage-X budget, no X protection)");
   }
-  // R (stage 2c): the device solve (ResampleClouds3D), without its diagnostics
-  if (cloud_resample && (!cloud_resample_device || cloud_resample_compare ||
-                         cloud_resample_feedback_check || cloud_resample_stress > 0 ||
-                         cloud_resample_stress_copies > 0 || !cloud_resample_dump.empty() ||
-                         cloud_resample_patch_stats || cloud_resample_pos_order)) {
-    bad.push_back("resampling other than the device solve (no host solve, compare, dump, stress, "
-                  "feedback check, patch statistics, position order)");
+  // R (stage 2c): the device solve (ResampleClouds3D)
+  if (cloud_resample && (!cloud_resample_device || cloud_resample_pos_order)) {
+    bad.push_back("resampling other than the device solve (no host solve, no position order)");
   }
-  if (!cloud_split_device || cloud_split_log || split_oracle) bad.push_back("the host split");
+  if (!cloud_split_device) bad.push_back("the host split");
   // (physical x3 faces: the supports fold back at the faces; x3_ghost_deposit = drop
   // is refused by the constructor)
   if (pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
@@ -1053,232 +1046,6 @@ int DustGasDrag::RouteToOwnerBlocks3D(const char *when) {
   return nchanged;
 }
 
-//----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::CheckLeafTraversal3D
-//! \brief Checks nsample clouds (random positions, levels, lobes, gather point flags and
-//! anchor blocks) against a brute-force integration: every finest cell under the support is
-//! integrated exactly (the same 1-D CDF differences on the finest faces) and its weight and first
-//! moments are added to the leaf that holds it (Locate).  Also the split eligibility (InsideFiner
-//! with the overlap rule) against the brute-force test "a finest cell of the shrunk support lies
-//! in a block finer than the cloud".  Stops with an error beyond round-off.
-
-void DustGasDrag::CheckLeafTraversal3D(const int nsample) {
-  auto lt = leaf_traversal3d;
-  // several ranks (stage 3): the leaves with fields (this rank's blocks and the halo); the clouds
-  // then sit in their anchor block, at the levels the halo reach covers (HaloReach)
-  const bool multi = global_variable::nranks > 1;
-  const int nleaf = lt.nfld*lt.ncells3*lt.ncells2*lt.ncells1;
-  auto blev_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), lt.blev);
-  auto box_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), lt.box);
-  DvceArray2D<Real> d("dust_leaf3d_check", nleaf, 4);
-  DvceArray1D<Real> res("dust_leaf3d_check_res", 4);
-  double maxw = 0.0, maxm = 0.0, maxsum = 0.0;
-  int nelig_bad = 0, nglobal = 0;
-  const Real slack = cloud_split_slack;
-  const std::uint64_t seed = static_cast<std::uint64_t>(pmy_pack->pmesh->ncycle) + 12345;
-  // shear-periodic x1: every sample at a random shear offset (the shear neighbours
-  // rebuilt for it; the offset of the current time restored at the end)
-  const Real tshear = (shear3d && qshear*omega0 != 0.0)
-                    ? lt.ly/(qshear*omega0*lt.lx) : 0.0;   // the time of one full offset
-  for (int s=0; s<nsample; ++s) {
-    const std::uint64_t key = seed*UINT64_C(1000003) + static_cast<std::uint64_t>(s)*7919;
-    if (tshear > 0.0) {
-      UpdateShear3D(tshear*Uniform01(key + 13));
-      lt = leaf_traversal3d;
-    }
-    const int anchor0 = std::min(lt.nmb - 1, static_cast<int>(Uniform01(key + 10)*lt.nmb));
-    Real px = lt.x1min + Uniform01(key + 1)*lt.lx;
-    Real py = lt.x2min + Uniform01(key + 2)*lt.ly;
-    Real pz = lt.x3min + Uniform01(key + 3)*lt.lz;
-    int lmin = 0;
-    // shear-periodic x1: a third of the clouds within two root cells of an x1 face
-    if (lt.shear && !multi && Uniform01(key + 11) < 1.0/3.0) {
-      const Real u = 2.0*lt.root_dx1*Uniform01(key + 1);
-      px = (Uniform01(key + 12) < 0.5) ? lt.x1min + u : lt.x1max - u;
-    }
-    // (physical x3 faces: a third of the clouds within two root cells of one)
-    if (!lt.x3per && !multi && Uniform01(key + 15) < 1.0/3.0) {
-      const Real u = 2.0*lt.root_dx3*Uniform01(key + 3);
-      pz = (Uniform01(key + 16) < 0.5) ? lt.x3min + u : lt.x3max - u;
-    }
-    if (multi) {
-      px = box_h(anchor0,0) + Uniform01(key + 1)*lt.nx1*box_h(anchor0,3);
-      py = box_h(anchor0,1) + Uniform01(key + 2)*lt.nx2*box_h(anchor0,4);
-      pz = box_h(anchor0,2) + Uniform01(key + 3)*lt.nx3*box_h(anchor0,5);
-      lmin = std::max(0, blev_h(anchor0) - 1);
-    }
-    const int lev = std::min(lt.nlev, lmin + static_cast<int>(Uniform01(key + 4)*(lt.nlev + 1 - lmin)));
-    int code = lev;
-    if (lev >= 1 && Uniform01(key + 5) < 0.5) {
-      code |= (static_cast<int>(Uniform01(key + 6)*4) & 3) << SMRCompositeTransfer::kCloudLobeShift1;
-      code |= (static_cast<int>(Uniform01(key + 7)*4) & 3) << SMRCompositeTransfer::kCloudLobeShift2;
-      code |= (static_cast<int>(Uniform01(key + 8)*4) & 3) << SMRCompositeTransfer::kCloudLobeShift3;
-    }
-    if (Uniform01(key + 9) < 0.3) code |= SMRCompositeTransfer::kCloudGatherPoint;
-    // one rank: two thirds of the clouds anchored in the block that holds them (the neighbour
-    // and shear-neighbour lists), the others in a random block (the searches over all blocks)
-    const bool own = !multi && Uniform01(key + 14) < 2.0/3.0;
-    Kokkos::deep_copy(d, 0.0);
-    Kokkos::parallel_for("dust_leaf3d_check", Kokkos::RangePolicy<>(DevExeSpace(), 0, 1),
-    KOKKOS_LAMBDA(const int) {
-      using LT = LeafTraversal;
-      using T = SMRCompositeTransfer;
-      bool reach = true;
-      int anchor = anchor0;
-      if (own) {
-        int b = -1;
-        lt.Owner(px, py, pz, anchor0, &b);
-        if (b >= 0 && b < lt.nmb) anchor = b;
-      }
-      // the first moments about the leaf centres, as the gather uses them (m1 + MinImage(p - c) w)
-      auto centre = [&](const int t, Real &xc, Real &yc, Real &zc) {
-        int tb, tk, tj, ti;
-        lt.Decode(t, tb, tk, tj, ti);
-        xc = lt.box(tb,0) + (ti - lt.is + 0.5)*lt.box(tb,3);
-        yc = lt.box(tb,1) + (tj - lt.js + 0.5)*lt.box(tb,4);
-        zc = lt.box(tb,2) + (tk - lt.ks + 0.5)*lt.box(tb,5);
-      };
-      const Real sum = lt.ForEach<true>(px, py, pz, code, anchor,
-      [&](const int t, const Real w, const Real m1x, const Real m1y, const Real m1z) {
-        Real xc, yc, zc;
-        centre(t, xc, yc, zc);
-        d(t, 0) += w;
-        d(t, 1) += m1x + T::MinImage(px - xc, lt.lx)*w;
-        d(t, 2) += m1y + T::MinImage(py - yc, lt.ly)*w;
-        d(t, 3) += m1z + T::MinImage(pz - zc, lt.lz)*w;
-      }, &reach);
-      res(0) = sum;
-      res(3) = reach ? 0.0 : 1.0;
-      // brute force over the finest cells of the support (unwrapped indices; Locate wraps); with
-      // shear-periodic x1 and the support across an x1 face, the part in the domain and the cloud
-      // translated across the face, each over its finest cells in the domain
-      const int lv = T::CloudLevel(code);
-      const bool point = (code & T::kCloudGatherPoint) != 0;
-      const LT::Shape s1a = LT::MakeShape(px, ldexp(lt.root_dx1, -lv), ldexp(lt.iroot_dx1, lv),
-                                          T::CloudLobe1(code), point);
-      const LT::Shape s3a = LT::MakeShape(pz, ldexp(lt.root_dx3, -lv), ldexp(lt.iroot_dx3, lv),
-                                          T::CloudLobe3(code), point);
-      const int npx = (lt.shear && (s1a.lo < lt.x1min || s1a.hi > lt.x1max)) ? 2 : 1;
-      const Real sgn = (s1a.hi > lt.x1max) ? 1.0 : -1.0;
-      // (physical x3 faces: the part beyond a face mirrored back)
-      const int npz = (!lt.x3per && (s3a.lo < lt.x3min || s3a.hi > lt.x3max)) ? 2 : 1;
-      const Real zf = (s3a.hi > lt.x3max) ? lt.x3max : lt.x3min;
-      for (int part=0; part<npx*npz; ++part) {
-      const int pxp = part % npx, pzp = part/npx;
-      const Real qx = (pxp == 0) ? px : px - sgn*lt.lx;
-      const Real qy = (pxp == 0) ? py : py + sgn*lt.ysh;
-      const Real qz = (pzp == 0) ? pz : 2.0*zf - pz;
-      const int l3 = (pzp == 0) ? T::CloudLobe3(code)
-                                : LeafTraversal3D::MirrorLobe(T::CloudLobe3(code));
-      const LT::Shape s1 = LT::MakeShape(qx, ldexp(lt.root_dx1, -lv), ldexp(lt.iroot_dx1, lv),
-                                         T::CloudLobe1(code), point);
-      const LT::Shape s2 = LT::MakeShape(qy, ldexp(lt.root_dx2, -lv), ldexp(lt.iroot_dx2, lv),
-                                         T::CloudLobe2(code), point);
-      const LT::Shape s3 = LT::MakeShape(qz, ldexp(lt.root_dx3, -lv), ldexp(lt.iroot_dx3, lv),
-                                         l3, point);
-      int ia = static_cast<int>(floor((s1.lo - lt.x1min)/lt.fine_dx1));
-      int ib = static_cast<int>(ceil((s1.hi - lt.x1min)/lt.fine_dx1)) - 1;
-      if (npx == 2) {ia = (ia < 0) ? 0 : ia; ib = (ib > lt.nfine1 - 1) ? lt.nfine1 - 1 : ib;}
-      const int ja = static_cast<int>(floor((s2.lo - lt.x2min)/lt.fine_dx2));
-      const int jb = static_cast<int>(ceil((s2.hi - lt.x2min)/lt.fine_dx2)) - 1;
-      int ka = static_cast<int>(floor((s3.lo - lt.x3min)/lt.fine_dx3));
-      int kb = static_cast<int>(ceil((s3.hi - lt.x3min)/lt.fine_dx3)) - 1;
-      lt.ClipZ(ka, kb);
-      for (int k=ka; k<=kb; ++k) {
-        Real w3, g3;
-        LT::Cell<true>(s3, LT::FaceAt<true>(s3, lt.x3min + k*lt.fine_dx3),
-                       LT::FaceAt<true>(s3, lt.x3min + (k + 1)*lt.fine_dx3), w3, g3);
-        for (int j=ja; j<=jb; ++j) {
-          Real w2, g2;
-          LT::Cell<true>(s2, LT::FaceAt<true>(s2, lt.x2min + j*lt.fine_dx2),
-                         LT::FaceAt<true>(s2, lt.x2min + (j + 1)*lt.fine_dx2), w2, g2);
-          for (int i=ia; i<=ib; ++i) {
-            Real w1, g1;
-            LT::Cell<true>(s1, LT::FaceAt<true>(s1, lt.x1min + i*lt.fine_dx1),
-                           LT::FaceAt<true>(s1, lt.x1min + (i + 1)*lt.fine_dx1), w1, g1);
-            const int t = lt.Locate(i, j, k);
-            if (t < 0 || t >= nleaf) {res(1) = 1.0e30; continue;}
-            Real xc, yc, zc;
-            centre(t, xc, yc, zc);
-            const Real w = w1*w2*w3;
-            d(t, 0) -= w;
-            d(t, 1) -= g1*w2*w3 + T::MinImage(qx - xc, lt.lx)*w;
-            d(t, 2) -= w1*g2*w3 + T::MinImage(qy - yc, lt.ly)*w;
-            d(t, 3) -= w1*w2*g3 + T::MinImage(qz - zc, lt.lz)*w;
-          }
-        }
-      }
-      }
-      // eligibility of a plain cloud of level lv at the position (overlap rule)
-      if (lt.split_overlap && lv < lt.nlev && lv < lt.cloud_max_level && !lt.split_everywhere) {
-        const bool fast = lt.InsideFiner(px, py, pz, lv, slack, anchor);
-        bool brute = false;
-        int fa, fb, ga, gb, ha, hb;
-        lt.SupportBox(px, py, pz, 1.0 - slack, lv, fa, fb, ga, gb, ha, hb);
-        // (shear-periodic x1: the part in the domain and the box around the translated position)
-        const int side = lt.ShearSide(fa, fb);
-        for (int part=0; part<((side >= 0) ? 2 : 1); ++part) {
-          if (part == 1) {
-            const Real sg = (side == 1) ? 1.0 : -1.0;
-            lt.SupportBox(px - sg*lt.lx, py + sg*lt.ysh, pz, 1.0 - slack, lv, fa, fb, ga, gb, ha, hb);
-          }
-          if (side >= 0) {fa = (fa < 0) ? 0 : fa; fb = (fb > lt.nfine1 - 1) ? lt.nfine1 - 1 : fb;}
-          for (int k=ha; k<=hb && !brute; ++k) {
-            for (int j=ga; j<=gb && !brute; ++j) {
-              for (int i=fa; i<=fb && !brute; ++i) {
-                int b = -1;
-                lt.Locate(i, j, k, &b);
-                if (b >= 0 && lt.blev(b) > lv) brute = true;
-              }
-            }
-          }
-        }
-        res(2) = (fast == brute) ? 0.0 : 1.0;
-      } else {
-        res(2) = 0.0;
-      }
-    });
-    double ew = 0.0, em = 0.0;
-    Kokkos::parallel_reduce("dust_leaf3d_check_max", Kokkos::RangePolicy<>(DevExeSpace(), 0, nleaf),
-    KOKKOS_LAMBDA(const int t, double &a, double &b) {
-      a = fmax(a, fabs(d(t, 0)));
-      b = fmax(b, fmax(fabs(d(t, 1)), fmax(fabs(d(t, 2)), fabs(d(t, 3)))));
-    }, Kokkos::Max<double>(ew), Kokkos::Max<double>(em));
-    auto rh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), res);
-    const Real hw = lt.root_dx1/static_cast<Real>(1 << lev);   // moments in length units
-    maxw = std::max(maxw, ew);
-    maxm = std::max(maxm, em/hw);
-    maxsum = std::max(maxsum, std::fabs(rh(0) - 1.0) + rh(1));
-    if (rh(2) != 0.0) ++nelig_bad;
-    if (rh(3) != 0.0) ++nglobal;
-  }
-  if (tshear > 0.0) UpdateShear3D(pmy_pack->pmesh->time);
-#if MPI_PARALLEL_ENABLED
-  if (multi) {
-    double mx[3] = {maxw, maxm, maxsum};
-    int ni[2] = {nelig_bad, nglobal};
-    MPI_Allreduce(MPI_IN_PLACE, mx, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    MPI_Allreduce(MPI_IN_PLACE, ni, 2, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    maxw = mx[0]; maxm = mx[1]; maxsum = mx[2]; nelig_bad = ni[0]; nglobal = ni[1];
-  }
-#endif
-  // (the moments about the leaf centres carry the round-off of the positions, about 1e-16 of the
-  // domain size: relative to the half-width at the deepest level up to a few 1e-14)
-  const bool ok = (maxw <= 1.0e-13 && maxm <= 1.0e-11 && maxsum <= 1.0e-13 && nelig_bad == 0);
-  if (global_variable::my_rank == 0) {
-    std::cout << "# 3-D leaf traversal check, cycle " << pmy_pack->pmesh->ncycle
-              << ": " << nsample << " clouds" << (multi ? " per rank" : "")
-              << ", max |weight - brute| " << maxw
-              << ", max |moment - brute|/half-width " << maxm << ", max |sum - 1| " << maxsum
-              << ", eligibility mismatches " << nelig_bad << ", global searches " << nglobal
-              << (ok ? " OK" : " FAILED") << std::endl;
-  }
-  if (!ok) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "3-D leaf traversal check failed" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-}
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::SplitCloudsP1Device3D

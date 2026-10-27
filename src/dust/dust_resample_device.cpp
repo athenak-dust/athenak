@@ -16,8 +16,7 @@
 //! The device result therefore follows the host's arithmetic order, except the Householder norm
 //! below the QR diagonal, which is a team reduction (its order is Kokkos's and can
 //! depend on the backend and the team size).  It can differ from the host by round-off (that sum,
-//! fused multiply-add, sqrt / hypot of the device library), which the comparison mode
-//! (<dust>/cloud_resample_compare) measures.  For a given backend and team size the solve is
+//! fused multiply-add, sqrt / hypot of the device library).  For a given backend and team size the solve is
 //! bitwise reproducible: Kokkos joins the partial sums of a team reduction in a fixed order (host:
 //! contiguous index blocks joined by team rank; CUDA: a fixed shuffle tree and warp order), and
 //! repeated solves of the same patch problem were identical on OpenMP (teams of 4, also with random
@@ -29,9 +28,8 @@
 //! update sums each column by row chunks over the team, in another order than the host.  The
 //! device and host solves then agree only to round-off, and the end-point reduction can turn a
 //! round-off difference into another end point of the null space: the kept clouds and their
-//! masses may differ from the host's (both satisfy every constraint to round-off).  Compare
-//! with cloud_resample_compare by tolerance, or set cloud_resample_qr_rows = false to recover
-//! the host's order (only in a build with -DDUST_R_QR_COLUMNS=1, dust_resample.hpp).
+//! masses may differ from the host's (both satisfy every constraint to round-off).  Set
+//! cloud_resample_qr_rows = false to recover the host's order (only in a build with -DDUST_R_QR_COLUMNS=1, dust_resample.hpp).
 //!
 //! Workspaces live in global memory, one per team slot, in two buckets of patch sizes (at
 //! most 64 clouds, more than 64) sized from the largest patch of the bucket; the number of

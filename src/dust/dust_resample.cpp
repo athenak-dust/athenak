@@ -26,9 +26,7 @@
 //!
 //! By default (<dust>/cloud_resample_device = true) the pool is put in patch order
 //! and every patch is solved on the device (dust_resample_device.cpp, same algorithm; false keeps
-//! the host solves); with
-//! cloud_resample_compare = true both run on the same pool and cloud_resample_compare.txt
-//! records the differences (the device result is applied only with cloud_resample_device).
+//! the host solves).
 //!
 //! Schedule: every cloud_resample_interval cycles (default), or with
 //! cloud_resample_schedule = time at the planned times t0 + k dt; see ResampleDue.
@@ -392,68 +390,6 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
   return info;
 }
 
-// <dust>/cloud_resample_dump (diagnostic): the particle table of the pack as
-// f64 rows [x1, x2, mass, v1, v2, v3, tag, level code], the layout of the particle rows of the
-// test problems' snapshots.  File resample.CYCLE.WHEN.bin, WHEN = pre | post.
-void DumpResampleState(particles::Particles *ppar, Mesh *pmesh, const char *when,
-                       const bool species = false) {
-  const int n = ppar->nprtcl_thispack;
-  auto pr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_rdata);
-  auto pi = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_idata);
-  std::vector<double> rows;
-  // v1: 8 columns (x, y, m, vx, vy, vz, tag, code); v2 (several species): and the species
-  const int nc = species ? 9 : 8;
-  rows.reserve(static_cast<std::size_t>(nc)*n);
-  for (int p=0; p<n; ++p) {
-    rows.insert(rows.end(), {pr(IPX,p), pr(IPY,p), pr(IPM,p), pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p),
-                             static_cast<double>(GetTag(pi,p)), static_cast<double>(pi(PLEV,p))});
-    if (species) rows.push_back(static_cast<double>(pi(PSP,p)));
-  }
-  char name[64];
-  std::snprintf(name, sizeof(name), "resample.%08d.%s.bin", pmesh->ncycle, when);
-  std::FILE *file = std::fopen(name, "wb");
-  bool ok = (file != nullptr) &&
-            std::fprintf(file, species ? "AthenaK resample dump v2 f64 species\n%.17g %d %d\n"
-                                       : "AthenaK resample dump v1 f64\n%.17g %d %d\n",
-                         pmesh->time, pmesh->ncycle, n) > 0;
-  ok = ok && std::fwrite(rows.data(), sizeof(double), rows.size(), file) == rows.size();
-  ok = (file != nullptr) && (std::fclose(file) == 0) && ok;
-  if (!ok) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "cannot write " << name << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-}
-
-// one row of cloud_resample_log.txt, with the header in front of the first; written for every
-// pass, also when the pool is too small to resample
-void AppendResampleLog(const char *row) {
-  std::FILE *fp = AppendLog(RankFile("cloud_resample_log.txt"));
-  if (fp == nullptr) return;
-  if (LogEmpty(fp)) {
-    std::fprintf(fp, "# ncycle time npart_before npart_after pool above_cap lobed patches"
-                 " patches_reduced kept at_cap fallback max_res_accepted steps_zero steps_cap scans"
-                 " M_b M_a PX_b PX_a t_total t_device t_copy t_sort t_host_wall t_host_cpu t_back"
-                 " threads nnz s_rows s_scale s_qr s_null s_reduce s_check n_max nb_max n_ge64 n_ge256"
-                 " device t_dev_order t_dev_sizes t_dev_small t_dev_large t_dev_mid\n");
-  }
-  std::fputs(row, fp);
-  std::fflush(fp);
-}
-
-// One row per 3-D resampling of the patches the rank screen left out
-void AppendScreenLog(const int ncycle, const double time, const long long npatch,
-                     const long long nscr, const long long cscr, const long long pool) {
-  std::FILE *fp = AppendLog(RankFile("cloud_resample_screen3d.txt"));
-  if (fp == nullptr) return;
-  if (LogEmpty(fp)) {
-    std::fprintf(fp, "# cloud_resample_rank_screen: ncycle time patches"
-                 " patches_screened pool clouds_screened\n");
-  }
-  std::fprintf(fp, "%d %.17g %lld %lld %lld %lld\n", ncycle, time, npatch, nscr, pool, cscr);
-  std::fflush(fp);
-}
-
 }  // namespace
 
 //----------------------------------------------------------------------------------------
@@ -525,8 +461,7 @@ void PoolInTagOrder(const DvceArray2D<int> &pi, const DvceArray1D<int> &slot, co
 //! first planned time not earlier than its start; a restart continues from the schedule
 //! record of the file when the origin and interval are unchanged, stops with an error when
 //! they changed (unless cloud_resample_schedule_reset), and derives the next event from the
-//! restart time when the file has no time-mode record.  Each event is logged in
-//! cloud_resample_schedule.txt.
+//! restart time when the file has no time-mode record.
 
 bool DustGasDrag::ResampleDue() {
   Mesh *pmesh = pmy_pack->pmesh;
@@ -571,8 +506,6 @@ bool DustGasDrag::ResampleDue() {
                 << how << ")" << std::endl;
     }
   }
-  const double tprev = cloud_resample_tprev;
-  cloud_resample_tprev = t;
   const double tk = planned(cloud_resample_next);
   if (t < tk - eps(tk)) return false;
   // every planned time up to t (within the slack) is done with this one execution
@@ -581,19 +514,6 @@ bool DustGasDrag::ResampleDue() {
   while (planned(nxt) <= t + eps(planned(nxt))) ++nxt;
   while (nxt > cloud_resample_next + 1 && planned(nxt - 1) > t + eps(planned(nxt - 1))) --nxt;
   const long long skipped = nxt - cloud_resample_next - 1;
-  if (global_variable::my_rank == 0) {
-    std::FILE *fp = AppendLog(RankFile("cloud_resample_schedule.txt"));
-    if (fp != nullptr) {
-      if (LogEmpty(fp)) {
-        std::fprintf(fp, "# event planned_time ncycle time delay skipped time_prev_cycle dt_cycle"
-                     " interval omega0\n");
-      }
-      std::fprintf(fp, "%lld %.17g %d %.17g %.6e %lld %.17g %.6e %.17g %.17g\n",
-                   cloud_resample_next, tk, pmesh->ncycle, t, t - tk, skipped, tprev, pmesh->dt,
-                   dt, static_cast<double>(cloud_resample_omega));
-      std::fflush(fp);
-    }
-  }
   ++cloud_resample_events;
   cloud_resample_skipped += static_cast<unsigned long long>(skipped);
   cloud_resample_next = nxt;
@@ -641,115 +561,6 @@ bool DustGasDrag::MergeDue() {
 //! \brief One resampling of the plain clouds (see the file header).  Returns the number of
 //! clouds removed.
 
-//----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::StressResamplePool
-//! \brief Diagnostic (Codex review: coincident and rank-critical clouds in
-//! the regression of the device resampling): before the first resampling, every
-//! cloud_resample_stress-th pool candidate (plain, positive mass, below its cap) becomes two
-//! copies of half its mass, in turn at the same position (exactly dependent columns), offset by
-//! 1e-13 and by 1e-10 of its cloud half width in x1 (rank-critical columns); with
-//! cloud_resample_stress_copies = K the first candidate becomes K + 1 equal copies at one point
-//! (a patch with a K-dimensional null space).  Masses add up to the old ones up to rounding;
-//! the resampling then has to keep the stressed state's leaf sums (cloud_resample_dump and
-//! r_leaf_check.py), cloud_resample_compare solves the same pool on the host and the device.
-
-void DustGasDrag::StressResamplePool() {
-  particles::Particles *ppar = pmy_pack->ppart;
-  Mesh *pmesh = pmy_pack->pmesh;
-  const int npart = ppar->nprtcl_thispack;
-  // (2026-10-26: EnsureRootCloudMass is collective, so it comes before the return of a rank
-  // without particles)
-  if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
-  if (npart == 0) return;
-  const int nsp = std::max(1, nspecies);
-  DvceArray1D<Real> m0sp("rs_stress_m0", nsp);
-  {
-    auto mh = Kokkos::create_mirror_view(m0sp);
-    for (int sp=0; sp<nsp; ++sp) {
-      mh(sp) = (cloud_resample_m0 > 0.0) ? cloud_resample_m0
-             : ((static_cast<int>(cloud_merge_mroot.size()) > sp) ? cloud_merge_mroot[sp] : 0.0);
-    }
-    Kokkos::deep_copy(m0sp, mh);
-  }
-  const Real eta = cloud_resample_eta;
-  const int every = cloud_resample_stress, kcopy = cloud_resample_stress_copies;
-  const int nrdata = ppar->nrdata, nidata = ppar->nidata;
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  // candidates as the pool flags them, their rank, the number of extra copies
-  DvceArray1D<int> rk(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_stress_rank"), npart);
-  DvceArray1D<int> ex(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_stress_extra"), npart);
-  DvceArray1D<int> off(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_stress_off"), npart);
-  int ncand = 0;
-  Kokkos::parallel_scan("rs_stress_cand", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
-    const int code = pi(PLEV,p);
-    bool ok = pr(IPM,p) > 0.0 && !SMRCompositeTransfer::CloudLobe1(code) &&
-              !SMRCompositeTransfer::CloudLobe2(code);
-    if (ok) {
-      const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-      const int lev = SMRCompositeTransfer::CloudLevel(code);
-      const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
-      ok = (pr(IPM,p) <= cap*(1.0 + resample::kPoolTol)) &&
-           !(pr(IPM,p) >= cap*(1.0 - resample::kCapTol));
-    }
-    if (final) rk(p) = ok ? upd : -1;
-    if (ok) ++upd;
-  }, ncand);
-  int nextra = 0;
-  Kokkos::parallel_scan("rs_stress_extra", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
-    const int r = rk(p);
-    int e = 0;
-    if (r >= 0 && kcopy > 0 && r == 0) e = kcopy;
-    else if (r >= 0 && every > 0 && r % every == 0) e = 1;
-    if (final) {ex(p) = e; off(p) = upd;}
-    upd += e;
-  }, nextra);
-  if (nextra > 0) {
-    const int nnew = npart + nextra;
-    if (ppar->prtcl_rdata.extent_int(1) < nnew) {
-      Kokkos::resize(ppar->prtcl_rdata, nrdata, nnew + nnew/4);
-      Kokkos::resize(ppar->prtcl_idata, nidata, nnew + nnew/4);
-    }
-    auto prv = ppar->prtcl_rdata;
-    auto piv = ppar->prtcl_idata;
-    EnsureNextTag();
-    const std::uint64_t tag0 = IssueTags(static_cast<std::uint64_t>(nextra));
-    const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
-    const auto transfer = smr_transfer;
-    Kokkos::parallel_for("rs_stress_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      const int e = ex(p);
-      if (e == 0) return;
-      // 0 same point, 1 1e-13, 2 1e-10 apart; the K copies of the first candidate at one point
-      const int type = (every > 0 && !(kcopy > 0 && rk(p) == 0)) ? (rk(p)/every) % 3 : 0;
-      const Real m = prv(IPM,p)/static_cast<Real>(e + 1);
-      const Real dx = (type == 0) ? 0.0 : ((type == 1) ? 1.0e-13 : 1.0e-10)*
-                      transfer.CloudHalfWidth1(SMRCompositeTransfer::CloudLevel(piv(PLEV,p)));
-      prv(IPM,p) = m;
-      for (int k=0; k<e; ++k) {
-        const int s = npart + off(p) + k;
-        for (int c=0; c<nrdata; ++c) prv(c,s) = prv(c,p);
-        for (int c=0; c<nidata; ++c) piv(c,s) = piv(c,p);
-        SetTag(piv, s, tag0 + static_cast<std::uint64_t>(off(p) + k)*tstride);
-        prv(IPX,s) += dx; prv(IPX1,s) += dx;
-      }
-    });
-    ppar->nprtcl_thispack = nnew;
-    pmesh->nprtcl_thisrank = nnew;
-    pmesh->nprtcl_eachrank[global_variable::my_rank] = nnew;
-    pmesh->nprtcl_total = nnew;
-  }
-  if (global_variable::my_rank == 0) {
-    std::cout << "# resampling stress test, cycle " << pmesh->ncycle << ": " << ncand
-              << " candidates, " << nextra << " copies added (every " << every << "-th candidate "
-              << "split in two, in turn coincident / 1e-13 / 1e-10 of a half width apart; the first "
-              << kcopy << " extra copies at one point), particles " << npart << " -> "
-              << npart + nextra << std::endl;
-  }
-}
-
 int DustGasDrag::ResampleClouds(const bool local) {
   ++gravity_mass_epoch;   // R changes the deposited mass (gravity field reuse)
   if (clouds3d) return ResampleClouds3D(local);
@@ -759,10 +570,6 @@ int DustGasDrag::ResampleClouds(const bool local) {
   };
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
-  if (!cloud_resample_stress_done && (cloud_resample_stress > 0 || cloud_resample_stress_copies > 0)) {
-    StressResamplePool();   // diagnostic: before the first resampling only
-    cloud_resample_stress_done = true;
-  }
   const int npart = ppar->nprtcl_thispack;
   const auto transfer = smr_transfer;
   const auto lt = leaf_traversal;   // cloud weights on the actual leaves
@@ -773,13 +580,6 @@ int DustGasDrag::ResampleClouds(const bool local) {
   // the root cloud mass (reduced over the ranks): also before any return
   if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
   if (npart == 0) return 0;
-  const bool dump = std::find(cloud_resample_dump.begin(), cloud_resample_dump.end(), pmesh->ncycle) !=
-                    cloud_resample_dump.end();
-  if (dump) {
-    DumpResampleState(ppar, pmesh, "pre", nspecies > 1);
-    // rewritten below if the resampling changes anything
-    DumpResampleState(ppar, pmesh, "post", nspecies > 1);
-  }
   // the root cloud mass of every species (cap eta m0 / 4^level): cloud_resample_m0 for all of
   // them, else the merge pass's per-species value.  The patches are also split by
   // species, so every species keeps its own leaf masses (one species: no change)
@@ -1071,14 +871,8 @@ int DustGasDrag::ResampleClouds(const bool local) {
       upd += (cnt(p) > 0) ? cnt(p) : 0;
     }, nnz);
   }
-  if (npool < 2) {   // nothing to resample; the pass keeps its log row (all patch columns 0)
+  if (npool < 2) {   // nothing to resample
     ++cloud_resample_pass;
-    char row[1024];
-    std::snprintf(row, sizeof(row), "%d %.17g %d %d %d %.0f %.0f 0 0 %d 0 0 0.000e+00 0 0 0"
-                  " %.17g %.17g %.17g %.17g %.4e 0 0 0 0 0 0 0 %d 0 0 0 0 0 0 0 0 0 0 %d 0 0 0 0 0\n",
-                  pmesh->ncycle, pmesh->time, npart, npart, npool, cnt_b[1], cnt_b[0], npool, tot_b[0],
-                  tot_b[0], tot_b[1], tot_b[1], seconds(t_all), nnz, cloud_resample_device ? 1 : 0);
-    AppendResampleLog(row);
     return 0;
   }
 
@@ -1235,17 +1029,14 @@ int DustGasDrag::ResampleClouds(const bool local) {
       pgeo(qs,2) = 0.5*w*d1; pgeo(qs,3) = 0.5*w*d2;
     }
   });
-  // The patch solves on the host (default), on the device, or both on the same
-  // pool (cloud_resample_compare: the differences are logged, the device result is used)
-  const bool on_dev = cloud_resample_device || cloud_resample_compare;
-  const bool on_host = !cloud_resample_device || cloud_resample_compare;
+  // The patch solves on the host or on the device (cloud_resample_device)
+  const bool on_dev = cloud_resample_device;
+  const bool on_host = !cloud_resample_device;
   double t_copy = 0.0, t_sort = 0.0, t_host = 0.0, cpu = 0.0;
   int nthread = 0;
   std::vector<PatchInfo> infos(npatch);
   std::vector<int> order;
   std::vector<double> mnew;
-  Kokkos::View<Real**, Kokkos::LayoutRight, HostMemSpace> pdc;   // pool table (comparison)
-  Kokkos::View<int**, Kokkos::LayoutRight, HostMemSpace> pidc;
   if (on_host) {
     auto pd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pd);
     auto pgeo_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pgeo);
@@ -1303,16 +1094,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     }
     t_host = seconds(t0);
     for (double b : busy) cpu += b;
-    if (cloud_resample_compare) {
-      pdc = Kokkos::View<Real**, Kokkos::LayoutRight, HostMemSpace>("rs_pdc", npool, npd);
-      pidc = Kokkos::View<int**, Kokkos::LayoutRight, HostMemSpace>("rs_pidc", npool, 2);
-      for (int a=0; a<npool; ++a) {
-        for (int c=0; c<npd; ++c) pdc(a,c) = pd_h(a,c);
-        pidc(a,0) = pid_h(a,0); pidc(a,1) = pid_h(a,1);
-      }
-    }
   }
-  std::vector<PatchInfo> dinfos;     // device per-patch counters (cloud_resample_compare only)
   resample::PatchSummary dsum;       // device totals
   DvceArray1D<Real> mdev;
   double dtim[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // device: order, sizes, small, large, solve, middle
@@ -1383,64 +1165,8 @@ int DustGasDrag::ResampleClouds(const bool local) {
     auto mdv = mdev;
     Kokkos::parallel_for("rs_unsort", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
     KOKKOS_LAMBDA(const int k) {mdv(sorder(k)) = mn(k);});
-    // The log row's totals reduced on the device; the per-patch counters go to the
-    // host only for the comparison with the host solve
+    // The totals reduced on the device
     resample::SummarizePatchesDevice(outi, outr, dsum);
-    if (cloud_resample_compare || cloud_resample_patch_stats) {
-      auto oi = Kokkos::create_mirror_view_and_copy(HostMemSpace(), outi);
-      auto orr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), outr);
-      dinfos.resize(npatch);
-      for (int q=0; q<npatch; ++q) {
-        PatchInfo f;
-        f.n = oi(q, resample::PN); f.kept = oi(q, resample::PKEPT); f.ncap = oi(q, resample::PNCAP);
-        f.fallback = oi(q, resample::PFALLBACK); f.steps_zero = oi(q, resample::PZERO);
-        f.steps_cap = oi(q, resample::PCAPSTEP); f.scans = oi(q, resample::PSCANS);
-        f.nrow = oi(q, resample::PNROW); f.nb = oi(q, resample::PNB); f.res = orr(q);
-        dinfos[q] = f;
-      }
-    }
-  }
-  if (cloud_resample_compare) {
-    // the same pool solved on the host and on the device: per cloud, per patch
-    auto md_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), mdev);
-    std::vector<double> mh(npool);
-    for (int k=0; k<npool; ++k) mh[order[k]] = mnew[k];
-    long long rem_h = 0, rem_d = 0, kdiff = 0;
-    double dmax = 0.0;
-    std::vector<char> pk(npatch, 0), pm(npatch, 0);
-    for (int a=0; a<npool; ++a) {
-      const double m0a = pdc(a, resample::JM);
-      if (!(mh[a] > 0.0)) ++rem_h;
-      if (!(md_h(a) > 0.0)) ++rem_d;
-      const int q = pidc(a, 0);
-      if ((mh[a] > 0.0) != (md_h(a) > 0.0)) {++kdiff; pk[q] = 1;}
-      const double rel = std::fabs(mh[a] - md_h(a))/m0a;
-      dmax = std::max(dmax, rel);
-      if (rel > 1.0e-12) pm[q] = 1;
-    }
-    long long fh = 0, fd = 0, npk = 0, npm = 0, nzh = 0, nzd = 0, nch = 0, ncd = 0;
-    for (int q=0; q<npatch; ++q) {
-      npk += pk[q]; npm += pm[q];
-      fh += (infos[q].fallback != 0); fd += (dinfos[q].fallback != 0);
-      nzh += infos[q].steps_zero; nzd += dinfos[q].steps_zero;
-      nch += infos[q].steps_cap; ncd += dinfos[q].steps_cap;
-    }
-    if (global_variable::my_rank == 0) {
-      std::FILE *fc = std::fopen("cloud_resample_compare.txt", "a");
-      if (fc != nullptr) {
-        std::fseek(fc, 0, SEEK_END);
-        if (std::ftell(fc) == 0) {
-          std::fprintf(fc, "# ncycle time pool removed_host removed_device clouds_kept_differ "
-                       "patches_kept_differ patches_mass_differ(>1e-12) max_rel_mass_diff "
-                       "fallback_host fallback_device steps_zero_host steps_zero_device "
-                       "steps_cap_host steps_cap_device t_host_wall t_device_solve\n");
-        }
-        std::fprintf(fc, "%d %.17g %d %lld %lld %lld %lld %lld %.3e %lld %lld %lld %lld %lld %lld %.4e %.4e\n",
-                     pmesh->ncycle, pmesh->time, npool, rem_h, rem_d, kdiff, npk, npm, dmax, fh, fd,
-                     nzh, nzd, nch, ncd, t_host, dtim[4]);
-        std::fclose(fc);
-      }
-    }
   }
   if (cloud_resample_device) {t_sort = dtim[0]; t_host = dtim[4];}
   t0 = Clock::now();
@@ -1467,11 +1193,6 @@ int DustGasDrag::ResampleClouds(const bool local) {
     if (f.kept < f.n) ++nred;
   }
   const int nremoved = static_cast<int>(pool - kept);
-
-  // Diagnostic (cloud_resample_feedback_check): the production predictor feedback
-  // on the frozen gas (AuditFeedback: linear gather, cloud-weight deposit) before the new masses
-  DvceArray2D<Real> fb_before;
-  if (cloud_resample_feedback_check) AuditFeedback(fb_before);
 
   // device: new masses, compaction
   if (nremoved > 0 || csteps > 0) {
@@ -1517,122 +1238,9 @@ int DustGasDrag::ResampleClouds(const bool local) {
     pmesh->nprtcl_eachrank[global_variable::my_rank] = nfinal;
     pmesh->nprtcl_total = nfinal;
   }
-  double tot_a[2] = {0.0, 0.0};
-  {
-    auto pra = ppar->prtcl_rdata;
-    Kokkos::parallel_reduce("rs_tot", Kokkos::RangePolicy<>(DevExeSpace(), 0, nfinal),
-    KOKKOS_LAMBDA(const int p, double &mt, double &px) {
-      mt += pra(IPM,p); px += pra(IPM,p)*pra(IPVX,p);
-    }, tot_a[0], tot_a[1]);
-  }
-  Kokkos::fence();
-  const double t_back = seconds(t0);
-  if (cloud_resample_patch_stats) {
-    // Diagnostic: per level (of the patch's MeshBlock) and
-    // patch size, the patches, clouds, removals and steps; and the five largest patches
-    const std::vector<PatchInfo> &ps = cloud_resample_device ? dinfos : infos;
-    const int nbin = 4, bin_lo[4] = {1, 64, 256, 1024};
-    std::map<std::pair<int,int>, std::array<long long,7>> acc;
-    std::vector<std::pair<int,int>> big;   // (clouds, patch)
-    auto level_of = [&](const int qs) {
-      const int q = qs/nsp/psub;
-      const int b = static_cast<int>(std::upper_bound(poff_h.begin(), poff_h.end(), q) -
-                                     poff_h.begin()) - 1;
-      return pmy_pack->pmb->mb_lev.h_view(b) - pmesh->root_level;
-    };
-    for (int qs=0; qs<static_cast<int>(ps.size()); ++qs) {
-      const PatchInfo &f = ps[qs];
-      if (f.n == 0) continue;
-      int bin = 0;
-      while (bin + 1 < nbin && f.n >= bin_lo[bin + 1]) ++bin;
-      auto it = acc.find({level_of(qs), bin});
-      if (it == acc.end()) {
-        it = acc.emplace(std::make_pair(level_of(qs), bin),
-                         std::array<long long,7>{0, 0, 0, 0, 0, 0, 0}).first;
-      }
-      auto &a = it->second;
-      a[0] += 1; a[1] += f.n; a[2] += f.n - f.kept; a[3] += f.steps_zero; a[4] += f.steps_cap;
-      a[5] += (f.kept < f.n) ? 1 : 0; a[6] = std::max<long long>(a[6], f.n);
-      big.emplace_back(f.n, qs);
-    }
-    const int ntop = std::min<int>(5, static_cast<int>(big.size()));
-    std::partial_sort(big.begin(), big.begin() + ntop, big.end(),
-                      [](const std::pair<int,int> &x, const std::pair<int,int> &y) {
-                        return x.first > y.first || (x.first == y.first && x.second < y.second);
-                      });
-    std::FILE *fs = AppendLog(RankFile("cloud_resample_patch_stats.txt"));
-    if (fs != nullptr) {
-      if (LogEmpty(fs)) {
-        std::fprintf(fs, "# bins: ncycle time bin level n_min patches clouds removed steps_zero "
-                     "steps_cap patches_reduced n_max\n# top:  ncycle time top level n nb nrow "
-                     "removed steps_zero steps_cap scans\n# split: ncycle time split "
-                     "patches_split patches_whole_or_split (cloud_resample_patch_split > 0)\n");
-      }
-      for (const auto &kv : acc) {
-        const auto &a = kv.second;
-        std::fprintf(fs, "%d %.17g bin %d %d %lld %lld %lld %lld %lld %lld %lld\n", pmesh->ncycle,
-                     pmesh->time, kv.first.first, bin_lo[kv.first.second], a[0], a[1], a[2], a[3],
-                     a[4], a[5], a[6]);
-      }
-      if (psub > 1) {
-        std::fprintf(fs, "%d %.17g split %d %d\n", pmesh->ncycle, pmesh->time, nsplit, nbase);
-      }
-      for (int t=0; t<ntop; ++t) {
-        const PatchInfo &f = ps[big[t].second];
-        std::fprintf(fs, "%d %.17g top %d %d %d %d %d %d %d %d\n", pmesh->ncycle, pmesh->time,
-                     level_of(big[t].second), f.n, f.nb, f.nrow, f.n - f.kept, f.steps_zero,
-                     f.steps_cap, f.scans);
-      }
-      std::fflush(fs);
-    }
-  }
   ++cloud_resample_pass;
   cloud_resample_removed += static_cast<unsigned long long>(nremoved);
   if (phst_track) phst_r_removed += static_cast<unsigned long long>(nremoved);
-  {
-    char row[1024];
-    std::snprintf(row, sizeof(row), "%d %.17g %d %d %lld %.0f %.0f %lld %lld %lld %lld %lld %.3e %lld %lld"
-                  " %lld %.17g %.17g %.17g %.17g %.4e %.4e %.4e %.4e %.4e %.4e %.4e %d %d"
-                  " %.4e %.4e %.4e %.4e %.4e %.4e %d %d %d %d %d %.4e %.4e %.4e %.4e %.4e\n", pmesh->ncycle,
-                  pmesh->time, npart, nfinal, pool, cnt_b[1], cnt_b[0], npat, nred, kept, atcap, nfall,
-                  resmax, zsteps, csteps, scans, tot_b[0], tot_a[0], tot_b[1], tot_a[1], seconds(t_all),
-                  t_dev, t_copy, t_sort, t_host, cpu, t_back, nthread, nnz, st[0], st[1], st[2],
-                  st[3], st[4], st[5], nmax, nbmax, n64, n256, cloud_resample_device ? 1 : 0,
-                  dtim[0], dtim[1], dtim[2], dtim[3], dtim[5]);
-    AppendResampleLog(row);
-  }
-  if (cloud_resample_feedback_check) {
-    // ... and after: per component the largest change of a leaf over the largest leaf value
-    DvceArray2D<Real> fb_after;
-    AuditFeedback(fb_after);
-    const int nt = fb_after.extent_int(1);
-    Real dl[4] = {0.0, 0.0, 0.0, 0.0}, rf[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int c=0; c<4; ++c) {
-      auto a = fb_before, b = fb_after;
-      Kokkos::parallel_reduce("rs_fbcheck", Kokkos::RangePolicy<>(DevExeSpace(), 0, nt),
-      KOKKOS_LAMBDA(const int t, Real &d, Real &r) {
-        d = Kokkos::fmax(d, Kokkos::fabs(b(c,t) - a(c,t)));
-        r = Kokkos::fmax(r, Kokkos::fabs(a(c,t)));
-      }, Kokkos::Max<Real>(dl[c]), Kokkos::Max<Real>(rf[c]));
-    }
-    if (global_variable::my_rank == 0) {
-      std::FILE *fp = std::fopen("cloud_resample_fbcheck.txt", "a");
-      if (fp != nullptr) {
-        std::fseek(fp, 0, SEEK_END);
-        if (std::ftell(fp) == 0) {
-          std::fprintf(fp, "# ncycle time removed; per component (x, y, z momentum, mass rate) of the "
-                       "production feedback (AuditFeedback): largest |after - before| of a leaf / largest "
-                       "|before|, then the largest |before|\n");
-        }
-        std::fprintf(fp, "%d %.17g %d", pmesh->ncycle, pmesh->time, nremoved);
-        for (int c=0; c<4; ++c) std::fprintf(fp, " %.3e", (rf[c] > 0.0) ? dl[c]/rf[c] : dl[c]);
-        for (int c=0; c<4; ++c) std::fprintf(fp, " %.6e", rf[c]);
-        std::fprintf(fp, "\n");
-        std::fclose(fp);
-      }
-    }
-  }
-  if (dump) DumpResampleState(ppar, pmesh, "post", nspecies > 1);
   return nremoved;
 }
 
@@ -1898,12 +1506,6 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
   gas_if_needed(npool);
   if (npool < 2) {
     ++cloud_resample_pass;
-    char row[1024];
-    std::snprintf(row, sizeof(row), "%d %.17g %d %d %d %.0f %.0f 0 0 %d 0 0 0.000e+00 0 0 0"
-                  " %.17g %.17g %.17g %.17g %.4e 0 0 0 0 0 0 0 %d 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0\n",
-                  pmesh->ncycle, pmesh->time, npart, npart, npool, cnt_b[1], cnt_b[0], npool, tot_b[0],
-                  tot_b[0], tot_b[1], tot_b[1], seconds(t_all), nnz);
-    AppendResampleLog(row);
     return 0;
   }
   // the pool table (x, y, m, v, ts, gathered gas velocity, cap, z), ids, CSR weights
@@ -2100,10 +1702,6 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
                                cloud_resample_device_wide_team, tim, scr);
   resample::PatchSummary dsum;
   resample::SummarizePatchesDevice(outi, outr, dsum);
-  if (cloud_resample_rank_screen) {
-    AppendScreenLog(pmesh->ncycle, pmesh->time, npatch, scr[0], scr[1],
-                    static_cast<long long>(dsum.pool));
-  }
   const int nremoved = static_cast<int>(dsum.pool - dsum.kept);
   if (nremoved > 0 || dsum.csteps > 0) {
     Kokkos::parallel_for("rs3_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
@@ -2138,34 +1736,9 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
     pmesh->nprtcl_eachrank[global_variable::my_rank] = nfinal;
     pmesh->nprtcl_total = nfinal;
   }
-  double tot_a[2] = {0.0, 0.0};
-  {
-    auto pra = ppar->prtcl_rdata;
-    Kokkos::parallel_reduce("rs3_tot", Kokkos::RangePolicy<>(DevExeSpace(), 0, nfinal),
-    KOKKOS_LAMBDA(const int p, double &mt, double &px) {
-      mt += pra(IPM,p); px += pra(IPM,p)*pra(IPVX,p);
-    }, tot_a[0], tot_a[1]);
-  }
-  Kokkos::fence();
   ++cloud_resample_pass;
   cloud_resample_removed += static_cast<unsigned long long>(nremoved);
   if (phst_track) phst_r_removed += static_cast<unsigned long long>(nremoved);
-  {
-    // the 2-D log row; the host-only columns (stage seconds, threads) are zero
-    char row[1024];
-    std::snprintf(row, sizeof(row), "%d %.17g %d %d %lld %.0f %.0f %lld %lld %lld %lld %lld %.3e %lld %lld"
-                  " %lld %.17g %.17g %.17g %.17g %.4e %.4e %.4e %.4e %.4e %.4e %.4e %d %d"
-                  " %.4e %.4e %.4e %.4e %.4e %.4e %d %d %d %d %d %.4e %.4e %.4e %.4e %.4e\n", pmesh->ncycle,
-                  pmesh->time, npart, nfinal, static_cast<long long>(dsum.pool), cnt_b[1], cnt_b[0],
-                  static_cast<long long>(dsum.npat), static_cast<long long>(dsum.nred),
-                  static_cast<long long>(dsum.kept), static_cast<long long>(dsum.atcap),
-                  static_cast<long long>(dsum.nfall), dsum.resmax, static_cast<long long>(dsum.zsteps),
-                  static_cast<long long>(dsum.csteps), static_cast<long long>(dsum.scans), tot_b[0],
-                  tot_a[0], tot_b[1], tot_a[1], seconds(t_all), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, nnz,
-                  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, dsum.nmax, dsum.nbmax, dsum.n64, dsum.n256, 1,
-                  0.0, tim[0], tim[1], tim[2], tim[4]);
-    AppendResampleLog(row);
-  }
   (void) nsplit;
   return nremoved;
 }

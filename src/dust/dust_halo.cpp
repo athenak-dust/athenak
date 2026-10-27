@@ -105,10 +105,9 @@ struct AccFlatInt {
 };
 
 // copy (forward: owner -> halo slots) or add back (reverse: halo slots -> owner) nc components
-// of the cells in the lists (whole blocks, or the strips a cloud can reach).  can_nan: the field
-// takes NaN (the strip guard fills the halo slots with it before the forward copy)
+// of the cells in the lists (whole blocks, or the strips a cloud can reach)
 template <typename Acc>
-void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc, const bool can_nan) {
+void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
 #if MPI_PARALLEL_ENABLED
   if (h.npeer == 0) return;
   using Clock = std::chrono::steady_clock;
@@ -135,38 +134,6 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc, con
   if (h.rbuf.extent_int(0) < nin*nc) Kokkos::realloc(h.rbuf, nin*nc);
   auto sbuf = h.sbuf;
   auto rbuf = h.rbuf;
-  // the strip guard (test): before the reverse copy, nothing may lie outside the strips of the
-  // halo slots; before the forward copy, the halo slots hold NaN where nothing is received
-  const int nh = h.hslot1 - h.hslot0, hs0 = h.hslot0, nx1 = h.nx1, nx2 = h.nx2, is = h.is, js = h.js;
-  const int nx3 = h.nx3, ks = h.ks, nc3 = h.ncells3, nxc = nx1*nx2*nx3;
-  if (h.guard && nh > 0) {
-    auto rect = h.rect_d;
-    if (reverse) {
-      int nbad = 0;
-      Kokkos::parallel_reduce("dust_halo_guard", Kokkos::RangePolicy<>(DevExeSpace(), 0, nh*nxc*nc),
-      KOKKOS_LAMBDA(const int q, int &bad) {
-        const int i = q % nx1, j = (q/nx1) % nx2, k = (q/(nx1*nx2)) % nx3, c = (q/nxc) % nc;
-        const int e = q/(nxc*nc);
-        const bool in = (i >= rect(e,0) && i < rect(e,1) && j >= rect(e,2) && j < rect(e,3) &&
-                         k >= rect(e,4) && k < rect(e,5));
-        if (!in && acc.get(c, (((hs0 + e)*nc3 + ks + k)*nc2 + js + j)*nc1 + is + i) != 0.0) ++bad;
-      }, nbad);
-      if (nbad > 0) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "dust halo: " << nbad << " deposits outside the strips of the halo blocks"
-                  << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-    } else if (can_nan) {
-      const Real qnan = std::numeric_limits<Real>::quiet_NaN();
-      Kokkos::parallel_for("dust_halo_nan", Kokkos::RangePolicy<>(DevExeSpace(), 0, nh*nxc*nc),
-      KOKKOS_LAMBDA(const int q) {
-        const int i = q % nx1, j = (q/nx1) % nx2, k = (q/(nx1*nx2)) % nx3, c = (q/nxc) % nc;
-        const int e = q/(nxc*nc);
-        acc.set(c, (((hs0 + e)*nc3 + ks + k)*nc2 + js + j)*nc1 + is + i, qnan);
-      });
-    }
-  }
   const int tag = reverse ? 2 : 1;
   std::vector<MPI_Request> rreq(h.npeer, MPI_REQUEST_NULL), sreq(h.npeer, MPI_REQUEST_NULL);
   tc = Clock::now();
@@ -254,7 +221,6 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
     nmb = lt.nmb; nfld = lt.nfld; gids = lt.gids;
   }
   h.hslot0 = nmb; h.hslot1 = nfld;
-  h.guard = cloud_halo_strip_guard;
   h.peer.clear(); h.soff.assign(1, 0); h.roff.assign(1, 0); h.npeer = 0;
   h.nblk_send = h.nblk_recv = 0;
   if (global_variable::nranks == 1) return;
@@ -331,11 +297,6 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
   for (std::size_t k=0; k<rh.size(); ++k) rb(k) = rh[k];
   Kokkos::deep_copy(h.scell, sb);
   Kokkos::deep_copy(h.rcell, rb);
-  const int nh = std::max(nfld - nmb, 1);
-  h.rect_d = DvceArray2D<int>("dust_halo_rect", nh, 6);
-  auto rr = Kokkos::create_mirror_view(h.rect_d);
-  for (int b=nmb; b<nfld; ++b) for (int q=0; q<6; ++q) rr(b - nmb, q) = h.rect[b - nmb][q];
-  Kokkos::deep_copy(h.rect_d, rr);
   ++h.builds;
 #else
   (void)pm; (void)slot_gid; (void)gids;
@@ -353,11 +314,11 @@ void DustGasDrag::HaloForwardPack(DvceArray5D<Real> &gp) {
   const int nc1 = halo_.ncells1, n12 = halo_.ncells1*halo_.ncells2;
   if (halo_.three) {   // 3-D: gpack3 (12 components)
     AccPack3 a; a.f = gp; a.nc1 = nc1; a.n12 = n12; a.n123 = n12*halo_.ncells3;
-    Exchange(halo_, gp.extent_int(4), false, a, true);
+    Exchange(halo_, gp.extent_int(4), false, a);
     return;
   }
   AccPack a; a.f = gp; a.ks = pmy_pack->pmesh->mb_indcs.ks; a.nc1 = nc1; a.n12 = n12;
-  Exchange(halo_, gp.extent_int(4), false, a, true);
+  Exchange(halo_, gp.extent_int(4), false, a);
 }
 
 void DustGasDrag::HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int nc) {
@@ -365,11 +326,11 @@ void DustGasDrag::HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int n
   const int nc1 = halo_.ncells1, n12 = halo_.ncells1*halo_.ncells2;
   if (halo_.three) {
     Acc5D3 a; a.f = f; a.c0 = c0; a.nc1 = nc1; a.n12 = n12; a.n123 = n12*halo_.ncells3;
-    Exchange(halo_, nc, true, a, true);
+    Exchange(halo_, nc, true, a);
     return;
   }
   Acc5D a; a.f = f; a.c0 = c0; a.ks = pmy_pack->pmesh->mb_indcs.ks; a.nc1 = nc1; a.n12 = n12;
-  Exchange(halo_, nc, true, a, true);
+  Exchange(halo_, nc, true, a);
 }
 
 void DustGasDrag::HaloForward5D(DvceArray5D<Real> &f, const int c0, const int nc) {
@@ -377,35 +338,35 @@ void DustGasDrag::HaloForward5D(DvceArray5D<Real> &f, const int c0, const int nc
   const int nc1 = halo_.ncells1, n12 = halo_.ncells1*halo_.ncells2;
   if (halo_.three) {
     Acc5D3 a; a.f = f; a.c0 = c0; a.nc1 = nc1; a.n12 = n12; a.n123 = n12*halo_.ncells3;
-    Exchange(halo_, nc, false, a, true);
+    Exchange(halo_, nc, false, a);
     return;
   }
   Acc5D a; a.f = f; a.c0 = c0; a.ks = pmy_pack->pmesh->mb_indcs.ks; a.nc1 = nc1; a.n12 = n12;
-  Exchange(halo_, nc, false, a, true);
+  Exchange(halo_, nc, false, a);
 }
 
 void DustGasDrag::HaloForwardFlat(DvceArray2D<Real> &f, const int nc) {
   if (halo_.npeer == 0) return;
   AccFlat a; a.f = f;
-  Exchange(halo_, nc, false, a, true);
+  Exchange(halo_, nc, false, a);
 }
 
 void DustGasDrag::HaloReverseAddFlat(DvceArray2D<Real> &f, const int nc) {
   if (halo_.npeer == 0) return;
   AccFlat a; a.f = f;
-  Exchange(halo_, nc, true, a, true);
+  Exchange(halo_, nc, true, a);
 }
 
 void DustGasDrag::HaloForwardFlags(DvceArray1D<int> &f) {
   if (halo_.npeer == 0) return;
   AccFlatInt a; a.f = f;
-  Exchange(halo_, 1, false, a, false);
+  Exchange(halo_, 1, false, a);
 }
 
 void DustGasDrag::HaloReverseAddFlags(DvceArray1D<int> &f) {
   if (halo_.npeer == 0) return;
   AccFlatInt a; a.f = f;
-  Exchange(halo_, 1, true, a, false);
+  Exchange(halo_, 1, true, a);
 }
 
 }  // namespace dust

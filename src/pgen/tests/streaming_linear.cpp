@@ -57,8 +57,6 @@
 void StreamingLinearHistory(HistoryData *pdata, Mesh *pm);
 void StreamingLinearHistory3D(HistoryData *pdata, Mesh *pm);   // 3-D refinable clouds
 void StreamingKx0Filter(Mesh *pm, const Real bdt);
-void RunMergeReplay(ParameterInput *pin, Mesh *pm, const Real taus0);
-void RunAuditReplay(ParameterInput *pin, Mesh *pm);
 bool kx0_filter_phi = false;  // also filter the azimuthal momentum (IM3 in the 2-D r-z box)
 Real kx0_filter_tstart = 0.0;  // the filter acts from this time on
 
@@ -232,13 +230,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   lina_pin_ = pin;
   if (restart) {
     // native restart: gas, particles and the dust counters come from the
-    // file; here only what the history function needs.  The split oracle keeps functions of
-    // the initial state and is not available after a restart.
-    if (pin->GetOrAddBoolean("problem", "split_oracle", false)) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "<problem>/split_oracle (diagnostic) requires a fresh run" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
+    // file; here only what the history function needs
     if (snapshots_) {
       snapshot_number_ = pin->GetOrAddInteger("problem", "rst_snapshot_number", 0);
       snapshot_calls_ = pin->GetOrAddInteger("problem", "rst_snapshot_calls", 0);
@@ -271,7 +263,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       (lina3d && ((pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
                    !pmbp->pdust->Clouds3D()) ||
                   pin->GetOrAddBoolean("problem", "prescribed_gas", false) ||
-                  pin->GetOrAddBoolean("problem", "split_oracle", false) ||
                   pin->GetOrAddBoolean("problem", "analytic_gather", false) ||
                   pin->GetOrAddBoolean("problem", "double_precision_snapshots", false) ||
                   pin->GetOrAddBoolean("problem", "kx0_filter", false) ||
@@ -355,8 +346,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   // refinable clouds on the root lattice (npar1d^2 per root cell in x1-x3, one per root cell in
   // x2), split to the leaves, the seed imprinted after the split with seed_after_split
   if (pmy_mesh_->three_d && pmbp->pdust->Clouds3D()) {
-    for (const char *key : {"prescribed_gas", "split_oracle", "split_oracle_velocity",
-                            "split_oracle_node", "analytic_gather", "kx0_filter",
+    for (const char *key : {"prescribed_gas", "analytic_gather", "kx0_filter",
                             "double_precision_snapshots"}) {
       if (pin->GetOrAddBoolean("problem", key, false)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -364,10 +354,9 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
         std::exit(EXIT_FAILURE);
       }
     }
-    if (boost != 0.0 || !pin->GetOrAddString("problem", "merge_replay", "").empty() ||
-        !pin->GetOrAddString("problem", "merge_audit_replay", "").empty()) {
+    if (boost != 0.0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "boost_vx and the replays are not available in 3-D" << std::endl;
+                << "boost_vx is not available in 3-D" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     auto &ind3 = pmy_mesh_->mb_indcs;
@@ -612,93 +601,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     }
   }
 
-  // Diagnostic position oracle: with the prescribed gas the linear
-  // dust velocity is the eigenmode's at all times, so the exact dust displacement of a
-  // particle whose unperturbed position is X (X0 = X - vnx t at t = 0) is
-  //   xi(X,t) = xi_eig(X,t) + [xi_seed(X0) - xi_eig(X0,0)],
-  //   xi_eig = Re[v~/(s - i Omega) e^{i(kx X - wR t)}] e^{st} (cos kz z; odd field with
-  //   i v~ and sin kz z), Omega = wR - kx vnx,  xi_seed = -(Apr/(kx rho_p0)) sin(kx X0) cos(kz z)
-  // (the seed imprints a radial displacement only).  The dust code uses it to place the
-  // pieces of in-run splits (DustGasDrag::SplitCloudsP1).
-  if (pin->GetOrAddBoolean("problem", "split_oracle_velocity", false) &&
-      !pin->GetOrAddBoolean("problem", "split_oracle", false)) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<problem>/split_oracle_velocity requires split_oracle" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  if (pin->GetOrAddBoolean("problem", "split_oracle_node", false) &&
-      !pin->GetOrAddBoolean("problem", "split_oracle", false)) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<problem>/split_oracle_node requires split_oracle" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  // The same displacement is exact for the two-way linear problem as well (2026-10-03):
-  // the eigenmode with dust velocity v~ solves the coupled linear equations, and the seed
-  // offset xi_seed - xi_eig(X0,0) is solenoidal (same dust density), so it changes neither
-  // the dust density nor the drag at linear order; the oracle then gives the exact linear
-  // state, not the numerical two-way solution.  No boost (Omega uses the unboosted drift).
-  if (pin->GetOrAddBoolean("problem", "split_oracle", false)) {
-    if (!pin->GetOrAddBoolean("problem", "seed_after_split", false) || boost != 0.0) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "<problem>/split_oracle requires seed_after_split and "
-                << "boost_vx = 0" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    const Real srate = pin->GetReal("problem", "growth_rate");
-    const Real wrate = pin->GetReal("problem", "omega_re");
-    const Real om = wrate - kx*vnx;
-    const Real rp0 = eps*rho0;
-    // c = v~/(s - i Omega) for x and i v~/(s - i Omega) for z
-    const Real den = srate*srate + om*om;
-    const Real cxr = (Vxr*srate - Vxi*om)/den, cxi = (Vxi*srate + Vxr*om)/den;
-    const Real vzr = (Vzr*srate - Vzi*om)/den, vzi = (Vzi*srate + Vzr*om)/den;
-    const Real czr = -vzi, czi = vzr;
-    const Real kxx = kx, kzz = kz, vd = vnx, ap = Apr;
-    pmbp->pdust->split_oracle_node =
-        pin->GetOrAddBoolean("problem", "split_oracle_node", false);
-    pmbp->pdust->split_oracle_node_meanfree =
-        pin->GetOrAddInteger("problem", "split_oracle_node_meanfree", 0);
-    if (pmbp->pdust->split_oracle_node_meanfree != 0 &&
-        (!pmbp->pdust->split_oracle_node || pmbp->pdust->split_oracle_node_meanfree < 0 ||
-         pmbp->pdust->split_oracle_node_meanfree > 2)) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "<problem>/split_oracle_node_meanfree must be 0, 1 or 2 and requires "
-                << "split_oracle_node" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    pmbp->pdust->split_oracle = [=](Real t, Real x, Real z, Real &dx, Real &dz) {
-      const Real x0 = x - vd*t;
-      const Real g = std::exp(srate*t), ph = kxx*x - wrate*t;
-      const Real c1 = std::cos(ph), s1 = std::sin(ph), c0 = std::cos(kxx*x0), s0 = std::sin(kxx*x0);
-      const Real cz = std::cos(kzz*z), sz = std::sin(kzz*z);
-      dx = (g*(cxr*c1 - cxi*s1) - (cxr*c0 - cxi*s0) - (ap/(kxx*rp0))*s0)*cz;
-      dz = (g*(czr*c1 - czi*s1) - (czr*c0 - czi*s0))*sz;
-    };
-    // optional velocity part: the exact dust velocity perturbation of the eigenmode,
-    //   dv = Re[v~ e^{i(kx X - wR t)}] e^{st} cos kz z (x, phi), Re[i v~ ...] sin kz z (z)
-    if (pin->GetOrAddBoolean("problem", "split_oracle_velocity", false)) {
-      const Real vxr = Vxr, vxi = Vxi, vzr2 = Vzr, vzi2 = Vzi, vpr = Vpr, vpi = Vpi;
-      pmbp->pdust->split_oracle_velocity = [=](Real t, Real x, Real z, Real &dvx, Real &dvz,
-                                               Real &dvp) {
-        const Real g = std::exp(srate*t), ph = kxx*x - wrate*t;
-        const Real c1 = std::cos(ph), s1 = std::sin(ph);
-        const Real cz = std::cos(kzz*z), sz = std::sin(kzz*z);
-        dvx = g*(vxr*c1 - vxi*s1)*cz;
-        dvz = -g*(vzr2*s1 + vzi2*c1)*sz;
-        dvp = g*(vpr*c1 - vpi*s1)*cz;
-      };
-    }
-    if (global_variable::my_rank == 0) {
-      std::cout << "# streaming_linear: split position oracle on (Omega = " << om << ")"
-                << (pmbp->pdust->split_oracle_velocity ? ", with velocities" : "")
-                << (pmbp->pdust->split_oracle_node ? ", node convention" : "")
-                << (pmbp->pdust->split_oracle_node_meanfree == 1 ? ", mean-free velocity" :
-                    (pmbp->pdust->split_oracle_node_meanfree == 2 ?
-                     ", mean-free velocity and position" : ""))
-                << std::endl;
-    }
-  }
-
   // Diagnostic analytic gather: the dust sees the analytic gas
   // velocity at t+dt/2 and the predicted midpoint position with the cloud response of
   // the cloud_transition = 2 gather, instead of the gather from the gas cells
@@ -904,16 +806,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       std::cout << "# refinable_cloud lattice: " << nlattice << " root clouds -> "
                 << ppar->nprtcl_thispack << " particles after the initial split"
                 << (seed_after ? ", seed imprinted after the split" : "") << std::endl;
-    }
-    // <problem>/merge_replay = snapshot (diagnostic): replace the
-    // particles by a LinA snapshot and replay split and merge with frozen velocities
-    if (!pin->GetOrAddString("problem", "merge_replay", "").empty()) {
-      RunMergeReplay(pin, pmy_mesh_, taus0);
-    }
-    // <problem>/merge_audit_replay = audit file (diagnostic): one merge pass
-    // from the entry state of a merge-pass audit
-    if (!pin->GetOrAddString("problem", "merge_audit_replay", "").empty()) {
-      RunAuditReplay(pin, pmy_mesh_);
     }
   } else {
   int nrdata = ppar->nrdata;
@@ -1233,285 +1125,5 @@ void StreamingKx0Filter(Mesh *pm, const Real bdt) {
   }
 }
 
-//----------------------------------------------------------------------------------------
-//! \fn void RunMergeReplay()
-//! \brief Diagnostic: local replay of the refinable-cloud split and
-//! merge without hydro.  The particles of a LinA snapshot (positions, velocities, masses,
-//! tags, codes) replace the lattice; then, per cycle as RefineClouds does it, the split
-//! check, a merge pass every cloud_merge_interval cycles (shifted by
-//! merge_replay_pass_offset), and a drift with the frozen velocities.  Variants: a random x
-//! offset (merge_replay_jitter, in root cells, for fine pieces with x in
-//! [merge_replay_jx0, merge_replay_jx1) root cells), a permuted storage order
-//! (merge_replay_shuffle = seed > 0).  Snapshots <basename>.replay.NNNNN.lina every
-//! merge_replay_snap_every cycles; the merge log goes to cloud_merge_log.txt.  Exits.
-void RunMergeReplay(ParameterInput *pin, Mesh *pm, const Real taus0) {
-  MeshBlockPack *pmbp = pm->pmb_pack;
-  particles::Particles *ppar = pmbp->ppart;
-  auto *pdust = pmbp->pdust;
-  const std::string fname = pin->GetString("problem", "merge_replay");
-  const int ncyc = pin->GetOrAddInteger("problem", "merge_replay_ncycles", 21300);
-  const Real dt = pin->GetOrAddReal("problem", "merge_replay_dt", 9.18667e-06);
-  const int snap_every = pin->GetOrAddInteger("problem", "merge_replay_snap_every", 1775);
-  const Real jit = pin->GetOrAddReal("problem", "merge_replay_jitter", 0.0);
-  const Real jx0 = pin->GetOrAddReal("problem", "merge_replay_jx0", -1.0e30);
-  const Real jx1 = pin->GetOrAddReal("problem", "merge_replay_jx1", 1.0e30);
-  const int seed = pin->GetOrAddInteger("problem", "merge_replay_seed", 1);
-  const int shuffle = pin->GetOrAddInteger("problem", "merge_replay_shuffle", 0);
-  const int offset = pin->GetOrAddInteger("problem", "merge_replay_pass_offset", 0);
-  const auto &msz = pm->mesh_size;
-  const Real len1 = msz.x1max - msz.x1min, len2 = msz.x2max - msz.x2min;
-  const Real hroot = len1/static_cast<Real>(pin->GetInteger("mesh", "nx1"));
-  // read the snapshot
-  FILE *f = std::fopen(fname.c_str(), "rb");
-  char line[256];
-  double t0 = 0.0; int cyc0 = 0, nc = 0, np = 0;
-  if (f == nullptr || std::fgets(line, sizeof(line), f) == nullptr ||
-      std::string(line) != "AthenaK LinA snapshot v2 f64-native\n" ||
-      std::fgets(line, sizeof(line), f) == nullptr ||
-      std::sscanf(line, "%lf %d %d %d", &t0, &cyc0, &nc, &np) != 4) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "merge_replay: cannot read snapshot " << fname << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  std::vector<double> raw(8*static_cast<size_t>(np));
-  if (std::fseek(f, 8L*8L*static_cast<long>(nc), SEEK_CUR) != 0 ||
-      std::fread(raw.data(), sizeof(double), raw.size(), f) != raw.size()) {
-    std::cout << "### FATAL ERROR: merge_replay: truncated snapshot " << fname << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  std::fclose(f);
-  std::vector<int> order(np);
-  std::iota(order.begin(), order.end(), 0);
-  std::mt19937_64 rng(seed);
-  if (shuffle > 0) {
-    std::mt19937_64 rs(shuffle);
-    std::shuffle(order.begin(), order.end(), rs);
-  }
-  std::uniform_real_distribution<double> uni(-1.0, 1.0);
-  auto &pr = ppar->prtcl_rdata;
-  auto &pi = ppar->prtcl_idata;
-  Kokkos::realloc(pr, ppar->nrdata, np);
-  Kokkos::realloc(pi, ppar->nidata, np);
-  auto hr = Kokkos::create_mirror_view(pr);
-  auto hi = Kokkos::create_mirror_view(pi);
-  auto &mbsize = pmbp->pmb->mb_size;
-  const int nmb = pmbp->nmb_thispack, gids = pmbp->gids;
-  std::uint64_t tagbound = 0;   // 1 + the largest tag
-  int njit = 0;
-  for (int s=0; s<np; ++s) {
-    const double *q = &raw[8*static_cast<size_t>(order[s])];
-    for (int col=0; col<ppar->nrdata; ++col) hr(col,s) = 0.0;
-    Real x = q[0], y = q[1];
-    const int code = static_cast<int>(q[7]);
-    if (jit != 0.0 && (code & 15) == 1) {
-      const Real xr = (x - msz.x1min)/hroot;
-      if (xr >= jx0 && xr < jx1) {x += jit*hroot*uni(rng); ++njit;}
-    }
-    while (x < msz.x1min) x += len1;
-    while (x >= msz.x1max) x -= len1;
-    hr(IPX,s) = x; hr(IPX1,s) = x; hr(IPY,s) = y; hr(IPY1,s) = y;
-    hr(IPM,s) = q[2]; hr(IPTS,s) = taus0;
-    hr(IPVX,s) = q[3]; hr(IPVY,s) = q[4]; hr(IPVZ,s) = q[5];
-    hr(IPVX1,s) = q[3]; hr(IPVY1,s) = q[4]; hr(IPVZ1,s) = q[5];
-    int owner = 0;
-    for (int mb=0; mb<nmb; ++mb) {
-      const auto &size = mbsize.h_view(mb);
-      if (x >= size.x1min && x < size.x1max && y >= size.x2min && y < size.x2max) {
-        owner = mb; break;
-      }
-    }
-    hi(PGID,s) = gids + owner; hi(PSP,s) = 0;
-    SetTag(hi, s, static_cast<std::uint64_t>(q[6]));
-    hi(PLEV,s) = code;
-    tagbound = std::max(tagbound, GetTag(hi,s) + 1);
-  }
-  Kokkos::deep_copy(pr, hr);
-  Kokkos::deep_copy(pi, hi);
-  ppar->nprtcl_thispack = np;
-  pm->nprtcl_thisrank = np;
-  pm->nprtcl_eachrank[global_variable::my_rank] = np;
-  pm->nprtcl_total = np;
-  pdust->cloud_next_tag = tagbound;
-  pdust->cloud_next_tag_set = true;
-  pm->time = t0;
-  pm->ncycle = cyc0;
-  std::cout << "# merge_replay: " << fname << " t=" << t0 << " cycle=" << cyc0 << " particles="
-            << np << " jittered=" << njit << " (amplitude " << jit << " root cells)"
-            << " shuffle=" << shuffle << " pass offset=" << offset << std::endl;
-  snapshot_basename_ = pin->GetString("job", "basename") + ".replay";
-  snapshot_number_ = 0;
-  WriteStreamingSnapshot(pm);
-  const Real x1min = msz.x1min, x2min = msz.x2min;
-  for (int n=0; n<ncyc; ++n) {
-    pdust->SplitAndMergeClouds();
-    if (pdust->cloud_merge && (pm->ncycle + offset) % pdust->cloud_merge_interval == 0) {
-      pdust->MergeClouds();
-    }
-    auto &dr = ppar->prtcl_rdata;
-    auto &di = ppar->prtcl_idata;
-    const int npart = ppar->nprtcl_thispack;
-    par_for("replay_drift", DevExeSpace(), 0, npart - 1, KOKKOS_LAMBDA(const int p) {
-      Real x = dr(IPX,p) + dr(IPVX,p)*dt, y = dr(IPY,p) + dr(IPVY,p)*dt;
-      if (x < x1min) x += len1;
-      if (x >= x1min + len1) x -= len1;
-      if (y < x2min) y += len2;
-      if (y >= x2min + len2) y -= len2;
-      dr(IPX,p) = x; dr(IPX1,p) = x; dr(IPY,p) = y; dr(IPY1,p) = y;
-      for (int mb=0; mb<nmb; ++mb) {
-        if (x >= mbsize.d_view(mb).x1min && x < mbsize.d_view(mb).x1max &&
-            y >= mbsize.d_view(mb).x2min && y < mbsize.d_view(mb).x2max) {
-          di(PGID,p) = gids + mb; break;
-        }
-      }
-    });
-    pm->time += dt;
-    pm->ncycle += 1;
-    if ((n + 1) % snap_every == 0) WriteStreamingSnapshot(pm);
-  }
-  std::cout << "# merge_replay done: t=" << pm->time << " cycle=" << pm->ncycle
-            << " particles=" << ppar->nprtcl_thispack << std::endl;
-  std::exit(EXIT_SUCCESS);
-}
 
-//----------------------------------------------------------------------------------------
-//! \fn void RunAuditReplay()
-//! \brief Diagnostic: replay one merge pass from the entry state of a
-//! merge-pass audit file (sections meta, a0_pr, a0_pi, gas).  Restores every particle
-//! column, the gas of the active cells, time, cycle, and the hidden merge state (pass
-//! counter, next tag, root mass); runs MergeClouds() once without split, drift or hydro;
-//! exits.  The pass writes its own audit when cloud_audit_t0/t1 cover the time.
-void RunAuditReplay(ParameterInput *pin, Mesh *pm) {
-  MeshBlockPack *pmbp = pm->pmb_pack;
-  particles::Particles *ppar = pmbp->ppart;
-  auto *pdust = pmbp->pdust;
-  const std::string fname = pin->GetString("problem", "merge_audit_replay");
-  std::FILE *f = std::fopen(fname.c_str(), "rb");
-  char line[4096];
-  if (f == nullptr || std::fgets(line, sizeof(line), f) == nullptr ||
-      std::string(line).rfind("AthenaK merge audit v1", 0) != 0) {
-    std::cout << "### FATAL ERROR: merge_audit_replay: cannot read " << fname << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  std::string meta;
-  std::vector<double> rpr, gas, gasfull;
-  std::vector<int> ipi;
-  long long n0r = 0, n1r = 0, n0i = 0, n1i = 0;
-  while (std::fgets(line, sizeof(line), f) != nullptr) {
-    char name[64], type[4];
-    int nd = 0, used = 0;
-    if (std::sscanf(line, "S %63s %3s %d%n", name, type, &nd, &used) != 3) break;
-    long long dims[4] = {0, 0, 0, 0}, nbytes = 0;
-    const char *q = line + used;
-    for (int k=0; k<nd; ++k) {int u = 0; std::sscanf(q, "%lld%n", &dims[k], &u); q += u;}
-    std::sscanf(q, "%lld", &nbytes);
-    std::vector<char> buf(static_cast<std::size_t>(nbytes));
-    if (nbytes > 0 && std::fread(buf.data(), 1, buf.size(), f) != buf.size()) break;
-    const std::string nm(name);
-    if (nm == "meta") {
-      meta.assign(buf.begin(), buf.end());
-    } else if (nm == "a0_pr") {
-      rpr.resize(buf.size()/sizeof(double)); std::memcpy(rpr.data(), buf.data(), buf.size());
-      n0r = dims[0]; n1r = dims[1];
-    } else if (nm == "a0_pi") {
-      ipi.resize(buf.size()/sizeof(int)); std::memcpy(ipi.data(), buf.data(), buf.size());
-      n0i = dims[0]; n1i = dims[1];
-    } else if (nm == "gas") {
-      gas.resize(buf.size()/sizeof(double)); std::memcpy(gas.data(), buf.data(), buf.size());
-    } else if (nm == "gas_full") {
-      gasfull.resize(buf.size()/sizeof(double)); std::memcpy(gasfull.data(), buf.data(), buf.size());
-    }
-  }
-  std::fclose(f);
-  auto get = [&](const std::string &key) {
-    const auto at = meta.find(key + "=");
-    if (at == std::string::npos) {
-      std::cout << "### FATAL ERROR: merge_audit_replay: no " << key << " in meta" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    return std::strtod(meta.c_str() + at + key.size() + 1, nullptr);
-  };
-  const int np = static_cast<int>(n1r);
-  // (an audit file written before the 64-bit tags has no PTAGH row: high words 0)
-  const bool no_hi = (n0i == PTAGH && ppar->nidata == PTAGH + 1);
-  if (n0r != ppar->nrdata || (n0i != ppar->nidata && !no_hi) || n1i != n1r || np <= 0 ||
-      gas.empty()) {
-    std::cout << "### FATAL ERROR: merge_audit_replay: incompatible sections in " << fname << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  auto &pr = ppar->prtcl_rdata;
-  auto &pi = ppar->prtcl_idata;
-  Kokkos::realloc(pr, ppar->nrdata, np);
-  Kokkos::realloc(pi, ppar->nidata, np);
-  auto hr = Kokkos::create_mirror_view(pr);
-  auto hi = Kokkos::create_mirror_view(pi);
-  for (int c=0; c<ppar->nrdata; ++c)
-    for (int p=0; p<np; ++p) hr(c,p) = rpr[static_cast<std::size_t>(c)*np + p];
-  for (int c=0; c<ppar->nidata; ++c)
-    for (int p=0; p<np; ++p) hi(c,p) = (c < n0i) ? ipi[static_cast<std::size_t>(c)*np + p] : 0;
-  Kokkos::deep_copy(pr, hr);
-  Kokkos::deep_copy(pi, hi);
-  ppar->nprtcl_thispack = np;
-  pm->nprtcl_thisrank = np;
-  pm->nprtcl_eachrank[global_variable::my_rank] = np;
-  pm->nprtcl_total = np;
-  // gas of the active cells, in the audit writer's order (blocks, rows, columns)
-  auto &ind = pm->mb_indcs;
-  auto u0 = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pmbp->phydro->u0);
-  // the whole array with ghost cells when the audit kept it (the linear gather reads ghosts)
-  const bool ghosts = gasfull.size() == u0.span();
-  if (ghosts) std::memcpy(u0.data(), gasfull.data(), gasfull.size()*sizeof(double));
-  std::size_t k = 0;
-  double maxdx = 0.0;
-  for (int m=0; m<pmbp->nmb_thispack; ++m) {
-    const auto &size = pmbp->pmb->mb_size.h_view(m);
-    for (int j=ind.js; j<=ind.je; ++j) {
-      for (int i=ind.is; i<=ind.ie; ++i, ++k) {
-        const double *c = &gas[8*k];
-        maxdx = std::max(maxdx, std::abs(c[0] - (size.x1min + (i-ind.is+0.5)*size.dx1)) +
-                                std::abs(c[1] - (size.x2min + (j-ind.js+0.5)*size.dx2)));
-        u0(m,IDN,ind.ks,j,i) = c[4]; u0(m,IM1,ind.ks,j,i) = c[5];
-        u0(m,IM2,ind.ks,j,i) = c[6]; u0(m,IM3,ind.ks,j,i) = c[7];
-      }
-    }
-  }
-  if (8*k != gas.size() || maxdx > 1.0e-12) {
-    std::cout << "### FATAL ERROR: merge_audit_replay: gas cells do not match the mesh" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  Kokkos::deep_copy(pmbp->phydro->u0, u0);
-  pm->time = get("time");
-  pm->dt = get("dt");   // the frozen feedback diagnostic scales with dt
-  pm->ncycle = static_cast<int>(get("ncycle"));
-  pdust->cloud_merge_pass = static_cast<int>(get("merge_pass"));
-  {
-    const double nt = get("next_tag");   // -1: not set
-    pdust->cloud_next_tag_set = (nt >= 0.0);
-    pdust->cloud_next_tag = (nt >= 0.0) ? static_cast<std::uint64_t>(nt) : 0;
-  }
-  const Real mroot = get("mroot0");
-  pdust->cloud_merge_mroot.clear();
-  if (mroot > 0.0) pdust->cloud_merge_mroot.push_back(mroot);
-  std::cout << "# merge_audit_replay: " << fname << " t=" << pm->time << " cycle=" << pm->ncycle
-            << " particles=" << np << " pass=" << pdust->cloud_merge_pass << " next_tag="
-            << pdust->cloud_next_tag << " mroot=" << mroot << std::endl;
-  // <problem>/merge_audit_restart (diagnostic): no replay pass and no exit, the run
-  // continues from the restored state; the driver fills the ghost cells before the first cycle
-  if (pin->GetOrAddBoolean("problem", "merge_audit_restart", false)) {
-    std::cout << "# merge_audit_restart: continuing from the restored state" << std::endl;
-    return;
-  }
-  // <problem>/merge_audit_replay_passes consecutive passes on the frozen state (no drift, no split)
-  const int npass = pin->GetOrAddInteger("problem", "merge_audit_replay_passes", 1);
-  const Real dtm = get("dt");
-  std::cout << "# merge_audit_replay: ghosts restored=" << (ghosts ? 1 : 0) << " passes=" << npass << std::endl;
-  for (int n=0; n<npass; ++n) {
-    const int nev = pdust->MergeClouds();
-    std::cout << "# merge_audit_replay pass " << n << " cycle=" << pm->ncycle << " events=" << nev
-              << " particles=" << ppar->nprtcl_thispack << std::endl;
-    pm->ncycle += pdust->cloud_merge_interval;
-    pm->time += pdust->cloud_merge_interval*dtm;
-  }
-  std::cout << "# merge_audit_replay done: particles=" << ppar->nprtcl_thispack << std::endl;
-  std::exit(EXIT_SUCCESS);
-}
 
