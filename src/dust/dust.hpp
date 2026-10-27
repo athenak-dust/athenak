@@ -1531,6 +1531,10 @@ class DustGasDrag {
   int cloud_merge_budget_evals = 4;    // ... evaluations per stage before the rest is rejected
   bool cloud_audit_rejected = false;   // full audit file when G groups were budget-rejected
   bool cloud_merge_budget_x = false;   // stage X is also decided by the pass budget
+  // test option: 3-D G budget by thinning instead of rejecting every group on a
+  // violating leaf: a group survives a violating leaf when its hash u in [0, 1) is below
+  // 0.9/(change/budget) of that leaf; the last evaluation round uses the strict rule
+  bool cloud_merge_budget_thin = false;
   bool cloud_audit_only = false;       // a merge pass writes its entry audit and returns
   bool cloud_resample = false;         // conservative same-level resampling in the code
   int cloud_resample_interval = 625;   // ... cycles between resamplings

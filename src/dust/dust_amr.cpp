@@ -302,11 +302,21 @@ void SetupDensityTrigger(ParameterInput *pin) {
   {
     // Rixin: default on (the shear-periodic x1 faces follow the 2:1 rule of all other
     // neighbours, within what the face exchange can fill); auto = only the exchange's limit
-    const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
+    std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
+    // restart files of 2026-10-27 and earlier carry the then default "auto" (and dmax = -1): read
+    // them as the current default; a value set by hand otherwise must be on or off
+    if (sfl == "auto") {
+      if (global_variable::my_rank == 0)
+        std::cout << "# NOTE (dust): amr_shear_face_limit = auto (an older default, e.g. from a restart "
+                  << "file) is read as on" << std::endl;
+      sfl = "on";
+      pin->SetString("dust", "amr_shear_face_limit", sfl);
+    }
     if (sfl == "on") trig_.shear_face_limit = true;
     else if (sfl == "off") trig_.shear_face_limit = false;
     else fatal("<dust>/amr_shear_face_limit must be on or off (auto was removed on 2026-10-27)");
-    if (pin->DoesParameterExist("dust", "amr_shear_face_dmax"))
+    if (pin->DoesParameterExist("dust", "amr_shear_face_dmax") &&
+        pin->GetInteger("dust", "amr_shear_face_dmax") >= 0)
       fatal("<dust>/amr_shear_face_dmax was removed on 2026-10-27 (it served the 8x16x8 conversion)");
   }
   audit_ = pin->GetOrAddBoolean("dust", "amr_trigger_audit", false);
