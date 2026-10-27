@@ -76,12 +76,21 @@ void SelfForceFinal(ParameterInput *pin, Mesh *pm) {
       pr(IPM,c) = sf.mass;
       pr(IPTS,c) = dust->taus.h_view(0);
       pi(PLEV,c) = sf.level; pi(PSP,c) = 0; pi(PTAG,c) = c;
+      // points: the leaf block (on this rank) that contains the probe
+      for (int b=0; b<pack->nmb_thispack; ++b) {
+        const auto sz = pack->pmb->mb_size.h_view(b);
+        if (pr(IPX,c) >= sz.x1min && pr(IPX,c) < sz.x1max && pr(IPY,c) >= sz.x2min &&
+            pr(IPY,c) < sz.x2max && pr(IPZ,c) >= sz.x3min && pr(IPZ,c) < sz.x3max) {
+          pi(PGID,c) = pack->gids + b;
+        }
+      }
     }
     Kokkos::deep_copy(part->prtcl_rdata, pr);
     Kokkos::deep_copy(part->prtcl_idata, pi);
     part->nprtcl_thispack = keep;
     pm->nprtcl_thisrank = keep;
-    dust->ResetPGIDFromPositions("selfforce probe");
+    // the block ids of the probes: 3-D clouds by the leaf traversal (single rank for points)
+    if (dust->Clouds3D()) dust->ResetPGIDFromPositions("selfforce probe");   // (points: set above)
     grav->Invalidate();
     grav->Solve(pm->time);
     DvceArray5D<Real> rho;
