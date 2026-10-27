@@ -6,10 +6,9 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_resample.hpp
-//! \brief Shared pieces of the same-level resampling of refinable clouds: the
-//! tolerances of the per-patch algorithm, the pool table columns, and the device solver of
-//! dust_resample_device.cpp, which runs the algorithm of the host
-//! ResamplePatch on the device.
+//! \brief Shared pieces of the same-level resampling of refinable clouds: the tolerances of
+//! the per-patch algorithm, the pool table columns, and the device solver of
+//! dust_resample_device.cpp, which runs the algorithm of the host ResamplePatch on the device.
 
 #include <limits>
 #include "athena.hpp"
@@ -22,11 +21,11 @@
 #ifndef DUST_R_DIAG
 #define DUST_R_DIAG 0
 #endif
-// Rixin: the column-by-column QR update of the device patch solves
-// (<dust>/cloud_resample_qr_rows = false, one thread per column in the host's order, bitwise
-// comparable with the host solver) is compiled only with -DDUST_R_QR_COLUMNS=1 (the reference
-// build); the production build has the row-parallel update only, and an input or
-// restart asking for false stops there (dust.cpp).  The host R solver is not affected.
+// The column-by-column QR update of the device patch solves (<dust>/cloud_resample_qr_rows =
+// false, one thread per column in the host's order, bitwise comparable with the host solver) is
+// compiled only with -DDUST_R_QR_COLUMNS=1 (the reference build); the production build has the
+// row-parallel update only, and an input or restart asking for false stops there (dust.cpp).
+// The host R solver is not affected.
 #ifndef DUST_R_QR_COLUMNS
 #define DUST_R_QR_COLUMNS 0
 #endif
@@ -70,8 +69,8 @@ struct DevicePatchProblem {
   // the teams (kNStage entries; empty = off)
   DvceArray1D<unsigned long long> stage;
   bool qr_rows = false;   // the QR update shares the rows as well (cloud_resample_qr_rows)
-  // 3-D, <dust>/cloud_resample_rank_screen: patches whose clouds do not outnumber their
-  // nominal rows (7 leaves + 6 + centre-of-mass rows) are left as they are, before any bucket
+  // 3-D, <dust>/cloud_resample_rank_screen: patches whose clouds do not outnumber their nominal
+  // rows (7 leaves + 6 + centre-of-mass rows) are left as they are, before any bucket
   bool rank_screen = false;
 };
 // stages: 0 rows and scaling, 1 QR, 2 null vectors, 3 end-point steps, 4 the whole stream
@@ -79,21 +78,21 @@ struct DevicePatchProblem {
 // Counts, not cycles: 7 QR blocks with a null space, 8 of them whose basic solution
 // on the pivot columns (the other clouds at zero) lies within 0 <= w <= cap, 9 within the bounds
 // except above a cap, 10 with a negative mass.
-// Scope (Codex review): the totals are this rank's only (DUST_R_STAGES prints
-// rank 0's, not a sum over ranks); the clock cycles exist only on CUDA (Clk() is 0 elsewhere),
-// the counts 6-10 on every backend.  The time of the basic-solution check (7-10) is outside
-// stages 1-3 and so lands in the stream's rest (4 minus 1-3; before 2026-10-20 it fell into 2).  With amr_profile off these branches do
-// not run, but compiled in they still cost registers and stack: hence DUST_R_DIAG above (the
-// cost is read from the compiler's resource report, not the runtime condition).
+// Scope: the totals are this rank's only (DUST_R_STAGES prints rank 0's, not a sum over ranks);
+// the clock cycles exist only on CUDA (Clk() is 0 elsewhere), the counts 6-10 on every backend.
+// The time of the basic-solution check (7-10) is outside stages 1-3 and so lands in the
+// stream's rest (4 minus 1-3).  With amr_profile off these branches do not run, but compiled in
+// they still cost registers and stack: hence DUST_R_DIAG above (the cost is read from the
+// compiler's resource report, not the runtime condition).
 constexpr int kNStage = 11;
 constexpr int kStagePatches = 6;   // the number of timed patches: > 0 once a profiled R has run
 inline unsigned long long *StageTotals() {
   static unsigned long long t[kNStage] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   return t;
 }
-// mid > 64: patches of 65 .. mid clouds form a middle bucket solved with teams of mid_team threads
-// (three buckets); mid <= 64: the two buckets of <= 64 and > 64 clouds.  wide_team > 512: the large bucket
-// with teams of up to 1024 threads (a kernel bound to 1024 threads).
+// mid > 64: patches of 65 .. mid clouds form a middle bucket solved with teams of mid_team threads;
+// mid <= 64: only the two buckets of at most 64 and of more than 64 clouds.  wide_team > 512: the
+// large bucket with teams of up to 1024 threads (a kernel bound to 1024 threads).
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
                         const int mid, const int mid_team, const int wide_team,

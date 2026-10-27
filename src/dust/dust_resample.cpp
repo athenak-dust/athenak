@@ -4,29 +4,24 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_resample.cpp
-//! \brief Conservative same-level resampling of refinable clouds, in the
-//! code instead of the offline reference (rs_lib.py / rs2_lib.py: Domain, rows, prune_cap).
+//! \brief Conservative same-level resampling of refinable clouds.
 //! Positions, velocities, shapes and stopping times are kept; only the masses of the plain
-//! clouds change, a cloud whose mass reaches zero is removed.  Per patch (kc x kc
-//! cells of one MeshBlock, so that a patch holds about the same number of leaves on every
-//! level; the s x s root-cell patches, cloud_resample_patches = root, were removed 2026-10-20)
+//! clouds change, a cloud whose mass reaches zero is removed.  Per patch (kc x kc cells of one
+//! MeshBlock, so that a patch holds about the same number of leaves on every level)
 //! the new masses keep, to round-off, every leaf's deposited mass and momentum, the three
 //! components of the frozen-gas drag feedback of every leaf (AuditFeedback), the centre of
 //! mass and the six velocity second moments of the patch; a mass never exceeds its cap
 //! eta m0 / 4^level.  Clouds above the cap are left alone, and so are the clouds already at
-//! the cap (cloud_resample_skip_at_cap = false, which kept them in the pool to lose mass only
-//! as in the offline reference, was removed on 2026-10-20).
+//! the cap.
 //!
 //! Device: selection of the pool, production gather of the gas velocity, cloud weights as a
 //! CSR list.  Host (std::thread over patches): constraint rows, null-space end-point
-//! reduction with deterministic end points.  The reference takes its null vectors from an
-//! SVD; here they come from a Householder QR with column pivoting, so the surviving set is
-//! not the reference's cloud for cloud, while the same rows are kept.  Device: new masses,
-//! compaction.  Single rank only, like the merge pass.
+//! reduction with deterministic end points.  The null vectors come from a Householder QR with
+//! column pivoting.  Device: new masses, compaction.
 //!
-//! By default (<dust>/cloud_resample_device = true) the pool is put in patch order
-//! and every patch is solved on the device (dust_resample_device.cpp, same algorithm; false keeps
-//! the host solves).
+//! By default (<dust>/cloud_resample_device = true) the pool is put in patch order and every
+//! patch is solved on the device (dust_resample_device.cpp, same algorithm; false keeps the host
+//! solves).
 //!
 //! Schedule: every cloud_resample_interval cycles (default), or with
 //! cloud_resample_schedule = time at the planned times t0 + k dt; see ResampleDue.
@@ -221,7 +216,7 @@ void ReduceCap(const double *b, const int m, const int n, double *w, const doubl
     if (!anyzero && ncol > nc) {steps(nc, ncol); nc = ncol; ++info.scans;}
     double best = -1.0;
     int bj = -1, bs = 0;
-    for (int sg=0; sg<2; ++sg) {      // minus first, as the reference's argmax over (sign, column)
+    for (int sg=0; sg<2; ++sg) {      // minus first: argmax over (sign, column), ties to the first
       for (int c=0; c<nc; ++c) {
         if (!std::isfinite(t[2*c + sg])) continue;
         const double *zc = ws.z.data() + static_cast<std::size_t>(c)*n;
@@ -288,7 +283,7 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
     for (int k=0; k<3; ++k) vb[k] += P(JM, a)*P(JVX + k, a);
   }
   for (int k=0; k<3; ++k) vb[k] /= mt;
-  // rows (rs_lib.rows, level DF): leaf mass, leaf momentum about the patch mean, centre of
+  // rows: leaf mass, leaf momentum about the patch mean, centre of
   // mass, velocity second moments, leaf feedback (the leaf volume is a row factor: left out)
   ws.a.assign(static_cast<std::size_t>(nrow)*n, 0.0);
   for (int a=a0; a<a1; ++a) {
@@ -394,7 +389,7 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
 
 //----------------------------------------------------------------------------------------
 //! \fn dust::PoolInTagOrder
-//! \brief For cloud_resample_order = tag, with 64-bit tags: the pool
+//! \brief cloud_resample_order = tag with 64-bit particle tags: the pool
 //! (the particles p with slot(p) >= 0, npool of them) in (tag, p) order; on return slot(p) is
 //! the rank of p and pofs(k) the particle of rank k.  While tag*npart + p fits into an int64
 //! (every tag below 2^63/npart) one int64 key per particle is sorted, which gives the order
@@ -573,7 +568,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
   const int npart = ppar->nprtcl_thispack;
   const auto transfer = smr_transfer;
   const auto lt = leaf_traversal;   // cloud weights on the actual leaves
-  // The gas velocity and its differences of every leaf of the current state, the
+  // the gas velocity and its differences of every leaf of the current state, the
   // owners' values on the halo blocks, for the gather of the pool (the predictor's packed
   // field).  Before any return: the halo exchange is collective.
   PackGasGather(pmy_pack->phydro->u0);
@@ -588,9 +583,8 @@ int DustGasDrag::ResampleClouds(const bool local) {
   const int nsp = std::max(1, nspecies);
   DvceArray1D<Real> m0sp("rs_m0", nsp);
   {
-    // Codex review: a missing value only takes its own species out of the pool (it was
-    // fatal when species 0 had none, e.g. eps_1 = 0 with a second species); fatal only when no
-    // species has one
+    // a missing value only takes its own species out of the pool (e.g. eps_1 = 0 with a second
+    // species); fatal only when no species has one
     auto mh = Kokkos::create_mirror_view(m0sp);
     bool any = false;
     for (int sp=0; sp<nsp; ++sp) {
@@ -617,10 +611,9 @@ int DustGasDrag::ResampleClouds(const bool local) {
     }
     Kokkos::deep_copy(m0sp, mh);
   }
-  // the patches: inside one MeshBlock, k x k of its cells with k = min(s 2^l, kc)
-  // (s x s root cells on the root level, up to the level where they reach kc x kc cells, never
-  // more), so a patch holds at most about (kc + 2)^2 leaves on any level.  (The patches of
-  // s x s root cells on every level, cloud_resample_patches = root, were removed 2026-10-20.)
+  // the patches: inside one MeshBlock, k x k of its cells with k = min(s 2^l, kc) (s x s root
+  // cells on the root level, up to the level where they reach kc x kc cells, never more), so a
+  // patch holds at most about (kc + 2)^2 leaves on any level.
   const int s = cloud_resample_patch, kc = cloud_resample_patch_cells;
   const int nmbp = pmy_pack->nmb_thispack, bnx1 = pmesh->mb_indcs.nx1, bnx2 = pmesh->mb_indcs.nx2;
   std::vector<int> kblk_h, poff_h(nmbp + 1, 0);   // block patches: k per block, patch offsets
@@ -633,7 +626,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
       for (int l=0; l<lev && k < kc; ++l) k *= 2;
       k = std::min(k, kc);
       if (bnx1 % k != 0 || bnx2 % k != 0) bad = true;
-      // Codex review: the quadrant split halves the width down to one cell
+      // the quadrant split halves the width down to one cell, so k must be a power of two
       if (cloud_resample_patch_split > 0 && (k & (k - 1)) != 0) bad = true;
       kblk_h[b] = k;
       poff_h[b + 1] = poff_h[b] + (bnx1/k)*(bnx2/k);
@@ -674,7 +667,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     };
     std::vector<std::array<Real, 4>> fresh;
     for (int g=0; g<ntot; ++g) {
-      // (2026-10-21: every regrid of the event, cloud_event_dt; 0 for one regrid as before)
+      // (every regrid of the event, cloud_event_dt; 0 for one regrid)
       if (pmr->ncyc_since_ref(g) <= amr_event_max_age) {
         Real b[4]; box(g, b); fresh.push_back({b[0], b[1], b[2], b[3]});
       }
@@ -699,7 +692,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     Kokkos::deep_copy(rmask, mh);
   }
   const bool use_mask = local;
-  // With cloud_resample_patch_split = N > 0 every block patch of k x k cells has one
+  // with cloud_resample_patch_split = N > 0 every block patch of k x k cells has one
   // slot per cell (kc^2 slots); a patch, or a quadrant of it, whose pool (one species) holds more
   // than N clouds is solved as its four quadrants, recursively down to single cells; each final
   // square is one patch in the slot of its lower-left cell
@@ -719,7 +712,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
   DvceArray1D<int> coff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_coff"), npart);
   int npool = 0, nnz = 0;
   double tot_b[2] = {0.0, 0.0}, cnt_b[3] = {0.0, 0.0, 0.0};
-  // With cloud_resample_cold_alpha > 0 a block patch (one species) is cold when
+  // cold gate (cloud_resample_cold_alpha > 0): a block patch (one species) is cold when
   // every velocity component of its candidate clouds spans at most alpha H / tau (H the cell size of
   // its block, tau = min(ts, 1/omega), the velocity tolerance of stage X).  Resampling keeps the
   // leaf masses at the moment of the pass but replaces a lattice (or intact P1 families) by unequal
@@ -804,7 +797,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
     if (pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
     if (calpha > 0.0 && cq(p) >= 0 && ccold(cq(p)) == 1) {ncold += 1.0; return;}   // cold patch
-    // A cloud whose leaf is on a block of another rank stays out (several
+    // a cloud whose leaf is on a block of another rank stays out (several
     // ranks; a position within round-off of a periodic face can be routed to this rank's block while
     // its leaf lookup takes the periodic image on the other side, owned elsewhere)
     if (multirank) {
@@ -823,7 +816,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     upd += (cnt(p) >= 0) ? 1 : 0;
   }, npool);
   if (cloud_resample_tag_order && npool > 1) {
-    // With cloud_resample_order = tag the pool is put in PTAG order, so that the streaming
+    // cloud_resample_order = tag: the pool in PTAG order, so that the streaming
     // order inside a patch does not depend on where the particles sit in the arrays (storage
     // sorting, several ranks); the CSR offsets follow the slots
     DvceArray1D<int> pofs(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pofs"), npool);
@@ -953,7 +946,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
       ctgt(e) = target; cwgt(e) = w; ++e;
     });
   });
-  // Count the pool of every cell slot; per block patch and species one thread
+  // count the pool of every cell slot; per block patch and species one thread
   // splits the squares holding more than N clouds into quadrants (down to single cells) and maps
   // every slot to the lower-left slot of its final square (own) with the square's width there (nsz)
   const int nbase = poff_h[nmbp]*nsp;   // geometric patch x species
@@ -1029,7 +1022,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
       pgeo(qs,2) = 0.5*w*d1; pgeo(qs,3) = 0.5*w*d2;
     }
   });
-  // The patch solves on the host or on the device (cloud_resample_device)
+  // the patch solves on the host or on the device (cloud_resample_device)
   const bool on_dev = cloud_resample_device;
   const bool on_host = !cloud_resample_device;
   double t_copy = 0.0, t_sort = 0.0, t_host = 0.0, cpu = 0.0;
@@ -1157,7 +1150,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
                                  cloud_resample_device_mid, cloud_resample_device_mid_team,
                                  cloud_resample_device_wide_team, tim);
     dtim[1] = tim[0]; dtim[2] = tim[1]; dtim[3] = tim[2]; dtim[4] = tim[3]; dtim[5] = tim[4];
-    if (pb.stage.extent(0) > 0) {
+    if (pb.stage.extent(0) > 0) {   // stage clock (amr_profile)
       auto sh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pb.stage);
       for (int c=0; c<resample::kNStage; ++c) resample::StageTotals()[c] += sh(c);
     }
@@ -1165,7 +1158,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     auto mdv = mdev;
     Kokkos::parallel_for("rs_unsort", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
     KOKKOS_LAMBDA(const int k) {mdv(sorder(k)) = mn(k);});
-    // The totals reduced on the device
+    // the totals reduced on the device
     resample::SummarizePatchesDevice(outi, outr, dsum);
   }
   if (cloud_resample_device) {t_sort = dtim[0]; t_host = dtim[4];}
@@ -1246,13 +1239,13 @@ int DustGasDrag::ResampleClouds(const bool local) {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ResampleClouds3D
-//! \brief ResampleClouds for 3-D refinable clouds (stage 2c), the device solve only.
-//! The same pool (plain clouds below their cap eta m0 / 8^level, the cold gate, the
-//! local event mask), patches of k x k x k cells inside one MeshBlock with
-//! k = min(s 2^level, kc), split into octants down to single cells while a patch holds more than
-//! cloud_resample_patch_split clouds, and the rows of every patch: leaf mass,
-//! momentum and feedback, the three centre-of-mass rows and the six velocity second moments.
-//! One rank (stage 2).  Returns the number of clouds removed.
+//! \brief ResampleClouds for 3-D refinable clouds, the device solve only.
+//! The same pool (plain clouds below their cap eta m0 / 8^level, the cold gate, the local event
+//! mask), patches of k x k x k cells inside one MeshBlock with k = min(s 2^level, kc), split
+//! into octants down to single cells while a patch holds more than cloud_resample_patch_split
+//! clouds, and the rows of every patch: leaf mass, momentum and feedback, the three
+//! centre-of-mass rows and the six velocity second moments.  Returns the number of clouds
+//! removed.
 
 int DustGasDrag::ResampleClouds3D(const bool local) {
   using Clock = std::chrono::steady_clock;
@@ -1264,11 +1257,10 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
   Mesh *pmesh = pmy_pack->pmesh;
   const int npart = ppar->nprtcl_thispack;
   const auto lt = leaf_traversal3d;
-  // (the gas gather field is packed below, once the pool is known; 2026-10-25, Codex perf review)
-  // 2026-10-26 fix: the decision is collective and the pack has a forward halo exchange, so every
-  // rank takes part, also one without particles (it returned before the MPI_Allreduce and the
-  // other ranks failed in it with MPI_ERR_TRUNCATE: 4 x H100, a 3-D AMR run, first R at
-  // t = 1 with the top and bottom root blocks free of dust)
+  // (the gas gather field is packed below, once the pool is known)
+  // the decision is collective and the pack has a forward halo exchange, so every rank takes
+  // part, also one without particles (a rank that returned early made the others fail in the
+  // MPI_Allreduce)
   auto gas_if_needed = [&](const int npool_mine) {
     int npool_max = npool_mine;
 #if MPI_PARALLEL_ENABLED
@@ -1500,7 +1492,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       upd += (cnt(p) > 0) ? cnt(p) : 0;
     }, nnz);
   }
-  // 2026-10-25 (Codex perf review): the gas gather field (u0 velocities, with a forward halo
+  // the gas gather field (u0 velocities, with a forward halo
   // exchange on several ranks) is only needed when some rank resamples; the decision is
   // collective because the halo exchange is.  u0 is unchanged since the call above used to be.
   gas_if_needed(npool);
@@ -1565,7 +1557,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       ctgt(e) = target; cwgt(e) = w; ++e;
     });
   });
-  // octant split of the crowded patches (the quadrant split in 3-D): every slot to the lowest-corner slot
+  // octant split of the crowded patches: every slot to the lowest-corner slot
   // of its final cube (own), with the cube's width there (nsz)
   const int nbase = poff_h[nmbp]*nsp;
   const int nslot = nbase*psub;

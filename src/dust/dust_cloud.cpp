@@ -77,22 +77,22 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   const int nvirt = pin->GetOrAddInteger("dust", "cloud_virtual_levels", 0);
   int nlev = nlev_mesh + nvirt;
 
-  // cloud_halo_coarser (test): levels a cloud may be coarser than the block of its centre, for the
+  // test option: levels a cloud may be coarser than the block of its centre, for the
   // reach of the halo (-1: from the split rule); the per-cycle check widens it where needed
   cloud_halo_coarser = pin->GetOrAddInteger("dust", "cloud_halo_coarser", -1);
-  // cloud_halo_strips: exchange only the cells of each halo block that this rank's clouds can reach
+  // exchange only the cells of each halo block that this rank's clouds can reach
   // (false: whole blocks)
-  cloud_halo_strips = pin->GetOrAddBoolean("dust", "cloud_halo_strips", true);   // Rixin: default true
-  // Every cloud_sort_interval cycles (0: never) the particle arrays are reordered
+  cloud_halo_strips = pin->GetOrAddBoolean("dust", "cloud_halo_strips", true);
+  // every cloud_sort_interval cycles (0: never) the particle arrays are reordered
   // by block, cell in the block (row by row) and old position, after
-  // the split, resampling and merge pass of the cycle (SortParticles).
-  // Following a Codex review, every 64 cycles by default on the configuration where it was timed and
+  // the split, resampling and merge pass of the cycle (SortParticles).  By default every 64
+  // cycles on the configuration where it was timed and
   // its effect on G checked (production PC2 path, device G and R, cloud_merge_exact_ts, stopping
   // times fixed per species: stopping_time_mode = species_fixed); 0 is the control
   {
     const bool prod = coupling == DustCoupling::hybrid &&
                       hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2;
-    // Not in 3-D yet (the sort keys are 2-D cells)
+    // not in 3-D yet (the sort keys are 2-D cells)
     const bool sortdef = prod && !clouds3d && (!cloud_merge || cloud_merge_device) &&
                          (!cloud_resample || cloud_resample_device) && cloud_merge_exact_ts &&
                          stopping_time_mode == DustStoppingTimeMode::species_fixed;
@@ -106,10 +106,9 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     }
     cloud_sort_random = (so == "random");   // diagnostic: a random permutation
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
-    // The cell-sorted index is on by default (every 8 cycles) where the two
-    // production cloud kernels run (hybrid / PC2 coupling, linear gather); 0 turns it off (the
-    // control, and the runs before ce92ed4b).  Rixin: default on also in 3-D (keys
-    // (block, k, j, i) since 063823b1; GB200 c640 -2.7%)
+    // the cell-sorted index is on by default (every 8 cycles) where the two production cloud
+    // kernels run (hybrid / PC2 coupling, linear gather), in 2-D and in 3-D (keys (block, k, j,
+    // i)); 0 turns it off
     {
       const bool prod = coupling == DustCoupling::hybrid &&
                         hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2;
@@ -136,7 +135,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
               << "<dust>/cloud_table must be auto, true or false" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // No finest-grid table in 3-D (CheckClouds3D stops the paths that need it)
+  // no finest-grid table in 3-D (CheckClouds3D stops the paths that need it)
   if (clouds3d && mode == "true") {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "<dust>/cloud_table = true: no finest-grid table in 3-D" << std::endl;
@@ -173,8 +172,8 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // dust on the mixed gas mesh); cloud_split_everywhere refines the whole lattice
   t.cloud_max_level = pin->GetOrAddInteger("dust", "cloud_max_level", nlev);
   t.cloud_split_everywhere = pin->GetOrAddBoolean("dust", "cloud_split_everywhere", false);
-  // Rixin: split on the first overlap with finer leaves by default (the production
-  // rule since the P1 + overlap round; false is the older rule, kept for comparison)
+  // split on the first overlap with finer leaves by default (the production rule; false is
+  // the older rule, kept for comparison)
   t.cloud_split_overlap = pin->GetOrAddBoolean("dust", "cloud_split_overlap", true);
 
   // every block aligned with the finest virtual grid (the actual-leaf traversal relies on it)
@@ -186,7 +185,7 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     Real off2 = (size.x2min - t.x2min)/t.fine_dx2;
     int fi0 = static_cast<int>(std::lround(off1));
     int fj0 = static_cast<int>(std::lround(off2));
-    // The third direction in 3-D
+    // the third direction in 3-D
     bool bad3 = false;
     if (clouds3d) {
       const Real fdx3 = (pmesh->mesh_size.x3max - pmesh->mesh_size.x3min)/
@@ -325,15 +324,15 @@ void DustGasDrag::RequireCloudTable(const char *what) const {
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::EnsureNextTag
 //! \brief The first tag of created particles, once: the largest tag of all particles + 1.
-//! It used to be the particle count at the first creation, which repeats tags when
-//! particles were removed before (a resampling at t = 0 before the first split of a run that
-//! starts on the root grid: D6 had 251 tags twice).  Called at the start of every cycle, so
-//! that it is set before anything removes particles; restarts carry the counter.
+//! (Not the particle count at the first creation: that repeats tags when particles were
+//! removed before, e.g. by a resampling at t = 0 before the first split.)  Called at the
+//! start of every cycle, so that it is set before anything removes particles; restarts carry
+//! the counter.
 
 void DustGasDrag::EnsureNextTag() {
   if (cloud_next_tag_set) return;
-  // Each rank hands out base + rank, then steps by the number of ranks;
-  // base = 1 + the largest live tag (as before), at least the bound of the restart file this run
+  // each rank hands out base + rank, then steps by the number of ranks; base = 1 + the
+  // largest live tag, at least the bound of the restart file this run
   // segment started from (tags of deleted particles are not issued again)
   std::uint64_t base = std::max(LiveTagBound(), cloud_tag_floor);
   const std::uint64_t rank = static_cast<std::uint64_t>(global_variable::my_rank);
@@ -446,7 +445,7 @@ void DustGasDrag::MigrateClouds() {
 //! to the rank of the block that holds them, by position (RouteToOwnerBlocks: a root cloud
 //! over a deep mesh has children several small blocks away, further than the neighbour step
 //! of the particle exchange), and the loop ends when no rank split anything.  One rank: the
-//! passes alone, as before.  Returns the number of particles split.
+//! passes alone.  Returns the number of particles split.
 
 int DustGasDrag::SplitToLeaves() {
   long long total = 0;
@@ -538,7 +537,7 @@ bool DustGasDrag::CheckHaloReach(const char *when) {
 //! exchange sees a step of one block at most and wraps them again.
 
 void DustGasDrag::FrameToBlock(const Real tpos) {
-  if (clouds3d && (global_variable::nranks > 1 || shear3d)) {   // with shear3d also on one rank
+  if (clouds3d && (global_variable::nranks > 1 || shear3d)) {   // 3-D shear: also on one rank
     FrameToBlock3D(tpos);
     return;
   }
@@ -578,22 +577,22 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
     amr_event_pending = false;          // no resampling after regrids: nothing to do
     amr_event_nnew = amr_event_ndel = 0;
   }
-  // 2026-10-21 (scaling): the event may wait cloud_event_dt after its first regrid
+  // the event may wait cloud_event_dt after its first regrid (later regrids join it)
   bool event_now = amr_event_pending;
   if (event_now && cloud_event_dt > 0.0) {
     const double t = pmy_pack->pmesh->time;
     event_now = t >= amr_event_first_time + cloud_event_dt - 1.0e-12*std::fmax(1.0, std::fabs(t));
   }
   if (event_now) {
-    // The cycle after a regrid: merge pass first, then one resampling
+    // the cycle after a regrid: merge pass first, then one resampling
     ProfTimer pt(prof_time[kProfEvent], prof_count[kProfEvent]);
     HandleRegridEvent(merge_due);
   } else {
-    // Resampling before the merge pass, so that an audit-only pass of the same cycle
-    // writes the resampled state; it is due every cloud_resample_interval cycles, or at the
-    // planned physical times
+    // resampling before the merge pass, so that an audit-only pass of the same cycle writes
+    // the resampled state; every cloud_resample_interval cycles, or at the planned physical
+    // times
     const bool resample_due = cloud_resample && ResampleDue();
-    // Several ranks: the split pieces go to the rank of their block before R and G
+    // several ranks: the split pieces to the rank of their block before R and G
     // (other cycles leave them to the migration after the push; until then they keep a block
     // of this rank as their anchor, which the leaf traversal allows)
     if (resample_due || merge_due) {
@@ -653,7 +652,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   const bool do_merge = merge_due || (merge_ok && ndel > 0);
   const char *why = !do_merge ? "none"
                   : ((merge_due && ndel > 0) ? "due+derefine" : (merge_due ? "due" : "derefine"));
-  MigrateClouds();   // every cloud in its block before G and R
+  MigrateClouds();   // several ranks: every cloud in its block before G and R
   CheckHaloReach("regrid event");
   const int n0 = ppar->nprtcl_thispack;
   Kokkos::Timer timer;
@@ -661,8 +660,8 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
     MergeClouds();
     // several ranks: a merged cloud whose block is on another rank keeps its parent's block
     // (NewCloudBlock); R bins every cloud by the leaf that holds it, so it moves first.  The
-    // cycle path runs R before G and leaves this to the push migration.  (GB200 AMR pilot,
-    // 2026-10-17: the first derefinement on 4 ranks aborted in R.)
+    // cycle path runs R before G and leaves this to the push migration.  (Without this, a
+    // derefinement on several ranks aborts in R.)
     MigrateClouds();
     CheckHaloReach("regrid event merge");
   }
@@ -670,8 +669,8 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   const double t_merge = timer.seconds();
   const int n1 = ppar->nprtcl_thispack;
   const bool scheduled = ResampleDue();
-  // Rixin: no extra resampling after a pure derefinement; G has run on
-  // the coarsened region, the scheduled resampling still reaches everything
+  // no extra resampling after a pure derefinement (unless cloud_resample_after_derefine); G
+  // has run on the coarsened region, the scheduled resampling still reaches everything
   const bool skip_r = !scheduled && nnew == 0 && ndel > 0 && !cloud_resample_after_derefine;
   timer.reset();
   // the blocks changed by every regrid of this event are fresh for the local R
@@ -684,7 +683,7 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   const int n2 = ppar->nprtcl_thispack;
   ++amr_event_handled;
   if (scheduled) ++amr_event_merged;
-  // several ranks: totals over the ranks (Codex review), the slowest rank's times
+  // several ranks: totals over the ranks, the slowest rank's times
   long long nn[4] = {n0, n1, n2, removed};
   double tt[2] = {t_merge, t_resample};
 #if MPI_PARALLEL_ENABLED
@@ -952,7 +951,7 @@ int DustGasDrag::SplitCloudsP1() {
 //! part of the fitted velocity gradient and the residual part.  Host prototype for a
 //! single rank, like SplitCloudsP1; the algorithm only looks at a centre's tent support.
 int DustGasDrag::MergeClouds() {
-  ++gravity_mass_epoch;   // G changes the deposited mass (gravity field reuse)
+  ++gravity_mass_epoch;   // G changes the deposited mass (no reuse of the gravity field)
   if (clouds3d) return MergeCloudsDevice3D();
   if (cloud_merge_device) return MergeCloudsDevice();
   RequireCloudTable("the host merge pass (cloud_merge_device = false)");
@@ -1256,7 +1255,7 @@ int DustGasDrag::MergeClouds() {
         near(c, hp, nb0);
         for (int t : nb0) {   // pieces with a positive tent weight only
           // with cloud_merge_exact_ts only pieces with the centre's ts (bitwise): the new cloud
-          // takes that ts (Codex review)
+          // takes that ts
           if (cloud_merge_exact_ts && R[t][IPTS] != R[c][IPTS]) continue;
           if (tent(transfer.MinImage1(R[t][IPX] - R[c][IPX]),
                    transfer.MinImage2(R[t][IPY] - R[c][IPY])) > 0.0) nb.push_back(t);

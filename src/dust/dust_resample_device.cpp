@@ -20,9 +20,9 @@
 //! bitwise reproducible: Kokkos joins the partial sums of a team reduction in a fixed order (host:
 //! contiguous index blocks joined by team rank; CUDA: a fixed shuffle tree and warp order), and
 //! repeated solves of the same patch problem were identical on OpenMP (teams of 4, also with random
-//! delays injected into the team code) and on a local CUDA GPU (the OpenMP run-to-run investigation; the repeat
-//! diagnostics are on branch dust-r-omp-debug).  Repeated OpenMP *runs* differ because their pools
-//! differ (the atomic deposit makes the whole run non-reproducible), not because of this solver.
+//! delays injected into the team code) and on a CUDA GPU.  Repeated OpenMP *runs* differ because
+//! their pools differ (the atomic deposit makes the whole run non-reproducible), not because of
+//! this solver.
 //!
 //! Exception: with <dust>/cloud_resample_qr_rows = true (the default) the QR
 //! update sums each column by row chunks over the team, in another order than the host.  The
@@ -58,10 +58,10 @@ using Policy = Kokkos::TeamPolicy<DevExeSpace>;
 using Member = Policy::member_type;
 // large patches: up to 512 threads per team, registers limited accordingly
 using PolicyWide = Kokkos::TeamPolicy<DevExeSpace, Kokkos::LaunchBounds<512, 1>>;
-// with cloud_resample_device_wide_team = 1024: teams of up to 1024 threads
+// cloud_resample_device_wide_team = 1024: teams of up to 1024 threads
 using PolicyWider = Kokkos::TeamPolicy<DevExeSpace, Kokkos::LaunchBounds<1024, 1>>;
-// a step search along one null vector is split in this many chunks (32 instead of
-// 8, so that 2 x 8 x 32 threads of a 1024-thread team share the scan; the chunks are merged in
+// a step search along one null vector is split in this many chunks (32, so that
+// 2 x 8 x 32 threads of a 1024-thread team share the scan; the chunks are merged in
 // their order with strict comparisons, so the result does not depend on the number)
 constexpr int kChunk = 32;
 // cloud_resample_qr_rows: row chunks per column in the dot products of the
@@ -306,14 +306,14 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
     (void) rows;   // the row-parallel update only (DUST_R_QR_COLUMNS = 0)
     {
 #endif
-      // The update with the rows shared as well.  The dot products of the
+      // cloud_resample_qr_rows: the update with the rows shared as well.  The dot products of the
       // Householder vector with the columns k+1..n-1 by (column, row chunk) over all threads, the
       // chunk sums added in their order; the rank-one update by matrix element (consecutive
       // threads on consecutive columns of a row).  NOTE: the sums run in another order than the
       // host's, so this QR (and the solve that follows) matches the host only to round-off, not
       // bitwise.  The chunk order is fixed for a given team size (nch depends on it), as is the
       // join order of the team-reduced Householder norm above: reproducible for one backend and
-      // team size, different between team sizes and backends (the OpenMP run-to-run investigation).
+      // team size, different between team sizes and backends.
       const int nc = n - k - 1, nr = m - k - 1;
       if (tau != 0.0 && nc > 0) {
         const int nthr = tm.team_size();
@@ -368,7 +368,7 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
   return kmax;
 }
 
-// The SM clock for the stage profile (0 off the device)
+// the SM clock for the stage profile (0 off the device)
 KOKKOS_INLINE_FUNCTION
 long long Clk() {
 #if defined(__CUDA_ARCH__)
@@ -412,7 +412,7 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
   tm.team_barrier();
   if (prof) {const long long c1 = Clk(); Kokkos::atomic_add(&st(2), (unsigned long long)(c1 - c0)); c0 = c1;}
   if (DUST_R_DIAG && st.extent(0) > 0) {
-    // Diagnostic (with amr_profile and DUST_R_DIAG): the basic solution that keeps the r pivot
+    // diagnostic (with amr_profile and DUST_R_DIAG): the basic solution that keeps the r pivot
     // clouds and puts every other cloud of the block at zero, w_B = w_B - Z_B w_N (the null
     // vector c moves cloud perm[r + c] alone among the others): within the bounds?
     auto basic = [&](const int i) {
@@ -434,7 +434,7 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
       if (nneg == 0 && nover > 0) Kokkos::atomic_add(&st(9), 1ULL);
       if (nneg > 0) Kokkos::atomic_add(&st(10), 1ULL);
     }
-    if (prof) c0 = Clk();   // the check's time stays outside stages 1-3 (Codex review)
+    if (prof) c0 = Clk();   // the check's time stays outside stages 1-3
   }
   while (ncol > 0) {
     int nc = (kNCand < ncol) ? kNCand : ncol;
@@ -582,7 +582,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
   const int e0 = pb.sptr(a0), ne = pb.sptr(a1) - e0;
   const int nl = DistinctSorted(tm, ne, [&](const int e) {return pb.stgt(e0 + e);}, ws.tab,
                                 hmask, ws.ltmp, ws.leaves);
-  const int ncom = pb.three ? 3 : 2;   // centre-of-mass rows (x3 too in 3-D)
+  const int ncom = pb.three ? 3 : 2;   // centre-of-mass rows (x3 in 3-D)
   const int nrow = 7*nl + 6 + ncom;
   const int fb0 = 4*nl + 6 + ncom;     // the first feedback row (2-D: 4 nl + 8)
   // mass-weighted mean velocity, host order
@@ -759,7 +759,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       sz(q, 2) = 0;
     });
   }
-  // Sizes, buckets and patch lists on the device; only a few totals go to the host
+  // sizes, buckets and patch lists on the device; only a few totals go to the host
   int emax = 1;
   Kokkos::parallel_reduce("rs_dev_emax", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
   KOKKOS_LAMBDA(const int q, int &m) {if (sz(q, 0) >= 2 && sz(q, 1) > m) m = sz(q, 1);},
@@ -784,7 +784,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       Kokkos::single(Kokkos::PerTeam(tm), [&]() {sz(q, 2) = nl;});
     });
   }
-  // cloud_resample_rank_screen (3-D): a patch of n clouds on nl leaves has at most
+  // 3-D, cloud_resample_rank_screen: a patch of n clouds on nl leaves has at most
   // 7 nl + 6 + ncom rows (PatchTeam), so for n > that many a null vector is certain.  Patches
   // with n <= that many are left as they are, like patches of one cloud: no bucket, no workspace,
   // no rows, no QR.  A screen of benefit, not a proof: dependent rows (coincident clouds) could
@@ -804,7 +804,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
   if (screened != nullptr) {screened[0] = nsk[0]; screened[1] = nsk[1];}
   // buckets: 0 at most 64 clouds, 1 (when mid > 64) at most mid clouds, 2 more;
   // patches of one or no cloud only get their counters.  Per bucket the number of patches and
-  // the largest clouds / entries / leaves.  mid <= 64: no bucket 1 (the original two buckets)
+  // the largest clouds / entries / leaves.  mid <= 64: no bucket 1 (buckets 0 and 2 only)
   constexpr int NB = 3;
   int nqb[NB] = {0, 0, 0}, nmx[NB] = {0, 0, 0}, emx[NB] = {1, 1, 1}, lmx[NB] = {1, 1, 1};
   {
@@ -897,8 +897,8 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
         }
       };
       // the large patches set the critical path of a resampling: the widest team the kernel
-      // allows (at most 512 threads); the small ones keep the automatic size.  However,
-      // a 512-thread team of the wide kernel (at most 128 registers per thread) fills the
+      // allows (at most 512 threads); the small ones keep the automatic size.
+      // A 512-thread team of the wide kernel (at most 128 registers per thread) fills the
       // register file of an SM, so the middle bucket runs the same kernel with mid_team threads
       // (several patches per SM)
       if (b == 0) {
@@ -916,7 +916,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
           told[b] = true;
         }
         if (b == 2 && wide_team > 512) {
-          // The large bucket with teams of up to 1024 threads (at most 64
+          // the large bucket with teams of up to 1024 threads (at most 64
           // registers per thread)
           const int tmax2 = PolicyWider(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
           int ts2 = 1;
