@@ -1064,6 +1064,81 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
     CloudImplicitConsistency3D(pdrive, stage);
     return TaskStatus::complete;
   }
+  if (!clouds3d && !UsesCompositeTransfer() && imex_consistent_gas) {
+    // Point particles (canonical TSC): as for the clouds, the gas takes the lumped
+    // solve's change G_c = rho (u*_c - u_c) plus its mass share rho/(rho + Q_c) of the residual
+    // D_c - G_c; the dust share r_c Q_c V of a cell goes to the particles whose TSC centre cell it
+    // is, in proportion to m_p c_p (the centre cell is an active cell of the particle's own block:
+    // no ghost values are needed).  A cell that is no particle's centre gives the whole residual
+    // to the gas (as before).  Total momentum is exact.
+    particles::Particles *ppar = pmy_pack->ppart;
+    auto &pr = ppar->prtcl_rdata;
+    auto &pi = ppar->prtcl_idata;
+    const int npart = ppar->nprtcl_thispack;
+    auto &mbsize = pmy_pack->pmb->mb_size;
+    const auto gids = pmy_pack->gids;
+    const int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
+    const bool three_d = pmy_pack->pmesh->three_d;
+    const int scheme = static_cast<int>(deposit);
+    const Real a_dt = DragStep(pdrive);
+    if (imex_resid.extent(0) != ustar.extent(0) || imex_resid.extent(1) != 4 ||
+        imex_resid.extent(2) != ustar.extent(2) || imex_resid.extent(3) != ustar.extent(3) ||
+        imex_resid.extent(4) != ustar.extent(4)) {
+      Kokkos::realloc(imex_resid, ustar.extent(0), 4, ustar.extent(2), ustar.extent(3),
+                      ustar.extent(4));
+    }
+    Kokkos::deep_copy(DevExeSpace(), imex_resid, 0.0);
+    auto res = imex_resid;   // 0-2: the dust correction per unit coupled mass, 3: centre-cell m c/V
+    auto centre = KOKKOS_LAMBDA(const int p, int &m, int &ip, int &jp, int &kp) {
+      m = pi(PGID,p) - gids;
+      Real w[3];
+      PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is, scheme, ip, w);
+      PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js, scheme, jp, w);
+      if (three_d) {
+        PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks, scheme, kp, w);
+      } else {
+        kp = ks;
+      }
+    };
+    par_for("dust_imex_point_centre_mass", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
+      if (pr(IPM,p) <= 0.0) return;
+      int m, ip, jp, kp;
+      centre(p, m, ip, jp, kp);
+      Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+      if (three_d) vol *= mbsize.d_view(m).dx3;
+      Kokkos::atomic_add(&res(m,3,kp,jp,ip), pr(IPM,p)*(a_dt/(pr(IPTS,p) + a_dt))/vol);
+    });
+    auto us = ustar;
+    auto qp = qdep;
+    par_for("dust_imex_point_consistent_gas",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+      const Real rho = u0(m,IDN,k,j,i), qt = res(m,3,k,j,i);
+      const Real q = qp(m,0,k,j,i);
+      for (int c=0; c<3; ++c) {
+        Real dgas = dmom_(m,c,k,j,i);
+        if (qt > 0.0) {
+          const Real g = rho*us(m,c,k,j,i) - u0(m,IM1+c,k,j,i);
+          const Real r = (dmom_(m,c,k,j,i) - g)/(rho + q);
+          dgas = g + rho*r;
+          res(m,c,k,j,i) = r*q/qt;
+        }
+        u0(m,IM1+c,k,j,i) += dgas;
+        dmom_(m,c,k,j,i) = dgas*inv_adt;
+      }
+    });
+    par_for("dust_imex_point_consistent_dust", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
+      if (pr(IPM,p) <= 0.0) return;
+      int m, ip, jp, kp;
+      centre(p, m, ip, jp, kp);
+      const Real cj = a_dt/(pr(IPTS,p) + a_dt);
+      for (int c=0; c<3; ++c) {
+        const Real dv = cj*res(m,c,kp,jp,ip);
+        pr(IPVX+2*c,p) += dv;
+        pr(IPRX+c,p) += dv/a_dt;
+      }
+    });
+    return TaskStatus::complete;
+  }
 
   par_for("dust_pmbr",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
