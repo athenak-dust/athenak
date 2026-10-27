@@ -1162,27 +1162,116 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   }
   // Reuse short row storage while visiting owned rows; no complete global cell
   // list, matrix, sample array, or face list is constructed on this rank.
-  RowWorkspace work;
   const bool discover_phase_rows = !m.phase_rows_ready;
   if (discover_phase_rows) m.phase_rows.clear();
-  for (GlobalIndex row = begin; row < end; ++row) {
-    const auto ci = m.Cell(row); double volume = 1.;
-    for (int d = 0; d < m.nd; ++d) volume *= ci.width[d];
-    if (forces) {
-      out.volume.push_back(volume); out.cells.push_back(ci); out.interface.push_back(0);
+  // One worker's consecutive rows. Every row is the same pure function of the geometry;
+  // the caches only memoize it, so private caches give the serial coefficients.
+  struct Part {
+    LocalCsr matrix, boundary_rhs;
+    std::array<LocalCsr,3> acceleration, boundary_acceleration;
+    std::vector<Real> volume;
+    std::vector<CompositeCell> cells;
+    std::vector<unsigned char> interface;
+    std::vector<int> phase_rows;
+  };
+  auto assemble = [&](GlobalIndex first, GlobalIndex last, Part &part,
+                      QuadraticCache &quadratics, ReconstructionFaces &faces) {
+    RowWorkspace work;
+    for (GlobalIndex row = first; row < last; ++row) {
+      const auto ci = m.Cell(row); double volume = 1.;
+      for (int d = 0; d < m.nd; ++d) volume *= ci.width[d];
+      if (forces) {
+        part.volume.push_back(volume); part.cells.push_back(ci); part.interface.push_back(0);
+      }
+      bool is_interface = false, phase_dependent = false;
+      m.AssembleRow(row,ci,volume,forces,work,quadratics,faces,
+                    forces ? &is_interface : nullptr,
+                    discover_phase_rows ? &phase_dependent : nullptr);
+      if (forces) part.interface.back() = is_interface;
+      if (discover_phase_rows && phase_dependent)
+        part.phase_rows.push_back(static_cast<int>(row-begin));
+      Append(part.matrix,work.a,n,false);
+      if (forces) Append(part.boundary_rhs,work.a,n,true,-1.);
+      for (int d = 0; forces && d < 3; ++d) {
+        Append(part.acceleration[d],work.g[d],n,false);
+        Append(part.boundary_acceleration[d],work.g[d],n,true);
+      }
     }
-    bool is_interface = false, phase_dependent = false;
-    m.AssembleRow(row,ci,volume,forces,work,m.quadratics,m.reconstruction_faces,
-                  forces ? &is_interface : nullptr,
-                  discover_phase_rows ? &phase_dependent : nullptr);
-    if (forces) out.interface.back() = is_interface;
-    if (discover_phase_rows && phase_dependent)
-      m.phase_rows.push_back(static_cast<int>(row-begin));
-    Append(out.matrix,work.a,n,false);
-    if (forces) Append(out.boundary_rhs,work.a,n,true,-1.);
-    for (int d = 0; forces && d < 3; ++d) {
-      Append(out.acceleration[d],work.g[d],n,false);
-      Append(out.boundary_acceleration[d],work.g[d],n,true);
+  };
+  // The full setup uses the phase workers too (in chunks of >= 4096 rows)
+  const int workers = static_cast<int>(std::max<GlobalIndex>(1,std::min<GlobalIndex>(
+      std::min(m.phase_threads,AvailablePhaseCpus()),(end-begin)/4096)));
+  if (workers == 1) {
+    // Serial: write straight into the output (identical to the original loop).
+    Part part;
+    part.matrix = std::move(out.matrix); part.boundary_rhs = std::move(out.boundary_rhs);
+    for (int d = 0; d < 3; ++d) {
+      part.acceleration[d] = std::move(out.acceleration[d]);
+      part.boundary_acceleration[d] = std::move(out.boundary_acceleration[d]);
+    }
+    part.volume = std::move(out.volume); part.cells = std::move(out.cells);
+    part.interface = std::move(out.interface);
+    assemble(begin,end,part,m.quadratics,m.reconstruction_faces);
+    out.matrix = std::move(part.matrix); out.boundary_rhs = std::move(part.boundary_rhs);
+    for (int d = 0; d < 3; ++d) {
+      out.acceleration[d] = std::move(part.acceleration[d]);
+      out.boundary_acceleration[d] = std::move(part.boundary_acceleration[d]);
+    }
+    out.volume = std::move(part.volume); out.cells = std::move(part.cells);
+    out.interface = std::move(part.interface);
+    if (discover_phase_rows) m.phase_rows = std::move(part.phase_rows);
+  } else {
+    std::vector<Part> parts(workers);
+    std::vector<QuadraticCache> quadratics(workers);
+    std::vector<ReconstructionFaces> faces(workers);
+    std::vector<std::exception_ptr> errors(workers);
+    auto run = [&](int w) {
+      try {
+        const GlobalIndex rows = end-begin;
+        assemble(begin+rows*w/workers,begin+rows*(w+1)/workers,parts[w],quadratics[w],faces[w]);
+      } catch (...) { errors[w] = std::current_exception(); }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(workers-1);
+    try {
+      for (int w = 1; w < workers; ++w) threads.emplace_back(run,w);
+    } catch (...) {
+      for (auto &thread : threads) thread.join();
+      throw;
+    }
+    run(0);
+    for (auto &thread : threads) thread.join();
+    for (const auto &error : errors) if (error) std::rethrow_exception(error);
+    // Concatenate in row order: no floating-point arithmetic, the serial entry order.
+    auto join = [](LocalCsr &destination, LocalCsr &source) {
+      const int offset = static_cast<int>(destination.values.size());
+      if (destination.values.size()+source.values.size() >
+          static_cast<size_t>(std::numeric_limits<int>::max()))
+        throw std::overflow_error("Gravity local CSR exceeds 32-bit offsets");
+      for (size_t i = 1; i < source.rowptr.size(); ++i)
+        destination.rowptr.push_back(offset+source.rowptr[i]);
+      destination.colidx.insert(destination.colidx.end(),source.colidx.begin(),source.colidx.end());
+      destination.values.insert(destination.values.end(),source.values.begin(),source.values.end());
+      source = LocalCsr{};
+    };
+    for (auto &part : parts) {
+      join(out.matrix,part.matrix);
+      if (forces) join(out.boundary_rhs,part.boundary_rhs);
+      for (int d = 0; forces && d < 3; ++d) {
+        join(out.acceleration[d],part.acceleration[d]);
+        join(out.boundary_acceleration[d],part.boundary_acceleration[d]);
+      }
+      out.volume.insert(out.volume.end(),part.volume.begin(),part.volume.end());
+      out.cells.insert(out.cells.end(),part.cells.begin(),part.cells.end());
+      out.interface.insert(out.interface.end(),part.interface.begin(),part.interface.end());
+      if (discover_phase_rows)
+        m.phase_rows.insert(m.phase_rows.end(),part.phase_rows.begin(),part.phase_rows.end());
+      part = Part{};
+    }
+    // The fallback diagnostics count unique fits, as the shared serial cache does.
+    for (auto &cache : quadratics) {
+      for (auto &q : cache) m.quadratics.emplace(q.first,std::move(q.second));
+      cache.clear();
     }
   }
   m.phase_rows_ready = true;
@@ -1225,6 +1314,10 @@ void MeshGeometry::SetPhaseThreads(int threads) {
 #endif
   }
   impl_->phase_threads = std::min(threads,AvailablePhaseCpus());
+}
+
+int MeshGeometry::SetupThreads() const {
+  return std::max(1,std::min(impl_->phase_threads,AvailablePhaseCpus()));
 }
 
 int MeshGeometry::PhaseThreads() const {

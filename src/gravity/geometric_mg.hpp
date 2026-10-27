@@ -63,9 +63,11 @@ HierarchyBuildTimes &BuildTimes();
 // neumann_z=true instead, exterior-center potentials are phi_adjacent+h*q,
 // boundary columns contain outward derivatives q, correction fills reflect, and
 // the constant nullspace is retained. This requires domain.isolated_z=true.
+// threads: host workers of every geometry's setup and phase assembly (SetPhaseThreads
+// semantics; 1 = serial). The coefficients do not depend on it.
 GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     const CompositeDomain &domain, int rank, int nranks, bool neumann_z = false,
-    bool fine_forces = true);
+    bool fine_forces = true, int threads = 1);
 
 // Both geometries must already have the current phase. Visits only the fixed
 // local P dependency list discovered during the original transfer construction.

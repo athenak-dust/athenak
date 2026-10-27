@@ -422,6 +422,8 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       if (pgrav != nullptr) {
         if (pgrav->UsesOrbitalSplit()) pgrav->SetHydroBoundaryTime(pmesh->time);
         pgrav->Solve(pmesh->time);
+        // The shear-phase host assembly for the closing solve overlaps the step
+        pgrav->PrefetchPhase(pmesh->time + pmesh->dt);
         pgrav->BeginEnergyStep();   // a no-op unless energy_source = flux / diag
         pgrav->KickMatter(0.5*pmesh->dt);
         InitBoundaryValuesAndPrimitives(pmesh);

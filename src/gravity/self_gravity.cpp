@@ -13,6 +13,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <sys/resource.h>
+#include <thread>
 
 #include "mesh/mesh.hpp"
 #include "coordinates/coordinates.hpp"
@@ -65,6 +66,18 @@ struct ExactSourceDifference {
   }
 };
 }  // namespace
+
+// Host-only products of one shear-phase assembly (fine A/forces/boundary, coarse A, P).
+struct SelfGravity::PhaseAssembly {
+  Real shift = 0;
+  int topology = -1;
+  std::uint64_t epoch = 0;
+  LocalCompositeUpdate fine;               // fine.matrix is moved into a[0]
+  std::vector<CsrRowUpdate> a, p;
+  double fine_s = 0, coarse_s = 0, prolongation_s = 0;
+  std::thread worker;
+  std::exception_ptr error;
+};
 
 SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack) {
   auto *pm = pack->pmesh;
@@ -182,6 +195,17 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
       std::cout << "# SG_PHASE_THREADS auto_capped=1 mpi_thread_level=" << mpi_thread_level << '\n';
   }
 #endif
+  {
+    // Overlap the next phase's host assembly with the matter step. Default on in
+    // device builds (the host is otherwise idle there), off in CPU builds (its cores run ranks).
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
+    const bool device_build = true;
+#else
+    const bool device_build = false;
+#endif
+    prefetch_enabled_ = pin->GetOrAddBoolean("gravity", "phase_prefetch", device_build)
+                        && !phase_serial_only_;
+  }
   setup_ = pin->GetOrAddString("gravity", "setup", "distributed");
   if (setup_ != "reference" && setup_ != "distributed") {
     Fail("gravity/setup must be reference or distributed");
@@ -234,6 +258,8 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
 }
 
 SelfGravity::~SelfGravity() {
+  JoinPrefetch();
+  prefetch_.reset();
   delete energy_bval_;
   if (global_variable::my_rank == 0) {
     std::cout << std::setprecision(16) << "# SELF_GRAVITY_SUMMARY solves=" << solve_count
@@ -242,7 +268,9 @@ SelfGravity::~SelfGravity() {
               << " linear_attempts=" << solve_count-cache_hit_count+preconditioner_refresh_count
               << " phase_updates=" << phase_update_count
               << " preconditioner_refreshes=" << preconditioner_refresh_count
-              << " rebuilds=" << rebuild_count << " iterations=" << last_solve.iterations
+              << " rebuilds=" << rebuild_count << " phase_prefetch_used=" << prefetch_used_
+              << " phase_prefetch_discarded=" << prefetch_discarded_
+              << " iterations=" << last_solve.iterations
               << " relative_residual=" << last_solve.relative_residual
               << " source_mean=" << last_source_mean << " time=" << last_time << '\n';
   }
@@ -289,6 +317,8 @@ void SelfGravity::OrbitalStep(Real dt) {
 }
 
 void SelfGravity::Rebuild(Real shear_offset) {
+  JoinPrefetch();
+  ++geometry_epoch_;
   if (setup_ == "distributed") {
     RebuildDistributed(shear_offset);
     return;
@@ -496,7 +526,8 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
   }
   const double t_geometry = ProfileTime(profile_);
   try {
-    auto setup = BuildGeometricHierarchy(std::move(patches),domain,rank,nranks,solver_neumann_z_);
+    auto setup = BuildGeometricHierarchy(std::move(patches),domain,rank,nranks,solver_neumann_z_,
+                                         true,phase_serial_only_ ? 1 : phase_threads_);
     const double t_assembly = ProfileTime(profile_);
     const auto old_partition = partition_;
     partition_ = setup.fine.row_partition;
@@ -631,26 +662,93 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
   }
 }
 
+Real SelfGravity::ShearShift(Real time) const {
+  auto *pm = pack_->pmesh;
+  if (pm->mesh_bcs[0] != BoundaryFlag::shear_periodic) return 0;
+  const auto *ps = pack_->phydro->psbox_u;
+  const Real ly = pm->mesh_size.x2max-pm->mesh_size.x2min;
+  return std::fmod(-ps->qshear*ps->omega0*(pm->mesh_size.x1max-pm->mesh_size.x1min)*time, ly);
+}
+
+// Host only: no MPI, no device work. Touches geometry_/coarse_geometry_ (their phase
+// caches), so at most one assembly runs at a time (JoinPrefetch before any other use).
+void SelfGravity::AssemblePhase(Real shear_offset, PhaseAssembly &out) {
+  using Clock = std::chrono::steady_clock;
+  auto seconds = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double>(b-a).count();
+  };
+  const auto begin = Clock::now();
+  out.fine = geometry_->BuildPhaseUpdate(shear_offset);
+  const auto fine_assembled = Clock::now();
+  out.a.clear(); out.p.clear();
+  out.a.reserve(coarse_geometry_.size()+1); out.a.push_back(std::move(out.fine.matrix));
+  for (auto &coarse : coarse_geometry_)
+    out.a.push_back(std::move(coarse->BuildPhaseUpdate(shear_offset,false).matrix));
+  const auto coarse_assembled = Clock::now();
+  out.p.reserve(coarse_geometry_.size());
+  auto current_domain = solver_domain_;
+  current_domain.shear_offset = shear_offset;
+  for (size_t l = 0; l < coarse_geometry_.size(); ++l) {
+    const auto &fine = l == 0 ? *geometry_ : *coarse_geometry_[l-1];
+    out.p.push_back(BuildProlongationPhaseUpdate(fine,*coarse_geometry_[l],current_domain,
+        global_variable::my_rank,prolongation_phase_rows_[l]));
+  }
+  const auto assembled = Clock::now();
+  out.shift = shear_offset;
+  out.fine_s = seconds(begin,fine_assembled);
+  out.coarse_s = seconds(fine_assembled,coarse_assembled);
+  out.prolongation_s = seconds(coarse_assembled,assembled);
+}
+
+void SelfGravity::JoinPrefetch() {
+  if (prefetch_ && prefetch_->worker.joinable()) prefetch_->worker.join();
+}
+
+void SelfGravity::PrefetchPhase(Real time) {
+  if (!prefetch_enabled_ || setup_ != "distributed" || !geometry_
+      || pack_->pmesh->mesh_bcs[0] != BoundaryFlag::shear_periodic || !std::isfinite(time)) return;
+  const Real shift = ShearShift(time);
+  if (!phase_valid_ || topology_ != pack_->pmesh->GetAMRLoadBalanceUpdateSeq()
+      || shift == phase_) return;
+  JoinPrefetch();
+  if (!prefetch_) prefetch_ = std::make_unique<PhaseAssembly>();
+  auto *job = prefetch_.get();
+  job->error = nullptr;
+  job->topology = topology_;
+  job->epoch = geometry_epoch_;
+  job->shift = shift;
+  job->worker = std::thread([this,job,shift]() {
+    try { AssemblePhase(shift,*job); } catch (...) { job->error = std::current_exception(); }
+  });
+}
+
 void SelfGravity::UpdatePhase(Real shear_offset) {
   const double begin = ProfileTime(profile_);
   PhaseTimes() = PhaseUpdateTimes{};
   try {
-    auto update = geometry_->BuildPhaseUpdate(shear_offset);
-    const double fine_assembled = ProfileTime(profile_);
-    std::vector<CsrRowUpdate> a;
-    a.reserve(coarse_geometry_.size()+1); a.push_back(std::move(update.matrix));
-    for (auto &coarse : coarse_geometry_)
-      a.push_back(std::move(coarse->BuildPhaseUpdate(shear_offset,false).matrix));
-    const double coarse_assembled = ProfileTime(profile_);
-    std::vector<CsrRowUpdate> p;
-    p.reserve(coarse_geometry_.size());
-    auto current_domain = solver_domain_;
-    current_domain.shear_offset = shear_offset;
-    for (size_t l = 0; l < coarse_geometry_.size(); ++l) {
-      const auto &fine = l == 0 ? *geometry_ : *coarse_geometry_[l-1];
-      p.push_back(BuildProlongationPhaseUpdate(fine,*coarse_geometry_[l],current_domain,
-          global_variable::my_rank,prolongation_phase_rows_[l]));
+    // A prefetched assembly counts only if it was made for exactly this shift on the
+    // current geometry; anything else is discarded and assembled again here.
+    double wait_s = 0;
+    bool prefetched = false;
+    if (prefetch_ && prefetch_->worker.joinable()) {
+      const auto t_wait = std::chrono::steady_clock::now();
+      prefetch_->worker.join();
+      wait_s = std::chrono::duration<double>(std::chrono::steady_clock::now()-t_wait).count();
+      prefetched = prefetch_->shift == shear_offset && prefetch_->epoch == geometry_epoch_
+                   && prefetch_->topology == topology_;
+      // The same assembly would fail here too; a mismatched request is simply redone.
+      if (prefetched && prefetch_->error) std::rethrow_exception(prefetch_->error);
+      prefetch_->error = nullptr;
+      if (prefetched) ++prefetch_used_; else ++prefetch_discarded_;
     }
+    if (!prefetched) {
+      if (!prefetch_) prefetch_ = std::make_unique<PhaseAssembly>();
+      AssemblePhase(shear_offset,*prefetch_);
+    }
+    auto &job = *prefetch_;
+    auto &update = job.fine;
+    auto &a = job.a;
+    auto &p = job.p;
     const double assembled = ProfileTime(profile_);
     mg_->UpdateHierarchyPhaseRows(a,p);
     for (int d = 0; d < solver_domain_.ndim; ++d) {
@@ -661,6 +759,10 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
       for (int d = 0; d < 3; ++d) boundary_force_[d]->UpdatePhaseRows(update.boundary_acceleration[d]);
       if (slab_) slab_->SetShearOffset(shear_offset);
     }
+    // Release the host CSR rows (the next assembly builds new ones).
+    job.fine = LocalCompositeUpdate{};
+    std::vector<CsrRowUpdate>().swap(job.a);
+    std::vector<CsrRowUpdate>().swap(job.p);
     solver_domain_.shear_offset = shear_offset;
     phase_ = shear_offset;
     field_cache_valid_ = false;
@@ -673,10 +775,11 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
                 << " phase_updates=" << phase_update_count
                 << " assembly_workers=" << geometry_->PhaseThreads()
                 << " phase_threads_config=" << phase_threads_
+                << " prefetched=" << prefetched << " prefetch_wait_s=" << wait_s
                 << " assembly_s=" << assembled-begin
-                << " fine_assembly_s=" << fine_assembled-begin
-                << " coarse_assembly_s=" << coarse_assembled-fine_assembled
-                << " prolongation_assembly_s=" << assembled-coarse_assembled
+                << " fine_assembly_s=" << job.fine_s
+                << " coarse_assembly_s=" << job.coarse_s
+                << " prolongation_assembly_s=" << job.prolongation_s
                 << " operators_s=" << ProfileTime(true)-assembled
                 << " op_validate_s=" << PhaseTimes().validate
                 << " op_ghosts_s=" << PhaseTimes().ghosts << " op_mpi_s=" << PhaseTimes().mpi
@@ -698,8 +801,10 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
 }
 
 void SelfGravity::RefreshHierarchy() {
+  JoinPrefetch();
   auto refreshed = BuildGeometricHierarchy(solver_patches_,solver_domain_,
-      global_variable::my_rank,global_variable::nranks,solver_neumann_z_,false);
+      global_variable::my_rank,global_variable::nranks,solver_neumann_z_,false,
+      phase_serial_only_ ? 1 : phase_threads_);
   if (refreshed.hierarchy.row_partitions[0] != partition_
       || refreshed.hierarchy.matrices[0].LocalRows() != solution_.extent_int(0)) {
     Fail("hierarchy-only refresh changed fine ownership; full rebuild required");
@@ -777,13 +882,7 @@ void SelfGravity::UpdateDustField(Real time) {
 void SelfGravity::Solve(Real time) {
   const double t0 = ProfileTime(profile_);
   auto *pm = pack_->pmesh;
-  Real shift = 0;
-  if (pm->mesh_bcs[0] == BoundaryFlag::shear_periodic) {
-    const auto *ps = pack_->phydro->psbox_u;
-    const Real ly = pm->mesh_size.x2max-pm->mesh_size.x2min;
-    shift = std::fmod(-ps->qshear*ps->omega0*
-                     (pm->mesh_size.x1max-pm->mesh_size.x1min)*time, ly);
-  }
+  const Real shift = ShearShift(time);
   if (!phase_valid_ || topology_ != pm->GetAMRLoadBalanceUpdateSeq()) {
     Rebuild(shift);
   } else if (shift != phase_) {

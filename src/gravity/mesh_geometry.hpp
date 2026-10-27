@@ -82,6 +82,8 @@ class MeshGeometry {
   // only assemble host rows; callers must not concurrently use this geometry.
   void SetPhaseThreads(int threads);
   int PhaseThreads() const;  // actual workers, including the calling thread
+  // Worker bound of a full setup (BuildSystem, transfers), independent of the phase rows.
+  int SetupThreads() const;
   // Requires initial BuildSystem or PhaseRows. Only PhaseRows are visited;
   // physical topology and sample ownership stay fixed across arbitrary phases.
   // false updates only A, without boundary/force CSR allocation or assembly.

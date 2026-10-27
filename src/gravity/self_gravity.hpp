@@ -39,6 +39,12 @@ class SelfGravity {
   SelfGravity &operator=(const SelfGravity &) = delete;
 
   void Solve(Real time);
+  // Start the HOST assembly of the shear-phase rows for a later Solve(time) in a
+  // background thread, overlapping the matter step. The next phase update uses it only if
+  // its shift, topology and geometry are still exactly those of the request; otherwise it
+  // is discarded and assembled again. The assembly is the same code on the same data, so
+  // the operator coefficients are bitwise those of the synchronous path.
+  void PrefetchPhase(Real time);
   // Symmetric half-kicks around the existing hydro/OA update. Density does not
   // change during a kick; ideal-gas internal energy is preserved exactly.
   void KickHydro(Real dt);
@@ -93,6 +99,10 @@ class SelfGravity {
   std::uint64_t phase_update_count = 0, preconditioner_refresh_count = 0;
 
  private:
+  struct PhaseAssembly;
+  Real ShearShift(Real time) const;
+  void AssemblePhase(Real shear_offset, PhaseAssembly &out);
+  void JoinPrefetch();
   void Rebuild(Real shear_offset);
   void RebuildDistributed(Real shear_offset);
   void UpdatePhase(Real shear_offset);
@@ -109,6 +119,9 @@ class SelfGravity {
   std::vector<std::unique_ptr<MeshGeometry>> coarse_geometry_;
   std::vector<std::vector<int>> prolongation_phase_rows_;
   std::vector<GravityPatch> solver_patches_;
+  std::unique_ptr<PhaseAssembly> prefetch_;
+  bool prefetch_enabled_ = false;
+  std::uint64_t geometry_epoch_ = 0, prefetch_used_ = 0, prefetch_discarded_ = 0;
   CompositeDomain solver_domain_;
   bool solver_neumann_z_ = false, hierarchy_fresh_ = true;
   std::unique_ptr<DistributedOperator> force_[3];
