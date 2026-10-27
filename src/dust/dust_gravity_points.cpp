@@ -236,7 +236,8 @@ void DustGasDrag::DepositPointGravityDensity(Real time,DvceArray5D<Real> &owned)
 // of DepRemapPlan (any levels, shear-periodic x1, physical x3 faces folded back).  Its own
 // plan and buffers (science_points_): an output leaves the coupling's and gravity's
 // transfers untouched.  out(b, 0..3) on the active cells; the ghost cells are zero.
-void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out) {
+void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out,
+                                            const bool mass_only) {
   auto *pm=pmy_pack->pmesh;
   if (!pm->three_d || clouds3d || !std::isfinite(time) ||
       !(smr_transfer_mode==DustSMRTransfer::owner_overlap ||
@@ -261,7 +262,8 @@ void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out) {
   const int ni=ind.nx1+2*ind.ng,nj=ind.nx2+2*ind.ng,nk=ind.nx3+2*ind.ng;
   const char *names[4]={"science_point_rho","science_point_m1","science_point_m2",
                         "science_point_m3"};
-  for (int c=0;c<4;++c) {
+  const int ncomp=mass_only ? 1 : 4;   // (mass_only: the phst row)
+  for (int c=0;c<ncomp;++c) {
     Resize(science_halo_[c],names[c],nb,1,nk,nj,ni);
     Kokkos::deep_copy(science_halo_[c],0.0);
   }
@@ -293,13 +295,14 @@ void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out) {
         if (w==0) continue;
         const int kk=kp+c-1,jj=jp+j-1,ii=ip+i-1;
         DepositAdd(&f0(b,0,kk,jj,ii),w);
+        if (mass_only) continue;
         DepositAdd(&f1(b,0,kk,jj,ii),w*v1);
         DepositAdd(&f2(b,0,kk,jj,ii),w*v2);
         DepositAdd(&f3(b,0,kk,jj,ii),w*v3);
       }
     },bad);
   CheckPointParticles(bad);
-  for (int c=0;c<4;++c) {
+  for (int c=0;c<ncomp;++c) {
     state.DepositMap(state.plan->stat,science_halo_[c]);
     if (state.plan->Shear()) state.DepositMap(state.plan->shr,science_halo_[c]);
   }
@@ -307,6 +310,7 @@ void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out) {
   par_for("science_point_owned",DevExeSpace(),0,nb-1,ind.ks,ind.ke,ind.js,ind.je,ind.is,ind.ie,
     KOKKOS_LAMBDA(int b,int k,int j,int i) {
       o(b,0,k,j,i)=f0(b,0,k,j,i);
+      if (mass_only) return;
       o(b,1,k,j,i)=f1(b,0,k,j,i);
       o(b,2,k,j,i)=f2(b,0,k,j,i);
       o(b,3,k,j,i)=f3(b,0,k,j,i);

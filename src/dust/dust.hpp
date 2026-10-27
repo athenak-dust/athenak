@@ -1893,8 +1893,11 @@ class DustGasDrag {
   // deposited mass, particle momentum (3), deposited momentum (3) of the last call.
   std::string ScienceRepresentationId() const;
   void ScienceRepresentation(std::ostream &os) const;
-  void DepositScienceFields(DvceArray5D<Real> &out, const bool audit = true);
-  void DepositPointScienceFields(Real geometry_time, DvceArray5D<Real> &out);  // 3-D points
+  // mass_only: component 0 alone (bit for bit the same as with the momenta), 1..3 stay zero
+  void DepositScienceFields(DvceArray5D<Real> &out, const bool audit = true,
+                            const bool mass_only = false);
+  void DepositPointScienceFields(Real geometry_time, DvceArray5D<Real> &out,
+                                 const bool mass_only = false);  // 3-D points
   double science_audit[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   // particle history (file_type = phst): the 16 global quantities of a row
   // after time and dt (all ranks hold them; the file writes the last two only in runs with G/R);
@@ -2074,6 +2077,7 @@ class DustGasDrag {
   // output never touches the coupling's or gravity's exchange state
   std::shared_ptr<GravityPointTransfer> science_points_;
   DvceArray5D<Real> science_halo_[4], science_work_, science_phst_;
+  DvceArray5D<Real> science_mass_;   // work array of the mass-only deposit (no realloc ping-pong)
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this DustGasDrag
 };
 

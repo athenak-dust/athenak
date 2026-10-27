@@ -121,7 +121,8 @@ void DustGasDrag::ScienceRepresentation(std::ostream &os) const {
 //! \fn DustGasDrag::DepositScienceFields
 //! \brief See the file header.  out is (re)allocated to at least (nmb, 4, nk, nj, ni).
 
-void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit) {
+void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
+                                       const bool mass_only) {
   Mesh *pm = pmy_pack->pmesh;
   auto &ind = pm->mb_indcs;
   const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
@@ -146,11 +147,38 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit)
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud && three_d) {
     // ---- 3-D refinable clouds: the exact leaf integrals of the coupling's traversal
     if (!clouds3d) ScienceFail("3-D refinable clouds need <dust>/experimental_3d = true");
-    DepositCloudDensity3D(science_work_);   // collective (halo), shear geometry at pm->time
-    auto f = science_work_;
+    if (!mass_only) {
+      DepositCloudDensity3D(science_work_);   // collective (halo), shear geometry at pm->time
+    } else {
+      // the mass component of DepositCloudDensity3D alone (the same operations)
+      if (science_mass_.extent_int(0) != qdep.extent_int(0) ||
+          science_mass_.extent_int(1) != 1 || science_mass_.extent_int(2) != qdep.extent_int(2) ||
+          science_mass_.extent_int(3) != qdep.extent_int(3) ||
+          science_mass_.extent_int(4) != qdep.extent_int(4)) {
+        Kokkos::realloc(science_mass_, qdep.extent(0), 1, qdep.extent(2), qdep.extent(3),
+                        qdep.extent(4));
+      }
+      Kokkos::deep_copy(science_mass_, 0.0);
+      UpdateShear3D(pm->time);
+      const auto lt = leaf_traversal3d;
+      auto ff = science_mass_;
+      Kokkos::parallel_for("dust_science_cloud3d_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, np),
+      KOKKOS_LAMBDA(const int p) {
+        const Real m = pr(IPM,p);
+        lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
+        [&](const int target, const Real w) {
+          int tb, tk, tj, ti;
+          lt.Decode(target, tb, tk, tj, ti);
+          DepositAdd(&ff(tb,0,tk,tj,ti), m*w/(lt.box(tb,3)*lt.box(tb,4)*lt.box(tb,5)));
+        });
+      });
+      HaloReverseAdd(science_mass_, 0, 1);
+    }
+    auto f = mass_only ? science_mass_ : science_work_;
+    const int nc = mass_only ? 1 : 4;
     par_for("dust_science_cloud3d", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      for (int c=0; c<4; ++c) o(m,c,k,j,i) = f(m,c,k,j,i);
+      for (int c=0; c<nc; ++c) o(m,c,k,j,i) = f(m,c,k,j,i);
     });
   } else if (UsesCompositeTransfer()) {
     // ---- 2-D refinable clouds (and the smooth_p2 control): composite weights on the leaves
@@ -159,7 +187,8 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit)
     const bool cloud = transfer.cloud_mode;
     const int ncb = nc1*nc2;
     const int nslot = (global_variable::nranks > 1) ? std::max(nmb, lt.nfld) : nmb;
-    DvceArray2D<Real> f0("dust_science_leaf2d", 4, static_cast<std::size_t>(nslot)*ncb);
+    const int nc = mass_only ? 1 : 4;
+    DvceArray2D<Real> f0("dust_science_leaf2d", nc, static_cast<std::size_t>(nslot)*ncb);
     par_for("dust_science_composite2d", DevExeSpace(), 0, np-1, KOKKOS_LAMBDA(const int p) {
       const Real mass = pr(IPM,p);
       if (mass == 0.0) return;
@@ -172,27 +201,30 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit)
                                 : mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2;
         const Real d = mass*w/area;
         DepositAdd(&f0(0,target), d);
+        if (mass_only) return;
         DepositAdd(&f0(1,target), d*v1);
         DepositAdd(&f0(2,target), d*v2);
         DepositAdd(&f0(3,target), d*v3);
       });
     });
-    HaloReverseAddFlat(f0, 4);   // several ranks: the halo parts to their owners
+    HaloReverseAddFlat(f0, nc);   // several ranks: the halo parts to their owners
     par_for("dust_science_composite2d_copy", DevExeSpace(), 0, nmb-1, js, je, is, ie,
     KOKKOS_LAMBDA(int m, int j, int i) {
       const std::size_t t = (static_cast<std::size_t>(m)*nc2 + j)*nc1 + i;
-      for (int c=0; c<4; ++c) o(m,c,ks,j,i) = f0(c,t);
+      for (int c=0; c<nc; ++c) o(m,c,ks,j,i) = f0(c,t);
     });
   } else if (three_d) {
     // ---- 3-D point particles: owner stencil + conservative ghost remap
-    DepositPointScienceFields(pm->time, out);
+    DepositPointScienceFields(pm->time, out, mass_only);
   } else if (smr_transfer_mode == DustSMRTransfer::owner_overlap) {
     // ---- 2-D point particles on a refined mesh: the owner_overlap leaf deposit
-    OwnerOverlapDeposit(science_work_, true);   // stops on a mass mismatch
-    auto g = science_work_;
+    DvceArray5D<Real> &work = mass_only ? science_mass_ : science_work_;
+    OwnerOverlapDeposit(work, !mass_only);   // stops on a mass mismatch
+    auto g = work;
+    const int nc = mass_only ? 1 : 4;
     par_for("dust_science_oo2d_copy", DevExeSpace(), 0, nmb-1, js, je, is, ie,
     KOKKOS_LAMBDA(int m, int j, int i) {
-      for (int c=0; c<4; ++c) o(m,c,ks,j,i) = g(m,c,ks,j,i);
+      for (int c=0; c<nc; ++c) o(m,c,ks,j,i) = g(m,c,ks,j,i);
     });
   } else {
     // ---- 2-D point particles on a uniform mesh: owner stencil + the coupling's additive
@@ -233,6 +265,7 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit)
           if (w == 0.0) continue;
           const int jj = jp + b - 1, ii = ip + c - 1;
           DepositAdd(&a(m,0,ks,jj,ii), w);
+          if (mass_only) continue;
           for (int q=0; q<3; ++q) DepositAdd(&a(m,1+q,ks,jj,ii), w*v[q]);
         }
       }
@@ -246,9 +279,10 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit)
     while (pbval_qp->RecvAndSumDeposit(science_work_) != TaskStatus::complete) {}
     while (pbval_qp->ClearSendDep() != TaskStatus::complete) {}
     while (pbval_qp->ClearRecvDep() != TaskStatus::complete) {}
+    const int nc = mass_only ? 1 : 4;
     par_for("dust_science_point2d_copy", DevExeSpace(), 0, nmb-1, js, je, is, ie,
     KOKKOS_LAMBDA(int m, int j, int i) {
-      for (int c=0; c<4; ++c) o(m,c,ks,j,i) = a(m,c,ks,j,i);
+      for (int c=0; c<nc; ++c) o(m,c,ks,j,i) = a(m,c,ks,j,i);
     });
   }
 
@@ -331,8 +365,8 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit)
 //!   row[0] n_particles (active rows, mass != 0); row[1] mass; row[2..4] momentum (stored
 //!   velocities); row[5] ekin = sum m |v|^2/2; row[6] z_rms = sqrt(sum m z^2/sum m), z = x3 in
 //!   3-D, x2 (the vertical of the 2-D r-z box) in 2-D; row[7] rho_max, the largest dust density
-//!   on the active cells (DepositScienceFields: the representation of the run, deposited from
-//!   the particles of this time); row[8..10] the centre of that cell, row[11] its level above
+//!   on the active cells (DepositScienceFields, mass only: the representation of the run,
+//!   deposited from the particles of this time, bit for bit dust_total_rho); row[8..10] the centre of that cell, row[11] its level above
 //!   the root (if rho_max = 0: centre 0, level -1); row[12] chi_max, row[13] dt_stiff_min (the
 //!   interval records of UpdateStiffness; -1 without back-reaction, without a PC2 cycle in the
 //!   interval, or, for dt_stiff_min, without stiff_thresh); row[14] coarsening events (G groups,
@@ -378,7 +412,7 @@ void DustGasDrag::ParticleHistory(double row[16]) {
   row[6] = (sums[1] > 0.0) ? std::sqrt(sums[6]/sums[1]) : 0.0;
 
   // ---- the densest cell of the deposit
-  DepositScienceFields(science_phst_, false);
+  DepositScienceFields(science_phst_, false, true);   // the mass component only
   auto &ind = pm->mb_indcs;
   const int nmb = pmy_pack->nmb_thispack;
   const int nx1 = ind.nx1, nx2 = ind.nx2, nx3 = ind.nx3;
