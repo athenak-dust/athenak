@@ -81,7 +81,7 @@ void ProlongCC(const int m, const int v, const int k, const int j, const int i,
 
 //----------------------------------------------------------------------------------------
 //! \fn ProlongCCAmplitudeAware()
-//! \brief Hydro-only diagnostic candidate (<mesh_refinement>/
+//! \brief Hydro-only diagnostic option (<mesh_refinement>/
 //! prolong_amplitude_eps > 0): amplitude-aware blend of the central and MC slopes for the
 //! conserved hydro variables of an isothermal static mesh.  Per coarse cell and direction
 //! the blend weight w = 1 - S((D - eps)/eps) on [eps, 2 eps] (S the C1 smoothstep, w = 1

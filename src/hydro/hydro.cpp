@@ -80,7 +80,7 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     pvisc = nullptr;
   }
 
-  // amplitude-aware ghost prolongation candidate: isothermal hydro only
+  // amplitude-aware ghost prolongation: isothermal hydro only
   if (ppack->pmesh->pmr != nullptr && ppack->pmesh->pmr->prolong_amp_eps > 0.0 &&
       peos->eos_data.is_ideal) {
     std::cout << "### FATAL ERROR in "<< __FILE__ <<" at line " << __LINE__ << std::endl

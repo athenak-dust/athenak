@@ -18,7 +18,7 @@
 //! \!fn void BoundaryValues::HydroBCs()
 //! \brief Apply physical boundary conditions for all Hydro variables at faces of MB which
 //! are at the edge of the computational domain
-//! With coarse = true they are applied to the coarse arrays (coarse_u0) with
+//! coarse = true applies them to the coarse arrays (coarse_u0) with
 //! the coarse indices, for the prolongation next to a physical boundary.
 
 void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,

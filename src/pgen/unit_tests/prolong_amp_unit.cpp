@@ -4,11 +4,11 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file prolong_amp_unit.cpp
-//! \brief Unit test of ProlongCCAmplitudeAware (Codex review of the
-//! results): the compiled device function is called on prescribed coarse stencils and the
+//! \brief Unit test of ProlongCCAmplitudeAware: the compiled device function is called
+//! on prescribed coarse stencils and the
 //! children are checked for (1) the density lower bound 0.1 rho after the positivity
 //! scaling, (2) conservation of the coarse average of every variable, (3) bitwise equality
-//! with the central slope when every weight is 1.  Cases: Codex's 3-D example (centre 1,
+//! with the central slope when every weight is 1.  Cases: a 3-D example (centre 1,
 //! neighbours 0.1 and 4 along every axis: MC corner child -0.35), its 2-D version, a 3-D
 //! case with momenta, and NRAND random strong 3-D stencils (rho in [1e-3, 10], u in [-5, 5]),
 //! for which the number of negative children of plain MC and plain central slopes is also
@@ -42,7 +42,7 @@ void ProblemGenerator::ProlongAmpUnit(ParameterInput *pin, const bool restart) {
     if (dir == 1) {ca_h(m,v,1,0,1) = lo; ca_h(m,v,1,1,1) = c; ca_h(m,v,1,2,1) = hi;}
     if (dir == 2) {ca_h(m,v,0,1,1) = lo; ca_h(m,v,1,1,1) = c; ca_h(m,v,2,1,1) = hi;}
   };
-  // case 0: Codex's 3-D example; case 1: same stencil, used in 2-D (three_d = false)
+  // case 0: the 3-D example; case 1: same stencil, used in 2-D (three_d = false)
   for (int m=0; m<2; ++m) for (int d=0; d<3; ++d) axis(m, IDN, 0.1, 1.0, 4.0, d);
   // case 2: 3-D example with momenta M = rho u, u = (2, -1, 0.5) on the low side, 0 centre,
   // (-3, 1, 0) on the high side along every axis

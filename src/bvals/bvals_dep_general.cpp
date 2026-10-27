@@ -4,7 +4,7 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file bvals_dep_general.cpp
-//! \brief S3a: the additive ghost-deposit exchange of a 3-D mesh with
+//! \brief The additive ghost-deposit exchange of a 3-D mesh with
 //! any levels, several MPI ranks and shear-periodic x1 faces (DepRemapPlan, and the general path
 //! of MeshBoundaryValuesDep).
 //!
@@ -356,8 +356,8 @@ void DepRemapPlan::BuildPart(const int part, const double shR, DepRemapMap &map)
   std::vector<SendPair> spairs;
   // the coverage counts of the source ghost cells: every cell of every local block for the static
   // part; for the shear part only the x1 ghost layers (2 nghost wide), since a cell beyond a
-  // shear-periodic x1 face is an x1 ghost cell (the full array was
-  // 77 MB per rank and build for one 128 x 128 x 512 block)
+  // shear-periodic x1 face is an x1 ghost cell (the full array was 77 MB per rank and
+  // build for one 128 x 128 x 512 block)
   const int nsl = 2*g.ng;
   const bool slab = (part == 1);
   std::vector<double> cov(slab ? static_cast<std::size_t>(nmb)*g.nc[2]*g.nc[1]*nsl

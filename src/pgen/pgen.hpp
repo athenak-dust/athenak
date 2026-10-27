@@ -20,7 +20,7 @@ using UserBoundaryFnPtr = void (*)(Mesh* pm);
 using UserSrctermFnPtr = void (*)(Mesh* pm, const Real bdt);
 using UserRefinementFnPtr = void (*)(MeshBlockPack* pmbp);
 using UserHistoryFnPtr = void (*)(HistoryData *pdata, Mesh *pm);
-// Work at the end of every cycle (Athena's Userwork_in_loop)
+// user work done once per cycle (like Athena++'s UserWorkInLoop)
 using UserWorkInLoopFnPtr = void (*)(Mesh *pm);
 
 //----------------------------------------------------------------------------------------
@@ -52,15 +52,15 @@ class ProblemGenerator {
   ProblemFinalizeFnPtr pgen_final_func=nullptr;
   // function pointer for user-enrolled BCs.  Called in ApplyPhysicalBCs in task list
   UserBoundaryFnPtr user_bcs_func=nullptr;
-  // Optional: user BCs on the coarse arrays (coarse_u0, coarse indices) before the
+  // optional: user BCs on the coarse arrays (coarse_u0, coarse indices) before the
   // ghost prolongation; without it user faces of the coarse arrays get zero gradient
   UserBoundaryFnPtr user_bcs_coarse_func=nullptr;
   UserSrctermFnPtr user_srcs_func=nullptr;
   UserRefinementFnPtr user_ref_func=nullptr;
   UserHistoryFnPtr user_hist_func=nullptr;
-  // Called by the driver at the start of every cycle, before the integrator
+  // called by the driver at the start of every cycle, before the integrator
   UserWorkInLoopFnPtr user_work_in_loop_func=nullptr;
-  // True if user_work_in_loop_func never changes particle positions, masses, levels
+  // true if user_work_in_loop_func never changes particle positions, masses, levels
   // or anchors (then <gravity>/kdk_reuse may keep the dust field across it)
   bool user_work_keeps_particles=false;
 

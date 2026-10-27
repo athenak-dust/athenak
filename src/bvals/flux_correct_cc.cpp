@@ -73,8 +73,8 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendFluxCC(DvceFaceFld5D<Real> &flx) {
     int dm = nghbr.d_view(m,n).gid - mbgid.d_view(0);
     int dn = nghbr.d_view(m,n).dest;
 
-    // only pack buffers when neighbor is at coarser level (and not across the shear-periodic
-    // x1 boundaries)
+    // only pack buffers when neighbor is at coarser level (and not across the
+    // shear-periodic x1 boundaries)
     const bool skip_shr = skip_shr_ && n < 8 &&
         mbbcs.d_view(m, (n < 4) ? BoundaryFace::inner_x1 : BoundaryFace::outer_x1) ==
         BoundaryFlag::shear_periodic;

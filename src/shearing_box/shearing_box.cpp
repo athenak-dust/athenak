@@ -35,16 +35,16 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   qshear = pin->GetReal("shearing_box","qshear");
   omega0 = pin->GetReal("shearing_box","omega0");
   is_stratified = pin->GetOrAddBoolean("shearing_box","stratified",false);
-  // (S2b) the blocks on the x1 faces may change level along x2: their x1 ghost
-  // zones are collected from the opposite face (PlanPull).  Only across
-  // shear-periodic x1 faces.  PlanPull picks the receivers by position (the blocks on the x1
+  // face_levels: the blocks on the x1 faces may change level along x2: their x1 ghost
+  // zones are collected from the opposite face (PlanPull).  Only across shear-periodic x1
+  // faces.  PlanPull picks the receivers by position (the blocks on the x1
   // faces) but the senders from the shear-periodic boundary lists, so with periodic x1 the face
   // blocks got collected x1 ghosts without any sender and the gas mass leaked through the x1 faces
   face_levels = ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic &&
                 ppack->pmesh->mesh_bcs[BoundaryFace::outer_x1] == BoundaryFlag::shear_periodic;
   report_timing = pin->GetOrAddBoolean("shearing_box", "report_timing", false);
-  // (S2c) non-periodic x3 needs the coarse-array physical
-  // boundaries for the corners the collected ghost zones leave to them; dust
+  // with face_levels, non-periodic x3 needs the physical boundary values of the coarse
+  // arrays for the corners the collected ghost zones leave to them; dust
   // (u* through the same collection, deposits through the general remap, particle routing by the
   // face-block table) is covered
   if (face_levels && ppack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
@@ -88,7 +88,7 @@ ShearingBox::~ShearingBox() {
 
 void ShearingBox::BuildBoundaryLists() {
   pull_ghost_valid = false;   // new or moved blocks: x1 ghosts not collected yet
-  BuildCandidates();
+  BuildCandidates();          // candidate partners of the block-local plans
   // Create vector with GID of every MBs on this rank at ix1/ox1 shearing-box boundaries
   std::vector<int> tmp_ix1bndry_gid, tmp_ox1bndry_gid;
   auto &mbbcs = pmy_pack->pmb->mb_bcs;
@@ -130,10 +130,11 @@ void ShearingBox::BuildBoundaryLists() {
 
 //----------------------------------------------------------------------------------------
 //! \fn void ShearingBox::CheckSupportedSetup()
-//! \brief Setup checks (Codex review): Pieces splits a block's x2 rows into at most
+//! \brief Pieces splits a block's x2 rows into at most
 //! three pieces, which needs nx2 >= 2 ng; the coarse arrays (3-D with refinement) have half the
 //! rows and the same ng, so there the fine blocks need nx2 >= 4 ng.  Non-periodic x3 needs the
-//! physical boundary values of the coarse arrays (on by default).
+//! physical boundary values of the coarse arrays
+//! (<mesh_refinement>/coarse_physical_bcs, on by default).
 
 void ShearingBox::CheckSupportedSetup(const bool coarse_bcs) const {
   Mesh *pm = pmy_pack->pmesh;
@@ -203,7 +204,7 @@ void ShearingBox::FreeRequests() {
 
 //----------------------------------------------------------------------------------------
 //! \fn ShearingBox::Set()
-//! \brief Index ranges of one exchange: the MeshBlock arrays or the coarse arrays
+//! \brief index ranges of one exchange: the MeshBlock arrays or the coarse arrays
 
 ShearingBox::ShearSet ShearingBox::Set(const bool coarse) const {
   const auto &indcs = pmy_pack->pmesh->mb_indcs;

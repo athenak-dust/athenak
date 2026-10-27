@@ -318,9 +318,9 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   //---- Step 1.  Set conserved variables in ghost zones for all physics
   InitBoundaryValuesAndPrimitives(pmesh);
 
-  // A restarted dynamic dust mesh gets its cooldown ages back and the
-  // mesh check that followed the outputs of the restart cycle, before the time step;
-  // refinable clouds get their MeshBlock ids from their positions (any mesh)
+  // A restarted dynamic dust mesh gets its cooldown ages back and redoes the mesh check
+  // that followed the outputs of the restart cycle, before the time step; refinable
+  // clouds get their MeshBlock ids from their positions (any mesh)
   if (res_flag) gravity::ResumeRestart(pmesh, this, pin);
   // Phi is a derived elliptic field. Recompute from the restored density and
   // physical time; never carry a pre-regrid potential or an old shear phase.
@@ -422,9 +422,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       if (pgrav != nullptr) {
         if (pgrav->UsesOrbitalSplit()) pgrav->SetHydroBoundaryTime(pmesh->time);
         pgrav->Solve(pmesh->time);
-        // The shear-phase host assembly for the closing solve overlaps the step
+        // the shear-phase host assembly for the closing solve overlaps the step
         pgrav->PrefetchPhase(pmesh->time + pmesh->dt);
-        pgrav->BeginEnergyStep();   // a no-op unless energy_source = flux / diag
+        pgrav->BeginEnergyStep();   // energy_source = flux / diag; else no-op
         pgrav->KickMatter(0.5*pmesh->dt);
         InitBoundaryValuesAndPrimitives(pmesh);
         if (pgrav->UsesOrbitalSplit()) {
@@ -480,7 +480,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         }
         pgrav->Solve(pmesh->time+pmesh->dt);
         pgrav->KickMatter(0.5*pmesh->dt);
-        pgrav->EndEnergyStep();     // a no-op unless energy_source = flux / diag
+        pgrav->EndEnergyStep();     // energy_source = flux / diag; else no-op
       }
 
       // Work outside of TaskLists:
@@ -530,7 +530,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
 
       // AMR
       if (pmesh->adaptive) {
-        if (pmesh->pmb_pack->pdust != nullptr) {
+        if (pmesh->pmb_pack->pdust != nullptr) {   // dust profile timer
           auto *pd = pmesh->pmb_pack->pdust;
           ProfTimer pt(pd->prof_time[pd->kProfAmr], pd->prof_count[pd->kProfAmr]);
           pmesh->pmr->AdaptiveMeshRefinement(this, pin);
@@ -546,7 +546,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         elapsed_time = UpdateWallClock();
       }
     }  // end while
-    // (2026-10-26) a dropped regrid (max_nmb_per_rank): the restart file of the final outputs
+    // a dropped regrid (max_nmb_per_rank): the restart file of the final outputs
     // marks this cycle's mesh check as pending, so a restart with a larger limit redoes it first
     if (pmesh->stop_max_nmb && pmesh->pmb_pack->pdust != nullptr) {
       pmesh->pmb_pack->pdust->amr_check_after_output = true;
@@ -586,7 +586,7 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
                     MPI_COMM_WORLD);
     }
 #endif
-    // switch summary of the amplitude-aware prolongation candidate
+    // switch summary of the amplitude-aware prolongation
     if (pmesh->pmr != nullptr && pmesh->pmr->prolong_amp_eps > 0.0 &&
         global_variable::my_rank == 0) {
       auto c = Kokkos::create_mirror_view_and_copy(HostMemSpace(),

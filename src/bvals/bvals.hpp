@@ -149,11 +149,11 @@ class MeshBlockPack;
 
 class MeshBoundaryValues {
  public:
-  // S1': no flux correction across the shear-periodic x1 boundaries (the
+  // no flux correction across the shear-periodic x1 boundaries (the
   // neighbour of the unsheared periodic topology is not the sheared one; the uniform shearing box
   // does no flux correction there either).  Set by Hydro with mesh refinement in 3-D.
   bool skip_shear_x1_flux=false;
-  // No prolongation or same-level restriction through neighbour slots across a
+  // no prolongation or same-level restriction through neighbour slots across a
   // shear-periodic x1 face: the shearing box collects those ghost zones itself
   bool skip_shear_x1_prol = false;
   MeshBoundaryValues(MeshBlockPack *ppack, ParameterInput *pin, bool z4c);
@@ -266,7 +266,7 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
 
 //----------------------------------------------------------------------------------------
 //! \struct DepRemapMap
-//! \brief S3a: one part of the general deposit remap: the ghost
+//! \brief One part of the general deposit remap: the ghost
 //! deposits added to the overlapping active cells of the blocks of this rank, as a list per
 //! target cell (CSR, sorted by source block gid and source cell: the sums are independent of
 //! the rank layout), and the source ghost cells this rank sends to every other rank.
@@ -281,7 +281,7 @@ struct DepRemapMap {
   DvceArray1D<int> send_cell;  // local source cells packed for the other ranks (by rank)
   std::vector<int> send_rank, send_off, send_cnt;   // per peer rank: offset, count (entries)
   std::vector<int> recv_rank, recv_off, recv_cnt;
-  // Ghost cells beyond a physical x3 face that are dropped (x3 mode drop): local
+  // ghost cells beyond a physical x3 face that are dropped (x3 mode drop): local
   // source cells and their volumes, for the record of the dropped deposits
   int ndrop = 0;
   DvceArray1D<int> drop_cell;
@@ -290,7 +290,7 @@ struct DepRemapMap {
 
 //----------------------------------------------------------------------------------------
 //! \class DepRemapPlan
-//! \brief S3a: the additive ghost-deposit exchange of a 3-D mesh with
+//! \brief The additive ghost-deposit exchange of a 3-D mesh with
 //! any levels (static or adaptive refinement), multi-rank, and shear-periodic x1 faces.  Every
 //! ghost cell deposit goes to the active cells it overlaps (volume overlap in the integer cell
 //! units of the finest level: exact, conservative); ghost cells beyond a shear-periodic x1 face
@@ -314,7 +314,7 @@ class DepRemapPlan {
   int shr_builds = 0, shr_updates = 0;   // full builds and weight-only updates of the shear part
 
  private:
-  // Between full builds of the shear part (same integer part of the
+  // between full builds of the shear part (same integer part of the
   // offset, and an integer or not) only its weights change: kRecipe doubles per entry say how
   // to recompute them exactly (bvals_dep_general.cpp, UpdateShearWeights)
   static constexpr int kRecipe = 8;
@@ -335,7 +335,7 @@ class MeshBoundaryValuesDep : public MeshBoundaryValues {
   MeshBoundaryValuesDep(MeshBlockPack *ppack, ParameterInput *pin);
   ~MeshBoundaryValuesDep();
 
-  // The general 3-D path: the dust module creates the plan and gives it to its
+  // the general 3-D path: the dust module creates the plan and gives it to its
   // deposit exchanges; then these replace InitRecv / ClearSend / ClearRecv of the base class
   void SetGeneralPlan(DepRemapPlan *p) {plan_ = p;}
   bool General() const {return plan_ != nullptr;}
@@ -368,7 +368,7 @@ class MeshBoundaryValuesDep : public MeshBoundaryValues {
   static constexpr int max_smr_targets_ = 8;
   bool local_smr_remap_ = false;
   bool local_smr_direct_ = false;
-  // General path: buffers and requests of this exchange (static, shear part)
+  // general path: buffers and requests of this exchange (static, shear part)
   DepRemapPlan *plan_ = nullptr;
   int gen_nvar_ = 0;
   DvceArray1D<Real> gsbuf_[2], grbuf_[2];   // device buffers given to MPI (as the base class)
@@ -465,7 +465,7 @@ class ParticlesBoundaryValues {
   DualArray3D<int> sgid_map;           // destination GID:  (side, lx3, lx2)
   DualArray3D<int> srank_map;          // destination rank: (side, lx3, lx2)
   void BuildShearMaps();               // also after every regrid
-  // Dust particles at the physical x3 faces of a 3-D mesh (S3c): 0 periodic,
+  // dust particles at the physical x3 faces of a 3-D mesh: 0 periodic,
   // 1 reflect (mirror position and velocity), 2 outflow (the particle leaves: mass and count added
   // to x3_removed, mass set to 0, parked at rest in its block; DustGasDrag removes it at the start
   // of the next cycle)

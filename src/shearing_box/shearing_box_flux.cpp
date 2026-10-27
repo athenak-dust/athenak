@@ -48,7 +48,7 @@ void ShearingBoxCC::PlanFluxMatch() {
   nfpiece = 0;
   nfrecv = 0;
   if (!flux_on) return;
-  if (face_levels) {PlanFluxPair(); return;}
+  if (face_levels) {PlanFluxPair(); return;}   // levels change along x2: cell pairs
   Mesh *pm = pmy_pack->pmesh;
   auto &indcs = pm->mb_indcs;
   const int nx2 = indcs.nx2, nk = indcs.nx3;
@@ -235,9 +235,8 @@ void ShearingBoxCC::PlanFluxMatch() {
     frreq_ = new MPI_Request[nfreq_];
   }
   for (int n=0; n<nfreq_; ++n) {fsreq_[n] = MPI_REQUEST_NULL; frreq_[n] = MPI_REQUEST_NULL;}
-  // one message per piece here (not per peer): on two GB200 nodes the merged
-  // messages made the band case 6% slower (large messages between nodes); tag (receiver lid,
-  // 40 + its piece number in the receiver's walk), as before S2d
+  // one message per piece here (not per peer): merged messages were slower between GPU
+  // nodes (large messages); tag (receiver lid, 40 + its piece number in the walk)
   fmsg_rank.clear(); fmsg_off.clear(); fmsg_size.clear(); fmsg_send.clear(); fmsg_tag.clear();
   for (int n=0; n<nfpiece; ++n) {
     const auto &p = pcs[n];
@@ -323,7 +322,7 @@ TaskStatus ShearingBoxCC::SendFluxMatch(DvceFaceFld5D<Real> &flx) {
 #if MPI_PARALLEL_ENABLED
   Kokkos::fence();
   bool no_errors = true;
-  for (size_t n=0; n<fmsg_rank.size(); ++n) {   // one message per peer
+  for (size_t n=0; n<fmsg_rank.size(); ++n) {   // one MPI message per list entry
     if (fmsg_send[n] == 0) continue;
     if (MPI_Isend(fsendflat.data() + fmsg_off[n], fmsg_size[n], MPI_ATHENA_REAL, fmsg_rank[n],
                   fmsg_tag[n], comm_sbox, &(fsreq_[n])) != MPI_SUCCESS) {
@@ -446,7 +445,7 @@ TaskStatus ShearingBoxCC::ClearFluxMatch() {
 
 //----------------------------------------------------------------------------------------
 //! \fn void ShearingBoxCC::PlanFluxPair()
-//! \brief Face levels: for every block Y on a face and every block X on the
+//! \brief face levels: for every block Y on a face and every block X on the
 //! opposite face that overlaps it after the shear shift and is authoritative there (finer, or
 //! the same level and on the outer face), a piece: the rows / x3 rows of Y it covers, the
 //! offsets that place X's rows in Y's frame (in X cells: X row jl occupies [jl + base + frac,
@@ -491,7 +490,7 @@ void ShearingBoxCC::PlanFluxPair() {
     const long long spany = static_cast<long long>(nx2)*f2;
     const long long spanz = static_cast<long long>(nx3)*f2;
     int seq = 0;
-    for (long long kz=(zper ? -2 : 0); kz<=(zper ? 2 : 0); ++kz) {   // (S2c) images only in a
+    for (long long kz=(zper ? -2 : 0); kz<=(zper ? 2 : 0); ++kz) {   // images only in a
                                                                       // periodic x3
       const long long bz = zx0 + kz*nzx - zy0;
       if (!(bz < spanz && bz + nx3 > 0)) continue;
@@ -743,7 +742,7 @@ TaskStatus ShearingBoxCC::RecvFluxPair(DvceFaceFld5D<Real> &flx) {
   auto f1 = flx.x1f;
   auto &mbbcs = pmy_pack->pmb->mb_bcs;
   auto qn = qnew;
-  // (Codex Astra review) a cell only partly covered by authoritative partners keeps its own
+  // a cell only partly covered by authoritative partners keeps its own
   // flux on the rest, where it is itself authoritative and sends the integral of its piecewise
   // linear flux (SendFluxPair): keep the same integral, F_own (1 - covered) - slope m1 (m1 = first
   // moment of the covered part), so both sides of every piece agree.  Fully covered cells as before.

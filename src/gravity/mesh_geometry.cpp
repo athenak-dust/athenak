@@ -1315,7 +1315,7 @@ void MeshGeometry::SetPhaseThreads(int threads) {
   if (threads < 0) throw std::invalid_argument("Gravity phase thread count must be nonnegative");
   if (threads == 0) {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
-    // 16 (was 8) so that the prefetched phase assembly of the slowest rank ends
+    // 16 so that the prefetched phase assembly of the slowest rank ends
     // within the step on GB200 (4 ranks x 36 cores); the coefficients do not depend on it
     threads = 16;
 #else

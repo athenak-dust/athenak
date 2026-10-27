@@ -4,7 +4,7 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file shearing_box_pull.cpp
-//! \brief S2b: x1 ghost zones of the shearing box when the blocks on
+//! \brief x1 ghost zones of the shearing box when the blocks on
 //! the x1 faces change level along x2 (ShearingBox::face_levels, on with shear-periodic x1).
 //!
 //! Every block on a shear-periodic x1 face has up to two receivers per face: its x1 ghost
@@ -113,7 +113,7 @@ void ShearingBox::PlanPull() {
     }
     long long kya = FloorDiv(y0 - sy1, ny_l) + 1, kyb = FloorDiv(y1 - 1 - sy0, ny_l);
     long long kza = FloorDiv(z0 - sz1, nz_l) + 1, kzb = FloorDiv(z1 - 1 - sz0, nz_l);
-    // (S2c) non-periodic x3: no images; the x3 ghost rows beyond the boundary are
+    // non-periodic x3: no images; the x3 ghost rows beyond the boundary are
     // left to the physical boundary conditions (they run after this exchange)
     if (!zper) {kza = std::max(kza, 0LL); kzb = std::min(kzb, 0LL);}
     int seq = 0;
@@ -291,7 +291,8 @@ TaskStatus ShearingBoxCC::PullSend(DvceArray5D<Real> &a) {
   auto pb = pbuf;
   auto sf = psendflat;
   const int nymax = npymax, nzmax = npzmax;
-  const bool xslope = pull_ghost_valid;   // the face column's x slope
+  const bool xslope = pull_ghost_valid;   // x slope at the face column only once the x1
+                                          // ghosts hold collected values
   par_for("shr-pull-pack", DevExeSpace(), 0, nppiece-1, 0, nv*ng-1, 0, nzmax-1, 0, nymax-1,
   KOKKOS_LAMBDA(const int n, const int vd, const int zz, const int yy) {
     if (pp.d_view(n,kPSLoc) == 0) return;

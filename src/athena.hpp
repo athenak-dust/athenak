@@ -67,9 +67,7 @@ enum MetricIndex {I00=0, I01=1, I02=2, I03=3, I11=4, I12=5, I13=6, I22=7, I23=8,
 // for dust particles: (IPX1...IPVZ1) store the stage-1 registers of the low-storage RK
 // integrator, (IPRX...IPRZ) the drag rate R_j recorded at each implicit stage, IPTS the
 // stopping time, and IPM the particle mass. PLEV (dust only) is the cloud level of a
-// refinable Lagrangian cloud: its hat cloud has half-width root_dx/2^PLEV. (The six
-// columns IPGXX...IPGZY of the deformable clouds went with <dust>/cloud_deform on
-// 2026-10-20.)
+// refinable Lagrangian cloud: its hat cloud has half-width root_dx/2^PLEV.
 //
 // PTAGH (dust only): the particle identity (tag) of a dust particle is an
 // unsigned 64-bit integer held in two int32 columns, PTAG (bits 0-31) and PTAGH (bits

@@ -95,7 +95,7 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
   // accessing the sendlist member through `this`) leaves a host pointer in a CUDA
   // lambda and fails as soon as an inter-rank particle is appended or packed.
   auto psendl = sendlist.d_view;
-  // (S3c) the physical x3 faces: reflect or outflow (see bvals.hpp)
+  // the physical x3 faces: reflect or outflow (see bvals.hpp)
   const int x3bc = x3bc_dust;
   constexpr int kLobe3Shift = SMRCompositeTransfer::kCloudLobeShift3;   // dust.hpp
   auto x3rem = x3_removed.d_view;
@@ -114,7 +114,7 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
         pr(IPVZ,p) = -pr(IPVZ,p);
         if (has_reg) {
           pr(IPZ1,p) = 2.0*zf - pr(IPZ1,p); pr(IPVZ1,p) = -pr(IPVZ1,p);
-          // (Codex Astra review) a refinable cloud's x3 lobe mirrors too: lobe 1 <-> 2 (bits
+          // a refinable cloud's x3 lobe mirrors too: lobe 1 <-> 2 (bits
           // 9-10 of PLEV, dust::SMRCompositeTransfer::kCloudLobeShift3; 0 and 3 are symmetric;
           // point particles have no lobe bits)
           const int l3 = (pi(PLEV,p) >> kLobe3Shift) & 3;
@@ -192,7 +192,7 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
 
     // only update particle GID if it has crossed MeshBlock boundary
     if ((abs(ix) + abs(iy) + abs(iz)) != 0) {
-      // 2026-10-21: the particle crossed a Mesh boundary when its block offset points out of
+      // The particle crossed a Mesh boundary when its block offset points out of
       // the Mesh (a block on that edge), the same rounding as the destination block above.  A
       // position test (x < xmin) disagrees with it within round-off of the boundary: a particle
       // at y = -1e-18 has iy = 0 (it stays in its row), but crossing in x only it was wrapped to
@@ -367,8 +367,8 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
     }
   });
 #if MPI_PARALLEL_ENABLED
-  // one rank: nothing can leave it, so no count, no copy to the host and no MPI calls (dust
-  // runs: they made an MPI build about 13% slower than a serial one on one GPU)
+  // one rank: nothing can leave it, so no count, no copy to the host and no MPI calls
+  // (they made an MPI build about 13% slower than a serial one on one GPU)
   if (global_variable::nranks == 1) {
     nprtcl_send = 0;
     return TaskStatus::complete;

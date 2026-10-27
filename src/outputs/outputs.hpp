@@ -253,7 +253,7 @@ class BaseTypeOutput {
   // data
   OutputParameters out_params;   // params read from <output> block for this type
   DvceArray5D<Real> derived_var; // array to store output variables computed from u0/b0
-  // A bin output of hydro variables in a dust run also writes
+  // a bin output of hydro variables in a dust run also writes
   // dust_total_rho, dust_total_mom1..3 (dust_total_var, DustGasDrag::DepositScienceFields),
   // unless <outputN>/dust_total = false; auto_dust_note says why a hydro bin output has none
   bool auto_dust_total = false;
@@ -410,8 +410,8 @@ class ParticleVTKOutput : public BaseTypeOutput {
 
 //----------------------------------------------------------------------------------------
 //! \class ParticleBinaryOutput
-//  \brief derived BaseTypeOutput class for the self-describing particle science file (pbin,
-//  readable on its own): typed columns of the active particles and a small block directory,
+//  \brief derived BaseTypeOutput class for the self-describing particle science file
+//  (pbin): typed columns of the active particles and a small block directory,
 //  one shared file per output written in parallel (pbin.cpp)
 
 class ParticleBinaryOutput : public BaseTypeOutput {
@@ -429,8 +429,8 @@ class ParticleBinaryOutput : public BaseTypeOutput {
 
 //----------------------------------------------------------------------------------------
 //! \class ParticleHistoryOutput
-//  \brief derived BaseTypeOutput class for the dust particle history (phst):
-//  one text row of global particle quantities per output time in <basename>.phst
+//  \brief derived BaseTypeOutput class for the dust particle history
+//  (phst): one text row of global particle quantities per output time in <basename>.phst
 
 class ParticleHistoryOutput : public BaseTypeOutput {
  public:

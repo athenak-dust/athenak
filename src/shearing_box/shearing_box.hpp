@@ -69,7 +69,7 @@ class ShearingBox {
   // data buffers for shearing box BCs.  Only two x1-faces get sheared
   // Use separate variables for ix1/ox1 since number of MBs on each face can be different
   ShearingBoxBoundaryBuffer sendbuf[2], recvbuf[2];
-  // (S1') with mesh refinement the same exchange also shifts the x1 ghost
+  // With mesh refinement the same exchange also shifts the x1 ghost
   // zones of the coarse arrays: a fine x1-face block whose partner across the boundary (or a
   // diagonal neighbour there) is coarser gets those ghost cells by prolongation from its coarse
   // array, after the shear exchange; its coarse array must be sheared first
@@ -81,7 +81,7 @@ class ShearingBox {
   MPI_Comm comm_sbox;
 #endif
 
-  // (S2b) face_levels (on with shear-periodic x1): the blocks on the x1
+  // face_levels (on with shear-periodic x1): the blocks on the x1
   // faces may change level along x2.  The x1 ghost zones (and those of the coarse arrays) are
   // then collected by each face block from the opposite face, converted to its level by the
   // senders and remapped by the receiver (ShearingBox::PlanPull, ShearingBoxCC::PullSend/
@@ -91,7 +91,7 @@ class ShearingBox {
   bool report_timing = false;
   double t_plan_pull = 0.0, t_plan_flux = 0.0;
   long n_plan_pull = 0, n_plan_flux = 0;
-  bool pull_ghost_valid = false;   // (S2c) x1 ghosts hold collected values (not after a regrid)
+  bool pull_ghost_valid = false;   // x1 ghosts hold collected values (not after a regrid)
   int nvar_pull = 0;
   ReconstructionMethod rcon_pull = ReconstructionMethod::plm;
   enum PullField {kPRGid, kPRType, kPRFace, kPRIdx, kPSGid, kPSLoc, kPSFace, kPD,
@@ -111,7 +111,7 @@ class ShearingBox {
 #endif
   void PlanPull();              // with the current yshear; posts the receives
   bool WaitPull();
-  // Block-local plans (S2d).  Per regrid, every local block on an x1
+  // Block-local plans.  Per regrid, every local block on an x1
   // face keeps the blocks of the opposite face that overlap it in x3 (with a ghost margin): the
   // only candidates of its shear exchanges, whatever the shift.  Per stage each rank plans only
   // the pieces it sends or receives; the pieces with a remote side go in one message per peer
@@ -133,7 +133,7 @@ class ShearingBox {
   TaskStatus ClearSend();
   // the lists of x1-face MeshBlocks and the MPI requests, again after a regrid
   void BuildBoundaryLists();
-  void CheckSupportedSetup(const bool coarse_bcs) const;   // block widths, periodic x3
+  void CheckSupportedSetup(const bool coarse_bcs) const;   // block widths, x3 boundaries
   // function to find target MB offset by shear.  Returns GID and rank
   void FindTargetMB(const int igid, const int jshift, int &gid, int &rank);
   // function to find index in x1bndry array of MB with input GID
@@ -215,7 +215,7 @@ class ShearingBoxCC : public ShearingBox {
 #if MPI_PARALLEL_ENABLED
   MPI_Request *fsreq_ = nullptr, *frreq_ = nullptr;
   int nfreq_ = 0;
-  std::vector<int> fmsg_rank, fmsg_off, fmsg_size, fmsg_send, fmsg_tag;   // one per message
+  std::vector<int> fmsg_rank, fmsg_off, fmsg_size, fmsg_send, fmsg_tag;   // per message
 #endif
   void PlanFluxMatch();                     // with the current yshear (InitRecv)
   TaskStatus SendFluxMatch(DvceFaceFld5D<Real> &flx);
@@ -241,7 +241,7 @@ class ShearingBoxCC : public ShearingBox {
   void PlanFluxPair();
   TaskStatus SendFluxPair(DvceFaceFld5D<Real> &flx);
   TaskStatus RecvFluxPair(DvceFaceFld5D<Real> &flx);
-  // the collected ghost zones
+  // the collected x1 ghost zones (face_levels)
   TaskStatus PullSend(DvceArray5D<Real> &a);
   TaskStatus PullRecv(DvceArray5D<Real> &a, const bool coarse);
 

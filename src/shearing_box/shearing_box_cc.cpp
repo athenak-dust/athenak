@@ -6,7 +6,7 @@
 //! \file shearing_box_cc.cpp
 //! \brief functions to pack/send and recv/unpack boundary values for cell-centered (CC)
 //! variables with shearing box boundaries.
-//! One implementation (S1') for the MeshBlock arrays and, with mesh
+//! One implementation for the MeshBlock arrays and, with mesh
 //! refinement, the coarse arrays (PackAndSendCoarseCC / RecvAndUnpackCoarseCC).
 
 #include <iostream>
@@ -31,7 +31,7 @@ ShearingBoxCC::ShearingBoxCC(MeshBlockPack *pp, ParameterInput *pin, int nvar) :
     ShearingBox(pp, pin), nvar_(nvar) {
   nvar_pull = nvar;
 #if MPI_PARALLEL_ENABLED
-  MPI_Comm_dup(MPI_COMM_WORLD, &comm_qflx);   // flux pairs
+  MPI_Comm_dup(MPI_COMM_WORLD, &comm_qflx);   // flux matching by cell pairs (face_levels)
 #endif
   AllocateBuffers();
 }
@@ -66,7 +66,7 @@ void ShearingBoxCC::AllocateBuffers() {
 //! Called on the physics_bcs task after purely periodic BC communication is finished.
 
 TaskStatus ShearingBoxCC::PackAndSendCC(DvceArray5D<Real> &a, ReconstructionMethod rcon) {
-  if (face_levels) {rcon_pull = rcon; return PullSend(a);}
+  if (face_levels) {rcon_pull = rcon; return PullSend(a);}   // collected ghost zones
   return PackAndSend(a, rcon, false);
 }
 
@@ -202,7 +202,7 @@ TaskStatus ShearingBoxCC::PackAndSend(DvceArray5D<Real> &a, ReconstructionMethod
 //! PackAndSendCC() function
 
 TaskStatus ShearingBoxCC::RecvAndUnpackCC(DvceArray5D<Real> &a) {
-  if (face_levels) return PullRecv(a, false);
+  if (face_levels) return PullRecv(a, false);     // collected ghost zones
   return RecvAndUnpack(a, false);
 }
 

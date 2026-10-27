@@ -369,7 +369,7 @@ TaskStatus Hydro::SendU_Shr(Driver *pdrive, int stage) {
   if (psbox_u != nullptr) {
     // only execute if (3D OR 2d_r_phi)
     if (pmy_pack->pmesh->three_d || psbox_u->shearing_box_r_phi) {
-      // (S2c) collected ghost zones: the senders' slopes read their x3 ghost rows,
+      // collected ghost zones: the senders' slopes read their x3 ghost rows,
       // which at a physical x3 boundary are otherwise set only after this exchange (one stage
       // old); set them now (the boundary conditions run again after the exchange, as usual)
       if (psbox_u->face_levels &&
@@ -429,7 +429,7 @@ TaskStatus Hydro::ApplyPhysicalBCs(Driver *pdrive, int stage) {
 TaskStatus Hydro::Prolongate(Driver *pdrive, int stage) {
   if (pmy_pack->pmesh->multilevel) {  // only prolongate with SMR/AMR
     pbval_u->FillCoarseInBndryCC(u0, coarse_u0);
-    // Physical boundary values of the coarse arrays.  AthenaK left them
+    // physical boundary values of the coarse arrays.  AthenaK left them
     // unset, and the prolongation next to a physical boundary reads them for its slopes (a
     // finer block beside a coarser one along a physical face, e.g. x3 of a stratified disc)
     Mesh *pm = pmy_pack->pmesh;
@@ -444,7 +444,7 @@ TaskStatus Hydro::Prolongate(Driver *pdrive, int stage) {
       pbval_u->ProlongateCC(w0, coarse_w0);
       pbval_u->PrimToConsFineBndry(w0, u0);
     } else if (pmy_pack->pmesh->pmr->prolong_amp_eps > 0.0) {
-      // amplitude-aware prolongation candidate
+      // amplitude-aware prolongation
       pbval_u->ProlongateCC(u0, coarse_u0, false, pmy_pack->pmesh->pmr->prolong_amp_eps,
                             peos->eos_data.iso_cs);
     } else {
