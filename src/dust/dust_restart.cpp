@@ -27,12 +27,11 @@
 //! cumulative split / merge counters of the history, the state of the hybrid coupling.  The
 //! leaf maps, masks and per-cycle fields are rebuilt as in a fresh run; the merge schedule
 //! and the cycle-mode resampling schedule follow from the cycle number of the file, the
-//! time-mode resampling schedule from the record resample_clk (origin,
-//! interval, next event); a regrid whose resampling has not run yet
-//! from the record regrid_evt.  Records are found by name, so a file written by a code with
-//! more (or fewer) records is still read.  The record species_table (written since
-//! 2026-10-27) holds the resolved species table of the run as ASCII lines
-//! (SpeciesTable::Record); a restart resolves the table of its input again and stops on any
+//! time-mode resampling schedule from the record resample_clk (origin, interval, next
+//! event); a regrid whose resampling has not run yet from the record regrid_evt.  Records
+//! are found by name, so a file written by a code with more (or fewer) records is still
+//! read.  The record species_table holds the resolved species table of the run as ASCII
+//! lines (SpeciesTable::Record); a restart resolves the table of its input again and stops on any
 //! difference (nspecies, kind of abundance, normalization, Omega, and per species tau_s,
 //! stokes, epsilon / Z, ppc, H_p); a file without the record is read with a note.
 //!
@@ -54,7 +53,7 @@
 //! run that does not take its own section back (another rank count or block layout) starts
 //! its new tags at the bound, so that no tag of a deleted particle is issued again.  Version 1
 //! files are still read: the high words are 0 and the counter is the int32 record next_tag;
-//! such a run on other ranks starts again from the largest live tag, as before.
+//! such a run on other ranks starts again from the largest live tag.
 
 #include <algorithm>
 #include <cstdint>
@@ -192,10 +191,10 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   const std::int64_t ev[6] = {amr_event_pending ? 1 : 0, amr_event_nnew, amr_event_ndel,
                               amr_event_regrid, amr_event_handled, amr_event_merged};
   PutRecord(b, "regrid_evt", ev, sizeof(ev));
-  // 2026-10-21 (cloud_event_dt): the first regrid of a pending event (time, cycle)
+  // the first regrid of a pending event (time, cycle), used by cloud_event_dt
   const double et[2] = {amr_event_first_time, static_cast<double>(amr_event_first_ncycle)};
   PutRecord(b, "regrid_evt_t", et, sizeof(et));
-  // (Codex Astra review) the physical-x3 ledger: the run totals of the outflow (the same on
+  // the physical-x3 ledger: the run totals of the outflow (the same on
   // every rank), the particles parked for removal and the dropped deposits (summed over the ranks
   // here, restored on rank 0 only, so a restart on any number of ranks counts them once)
   {

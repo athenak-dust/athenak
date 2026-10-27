@@ -4,7 +4,7 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_cloud3d.cpp
-//! \brief Stage S3b: refinable clouds on a 3-D mesh.  The 2-D paths
+//! \brief Refinable clouds on a 3-D mesh.  The 2-D paths
 //! are not touched; in 3-D these replace them:
 //!  - BuildLeafTraversal3D: the block geometry of LeafTraversal3D (dust_leaf3d.hpp);
 //!  - SplitCloudsP1Device3D: the moving P1 split, the 2-D rules along each of three directions;
@@ -150,12 +150,12 @@ void DustGasDrag::CheckClouds3D() {
   if (cloud_gather_order != 2 || analytic_gather.on) {
     bad.push_back("gather variants (cloud_gather_order != 2, analytic_gather)");
   }
-  // G (stage 2b): the device quantum pass with the pass budget (MergeCloudsDevice3D)
+  // G: the device quantum pass with the pass budget (MergeCloudsDevice3D)
   if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_budget_x ||
                       cloud_merge_xprotect)) {
     bad.push_back("merging other than the device quantum G (no stage-X budget, no X protection)");
   }
-  // R (stage 2c): the device solve (ResampleClouds3D)
+  // R: the device solve (ResampleClouds3D)
   if (cloud_resample && (!cloud_resample_device || cloud_resample_pos_order)) {
     bad.push_back("resampling other than the device solve (no host solve, no position order)");
   }
@@ -166,12 +166,12 @@ void DustGasDrag::CheckClouds3D() {
       pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::reflect &&
       pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::outflow &&
       pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::user) {
-    // (user faces, e.g. the Li et al. 2018 gas boundaries; the clouds only need the
+    // (user faces, e.g. the Li et al. 2018 gas boundaries: the clouds only need the
     // faces to be non-periodic and <dust>/particle_x3_bc)
     bad.push_back("x3 faces other than periodic, reflect, outflow or user");
   }
-  // 2026-10-25 (Codex perf review item 2): the execution-order index (cloud_order_interval) has
-  // 3-D keys; the physical sort (cloud_sort_interval) still has 2-D keys only
+  // the execution-order index (cloud_order_interval) has 3-D keys; the physical sort
+  // (cloud_sort_interval) still has 2-D keys only
   if (cloud_sort_interval > 0) {
     bad.push_back("the particle sort (cloud_sort_interval)");
   }
@@ -195,7 +195,7 @@ void DustGasDrag::CheckClouds3D() {
 //! every block (from the logical locations, as AthenaK computes mb_size), the distinct adjacent
 //! blocks of every block with the periodic shift that places each next to it (from the 56
 //! neighbour slots), the ring its neighbours certainly hold, and the index of logical
-//! locations; several ranks (stage 3): the halo slots and the exchange lists (BuildHalo).
+//! locations; several ranks: the halo slots and the exchange lists (BuildHalo).
 
 void DustGasDrag::BuildLeafTraversal3D() {
   Mesh *pm = pmy_pack->pmesh;
@@ -211,9 +211,9 @@ void DustGasDrag::BuildLeafTraversal3D() {
     std::exit(EXIT_FAILURE);
   }
   const auto &t = smr_transfer;
-  // Physical x3 faces (no periodic image in x3)
+  // physical x3 faces (no periodic image in x3)
   const bool zper = pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic;
-  // block slots (stage 3): the blocks of this rank (slot = gid - gids), then
+  // block slots: the blocks of this rank (slot = gid - gids), then
   // the blocks of other ranks that a cloud of this rank can reach (halo, ascending gid: the
   // neighbours, and every block within the reach of a block of this rank, HaloReach), then all
   // other blocks; with the box of cells of each halo block that the clouds can reach (strips)
@@ -329,7 +329,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
             }
           }
         }
-        // Shear-periodic x1: across an x1 face the reach lands at a y that moves
+        // shear-periodic x1.  Across an x1 face the reach lands at a y that moves
         // with time: every block within the reach of the opposite face whose z range meets the
         // reach, at any y (cells within the reach in x1 and z, every y)
         if (shear3d) {
@@ -651,7 +651,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
     Kokkos::deep_copy(dmom, 0.0);
   }
   BuildHalo(slot_gid);
-  // Shear-periodic x1, the data of the shear neighbours (UpdateShear3D): the finest
+  // shear-periodic x1, the data of the shear neighbours (UpdateShear3D): the finest
   // boxes of all slots, the slots near each x1 face, the reach of each local block (the halo's
   // on several ranks, the level rule on one)
   lt.shear = shear3d;
@@ -706,7 +706,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::WrapParticles3D, ResetBlocks3D
-//! \brief Stage 2a: every position (with its RK register) into the box; then the
+//! \brief Every position (with its RK register) into the box; then the
 //! block of every cloud from its position on the current mesh (LeafOwner on the 3-D leaves) and,
 //! with check, the sum of its weights over the leaves (largest |sum - 1| in dwmax) and the
 //! particle mass.  Returns how many block ids changed; stops on a particle without a block of
@@ -714,7 +714,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::UpdateShear3D
-//! \brief Shear-periodic x1: the shear offset ysh = fmod(q Omega Lx t, Ly) of the
+//! \brief Shear-periodic x1.  The shear offset ysh = fmod(q Omega Lx t, Ly) of the
 //! time t of the positions to be traversed (bvals_part.cpp) and, when it changed, the shear
 //! neighbours of every local block: for each side, the blocks that meet the block translated
 //! across that x1 face ((+Lx, -ysh) across the inner face, (-Lx, +ysh) across the outer one)
@@ -799,7 +799,7 @@ void DustGasDrag::WrapParticles3D() {
   const auto &ms = pmy_pack->pmesh->mesh_size;
   const Real x1a = ms.x1min, x1b = ms.x1max, x2a = ms.x2min, x2b = ms.x2max;
   const Real x3a = ms.x3min, x3b = ms.x3max;
-  // Across a shear-periodic x1 face y moves by n ysh (with its register)
+  // across a shear-periodic x1 face y moves by n ysh (with its register)
   const bool sh = leaf_traversal3d.shear;
   const Real ysh = leaf_traversal3d.ysh, ilx = 1.0/(x1b - x1a);
   const bool zper = pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic;
@@ -861,8 +861,9 @@ int DustGasDrag::ResetBlocks3D(const char *when, const bool check, Real &dwmax, 
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::FrameToBlock3D, CheckHaloReach3D, RouteToOwnerBlocks3D
-//! \brief Stage 3: several ranks, the 2-D multi-rank functions with a third
-//! direction.  FrameToBlock3D: a particle in the periodic image next to the block it keeps
+//! \brief Several ranks: the 2-D functions FrameToBlock, CheckHaloReach and RouteToOwnerBlocks
+//! with a third direction.  FrameToBlock3D: a particle in the periodic image next to the block
+//! it keeps
 //! (positions and RK position registers), so that the particle exchange sees a step of one
 //! block.  CheckHaloReach3D: how far each cloud's support (two half-widths on a lobed side)
 //! extends beyond its block, against the block's allowance; where it exceeds it the block's reach
@@ -876,7 +877,7 @@ void DustGasDrag::FrameToBlock3D(const Real tpos) {
   const int npart = pmy_pack->ppart->nprtcl_thispack;
   if (npart == 0) return;
   const bool frame = global_variable::nranks > 1;
-  // The particle routing (bvals_part.cpp) moves a particle across a shear-periodic x1
+  // the particle routing (bvals_part.cpp) moves a particle across a shear-periodic x1
   // face by ysh at pm->time; positions at tpos != pm->time (after the push) get the difference
   // first, so that the move is the one of their time
   Real dsh = 0.0, ysp = lt.ysh;   // ysp: the shear offset at the time of the positions
@@ -1122,8 +1123,8 @@ int DustGasDrag::SplitCloudsP1Device3D() {
       const int a = k % n1, b = (k/n1) % n2, c = k/n12;
       const int s = (k == 0) ? p : npart + tagoff(p) + k - 1;
       Real cx = x + p1[a].off*e1, cy = y + p2[b].off*e2, cz = z + p3[c].off*e3;
-      // (shear-periodic x1: y moves with an x wrap; a physical x3 face: a piece
-      // beyond it is mirrored back with its x3 lobe swapped)
+      // (shear-periodic x1: y moves with an x wrap; a physical x3 face: a piece beyond it
+      // is mirrored back with its x3 lobe swapped)
       const int zmir = lt.WrapPos(cx, cy, cz);
       if (k > 0) {
         for (int q=0; q<nrdata; ++q) prv(q,s) = prv(q,p);
@@ -1271,7 +1272,7 @@ void DustGasDrag::CloudPredictor3D(const bool rate_dep) {
     CloudParFor("dust_pc2_cloud3d_predictor", npart, body);
   }
   // deposits on halo blocks back to their owners; component 4 (stiffness) only when the automatic
-  // PC2 / split-BE switch reads it (rate_dep, the same on every rank; 2026-10-25, Codex perf review)
+  // PC2 / split-BE switch reads it (rate_dep, the same on every rank)
   HaloReverseAdd(qdep, 1, rate_dep ? 4 : 3);
 }
 
@@ -1294,7 +1295,7 @@ void DustGasDrag::CloudAdvance3D() {
   const bool is_sbox = is_shearing_box, is_strat = is_stratified;
   const Real qshear_ = qshear, omega0_ = omega0;
   auto &dmom_ = dmom;
-  // The gas is sampled in its t^n orbital-advection frame (the remap runs after this
+  // the gas is sampled in its t^n orbital-advection frame (the remap runs after this
   // gather and the impulse deposit), so the shear-periodic images are those of t^n
   UpdateShear3D(pmy_pack->pmesh->time);
   const auto lt = leaf_traversal3d;
@@ -1311,7 +1312,7 @@ void DustGasDrag::CloudAdvance3D() {
     const Real xh = x0 + 0.5*dt*vx0;
     const Real yh = y0 + 0.5*dt*(vy0 - (is_sbox ? qshear_*omega0_*x0 : 0.0));
     const Real zh = z0 + 0.5*dt*vz0;
-    // The gas met at the lab midpoint (xh, yh) sits at yh + q Omega xh dt/2 in the stored
+    // the gas met at the lab midpoint (xh, yh) sits at yh + q Omega xh dt/2 in the stored
     // field (IPY1 keeps the lab midpoint)
     const Real yg = yh + (is_sbox ? qshear_*omega0_*xh*0.5*dt : 0.0);
     Real ugx = 0.0, ugy = 0.0, ugz = 0.0;

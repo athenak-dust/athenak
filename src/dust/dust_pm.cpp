@@ -56,7 +56,7 @@ namespace dust {
 //! \fn DustGasDrag::PackGasGather
 //! \brief The gas velocity of every cell (ghosts included) of a conserved state u into
 //! uvel_pred, then PackGatherField: the gather field of the linear cloud gather from u (the
-//! predictor's old state; also the resampling's current state, which reads it
+//! predictor's old state, or the resampling's current state, which reads it
 //! through the halo like the predictor).
 
 void DustGasDrag::PackGasGather(const DvceArray5D<Real> &u) {
@@ -80,7 +80,7 @@ void DustGasDrag::PackGasGather(const DvceArray5D<Real> &u) {
 }
 
 void DustGasDrag::PackGatherField(const DvceArray5D<Real> &vel) {
-  // Room for the halo slots (their values come from HaloForwardPack)
+  // room for the halo slots (their values come from HaloForwardPack)
   const int nmb = std::max(vel.extent_int(0), leaf_traversal.nfld), nk = vel.extent_int(2);
   const int nj = vel.extent_int(3), ni = vel.extent_int(4);
   if (gpack.extent_int(0) != nmb || gpack.extent_int(1) != nk || gpack.extent_int(2) != nj ||
@@ -104,8 +104,8 @@ void DustGasDrag::PackGatherField(const DvceArray5D<Real> &vel) {
 
 TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
-  // The stiffness deposit qdep[4] feeds the automatic switch's metric and
-  // the stiffness monitor / dt limit / predictor damping
+  // the stiffness deposit qdep[4] feeds the automatic switch's metric and the stiffness
+  // monitor / dt limit / predictor damping
   const bool rate_dep = NeedsHybridMetric() || StiffnessActive();
 
   if (coupling == DustCoupling::hybrid) {
@@ -137,17 +137,16 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       bool linear = (cloud_gather_order == 2);
       int tmode = cloud_transition;
       if (linear) {
-        // Production refinable-cloud predictor: the linear gather and the
-        // cloud-weight deposit.  (The general kernel dust_pc2_cloud_predictor with the
-        // force / deformation variants was removed.)
+        // Production refinable-cloud predictor: the linear gather and the cloud-weight
+        // deposit.
         // The gas velocity of every cell (ghosts included) is formed once; the gather then
         // reads velocities, as the advance does with u*, instead of dividing five momenta
         // by five densities in each of the cloud's cells.
-        if (clouds3d) {CloudPredictor3D(rate_dep); return TaskStatus::complete;}
+        if (clouds3d) {CloudPredictor3D(rate_dep); return TaskStatus::complete;}   // 3-D clouds
         PackGasGather(uold);
         auto gp = gpack;
-        // (a split into gather + deposit kernels and a shared-memory weight
-        // cache were tried and removed, see CloudParFor in dust.hpp)
+        // (a split into gather + deposit kernels and a shared-memory weight cache were
+        // tried and removed, see CloudParFor in dust.hpp)
         auto pred_body = KOKKOS_LAMBDA(const int p) {
           Real xp = pr(IPX,p), yp = pr(IPY,p);
           const int am = lt.Anchor(pi(PGID,p));   // anchor block of the cloud
@@ -204,8 +203,8 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         } else {
           CloudParFor("dust_pc2_cloud_predictor_linear", npart, pred_body);
         }
-        // Deposits on halo blocks back to their owners; component 4 only for the
-        // automatic switch (rate_dep, 2026-10-25, Codex perf review)
+        // deposits on halo blocks back to their owners; component 4 only when the stiffness
+        // rate is deposited (rate_dep)
         HaloReverseAdd(qdep, 1, rate_dep ? 4 : 3);
         return TaskStatus::complete;
       }
@@ -351,7 +350,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
       });
     };
     if (cloud_ord_n > 0 && cloud_ord_n <= npart) {
-      // In the order of the cell-sorted index (a permutation of its slots,
+      // in the order of the cell-sorted index (a permutation of its slots,
       // which the migration of this stage may have refilled)
       CloudParForOrdered("dust_composite_scatter", npart, cloud_ord,
                          cloud_ord_n, scat_body);
@@ -362,7 +361,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
     return TaskStatus::complete;
   }
 
-  const Real sh = ImplicitShearShift(pdrive, stage);   // 0 for the hybrid paths
+  const Real sh = ImplicitShearShift(pdrive, stage);   // t^n gas frame (0 for hybrid paths)
   par_for("dust_scatter",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     int ip, jp, kp;
@@ -462,7 +461,7 @@ void DustGasDrag::UpdateStiffness(const Real dt) {
 //! for the next cycle's hysteretic choice.
 
 void DustGasDrag::UpdateHybridMetric(Driver *pdrive, int stage) {
-  // Only the automatic switch reads the metric; with a fixed mode (coupling = pc2,
+  // only the automatic switch reads the metric; with a fixed mode (coupling = pc2,
   // hybrid_force_mode = pc2 / split_be) the full-mesh reduction and its host wait are skipped
   // and the metric stays "not computed" (hybrid_have_metric = false)
   if (!NeedsHybridMetric()) {InvalidateHybridMetric(); return;}
@@ -638,8 +637,8 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
     int ncells1 = ustar.extent_int(4);
     int ncells2 = ustar.extent_int(3);
     int tmode = cloud_transition;
-    // Refinable clouds (2026-10-17): the gather reads the packed u* field (velocity and
-    // its central differences, the owners' values on halo blocks).
+    // Refinable clouds: the gather reads the packed u* field (velocity and its central
+    // differences, with the owners' values on halo blocks).
     // cloud_gather_order = 2 gathers the linear reconstruction of u* over the cloud, with
     // the lobed weights and point values of transition mode 2, as the PC2 midpoint gather
     // does with its midpoint velocity; order 1 the cell values (piecewise constant).  The
@@ -729,7 +728,7 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
       }
     };
     if (cloud_ord_n > 0 && cloud_ord_n <= npart) {
-      // In the order of the cell-sorted index (a permutation of its slots)
+      // in the order of the cell-sorted index (a permutation of its slots)
       CloudParForOrdered("dust_cloud_gather_kick", npart, cloud_ord,
                          cloud_ord_n, gk_body);
     } else {
@@ -739,7 +738,7 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
     return TaskStatus::complete;
   }
 
-  const Real sh = ImplicitShearShift(pdrive, stage);   // 0 for split-BE
+  const Real sh = ImplicitShearShift(pdrive, stage);   // gas in its t^n frame (0 for split-BE)
   par_for("dust_gather",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     int ip, jp, kp;
@@ -862,7 +861,7 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
   auto &u0 = pmy_pack->phydro->u0;
   auto &dmom_ = dmom;
   Real inv_adt = 1.0/((pdrive->a_impl)*(pmy_pack->pmesh->dt));
-  if (clouds3d && imex_consistent_gas) {
+  if (clouds3d && imex_consistent_gas) {   // consistent gas / dust split of the residual
     CloudImplicitConsistency3D(pdrive, stage);
     return TaskStatus::complete;
   }

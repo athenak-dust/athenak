@@ -4,7 +4,7 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_amr.cpp
-//! \brief Dynamic mesh for the dust (stage A: the particles are kept as
+//! \brief Dynamic mesh for the dust (the particles are kept as
 //! they are, only the mesh changes).
 //!
 //! AthenaK regrids at the end of a cycle, after every stage, the time increment and the
@@ -30,8 +30,8 @@
 //! DensityRefinement() is the minimal dust-density request: at the
 //! check (end of the cycle, after the outputs, before the regrid) the dust mass of the
 //! particles at their new positions is deposited on the current leaves with the exact cloud
-//! integrals (the transfer of the coupling and of the field outputs).  As the AthenaK
-//! criteria, a block is judged on the maximum of
+//! integrals (the transfer of the coupling and of the field outputs).  Like the AthenaK
+//! refinement criteria, a block is judged on the maximum of
 //! rho_d / mean over its own leaf cells, widened by amr_rho_buffer cells of its own level
 //! (periodic; the cells of neighbouring blocks, from the halo on several ranks).  A block whose value
 //! reaches amr_rho_refine is flagged for
@@ -40,8 +40,8 @@
 //! The sibling, 2:1 and refinement_interval rules of MeshRefinement apply as usual.  Each
 //! check decides the refinement flags.
 //!
-//! For the comparison with the old transfer, the old owner_overlap
-//! transfer also runs on the dynamic mesh, one rank.  Point particles, TSC on the block that
+//! The old owner_overlap transfer (kept for comparison) also runs on the dynamic mesh, one
+//! rank.  Point particles, TSC on the block that
 //! holds them, ghost deposits added by volume to the leaves they overlap (the remap of
 //! MeshBoundaryValuesDep, rebuilt after every regrid); after a regrid the block of every
 //! particle is set from its position (BuildOwnerOverlapMesh, ResetPGIDOwnerOverlap).  The
@@ -87,12 +87,12 @@ std::vector<SchedPatch> sched_;
 // the dust-density request (SetupDensityTrigger)
 struct DensityTrigger {
   Real rho_refine = 0.0, rho_derefine = 0.0;   // in units of the mean dust density (or code units)
-  // <dust>/amr_rho_units = mean (default, the 2-D BA trigger:
+  // <dust>/amr_rho_units = mean (default, the 2-D trigger:
   // rho_d over the box mean), code, or roche (thresholds in 9 Omega^2/(4 pi G)).
   // Roche thresholds are converted once to code density; the traversal is shared.
   bool code_units = false;
   int buffer = 0;                               // cells of the block's level
-  // The thresholds grow by level_factor per level (amr_rho_level_factor): a
+  // the thresholds grow by level_factor per level (amr_rho_level_factor): a
   // block of level l is refined at rho_refine f^l and derefined below rho_derefine f^(l - 1); 4 is
   // a fixed dust mass per cell (2-D, the old amr_rho_level_scaling = mass), 1 the same thresholds
   // on every level
@@ -110,14 +110,14 @@ struct DensityTrigger {
     if (refine_levels.empty()) return rho_derefine*std::pow(level_factor, l - 1);
     return rho_derefine/rho_refine*refine_levels[std::max(0, l - 1)];
   }
-  // The block values on the device (default) or on the host
+  // the block values on the device (default) or on the host
   bool device = true;
-  // <dust>/amr_shear_face_limit = on (the default: the 2:1 rule of
+  // <dust>/amr_shear_face_limit = on (default: the 2:1 rule of
   // all other neighbours, within what the face exchange can fill) | off (ShearFaceLevelLimit).
   bool shear_face_limit = true;
 };
 DensityTrigger trig_;
-// Per-block audit of the trigger
+// per-block audit of the trigger
 
 // Order-independent 64-bit sum over the particles of a hash of every real column and of every
 // integer column except PGID: equal before and after a regrid exactly when no particle was
@@ -140,7 +140,7 @@ unsigned long long ParticleChecksum(particles::Particles *ppar) {
     }
     for (int q=0; q<nidata; ++q) {
       if (q == PGID) continue;
-      // The high tag word only when it is not 0, so that the sum of a run with tags
+      // the high tag word only when it is not 0, so that the sum of a run with tags
       // below 2^32 is the one of the int32 tags before (any change of the word still shows)
       if (q == PTAGH && pi(q,p) == 0) continue;
       h = (h ^ static_cast<unsigned long long>(static_cast<unsigned int>(pi(q,p))))*1099511628211ULL;
@@ -251,9 +251,9 @@ void SetupDensityTrigger(ParameterInput *pin) {
     }
   }
   {
-    // The thresholds grow by amr_rho_level_factor per level (1:
+    // the thresholds grow by amr_rho_level_factor per level (1:
     // the same on every level; 4: a fixed dust mass per cell in 2-D; 2 follows the growth of the
-    // peak density with resolution in the 2048^2 run)
+    // peak density with resolution in a 2048^2 test)
     trig_.level_factor = pin->GetOrAddReal("dust", "amr_rho_level_factor", 1.0);
     if (!(trig_.level_factor >= 1.0)) fatal("<dust>/amr_rho_level_factor must be >= 1");
     if (pin->DoesParameterExist("dust", "amr_rho_refine_levels")) {
@@ -278,7 +278,7 @@ void SetupDensityTrigger(ParameterInput *pin) {
   }
   trig_.device = pin->GetOrAddBoolean("dust", "amr_rho_device", true);
   {
-    // Rixin: default on (the shear-periodic x1 faces follow the 2:1 rule of all other
+    // default on (the shear-periodic x1 faces follow the 2:1 rule of all other
     // neighbours, within what the face exchange can fill); auto = only the exchange's limit
     const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
     if (sfl == "on") trig_.shear_face_limit = true;
@@ -307,11 +307,11 @@ void SetupDensityTrigger(ParameterInput *pin) {
 
 //----------------------------------------------------------------------------------------
 //! \fn dust::DensityRefinement3D
-//! \brief Stage 2a: the density trigger with 3-D refinable clouds.  The dust density on
+//! \brief The density trigger with 3-D refinable clouds.  The dust density on
 //! the leaves (DepositCloudDensity3D); per block the largest rho_d/mean over the leaf cells that
 //! overlap the block widened by amr_rho_buffer cells of its level (the slots with leaf fields,
 //! every periodic image; the widened box must be covered); the thresholds and the log line as
-//! in 2-D.  Several ranks (stage 3): the halo slots, each with the cells it receives.
+//! in 2-D.  Several ranks: the halo slots, each with the cells it receives.
 
 //----------------------------------------------------------------------------------------
 //! \fn ShearFaceLevelLimit
@@ -497,7 +497,7 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
 void DensityRefinement3D(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
   DustGasDrag *pd = pmbp->pdust;
-  // several ranks (stage 3): the deposit traverses the supports, so the reach of the
+  // several ranks: the deposit traverses the supports, so the reach of the
   // halo is checked first; the deposit adds the halo parts to their owners, and with a buffer the
   // owners' sums go back to the halo slots
   pd->CheckHaloReach("density trigger");
@@ -757,15 +757,15 @@ void DensityRefinement3DPoint(MeshBlockPack *pmbp) {
 void DensityRefinement(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
   DustGasDrag *pdust = pmbp->pdust;
-  // 3-D point particles here; 3-D refinable clouds below
+  // 3-D point particles; 3-D refinable clouds below
   if (pm->three_d && !(pdust != nullptr && pdust->Clouds3D())) {
     DensityRefinement3DPoint(pmbp);
     return;
   }
-  double dummy_t = 0.0; long long dummy_c = 0;   // for the profile timer
+  double dummy_t = 0.0; long long dummy_c = 0;   // profile timer
   ProfTimer prof_timer(pdust ? pdust->prof_time[DustGasDrag::kProfTrigger] : dummy_t,
                        pdust ? pdust->prof_count[DustGasDrag::kProfTrigger] : dummy_c);
-  // The old owner_overlap transfer has its own deposit (TSC on the owner blocks, the
+  // the old owner_overlap transfer has its own deposit (TSC on the owner blocks, the
   // ghost parts added to the leaves they overlap); the block values below are the same
   const bool oo = (pdust != nullptr) &&
                   pdust->smr_transfer_mode == DustSMRTransfer::owner_overlap;
@@ -779,12 +779,12 @@ void DensityRefinement(MeshBlockPack *pmbp) {
               << "amr_density_trigger needs 2-D refinable-cloud or owner_overlap dust" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // several ranks (Codex review): the deposit below traverses the supports, so
+  // several ranks: the deposit below traverses the supports, so
   // the reach of the halo is checked first, before the leaf traversal is copied: after the
   // push (particles moved and may have changed owner) and after a restart whose pending mesh
   // check runs before any cycle
   pdust->CheckHaloReach("density trigger");
-  // Fenced sub-phases (deposit with the halo sums and totals, copy to the host, the
+  // fenced sub-phases (deposit with the halo sums and totals, copy to the host, the
   // per-block decisions on the host)
   using PClock = std::chrono::steady_clock;
   if (ProfOn()) Kokkos::fence();
@@ -859,7 +859,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   }
 #endif
   lap(DustGasDrag::kProfTrigDeposit);
-  // On the device the field stays there (the host copy only for the host path and
+  // on the device the field stays there (the host copy only for the host path and
   // the comparison)
   const bool dev_blocks = trig_.device;
   const bool host_f = !dev_blocks;
@@ -933,7 +933,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       r[0] = rc[0]; r[1] = rc[1]; r[2] = rc[2]; r[3] = rc[3];
     }
   };
-  // The slots binned by the root cells their received cells touch (generous ranges,
+  // the slots binned by the root cells their received cells touch (generous ranges,
   // wrapped), so that a block looks only at the slots near its widened box instead of all of
   // them (blocks x slots x 9 images was most of the trigger's time); every slot that overlaps the
   // widened box through some periodic image is in one of the bins the box touches
@@ -1028,7 +1028,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     }
     return q;
   };
-  // The block values on the device: one thread per (block, slot) pair, the same
+  // the block values on the device: one thread per (block, slot) pair, the same
   // tests and cells as BlockValue; per block the largest value (atomic max), the covered area and
   // the non-finite cells, then only these three numbers per block go to the host
   decltype(Kokkos::create_mirror_view(DvceArray1D<Real>())) qd_h, ad_h;
@@ -1058,7 +1058,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     auto box = lt.box;
     auto mbsz = mbsize;
     const int bb = trig_.buffer;
-    // (block, slot) as a 2-D range: nmb*nslot overflows an int on large meshes (Codex review)
+    // (block, slot) as a 2-D range: nmb*nslot overflows an int on large meshes
     Kokkos::parallel_for("amr_rho_blocks",
     Kokkos::MDRangePolicy<DevExeSpace, Kokkos::Rank<2>>({0, 0}, {nmb, nslot}),
     KOKKOS_LAMBDA(const int m, const int s) {
@@ -1143,9 +1143,9 @@ void DensityRefinement(MeshBlockPack *pmbp) {
 //! first time step.  Restores the cooldown age of every block and, when the file was written
 //! among the outputs of a cycle, carries out the mesh check that followed those outputs in
 //! the run that wrote it.  A file without the record (older code) keeps the old behaviour:
-//! ages start at zero and no check is repeated.  First, on any mesh, the
-//! MeshBlock id of every refinable cloud is set from its position (files written before the
-//! routing fix 9807158d can name a wrong block; the composite weights never read it).
+//! ages start at zero and no check is repeated.  First, on any mesh, the MeshBlock id of
+//! every refinable cloud is set from its position (files written by older versions can name
+//! a wrong block; the composite weights never read it).
 
 void DustGasDrag::ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin) {
   Mesh *pm = pmy_pack->pmesh;
@@ -1180,7 +1180,7 @@ void DustGasDrag::ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin) {
 //! it; stops if a position has no owning block of this pack.
 
 int DustGasDrag::ResetPGIDFromPositions(const char *when) {
-  if (global_variable::nranks > 1) return RouteToOwnerBlocks(when);
+  if (global_variable::nranks > 1) return RouteToOwnerBlocks(when);   // several ranks
   if (clouds3d) {   // the 3-D leaves
     Real dw = 0.0;
     double ms = 0.0;
@@ -1236,7 +1236,7 @@ int DustGasDrag::ResetPGIDFromPositions(const char *when) {
 //! rank's particles changed.
 
 int DustGasDrag::RouteToOwnerBlocks(const char *when) {
-  if (clouds3d) return RouteToOwnerBlocks3D(when);
+  if (clouds3d) return RouteToOwnerBlocks3D(when);   // 3-D refinable clouds
   particles::Particles *ppar = pmy_pack->ppart;
   auto *pb = ppar->pbval_part;
   const int npart = ppar->nprtcl_thispack;
@@ -1401,7 +1401,7 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
   amr_npart_before = pmy_pack->ppart->nprtcl_thispack;
   amr_regrid_nnew = nnew;
   amr_regrid_ndel = ndel;
-  // Positions into the box before the checksum (the rebuild sets the blocks from
+  // positions into the box before the checksum (the rebuild sets the blocks from
   // the wrapped positions and must find the same particles)
   if (clouds3d) {   // the third direction too
     WrapParticles3D();
@@ -1448,7 +1448,7 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
 //! regrid (several ranks, <dust>/load_balance_cloud_weight > 0): the cost of every new block,
 //! 1 + w * clouds / mean, with the clouds of the old blocks (BeforeRegrid): an unchanged block
 //! keeps its count, a refined block gives each child 1/2^d of its clouds times the 3^d children
-//! of the split of refinable clouds (since 2026-10-25; 1/2^d for point particles), a derefined
+//! of the split of refinable clouds (1/2^d for point particles), a derefined
 //! parent takes the sum of its children.  The old mesh (lloc_eachmb) is still in place when it is called.
 
 void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_lloc,
@@ -1490,7 +1490,7 @@ void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_ll
   }
   if (lb_cloud_weight <= 0.0 || lb_old_counts.empty()) return;
   const int nleaf = pm->three_d ? 8 : (pm->two_d ? 4 : 2);
-  // Rixin: refinable clouds split right after the regrid
+  // refinable clouds split right after the regrid
   // into 3 children per direction (P1 split: 27 in 3-D, 9 in 2-D), so a refined block gets
   // 3^d / 2^d of its parent's clouds, not 1 / 2^d (other transfer modes keep the particles)
   const double nsplit = (smr_transfer_mode == DustSMRTransfer::refinable_cloud) ?
@@ -1554,7 +1554,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       Kokkos::Sum<double>(msum));
     }
   } else if (oo) {
-    // The old owner_overlap path: point particles, nothing to split or merge; the boxes,
+    // the old owner_overlap path: point particles, nothing to split or merge; the boxes,
     // the block table, the deposit remaps and the block of every particle on the new mesh
     BuildOwnerOverlapMesh(true);
     ResetPGIDOwnerOverlap(nullptr);
@@ -1572,16 +1572,16 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     psbox_us->BuildBoundaryLists();
     psbox_us->AllocateBuffers();
   }
-  // Shear-periodic x1: the particle routing across the radial faces on the new mesh
+  // shear-periodic x1: the particle routing across the radial faces on the new mesh
   if (ppar->pbval_part->shear_periodic_x1) ppar->pbval_part->BuildShearMaps();
-  // Several ranks: the particles follow their blocks to the ranks that hold
+  // several ranks: the particles follow their blocks to the ranks that hold
   // them on the new mesh (load balancing may move blocks anywhere)
   if (global_variable::nranks > 1) {
     RouteToOwnerBlocks("regrid");
     CheckHaloReach("regrid");   // clouds one level behind the new mesh
   }
   npart = ppar->nprtcl_thispack;
-  // Every regrid is an event, handled at the start of the next cycle after
+  // every regrid is an event, handled at the start of the next cycle after
   // its split (HandleRegridEvent); refine / derefine from the blocks actually created and
   // deleted, not from the net change of the block count.  A regrid that deleted blocks also
   // starts a burst of merge passes.  Two regrids before one handling (possible
@@ -1691,7 +1691,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       if (mblev.h_view(m) > pmesh->root_level) ++nlev1;
     }
   }
-  // several ranks (Codex review): the log holds totals over the ranks (sums;
+  // several ranks: the log holds totals over the ranks (sums;
   // the largest weight error; the smallest particle step)
   int nblk = nmb;
   long long nprt = npart;
@@ -1803,7 +1803,7 @@ int DustGasDrag::ResetPGIDOwnerOverlap(const char *when) {
   if (npart > 0) {
     Kokkos::parallel_reduce("dust_oo_pgid", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
-      // the image of the position itself (Codex review): a point in the box is never
+      // the image of the position itself: a point in the box is never
       // wrapped (x - x1min can round to lx at the upper face, which a wrap would send to the other
       // side of the box); the rounded table index is clamped instead, so the block is the one
       // next to the point.  A point more than a table cell outside the box is an error.
