@@ -41,6 +41,7 @@
 
 #include "athena.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "globals.hpp"
 #include "gravity/self_gravity.hpp"
 #include "hydro/hydro.hpp"
@@ -257,6 +258,7 @@ void Final(ParameterInput *, Mesh *pm) {Observe(pm);}
 }  // namespace
 
 void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
+  dust::RequireLegacySpeciesInit(pin, "dust_freefall");
   auto *pack = pmy_mesh_->pmb_pack;
   if (pack->pdust == nullptr || pack->ppart == nullptr || pack->pgrav == nullptr ||
       !pmy_mesh_->three_d || !pack->pdust->Clouds3D() || pack->pdust->nspecies != 1) {

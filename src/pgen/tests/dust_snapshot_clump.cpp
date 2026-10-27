@@ -31,6 +31,7 @@
 
 #include "athena.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "globals.hpp"
 #include "hydro/hydro.hpp"
 #include "mesh/mesh.hpp"
@@ -226,6 +227,7 @@ Real MapCoordinate(float source, Real source_min, Real source_max,
 //! \brief Initialize a controllable dust benchmark from a particle-snapshot template.
 
 void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
+  dust::RequireLegacySpeciesInit(pin, "dust_snapshot_clump");  // legacy species keys only
   user_hist_func = DustSnapshotClumpHistory;
   if (restart) return;
 

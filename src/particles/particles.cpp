@@ -16,6 +16,7 @@
 #include "mesh/mesh.hpp"
 #include "bvals/bvals.hpp"
 #include "particles.hpp"
+#include "dust/dust_species.hpp"
 
 namespace particles {
 //----------------------------------------------------------------------------------------
@@ -31,8 +32,10 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
   }
 
   // read number of particles per cell, and calculate number of particles this pack
-  // Dust API: dust use of <particles>/ppc is to be deprecated after
-  // <dust>/ppc_N is implemented. Other particle types retain this generic input.
+  // Dust API: with <dust>/ppc_N the resolved species table (parsed here, before
+  // the allocation) sets <particles>/ppc to their sum; the dust use of <particles>/ppc alone is
+  // the legacy input (to be deprecated).  Other particle types retain this generic input.
+  if (pin->DoesBlockExist("dust")) (void) dust::Species(pin);
   Real ppc = pin->GetOrAddReal("particles","ppc",1.0);
 
   // compute number of particles as real number, since ppc can be < 1

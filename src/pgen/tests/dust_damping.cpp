@@ -36,6 +36,7 @@
 #include "hydro/hydro.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "outputs/outputs.hpp"
 
 #include <Kokkos_Random.hpp>
@@ -140,10 +141,19 @@ void ProblemGenerator::DustDamping(ParameterInput *pin, const bool restart) {
               << "nspecies=1, and ppc*ncells = lat_nx1*lat_nx2*lat_nx3" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (lattice && ((npart_permb != ppc_int*ncells) || (ppc_int % nspec_ != 0))) {
+  // the new species keys: ppc_N per cell (the sum is <particles>/ppc), the
+  // species of a cell's slot from the resolved table (interleaved for equal ppc_N, else blocks)
+  const dust::SpeciesTable &spt = dust::Species(pin);
+  if (spt.new_init && spt.abundance != "epsilon") {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "the damping test needs epsilon_N (Z_N belongs to stratified set-ups)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (lattice && ((npart_permb != ppc_int*ncells) ||
+                  (spt.new_init ? (ppc_int != spt.ppc_total) : (ppc_int % nspec_ != 0)))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "lattice placement requires <particles>/ppc to be an "
-              << "integer multiple of <dust>/nspecies" << std::endl;
+              << "integer multiple of <dust>/nspecies (new keys: the sum of ppc_N)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2, lnx3 = indcs.nx3;
@@ -207,16 +217,30 @@ void ProblemGenerator::DustDamping(ParameterInput *pin, const bool restart) {
     spdat.h_view(s,0) = vdh[s];
     Real eps_s = has_eps ? pin->GetReal("problem","eps_" + std::to_string(s+1)) : 0.0;
     spdat.h_view(s,1) = eps_s*rho0*static_cast<Real>(nspec)/ppc;
+    // new keys: equal ppc_N keep the legacy expression (bitwise equal to <problem>/eps_N)
+    if (spt.new_init) {
+      eps_s = spt.value[s];
+      spdat.h_view(s,1) = spt.equal_ppc ? eps_s*rho0*static_cast<Real>(nspec)/ppc :
+          ((spt.ppc[s] > 0) ? eps_s*rho0/static_cast<Real>(spt.ppc[s]) : 0.0);
+    }
   }
+  if (spt.new_init) {has_eps = true;}
   spdat.template modify<HostMemSpace>();
   spdat.template sync<DevExeSpace>();
   auto &taus_ = pmbp->pdust->taus;
+  const bool nkeys = spt.new_init;
+  const int ptot = nkeys ? spt.ppc_total : 1;
+  DualArray1D<int> slot("dustdamp_slot", ptot);
+  for (int k=0; k<ptot; ++k) {int sp = 0, kk = 0; if (nkeys) spt.SlotSpecies(k, sp, kk); slot.h_view(k) = sp;}
+  slot.template modify<HostMemSpace>();
+  slot.template sync<DevExeSpace>();
+  auto slotd = slot.d_view;
   par_for("dustdamp_part_vel", DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = p/npart_permb;
     if (m > (nmb-1)) {m = nmb-1;}
     if (lattice) {
       int q = p - m*npart_permb;
-      int s = (q % ppc_int) % nspec;
+      int s = nkeys ? slotd(q % ppc_int) : (q % ppc_int) % nspec;
       pi(PSP,p) = s;
       pr(IPTS,p) = taus_.d_view(s);
     }

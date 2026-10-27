@@ -310,6 +310,21 @@ class PbinSnapshot:
         """Rows of one species (0-based species_id = input index - 1)."""
         return self.select(self.species == species_id)
 
+    def species_table(self):
+        """The resolved species table of the [species] section: one dict per
+        species_id with input_index, tau_s and, as the run defines them, stokes, epsilon or Z,
+        ppc and H_p (numbers)."""
+        sec = self.header.get("species", {})
+        out = []
+        for s in range(int(sec.get("nspecies", 0))):
+            row = {"species_id": s}
+            for item in sec.get(f"species.{s}", "").split(","):
+                k, _, v = item.strip().partition(" ")
+                if k:
+                    row[k] = int(v) if k in ("input_index", "ppc") else float(v)
+            out.append(row)
+        return out
+
     # ---- MeshBlocks
     def topology_hash(self):
         b = self.blocks
