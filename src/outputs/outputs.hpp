@@ -224,6 +224,12 @@ class BaseTypeOutput {
   // data
   OutputParameters out_params;   // params read from <output> block for this type
   DvceArray5D<Real> derived_var; // array to store output variables computed from u0/b0
+  // A bin output of hydro variables in a dust run also writes
+  // dust_total_rho, dust_total_mom1..3 (dust_total_var, DustGasDrag::DepositScienceFields),
+  // unless <outputN>/dust_total = false; auto_dust_note says why a hydro bin output has none
+  bool auto_dust_total = false;
+  std::string auto_dust_note;
+  DvceArray5D<Real> dust_total_var;
 
   // function which computes derived output variables like vorticity and current density
   void ComputeDerivedVariable(std::string name, Mesh *pm);

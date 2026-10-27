@@ -29,6 +29,7 @@
 #include "z4c/z4c.hpp"
 #include "srcterms/srcterms.hpp"
 #include "srcterms/turb_driver.hpp"
+#include "dust/dust.hpp"
 #include "outputs.hpp"
 
 #if MPI_PARALLEL_ENABLED
@@ -752,6 +753,29 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     outvars.emplace_back("dustd",0,&(derived_var));
   }
 
+  // With dust, every bin output of hydro variables carries the
+  // dust mass and momentum densities too (dust_total_var; not with ghost zones); opt out per
+  // block with dust_total = false.  The key is read only when given, so a restart file whose
+  // output blocks lack it (older files included) gets the default.
+  if (out_params.file_type.compare("bin") == 0 && pm->pmb_pack->pdust != nullptr &&
+      out_params.variable.compare(0, 6, "hydro_") == 0) {
+    bool want = true;
+    if (pin->DoesParameterExist(out_params.block_name, "dust_total")) {
+      want = pin->GetBoolean(out_params.block_name, "dust_total");
+    }
+    if (!want) {
+      auto_dust_note = "dust_total = false";
+    } else if (out_params.include_gzs) {
+      auto_dust_note = "ghost_zones = true";
+    } else {
+      auto_dust_total = true;
+      outvars.emplace_back("dust_total_rho",0,&(dust_total_var));
+      outvars.emplace_back("dust_total_mom1",1,&(dust_total_var));
+      outvars.emplace_back("dust_total_mom2",2,&(dust_total_var));
+      outvars.emplace_back("dust_total_mom3",3,&(dust_total_var));
+    }
+  }
+
   // dust mass and momentum densities on the active cells with the run's
   // representation (DustGasDrag::DepositScienceFields): derived_var(m, 0..3)
   if (out_params.variable.compare("dust_total") == 0 ||
@@ -883,6 +907,10 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
   // Calculate derived variables, if required
   if (out_params.contains_derived) {
     ComputeDerivedVariable(out_params.variable, pm);
+  }
+  // the dust fields appended to a bin output of hydro variables
+  if (auto_dust_total) {
+    pm->pmb_pack->pdust->DepositScienceFields(dust_total_var);
   }
 
   // Now copy data to host (outarray) over all variables and MeshBlocks

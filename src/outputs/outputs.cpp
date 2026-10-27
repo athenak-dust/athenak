@@ -39,6 +39,7 @@
 //! comment text: 'NEW_OUTPUT_TYPES'.
 //========================================================================================
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>    // strcmp
@@ -46,8 +47,10 @@
 #include <iostream>
 #include <sstream>
 #include <string>   // std::string, to_string()
+#include <vector>
 
 #include "athena.hpp"
+#include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
 #include "outputs.hpp"
@@ -322,6 +325,28 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
             << "' in output block '" << opar.block_name << "'" << std::endl;
         exit(EXIT_FAILURE);
       }
+    }
+  }
+
+  // say once which bin outputs carry the dust fields
+  if (pm->pmb_pack->pdust != nullptr && global_variable::my_rank == 0) {
+    std::vector<BaseTypeOutput*> list(pout_list);   // in the order of the block numbers
+    std::stable_sort(list.begin(), list.end(), [](BaseTypeOutput *a, BaseTypeOutput *b) {
+      return a->out_params.block_number < b->out_params.block_number;
+    });
+    std::string with, without;
+    for (BaseTypeOutput *p : list) {
+      if (p->auto_dust_total) {
+        with += " " + p->out_params.block_name + " (" + p->out_params.variable + ")";
+      } else if (!p->auto_dust_note.empty()) {
+        without += " " + p->out_params.block_name + " (" + p->auto_dust_note + ")";
+      }
+    }
+    if (!with.empty() || !without.empty()) {
+      std::cout << "# dust_total_rho, dust_total_mom1..3 added to the bin outputs:"
+                << (with.empty() ? " none" : with)
+                << (without.empty() ? "" : "; not to:" + without)
+                << " (opt out per block: dust_total = false)" << std::endl;
     }
   }
 
