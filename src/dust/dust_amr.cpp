@@ -100,10 +100,10 @@ struct DensityTrigger {
   // With map = block, the block values on the device (default) or on the host; check:
   // both, every value compared (diagnostic)
   bool device = true, device_check = false;
-  // <dust>/amr_shear_face_limit = auto (the levels across the shear-periodic x1
-  // faces within what the face exchange can fill, only when some level could exceed it), on (also
-  // the 2:1 rule of all other neighbours), off (ShearFaceLevelLimit)
-  int shear_face_limit = 0;   // 0 auto, 1 on, -1 off
+  // <dust>/amr_shear_face_limit = on (the default: the 2:1 rule
+  // of all other neighbours, and within what the face exchange can fill), auto (only the exchange's
+  // limit, and only when some level could exceed it), off (ShearFaceLevelLimit)
+  int shear_face_limit = 1;   // 0 auto, 1 on (default since 2026-10-27), -1 off
   // <dust>/amr_shear_face_dmax >= 0 caps the exchange's dmax (a 16^3 run that will be
   // converted to 8x16x8 blocks: 1); -1 = from the block shape
   int shear_face_dmax = -1;
@@ -269,7 +269,9 @@ void SetupDensityTrigger(ParameterInput *pin) {
   trig_.device = pin->GetOrAddBoolean("dust", "amr_rho_device", true);
   trig_.device_check = pin->GetOrAddBoolean("dust", "amr_rho_device_check", false);
   {
-    const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "auto");
+    // Rixin: default on (the shear-periodic x1 faces follow the 2:1 rule of all other
+    // neighbours, within what the face exchange can fill); auto = only the exchange's limit
+    const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
     if (sfl == "auto") trig_.shear_face_limit = 0;
     else if (sfl == "on") trig_.shear_face_limit = 1;
     else if (sfl == "off") trig_.shear_face_limit = -1;
