@@ -79,7 +79,7 @@ int ba_snapshot_number_ = 0;
 ParameterInput *ba_pin_ = nullptr;
 bool ba_ppdf_resume_ = false;
 Real ba_snapshot_dt_ = 40.0;
-// 2026-10-21: the schedule index of the next snapshot / field frame (due at dt*index), equal to
+// the schedule index of the next snapshot / field frame (due at dt*index), equal to
 // the file number unless a restart changed the interval (ScheduleIndex)
 int ba_snapshot_k_ = 0, ba_field_k_ = 0;
 std::string ba_snapshot_basename_;
@@ -245,7 +245,7 @@ void FinishBAParticlePDF(Mesh *pm, const std::vector<std::vector<double>> &grid,
       rmax[e] = std::max(rmax[e], r[e]);
     }
   }
-  // several ranks (2026-10-17, U2048): every rank evaluates its particles on the global grids;
+  // several ranks: every rank evaluates its particles on the global grids;
   // the sums go to rank 0, which writes the record
   long long ntot = npart;
 #if MPI_PARALLEL_ENABLED
@@ -336,7 +336,7 @@ void WriteBAParticlePDF(Mesh *pm, const FieldHost &fh, const PrtclHost &prh, con
     nlev = std::max(nlev, blev[m]);
   }
 #if MPI_PARALLEL_ENABLED
-  // several ranks (refinable clouds, 2026-10-21): the grids of the whole mesh, from all ranks
+  // several ranks (refinable clouds): the grids of the whole mesh, from all ranks
   if (global_variable::nranks > 1)
     MPI_Allreduce(MPI_IN_PLACE, &nlev, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 #endif
@@ -399,7 +399,7 @@ void WriteBAParticlePDF(Mesh *pm, const FieldHost &fh, const PrtclHost &prh, con
   FinishBAParticlePDF(pm, grid, lmap, nlev, ref, nr1, nr2, prh, npart, mtot);
 }
 
-// Several ranks (2026-10-17, U2048): the field snapshot of a uniform mesh with the canonical
+// Several ranks: the field snapshot of a uniform mesh with the canonical
 // TSC deposit.  Every rank deposits its particles on the global periodic grid; the sums are
 // reduced (mass and momentum to all ranks for the second pass, the central moments and the gas
 // to rank 0), and rank 0 writes the cells in row order (x fastest) with that geometry, in the
@@ -535,7 +535,7 @@ void WriteBAFieldsGlobal(Mesh *pm) {
   char line[160];
   // the geometry (row order) with the first frame of this process: after a restart it is written
   // again, numbered with that frame, since the earlier frames may come from the block writer (one
-  // rank, block order) or from another directory (Codex review)
+  // rank, block order) or from another directory
   const int mesh_seq = pm->GetAMRLoadBalanceUpdateSeq();
   if (!ba_geom_written_ || mesh_seq != ba_geom_seq_) {
     std::vector<double> geom;
@@ -600,7 +600,7 @@ void GatherToRoot(std::vector<T> &v, MPI_Datatype type) {
 // instead of a cancellation residue).  The deposit is the exact one the run uses: the
 // composite-transfer cloud weights, or canonical TSC on a uniform periodic mesh.
 // Geometry (x, z, dx, dz per active leaf, f64) is written once; fields are f32.
-// Several ranks (2026-10-21): refinable clouds deposit on the leaves
+// Several ranks: refinable clouds deposit on the leaves
 // of their own and of the halo blocks; the halo parts are added to their owners
 // (and, for the second pass, the owners' mass and momentum sent back), and rank 0 writes the
 // leaves of all ranks in gid order, i.e. the files of one rank with the same mesh.  The
@@ -768,7 +768,7 @@ void WriteBAFields(Mesh *pm) {
     mtot = sums[0]; mdep = sums[1]; ntot = counts[0]; ncell_tot = counts[1];
   }
 #endif
-  if (std::fabs(mdep - mtot) > 1.0e-8*mtot) {   // rounding of ~1e7 particles on ~4e6 cells (U2048)
+  if (std::fabs(mdep - mtot) > 1.0e-8*mtot) {   // rounding of ~1e7 particles on ~4e6 cells
     if (global_variable::my_rank == 0)
       std::fprintf(stderr, "BA fields: deposited mass %.17g != particle mass %.17g\n", mdep, mtot);
     std::exit(EXIT_FAILURE);
@@ -838,12 +838,12 @@ Real HashUniform01(std::uint64_t key) {
 
 //----------------------------------------------------------------------------------------
 //! \fn ScheduleIndex
-//! \brief 2026-10-21: the schedule index of the next BA output after a restart at time t.  The
+//! \brief the schedule index of the next BA output after a restart at time t.  The
 //! stored file number is kept when it fits the interval (dt*(number-1) <= t < dt*number); a
 //! restart with another interval (e.g. ba_field_dt on the command line) continues the numbering
-//! and starts the schedule at the next multiple of the new interval after t (before, the
-//! schedule was dt*number: a smaller interval wrote one frame per history call until it caught
-//! up, a larger one wrote none for a long time).
+//! and starts the schedule at the next multiple of the new interval after t (a schedule at
+//! dt*number would write one frame per history call until it caught up for a smaller
+//! interval, and none for a long time for a larger one).
 
 int ScheduleIndex(const int number, const Real dt, const Real t) {
   const bool fits = (dt*number + 1.0e-10 > t) && (dt*(number - 1) <= t + 1.0e-10);
@@ -852,7 +852,7 @@ int ScheduleIndex(const int number, const Real dt, const Real t) {
 
 //----------------------------------------------------------------------------------------
 //! \struct RootPlacement
-//! \brief The position of root parent q (cloud_root_random): mode 0 the
+//! \brief the position of root parent q (cloud_root_random): mode 0 the
 //! independent random draw (the original hash), 1 a square lattice (ppc = n^2, cell-centred
 //! offsets), 2 a generic arrangement for problems along x1: x1 offsets (k + 1/2)/ppc in the root
 //! cell, x2 offsets frac((k + 1/2) phi) (phi the golden ratio), the same in every root cell, so
@@ -922,7 +922,7 @@ struct RootPlacement {
       x -= lx*Kokkos::floor((x - x1min)/lx);
     }
   }
-  // 3-D refinable clouds: root cells nc1 x nc2 x nc3; mode 1 a cubic lattice (ppc = n^3),
+  // root cells nc1 x nc2 x nc3; mode 1 a cubic lattice (ppc = n^3),
   // mode 2 x1 offsets (k + 1/2)/ppc and the R2 sequence frac((k + 1/2) g1), frac((k + 1/2) g2) in
   // x2, x3 (g1, g2 the inverse plastic number and its square), mode 0 an independent random draw
   int nc2 = 1;
@@ -1222,7 +1222,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   dust_moments_hist_ = pin->GetOrAddBoolean("problem", "dust_moments_hist", false);
   dust_moments_exact_ = pin->GetOrAddBoolean("problem", "dust_moments_exact", false);
   // several ranks: fields of the canonical TSC deposit on a uniform mesh (WriteBAFieldsGlobal), or
-  // of refinable clouds (2026-10-21, WriteBAFields); not ba_history
+  // of refinable clouds (WriteBAFields); not ba_history
   const bool fields_mpi = dust_active && !ba_history_ &&
       ((!pmy_mesh_->multilevel && pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none) ||
        pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud);
@@ -1355,8 +1355,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       ba_geom_written_ = ba_field_number_ > 0;
     }
     if (pmy_mesh_->pmb_pack->pdust != nullptr && pmy_mesh_->pmb_pack->ppart != nullptr) {
-      // 2026-10-26 fix: the total over the ranks; a rank may hold no particles (blocks far from
-      // the midplane: u640 seed 4 on 128 ranks stopped here on every such rank)
+      // the total over the ranks: a rank may hold no particles (e.g. blocks far from the
+      // midplane), which is not an empty restart
       long long np = pmy_mesh_->pmb_pack->ppart->nprtcl_thispack;
 #if MPI_PARALLEL_ENABLED
       MPI_Allreduce(MPI_IN_PLACE, &np, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
@@ -1796,7 +1796,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       }
     }
   }
-  Real ppc = static_cast<Real>(dust::RootPpc(pin));   // new species keys: sum of ppc_N
+  Real ppc = static_cast<Real>(dust::RootPpc(pin));   // new keys: sum of ppc_N
   std::uint64_t random_seed = static_cast<std::uint64_t>(
       pin->GetOrAddInteger("problem","random_seed",1));
   auto &taus_ = pmbp->pdust->taus;
@@ -2141,8 +2141,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       if (seed_leaf) {
         // the root cloud mass of G and R: 8^lmax times the largest cloud, so that a
         // seeded cloud on the finest level is one quantum there (the clouds are not root parents).
-        // Per species (Codex review): the largest cloud of all species
-        // gave a light species the quantum of the heaviest one
+        // per species: the largest cloud of all species would give a light species the
+        // quantum of the heaviest one
         const int nsp = std::max(1, nspec);
         std::vector<Real> mmax(nsp, 0.0);
         int lmax = 0;
@@ -2375,7 +2375,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   });
   }
 
-  // S3c: <problem>/stratified_dust (3-D shearing box with <shearing_box>/stratified):
+  // <problem>/stratified_dust (3-D shearing box with <shearing_box>/stratified):
   // isothermal hydrostatic gas rho0 exp(-z^2/2H^2), H = cs/omega0, the velocities of the set-up
   // above (NSH, zero for etavk = 0), dust masses times exp(-z^2/2 Hp^2) (<problem>/dust_hp,
   // default H: the dust-to-gas ratio of the set-up everywhere), <problem>/dust_vz0 added to vz
@@ -2595,8 +2595,8 @@ void DustNSHErrors(ParameterInput *pin, Mesh *pm) {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustTest3DErrors
-//! \brief The errors of the 3-D drag tests, with the definitions of dtest_metrics.py
-//! computed in the code (leaf cells, volume weighted).  damping: rms(rho_g - rho0),
+//! \brief The errors of the 3-D drag tests, computed in the code (leaf cells, volume
+//! weighted).  damping: rms(rho_g - rho0),
 //! rms(u_x - u(t)), rms(rho_d/(eps rho0) - 1), rms|u_perp|; wave: L1 errors over the amplitudes
 //! (gas and dust density as cell averages, u_x at the cell centre) and rms|u_perp|/|du|.  Both:
 //! the rms deviation of rho_g and rho_d from their x-column means (the part that is not one-
@@ -2918,7 +2918,7 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
 
 //----------------------------------------------------------------------------------------
 //! \fn LiVerticalBCs, LiVerticalBCsCoarse
-//! \brief The outflow vertical boundaries of Li et al. (2018) on u0 or, for the
+//! \brief the outflow vertical boundaries of Li et al. (2018) on u0 or, for the
 //! ghost prolongation next to the x3 faces of a refined mesh, on coarse_u0 with the
 //! coarse indices; the same rules as Athena's strat_ix3 / strat_ox3 (isothermal)
 
@@ -3004,7 +3004,7 @@ void LiVerticalBCsCoarse(Mesh *pm) {LiVerticalBCsApply(pm, true);}
 
 //----------------------------------------------------------------------------------------
 //! \fn LiRenormalize
-//! \brief At the start of every cycle (ProblemGenerator::user_work_in_loop_func):
+//! \brief at the start of every cycle (ProblemGenerator::user_work_in_loop_func):
 //! the gas density of the whole box scaled back to the initial mean, the momenta left as they
 //! are, with the floor vbc_density_floor (Athena's mass_cons / Userwork_in_loop, which runs after
 //! the step).  Every cell, the ghost cells too, then the primitives from the conserved variables

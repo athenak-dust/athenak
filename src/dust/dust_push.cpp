@@ -290,8 +290,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         int clo = three_d ? 0 : 1, chi = three_d ? 2 : 1;
         // Refinable clouds with the analytic gather: midpoint gas velocity of leaf
         // (tm,tj,ti) integrated against the cloud over one virtual cell, with the linear
-        // reconstruction.  (The force / deformation variants that also used it were
-        // removed.)
+        // reconstruction.
         auto leaf_value = [&](const Real px, const Real py,
                               const int tm, const int tj, const int ti, const Real w,
                               const Real m1x, const Real m1y,

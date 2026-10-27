@@ -43,7 +43,8 @@ void DustGasDrag::AssembleDustGasDragTasks(
   Hydro *phyd = pmy_pack->phydro;
 
   // assemble "before_timeintegrator" task list
-  // remove the particles that left through an outflow x3 face in the last cycle (no-op otherwise)
+  // remove the particles that left through an outflow x3 face in the last cycle (no-op
+  // otherwise)
   id.x3out   = tl["before_timeintegrator"]->AddTask(&DustGasDrag::RemoveOutflowParticles, this,
                                                     none);
   id.gswitch = tl["before_timeintegrator"]->AddTask(&DustGasDrag::GammaSwitch,this,id.x3out);
@@ -136,8 +137,8 @@ struct MigTimer {
   double &acc;
   std::chrono::steady_clock::time_point t0;
   bool on;
-  // the kernels before are waited for first and counted apart (wait).  2026-10-25 (Codex perf
-  // review): only with <dust>/amr_profile; the fence is for the timing alone (the migration
+  // the kernels before are waited for first and counted apart (wait).  Only
+  // with <dust>/amr_profile; the fence is for the timing alone (the migration
   // fences before its MPI sends, bvals_part.cpp), off it is neither fenced nor timed
   MigTimer(double &a, double &wait) : acc(a), on(ProfOn()) {
     if (!on) return;
@@ -434,7 +435,7 @@ TaskStatus DustGasDrag::RemoveOutflowParticles(Driver *pdrive, int stage) {
 #endif
   if (rm[1] == 0.0) return TaskStatus::complete;
   const int npart = ppar->nprtcl_thispack;
-  // (Codex Astra review) every rank removes its parked particles: after a restart the
+  // every rank removes its parked particles: after a restart the
   // pending count is held by rank 0 while the parked particles may sit on any rank
   {
     auto pr = ppar->prtcl_rdata;
