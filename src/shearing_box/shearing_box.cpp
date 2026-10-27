@@ -151,8 +151,7 @@ void ShearingBox::CheckSupportedSetup(const bool coarse_bcs) const {
   if (indcs.cnx2 < 2*ng) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "Shearing box with mesh refinement: the coarse arrays are sheared too, so "
-              << "meshblock/nx2 = " << indcs.nx2 << " must be at least 4*nghost = " << 4*ng
-              << std::endl;
+              << "meshblock/nx2 = " << indcs.nx2 << " must be at least 4*nghost = " << 4*ng << std::endl;
     std::exit(EXIT_FAILURE);
   }
   // the coarse arrays get physical boundary values in Hydro::Prolongate

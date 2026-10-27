@@ -143,8 +143,8 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     // energy of the kicks; the flux form exists only for one level and periodic boxes): source =
     // gas or both stops unless <gravity>/experimental_gas_source = true (tests, development)
     if (source_gas_ && !pin->GetOrAddBoolean("gravity", "experimental_gas_source", false))
-      Fail("<gravity>/source = " + src + ": the gas as a gravity source needs further development "
-           "first; use source = dust, or experimental_gas_source = true for tests");
+      Fail("<gravity>/source = " + src + ": the gas as a gravity source needs further development"
+           "; use source = dust, or experimental_gas_source = true for tests");
     parse("kick", pin->GetOrAddString("gravity", "kick", src), kick_gas_, kick_dust_);
     if (!coupled_dust_ && (source_dust_ || kick_dust_))
       Fail("<gravity>/source or kick includes dust, but the run has no dust module");

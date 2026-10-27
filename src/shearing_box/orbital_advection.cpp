@@ -143,8 +143,7 @@ void OrbitalAdvection::BuildMixedLists() {
   if (any_mixed && 2*nrow > indcs.nx2) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "Orbital advection with x2 neighbours on another level: meshblock/nx2 = "
-              << indcs.nx2 << " must be at least 2*(nghost + maxjshift) = " << 2*nrow
-              << std::endl;
+              << indcs.nx2 << " must be at least 2*(nghost + maxjshift) = " << 2*nrow << std::endl;
     std::exit(EXIT_FAILURE);
   }
   const int nk = indcs.nx3, ni = indcs.nx1;
