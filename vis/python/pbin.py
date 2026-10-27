@@ -1,5 +1,5 @@
 """
-Reader for AthenaK particle science files (file_type = pbin, format version 1).
+Reader for AthenaK particle science files (file_type = pbin, format versions 1 and 2).
 
 A pbin file holds the active dust particles of one output time as typed columns
 (float64 positions, velocities, masses and stopping times, uint64 ids, uint32
@@ -8,6 +8,12 @@ MeshBlocks, and a text header with the run's complete input parameters, the
 representation rule of the dust mass, the velocity frame and the column
 directory.  The file can be read alone (without any code of the dust
 project).  Only numpy is needed.
+
+Format version 2 may store a particle quantity once in the header ([constants])
+instead of as a column: with one species and species_fixed stopping times the
+species and stopping_time columns are constants.  The reader always returns them
+as arrays of length N (read-only broadcast views of the constant), so analysis
+code is the same for both layouts; ``snap.constant_columns`` names them.
 
 Example::
 
@@ -40,7 +46,7 @@ MAGIC = b"AKPBIN01"
 END = b"AKPBEND1"
 PREAMBLE = 64
 FOOTER = 16
-SUPPORTED_VERSIONS = (1,)
+SUPPORTED_VERSIONS = (1, 2)
 SHAPE_VERSION = 1
 
 
@@ -50,9 +56,11 @@ class PbinError(Exception):
 
 def _parse_text(text):
     """Split the text header into {section: {key: value}}, the column directory and the
-    raw input-parameter dump."""
+    raw input-parameter dump.  The constants of version 2 are in sections["constants"] as
+    {"table.name": dict(table, name, dtype, value)}."""
     sections = {}
     columns = []
+    constants = {}
     current = None
     head, sep, dump = text.partition("\n[input]\n")
     if not sep:
@@ -73,9 +81,15 @@ def _parse_text(text):
             columns.append(dict(table=t[0], name=t[1], dtype=t[2], count=int(t[3]),
                                 offset=int(t[4]), nbytes=int(t[5])))
             continue
+        if current == "constants" and key == "constant":
+            t = value.split()
+            constants[f"{t[0]}.{t[1]}"] = dict(table=t[0], name=t[1], dtype=t[2],
+                                               value=t[3])
+            continue
         # drop trailing comments "  # ..." (values themselves contain no " # ")
         value = value.split("  #")[0].strip()
         sections[current][key] = value
+    sections["constants"] = constants
     return sections, columns, dump
 
 
@@ -159,6 +173,12 @@ class PbinSnapshot:
         self.blocks = blocks
 
     # ---- basic metadata
+    @property
+    def constant_columns(self):
+        """Names of the particle quantities stored once in the header (version 2)."""
+        return sorted(c["name"] for c in self.header.get("constants", {}).values()
+                      if c["table"] == "particles")
+
     def __len__(self):
         return self.preamble["n_particles"]
 
@@ -356,6 +376,17 @@ def read(path, columns=None):
             if arr.size != c["count"]:
                 raise PbinError(f"{path}: column {c['name']} is truncated")
             (cols if c["table"] == "particles" else blocks)[c["name"]] = arr
+    # version 2: quantities stored once, as read-only broadcast arrays
+    for c in sections["constants"].values():
+        wanted = columns is None or c["name"] in columns
+        if c["table"] != "particles" or not wanted:
+            continue
+        if c["name"] in cols:
+            raise PbinError(f"{path}: {c['name']} is both a column and a constant")
+        dt = np.dtype(c["dtype"])
+        value = float(c["value"]) if dt.kind == "f" else int(c["value"])
+        n = pre["n_particles"]
+        cols[c["name"]] = np.broadcast_to(np.array(value, dtype=dt), (n,))
     if columns is not None:
         missing = set(columns) - set(cols)
         if missing:

@@ -12,17 +12,19 @@
 //!   dt        = 6.283185307179586
 //!   id        = particles   # optional, the default
 //!
-//! writes pbin/<basename>.<id>.<NNNNN>.pbin.  Format version 1 (vis/python/pbin.py reads it):
+//! writes pbin/<basename>.<id>.<NNNNN>.pbin.  Format version 2 (vis/python/pbin.py reads 1 and 2):
 //!
 //!   preamble, 64 bytes
-//!     char[8] "AKPBIN01"; uint32 0x01020304 (byte-order mark); uint32 format version (1);
+//!     char[8] "AKPBIN01"; uint32 0x01020304 (byte-order mark); uint32 format version (2);
 //!     uint64 text_bytes; uint64 data_start (multiple of 64); uint64 data_bytes;
 //!     uint64 n_particles; uint64 n_blocks; uint64 0 (reserved)
 //!   text header, text_bytes of UTF-8 text (ASCII except in input comments): "key = value"
 //!     lines in [sections]; [columns] lists
 //!     every column as "column = <table> <name> <dtype> <count> <offset> <nbytes>" (numpy
-//!     dtype, offset from data_start); the last section, [input], is the complete parameter
-//!     dump of the run, as in the mesh .bin files
+//!     dtype, offset from data_start); [constants] (version 2) lists the particle quantities
+//!     stored once instead of as a column, "constant = <table> <name> <dtype> <value>"; the
+//!     last section, [input], is the complete parameter dump of the run, as in the mesh .bin
+//!     files
 //!   zero padding up to data_start
 //!   data section, data_bytes: the columns one after the other, each 64-byte aligned; in a
 //!     particle column the rows of rank 0 come first, then those of rank 1, ...; the block
@@ -32,7 +34,11 @@
 //! Only the active rows are written: the capacity tail of the particle arrays and the
 //! zero-mass rows (outflow tombstones, removed at the start of the next cycle) are left out;
 //! the restart-only columns (RK registers, drag rates) are not part of the science state.  The
-//! integer tag (int32 PTAG in this code) is promoted to uint64 without change.  Every rank
+//! integer tag (int32 PTAG in this code) is promoted to uint64 without change.  Version 2:
+//! with one species and species_fixed stopping times the species and
+//! stopping_time columns are constants of the header, provided every active row holds exactly
+//! species 0 and tau_s of species 0 (checked; otherwise both stay columns); with several
+//! species or per-particle stopping times both are always columns.  Every rank
 //! writes its own rows at a global prefix offset with independent MPI-IO writes of at most
 //! 1 GiB (no gather on rank 0; ranks without particles write nothing; all offsets 64-bit and
 //! checked).  The file is written as <name>.tmp and renamed when it is complete.  Writing reads
@@ -70,7 +76,7 @@ namespace {
 
 constexpr char kMagic[9] = "AKPBIN01";
 constexpr char kEnd[9] = "AKPBEND1";
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 2;   // 1: no [constants] (2026-10-27, first files)
 constexpr std::uint64_t kAlign = 64;
 constexpr std::uint64_t kPreamble = 64;
 constexpr std::uint64_t kFooter = 16;
@@ -246,6 +252,25 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     if (r == me) prefix = ntotal;
     ntotal = Add(ntotal, counts[r]);
   }
+  // version 2: one species with species_fixed stopping times stores species and stopping time
+  // once in the header, if every active row holds exactly those values (else as columns)
+  auto taus_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pd->taus.d_view);
+  bool constant_sp_ts = (pd->nspecies == 1 &&
+                         pd->stopping_time_mode == DustStoppingTimeMode::species_fixed &&
+                         taus_h.extent_int(0) >= 1);
+  long long ndiffer = 0;
+  const Real ts0 = (taus_h.extent_int(0) >= 1) ? taus_h(0) : Real(0);
+  if (constant_sp_ts) {
+    Kokkos::parallel_reduce("pbin_constant_check", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
+    KOKKOS_LAMBDA(const int q, long long &d) {
+      const int p = idx(q);
+      if (pi(PSP,p) != 0 || pr(IPTS,p) != ts0) ++d;
+    }, Kokkos::Sum<long long>(ndiffer));
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &ndiffer, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+#endif
+    if (ndiffer > 0) constant_sp_ts = false;
+  }
   const std::uint64_t nblocks = static_cast<std::uint64_t>(pm->nmb_total);
   const std::uint64_t bprefix = static_cast<std::uint64_t>(pm->gids_eachrank[me]);
   const int nmb = pm->pmb_pack->nmb_thispack;
@@ -262,7 +287,9 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   const bool sbox = pd->is_shearing_box;
   col("particles", "id", "u8", 8, "numerical sample identity: PTAG (int32) promoted to uint64; "
       "split / merge / resampling create and remove samples, an id is not a grain lineage");
-  col("particles", "species", "u4", 4, "species_id (0-based; input index N = species_id + 1)");
+  const char *species_meaning = "species_id (0-based; input index N = species_id + 1)";
+  const char *ts_meaning = "stopping time t_s (code time)";
+  if (!constant_sp_ts) col("particles", "species", "u4", 4, species_meaning);
   col("particles", "x1", "f8", 8, "position x1 (code length)");
   col("particles", "x2", "f8", 8, "position x2 (code length)");
   col("particles", "x3", "f8", 8, pm->three_d ? "position x3 (code length)" :
@@ -271,7 +298,7 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   col("particles", "v2", "f8", 8, "velocity component 2 (see [frame])");
   col("particles", "v3", "f8", 8, "velocity component 3 (see [frame])");
   col("particles", "mass", "f8", 8, "macro-particle mass (code units; not a grain mass)");
-  col("particles", "stopping_time", "f8", 8, "stopping time t_s (code time)");
+  if (!constant_sp_ts) col("particles", "stopping_time", "f8", 8, ts_meaning);
   if (clouds) {
     col("particles", "shape", "u2", 2, "cloud shape code v1: bits 0-3 cloud level, bits 4-5 "
         "lobe along x1, 6-7 lobe along x2, 8-9 lobe along x3 (0 none, 1 lower, 2 upper, "
@@ -354,6 +381,15 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     if (clouds) h << "shape_unknown_bit_rows = " << anomalies[3] << "\n";
     h << "owner = not stored: the MeshBlock whose half-open box [min, max) holds the position "
       << "(blocks table)\n";
+    if (constant_sp_ts) {
+      h << "constant_columns = species stopping_time  # one species, species_fixed: one value "
+        << "for every row, in [constants]\n";
+    } else if (ndiffer > 0) {
+      h << "constant_columns = none  # one species, species_fixed, but " << ndiffer
+        << " rows differ from species 0 / its tau_s: kept as columns\n";
+    } else {
+      h << "constant_columns = none\n";
+    }
     h << "[species]\n";
     {
       const int ns = pd->nspecies;
@@ -361,12 +397,12 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       const char *mode = (pd->stopping_time_mode == DustStoppingTimeMode::species_fixed) ?
           "species_fixed" : (pd->stopping_time_mode == DustStoppingTimeMode::particle_static) ?
           "particle_static" : "dynamic";
-      h << "stopping_time_mode = " << mode << "  # the stopping_time column holds the value "
-        << "each particle uses\n";
+      h << "stopping_time_mode = " << mode << "  # stopping_time (column or constant) is the "
+        << "value each particle uses\n";
       h << "dust_to_gas = " << pd->dust_to_gas << "  # the <dust>/dust_to_gas key only; a "
         << "problem generator may set its own abundances (e.g. <problem>/eps_N, see [input])\n";
       h << "back_reaction = " << (pd->back_reaction ? 1 : 0) << "\n";
-      auto taus = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pd->taus.d_view);
+      auto &taus = taus_h;
       for (int s=0; s<ns; ++s) {
         h << "species." << s << " = input_index " << (s + 1) << ", tau_s "
           << ((s < taus.extent_int(0)) ? taus(s) : std::nan("")) << "\n";
@@ -403,8 +439,19 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       h << "column = " << c.table << " " << c.name << " " << c.dtype << " " << c.count << " "
         << c.offset << " " << c.bytes << "\n";
     }
+    h << "[constants]\n";
+    h << "# constant = table name dtype value (the same value in every row of the table)\n";
+    if (constant_sp_ts) {
+      h << "constant = particles species " << bo << "u4 0\n";
+      h << "constant = particles stopping_time " << bo << "f8 " << static_cast<double>(ts0)
+        << "\n";
+    }
     h << "[meaning]\n";
     for (const auto &c : cols) h << c.table << "." << c.name << " = " << c.meaning << "\n";
+    if (constant_sp_ts) {
+      h << "particles.species = " << species_meaning << "\n";
+      h << "particles.stopping_time = " << ts_meaning << "\n";
+    }
     h << "[input]\n";
     std::ostringstream ost;
     pin->ParameterDump(ost);
