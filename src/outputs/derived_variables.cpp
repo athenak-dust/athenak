@@ -1311,5 +1311,13 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
   if (name.compare(0, 10, "dust_total") == 0) {
     pm->pmb_pack->pdust->DepositScienceFields(derived_var);
   }
+  // per species: dust_species (all), dust_sN_* (species N, 1-based)
+  {
+    const int nsel = DustSpeciesVariable(name);
+    if (nsel == 0) pm->pmb_pack->pdust->DepositSpeciesScienceFields(derived_var);
+    if (nsel > 0) {
+      pm->pmb_pack->pdust->DepositScienceFields(derived_var, true, false, nsel - 1);
+    }
+  }
   i_dv = i_dv % n_dv; // reset derived variable index
 }

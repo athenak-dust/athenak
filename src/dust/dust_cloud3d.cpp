@@ -1641,9 +1641,9 @@ void DustGasDrag::CloudAdvance3D() {
 //! \brief Dust density (component 0) and momentum density (1-3) of the clouds on the leaves of
 //! this rank (diagnostics; f is (re)allocated to the size of qdep with 4 components).  Several
 //! ranks: the deposits on halo blocks are added to their owners (the halo slots keep this rank's
-//! share).
+//! share).  species >= 0: the clouds of that species (0-based) alone.
 
-void DustGasDrag::DepositCloudDensity3D(DvceArray5D<Real> &f) {
+void DustGasDrag::DepositCloudDensity3D(DvceArray5D<Real> &f, const int species) {
   if (f.extent_int(0) != qdep.extent_int(0) || f.extent_int(1) != 4 ||
       f.extent_int(2) != qdep.extent_int(2) || f.extent_int(3) != qdep.extent_int(3) ||
       f.extent_int(4) != qdep.extent_int(4)) {
@@ -1659,6 +1659,7 @@ void DustGasDrag::DepositCloudDensity3D(DvceArray5D<Real> &f) {
   auto ff = f;
   Kokkos::parallel_for("dust_cloud3d_density", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
+    if (species >= 0 && pi(PSP,p) != species) return;
     const Real m = pr(IPM,p), vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
     lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
     [&](const int target, const Real w) {

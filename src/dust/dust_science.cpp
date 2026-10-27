@@ -23,6 +23,8 @@
 //!        uniform mesh the owner stencil with the coupling's additive ghost exchange.
 //!    The masses and momenta of the particles and of the fields are compared (science_audit,
 //!    one log line per call); outputs never change the particle, gas or coupling state.
+//!    Per species: the same deposit of the particles of one species
+//!    (a filter on PSP in every path); DepositSpeciesScienceFields runs it for every species.
 
 #include <algorithm>
 #include <cmath>
@@ -120,9 +122,10 @@ void DustGasDrag::ScienceRepresentation(std::ostream &os) const {
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::DepositScienceFields
 //! \brief See the file header.  out is (re)allocated to at least (nmb, 4, nk, nj, ni).
+//! species >= 0: the particles of that species (0-based) alone.
 
 void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
-                                       const bool mass_only) {
+                                       const bool mass_only, const int species) {
   Mesh *pm = pmy_pack->pmesh;
   auto &ind = pm->mb_indcs;
   const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
@@ -143,12 +146,15 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
   auto &mbsize = pmy_pack->pmb->mb_size;
   const bool three_d = pm->three_d;
   if (pm->one_d) ScienceFail("dust science fields need a 2-D or 3-D mesh");
+  if (species >= nspecies) ScienceFail("species " + std::to_string(species + 1) + " of " +
+                                       std::to_string(nspecies));
 
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud && three_d) {
     // ---- 3-D refinable clouds: the exact leaf integrals of the coupling's traversal
     if (!clouds3d) ScienceFail("3-D refinable clouds need <dust>/experimental_3d = true");
     if (!mass_only) {
-      DepositCloudDensity3D(science_work_);   // collective (halo), shear geometry at pm->time
+      // collective (halo), shear geometry at pm->time
+      DepositCloudDensity3D(science_work_, species);
     } else {
       // the mass component of DepositCloudDensity3D alone (the same operations)
       if (science_mass_.extent_int(0) != qdep.extent_int(0) ||
@@ -164,6 +170,7 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
       auto ff = science_mass_;
       Kokkos::parallel_for("dust_science_cloud3d_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, np),
       KOKKOS_LAMBDA(const int p) {
+        if (species >= 0 && pi(PSP,p) != species) return;
         const Real m = pr(IPM,p);
         lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
         [&](const int target, const Real w) {
@@ -192,6 +199,7 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
     par_for("dust_science_composite2d", DevExeSpace(), 0, np-1, KOKKOS_LAMBDA(const int p) {
       const Real mass = pr(IPM,p);
       if (mass == 0.0) return;
+      if (species >= 0 && pi(PSP,p) != species) return;
       const Real v1 = pr(IPVX,p), v2 = pr(IPVY,p), v3 = pr(IPVZ,p);
       ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p),
                              lt.Anchor(pi(PGID,p)),
@@ -215,11 +223,11 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
     });
   } else if (three_d) {
     // ---- 3-D point particles: owner stencil + conservative ghost remap
-    DepositPointScienceFields(pm->time, out, mass_only);
+    DepositPointScienceFields(pm->time, out, mass_only, species);
   } else if (smr_transfer_mode == DustSMRTransfer::owner_overlap) {
     // ---- 2-D point particles on a refined mesh: the owner_overlap leaf deposit
     DvceArray5D<Real> &work = mass_only ? science_mass_ : science_work_;
-    OwnerOverlapDeposit(work, !mass_only);   // stops on a mass mismatch
+    OwnerOverlapDeposit(work, !mass_only, species);   // stops on a mass mismatch
     auto g = work;
     const int nc = mass_only ? 1 : 4;
     par_for("dust_science_oo2d_copy", DevExeSpace(), 0, nmb-1, js, je, is, ie,
@@ -248,6 +256,7 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
     KOKKOS_LAMBDA(const int p, int &nbad) {
       const Real mass = pr(IPM,p);
       if (mass == 0.0) return;
+      if (species >= 0 && pi(PSP,p) != species) return;
       const int m = pi(PGID,p) - gids;
       if (m < 0 || m >= nmb) {++nbad; return;}
       int ip, jp;
@@ -301,6 +310,7 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
       double a[5] = {0, 0, 0, 0, 0};
       const int p1 = (c + 1)*kChunk < np ? (c + 1)*kChunk : np;
       for (int p=c*kChunk; p<p1; ++p) {
+        if (species >= 0 && pi(PSP,p) != species) continue;
         const double m = static_cast<double>(pr(IPM,p));
         const double v[3] = {static_cast<double>(pr(IPVX,p)), static_cast<double>(pr(IPVY,p)),
                              static_cast<double>(pr(IPVZ,p))};
@@ -347,6 +357,7 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
   if (global_variable::my_rank == 0) {
     std::cout << std::setprecision(10) << "# DUST_SCIENCE_FIELDS t=" << pm->time
               << " cycle=" << pm->ncycle << " representation=" << ScienceRepresentationId()
+              << ((species >= 0) ? " species=" + std::to_string(species + 1) : std::string())
               << " mass_particles=" << s[0] << " mass_mesh=" << s[1]
               << " rel_mass_error=" << std::setprecision(3) << rel_mass
               << " momentum_error/sum(m|v|)=" << ((pabs > 0.0) ? perr/pabs : perr)
@@ -355,6 +366,39 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
       std::cout << "### WARNING (dust science fields): the deposited dust mass differs from the "
                 << "particle mass by " << rel_mass << " (relative)" << std::endl;
     }
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::DepositSpeciesScienceFields
+//! \brief The fields of every species: out(m, 4 s + c, k, j, i) is
+//! component c (rho_d, rho_d v1..3) of species s (0-based), DepositScienceFields with that
+//! species (one deposit per species, each with its audit line).  out is (re)allocated to
+//! (nmb, 4 nspecies, nk, nj, ni).  Collective.
+
+void DustGasDrag::DepositSpeciesScienceFields(DvceArray5D<Real> &out) {
+  Mesh *pm = pmy_pack->pmesh;
+  auto &ind = pm->mb_indcs;
+  const int nmb = pmy_pack->nmb_thispack;
+  const int nc1 = ind.nx1 + 2*ind.ng;
+  const int nc2 = (ind.nx2 > 1) ? ind.nx2 + 2*ind.ng : 1;
+  const int nc3 = (ind.nx3 > 1) ? ind.nx3 + 2*ind.ng : 1;
+  const int ncomp = 4*nspecies;
+  if (out.extent_int(0) < nmb || out.extent_int(1) != ncomp || out.extent_int(2) != nc3 ||
+      out.extent_int(3) != nc2 || out.extent_int(4) != nc1) {
+    Kokkos::realloc(out, std::max(1, nmb), ncomp, nc3, nc2, nc1);
+  }
+  Kokkos::deep_copy(out, 0.0);
+  auto o = out;
+  for (int s=0; s<nspecies; ++s) {
+    DepositScienceFields(science_species_, true, false, s);
+    auto f = science_species_;
+    const int c0 = 4*s;
+    par_for("dust_science_species_copy", DevExeSpace(), 0, nmb-1, ind.ks, ind.ke, ind.js, ind.je,
+            ind.is, ind.ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      for (int c=0; c<4; ++c) o(m,c0+c,k,j,i) = f(m,c,k,j,i);
+    });
   }
 }
 
