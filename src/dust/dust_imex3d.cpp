@@ -33,7 +33,7 @@ void DustGasDrag::CloudDepositImplicit3D(Driver *pdrive, int stage) {
   auto pi = pmy_pack->ppart->prtcl_idata;
   const int npart = pmy_pack->ppart->nprtcl_thispack;
   const Real a_dt = DragStep(pdrive);
-  // The gas is in its t^n orbital-advection frame: shear images of t^n, positions shifted
+  // the gas is in its t^n orbital-advection frame: shear images of t^n, positions shifted
   const Real sh = ImplicitShearShift(pdrive, stage);
   UpdateShear3D(pmy_pack->pmesh->time);
   const auto lt = leaf_traversal3d;
@@ -141,7 +141,7 @@ void DustGasDrag::CloudGatherImplicit3D(Driver *pdrive, int stage) {
 }
 
 
-// The bound-clump NaN: the local implicit solve is lumped, u*_c = (rho u + P)/(rho + Q)
+// Bound-clump NaN fix: the local implicit solve is lumped, u*_c = (rho u + P)/(rho + Q)
 // per cell, while each cloud couples to several cells (deposit W, gather from neighbouring u*).  Giving
 // the gas the particles' actual impulse D_c (as PMBR alone does) leaves the gas with D_c - G_c, G_c =
 // rho (u*_c - u_c) the lumped change, which the light gas of a dust-dominated cell feels Q/rho times

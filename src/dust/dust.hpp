@@ -42,7 +42,8 @@
 #include "bvals/bvals.hpp"
 #include "dust_input.hpp"
 
-// a device function kept out of line (rare paths of the hot cloud kernels)
+// a device function kept out of line (rare paths of the hot cloud kernels, whose speed is
+// sensitive to their code size)
 #if defined(__CUDACC__)
 #define DUST_NOINLINE __noinline__
 #else
@@ -80,10 +81,10 @@ enum class HybridForceMode {automatic=0, pc2=1, split_be=2};
 // every particle its own hat cloud: weights are exact integrals of
 // the cloud over active leaf cells, and clouds change size only by the exact B-spline
 // two-scale split (see DustGasDrag::SplitCloudsP1).
-// (the value 2 was the smooth_p2 transfer, removed on 2026-10-27)
+// (the value 2 belonged to a transfer that has been removed)
 enum class DustSMRTransfer {none=0, owner_overlap=1, refinable_cloud=3};
 
-// <dust>/refinable_mode: the validated parameter sets of the refinable clouds.
+// <dust>/refinable_mode: preset parameter sets of the refinable clouds.
 //   standard (input value "default"): the moving P1 split, G (quantum merge under the pass budget
 //     beta = cloud_merge_budget) and R (resampling with the cap eta = cloud_resample_eta), both
 //     on their schedules;
@@ -471,7 +472,7 @@ struct LeafTraversal {
   bool split_everywhere = false, split_overlap = false;
   DvceArray1D<int> blev;
   DvceArray2D<int> fbox;
-  // (m) the finest level among local block m and its neighbours, i.e. among the
+  // (m): the finest level among local block m and its neighbours, i.e. among the
   // candidates of a query that needs no global search
   DvceArray1D<int> nbmax;
   // (m, 0..1): width of the ring around block m (finest cells, per direction) that its
@@ -549,7 +550,7 @@ struct LeafTraversal {
     }
   }
 
-  // ---- candidate blocks (Codex reviews) -------------------------------------------------
+  // ---- candidate blocks ----------------------------------------------------------------
   // Every query is answered in the frame of the anchor block m (the periodic image of the
   // position next to m).  Local: m and its distinct neighbours, each with the periodic shift
   // (domain lengths, from the direction of its neighbour slot) that puts it on that side of
@@ -730,7 +731,7 @@ struct LeafTraversal {
   // every leaf cell under the cloud `code` at (x1, x2), anchor block m: function(target, w,
   // m1x, m1y) with kMoments (moments about the particle), function(target, w) without.
   // Returns the sum of the weights.  The callback appears once, in loops that are not
-  // unrolled (code size of the hot kernels).
+  // unrolled (the speed of the hot kernels is sensitive to their code size).
   template <bool kMoments, typename Function>
   KOKKOS_INLINE_FUNCTION
   Real ForEach(const Real px1, const Real px2, const int code, const int m,
@@ -824,7 +825,7 @@ struct LeafTraversal {
   // neighbours, then every block); -1 if no block holds it.  *bout: the block.  A position on a
   // block face can round outside both blocks (y = -1.7e-17 against a face at 0: (y - y0)/dy is
   // exactly nx2 below and negative above), so a last pass accepts 1e-9 cells around the blocks
-  // and clamps the cell (the table's finest-cell index always gave a leaf).
+  // and clamps the cell.
   // The index of logical locations.  A block of level l at logical (lx1, lx2)
   // (its finest-cell box over the block width in finest cells) has the key LocKey(l, lx1, lx2);
   // lockey holds the keys of all blocks sorted, locblk the block of each.  The leaf cell with
@@ -855,7 +856,7 @@ struct LeafTraversal {
     }
     return -1;
   }
-  // The search beyond the neighbours is the index of logical locations
+  // The search beyond the neighbours uses the index of logical locations
   // (Locate, O(levels log blocks)); the scan of all blocks remains for a structure without it.
   KOKKOS_INLINE_FUNCTION
   int Owner(const Real px1, const Real px2, const int m, int *bout = nullptr) const {
@@ -887,7 +888,7 @@ struct LeafTraversal {
     return res;
   }
 
-  // ---- split / merge eligibility ---------------------------------------------------------
+  // ---- split / merge eligibility -------------------------------------------------------
   // the region of the table's level map above lev (see the members), on the anchor's
   // neighbourhood or, when that does not hold the box widened by the dilation, on all blocks
   KOKKOS_INLINE_FUNCTION
@@ -1019,9 +1020,9 @@ inline std::string RankFile(const std::string &name) {
   return (dot == std::string::npos) ? name + sfx : name.substr(0, dot) + sfx + name.substr(dot);
 }
 
-// An append-mode log file opened once per process and kept open, instead of an
-// open and close per line (a GB200 test measured about 1 ms per open/close for the sort log; for the
-// trigger and event logs a GB200 test found no difference); callers write and fflush
+// an append-mode log file opened once per process and kept open, instead of an open and
+// close per line (an open/close can take about 1 ms on a parallel file system); callers
+// write and fflush
 inline std::FILE *AppendLog(const std::string &name) {
   static std::map<std::string, std::FILE*> open;
   auto it = open.find(name);
@@ -1031,9 +1032,9 @@ inline std::FILE *AppendLog(const std::string &name) {
   return fp;
 }
 
-// 2026-10-21: whether a log kept open by AppendLog is empty (its header still to write), asked
-// once per file: on a Lustre scratch file system the position query at the end of the file costs
-// about 0.9 ms per call (fprintf + fflush about 1 us), which made every logged line ~1 ms
+// whether a log kept open by AppendLog is empty (its header still to write), asked once per
+// file: on a Lustre file system the position query at the end of the file can take about
+// 1 ms per call, far longer than writing a line
 inline bool LogEmpty(std::FILE *fp) {
   static std::map<std::FILE*, bool> asked;
   if (asked.count(fp) != 0) return false;
@@ -1155,18 +1156,17 @@ void DepositAdd(Real *destination, const Real value) {
   }
 }
 
-// Tried and removed: splitting each of the two production cloud
-// kernels into a gather kernel and a deposit kernel that forms the leaf weights again (fewer
-// registers per kernel) was 10% slower in wall time on GB200; keeping the 25-entry
-// leaf-weight cache in team scratch (shared memory, teams of 128) instead of per-thread local
-// arrays changed nothing measurable (277 s against 280 s).  Both gave results identical to this
-// kernel on the CPU.  ncu: 128 registers, 25% occupancy, waiting on L1 data.
-// The cloud kernels over particles 0..n-1 with a launch bound: 0 none, 1
-// <256, 2> (at most 128 registers, default: fastest on GB200), 2 <128, 3> (at most 168), 3
-// <256, 3> (at most 85); occupancy against spills.  Rixin: a
-// compile-time choice, -DDUST_CLOUD_LAUNCH_BOUNDS=n (the run-time key <dust>/cloud_launch_bounds
-// compiled all four variants of every cloud kernel); the key is accepted only with the compiled
-// value (dust.cpp)
+// Tried and not adopted: splitting each of the two production cloud kernels into a gather
+// kernel and a deposit kernel that forms the leaf weights again (fewer registers per kernel)
+// was about 10% slower on a GB200 GPU; keeping the 25-entry leaf-weight cache in team scratch
+// (shared memory) instead of per-thread local arrays changed nothing measurable.  Both gave
+// results identical to this kernel on the CPU.  Profile on that GPU: 128 registers, 25%
+// occupancy, waiting on L1 data.
+// The cloud kernels over particles 0..n-1 with a launch bound: 0 none, 1 <256, 2> (at most
+// 128 registers, default: fastest on GB200), 2 <128, 3> (at most 168), 3 <256, 3> (at most
+// 85); occupancy against spills.  A compile-time choice, -DDUST_CLOUD_LAUNCH_BOUNDS=n (a
+// run-time choice would compile all four variants of every cloud kernel); the key
+// <dust>/cloud_launch_bounds is accepted only with the compiled value (dust.cpp)
 #ifndef DUST_CLOUD_LAUNCH_BOUNDS
 #define DUST_CLOUD_LAUNCH_BOUNDS 1
 #endif
@@ -1257,7 +1257,7 @@ class DustGasDrag {
   Real hybrid_last_chi = 0.0;
   Real hybrid_feedback_rate_max = 0.0;
   bool hybrid_have_metric = false;
-  // Following Bai 2010 §2.4 and Athena-C, the PC2 feedback stiffness
+  // the PC2 feedback stiffness (after Bai 2010 §2.4 and Athena-C)
   // chi = dt max_cells sum_p w m_p/(t_s,p V rho_g) (= Bai's chi when t_s >= dt), from the stage-1
   // predictor deposit qdep[4], computed when the damping, the dt limit or the particle history
   // (phst: chi_max, dt_stiff_min) needs it; stiff_thresh > 0: dt <= stiff_thresh/max rate (as AthenaSG new_dt.c; < 0 = off, the default);
@@ -1294,7 +1294,7 @@ class DustGasDrag {
   // moving-particle P1 split: edge children
                                       // separate only where the neighbour parent splits,
                                       // no merging (requires cloud_transition > 0); the
-                                      // only split since 2026-10-20 (the old 3x3 one is gone)
+                                      // only split scheme
   bool cloud_merge = false;           // coarsening: far from finer
                                       // leaves, release lobes and merge fine clouds that are
                                       // indistinguishable at the coarser level
@@ -1317,16 +1317,16 @@ class DustGasDrag {
   int cloud_merge_burst_interval = 50;
   bool cloud_merge_clock_restored = false;
   bool MergeDue();
-  // One resampling after every regrid, once the particle work of that regrid
+  // one resampling after every regrid, once the particle work of that regrid
   // is done (the split of the next cycle and, with merging on, the first merge pass of a
-  // derefinement); off by default since 2026-10-21 (on before).  An event is a regrid
+  // derefinement); off by default.  An event is a regrid
   // that created (nnew) or deleted (ndel) blocks, whatever the net change of the block count.
-  bool cloud_resample_after_regrid = false;   // Rixin: default false
+  bool cloud_resample_after_regrid = false;
   bool amr_event_pending = false;
-  // For the scaling on several ranks: a regrid event may wait cloud_event_dt (code
+  // to limit the cost on many ranks, a regrid event may wait cloud_event_dt (code
   // time; <dust>/cloud_event_dt_omega / omega0) after the first regrid it covers; the regrids in
   // between make one event (counts summed, the blocks of all of them fresh for the local R).  0:
-  // the cycle after each regrid, as before.  first_ncycle < 0: none recorded (handle at once).
+  // the cycle after each regrid.  first_ncycle < 0: none recorded (handle at once).
   Real cloud_event_dt = 0.0;
   Real amr_event_first_time = -1.0e300;
   long long amr_event_first_ncycle = -1;
@@ -1338,10 +1338,10 @@ class DustGasDrag {
   void HandleRegridEvent(const bool merge_due);
   bool cloud_merge_nc = true;         // merge-side node convention
   int cloud_merge_lobe_wait = 0;      // a centre waits while an unreleased lobed cloud is near
-                                      // (1: reach H + ell, 2: reach per lobe direction)
+                                      // 1: reach H + ell, 2: reach per lobe direction
   std::vector<Real> cloud_merge_mroot; // per species: root-level cloud mass (set on first pass)
   // quantum mode: stage X exact P1-stencil re-merge, stage G mass-quantum grouping
-  // (cross-level); stage C (same-level compression) was removed on 2026-10-20
+  // (cross-level)
   int cloud_merge_mode = 0;           // 0 tent, 1 quantum
   bool cloud_merge_stencil = true;    // quantum: stage X on
   Real cloud_merge_stencil_tol = 0.02;  // stage X offset tolerance (units of the piece half-width)
@@ -1351,7 +1351,7 @@ class DustGasDrag {
   bool cloud_merge_xprotect = false;   // stage X's waiting candidates are not
                                        // walked by G in the same pass
   Real cloud_merge_budget = -1.0;      // > 0, one budget of leaf mass / momentum
-  // kappa > 0: the budget of a leaf is min(beta, kappa s), s the largest dust
+  // > 0, the budget of a leaf is min(beta, kappa s), s the largest dust
   // density difference to its four neighbour leaves relative to its own (structure-relative); 0 = off
   Real cloud_merge_budget_kappa = 0.0;
   // <dust>/refinable_mode (see RefinableMode); refinable_given: the preset keys given in the
@@ -1369,10 +1369,10 @@ class DustGasDrag {
   // violating leaf: a group survives a violating leaf when its hash u in [0, 1) is below
   // 0.9/(change/budget) of that leaf; the last evaluation round uses the strict rule
   bool cloud_merge_budget_thin = false;
-  bool cloud_resample = false;         // conservative same-level resampling in the code
+  bool cloud_resample = false;         // conservative same-level resampling
   int cloud_resample_interval = 625;   // ... cycles between resamplings
   Real cloud_resample_eta = 2.0;       // ... mass cap eta m0 / 4^level (<= 0: no cap)
-  // alpha > 0 keeps cold patches out of the pool: every velocity component
+  // > 0 keeps cold patches out of the pool: every velocity component
   // spans at most alpha H / tau over the patch (H its cell size, tau = min(ts, 1/omega)); 0 = off
   Real cloud_resample_cold_alpha = 0.0;
   unsigned long long cloud_resample_cold_skips = 0;   // clouds kept out as cold (cumulative)
@@ -1382,7 +1382,7 @@ class DustGasDrag {
   int cloud_resample_patch_split = 1024;   // ... a patch (or quadrant) with more pool
                                       //     clouds is split into quadrants, down to cells (0: never)
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
-  bool cloud_resample_rank_screen = true;   // ... 3-D only: skip the patches whose
+  bool cloud_resample_rank_screen = true;   // ... (3-D only) skip the patches whose
                                       //     clouds do not outnumber their nominal rows (false: all)
   bool cloud_resample_device = true;   // ... the patch solves on the device (default)
   bool cloud_resample_qr_rows = true;  // ... row-parallel QR update on the device
@@ -1410,7 +1410,7 @@ class DustGasDrag {
   long long cloud_resample_next_file = -1;  // ... and next event
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
                                       // neighbourhood is in the merge zone: the outer band is
-                                      // left to stage X (found in the LinA tests)
+                                      // left to stage X
   int cloud_merge_pass = 0;           // pass counter (walk rotation)
   unsigned long long cloud_coarsen_events = 0, cloud_coarsen_in = 0;
   unsigned long long cloud_coarsen_reject = 0, cloud_far_release = 0;
@@ -1446,7 +1446,7 @@ class DustGasDrag {
   };
   AnalyticGather analytic_gather;
   unsigned long long cloud_split_event = 0;
-  // cloud_merge_count: coincident children merged by the old 3x3 split (removed 2026-10-20);
+  // cloud_merge_count: coincident children merged by an older split scheme (removed);
   // stays 0, kept in the restart record and the summary line
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   unsigned long long cloud_lobe_split_count = 0;
@@ -1455,7 +1455,7 @@ class DustGasDrag {
   bool NeedsHybridMetric() const {
     return coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::automatic;
   }
-  // Codex review: with a fixed mode the cached metric (from a restart written by
+  // with a fixed mode the cached metric (from a restart written by
   // an automatic run, say) is marked invalid, so that a later automatic run never starts from it
   void InvalidateHybridMetric() {
     hybrid_have_metric = false;
@@ -1531,13 +1531,13 @@ class DustGasDrag {
   // dynamic mesh (dust_amr.cpp): rebuild the leaf maps, mark
   // the cached masks stale, set PGID from the positions and the particle time step again
   void BeforeRegrid(int nnew, int ndel);  // particle count and checksum before the mesh changes
-  // For the scaling on several ranks: <dust>/load_balance_cloud_weight w > 0 gives the
+  // <dust>/load_balance_cloud_weight w > 0 gives the
   // new blocks of a regrid the cost 1 + w * clouds / (mean clouds per block) in AthenaK's load
   // balance (otherwise every block costs 1).  The clouds of every old block are counted in
   // BeforeRegrid (all ranks); RegridCosts maps them to the new blocks (a refined block passes
-  // 3^d/2^d of its clouds to each child since 2026-10-25 (the P1 split; 1/2^d for point
+  // 3^d/2^d of its clouds to each child (the P1 split; 1/2^d for point
   // particles), a derefined parent takes the sum of its children).
-  Real lb_cloud_weight = 4.0;   // Rixin: default 4
+  Real lb_cloud_weight = 4.0;   // default 4
   std::vector<float> lb_old_counts;
   // 3-D owner_overlap on a dynamic mesh: the new block of every old block (8 entries:
   // the child by octant of the position; one value repeated if not refined) and the old block
@@ -1547,7 +1547,7 @@ class DustGasDrag {
   void RegridCosts(const int *newtoold, const LogicalLocation *new_lloc, const int new_nmb, float *cost);
   int ResetPGIDFromPositions(const char *when);  // refinable clouds
   void RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin);
-  // The old owner_overlap transfer on a dynamic mesh (dust_amr.cpp).  The
+  // the owner_overlap transfer on a dynamic mesh (dust_amr.cpp).  The
   // block boxes (leaf_traversal: boxes only, read by the density trigger), the finest-block table
   // of the block of a position and the ghost-to-leaf remaps of the deposit exchanges, for the
   // current mesh; the block of every particle from its position; the TSC deposit on the owner
@@ -1561,7 +1561,7 @@ class DustGasDrag {
   DvceArray5D<Real> oo_rho;
   unsigned long long amr_checksum = 0ULL;
   int amr_npart_before = -1;
-  // Dynamic-mesh state across a restart.  The driver sets
+  // dynamic-mesh state across a restart.  The driver sets
   // amr_check_after_output while it writes the outputs of a cycle (the mesh check of that
   // cycle follows them); a restart file keeps it and the per-block cooldown ages
   // (MeshRefinement::ncyc_since_ref), and ResumeAmrAfterRestart restores the ages and does
@@ -1584,7 +1584,7 @@ class DustGasDrag {
   int SplitCloudsP1();         // moving-particle P1 split
   int SplitCloudsP1Device();   // device P1 split without the diagnostics
   TaskStatus RefineClouds(Driver *pdrive, int stage);
-  // S3c: remove the particles that left through an outflow x3 face (zero mass), log
+  // remove the particles that left through an outflow x3 face (zero mass), log
   TaskStatus RemoveOutflowParticles(Driver *pdrive, int stage);
   // the end of the u* ghost fill: coarse x3 boundary values, prolongation, fine x3
   // boundary values (physical x3 faces)
@@ -1597,7 +1597,7 @@ class DustGasDrag {
   int ResampleClouds(const bool local = false);   // returns the number of clouds removed;
                               // local: only clouds anchored in blocks new since the
                               // regrid and their neighbours
-  bool cloud_resample_event_local = true;    // on by default: the resampling
+  bool cloud_resample_event_local = true;    // default: the resampling
                                              // after a regrid is local (the scheduled one global)
   bool cloud_resample_after_derefine = false;   // R after a pure derefinement event
   bool ResampleDue();         // is a resampling due at the start of this cycle?
@@ -1605,20 +1605,20 @@ class DustGasDrag {
   void PackGasGather(const DvceArray5D<Real> &u);       // ... from a conserved state
   // block-local traversal of the actual leaves (dust_leaf.cpp)
   LeafTraversal leaf_traversal;
-  // S3b: 3-D refinable clouds: the 3-D leaf traversal, the packed gather field
+  // 3-D refinable clouds: the 3-D leaf traversal, the packed gather field
   // (velocity and its central differences in x1, x2, x3: 12 numbers per cell) and the 3-D paths
   // (dust_cloud3d.cpp)
   LeafTraversal3D leaf_traversal3d;
   DvceArray5D<Real> gpack3;
   bool clouds3d = false;               // refinable clouds on a 3-D mesh (set by the constructor)
   bool Clouds3D() const {return clouds3d;}
-  // stage 4: 3-D clouds in a shearing box with shear-periodic x1; the shear
+  // 3-D clouds in a shearing box with shear-periodic x1; the shear
   // neighbours of LeafTraversal3D for the shear
   // offset at a time (UpdateShear3D: rebuilt when the offset changes), from the finest-cell boxes
   // of the slots, the slots near the inner / outer x1 face and the reach of every local block
   bool shear3d = false;
   bool shear3d_route_fix = true;   // <dust>/cloud_shear_route_time (test: false = AthenaK's time)
-  // the same for point particles (old OO, uniform / static / AMR) in a 3-D shearing
+  // the same for point particles (owner_overlap, uniform / static / AMR) in a 3-D shearing
   // box, <dust>/shear_route_time (default true; false = AthenaK's time).  ShearRouteTime: the time
   // whose shear offset a particle crossing an x1 face at this migration needs (the end of the step
   // for PC2 / hybrid; for imex the stages still to come move it with the sheared x, see dust.cpp);
@@ -1627,7 +1627,7 @@ class DustGasDrag {
   Real ShearRouteTime(Driver *pdrive, int stage) const;
   void ShiftShearCrossings(const Real tau);
   bool shear3d_lists_ok_ = false;
-  // 2026-10-25 (Codex perf review item 1): <dust>/cloud_shear_list_cache keeps the shear neighbour
+  // <dust>/cloud_shear_list_cache keeps the shear neighbour
   // lists while ysh / fine_dx2 stays in one unit interval [k, k + 1) (lists built for the whole
   // interval: a superset, the traversal filters by the current ysh); shear3d_key_ = k
   bool shear3d_list_cache = false;
@@ -1722,14 +1722,14 @@ class DustGasDrag {
   // incremented by every operation that may change the deposited dust mass other
   // than by an exact refinement or reordering (G, R, a regrid)
   std::uint64_t gravity_mass_epoch = 0;
-  void CheckClouds3D();   // the restrictions of 3-D stage 1
+  void CheckClouds3D();   // checks the restrictions of the 3-D clouds
   void WrapParticles3D();
   int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
-  void FrameToBlock3D(const Real tpos);         // 3-D stages 3 and 4
+  void FrameToBlock3D(const Real tpos);         // tpos: the time of the positions
   bool CheckHaloReach3D(const char *when);
   int RouteToOwnerBlocks3D(const char *when);
-  int MergeCloudsDevice3D();   // 3-D stage 2b (dust_cloud_device.cpp)
-  int ResampleClouds3D(const bool local);   // 3-D stage 2c (dust_resample.cpp)
+  int MergeCloudsDevice3D();   // (dust_cloud_device.cpp)
+  int ResampleClouds3D(const bool local);   // (dust_resample.cpp)
   // timing diagnostic: storage order of the particles
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)
   bool cloud_sort_random = false;     // diagnostic: a random permutation instead
@@ -1750,14 +1750,14 @@ class DustGasDrag {
   // multi-rank refinable clouds: the gid of every block slot of the leaf traversal,
   // the halo lists and the exchanges (dust_halo.cpp)
   // the buffer of the density trigger (amr_rho_map = block), cells of a block's level: part of the
-  // reach of the halo, so that the strips hold the buffer cells (Codex review)
+  // reach of the halo, so that the strips hold the buffer cells
   int halo_trigger_cells = 0;
   // profile: fenced wall-clock seconds and calls of the AMR and cloud-management
   // phases, summed over the run (rank 0's), printed as one DUST_AMR_PROFILE line at the end
   enum ProfPhase {kProfTrigger, kProfAmr, kProfRegridMesh, kProfRebuild, kProfRefineClouds, kProfSplit,
                   kProfEvent, kProfSchedR, kProfSchedG, kProfSort, kProfOrder,
                   kProfTrigDeposit, kProfTrigCopy, kProfTrigBlocks, kProfTrigLog,
-                  kProfN};   // kProfTrig*: trigger parts
+                  kProfN};   // kProfTrig*: parts of the trigger
   double prof_time[kProfN] = {0.0};
   long long prof_count[kProfN] = {0};
   std::vector<int> leaf_slot_gid;
@@ -1767,7 +1767,7 @@ class DustGasDrag {
   // device arrays in every check synchronizes the device); reallocated when a size changes
   DvceArray2D<Real> trig_f;
   DvceArray5D<Real> trig_f3;          // the 3-D leaf densities of the trigger
-  // Rixin: dust_trigger_log.txt gets the line of a check only when the mesh changes after
+  // dust_trigger_log.txt gets the line of a check only when the mesh changes after
   // it (BeforeRegrid writes the pending line) and the first check of the run
   DvceArray1D<Real> trig_q, trig_area;
   DvceArray1D<int> trig_bad, trig_fine;
@@ -1797,7 +1797,7 @@ class DustGasDrag {
   unsigned long long mpi_count[4] = {0, 0, 0, 0};
   void HaloForwardPack(DvceArray5D<Real> &gp);
   void HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int nc);
-  void HaloForward5D(DvceArray5D<Real> &f, const int c0, const int nc);
+  void HaloForward5D(DvceArray5D<Real> &f, const int c0, const int nc);   // 3-D clouds
   void HaloForwardFlat(DvceArray2D<Real> &f, const int nc);
   void HaloReverseAddFlat(DvceArray2D<Real> &f, const int nc);
   void HaloForwardFlags(DvceArray1D<int> &f);
