@@ -540,6 +540,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_buffer = pin->GetOrAddInteger("dust", "cloud_merge_buffer", 2);
       // Rixin: production alpha
       cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha", 0.05);
+      // The 3-D G velocity tolerance on the cell size of the leaf
+      // that holds the merge cell (alpha 2^gap H / tau when the leaf is gap levels coarser)
+      cloud_merge_alpha_leaf = pin->GetOrAddBoolean("dust", "cloud_merge_alpha_leaf", false);
       cloud_merge_interval = pin->GetOrAddInteger("dust", "cloud_merge_interval", 10);
       cloud_merge_min_mass = pin->GetOrAddReal("dust", "cloud_merge_min_mass", 0.5);
       cloud_merge_nc = pin->GetOrAddBoolean("dust", "cloud_merge_nc", true);
