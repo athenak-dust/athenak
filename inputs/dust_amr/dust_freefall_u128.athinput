@@ -1,0 +1,91 @@
+# Free fall of a cold uniform dust sphere under its own gravity (dust gravity only, no drag, no
+# shear, gas uniform and at rest): radius 0.2 in a periodic unit box, density set so that
+# t_ff = 1 (4 pi G = 1).  Uniform 128^3 mesh, refinable clouds (exact TSC on a uniform mesh).
+# Test: Lagrangian radii r_q / (f(t) r_q(0)) and the energy drift in freefall_history.jsonl
+# against the homologous collapse f(t) with the periodic mean (dust_freefall.cpp); at t = 0.98
+# (density x200) the inner shells (q <= 0.25) agree to ~1e-3 and (E - E0)/|W| ~ -0.4%.
+# Runtime: t = 0 -> 0.98, tens of minutes on 32 CPU cores.
+<job>
+basename = FF
+
+<mesh>
+nghost = 4
+nx1 = 128
+x1min = 0.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 128
+x2min = 0.0
+x2max = 1.0
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 128
+x3min = 0.0
+x3max = 1.0
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = -1
+tlim = 0.98
+ndiag = 1
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hlle
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+ppc = 1                         # legacy sampling keys (dust_freefall)
+
+<dust>
+nspecies = 1
+taus_1 = 1.0e20                 # no drag
+back_reaction = false
+deposit = tsc
+dt_cfl = 0.3
+coupling = pc2
+amr_pic = refinable_cloud       # exact TSC clouds on the uniform mesh
+refinable_mode = split_only
+
+<problem>
+pgen_name = dust_freefall
+ff_radius = 0.2
+ff_n = 1
+ff_dt = 0.02                    # diagnostics interval
+rho0 = 1.0
+etavk = 0.0
+eps_1 = 0.1                     # the fixture's own clouds, replaced by the sphere
+cloud_root_random = true
+random_seed = 2007
+root_placement = lattice
+dust_test = damping
+dust_test_v0 = 0.0
+check_equilibrium = false
+
+<gravity>
+enabled = true
+source = dust
+kick = dust
+setup = distributed
+solver = multigrid
+four_pi_G = 1.0
+vertical_bc = periodic
+rtol = 1e-10
+max_iterations = 300
+
+<output1>
+file_type = phst
+dt = 0.02

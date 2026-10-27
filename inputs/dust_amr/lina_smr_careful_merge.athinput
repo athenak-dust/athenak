@@ -1,0 +1,116 @@
+# LinA (Youdin & Johansen 2007 linear streaming-instability mode A, tau_s = 0.1, eps = 3) in a
+# 2-D shearing box on a static nested mesh: root 64^2, the central square [L/4, 3L/4]^2 one level
+# finer (128^2 there).  Refinable dust clouds with refinable_mode = careful_merge (exact P1 split,
+# X stencil re-merge, G quantum merge and R resampling, with the quiet-state protections).
+# Test: growth of the dust target projection (history columns 2, 3) on t in [1, 2 pi] against the
+# analytic rate 0.4190091 and with uniform 64^2 and 128^2 runs.
+# Runtime: t = 0 -> 2 pi is ~3.5e5 cycles, about half an hour on two CPU cores (1 or more MPI ranks).
+<job>
+basename = LinA
+
+<mesh>
+nghost = 4
+nx1 = 64
+x1min = 0.0
+x1max = 0.010471975511965976
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 64
+x2min = 0.0
+x2max = 0.010471975511965976
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 1
+
+<mesh_refinement>
+refinement = static
+
+<refined_region1>
+level = 1
+x1min = 0.002618153877991494
+x1max = 0.007853821633974481
+x2min = 0.002618153877991494
+x2max = 0.007853821633974481
+x3min = -0.5
+x3max = 0.5
+
+<time>
+tlim = 6.283185307179586
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.225
+nlim = -1
+ndiag = 1
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hlle
+
+<hydro_srcterms>
+const_accel = true
+const_accel_val = 0.1           # 2 Omega eta v_K: the radial pressure gradient on the gas
+const_accel_dir = 1
+
+<shearing_box>
+qshear = 1.5
+omega0 = 1.0
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+ppc = 1.0                       # legacy sampling key (streaming_linear uses the legacy keys)
+
+<dust>
+nspecies = 1
+taus_1 = 0.1                    # legacy keys: streaming_linear reads taus_1 and <problem>/eps
+dust_to_gas = 3.0
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+coupling = pc2
+amr_pic = refinable_cloud
+refinable_mode = careful_merge
+
+<problem>
+pgen_name = streaming_linear
+user_hist = true
+rho0 = 1.0
+etavk = 0.05
+eps = 3.0
+kx = 600.0
+kz = 600.0
+omega_re = 0.3480181522220716
+drhog_re = 2.2390973021942755e-11
+drhog_im = 2.120321162175151e-11
+dugx_re = -8.45681860586763e-09
+dugx_im = 1.8080318276365703e-09
+dugp_re = 6.68355169629038e-09
+dugp_im = 2.958364479042931e-09
+dugz_re = 8.456774829225835e-09
+dugz_im = -1.8080436236185242e-09
+drhop_re = 3.0000000000000005e-06
+dvpx_re = -6.992971139842195e-09
+dvpx_im = 1.864998340789883e-09
+dvpp_re = 6.528173354473428e-09
+dvpp_im = 3.202761793127405e-09
+dvpz_re = 8.197611012533743e-09
+dvpz_im = -1.1666497869340141e-09
+lattice_shift = -0.25
+lattice_shift_z = -0.125
+seed_after_split = true         # seed the mode after the initial split (no t = 0 sawtooth)
+
+<output1>
+file_type = hst
+data_format = %.17e
+dt = 0.02617993877991494

@@ -1,0 +1,99 @@
+# Linear gravitational (Jeans-type) instability of a dusty gas: one Fourier mode along x1 of the
+# coupled gas + dust system (tau_s = 0.1, eps = 1, 4 pi G = 50) with the gas and the dust both
+# as gravity sources (experimental_gas_source: the gas as a source is still experimental).
+# Box 1 x 0.25 x 0.25, uniform 128 x 32 x 32 with 16^3 blocks, 8 refinable clouds per cell.
+# Test: the mode's growth rate (jeans_sigma = 9.0356) and the amplitudes of the gas and dust
+# density and velocity (user history) against the linear solution.
+# Runtime: t = 0 -> 0.5, a few minutes on 32 CPU cores.
+<job>
+basename = jeans
+
+<mesh>
+nghost = 4
+nx1 = 128
+x1min = 0.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 32
+x2min = 0.0
+x2max = 0.25
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 32
+x3min = 0.0
+x3max = 0.25
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.225
+nlim = -1
+tlim = 0.5
+ndiag = 1
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hllc
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+ppc = 8                         # legacy sampling keys (dust_jeans reads taus_1 and eps_1)
+
+<dust>
+nspecies = 1
+taus_1 = 0.1
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+coupling = pc2
+amr_pic = refinable_cloud       # exact TSC clouds on the uniform mesh
+refinable_mode = split_only
+
+<gravity>
+enabled = true
+source = both
+kick = both
+experimental_gas_source = true
+setup = distributed
+solver = multigrid
+four_pi_G = 50.0
+vertical_bc = periodic
+rtol = 1e-11
+
+<problem>
+pgen_name = dust_jeans
+user_hist = true
+check_equilibrium = false
+rho0 = 1.0
+eps_1 = 1.0
+dust_test = damping
+dust_test_v0 = 0.0
+cloud_root_random = true
+root_placement = lattice
+particle_placement = random
+jeans_phase = 0.37
+jeans_sigma = 9.035597601378303
+jeans_dg = 8.692041727944386e-07
+jeans_ug = 1.2499677718935327e-06
+jeans_dd = 1e-06
+jeans_vd = 1.4380600220486312e-06
+
+<output1>
+file_type = hst
+dt = 0.005
+data_format = %.17e
+
+<output2>
+file_type = phst
+dt = 0.05

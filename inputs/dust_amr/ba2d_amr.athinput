@@ -1,0 +1,122 @@
+# Run "BA" of Bai & Stone (2010) in 2-D (radial-vertical, unstratified): streaming instability with
+# tau_s = 1 and eps = 0.2, box 2H x 2H, root 128^2 with 16^2 blocks and adaptive refinement up to
+# num_levels = 5 (2048^2 effective).  Refinable dust clouds, refinable_mode = default (G merge
+# and R resampling every 0.25/Omega, none right after a regrid; PC2 with feedback damping).  The
+# dust density trigger refines a block where rho_d/<rho_d> >= 10 * 2^l on level l and lets it
+# coarsen below 3.3 * 2^(l-1), with a 2-cell buffer.
+# Test: the cumulative particle-density distribution on t in [300, 600] against a uniform 2048^2
+# reference (pbin / hydro_w outputs).  Runtime: t = 0 -> 600 is several GPU hours (one GPU);
+# shorten tlim for a first look.
+<job>
+basename = BA
+
+<mesh>
+nghost = 4
+nx1 = 128
+x1min = -1.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 128
+x2min = -1.0
+x2max = 1.0
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 1
+
+<mesh_refinement>
+refinement = adaptive
+num_levels = 5
+ncycle_check = 10
+refinement_interval = 100
+max_nmb_per_rank = 8192         # preallocated per rank (one GPU); scale it down for more ranks
+
+<amr_criterion0>
+method = user                   # the dust density trigger below
+
+<time>
+tlim = 600
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.225
+nlim = -1
+ndiag = 1
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hlle
+
+<hydro_srcterms>
+const_accel = true
+const_accel_val = 0.1           # 2 Omega eta v_K
+const_accel_dir = 1
+
+<shearing_box>
+qshear = 1.5
+omega0 = 1.0
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+
+<dust>
+nspecies = 1
+tau_s_1 = 1.0
+epsilon_1 = 0.2
+ppc_1 = 4                       # root clouds per root cell
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+coupling = pc2
+amr_pic = refinable_cloud
+refinable_mode = default
+amr_density_trigger = true
+amr_rho_units = mean            # thresholds in units of the mean dust density
+amr_rho_refine = 10.0
+amr_rho_derefine = 3.3
+amr_rho_level_factor = 2.0
+amr_rho_buffer = 2
+
+<problem>
+pgen_name = dust_nsh
+user_hist = true
+rho0 = 1.0
+etavk = 0.05
+cloud_root_random = true
+root_placement = random
+random_seed = 2007
+check_equilibrium = false
+
+<output1>
+file_type = hst
+dt = 0.1
+data_format = %.14e
+
+<output2>
+file_type = phst                # particle history (max rho_p, cloud counts, G/R columns)
+dt = 0.1
+
+<output3>
+file_type = bin
+variable = hydro_w              # adds dust_total_rho and dust_total_mom1..3 automatically
+precision = double
+dt = 1.0
+
+<output4>
+file_type = pbin                # every active cloud: position, velocity, mass, level, tag
+dt = 10.0
+
+<output5>
+file_type = rst
+dt = 25.0

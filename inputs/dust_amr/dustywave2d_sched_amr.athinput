@@ -1,0 +1,115 @@
+# Damped dusty sound wave (one wavelength along x1, amplitude 1e-6, tau_s = 0.1, eps = 1) in 2-D
+# without rotation, with scheduled adaptive refinement: the band x1 in [0.25, 0.5] is refined
+# to level 1 for 0.25 <= t < 0.75 and to level 2 for 0.75 <= t < 1.25, then the mesh coarsens
+# back to the root.
+# Refinable clouds, refinable_mode = default (G and R every 50 cycles without omega0).
+# Test: the wave's frequency and damping rate (user history) against the uniform-mesh run and the
+# analytic dispersion relation, with refinement and coarsening crossing the wave.
+# Runtime: t = 0 -> 2, under a minute on one CPU core.
+<job>
+basename = DW
+
+<mesh>
+nghost = 4
+nx1 = 64
+x1min = 0.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 16
+x2min = 0.0
+x2max = 0.25
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 1
+
+<mesh_refinement>
+refinement = adaptive
+num_levels = 3
+ncycle_check = 10
+refinement_interval = 100
+max_nmb_per_rank = 256
+
+<amr_criterion0>
+method = user                   # the refinement schedule amr_sched* below
+
+<time>
+tlim = 2.0
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.225
+nlim = -1
+ndiag = 1
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hlle
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+
+<dust>
+nspecies = 1
+tau_s_1 = 0.1
+epsilon_1 = 1.0
+ppc_1 = 4                       # square: 2 x 2 lattice root parents per cell
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+coupling = pc2
+amr_pic = refinable_cloud
+refinable_mode = default
+cloud_merge_interval = 50       # cycles (no <shearing_box>/omega0)
+cloud_resample_interval = 50
+amr_sched_n = 2
+amr_sched1_t0 = 0.25
+amr_sched1_t1 = 0.75
+amr_sched1_x1min = 0.25
+amr_sched1_x1max = 0.50
+amr_sched1_x2min = -1.0
+amr_sched1_x2max = 1.0
+amr_sched1_level = 1
+amr_sched2_t0 = 0.75
+amr_sched2_t1 = 1.25
+amr_sched2_x1min = 0.25
+amr_sched2_x1max = 0.50
+amr_sched2_x2min = -1.0
+amr_sched2_x2max = 1.0
+amr_sched2_level = 2
+
+<problem>
+pgen_name = dust_nsh
+user_hist = true
+rho0 = 1.0
+dust_test = wave
+amp = 1.0e-6
+wave_n = 1
+cloud_root_random = true
+root_placement = lattice
+
+<output1>
+file_type = hst
+dt = 0.005
+data_format = %.16e
+
+<output2>
+file_type = phst
+dt = 0.05
+
+<output3>
+file_type = bin
+variable = hydro_w              # adds dust_total_rho and dust_total_mom1..3 automatically
+precision = double
+dt = 0.25

@@ -1,0 +1,129 @@
+# Multi-species NSH drift equilibrium (Nakagawa et al. 1986) in a 2-D radial-vertical shearing box:
+# gas and three dust species (tau_s = 0.01, 0.1, 1; eps = 0.2, 0.5, 0.3) start on the exact steady
+# drift solution.  Scheduled adaptive refinement: the square [-0.25, 0.25]^2 is at level 1 for
+# 0.5 <= t < 3 and at level 2 for 1 <= t < 2; the mesh is back on the root after t = 3.
+# Refinable clouds, refinable_mode = default (G and R every 0.25/Omega).
+# Test: the mean drift velocities of gas and dust (user history) stay at the equilibrium values
+# through the refinement and coarsening.  Runtime: t = 0 -> 4, a few minutes on one CPU core.
+<job>
+basename = NSH
+
+<mesh>
+nghost = 4
+nx1 = 64
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 64
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 1
+
+<mesh_refinement>
+refinement = adaptive
+num_levels = 3
+ncycle_check = 10
+refinement_interval = 100
+max_nmb_per_rank = 512
+
+<amr_criterion0>
+method = user                   # the refinement schedule amr_sched* below
+
+<time>
+tlim = 4.0
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.225
+nlim = -1
+ndiag = 1
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hlle
+
+<hydro_srcterms>
+const_accel = true
+const_accel_val = 0.1           # 2 Omega eta v_K
+const_accel_dir = 1
+
+<shearing_box>
+qshear = 1.5
+omega0 = 1.0
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+
+<dust>
+nspecies = 3
+tau_s_1 = 0.01
+tau_s_2 = 0.1
+tau_s_3 = 1.0
+epsilon_1 = 0.2
+epsilon_2 = 0.5
+epsilon_3 = 0.3
+ppc_1 = 3                       # equal ppc_N on the lattice: the total (9) must be a square
+ppc_2 = 3
+ppc_3 = 3
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+coupling = pc2
+amr_pic = refinable_cloud
+refinable_mode = default
+amr_sched_n = 2
+amr_sched1_t0 = 0.5
+amr_sched1_t1 = 3.0
+amr_sched1_x1min = -0.25
+amr_sched1_x1max = 0.25
+amr_sched1_x2min = -0.25
+amr_sched1_x2max = 0.25
+amr_sched1_level = 1
+amr_sched2_t0 = 1.0
+amr_sched2_t1 = 2.0
+amr_sched2_x1min = -0.25
+amr_sched2_x1max = 0.25
+amr_sched2_x2min = -0.25
+amr_sched2_x2max = 0.25
+amr_sched2_level = 2
+
+<problem>
+pgen_name = dust_nsh
+user_hist = true
+rho0 = 1.0
+etavk = 0.05
+cloud_root_random = true
+root_placement = lattice
+
+<output1>
+file_type = hst
+dt = 0.01
+data_format = %.16e
+
+<output2>
+file_type = phst
+dt = 0.05
+
+<output3>
+file_type = bin
+variable = dust_species         # dust_sN_rho and dust_sN_mom1..3 of every species
+precision = double
+dt = 1.0
+
+<output4>
+file_type = pbin
+dt = 1.0

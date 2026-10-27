@@ -1,0 +1,139 @@
+# Drag damping of uniform dust (tau_s = 2, eps = 1) moving at v0 = 0.5 through gas at rest, no
+# rotation, in 3-D with scheduled adaptive refinement: a slab x1 in [0, 1/4] at level 2 for
+# t < 1, then it moves to [1/4, 1/2], [1/2, 3/4], [3/4, 1] and back to [0, 1/4], one step per
+# unit time.  Refinable clouds split as the slab arrives and are merged / resampled after it
+# leaves (refinable_mode = careful_merge; no omega0, so G and R run every 50 cycles).
+# Test: the mean dust and gas velocities follow the analytic damping (user history) to round-off
+# through every refinement and coarsening.  Runtime: t = 0 -> 5, about a minute on one CPU core.
+<job>
+basename = DT
+
+<mesh>
+nghost = 4
+nx1 = 32
+x1min = 0.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 8
+x2min = 0.0
+x2max = 0.25
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 8
+x3min = 0.0
+x3max = 0.25
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement = adaptive
+num_levels = 3
+ncycle_check = 10
+refinement_interval = 100
+max_nmb_per_rank = 160
+
+<amr_criterion0>
+method = user                   # the refinement schedule amr_sched* below
+
+<time>
+tlim = 5.0
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.225
+nlim = -1
+ndiag = 1
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hlle
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+
+<dust>
+nspecies = 1
+tau_s_1 = 2.0
+epsilon_1 = 1.0
+ppc_1 = 1
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+coupling = pc2
+amr_pic = refinable_cloud
+refinable_mode = careful_merge
+cloud_merge_interval = 50       # cycles (no <shearing_box>/omega0)
+cloud_resample_interval = 50
+amr_sched_n = 5
+amr_sched1_t0 = 0.0
+amr_sched1_t1 = 1.0
+amr_sched1_x1min = 0.000
+amr_sched1_x1max = 0.250
+amr_sched1_x2min = -1.0
+amr_sched1_x2max = 1.0
+amr_sched1_level = 2
+amr_sched2_t0 = 1.0
+amr_sched2_t1 = 2.0
+amr_sched2_x1min = 0.250
+amr_sched2_x1max = 0.500
+amr_sched2_x2min = -1.0
+amr_sched2_x2max = 1.0
+amr_sched2_level = 2
+amr_sched3_t0 = 2.0
+amr_sched3_t1 = 3.0
+amr_sched3_x1min = 0.500
+amr_sched3_x1max = 0.750
+amr_sched3_x2min = -1.0
+amr_sched3_x2max = 1.0
+amr_sched3_level = 2
+amr_sched4_t0 = 3.0
+amr_sched4_t1 = 4.0
+amr_sched4_x1min = 0.750
+amr_sched4_x1max = 1.000
+amr_sched4_x2min = -1.0
+amr_sched4_x2max = 1.0
+amr_sched4_level = 2
+amr_sched5_t0 = 4.0
+amr_sched5_t1 = 5.0
+amr_sched5_x1min = 0.000
+amr_sched5_x1max = 0.250
+amr_sched5_x2min = -1.0
+amr_sched5_x2max = 1.0
+amr_sched5_level = 2
+
+<problem>
+pgen_name = dust_nsh
+user_hist = true
+rho0 = 1.0
+dust_test = damping
+dust_test_v0 = 0.5
+cloud_root_random = true
+root_placement = lattice
+random_seed = 2007
+
+<output1>
+file_type = hst
+dt = 0.01
+data_format = %.16e
+
+<output2>
+file_type = phst
+dt = 0.05
+
+<output3>
+file_type = pbin
+dt = 1.0
+
+<output4>
+file_type = bin
+variable = hydro_w              # adds dust_total_rho and dust_total_mom1..3 automatically
+precision = double
+dt = 0.5

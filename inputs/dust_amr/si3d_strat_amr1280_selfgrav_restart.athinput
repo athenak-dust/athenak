@@ -1,0 +1,40 @@
+# Self-gravity of the dust switched on at a restart of si3d_strat_amr1280.athinput, e.g. from the
+# restart file at t = 140 (22.3 orbits):
+#     athena -r rst/st.00014.rst -i si3d_strat_amr1280_selfgrav_restart.athinput
+# Only the blocks and keys below change; everything else comes from the restart file.
+# Gravity of the dust only (source = kick = dust), 4 pi G = 0.05, isolated in x3, multigrid with
+# rtol 1e-10, the closing field reused at the next opening solve (kdk_reuse) and the first guess
+# extrapolated in time.  A fourth level (2560/H) is opened at rho_d >= 5120 (per-level thresholds
+# 64 / 256 / 5120), the mesh is checked every 50 cycles, and pbin / phst are written more often.
+# Runtime: t = 140 -> 157 (25 orbits) is about a day on four GPUs; the collapse of the densest
+# clumps sets the time step.
+<gravity>
+enabled = true
+source = dust
+kick = dust
+four_pi_G = 0.05
+setup = distributed
+solver = multigrid
+vertical_bc = isolated
+rtol = 1e-10
+kdk_reuse = true
+guess = extrapolate
+
+<mesh_refinement>
+num_levels = 4
+ncycle_check = 50
+
+<dust>
+amr_rho_refine_levels = 64 256 5120
+
+<output2>
+dt = 1.0                        # hydro_w (with dust_total)
+
+<output3>
+dt = 2.0                        # rst
+
+<output4>
+dt = 0.02                       # phst
+
+<output5>
+dt = 1.0                        # pbin
