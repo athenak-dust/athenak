@@ -5,6 +5,7 @@
 #include "gravity/geometric_mg.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -395,13 +396,21 @@ void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
     source = LocalCsr{};
   };
   const int threads = fine.SetupThreads();
+  // consecutive chunks (>= 512 rows, up to 16 per worker) taken in any order, joined in order
+  auto chunking = [threads](GlobalIndex rows, int &workers, int &chunks) {
+    workers = static_cast<int>(std::max<GlobalIndex>(1,std::min<GlobalIndex>(threads,rows/4096)));
+    chunks = static_cast<int>(std::max<GlobalIndex>(workers,
+        std::min<GlobalIndex>(16*static_cast<GlobalIndex>(workers),rows/512)));
+  };
   {
     const GlobalIndex rows = fine_end-p.row_begin;
-    const int workers = static_cast<int>(std::max<GlobalIndex>(1,
-        std::min<GlobalIndex>(threads,rows/4096)));
-    std::vector<PartP> parts(workers);
-    parallel(workers,[&](int w) {
-      prolongation(p.row_begin+rows*w/workers,p.row_begin+rows*(w+1)/workers,parts[w]);
+    int workers = 1, chunks = 1;
+    chunking(rows,workers,chunks);
+    std::vector<PartP> parts(chunks);
+    std::atomic<int> next{0};
+    parallel(workers,[&](int) {
+      for (int c = next++; c < chunks; c = next++)
+        prolongation(p.row_begin+rows*c/chunks,p.row_begin+rows*(c+1)/chunks,parts[c]);
     });
     cache_statistics = ProlongationCacheStats{};
     for (auto &part : parts) {
@@ -417,11 +426,13 @@ void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
   }
   {
     const GlobalIndex rows = coarse_end-r.row_begin;
-    const int workers = static_cast<int>(std::max<GlobalIndex>(1,
-        std::min<GlobalIndex>(threads,rows/4096)));
-    std::vector<PartR> parts(workers);
-    parallel(workers,[&](int w) {
-      restriction(r.row_begin+rows*w/workers,r.row_begin+rows*(w+1)/workers,parts[w]);
+    int workers = 1, chunks = 1;
+    chunking(rows,workers,chunks);
+    std::vector<PartR> parts(chunks);
+    std::atomic<int> next{0};
+    parallel(workers,[&](int) {
+      for (int c = next++; c < chunks; c = next++)
+        restriction(r.row_begin+rows*c/chunks,r.row_begin+rows*(c+1)/chunks,parts[c]);
     });
     for (auto &part : parts) {
       join(r,part.r);
@@ -450,7 +461,7 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
   GeometricSystem out;
   out.fine_geometry.reset(new MeshGeometry(std::move(patches),domain,rank,nranks,neumann_z));
   MeshGeometry *fine = out.fine_geometry.get();
-  fine->SetPhaseThreads(threads);
+  fine->SetSetupThreads(threads);
   lap(times.geometry);
   out.fine = fine->BuildSystem(fine_forces);
   lap(times.fine_system);
@@ -466,7 +477,7 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
       throw std::runtime_error("Gravity geometric coarsening did not reduce global rows");
     std::unique_ptr<MeshGeometry> coarse(new MeshGeometry(std::move(coarse_patches),domain,
                                                         rank,nranks,neumann_z,true));
-    coarse->SetPhaseThreads(threads);
+    coarse->SetSetupThreads(threads);
     lap(times.geometry);
     LocalCsr p, r; TransferDiagnostics check; std::vector<int> phase_rows;
     ProlongationCacheStats cache_statistics;

@@ -183,6 +183,10 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   profile_ = pin->GetOrAddBoolean("gravity", "profile", false);
   phase_threads_ = pin->GetOrAddInteger("gravity", "phase_threads", 0);
   if (phase_threads_ < 0) Fail("gravity/phase_threads must be nonnegative");
+  // host workers of a full hierarchy setup (0: every affinity CPU in device
+  // builds, one in CPU builds; the coefficients do not depend on it)
+  setup_threads_ = pin->GetOrAddInteger("gravity", "setup_threads", 0);
+  if (setup_threads_ < 0) Fail("gravity/setup_threads must be nonnegative");
 #if MPI_PARALLEL_ENABLED
   int mpi_thread_level = MPI_THREAD_SINGLE, mpi_main_thread = 0;
   MPI_Query_thread(&mpi_thread_level);
@@ -543,7 +547,7 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
   const double t_geometry = ProfileTime(profile_);
   try {
     auto setup = BuildGeometricHierarchy(std::move(patches),domain,rank,nranks,solver_neumann_z_,
-                                         true,phase_serial_only_ ? 1 : phase_threads_);
+                                         true,phase_serial_only_ ? 1 : setup_threads_);
     const double t_assembly = ProfileTime(profile_);
     const auto old_partition = partition_;
     partition_ = setup.fine.row_partition;
@@ -820,7 +824,7 @@ void SelfGravity::RefreshHierarchy() {
   JoinPrefetch();
   auto refreshed = BuildGeometricHierarchy(solver_patches_,solver_domain_,
       global_variable::my_rank,global_variable::nranks,solver_neumann_z_,false,
-      phase_serial_only_ ? 1 : phase_threads_);
+      phase_serial_only_ ? 1 : setup_threads_);
   if (refreshed.hierarchy.row_partitions[0] != partition_
       || refreshed.hierarchy.matrices[0].LocalRows() != solution_.extent_int(0)) {
     Fail("hierarchy-only refresh changed fine ownership; full rebuild required");

@@ -156,7 +156,7 @@ class SelfGravity {
   std::vector<GlobalIndex> partition_;
   int topology_ = -1, max_iterations_, restart_;
   int slab_modes_x_ = 0, slab_modes_y_ = 0;
-  int phase_threads_ = 0;
+  int phase_threads_ = 0, setup_threads_ = 0;
   bool phase_serial_only_ = false;
   Real phase_ = 0, tolerance_, gravity_cfl_;
   bool phase_valid_ = false, report_each_solve_;

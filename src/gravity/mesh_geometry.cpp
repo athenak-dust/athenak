@@ -5,6 +5,7 @@
 #include "gravity/mesh_geometry.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <exception>
 #include <limits>
@@ -155,7 +156,7 @@ struct MeshGeometry::Impl {
     double shear = std::numeric_limits<double>::quiet_NaN();
   };
   std::vector<PhaseContext> phase_contexts;
-  int phase_threads = 1;
+  int phase_threads = 1, setup_threads = 1;
   std::vector<int> phase_rows;
   bool phase_rows_ready = false;
 
@@ -1198,9 +1199,11 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
       }
     }
   };
-  // The full setup uses the phase workers too (in chunks of >= 4096 rows)
+  // The full setup runs on SetupThreads() workers; the rows are cut into
+  // consecutive chunks (>= 512 rows, up to 16 per worker) taken in any order and joined
+  // in row order, which balances the much more expensive interface rows.
   const int workers = static_cast<int>(std::max<GlobalIndex>(1,std::min<GlobalIndex>(
-      std::min(m.phase_threads,AvailablePhaseCpus()),(end-begin)/4096)));
+      SetupThreads(),(end-begin)/4096)));
   if (workers == 1) {
     // Serial: write straight into the output (identical to the original loop).
     Part part;
@@ -1221,15 +1224,19 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
     out.interface = std::move(part.interface);
     if (discover_phase_rows) m.phase_rows = std::move(part.phase_rows);
   } else {
-    std::vector<Part> parts(workers);
+    const GlobalIndex rows = end-begin;
+    const int chunks = static_cast<int>(std::max<GlobalIndex>(workers,
+        std::min<GlobalIndex>(16*static_cast<GlobalIndex>(workers),rows/512)));
+    std::vector<Part> parts(chunks);
     std::vector<QuadraticCache> quadratics(workers);
     std::vector<ReconstructionFaces> faces(workers);
     std::vector<std::exception_ptr> errors(workers);
+    std::atomic<int> next{0};
     auto run = [&](int w) {
       try {
-        const GlobalIndex rows = end-begin;
-        assemble(begin+rows*w/workers,begin+rows*(w+1)/workers,parts[w],quadratics[w],faces[w]);
-      } catch (...) { errors[w] = std::current_exception(); }
+        for (int c = next++; c < chunks; c = next++)
+          assemble(begin+rows*c/chunks,begin+rows*(c+1)/chunks,parts[c],quadratics[w],faces[w]);
+      } catch (...) { errors[w] = std::current_exception(); next = chunks; }
     };
     std::vector<std::thread> threads;
     threads.reserve(workers-1);
@@ -1316,8 +1323,20 @@ void MeshGeometry::SetPhaseThreads(int threads) {
   impl_->phase_threads = std::min(threads,AvailablePhaseCpus());
 }
 
+void MeshGeometry::SetSetupThreads(int threads) {
+  if (threads < 0) throw std::invalid_argument("Gravity setup thread count must be nonnegative");
+  if (threads == 0) {
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
+    threads = AvailablePhaseCpus();
+#else
+    threads = 1;
+#endif
+  }
+  impl_->setup_threads = std::min(threads,AvailablePhaseCpus());
+}
+
 int MeshGeometry::SetupThreads() const {
-  return std::max(1,std::min(impl_->phase_threads,AvailablePhaseCpus()));
+  return std::max(1,std::min(impl_->setup_threads,AvailablePhaseCpus()));
 }
 
 int MeshGeometry::PhaseThreads() const {
