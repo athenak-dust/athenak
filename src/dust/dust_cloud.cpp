@@ -190,8 +190,6 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   }
 
   auto &t = smr_transfer;
-  t.enabled = true;
-  t.cloud_mode = true;
   t.cloud_table = table;
   t.cloud_nlev = nlev;
   t.ncoarse1 = pmesh->mesh_indcs.nx1;

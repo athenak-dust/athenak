@@ -131,7 +131,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
       if (br) Kokkos::deep_copy(DevExeSpace(), dmom, 0.0);
       auto &ustar_ = ustar;
       auto &dmom_ = dmom;
-      bool linear = composite_smr && (cloud_gather_order == 2) && transfer.cloud_mode;
+      bool linear = composite_smr && (cloud_gather_order == 2);
       int tmode = cloud_transition;
       auto ag = analytic_gather;
       Real time0 = pmy_pack->pmesh->time;
@@ -146,7 +146,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         // Production refinable-cloud advance: linear gather at the
         // midpoint, implicit-midpoint kick and drift, cloud-weight impulse deposit.  Same
         // arithmetic as dust_pc2_advance below, kept separate because the paths there
-        // (TSC, smooth_p2 / owner_overlap, the analytic gather) cost registers and occupancy.
+        // (TSC, owner_overlap, the analytic gather) cost registers and occupancy.
         if (clouds3d) {CloudAdvance3D(); return TaskStatus::complete;}
         PackGatherField(ustar);
         auto gp = gpack;

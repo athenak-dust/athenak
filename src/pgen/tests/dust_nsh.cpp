@@ -713,8 +713,7 @@ void WriteBAFields(Mesh *pm) {
       auto add = [&](const int target, const Real w) {
         if (w == 0.0) return;
         int tm = target/ncb;
-        // a halo slot: its box from the leaf traversal (computed as mb_size, dust_leaf.cpp;
-        // smooth_p2 builds no traversal but has no halo)
+        // a halo slot: its box from the leaf traversal (computed as mb_size, dust_leaf.cpp)
         Real area = (tm < nmb) ? mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2
                                : lt.box(tm,2)*lt.box(tm,3);
         Real d = mass*w/area;

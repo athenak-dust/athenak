@@ -80,7 +80,8 @@ enum class HybridForceMode {automatic=0, pc2=1, split_be=2};
 // every particle its own hat cloud: weights are exact integrals of
 // the cloud over active leaf cells, and clouds change size only by the exact B-spline
 // two-scale split (see DustGasDrag::SplitCloudsP1).
-enum class DustSMRTransfer {none=0, owner_overlap=1, smooth_p2=2, refinable_cloud=3};
+// (the value 2 was the smooth_p2 transfer, removed on 2026-10-27)
+enum class DustSMRTransfer {none=0, owner_overlap=1, refinable_cloud=3};
 
 // <dust>/refinable_mode: the validated parameter sets of the refinable clouds.
 //   standard (input value "default"): the moving P1 split, G (quantum merge under the pass budget
@@ -94,11 +95,8 @@ enum class DustSMRTransfer {none=0, owner_overlap=1, smooth_p2=2, refinable_clou
 // A key given explicitly overrides its preset value (advanced use).
 enum class RefinableMode {standard, careful_merge, split_only};
 
-// Device-copyable description of the smooth composite transfer. Each virtual coarse
-// or fine cell stores a short linear map to active leaf-cell degrees of freedom. The
-// same ForEachWeight() traversal is consumed by every gather and deposit operation.
-// In cloud_mode the struct instead holds the finest-level virtual grid of the
-// refinable-cloud transfer, and ForEachWeight(x1,x2,lev,f) dispatches to it.
+// Device-copyable description of the refinable-cloud transfer: the finest-level virtual grid
+// (and, with cloud_table, its map to the active leaves) and the 1-D cloud weights.
 struct SMRCompositeTransfer {
   // Largest 1-D cloud stencil on the finest virtual grid: 2*2^(nlev-lev)+1 cells, so
   // nine cells allow a root cloud to sit on leaves up to two levels finer.
@@ -135,8 +133,6 @@ struct SMRCompositeTransfer {
     return code;
   }
 
-  bool enabled = false;
-  bool cloud_mode = false;
   bool cloud_table = false;            // cloud_target / cloud_level built
   int cloud_nlev = 0;                 // max_level - root_level
   int cloud_max_level = 0;            // clouds are never split beyond this level
@@ -147,26 +143,10 @@ struct SMRCompositeTransfer {
   Real fine_dx1 = 0.0, fine_dx2 = 0.0;
   DvceArray2D<int> cloud_target;      // finest virtual cell -> encoded active leaf
   DvceArray2D<int> cloud_level;       // finest virtual cell -> owner level - root_level
-  bool measure_correction = true;
-  int ncoarse1 = 0, ncoarse2 = 0;
-  int nfine1 = 0, nfine2 = 0;
-  int nfine_blocks = 0;
-  int correction_tiles = 0;
+  int ncoarse1 = 0, ncoarse2 = 0;     // root cells of the mesh
+  int nfine1 = 0, nfine2 = 0;         // finest virtual cells
   Real x1min = 0.0, x1max = 0.0;
   Real x2min = 0.0, x2max = 0.0;
-  Real transition_width = 0.0;
-  Real interface_x1[2] = {0.0, 0.0};
-  Real interface_coarse_sign[2] = {0.0, 0.0};
-  DvceArray2D<int> coarse_count;
-  DvceArray3D<int> coarse_target;
-  DvceArray3D<Real> coarse_weight;
-  DvceArray2D<int> fine_count;
-  DvceArray3D<int> fine_target;
-  DvceArray3D<Real> fine_weight;
-  DvceArray2D<Real> fine_block_bounds;
-  DvceArray1D<int> correction_count;
-  DvceArray2D<int> correction_target;
-  DvceArray2D<Real> correction_weight;
 
   KOKKOS_INLINE_FUNCTION
   static int WrapIndex(const int index, const int extent) {
@@ -198,22 +178,6 @@ struct SMRCompositeTransfer {
     if (yw != y) {pr(IPY,p) = yw; pr(IPY1,p) += yw - y;}
   }
 
-  KOKKOS_INLINE_FUNCTION
-  static void VirtualTSC(const Real x, const Real xmin, const Real xmax, const int ncells,
-                         int index[3], Real weight[3]) {
-    Real dx = (xmax - xmin)/static_cast<Real>(ncells);
-    Real coordinate = (x - xmin)/dx - 0.5;
-    int nearest = static_cast<int>(floor(coordinate + 0.5));
-    Real offset = coordinate - static_cast<Real>(nearest);
-    index[0] = WrapIndex(nearest - 1, ncells);
-    index[1] = WrapIndex(nearest,     ncells);
-    index[2] = WrapIndex(nearest + 1, ncells);
-    weight[0] = 0.5*SQR(0.5 - offset);
-    weight[1] = 0.75 - SQR(offset);
-    weight[2] = 0.5*SQR(0.5 + offset);
-  }
-
-  // Cumulative distribution of the unit hat cloud S(s) = max(0, 1-|s|).
   KOKKOS_INLINE_FUNCTION
   static Real HatCDF(const Real s) {
     if (s <= -1.0) return 0.0;
@@ -455,114 +419,6 @@ struct SMRCompositeTransfer {
     int fi = WrapIndex(static_cast<int>(floor((x1 - x1min)/fine_dx1)), nfine1);
     int fj = WrapIndex(static_cast<int>(floor((x2 - x2min)/fine_dx2)), nfine2);
     return cloud_target(fj, fi);
-  }
-
-  template <typename Function>
-  KOKKOS_INLINE_FUNCTION
-  void ForEachWeight(const Real particle_x1, const Real particle_x2, const int lev,
-                     const Function &function) const {
-    if (cloud_mode) {
-      ForEachCloudWeight(particle_x1, particle_x2, lev, function);
-    } else {
-      ForEachWeight(particle_x1, particle_x2, function);
-    }
-  }
-
-  KOKKOS_INLINE_FUNCTION
-  Real FineFraction(const Real particle_x1, const Real particle_x2) const {
-    Real x1 = WrapPosition(particle_x1, x1min, x1max);
-    Real x2 = WrapPosition(particle_x2, x2min, x2max);
-    Real length1 = x1max - x1min;
-    Real length2 = x2max - x2min;
-    Real minimum_distance = 1.0e30;
-    for (int block=0; block<nfine_blocks; ++block) {
-      for (int shift2=-1; shift2<=1; ++shift2) {
-        Real lower2 = fine_block_bounds(block,2) + shift2*length2;
-        Real upper2 = fine_block_bounds(block,3) + shift2*length2;
-        Real distance2 = (x2 < lower2) ? lower2 - x2
-                       : ((x2 > upper2) ? x2 - upper2 : 0.0);
-        for (int shift1=-1; shift1<=1; ++shift1) {
-          Real lower1 = fine_block_bounds(block,0) + shift1*length1;
-          Real upper1 = fine_block_bounds(block,1) + shift1*length1;
-          Real distance1 = (x1 < lower1) ? lower1 - x1
-                         : ((x1 > upper1) ? x1 - upper1 : 0.0);
-          Real distance = sqrt(SQR(distance1) + SQR(distance2));
-          minimum_distance = fmin(minimum_distance, distance);
-        }
-      }
-    }
-    if (minimum_distance <= 0.0) return 1.0;
-    Real s = fmax(0.0, 1.0 - minimum_distance/transition_width);
-    // Quintic smoothstep: alpha, alpha', and alpha'' match at both band edges.
-    return s*s*s*(10.0 + s*(-15.0 + 6.0*s));
-  }
-
-  template <typename Function>
-  KOKKOS_INLINE_FUNCTION
-  void ForEachWeight(const Real particle_x1, const Real particle_x2,
-                     const Function &function) const {
-    Real x1 = WrapPosition(particle_x1, x1min, x1max);
-    Real x2 = WrapPosition(particle_x2, x2min, x2max);
-    Real alpha = FineFraction(x1, x2);
-    int index1[3], index2[3];
-    Real weight1[3], weight2[3];
-
-    VirtualTSC(x1, x1min, x1max, ncoarse1, index1, weight1);
-    VirtualTSC(x2, x2min, x2max, ncoarse2, index2, weight2);
-    Real coarse_fraction = 1.0 - alpha;
-    for (int b=0; b<3; ++b) {
-      for (int a=0; a<3; ++a) {
-        Real virtual_weight = coarse_fraction*weight2[b]*weight1[a];
-        int count = coarse_count(index2[b], index1[a]);
-        for (int entry=0; entry<count; ++entry) {
-          function(coarse_target(index2[b],index1[a],entry),
-                   virtual_weight*coarse_weight(index2[b],index1[a],entry));
-        }
-      }
-    }
-
-    VirtualTSC(x1, x1min, x1max, nfine1, index1, weight1);
-    VirtualTSC(x2, x2min, x2max, nfine2, index2, weight2);
-    for (int b=0; b<3; ++b) {
-      for (int a=0; a<3; ++a) {
-        Real virtual_weight = alpha*weight2[b]*weight1[a];
-        int count = fine_count(index2[b], index1[a]);
-        for (int entry=0; entry<count; ++entry) {
-          function(fine_target(index2[b],index1[a],entry),
-                   virtual_weight*fine_weight(index2[b],index1[a],entry));
-        }
-      }
-    }
-
-    if (!measure_correction) return;
-
-    // Measure-preserving correction. Each interface/y-tile defect is the integral of
-    // the raw blended row relative to G_H. The normalized compact profiles integrate
-    // to one, so subtracting them restores every active-leaf column integral while
-    // retaining the tile defect's zero zeroth and first moments.
-    Real domain_length1 = x1max - x1min;
-    Real coarse_dx2 = (x2max - x2min)/static_cast<Real>(ncoarse2);
-    int yindex[3];
-    Real yweight[3];
-    VirtualTSC(x2, x2min, x2max, ncoarse2, yindex, yweight);
-    for (int interface=0; interface<2; ++interface) {
-      Real offset = x1 - interface_x1[interface];
-      if (offset < -0.5*domain_length1) offset += domain_length1;
-      if (offset >= 0.5*domain_length1) offset -= domain_length1;
-      Real distance = interface_coarse_sign[interface]*offset;
-      if (!(distance > 0.0 && distance < transition_width)) continue;
-      Real s = distance/transition_width;
-      Real profile1 = 140.0*s*s*s*SQR(1.0-s)*(1.0-s)/transition_width;
-      for (int b=0; b<3; ++b) {
-        int tile = interface*ncoarse2 + yindex[b];
-        Real profile = profile1*yweight[b]/coarse_dx2;
-        int count = correction_count(tile);
-        for (int entry=0; entry<count; ++entry) {
-          function(correction_target(tile,entry),
-                   -profile*correction_weight(tile,entry));
-        }
-      }
-    }
   }
 };
 
@@ -1223,19 +1079,14 @@ struct DustHalo {
 #endif
 };
 
-// the weights of a particle on the composite transfer, as
-// SMRCompositeTransfer::ForEachWeight(x1, x2, code, f): refinable clouds on the actual leaves
-// (anchor block m), the smooth transfer (smooth_p2, owner_overlap) on its own maps
+// the weights of a particle on the composite transfer: refinable clouds
+// on the actual leaves (anchor block m)
 template <typename Function>
 KOKKOS_INLINE_FUNCTION
 void ForEachCompositeWeight(const SMRCompositeTransfer &t, const LeafTraversal &lt,
                             const Real x1, const Real x2, const int code, const int m,
                             const Function &function) {
-  if (t.cloud_mode) {
-    lt.ForEachCloudWeight(x1, x2, code, m, function);
-  } else {
-    t.ForEachWeight(x1, x2, function);
-  }
+  lt.ForEachCloudWeight(x1, x2, code, m, function);
 }
 
 //----------------------------------------------------------------------------------------
@@ -1687,8 +1538,7 @@ class DustGasDrag {
     hybrid_last_chi = 0.0;
   }
   bool UsesCompositeTransfer() const {
-    return (smr_transfer_mode == DustSMRTransfer::smooth_p2 ||
-            smr_transfer_mode == DustSMRTransfer::refinable_cloud);
+    return smr_transfer_mode == DustSMRTransfer::refinable_cloud;
   }
   // u* is exchanged into the ghost cells for the TSC gather and for the linear cloud gather
   // (central differences); the piecewise-constant composite gathers read leaf cells only
@@ -1751,7 +1601,6 @@ class DustGasDrag {
   Real DragStep(Driver *pdrive) const;
   // default particle mass/species/stopping-time initialization (pgen may override)
   void SetDefaultMasses(ParameterInput *pin);
-  void BuildSMRCompositeTransfer(ParameterInput *pin);
   void BuildRefinableCloudTransfer(ParameterInput *pin);
   // dynamic mesh (dust_amr.cpp): rebuild the leaf maps, mark
   // the cached masks stale, set PGID from the positions and the particle time step again

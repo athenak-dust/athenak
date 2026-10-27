@@ -14,7 +14,7 @@
 //!      refinable clouds, 3-D: the exact integrals of the cloud shapes over the active leaves
 //!        (DepositCloudDensity3D, the leaf traversal of the coupling; shear-periodic images,
 //!        physical x3 faces mirrored back);
-//!      refinable clouds, 2-D (and smooth_p2): the composite weights of the coupling on the
+//!      refinable clouds, 2-D: the composite weights of the coupling on the
 //!        leaves (ForEachCompositeWeight), the halo parts added to their owners;
 //!      point particles, 3-D: the coupling's stencil (<dust>/deposit) on the owner block, the
 //!        ghost parts remapped conservatively onto the leaves they overlap (DepRemapPlan:
@@ -58,12 +58,10 @@ const char *StencilName(const DustDeposit d) {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ScienceRepresentationId
-//! \brief refinable_hat (refinable clouds), smooth_p2 (the 2-D composite control), or
-//! <stencil>_owner (point particles: the coupling's stencil on the owner block's cells).
+//! \brief refinable_hat (refinable clouds) or <stencil>_owner (point particles: the coupling's stencil on the owner block's cells).
 
 std::string DustGasDrag::ScienceRepresentationId() const {
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) return "refinable_hat";
-  if (smr_transfer_mode == DustSMRTransfer::smooth_p2) return "smooth_p2";
   return std::string(StencilName(deposit)) + "_owner";
 }
 
@@ -98,8 +96,6 @@ void DustGasDrag::ScienceRepresentation(std::ostream &os) const {
        << "along x3)\n";
     os << "mesh_deposit = exact integral of the cloud shape over the active leaf cells "
        << "(uniform level-0 mesh: canonical TSC)\n";
-  } else if (id == "smooth_p2") {
-    os << "mesh_deposit = smooth_p2 composite transfer (2-D control; see the source)\n";
   } else {
     os << "stencil = " << StencilName(deposit) << "  # on the cells of the owner MeshBlock "
        << "(the block whose half-open box holds x_p)\n";
@@ -187,10 +183,9 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
       for (int c=0; c<nc; ++c) o(m,c,k,j,i) = f(m,c,k,j,i);
     });
   } else if (UsesCompositeTransfer()) {
-    // ---- 2-D refinable clouds (and the smooth_p2 control): composite weights on the leaves
+    // ---- 2-D refinable clouds: composite weights on the leaves
     const auto transfer = smr_transfer;
     const auto lt = leaf_traversal;
-    const bool cloud = transfer.cloud_mode;
     const int ncb = nc1*nc2;
     const int nslot = (global_variable::nranks > 1) ? std::max(nmb, lt.nfld) : nmb;
     const int nc = mass_only ? 1 : 4;
@@ -204,8 +199,7 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
                              lt.Anchor(pi(PGID,p)),
       [&](const int target, const Real w) {
         const int tm = target/ncb;
-        const Real area = cloud ? lt.box(tm,2)*lt.box(tm,3)
-                                : mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2;
+        const Real area = lt.box(tm,2)*lt.box(tm,3);
         const Real d = mass*w/area;
         DepositAdd(&f0(0,target), d);
         if (mass_only) return;

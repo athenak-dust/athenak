@@ -1134,19 +1134,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       int nccells2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*(indcs.ng)) : 1;
       int nccells3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*(indcs.ng)) : 1;
       Kokkos::realloc(cdummy, nmb, 3, nccells3, nccells2, nccells1);
-    } else {
-      BuildSMRCompositeTransfer(pin);
-      if (global_variable::my_rank == 0) {
-        std::cout << "# WARNING (dust): experimental static-SMR smooth_p2 transfer is "
-                  << "enabled. Gather and deposition share one composite leaf stencil. ";
-        if (smr_transfer.measure_correction) {
-          std::cout << "The construction-time uniform-loading audit passed, but SI "
-                    << "convergence is not certified" << std::endl;
-        } else {
-          std::cout << "The raw blend has a known uniform-loading defect and is for "
-                    << "diagnostics only" << std::endl;
-        }
-      }
     }
   }
   if (drag_solver != DustDragSolver::local) {
