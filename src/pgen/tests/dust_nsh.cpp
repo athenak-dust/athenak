@@ -1474,6 +1474,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       pin->GetOrAddBoolean("shearing_box", "stratified", false);
   std::vector<Real> hps;            // per-species H_p (new keys, stratified)
   std::vector<Real> finside;        // fraction of each species' Gaussian inside its sampling range
+  // Z with column_normalization = redraw (the default, Athena-C):
+  // the whole column Z Sigma_g A inside the cut (box, or dust_zcut inside it): gaussian samples
+  // drawn again outside the cut with unchanged masses, weights divided by f_in (wnorm)
+  bool redraw = false;
+  std::vector<Real> wnorm;          // per species: the factor of the weights (redraw: 1/f_in)
   Real mg_box = 0.0;                // the initial gas mass of the box (Z with domain)
   if (new_init) {
     if (spt->abundance == "Z" && !strat_setup) {
@@ -1498,6 +1503,9 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
         const Real r2 = std::sqrt(2.0)*hps[sp];
         finside[sp] = 0.5*(std::erf(zhi/r2) - std::erf(zlo/r2));
       }
+      redraw = (spt->abundance == "Z" && spt->column_normalization == "redraw");
+      wnorm.assign(nspec, 1.0);
+      if (redraw) for (int sp=0; sp<nspec; ++sp) wnorm[sp] = 1.0/finside[sp];
       if (spt->abundance == "Z" && spt->column_normalization == "domain") {
         // the gas mass of the box as the initialisation below sets it (cell centres)
         const Real rho0g = pin->GetOrAddReal("problem", "rho0", 1.0);
@@ -1525,7 +1533,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
         const Real rho0g = pin->GetOrAddReal("problem", "rho0", 1.0);
         const Real area = (ms.x1max - ms.x1min)*(ms.x2max - ms.x2min);
         for (int sp=0; sp<nspec; ++sp) {
-          if (spt->column_normalization == "full_profile") {
+          if (spt->column_normalization != "domain") {   // full_profile and redraw
             eps[sp] = static_cast<Real>(spt->value[sp])*hg/hps[sp];
           } else {
             eps[sp] = static_cast<Real>(spt->value[sp])*mg_box/
@@ -1594,7 +1602,10 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     const Real fcut = (zcut > 0.0) ? 1.0/std::erf(zcut/(std::sqrt(2.0)*hpz)) : 1.0;
     std::vector<Real> as(nspec, a), fcs(nspec, fcut);
     if (new_init) {
-      for (int s=0; s<nspec; ++s) {as[s] = 1.0/(hps[s]*hps[s]) - 1.0/(hg*hg); fcs[s] = 1.0;}
+      for (int s=0; s<nspec; ++s) {
+        as[s] = 1.0/(hps[s]*hps[s]) - 1.0/(hg*hg);
+        fcs[s] = redraw ? 1.0/finside[s] : 1.0;   // redraw: the column inside the cut
+      }
     }
     std::vector<Real> ez(nspec), vxz(nspec, 0.0), vpz(nspec, 0.0);
     for (int n=0; n<nt; ++n) {
@@ -1871,7 +1882,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       } else if (domain) {
         tgt[sp] = spt->value[sp]*mg_box;
       } else {
-        tgt[sp] = eps[sp]*rho0*std::sqrt(2.0*M_PI)*hps[sp]*finside[sp]*area;
+        tgt[sp] = eps[sp]*rho0*std::sqrt(2.0*M_PI)*hps[sp]*(redraw ? 1.0 : finside[sp])*area;
       }
     }
     // the scaling corrects a real mismatch (the weight-sampled lattice); a gaussian sample has the
@@ -1899,6 +1910,9 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
         if (strat_setup) {
           o << ", H_p = " << hps[sp] << ", midplane epsilon0 = " << eps[sp]
             << ", fraction of the profile in the sampling range " << finside[sp];
+          if (redraw) {
+            o << " (redraw: all of Z Sigma_g A inside, midplane ratio " << eps[sp]/finside[sp] << ")";
+          }
         }
         o << ", target mass " << tgt[sp] << ", particle mass " << act[sp] << ", rel_error "
           << std::setprecision(3) << ((tgt[sp] > 0.0) ? act[sp]/tgt[sp] - 1.0 : 0.0)
@@ -1998,8 +2012,11 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       place.zcut = pin->GetOrAddReal("problem", "dust_zcut", 0.0);
       if (place.zcut > 0.0 && global_variable::my_rank == 0) {
         std::cout << "# dust_zcut: Gaussian truncated to |z| < " << place.zcut;
-        if (new_init) {   // the profile is cut, not renormalised
+        if (new_init && !redraw) {   // epsilon_N, full_profile, domain: cut
           std::cout << ", the mass of the profile inside only (new species keys)" << std::endl;
+        } else if (new_init) {   // redraw: all of the column inside, per species
+          std::cout << ", redraw: all of Z Sigma_g A inside, density inside x 1/f_in (per species, "
+                    << "the mass audit below)" << std::endl;
         } else {
           std::cout << ", density inside x " << 1.0/std::erf(place.zcut/(std::sqrt(2.0)*place.hp))
                     << std::endl;
@@ -2087,15 +2104,23 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // per species: the Gaussian factor of the equal masses and the H_p of the weights (legacy:
     // the single values; per species, the Gaussian masses times the fraction of
     // the profile inside the sampling range, so a truncated profile carries less mass)
+    // redraw: the gaussian masses without f_in (all of the column inside), the
+    // weights times 1/f_in
     DualArray1D<Real> sgf("nsh_species_gfac", nspec), shpv("nsh_species_hpw", nspec);
+    DualArray1D<Real> swn("nsh_species_wnorm", nspec);
     for (int sp=0; sp<nspec; ++sp) {
-      sgf.h_view(sp) = new_init && strat ? std::sqrt(2.0*M_PI)*hps[sp]/place.lz*finside[sp] : gfac;
+      sgf.h_view(sp) = new_init && strat ? std::sqrt(2.0*M_PI)*hps[sp]/place.lz*
+                                           (redraw ? 1.0 : finside[sp]) : gfac;
       shpv.h_view(sp) = new_init && strat ? hps[sp] : shp;
+      swn.h_view(sp) = (new_init && strat) ? wnorm[sp] : 1.0;
     }
     sgf.template modify<HostMemSpace>(); sgf.template sync<DevExeSpace>();
     shpv.template modify<HostMemSpace>(); shpv.template sync<DevExeSpace>();
+    swn.template modify<HostMemSpace>(); swn.template sync<DevExeSpace>();
     auto sgfd = sgf.d_view;
     auto shpd = shpv.d_view;
+    auto swnd = swn.d_view;
+    const bool wscale = redraw && !gsamp;
     auto mblev0 = pmbp->pmb->mb_lev;
     const int rootlev0 = pmy_mesh_->root_level;
     const bool nshz = nsh_vertical;
@@ -2124,6 +2149,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
         // gaussian: the equal mass eps rho0 sqrt(2 pi) Hp Lx Ly / (parents of the
         // species) = (the uniform root mass) sqrt(2 pi) Hp / Lz
         pr0(IPM,p) *= gsamp ? sgfd(sp) : exp(-0.5*z*z/(shpd(sp)*shpd(sp)));
+        if (wscale) pr0(IPM,p) *= swnd(sp);
         pr0(IPVZ,p) = svz0; pr0(IPVZ1,p) = svz0;
       }
       if (nshz) {   // the NSH drift at the height of the parent
@@ -2492,10 +2518,16 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     const Real hgas = pmbp->phydro->peos->eos_data.iso_cs/omega0;
     // the new keys: per-species H_p; legacy: the single dust_hp
     const Real hp = new_init ? hps[0] : pin->GetOrAddReal("problem", "dust_hp", hgas);
-    DualArray1D<Real> hpv("nsh_strat_hp", nspec);
-    for (int sp=0; sp<nspec; ++sp) hpv.h_view(sp) = new_init ? hps[sp] : hp;
+    DualArray1D<Real> hpv("nsh_strat_hp", nspec), wnv("nsh_strat_wnorm", nspec);
+    for (int sp=0; sp<nspec; ++sp) {
+      hpv.h_view(sp) = new_init ? hps[sp] : hp;
+      wnv.h_view(sp) = new_init ? wnorm[sp] : 1.0;   // redraw: 1/f_in
+    }
     hpv.template modify<HostMemSpace>(); hpv.template sync<DevExeSpace>();
+    wnv.template modify<HostMemSpace>(); wnv.template sync<DevExeSpace>();
     auto hpd = hpv.d_view;
+    auto wnd = wnv.d_view;
+    const bool wscale = redraw;
     const Real vz0 = pin->GetOrAddReal("problem", "dust_vz0", 0.0);
     auto &prs = ppar->prtcl_rdata;
     auto &pis = ppar->prtcl_idata;
@@ -2505,6 +2537,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
       const Real z = prs(IPZ,p);
       const Real h = hpd(pis(PSP,p));
       prs(IPM,p) *= exp(-0.5*z*z/(h*h));
+      if (wscale) prs(IPM,p) *= wnd(pis(PSP,p));
       prs(IPVZ,p) += vz0;
       if (nshz) {   // the NSH drift at the height of the particle
         const int s = pis(PSP,p);

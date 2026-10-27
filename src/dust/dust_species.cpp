@@ -272,12 +272,13 @@ SpeciesTable Parse(ParameterInput *pin) {
     }
   }
   if (t.abundance == "Z") {
-    if (!Has(pin, D, "column_normalization")) {
-      Fail("Z needs <dust>/column_normalization = full_profile | domain");
-    }
-    t.column_normalization = pin->GetString(D, "column_normalization");
-    if (t.column_normalization != "full_profile" && t.column_normalization != "domain") {
-      Fail("<dust>/column_normalization must be full_profile or domain");
+    // Rixin: chose redraw (Athena-C) as the default; full_profile and domain
+    // are explicit alternatives
+    t.column_normalization = Has(pin, D, "column_normalization") ?
+        pin->GetString(D, "column_normalization") : std::string("redraw");
+    if (t.column_normalization != "redraw" && t.column_normalization != "full_profile" &&
+        t.column_normalization != "domain") {
+      Fail("<dust>/column_normalization must be redraw (default), full_profile or domain");
     }
   } else if (Has(pin, D, "column_normalization")) {
     Fail("column_normalization belongs to Z (column ratios), not to epsilon");
@@ -368,7 +369,7 @@ std::string SpeciesTable::Describe(const std::string &pre) const {
 //   stopping_times <source>          (tau_s_N | stokes_N | powerlaw (...) | taus_N (legacy))
 //   omega_ref <Omega of the Stokes numbers, 0: none>
 //   abundance epsilon | Z | legacy
-//   column_normalization full_profile | domain | -
+//   column_normalization redraw | full_profile | domain | -
 //   species <input index> tau_s <t> stokes <St | -> <epsilon | Z | value> <v | -> ppc <n | -> H_p <h | ->
 std::string SpeciesTable::Record() const {
   std::ostringstream r;
