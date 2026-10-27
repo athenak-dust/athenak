@@ -315,9 +315,9 @@ void SetupDensityTrigger(ParameterInput *pin) {
 //! needs is refined (or kept from derefining); if one level up is not enough, the refinement of
 //! the opposite blocks above omax of its target is cancelled instead.  Repeated until nothing
 //! changes (the current mesh is assumed valid, so cancelling always succeeds).  Not covered: the
-//! tree's 2:1 balance after the trigger can refine further face blocks; with at most dmax + 1
-//! levels below the finest (3 levels for 8x16x8 and 16^3 limits) it only lifts root blocks and
-//! cannot break the limit, with more levels the exchange stops with its own error.
+//! tree's 2:1 balance after the trigger can refine further face blocks, up to lmax - 1; omax(l) >=
+//! dmax for every l, so this is safe while lmax <= dmax + 1 (8x16x8: up to 3 levels, 16^3: up to
+//! 4); with more levels the exchange may stop with its own error.
 void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
   Mesh *pm = pmbp->pmesh;
   if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) return;
