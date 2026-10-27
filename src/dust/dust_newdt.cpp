@@ -119,7 +119,7 @@ TaskStatus DustGasDrag::ComputeNewTimeStep(Driver *pdrive, int stage) {
 
   particles::Particles *ppar = pmy_pack->ppart;
   int npart = ppar->nprtcl_thispack;
-  // As in AthenaSG (new_dt.c): with stiff_thresh > 0 the next PC2 step keeps
+  // as in AthenaSG new_dt.c: with stiff_thresh > 0 the next PC2 step keeps
   // chi = dt*max_rate <= stiff_thresh, from the global max rate of this cycle's predictor (the same
   // on every rank, also on ranks without particles)
   const Real dt_stiff = (stiff_thresh > 0.0 && stiff_rate_max > 0.0 &&

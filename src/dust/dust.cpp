@@ -43,7 +43,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     solver_p("dust_solver_p",1,1,1,1,1),
     solver_ap("dust_solver_ap",1,1,1,1,1),
     pmy_pack(ppack) {
-  // The compile-time choices of the dust module, once at start
+  // print the compile-time choices of the dust module once at start
   // (DUST_CLOUD_LAUNCH_BOUNDS: dust.hpp; DUST_R_QR_COLUMNS, DUST_R_DIAG: dust_resample.hpp)
   {
     static bool told = false;
@@ -104,7 +104,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
               << "or hybrid requires integrator=rk2" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // keys of the development branches that are no longer read (one NOTE each; the run goes on).
+  // keys of earlier versions that are no longer read (one NOTE each; the run goes on).
   // Refined meshes, adaptive refinement, 3-D and several MPI ranks need no opt-in (the supported
   // configurations are checked below, in CheckMultiRank and in CheckClouds3D).
   if (global_variable::my_rank == 0) {
@@ -141,19 +141,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                 << std::endl;
     }
   }
-  // S3b: refinable clouds on a 3-D mesh (dust_cloud3d.cpp)
+  // refinable clouds on a 3-D mesh (dust_cloud3d.cpp)
   clouds3d = pmy_pack->pmesh->three_d && smr_transfer_mode == DustSMRTransfer::refinable_cloud;
-  // Stage 4: shear-periodic x1 in the leaf traversal (the cloud supports across
+  // shear-periodic x1 in the leaf traversal (the cloud supports across
   // the radial boundaries on the sheared image)
   shear3d = clouds3d &&
       pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
   // (test) false: particles crossing an x1 face after the push take the shear offset of the start
   // of the step, as the routing of point particles does
   if (shear3d) shear3d_route_fix = pin->GetOrAddBoolean("dust", "cloud_shear_route_time", true);
-  // Rixin: default on (history bitwise equal)
+  // cache the shear-image lists (default on; bitwise the same results as without the cache)
   if (shear3d) shear3d_list_cache = pin->GetOrAddBoolean("dust", "cloud_shear_list_cache", true);
-  // 3-D clouds at physical x3 faces fold their supports back (the drop mode has
-  // no cloud version)
+  // 3-D clouds at physical x3 faces fold their supports back (dropping the ghost deposits has no
+  // cloud version)
   if (clouds3d && pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
       pin->GetOrAddString("dust", "x3_ghost_deposit", "fold") != "fold") {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -161,19 +161,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
               << "(the supports fold back)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // Rixin: set the default to 4 (the balance of clouds per rank, fastest of 1 / 2 / 4); 0 gives
+  // default 4 (the best balance of clouds per rank, fastest of 1 / 2 / 4); 0 gives
   // every new block the cost 1 as AthenaK does; one rank never uses it
   lb_cloud_weight = pin->GetOrAddReal("dust", "load_balance_cloud_weight", 4.0);
   if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {   // (block map: the only one)
     halo_trigger_cells = std::max(0, pin->GetOrAddInteger("dust", "amr_rho_buffer", 2));
   }
   if (pmy_pack->pmesh->multilevel) {
-    // The fenced phase profile (DUST_AMR_PROFILE) only on request; its fences make the
+    // the fenced phase profile (DUST_AMR_PROFILE) only on request; its fences make the
     // host wait for the device several times per cycle
     ProfOn() = pin->GetOrAddBoolean("dust", "amr_profile", false);
     // static or adaptive refinement (dust_amr.cpp: the dust state is rebuilt
     // after every regrid): a 2-D periodic mesh, or a 3-D mesh with periodic or shear-periodic x1
-    // (for owner_overlap and refinable clouds), periodic x2 and periodic or physical x3
+    // (owner_overlap or refinable clouds), periodic x2 and periodic or physical x3
     // faces; the boundaries are checked below
     if (!((pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic) ||
           pmy_pack->pmesh->three_d)) {
@@ -185,7 +185,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   bool shear_x1 = (pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] ==
                    BoundaryFlag::shear_periodic);
-  // Physical x3 faces in 3-D (a stratified box, S3c): particles reflect or leave
+  // physical x3 faces in 3-D (a stratified box): particles reflect or leave
   // (<dust>/particle_x3_bc), ghost deposits beyond the faces fold back (or are dropped,
   // <dust>/x3_ghost_deposit); the PC2 gather reads the gas ghost cells of the gas boundary
   // conditions, imex and the automatic hybrid the u* ghost cells.
@@ -205,7 +205,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     }
     // imex and the automatic hybrid read u*, which gets x3 boundary values
     // (DustGasDrag::UstarX3BCs); every coupling is allowed
-    // S3a: the ghost deposits across the shear-periodic faces are moved
+    // the ghost deposits across the shear-periodic faces are moved
     // to the opposite face with the shear offset (DepRemapPlan); the u* ghost fill is remapped
   }
   // AthenaK's time step is cfl_number times the smallest dx/(|v| + c)
@@ -242,7 +242,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   stopping_times_initialized = false;
   dt_cfl        = pin->GetOrAddReal("dust","dt_cfl",0.5);
-  // Dust API: <dust>/dust_to_gas is the legacy total (to be deprecated); with
+  // <dust>/dust_to_gas is the legacy total (to be deprecated); with
   // the new abundance keys it is not read (mixing is an error, dust_species.cpp) and holds the
   // sum of epsilon_N / Z_N for the default masses
   {
@@ -254,11 +254,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   hybrid_enter_chi  = pin->GetOrAddReal("dust", "hybrid_enter_chi", 0.5);
   hybrid_exit_zeta  = pin->GetOrAddReal("dust", "hybrid_exit_zeta", 0.25);
   hybrid_exit_chi   = pin->GetOrAddReal("dust", "hybrid_exit_chi", 0.25);
-  // PC2 feedback stiffness monitor, optional dt limit and predictor damping.  Rixin:
-  // the damping (as Athena-C) on by default, the dt limit left to the user (off)
+  // PC2 feedback stiffness monitor, optional dt limit and predictor damping: the damping (as
+  // Athena-C) on by default, the dt limit left to the user (off)
   stiff_thresh = pin->GetOrAddReal("dust", "stiff_thresh", -1.0);
-  // The IMEX gas gets the lumped solve's change plus its mass share of the residual (3-D
-  // clouds; false = the gas takes the clouds' whole impulse, as before)
+  // the IMEX gas gets the lumped solve's change plus its mass share of the residual (3-D
+  // clouds; false = the gas takes the clouds' whole impulse)
   imex_consistent_gas = pin->GetOrAddBoolean("dust", "imex_consistent_gas", true);
   pc2_feedback_damping = pin->GetOrAddBoolean("dust", "pc2_feedback_damping", true);
   if (!(hybrid_enter_zeta > hybrid_exit_zeta && hybrid_exit_zeta >= 0.0 &&
@@ -376,7 +376,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
 
   // per-species stopping times from the resolved species table (dust_species.cpp):
-  // tau_s_N, stokes_N or the power law; the legacy taus_N (to be deprecated) as before
+  // tau_s_N, stokes_N or the power law, or the legacy taus_N (to be deprecated)
   {
     const SpeciesTable &st = Species(pin);
     nspecies = st.nspecies;
@@ -429,7 +429,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       {
         const bool given = pin->DoesParameterExist("dust", "refinable_mode");
         std::string mode = given ? pin->GetString("dust", "refinable_mode") : "default";
-        // the switch of the development branches maps onto careful_merge
+        // the old key cloud_quiet_protection maps onto careful_merge
         if (pin->DoesParameterExist("dust", "cloud_quiet_protection")) {
           const bool q = pin->GetBoolean("dust", "cloud_quiet_protection");
           if (q && given && mode != "careful_merge") {
@@ -510,38 +510,37 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << "requires cloud_gather_order=2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      // The Kokkos P1 split on every backend (Codex review; it runs on CPUs
+      // the Kokkos P1 split on every backend (it runs on CPUs
       // too); the host split needs the finite fine-grid table (few levels, one rank) and stays a
       // reference, selected explicitly
       cloud_split_device = pin->GetOrAddBoolean("dust", "cloud_split_device", true);
-      // Test switch: false keeps every cloud at its level whatever the mesh
+      // test switch; false keeps every cloud at its level whatever the mesh
       cloud_split_enable = pin->GetOrAddBoolean("dust", "cloud_split_enable", true);
       // G (quantum merge under the pass budget): on in default and careful_merge (a full AMR
       // needs a coarsening channel), off in split_only
       cloud_merge = preset_bool("cloud_merge", !split_only);
       cloud_merge_buffer = pin->GetOrAddInteger("dust", "cloud_merge_buffer", 2);
-      // Rixin: production alpha
-      // 0.2 in 3-D (0.05 in 2-D); alpha H / tau lets the merged cloud's
+      // production alpha 0.2 in 3-D (0.05 in 2-D); alpha H / tau lets the merged cloud's
       // velocity error move its mass by at most alpha cells within one damping time
       cloud_merge_alpha = pin->GetOrAddReal("dust", "cloud_merge_alpha",
                                             pmy_pack->pmesh->three_d ? 0.2 : 0.05);
-      // The 3-D G velocity tolerance on the cell size of the leaf
+      // the 3-D G velocity tolerance on the cell size of the leaf
       // that holds the merge cell (alpha 2^gap H / tau when the leaf is gap levels coarser);
-      // Rixin: on by default
+      // on by default
       cloud_merge_alpha_leaf = pin->GetOrAddBoolean("dust", "cloud_merge_alpha_leaf", true);
       cloud_merge_interval = pin->GetOrAddInteger("dust", "cloud_merge_interval", 10);
       cloud_merge_min_mass = pin->GetOrAddReal("dust", "cloud_merge_min_mass", 0.5);
       cloud_merge_nc = pin->GetOrAddBoolean("dust", "cloud_merge_nc", true);
       cloud_merge_lobe_wait = pin->GetOrAddInteger("dust", "cloud_merge_lobe_wait", 0);
-      // Quantum G and several ranks exist only in the Kokkos merge
+      // quantum G and several ranks exist only in the Kokkos merge
       cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", true);
-      // Merge schedule in physical time, burst after derefinement
+      // merge schedule in physical time, burst after derefinement
       {
         Real om = 0.0;
         if (pin->DoesBlockExist("shearing_box") && pin->DoesParameterExist("shearing_box", "omega0")) {
           om = pin->GetReal("shearing_box", "omega0");
         }
-        // Rixin: physical time (every cloud_merge_dt_omega = 0.25
+        // physical time (every cloud_merge_dt_omega = 0.25
         // / omega0) whenever omega0 is given, cycles otherwise
         const std::string ms = pin->GetOrAddString("dust", "cloud_merge_schedule",
                                                    (om > 0.0) ? "time" : "cycle");
@@ -568,7 +567,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         if (cloud_merge_burst_interval < 1) fatal("cloud_merge_burst_interval must be >= 1");
       }
       {
-        // Quantum G by default; tent stays a research control
+        // quantum G by default; tent stays a research control
         std::string mode = pin->GetOrAddString("dust", "cloud_merge_mode", "quantum");
         if (mode == "tent") cloud_merge_mode = 0;
         else if (mode == "quantum") cloud_merge_mode = 1;
@@ -579,7 +578,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       // stage X (the exact stencil re-merge before G in quantum mode): careful_merge only
       cloud_merge_stencil = preset_bool("cloud_merge_stencil", careful);
-      // Rixin: no X in a 3-D shearing box: the background shear pulls the
+      // no X in a 3-D shearing box: the background shear pulls the
       // members of a P1 family apart in x2 (q Omega l per unit time), so no family is ever complete
       // again.  G with its budget (beta, kappa) and R with the cold gate stay available there.
       if (shear_x1 && pmy_pack->pmesh->three_d && cloud_merge_stencil) {
@@ -599,17 +598,16 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_stencil_tol = pin->GetOrAddReal("dust", "cloud_merge_stencil_tol", 0.02);
       cloud_merge_smax = pin->GetOrAddReal("dust", "cloud_merge_smax", 1.0);
       cloud_merge_K = pin->GetOrAddInteger("dust", "cloud_merge_K", 4);
-      // Merged clouds keep their members' common ts (default); false reproduces the
-      // runs before 2026-10-16, where ts was mass-averaged with the velocities (last-bit drift)
+      // merged clouds keep their members' common ts (default); false mass-averages ts with the
+      // velocities (last-bit drift)
       cloud_merge_exact_ts = pin->GetOrAddBoolean("dust", "cloud_merge_exact_ts", true);
       cloud_merge_g_lag = pin->GetOrAddInteger("dust", "cloud_merge_g_lag", 2);
       cloud_merge_xprotect = pin->GetOrAddBoolean("dust", "cloud_merge_xprotect", false);
       // the mass floor of the pass budget (named after the absorption budget)
       cloud_absorb_floor = pin->GetOrAddReal("dust", "cloud_absorb_floor", 0.1);
-      // Rixin: the production pass budget beta = 0.3 (was -1,
-      // no budget); cloud_merge_budget = -1 switches it off
+      // the production pass budget beta = 0.3; cloud_merge_budget = -1 switches it off
       cloud_merge_budget = pin->GetOrAddReal("dust", "cloud_merge_budget", 0.3);
-      // The structure-relative budget (careful_merge: 1; 0 = off)
+      // the structure-relative budget (careful_merge: 1; 0 = off)
       cloud_merge_budget_kappa = preset_real("cloud_merge_budget_kappa", careful ? 1.0 : 0.0);
       cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
       cloud_merge_budget_thin = pin->GetOrAddBoolean("dust", "cloud_merge_budget_thin", false);
@@ -617,8 +615,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // R (resampling) on in default and careful_merge, with the production clock below; off in
       // split_only
       cloud_resample = preset_bool("cloud_resample", !split_only);
-      // <dust>/cloud_resample_schedule = cycle (default: every
-      // cloud_resample_interval cycles, as before) or time (event k at t0 + k dt, dt from
+      // <dust>/cloud_resample_schedule = cycle (every
+      // cloud_resample_interval cycles) or time (event k at t0 + k dt, dt from
       // cloud_resample_dt in code time or cloud_resample_dt_omega in units of 1/omega0).  Only
       // the chosen mode triggers; keys of the other mode are ignored with a warning (the input
       // kept in a restart file still carries them when a run switches modes at a restart).
@@ -637,11 +635,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
             pin->DoesParameterExist("shearing_box", "omega0")) {
           cloud_resample_omega = pin->GetReal("shearing_box", "omega0");
         }
-        // Rixin: physical time whenever omega0 is given (every
+        // physical time whenever omega0 is given (every
         // cloud_resample_dt_omega = 1 / omega0 unless cloud_resample_dt is given), cycles otherwise
         const std::string sched = pin->GetOrAddString("dust", "cloud_resample_schedule",
                                                       (cloud_resample_omega > 0.0) ? "time" : "cycle");
-        // Rixin: every 0.25 / omega0 (was 1), with no resampling after the
+        // every 0.25 / omega0 by default, with no resampling after the
         // regrids: G and R on their schedules only
         if (sched == "time" && !g_dt && !g_dto && cloud_resample_omega > 0.0) {
           pin->GetOrAddReal("dust", "cloud_resample_dt_omega", 0.25);
@@ -684,55 +682,53 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       if (!cloud_resample_by_time) {
         cloud_resample_interval = pin->GetOrAddInteger("dust", "cloud_resample_interval", 625);
       }
-      // Rixin: the production cap factor (was 2.0)
+      // the production cap factor
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 1.5);
-      // Resampling leaves cold patches alone (careful_merge: 0.05; 0 = off)
+      // resampling leaves cold patches alone (careful_merge: 0.05; 0 = off)
       cloud_resample_cold_alpha = preset_real("cloud_resample_cold_alpha", careful ? 0.05 : 0.0);
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
-      // Patches inside one MeshBlock of min(cloud_resample_patch 2^level,
+      // patches inside one MeshBlock of min(cloud_resample_patch 2^level,
       // cloud_resample_patch_cells)^2 of its cells
       cloud_resample_patch_cells = pin->GetOrAddInteger("dust", "cloud_resample_patch_cells", 4);   // cap
-      // A block patch, or a quadrant of one, holding more than this many pool clouds
+      // a block patch, or a quadrant of one, holding more than this many pool clouds
       // (of one species) is split into its four quadrants, recursively down to single cells;
       // 0 = never.  Only for block patches whose widths min(cloud_resample_patch 2^level,
-      // cloud_resample_patch_cells) are powers of two (Codex review: the halving loses the
-      // odd row and column otherwise) and at most 16.  Rixin: default 1024 where allowed;
-      // 0 reproduces the results before 6f9512a9
+      // cloud_resample_patch_cells) are powers of two (the halving loses the
+      // odd row and column otherwise) and at most 16.  Default 1024 where allowed
       auto pow2 = [](const int n) {return n >= 1 && (n & (n - 1)) == 0;};
       const bool split_ok = cloud_resample_patch_cells <= 16 &&
                             pow2(cloud_resample_patch) && pow2(cloud_resample_patch_cells);
       cloud_resample_patch_split = pin->GetOrAddInteger("dust", "cloud_resample_patch_split",
                                                         split_ok ? 1024 : 0);
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
-      // For 3-D refinable clouds only (2-D ignores it): the device solve leaves out the
+      // (3-D refinable clouds only; 2-D ignores it): the device solve leaves out the
       // patches of n clouds on nl leaves with n <= 7 nl + 9 (the nominal rows: no null vector is
       // certain there).  false: every patch is solved (the reference path)
       cloud_resample_rank_screen = pin->GetOrAddBoolean("dust", "cloud_resample_rank_screen", true);
-      // Rixin: the per-patch solves on the device by default (same patches and algorithm;
-      // false keeps the host solves)
-      // Rixin: the default follows the build: the device solver when the
+      // the per-patch solves on the device (same patches and algorithm; false keeps the host
+      // solves).  The default follows the build: the device solver when the
       // default execution space is not a host space (GPU builds), the threaded host solver
       // otherwise (on a CPU build the host solver was 3.3x faster than the device code)
       // (3-D refinable clouds have only the device solver, which also runs on a CPU)
       cloud_resample_device = pin->GetOrAddBoolean("dust", "cloud_resample_device",
           !std::is_same<DevExeSpace, Kokkos::DefaultHostExecutionSpace>::value || clouds3d);
       cloud_resample_device_mem_mb = pin->GetOrAddInteger("dust", "cloud_resample_device_mem_mb", 2048);
-      // A middle bucket (65 .. cloud_resample_device_mid clouds; 0: off) of the
+      // a middle bucket (65 .. cloud_resample_device_mid clouds; 0: off) of the
       // device solves with narrower teams, several per SM
       cloud_resample_device_mid = pin->GetOrAddInteger("dust", "cloud_resample_device_mid", 0);
       cloud_resample_device_mid_team = pin->GetOrAddInteger("dust", "cloud_resample_device_mid_team", 128);
-      // Default 1024 since the patch split (GB200, three jobs: the resampling 10-11% and
-      // the pilot segment about 3% faster than with 512; before the split 1024 was 3% slower)
+      // default 1024: with the patch split, the resampling on a GB200 GPU was about 10% faster
+      // than with 512
       cloud_resample_device_wide_team = pin->GetOrAddInteger("dust", "cloud_resample_device_wide_team", 1024);
-      // The device QR update shares the rows among the threads as well.  Its sums run
+      // the device QR update shares the rows among the threads as well.  Its sums run
       // in another order than the host's, so the device solve agrees with the host solve only to
       // round-off (the kept clouds can differ; both satisfy the constraints to round-off); false:
-      // one thread per column in the host's order (bitwise comparable).  Default true since GB200
-      // (QR -35%, resampling -10%, no fallback)
+      // one thread per column in the host's order (bitwise comparable).  Default true (on a GB200
+      // GPU the QR took 35% less time, the resampling 10% less)
       cloud_resample_qr_rows = pin->GetOrAddBoolean("dust", "cloud_resample_qr_rows", true);
-      // Default <256, 2> (at most 128 registers): on GB200 the two production
-      // cloud kernels are 8-16% faster than without a bound (BA 128/256 and the dynamic mesh).
-      // Rixin: a compile-time choice (DUST_CLOUD_LAUNCH_BOUNDS, dust.hpp);
+      // default <256, 2> (at most 128 registers): on a GB200 GPU the two production
+      // cloud kernels were 8-16% faster than without a bound.
+      // a compile-time choice (DUST_CLOUD_LAUNCH_BOUNDS, dust.hpp);
       // an input or restart may only ask for the compiled value
       if (pin->GetOrAddInteger("dust", "cloud_launch_bounds", DUST_CLOUD_LAUNCH_BOUNDS) !=
           DUST_CLOUD_LAUNCH_BOUNDS) {
@@ -744,7 +740,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << "-DDUST_CLOUD_LAUNCH_BOUNDS=<n> in CMAKE_CXX_FLAGS, or drop the key)" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      // Rixin: the column-by-column device QR (qr_rows = false) exists only
+      // the column-by-column device QR (qr_rows = false) exists only
       // in the reference build (-DDUST_R_QR_COLUMNS=1, dust_resample.hpp); without it a run whose
       // device R solver would take that path stops instead of silently running the row update
       if (!cloud_resample_qr_rows && !DUST_R_QR_COLUMNS && cloud_resample &&
@@ -756,7 +752,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << "build), or use the row-parallel update (true, the default)" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      // The order in which a patch takes its candidates: array (default, as before)
+      // the order in which a patch takes its candidates: array (default)
       // or tag (PTAG order, independent of the storage order)
       {
         const std::string ro = pin->GetOrAddString("dust", "cloud_resample_order", "array");
@@ -772,19 +768,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         std::cout << "# NOTE (dust): cloud_resample_m0 is the root cloud mass of every species "
                   << "(leave it unset for the per-species masses of the initial clouds)" << std::endl;
       }
-      // Resampling after every regrid.  Rixin: default
-      // false: no G or R after the regrids, the scheduled ones (G and R every 0.25 / omega0) cover
-      // them; a regrid every ~40 cycles made the per-regrid R latency-bound
+      // resampling after every regrid.  Default false: no G or R after the regrids, the scheduled
+      // ones (G and R every 0.25 / omega0) cover them; with a regrid every ~40 cycles the
+      // per-regrid R was latency-bound
       cloud_resample_after_regrid = pin->GetOrAddBoolean("dust", "cloud_resample_after_regrid",
                                                          false);
-      // The resampling after a regrid only on the blocks the regrid made and their
+      // the resampling after a regrid only on the blocks the regrid made and their
       // neighbours (the scheduled resampling stays global)
-      // Rixin: default true (false reproduces the earlier runs).  The
+      // Default true (false resamples every block after a regrid).  The
       // scheduled resampling (every cloud_resample_dt_omega) stays global, also when a regrid event
       // falls on its cycle
       cloud_resample_event_local = pin->GetOrAddBoolean("dust", "cloud_resample_event_local", true);
       {
-        // 2026-10-21 (scaling): regrid events handled together, cloud_event_dt_omega / omega0 after
+        // regrid events handled together, cloud_event_dt_omega / omega0 after
         // the first regrid (0: every regrid at the next cycle)
         const Real edt = pin->GetOrAddReal("dust", "cloud_event_dt_omega", 0.0);
         if (edt > 0.0) {
@@ -800,7 +796,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           cloud_event_dt = edt/om;
         }
       }
-      // Rixin: a regrid event that only deleted blocks runs G but no R,
+      // a regrid event that only deleted blocks runs G but no R,
       // unless the scheduled resampling falls on that cycle
       cloud_resample_after_derefine = pin->GetOrAddBoolean("dust",
                                          "cloud_resample_after_derefine", false);
@@ -815,7 +811,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << " cloud_gather_order = 2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      // (2026-10-20: quantum is the default mode now, so its requirements apply only when G is on;
+      // (quantum is the default mode, so its requirements apply only when G is on;
       // cloud_merge = false with the default mode is a run without G, not an error)
       if (cloud_merge && cloud_merge_mode == 1 &&
           (!cloud_merge_device || cloud_merge_K < 1 || cloud_merge_K > 8 ||
@@ -866,7 +862,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     omega0 = 0.0;
     is_stratified = false;
   }
-  // Point particles crossing a shear-periodic x1 face take the shear offset of the
+  // point particles crossing a shear-periodic x1 face take the shear offset of the
   // time of their position (<dust>/shear_route_time, default true; 3-D, where the push advects y
   // with the background shear).  The 3-D clouds keep their own key (cloud_shear_route_time).
   if (is_shearing_box && pmy_pack->pmesh->three_d && !clouds3d &&
@@ -904,8 +900,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
     Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
   }
-  // The old owner_overlap transfer also runs on a dynamic mesh (one rank)
-  // In 3-D also on several ranks (the general deposit remap)
+  // the owner_overlap transfer also runs on a dynamic mesh (one rank), in 3-D also on several
+  // ranks (the general deposit remap)
   if (pmy_pack->pmesh->adaptive && smr_transfer_mode != DustSMRTransfer::refinable_cloud &&
       !(smr_transfer_mode == DustSMRTransfer::owner_overlap &&
         (global_variable::nranks == 1 || pmy_pack->pmesh->three_d))) {
@@ -963,18 +959,18 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // shear-periodic remap of the u* radial ghost zones (3D shearing box only)
   if (shear_x1 && pmy_pack->pmesh->three_d) {
     psbox_us = new ShearingBoxCC(pmy_pack, pin, 3);
-    // Collected u* ghost zones (S2c): the u* prolongation stays out of the slots
+    // collected u* ghost zones: the u* prolongation stays out of the slots
     // across the shear-periodic faces, as for the gas
     if (psbox_us->face_levels) pbval_us->skip_shear_x1_prol = true;
-    // With refinement also the coarse u* array (cdummy), before its prolongation
+    // with refinement also the coarse u* array (cdummy), before its prolongation
     if (pmy_pack->pmesh->multilevel) {
       psbox_us->coarse_on = true;
       psbox_us->AllocateBuffers();
     }
   }
-  // S3a: in 3-D with refinement or with shear-periodic x1 faces the ghost
+  // in 3-D with refinement or with shear-periodic x1 faces the ghost
   // deposits go through the general remap (any levels, several ranks, the shear offset)
-  // Not for 3-D refinable clouds: they deposit into the leaves directly
+  // not for 3-D refinable clouds: they deposit into the leaves directly
   if (pmy_pack->pmesh->three_d && !clouds3d &&
       (pmy_pack->pmesh->multilevel || shear_x1 || x3_phys)) {
     if (drag_solver != DustDragSolver::local ||
@@ -994,7 +990,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    // Ghost deposits beyond physical x3 faces: fold back (default) or drop
+    // ghost deposits beyond physical x3 faces: fold back (default) or drop
     int x3mode = 0;
     if (x3_phys) {
       const std::string xd = pin->GetOrAddString("dust", "x3_ghost_deposit", "fold");
@@ -1072,7 +1068,7 @@ void DustGasDrag::PrintRefinablePreset() const {
 void DustGasDrag::CheckMultiRank() {
   if (global_variable::nranks == 1) return;
   std::vector<std::string> bad;
-  // PC2, or imex2+ (2026-10-17: its deposit and gather-kick kernels use the halo); not the
+  // PC2, or imex2+ (its deposit and gather-kick kernels use the halo); not the
   // automatic hybrid, whose split-BE preparation pass has no halo exchange yet
   if (!(coupling == DustCoupling::imex ||
         (coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2))) {
@@ -1083,7 +1079,7 @@ void DustGasDrag::CheckMultiRank() {
   if (cloud_gather_order != 2 || analytic_gather.on) {
     bad.push_back("gather variants (cloud_gather_order != 2, analytic_gather)");
   }
-  // Stage X and the structure-relative budget on several ranks (X merges
+  // stage X and the structure-relative budget run on several ranks (X merges
   // the families whose nine members are on this rank; the budget's neighbour leaves come from
   // the halo); X under the pass budget (cloud_merge_budget_x) has no exchange yet
   if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device)) {
@@ -1115,7 +1111,7 @@ DustGasDrag::~DustGasDrag() {
               << "# DUST_HYBRID_SUMMARY pc2_cycles=" << hybrid_pc2_cycles
               << " split_be_cycles=" << hybrid_split_be_cycles
               << " pc2_fraction=" << pc2_fraction;
-    // With a fixed mode the switching metric is not computed (not a zero)
+    // with a fixed mode the switching metric is not computed (not a zero)
     if (NeedsHybridMetric()) {
       std::cout << " last_zeta=" << hybrid_last_zeta << " last_chi=" << hybrid_last_chi;
     } else {
@@ -1129,7 +1125,7 @@ DustGasDrag::~DustGasDrag() {
               << " pc2_feedback_damping=" << (pc2_feedback_damping ? 1 : 0) << std::endl;
   }
   if (global_variable::my_rank == 0 && (prof_count[kProfAmr] > 0 || prof_count[kProfRefineClouds] > 0)) {
-    // Rank 0's fenced phase times (s) and calls
+    // rank 0's fenced phase times (s) and calls
     const char *names[kProfN] = {"trigger", "amr_total", "regrid_mesh", "regrid_dust_rebuild", "refine_clouds",
                                  "split", "regrid_event_GR", "scheduled_R", "scheduled_G", "sort", "cell_order",
                                  "trigger_deposit", "trigger_copy", "trigger_blocks", "trigger_log"};
@@ -1139,20 +1135,20 @@ DustGasDrag::~DustGasDrag() {
     }
     std::cout << std::endl;
   }
-  // Codex review: printed once a profiled R has run (the patch count; the last
+  // printed once a profiled R has run (the patch count; the last
   // entry, the negative basic solutions, can stay 0)
   if (global_variable::my_rank == 0 && ProfOn() && !DUST_R_DIAG && cloud_resample && cloud_resample_device) {
     std::cout << "# DUST_R_STAGES not compiled (build with -DDUST_R_DIAG=1)" << std::endl;
   }
   if (global_variable::my_rank == 0 && resample::StageTotals()[resample::kStagePatches] > 0) {
-    // Device clock cycles of the patch solves by stage, summed over the teams of
+    // device clock cycles of the patch solves by stage, summed over the teams of
     // rank 0 (CUDA only; 0 on other backends)
     const unsigned long long *t = resample::StageTotals();
     std::cout << "# DUST_R_STAGES (rank 0, device clock cycles, summed over the teams) rows=" << t[0]
               << " qr=" << t[1] << " null=" << t[2] << " steps=" << t[3] << " stream=" << t[4]
               << " stream_rest=" << (t[4] - t[1] - t[2] - t[3]) << " check=" << t[5]
               << " patches=" << t[6] << std::endl;
-    // The basic solution on the pivot columns
+    // the basic solution on the pivot columns
     std::cout << "# DUST_R_BASIS (QR blocks with a null space) blocks=" << t[7] << " feasible=" << t[8]
               << " cap_only=" << t[9] << " negative=" << t[10] << std::endl;
   }
@@ -1169,18 +1165,18 @@ DustGasDrag::~DustGasDrag() {
                   " far_releases=" + std::to_string(cloud_far_release) +
                   " dK_grad=" + std::to_string(cloud_coarsen_dk_grad) +
                   " dK_res=" + std::to_string(cloud_coarsen_dk_res) : std::string())
-              // with several ranks the counters are rank 0's, the particles all ranks'
+              // several ranks: the counters are rank 0's, the particles all ranks'
               << " particles=" << ((global_variable::nranks > 1) ? pmy_pack->pmesh->nprtcl_total
                                                                   : pmy_pack->ppart->nprtcl_thispack)
               << ((global_variable::nranks > 1) ? " counters=rank0" : "") << std::endl;
   }
-  if (global_variable::my_rank == 0 && shear3d) {   // (Codex perf review item 1)
+  if (global_variable::my_rank == 0 && shear3d) {   // shear-image list counters
     std::cout << "# DUST_SHEAR_LISTS rank0 ysh_updates=" << shear3d_updates << " list_rebuilds="
               << shear3d_rebuilds << " cache=" << (shear3d_list_cache ? "on" : "off") << std::endl;
   }
   if (global_variable::my_rank == 0 && global_variable::nranks > 1 && ProfOn() &&
       smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
-    // Rank 0's seconds in the multi-rank parts of the dust (with amr_profile)
+    // rank 0's seconds in the multi-rank parts of the dust (with amr_profile)
     const double *t = halo_.tsec;
     std::cout << "# DUST_MPI_TIMING rank0 migrate_refine=" << mpi_time[0] << " (" << mpi_count[0]
               << ") migrate_push=" << mpi_time[1] << " (" << mpi_count[1] << ") kernels_before="
@@ -1326,7 +1322,7 @@ void DustGasDrag::SetDefaultMasses(ParameterInput *pin) {
   auto &mbsize = pmy_pack->pmb->mb_size;
   bool three_d = pmy_pack->pmesh->three_d;
   Real rho0 = pin->GetOrAddReal("problem","rho0",1.0);
-  Real ppc = static_cast<Real>(RootPpc(pin));   // with the new keys the sum of ppc_N
+  Real ppc = static_cast<Real>(RootPpc(pin));   // per-species keys: sum of ppc_N
 
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
@@ -1334,7 +1330,7 @@ void DustGasDrag::SetDefaultMasses(ParameterInput *pin) {
   auto gids = pmy_pack->gids;
   int nspec = nspecies;
   Real d2g = dust_to_gas;
-  // With the new keys, every run of ppc_total consecutive particles of a block holds
+  // the per-species keys: every run of ppc_total consecutive particles of a block holds
   // ppc_N of species N (interleaved for equal ppc_N, else in blocks), mass
   // epsilon_N rho0 V_cell/ppc_N; the legacy striping otherwise
   const SpeciesTable &st = Species(pin);

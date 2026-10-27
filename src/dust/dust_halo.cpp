@@ -4,7 +4,7 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_halo.cpp
-//! \brief The dust halo: the leaf fields of whole
+//! \brief The dust halo for multi-rank runs.  The leaf fields of whole
 //! MeshBlocks are exchanged with the ranks that own the blocks a cloud can reach (the halo
 //! blocks of BuildLeafTraversal: every block of another rank within the reach of a block of this
 //! rank):
@@ -105,7 +105,7 @@ struct AccFlatInt {
 };
 
 // copy (forward: owner -> halo slots) or add back (reverse: halo slots -> owner) nc components
-// of the cells in the lists (whole blocks, or the strips a cloud can reach)
+// of the cells in the lists (whole blocks, or with <dust>/cloud_halo_strips their reachable strips)
 template <typename Acc>
 void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
 #if MPI_PARALLEL_ENABLED
@@ -118,7 +118,7 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
   ++h.nexch[reverse ? 1 : 0];
   Clock::time_point tc = Clock::now();
   // the kernels before the exchange (their time, not MPI): a fence for the timing alone (the pack
-  // below fences before the sends), so only with <dust>/amr_profile (2026-10-25, Codex perf review)
+  // below fences before the sends), so only with <dust>/amr_profile
   if (ProfOn()) {
     Kokkos::fence();
     ts[0] += since(tc);
@@ -197,7 +197,7 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
 //! \fn DustGasDrag::BuildHalo
 //! \brief The exchange lists of the halo from the block slots of BuildLeafTraversal.  Every
 //! rank asks the owners of its halo slots for those blocks (ascending gid), each with the
-//! rectangle of its cells that it needs (halo_.rect: the whole block, or a strip of it);
+//! rectangle of its cells that it needs (halo_.rect: the whole block, or its reachable strip);
 //! one all-to-all of the counts and one of the requests, so that both sides of every pair hold
 //! the same lists: per peer rank (ascending), the cells of this rank's blocks asked for by it
 //! and the cells of the halo slots it fills, block by block, row by row.  (The halo may hold
@@ -312,7 +312,7 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
 void DustGasDrag::HaloForwardPack(DvceArray5D<Real> &gp) {
   if (halo_.npeer == 0) return;
   const int nc1 = halo_.ncells1, n12 = halo_.ncells1*halo_.ncells2;
-  if (halo_.three) {   // 3-D: gpack3 (12 components)
+  if (halo_.three) {   // 3-D clouds: gpack3 (12 components)
     AccPack3 a; a.f = gp; a.nc1 = nc1; a.n12 = n12; a.n123 = n12*halo_.ncells3;
     Exchange(halo_, gp.extent_int(4), false, a);
     return;

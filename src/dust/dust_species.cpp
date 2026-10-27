@@ -4,8 +4,8 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_species.cpp
-//! \brief The resolved dust species table (dust_species.hpp).
-//! All checks happen here, once, before the particles are allocated: complete vectors
+//! \brief The resolved dust species table (dust_species.hpp).  All checks happen here,
+//! once, before the particles are allocated: complete vectors
 //! (every species 1..nspecies, no index beyond nspecies), no mixing of a legacy and a new key
 //! for the same quantity, finite positive stopping times, non-negative abundances, integer
 //! ppc, a positive abundance only with particles and particles only with a positive abundance.
@@ -272,7 +272,7 @@ SpeciesTable Parse(ParameterInput *pin) {
     }
   }
   if (t.abundance == "Z") {
-    // Rixin: chose redraw (Athena-C) as the default; full_profile and domain
+    // redraw (as in Athena-C) is the default; full_profile and domain
     // are explicit alternatives
     t.column_normalization = Has(pin, D, "column_normalization") ?
         pin->GetString(D, "column_normalization") : std::string("redraw");
@@ -298,7 +298,7 @@ SpeciesTable Parse(ParameterInput *pin) {
   if (t.ppc_total < 1) Fail("no particles: every ppc_N is 0");
   t.equal_ppc = true;
   for (int s=0; s<n; ++s) if (t.ppc[s] != t.ppc[0]) t.equal_ppc = false;
-  // Rixin: the sampling is given once; <particles>/ppc is the legacy key
+  // the sampling is given once; <particles>/ppc is the legacy key
   // and is not allowed next to ppc_N / ppc_per_species, not even as their sum.  The particle
   // module takes the total from this table (RootPpc).
   if (Has(pin, "particles", "ppc")) {
