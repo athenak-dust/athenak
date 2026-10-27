@@ -355,6 +355,19 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
     const Real tol = 1.0e-9*(x1 - x0);
     return (std::fabs(sz.x1min - x0) < tol) ? 0 : ((std::fabs(sz.x1max - x1) < tol) ? 1 : -1);
   };
+  // the receivers' x3 rows include nghost ghost rows at the receiver's level (the coarse array's,
+  // one level coarser, above the root): a block at level lev reads the opposite face over
+  // [k0 - e, k1 + e), e = nghost 2^(lmax - lev + 1) finest cells (2^(lmax) at the root), periodic in
+  // x3 or cut at the x3 boundaries as the exchange does (shearing_box_pull.cpp, "pieces")
+  const bool zper = (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic);
+  auto slots = [&](int k0, int k1, int lev, auto &&fn) {
+    const int e = ind.ng << (lmax - lev + ((lev > 0) ? 1 : 0));
+    for (int kk=k0 - e; kk<k1 + e; ++kk) {
+      int k = kk;
+      if (zper) {k = ((k % nzf) + nzf) % nzf;} else if (k < 0 || k >= nzf) {continue;}
+      fn(k);
+    }
+  };
   const int big = 1 << 20;
   int nraise = 0, nkeep = 0, nveto = 0, rounds = 0;
   for (int changed = 1; changed && rounds < 32; ++rounds) {
@@ -379,17 +392,21 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
       const int f = face(sz);
       if (f < 0) continue;
       int k0, k1; zrange(sz, k0, k1);
-      int other = -1;
-      for (int k=k0; k<k1; ++k) other = std::max(other, tmax[(1 - f)*nzf + k]);
+      auto other_at = [&](int lev) {
+        int o = -1;
+        slots(k0, k1, lev, [&](int k) {o = std::max(o, tmax[(1 - f)*nzf + k]);});
+        return o;
+      };
       const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
       int &flag = refine_flag.h_view(m + mbs);
-      if (flag < 0 && omax(l - 1) < other) {flag = 0; --nder; ++nkeep; changed = 1;}
+      if (flag < 0 && omax(l - 1) < other_at(l - 1)) {flag = 0; --nder; ++nkeep; changed = 1;}
       int t = l + std::max(0, flag);
-      if (omax(t) < other && flag <= 0 && l < lmax && omax(l + 1) >= other) {
+      if (omax(t) < other_at(t) && flag <= 0 && l < lmax && omax(l + 1) >= other_at(l + 1)) {
         flag = 1; ++nref; ++nraise; changed = 1; t = l + 1;
       }
-      if (omax(t) < other) {
-        for (int k=k0; k<k1; ++k) cap[(1 - f)*nzf + k] = std::min(cap[(1 - f)*nzf + k], omax(t));
+      if (omax(t) < other_at(t)) {
+        const int c = omax(t);
+        slots(k0, k1, t, [&](int k) {cap[(1 - f)*nzf + k] = std::min(cap[(1 - f)*nzf + k], c);});
       }
     }
 #if MPI_PARALLEL_ENABLED
