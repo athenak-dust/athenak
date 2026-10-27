@@ -160,7 +160,7 @@ void JeansFinal(ParameterInput *,Mesh *pm) {
 }  // namespace
 
 void ProblemGenerator::DustJeans(ParameterInput *pin,const bool restart) {
-  dust::RequireLegacySpeciesInit(pin, "dust_jeans");
+  dust::RequireLegacySpeciesInit(pin, "dust_jeans");  // legacy species keys only
   auto *pack=pmy_mesh_->pmb_pack;
   Require(pack->pdust && pack->ppart && pack->phydro && pack->pgrav &&
       pack->pdust->nspecies==1 && !pin->DoesBlockExist("shearing_box") &&

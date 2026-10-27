@@ -1873,7 +1873,13 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
         tgt[sp] = eps[sp]*rho0*std::sqrt(2.0*M_PI)*hps[sp]*finside[sp]*area;
       }
     }
-    if (domain && allow_rescale) {
+    // the scaling corrects a real mismatch (the weight-sampled lattice); a gaussian sample has the
+    // target already, and its sum here is only accurate to round-off (serial: N eps)
+    bool rescale = false;
+    for (int sp=0; sp<nspec; ++sp) {
+      if (act[sp] > 0.0 && std::fabs(act[sp]/tgt[sp] - 1.0) > 1.0e-11) rescale = true;
+    }
+    if (domain && allow_rescale && rescale) {
       DualArray1D<Real> fac("nsh_species_rescale", nspec);
       for (int sp=0; sp<nspec; ++sp) fac.h_view(sp) = (act[sp] > 0.0) ? tgt[sp]/act[sp] : 1.0;
       fac.template modify<HostMemSpace>();
@@ -1896,7 +1902,8 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
         o << ", target mass " << tgt[sp] << ", particle mass " << act[sp] << ", rel_error "
           << std::setprecision(3) << ((tgt[sp] > 0.0) ? act[sp]/tgt[sp] - 1.0 : 0.0)
           << std::setprecision(17)
-          << ((domain && allow_rescale) ? " (before the scaling to the target)" : "") << "\n";
+          << ((domain && allow_rescale && rescale) ? " (before the scaling to the target)" : "")
+          << "\n";
       }
       std::cout << o.str() << std::flush;
     }
