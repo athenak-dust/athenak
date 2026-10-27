@@ -646,7 +646,7 @@ void WriteBAFields(Mesh *pm) {
     if (pm->multilevel || pdust->deposit != DustDeposit::tsc) {
       std::cerr << "BA fields: canonical deposit requires TSC on a uniform mesh (static SMR with "
                 << "owner_overlap: no leaf deposit to write; with coupling = pc2 the run does not "
-                << "deposit a density either; use f64 snapshots and an offline estimator)"
+                << "deposit a density either; use the pbin output and an offline estimator)"
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
