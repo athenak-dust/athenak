@@ -2274,6 +2274,7 @@ int DustGasDrag::MergeCloudsDevice() {
   ++cloud_merge_pass;
   const unsigned long long nc_shift = ic(4), nc_skip = ic(5);
   cloud_coarsen_events += nevents;
+  if (phst_track) phst_g_events += nevents;
   cloud_coarsen_in += nin;
   cloud_coarsen_reject += nreject;
   cloud_far_release += nrelease;
@@ -3356,6 +3357,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
   ++cloud_merge_pass;
   const unsigned long long nevents = static_cast<unsigned long long>(qtot[0] + qtot[2] - gcb[0]);
   cloud_coarsen_events += nevents;
+  if (phst_track) phst_g_events += nevents;
   cloud_coarsen_in += static_cast<unsigned long long>(27.0*qtot[0] + qtot[3] - gcb[1]);
   cloud_far_release += nrelease;
   std::FILE *fp = AppendLog(RankFile("cloud_merge_log3d.txt"));   // one per rank

@@ -50,7 +50,8 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
       out_params.file_type.compare("rst") == 0 ||
       out_params.file_type.compare("log") == 0 ||
       out_params.file_type.compare("trk") == 0 ||
-      out_params.file_type.compare("pbin") == 0) {return;}
+      out_params.file_type.compare("pbin") == 0 ||
+      out_params.file_type.compare("phst") == 0) {return;}
 
   // initialize vector containing number of output MBs per rank
   noutmbs.assign(global_variable::nranks, 0);
@@ -177,8 +178,9 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl << "Input file is likely missing corresponding block" << std::endl;
     exit(EXIT_FAILURE);
   }
-  // dust_total, dust_total_rho, dust_total_mom: a dust module, active cells
-  if ((ivar >= 159) && (ivar <= 161) &&
+  // dust_total, dust_total_rho, dust_total_mom(1..3): a dust module, active
+  // cells
+  if ((ivar >= 159) && (ivar <= 164) &&
       (pm->pmb_pack->pdust == nullptr || out_params.include_gzs)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
        << "Output variable '" << out_params.variable << "' in <output> block '"
@@ -757,8 +759,11 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
   // dust mass and momentum densities too (dust_total_var; not with ghost zones); opt out per
   // block with dust_total = false.  The key is read only when given, so a restart file whose
   // output blocks lack it (older files included) gets the default.
+  // (Rixin: only the full sets hydro_w and hydro_u; single components and derived
+  // variables get nothing)
   if (out_params.file_type.compare("bin") == 0 && pm->pmb_pack->pdust != nullptr &&
-      out_params.variable.compare(0, 6, "hydro_") == 0) {
+      (out_params.variable.compare("hydro_w") == 0 ||
+       out_params.variable.compare("hydro_u") == 0)) {
     bool want = true;
     if (pin->DoesParameterExist(out_params.block_name, "dust_total")) {
       want = pin->GetBoolean(out_params.block_name, "dust_total");
@@ -778,18 +783,20 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
 
   // dust mass and momentum densities on the active cells with the run's
   // representation (DustGasDrag::DepositScienceFields): derived_var(m, 0..3)
-  if (out_params.variable.compare("dust_total") == 0 ||
-      out_params.variable.compare("dust_total_rho") == 0 ||
-      out_params.variable.compare("dust_total_mom") == 0) {
+  // (dust_total: all four; dust_total_rho; dust_total_mom: the three momenta; dust_total_momN:
+  // one component, like hydro_u_m1)
+  if (out_params.variable.compare(0, 10, "dust_total") == 0) {
+    const std::string &v = out_params.variable;
     out_params.contains_derived = true;
     out_params.n_derived += 4;
-    if (out_params.variable.compare("dust_total_mom") != 0) {
+    if (v == "dust_total" || v == "dust_total_rho") {
       outvars.emplace_back("dust_total_rho",0,&(derived_var));
     }
-    if (out_params.variable.compare("dust_total_rho") != 0) {
-      outvars.emplace_back("dust_total_mom1",1,&(derived_var));
-      outvars.emplace_back("dust_total_mom2",2,&(derived_var));
-      outvars.emplace_back("dust_total_mom3",3,&(derived_var));
+    for (int c=1; c<=3; ++c) {
+      const std::string name = "dust_total_mom" + std::to_string(c);
+      if (v == "dust_total" || v == "dust_total_mom" || v == name) {
+        outvars.emplace_back(name,c,&(derived_var));
+      }
     }
   }
 

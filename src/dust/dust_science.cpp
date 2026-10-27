@@ -121,7 +121,7 @@ void DustGasDrag::ScienceRepresentation(std::ostream &os) const {
 //! \fn DustGasDrag::DepositScienceFields
 //! \brief See the file header.  out is (re)allocated to at least (nmb, 4, nk, nj, ni).
 
-void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out) {
+void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit) {
   Mesh *pm = pmy_pack->pmesh;
   auto &ind = pm->mb_indcs;
   const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
@@ -252,6 +252,7 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out) {
     });
   }
 
+  if (!audit) return;   // (the particle history makes its own sums)
   // ---- audit: the particles' mass and momentum against the fields' (all ranks)
   double s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   double pabs = 0.0;   // sum of m |v| (1-norm): the scale of the momentum round-off
@@ -321,6 +322,111 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out) {
                 << "particle mass by " << rel_mass << " (relative)" << std::endl;
     }
   }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::ParticleHistory
+//! \brief The quantities of one particle-history row (file_type = phst)
+//! after time and dt, global over the ranks (every rank gets them):
+//!   row[0] n_particles (active rows, mass != 0); row[1] mass; row[2..4] momentum (stored
+//!   velocities); row[5] ekin = sum m |v|^2/2; row[6] z_rms = sqrt(sum m z^2/sum m), z = x3 in
+//!   3-D, x2 (the vertical of the 2-D r-z box) in 2-D; row[7] rho_max, the largest dust density
+//!   on the active cells (DepositScienceFields: the representation of the run, deposited from
+//!   the particles of this time); row[8..10] the centre of that cell, row[11] its level above
+//!   the root (if rho_max = 0: centre 0, level -1); row[12] chi_max, row[13] dt_stiff_min (the
+//!   interval records of UpdateStiffness; -1 without back-reaction, without a PC2 cycle in the
+//!   interval, or, for dt_stiff_min, without stiff_thresh); row[14] coarsening events (G groups,
+//!   and stage X families where X is on) and row[15] particles removed by R since the previous
+//!   row.
+//! Resets the interval records.  Collective.
+
+void DustGasDrag::ParticleHistory(double row[16]) {
+  Mesh *pm = pmy_pack->pmesh;
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto pr = ppar->prtcl_rdata;
+  const int np = ppar->nprtcl_thispack;
+  const int zc = pm->three_d ? IPZ : IPY;
+  // ---- particle sums: per chunk on the device, the chunks in order on the host
+  constexpr int kChunk = 4096, kSums = 7;
+  const int nchunk = (np + kChunk - 1)/kChunk;
+  DvceArray2D<double> part("phst_chunks", std::max(1, nchunk), kSums);
+  Kokkos::parallel_for("phst_particle_sums", Kokkos::RangePolicy<DevExeSpace>(0, nchunk),
+  KOKKOS_LAMBDA(const int c) {
+    double a[kSums] = {0, 0, 0, 0, 0, 0, 0};
+    const int p1 = (c + 1)*kChunk < np ? (c + 1)*kChunk : np;
+    for (int p=c*kChunk; p<p1; ++p) {
+      const double m = static_cast<double>(pr(IPM,p));
+      if (m == 0.0) continue;   // outflow tombstones
+      const double v1 = pr(IPVX,p), v2 = pr(IPVY,p), v3 = pr(IPVZ,p), z = pr(zc,p);
+      a[0] += 1.0;
+      a[1] += m;
+      a[2] += m*v1; a[3] += m*v2; a[4] += m*v3;
+      a[5] += 0.5*m*(v1*v1 + v2*v2 + v3*v3);
+      a[6] += m*z*z;
+    }
+    for (int q=0; q<kSums; ++q) part(c,q) = a[q];
+  });
+  auto ph = Kokkos::create_mirror_view_and_copy(HostMemSpace(), part);
+  double sums[kSums + 2] = {0};
+  for (int c=0; c<nchunk; ++c) for (int q=0; q<kSums; ++q) sums[q] += ph(c,q);
+  sums[kSums] = static_cast<double>(phst_g_events);
+  sums[kSums + 1] = static_cast<double>(phst_r_removed);
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, sums, kSums + 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  for (int q=0; q<6; ++q) row[q] = sums[q];
+  row[6] = (sums[1] > 0.0) ? std::sqrt(sums[6]/sums[1]) : 0.0;
+
+  // ---- the densest cell of the deposit
+  DepositScienceFields(science_phst_, false);
+  auto &ind = pm->mb_indcs;
+  const int nmb = pmy_pack->nmb_thispack;
+  const int nx1 = ind.nx1, nx2 = ind.nx2, nx3 = ind.nx3;
+  const int is = ind.is, js = ind.js, ks = ind.ks;
+  const int ncell = nx1*nx2*nx3;
+  auto f = science_phst_;
+  using ML = Kokkos::MaxLoc<Real, int>;
+  typename ML::value_type best;
+  best.val = 0.0; best.loc = -1;
+  if (nmb > 0) {
+    Kokkos::parallel_reduce("phst_rho_max", Kokkos::RangePolicy<DevExeSpace>(0, nmb*ncell),
+    KOKKOS_LAMBDA(const int q, typename ML::value_type &b) {
+      const int m = q/ncell, r = q % ncell;
+      const Real v = f(m, 0, ks + r/(nx1*nx2), js + (r/nx1) % nx2, is + r % nx1);
+      if (v > b.val || (v == b.val && q < b.loc)) {b.val = v; b.loc = q;}
+    }, ML(best));
+  }
+  struct {double val; int rank;} mine = {static_cast<double>(best.val), global_variable::my_rank};
+  if (best.loc < 0) mine.val = -1.0;
+  auto glob = mine;
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(&mine, &glob, 1, MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+#endif
+  double where[4] = {0.0, 0.0, 0.0, -1.0};
+  if (glob.rank == global_variable::my_rank && best.loc >= 0 && best.val > 0.0) {
+    const int m = best.loc/ncell, r = best.loc % ncell;
+    const int k = r/(nx1*nx2), j = (r/nx1) % nx2, i = r % nx1;
+    const auto &sz = pmy_pack->pmb->mb_size.h_view(m);
+    where[0] = sz.x1min + (i + 0.5)*sz.dx1;
+    where[1] = sz.x2min + (j + 0.5)*sz.dx2;
+    where[2] = pm->three_d ? sz.x3min + (k + 0.5)*sz.dx3 : 0.0;
+    where[3] = pm->lloc_eachmb[pmy_pack->gids + m].level - pm->root_level;
+  }
+#if MPI_PARALLEL_ENABLED
+  MPI_Bcast(where, 4, MPI_DOUBLE, glob.rank, MPI_COMM_WORLD);
+#endif
+  row[7] = std::max(0.0, glob.val);
+  for (int c=0; c<4; ++c) row[8 + c] = where[c];
+
+  // ---- the interval records (UpdateStiffness, the G / R counters), then reset
+  row[12] = back_reaction ? static_cast<double>(phst_chi_max) : -1.0;
+  row[13] = (back_reaction && stiff_thresh > 0.0) ? static_cast<double>(phst_dt_stiff_min) : -1.0;
+  row[14] = sums[kSums];
+  row[15] = sums[kSums + 1];
+  phst_chi_max = -1.0;
+  phst_dt_stiff_min = -1.0;
+  phst_g_events = 0;
+  phst_r_removed = 0;
 }
 
 }  // namespace dust

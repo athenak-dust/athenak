@@ -134,6 +134,7 @@ add_executable(
         outputs/derived_variables.cpp
         outputs/binary.cpp
         outputs/pbin.cpp
+        outputs/phst.cpp
         outputs/eventlog.cpp
         outputs/formatted_table.cpp
         outputs/history.cpp

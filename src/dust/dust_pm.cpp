@@ -447,6 +447,13 @@ void DustGasDrag::UpdateStiffness(const Real dt) {
   stiff_rate_max = rate;
   stiff_chi_last = dt*rate;
   stiff_chi_run_max = std::max(stiff_chi_run_max, stiff_chi_last);
+  if (phst_track) {   // the interval records of the particle history
+    phst_chi_max = std::max(phst_chi_max, stiff_chi_last);
+    if (stiff_thresh > 0.0 && rate > 0.0) {
+      const Real d = stiff_thresh/rate;
+      phst_dt_stiff_min = (phst_dt_stiff_min < 0.0) ? d : std::min(phst_dt_stiff_min, d);
+    }
+  }
   if (stiff_log && global_variable::my_rank == 0) {
     std::FILE *fp = AppendLog("dust_stiffness_log.txt");
     if (fp != nullptr) {

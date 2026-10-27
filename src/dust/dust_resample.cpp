@@ -1527,6 +1527,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
   }
   ++cloud_resample_pass;
   cloud_resample_removed += static_cast<unsigned long long>(nremoved);
+  if (phst_track) phst_r_removed += static_cast<unsigned long long>(nremoved);
   {
     char row[1024];
     std::snprintf(row, sizeof(row), "%d %.17g %d %d %lld %.0f %.0f %lld %lld %lld %lld %lld %.3e %lld %lld"
@@ -2099,6 +2100,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
   Kokkos::fence();
   ++cloud_resample_pass;
   cloud_resample_removed += static_cast<unsigned long long>(nremoved);
+  if (phst_track) phst_r_removed += static_cast<unsigned long long>(nremoved);
   {
     // the 2-D log row; the host-only columns (stage seconds, threads) are zero
     char row[1024];

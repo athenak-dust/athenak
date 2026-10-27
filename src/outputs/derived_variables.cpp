@@ -1308,8 +1308,7 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
   }
   // dust mass and momentum densities with the run's representation, from the
   // particles of this time (collective: halo / ghost-deposit exchanges)
-  if (name.compare("dust_total") == 0 || name.compare("dust_total_rho") == 0 ||
-      name.compare("dust_total_mom") == 0) {
+  if (name.compare(0, 10, "dust_total") == 0) {
     pm->pmb_pack->pdust->DepositScienceFields(derived_var);
   }
   i_dv = i_dv % n_dv; // reset derived variable index

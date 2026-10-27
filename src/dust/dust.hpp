@@ -1893,9 +1893,23 @@ class DustGasDrag {
   // deposited mass, particle momentum (3), deposited momentum (3) of the last call.
   std::string ScienceRepresentationId() const;
   void ScienceRepresentation(std::ostream &os) const;
-  void DepositScienceFields(DvceArray5D<Real> &out);
+  void DepositScienceFields(DvceArray5D<Real> &out, const bool audit = true);
   void DepositPointScienceFields(Real geometry_time, DvceArray5D<Real> &out);  // 3-D points
   double science_audit[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  // particle history (file_type = phst): the 16 global quantities of a row
+  // after time and dt (all ranks hold them; the file writes the last two only in runs with G/R);
+  // phst_track (set by the phst output) keeps the interval records below, which
+  // ParticleHistory resets.  Reading only: no effect on the run.
+  void ParticleHistory(double row[16]);
+  bool PhstGRColumns() const {   // refinable clouds with G or R on a refined mesh
+    return smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
+           pmy_pack->pmesh->multilevel && (cloud_merge || cloud_resample);
+  }
+  bool phst_track = false;
+  Real phst_chi_max = -1.0;        // largest PC2 stiffness chi of the interval (-1: none)
+  Real phst_dt_stiff_min = -1.0;   // smallest stiff_thresh/max_rate of the interval (-1: none)
+  unsigned long long phst_g_events = 0;   // coarsening events (G groups, X families), this rank
+  unsigned long long phst_r_removed = 0;  // particles removed by resampling, this rank
   void CheckClouds3D();   // the restrictions of 3-D stage 1
   void WrapParticles3D();
   int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
@@ -2059,7 +2073,7 @@ class DustGasDrag {
   // science output: its own ghost-deposit transfer (3-D points) and work arrays, so that an
   // output never touches the coupling's or gravity's exchange state
   std::shared_ptr<GravityPointTransfer> science_points_;
-  DvceArray5D<Real> science_halo_[4], science_work_;
+  DvceArray5D<Real> science_halo_[4], science_work_, science_phst_;
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this DustGasDrag
 };
 

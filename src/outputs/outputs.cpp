@@ -63,6 +63,7 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
   // and add to linked list of BaseTypeOutputs.
 
   int num_hst=0, num_rst=0, num_log=0; // count # of hst,rst,log outputs
+  int num_phst=0;                       // particle history outputs
   for (auto it = pin->block.begin(); it != pin->block.end(); ++it) {
     if (it->block_name.compare(0, 6, "output") == 0) {
       OutputParameters opar;  // define temporary OutputParameters struct
@@ -97,7 +98,8 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
           opar.file_type.compare("rst") != 0 &&
           opar.file_type.compare("log") != 0 &&
           opar.file_type.compare("trk") != 0 &&
-          opar.file_type.compare("pbin") != 0) {
+          opar.file_type.compare("pbin") != 0 &&
+          opar.file_type.compare("phst") != 0) {
         opar.variable = pin->GetString(opar.block_name, "variable");
         opar.file_id = pin->GetOrAddString(opar.block_name,"id",opar.variable);
       }
@@ -188,7 +190,8 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       if (opar.file_type.compare("hst") != 0 &&
           opar.file_type.compare("rst") != 0 &&
           opar.file_type.compare("log") != 0 &&
-          opar.file_type.compare("pbin") != 0) {
+          opar.file_type.compare("pbin") != 0 &&
+          opar.file_type.compare("phst") != 0) {
         opar.variable = pin->GetString(opar.block_name, "variable");
         opar.file_id = pin->GetOrAddString(opar.block_name,"id",opar.variable);
       }
@@ -229,8 +232,10 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
         }
       }
 
-      // set optional data format string used in formatted writes
-      opar.data_format = pin->GetOrAddString(opar.block_name, "data_format", "%12.5e");
+      // set optional data format string used in formatted writes (phst: full precision of
+      // the particle counts and sums by default)
+      opar.data_format = pin->GetOrAddString(opar.block_name, "data_format",
+          (opar.file_type.compare("phst") == 0) ? "%.16e" : "%12.5e");
       opar.data_format.insert(0, " "); // prepend with blank to separate columns
 
       // Construct new BaseTypeOutput according to file format
@@ -305,6 +310,10 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       } else if (opar.file_type.compare("pbin") == 0) {
         pnode = new ParticleBinaryOutput(pin,pm,opar);
         pout_list.insert(pout_list.begin(),pnode);
+      } else if (opar.file_type.compare("phst") == 0) {
+        pnode = new ParticleHistoryOutput(pin,pm,opar);
+        pout_list.insert(pout_list.begin(),pnode);
+        num_phst++;
       } else if (opar.file_type.compare("cart") == 0) {
         pnode = new CartesianGridOutput(pin,pm,opar);
         pout_list.insert(pout_list.begin(),pnode);
@@ -351,9 +360,10 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
   }
 
   // check there were no more than one history, event log, or restart files requested
-  if (num_hst > 1 || num_rst > 1 || num_log > 1) {
+  if (num_hst > 1 || num_rst > 1 || num_log > 1 || num_phst > 1) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "More than one history, event log, or restart output block found in "
+              << "More than one history, particle history, event log, or restart output "
+              << "block found in "
               << "input file" << std::endl;
     exit(EXIT_FAILURE);
   }

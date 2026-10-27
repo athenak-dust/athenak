@@ -1786,6 +1786,7 @@ int DustGasDrag::MergeClouds() {
   pmesh->nprtcl_total = nnew;
 
   cloud_coarsen_events += nevents;
+  if (phst_track) phst_g_events += nevents;
   cloud_coarsen_in += nin;
   cloud_coarsen_reject += nreject;
   cloud_far_release += nrelease;

@@ -21,7 +21,7 @@
     #error NHISTORY > NREDUCTION in outputs.hpp
 #endif
 
-#define NOUTPUT_CHOICES 162
+#define NOUTPUT_CHOICES 165
 // choices for output variables used in <ouput> blocks in input file
 // TO ADD MORE CHOICES:
 //   - add more strings to array below, change NOUTPUT_CHOICES above appropriately
@@ -101,9 +101,10 @@ static const char *var_choice[NOUTPUT_CHOICES] = {
   "prtcl_all", "prtcl_d", "dust_d",
   // Composite self-gravity (154-158); active cells only
   "gravity_phi", "gravity_g1", "gravity_g2", "gravity_g3", "gravity",
-  // Dust mass and momentum densities with the run's representation (159-161);
+  // Dust mass and momentum densities with the run's representation (159-164);
   // active cells only.  Not the NGP histogram dust_d.
-  "dust_total", "dust_total_rho", "dust_total_mom"
+  "dust_total", "dust_total_rho", "dust_total_mom",
+  "dust_total_mom1", "dust_total_mom2", "dust_total_mom3"
 };
 
 
@@ -396,6 +397,24 @@ class ParticleBinaryOutput : public BaseTypeOutput {
   long long nzero_ = 0;              // zero-mass rows left out (this rank)
   long long nbad_mass_ = 0;          // rows with a negative or non-finite mass (this rank)
   long long nneg_tag_ = 0;           // rows with a negative int32 tag (this rank)
+};
+
+//----------------------------------------------------------------------------------------
+//! \class ParticleHistoryOutput
+//  \brief derived BaseTypeOutput class for the dust particle history (phst):
+//  one text row of global particle quantities per output time in <basename>.phst
+
+class ParticleHistoryOutput : public BaseTypeOutput {
+ public:
+  ParticleHistoryOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
+  void LoadOutputData(Mesh *pm) override;
+  void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+ protected:
+  double row_[16] = {0};
+  bool gr_columns_ = false;     // g_groups, r_removed written (runs with G/R; kept by restarts)
+  bool header_written_ = false;
+  bool skip_ = false;           // a second call in the same cycle (dcycle and the final output)
+  long long last_cycle_ = -1;
 };
 
 //----------------------------------------------------------------------------------------
