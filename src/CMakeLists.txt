@@ -74,6 +74,7 @@ add_executable(
         dust/dust_amr.cpp
         dust/dust_restart.cpp
         dust/dust_science.cpp
+        dust/dust_species.cpp
         dust/dust_tasks.cpp
 
         dyn_grmhd/dyn_grmhd.cpp

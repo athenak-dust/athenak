@@ -12,6 +12,7 @@
 
 #include "athena.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "eos/eos.hpp"
 #include "globals.hpp"
 #include "gravity/self_gravity.hpp"
@@ -159,6 +160,7 @@ void JeansFinal(ParameterInput *,Mesh *pm) {
 }  // namespace
 
 void ProblemGenerator::DustJeans(ParameterInput *pin,const bool restart) {
+  dust::RequireLegacySpeciesInit(pin, "dust_jeans");
   auto *pack=pmy_mesh_->pmb_pack;
   Require(pack->pdust && pack->ppart && pack->phydro && pack->pgrav &&
       pack->pdust->nspecies==1 && !pin->DoesBlockExist("shearing_box") &&

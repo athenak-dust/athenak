@@ -66,6 +66,7 @@
 #include "mesh/mesh.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "outputs.hpp"
 
 #if MPI_PARALLEL_ENABLED
@@ -399,13 +400,30 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
           "particle_static" : "dynamic";
       h << "stopping_time_mode = " << mode << "  # stopping_time (column or constant) is the "
         << "value each particle uses\n";
-      h << "dust_to_gas = " << pd->dust_to_gas << "  # the <dust>/dust_to_gas key only; a "
-        << "problem generator may set its own abundances (e.g. <problem>/eps_N, see [input])\n";
+      // the resolved species table: stopping-time source, abundance (epsilon_N
+      // or Z_N with its normalization), ppc_N and H_p_N; legacy inputs keep the old lines
+      const dust::SpeciesTable &spt = dust::Species(pin);
+      if (!spt.new_init) {
+        h << "dust_to_gas = " << pd->dust_to_gas << "  # the <dust>/dust_to_gas key only; a "
+          << "problem generator may set its own abundances (e.g. <problem>/eps_N, see [input])\n";
+      }
       h << "back_reaction = " << (pd->back_reaction ? 1 : 0) << "\n";
+      std::string table = spt.Describe("");
+      table = table.substr(table.find('\n') + 1);   // nspecies is written above
+      std::istringstream tl(table);
+      for (std::string line; std::getline(tl, line);) {
+        if (line.compare(0, 8, "species.") == 0) continue;   // per-species lines follow
+        h << line << "\n";
+      }
       auto &taus = taus_h;
+      h << std::setprecision(17);
       for (int s=0; s<ns; ++s) {
         h << "species." << s << " = input_index " << (s + 1) << ", tau_s "
-          << ((s < taus.extent_int(0)) ? taus(s) : std::nan("")) << "\n";
+          << ((s < taus.extent_int(0)) ? taus(s) : std::nan(""));
+        if (spt.omega_ref > 0.0) h << ", stokes " << spt.tau_s[s]*spt.omega_ref;
+        if (spt.new_init) h << ", " << spt.abundance << " " << spt.value[s] << ", ppc " << spt.ppc[s];
+        if (!spt.hp.empty()) h << ", H_p " << spt.hp[s];
+        h << "\n";
       }
       if (!pd->cloud_merge_mroot.empty()) {
         for (std::size_t s=0; s<pd->cloud_merge_mroot.size(); ++s) {

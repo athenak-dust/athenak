@@ -26,6 +26,7 @@
 
 #include "athena.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "globals.hpp"
 #include "gravity/self_gravity.hpp"
 #include "mesh/mesh.hpp"
@@ -133,6 +134,7 @@ void SelfForceFinal(ParameterInput *pin, Mesh *pm) {
 }  // namespace
 
 void ProblemGenerator::DustSelfForce(ParameterInput *pin, const bool restart) {
+  dust::RequireLegacySpeciesInit(pin, "dust_selfforce");
   sf.mode = pin->GetOrAddString("problem", "sf_mode", "single");
   if (sf.mode != "single" && sf.mode != "pair") {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl

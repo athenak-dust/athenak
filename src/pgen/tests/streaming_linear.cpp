@@ -50,6 +50,7 @@
 #include "hydro/hydro.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "outputs/outputs.hpp"
 
 // user history: Fourier projections onto the seeded mode
@@ -179,6 +180,7 @@ void SolveNSH2(const Real omega0, const Real qshear, const Real ax,
 //! \brief Problem Generator for linear streaming-instability eigenmodes
 
 void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) {
+  dust::RequireLegacySpeciesInit(pin, "streaming_linear");  // legacy species keys only
   // in 3-D the mode lies in the x1-x3 plane (x2 the azimuth, the state uniform in x2)
   // (StreamingLinearHistory also projects the 3-D lattice with x3 vertical)
   user_hist_func = (pmy_mesh_->three_d && pmy_mesh_->pmb_pack->pdust != nullptr &&

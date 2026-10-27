@@ -23,6 +23,7 @@
 #include "particles/particles.hpp"
 #include "shearing_box/shearing_box.hpp"
 #include "dust.hpp"
+#include "dust_species.hpp"
 #include "dust_resample.hpp"
 
 namespace dust {
@@ -242,9 +243,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   stopping_times_initialized = false;
   dt_cfl        = pin->GetOrAddReal("dust","dt_cfl",0.5);
-  // Dust API: to be deprecated after epsilon[_N]/Z[_N] is implemented.
-  // Retain the existing dust_to_gas semantics for legacy inputs and restarts.
-  dust_to_gas   = pin->GetOrAddReal("dust","dust_to_gas",0.01);
+  // Dust API: <dust>/dust_to_gas is the legacy total (to be deprecated); with
+  // the new abundance keys it is not read (mixing is an error, dust_species.cpp) and holds the
+  // sum of epsilon_N / Z_N for the default masses
+  {
+    const SpeciesTable &st = Species(pin);
+    dust_to_gas = st.new_init ? st.total : pin->GetOrAddReal("dust","dust_to_gas",0.01);
+  }
 
   hybrid_enter_zeta = pin->GetOrAddReal("dust", "hybrid_enter_zeta", 0.5);
   hybrid_enter_chi  = pin->GetOrAddReal("dust", "hybrid_enter_chi", 0.5);
@@ -373,28 +378,20 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     std::exit(EXIT_FAILURE);
   }
 
-  // per-species stopping times: <dust>/nspecies and taus_1, taus_2, ...
-  // taus_N: to be deprecated after the tau_s_N compatibility alias is implemented.
-  // The new spelling is a design proposal; keep this reader operational meanwhile.
-  nspecies = pin->GetOrAddInteger("dust","nspecies",1);
-  if (nspecies < 1) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<dust>/nspecies must be at least 1" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  taus = DualArray1D<Real>("dust_taus", nspecies);
-  taus_max = 0.0;
-  taus_min = std::numeric_limits<Real>::max();
-  for (int s=0; s<nspecies; ++s) {
-    Real ts = pin->GetReal("dust", "taus_" + std::to_string(s+1));
-    if (ts <= 0.0) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "Dust stopping times must be positive" << std::endl;
-      std::exit(EXIT_FAILURE);
+  // per-species stopping times from the resolved species table (dust_species.cpp):
+  // tau_s_N, stokes_N or the power law; the legacy taus_N (to be deprecated) as before
+  {
+    const SpeciesTable &st = Species(pin);
+    nspecies = st.nspecies;
+    taus = DualArray1D<Real>("dust_taus", nspecies);
+    taus_max = 0.0;
+    taus_min = std::numeric_limits<Real>::max();
+    for (int s=0; s<nspecies; ++s) {
+      const Real ts = static_cast<Real>(st.tau_s[s]);
+      taus.h_view(s) = ts;
+      taus_max = std::max(taus_max, ts);
+      taus_min = std::min(taus_min, ts);
     }
-    taus.h_view(s) = ts;
-    taus_max = std::max(taus_max, ts);
-    taus_min = std::min(taus_min, ts);
   }
   taus.template modify<HostMemSpace>();
   taus.template sync<DevExeSpace>();
@@ -1513,6 +1510,42 @@ void DustGasDrag::SetDefaultMasses(ParameterInput *pin) {
   auto gids = pmy_pack->gids;
   int nspec = nspecies;
   Real d2g = dust_to_gas;
+  // With the new keys, every run of ppc_total consecutive particles of a block holds
+  // ppc_N of species N (interleaved for equal ppc_N, else in blocks), mass
+  // epsilon_N rho0 V_cell/ppc_N; the legacy striping otherwise
+  const SpeciesTable &st = Species(pin);
+  if (st.new_init) {
+    if (st.abundance != "epsilon") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "the default dust masses need epsilon_N (Z_N needs a stratified problem "
+                << "generator)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    const int ptot = st.ppc_total;
+    DualArray1D<int> slot_s("dust_slot_species", ptot);
+    DualArray1D<Real> mfac("dust_species_mfac", nspec);
+    for (int k=0; k<ptot; ++k) {int sp, kk; st.SlotSpecies(k, sp, kk); slot_s.h_view(k) = sp;}
+    for (int sp=0; sp<nspec; ++sp) {
+      mfac.h_view(sp) = (st.ppc[sp] > 0) ? st.value[sp]*rho0/static_cast<Real>(st.ppc[sp]) : 0.0;
+    }
+    slot_s.template modify<HostMemSpace>(); slot_s.template sync<DevExeSpace>();
+    mfac.template modify<HostMemSpace>(); mfac.template sync<DevExeSpace>();
+    auto ss = slot_s.d_view;
+    auto mf = mfac.d_view;
+    const int nmb = pmy_pack->nmb_thispack;
+    const int npmb = npart/std::max(1, nmb);
+    par_for("dust_masses_species",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
+      int m = pi(PGID,p) - gids;
+      Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+      if (three_d) {vol *= mbsize.d_view(m).dx3;}
+      const int q = (npmb > 0) ? p % npmb : p;
+      const int s = ss(q % ptot);
+      pi(PSP,p) = s;
+      pr(IPTS,p) = taus_.d_view(s);
+      pr(IPM,p) = mf(s)*vol;
+    });
+    return;
+  }
   par_for("dust_masses",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
