@@ -187,7 +187,7 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
   MPI_Waitall(h.npeer, sreq.data(), MPI_STATUSES_IGNORE);
   ts[2] += since(tc);
 #else
-  (void)h; (void)nc; (void)reverse; (void)acc; (void)can_nan;
+  (void)h; (void)nc; (void)reverse; (void)acc;
 #endif
 }
 
