@@ -7,7 +7,8 @@
 # coarsen below one third of its refinement threshold.  WENO-Z + HLLC, Li & Youdin (2018)
 # vertical gas boundaries (<problem>/vertical_bc = li2018), dust leaves through the x3 faces.
 # Test: particle-layer thickness, maximum rho_p and the onset of strong clumping against a uniform
-# 1280/H run.  Runtime: t = 0 -> 25 orbits (157.08) takes about a day on four GPUs.
+# 1280/H run.  Runtime: t = 0 -> 25 orbits (157.08) is ~1e6 cycles, one to two days on four
+# GPUs.
 # Restart with self-gravity: si3d_strat_amr1280_selfgrav_restart.athinput.
 <job>
 basename = st

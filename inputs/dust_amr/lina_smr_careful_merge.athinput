@@ -3,8 +3,11 @@
 # finer (128^2 there).  Refinable dust clouds with refinable_mode = careful_merge (exact P1 split,
 # X stencil re-merge, G quantum merge and R resampling, with the quiet-state protections).
 # Test: growth of the dust target projection (history columns 2, 3) on t in [1, 2 pi] against the
-# analytic rate 0.4190091 and with uniform 64^2 and 128^2 runs.
-# Runtime: t = 0 -> 2 pi is ~3.5e5 cycles, about half an hour on two CPU cores (1 or more MPI ranks).
+# analytic rate 0.4190091.  Expected: growth-rate error about -0.40% (uniform TSC: 64^2 -0.24%,
+# 128^2 -0.059%), about 13,300 particles at the end.  The production refinable_mode = default
+# (G and R without the quiet gates) destroys this linear mode; use careful_merge or split_only
+# for quiet linear tests.
+# Runtime: t = 0 -> 2 pi is ~3.5e5 cycles, about 15 minutes on 4 CPU ranks.
 <job>
 basename = LinA
 

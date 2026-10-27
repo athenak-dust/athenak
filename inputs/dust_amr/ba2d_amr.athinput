@@ -5,7 +5,7 @@
 # dust density trigger refines a block where rho_d/<rho_d> >= 10 * 2^l on level l and lets it
 # coarsen below 3.3 * 2^(l-1), with a 2-cell buffer.
 # Test: the cumulative particle-density distribution on t in [300, 600] against a uniform 2048^2
-# reference (pbin / hydro_w outputs).  Runtime: t = 0 -> 600 is several GPU hours (one GPU);
+# reference (pbin / hydro_w outputs).  Runtime: t = 0 -> 600 is about 7 hours on one GPU;
 # shorten tlim for a first look.
 <job>
 basename = BA
