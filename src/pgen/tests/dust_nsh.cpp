@@ -162,34 +162,6 @@ struct LiVBC {
 LiVBC livbc_;
 Real LiGasMass(Mesh *pm);      // below
 Real LiBoxVolume(Mesh *pm);
-// 3-D particle snapshots: every p3d_snapshot_dt, per rank p3d.NNNNN.rRRRRR.bin with
-// "P3D1", the time (double), the particle count (int), then x, y, z, m (float32 arrays)
-Real p3d_dt_ = -1.0;
-Real p3d_t0_ = 0.0;   // frame k at p3d_t0 + k p3d_dt (p3d_snapshot_t0)
-int p3d_number_ = 0;
-void WriteP3DSnapshot(Mesh *pm) {
-  auto *ppar = pm->pmb_pack->ppart;
-  const int npart = ppar->nprtcl_thispack;
-  auto pr = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ppar->prtcl_rdata);
-  char fn[64];
-  std::snprintf(fn, sizeof(fn), "p3d.%05d.r%06d.bin", p3d_number_, global_variable::my_rank);
-  std::FILE *fp = std::fopen(fn, "wb");
-  if (fp == nullptr) {std::cerr << "cannot open " << fn << std::endl; std::exit(EXIT_FAILURE);}
-  const double t = pm->time;
-  std::fwrite("P3D1", 1, 4, fp);
-  std::fwrite(&t, sizeof(double), 1, fp);
-  std::fwrite(&npart, sizeof(int), 1, fp);
-  std::vector<float> buf(npart);
-  for (int c : {static_cast<int>(IPX), static_cast<int>(IPY), static_cast<int>(IPZ),
-                static_cast<int>(IPM)}) {
-    for (int p=0; p<npart; ++p) buf[p] = static_cast<float>(pr(c,p));
-    std::fwrite(buf.data(), sizeof(float), npart, fp);
-  }
-  std::fclose(fp);
-  ++p3d_number_;
-  // native restart: the number of the next frame travels in the restart file
-  if (ba_pin_ != nullptr) ba_pin_->SetInteger("problem", "rst_p3d_number", p3d_number_);
-}
 int ba_field_number_ = 0;
 bool ba_geom_written_ = false;   // the geometry file is written with the first field file
 int ba_geom_seq_ = -1;           // mesh update sequence of the geometry last written
@@ -1249,8 +1221,6 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   ba_history_ = pin->GetOrAddBoolean("problem", "ba_history", false);
   dust_moments_hist_ = pin->GetOrAddBoolean("problem", "dust_moments_hist", false);
   dust_moments_exact_ = pin->GetOrAddBoolean("problem", "dust_moments_exact", false);
-  p3d_dt_ = pin->GetOrAddReal("problem", "p3d_snapshot_dt", -1.0);
-  p3d_t0_ = pin->GetOrAddReal("problem", "p3d_snapshot_t0", 0.0);
   // several ranks: fields of the canonical TSC deposit on a uniform mesh (WriteBAFieldsGlobal), or
   // of refinable clouds (2026-10-21, WriteBAFields); not ba_history
   const bool fields_mpi = dust_active && !ba_history_ &&
@@ -1366,10 +1336,6 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     // file.  The output numbers continue from the values the file carries in <problem>; a file
     // without them falls back on the time.  No file is touched here (the run directory is set
     // later); the distribution file is cut back and continued at its next record.
-    if (p3d_dt_ > 0.0) {   // the 3-D particle snapshots continue their numbering
-      p3d_number_ = pin->GetOrAddInteger("problem", "rst_p3d_number",
-          std::max(0, static_cast<int>(std::ceil((pmy_mesh_->time - p3d_t0_ - 1.0e-10)/p3d_dt_))));
-    }
     if (ba_snapshots_) {
       ba_snapshot_number_ = pin->GetOrAddInteger("problem", "rst_ba_snapshot_number",
           static_cast<int>(std::ceil((pmy_mesh_->time - 1.0e-10)/ba_snapshot_dt_)));
@@ -2409,90 +2375,6 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   });
   }
 
-  // <problem>/deptest: a test of the general deposit remap (3-D, one rank): every
-  // particle is placed at random within deptest_w of the two x1 faces, with a random mass, then
-  // moved by deptest_shift along x1 (crossing a shear-periodic face: y shifted by the offset of
-  // time deptest_t, as a crossing particle); the remapped mass density is written
-  // (DustGasDrag::DepositRemapTest) and the run stops
-  if (pin->GetOrAddBoolean("problem", "deptest", false)) {
-    const Real w = pin->GetReal("problem", "deptest_w");
-    const Real shx = pin->GetOrAddReal("problem", "deptest_shift", 0.0);
-    const Real tt = pin->GetOrAddReal("problem", "deptest_t", 0.0);
-    const std::string tag = pin->GetOrAddString("problem", "deptest_tag", "a");
-    const auto &ms = pmy_mesh_->mesh_size;
-    const Real lx = ms.x1max - ms.x1min, ly = ms.x2max - ms.x2min, lz = ms.x3max - ms.x3min;
-    const bool shear = pin->DoesBlockExist("shearing_box") &&
-        pmy_mesh_->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
-    const Real ysh = shear ? std::fmod(pin->GetReal("shearing_box", "qshear")*
-                                       pin->GetReal("shearing_box", "omega0")*lx*tt, ly) : 0.0;
-    // the same global set of deptest_n particles on every rank; each keeps those in its blocks
-    // (in the order of the global index, so a block's deposit does not depend on the ranks)
-    const int nglob = pin->GetOrAddInteger("problem", "deptest_n", ppar->nprtcl_thispack);
-    const Real x1a = ms.x1min, x2a = ms.x2min, x3a = ms.x3min;
-    const Real x1b = ms.x1max, x2b = ms.x2max;
-    const int nmbl = nmb;
-    auto pos = KOKKOS_LAMBDA(const int q, Real &x, Real &y, Real &z, Real &mq) {
-      std::uint64_t key = static_cast<std::uint64_t>(q) + random_seed*UINT64_C(0x9e3779b97f4a7c15);
-      const Real u0 = HashUniform01(key + UINT64_C(0x632be59bd9b4e019));
-      const Real u1 = HashUniform01(key + UINT64_C(0x8cb92baa3f3d8dd7));
-      const Real u2 = HashUniform01(key + UINT64_C(0x58f38ded6f7c55b5));
-      const Real u3 = HashUniform01(key + UINT64_C(0x1f83d9abfb41bd6b));
-      x = (u0 < 0.5) ? (x1b - 2.0*u0*w) : (x1a + 2.0*(u0 - 0.5)*w);
-      y = x2a + u1*ly; z = x3a + u2*lz;
-      x += shx;
-      if (x >= x1b) {x -= lx; y += ysh;}
-      if (x < x1a) {x += lx; y -= ysh;}
-      if (y >= x2b) y -= ly;
-      if (y < x2a) y += ly;
-      mq = 1.0 + u3;
-    };
-    DvceArray1D<int> qslot("nsh_deptest_slot", std::max(1, nglob));
-    par_for("nsh_deptest_owner", DevExeSpace(), 0, nglob-1, KOKKOS_LAMBDA(const int q) {
-      Real x, y, z, mq;
-      pos(q, x, y, z, mq);
-      int mm = -1;
-      for (int b=0; b<nmbl; ++b) {
-        if (x >= mbsize.d_view(b).x1min && x < mbsize.d_view(b).x1max &&
-            y >= mbsize.d_view(b).x2min && y < mbsize.d_view(b).x2max &&
-            z >= mbsize.d_view(b).x3min && z < mbsize.d_view(b).x3max) mm = b;
-      }
-      qslot(q) = mm;
-    });
-    DvceArray1D<int> qnew("nsh_deptest_new", std::max(1, nglob));
-    int nkeep = 0;
-    Kokkos::parallel_scan("nsh_deptest_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, nglob),
-    KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
-      if (final) qnew(q) = (qslot(q) >= 0) ? upd : -1;
-      if (qslot(q) >= 0) ++upd;
-    }, nkeep);
-    Kokkos::realloc(ppar->prtcl_rdata, ppar->nrdata, std::max(1, nkeep));
-    Kokkos::realloc(ppar->prtcl_idata, ppar->nidata, std::max(1, nkeep));
-    ppar->nprtcl_thispack = nkeep;
-    auto prt = ppar->prtcl_rdata;
-    auto pit = ppar->prtcl_idata;
-    const int nrd = ppar->nrdata;
-    par_for("nsh_deptest_set", DevExeSpace(), 0, nglob-1, KOKKOS_LAMBDA(const int q) {
-      const int p = qnew(q);
-      if (p < 0) return;
-      Real x, y, z, mq;
-      pos(q, x, y, z, mq);
-      for (int c=0; c<nrd; ++c) prt(c,p) = 0.0;
-      prt(IPX,p) = x; prt(IPY,p) = y; prt(IPZ,p) = z; prt(IPM,p) = mq;
-      pit(PGID,p) = gids + qslot(q);
-      SetTag(pit, p, static_cast<std::uint64_t>(q));
-    });
-    if (!three_d) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "deptest: 3-D only" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    pmbp->pdust->DepositRemapTest(tt, tag);
-#if MPI_PARALLEL_ENABLED
-    MPI_Finalize();
-#endif
-    std::exit(EXIT_SUCCESS);
-  }
-
   // S3c: <problem>/stratified_dust (3-D shearing box with <shearing_box>/stratified):
   // isothermal hydrostatic gas rho0 exp(-z^2/2H^2), H = cs/omega0, the velocities of the set-up
   // above (NSH, zero for etavk = 0), dust masses times exp(-z^2/2 Hp^2) (<problem>/dust_hp,
@@ -2911,8 +2793,6 @@ void DustNSHHistory(HistoryData *pdata, Mesh *pm) {
     pdata->hdata[3*s+1] = sp;
     pdata->hdata[3*s+2] = sn;
   }
-  // the particle snapshots ride on the history calls
-  if (p3d_dt_ > 0.0 && pm->time >= p3d_t0_ + p3d_number_*p3d_dt_ - 1.0e-10*p3d_dt_) WriteP3DSnapshot(pm);
   if (dust_moments_hist_) {   // all species: sum m, m vx, m vz, m z^2
     int h = pdata->nhist;
     if (h + 4 > NHISTORY_VARIABLES) {

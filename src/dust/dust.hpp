@@ -1555,9 +1555,6 @@ class DustGasDrag {
   // momentum and the raw second moments: 7 components), checked against the particle mass
   void BuildOwnerOverlapMesh(const bool remap);
   int ResetPGIDOwnerOverlap(const char *when);
-  // test of the general deposit remap: the particle mass density (TSC on the own
-  // block) remapped with the shear offset of time t_test; writes deptest_<tag>_r<rank>.bin
-  void DepositRemapTest(const Real t_test, const std::string &tag);
   // species >= 0: the particles of that species (0-based) only
   void OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments, const int species = -1);
   DvceArray2D<int> oo_block_map;
