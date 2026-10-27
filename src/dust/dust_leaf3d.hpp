@@ -6,7 +6,7 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_leaf3d.hpp
-//! \brief S3b: the block-local traversal of the actual leaves
+//! \brief The block-local traversal of the actual leaves
 //! under a refinable cloud on a 3-D mesh.  The 2-D LeafTraversal (dust.hpp) stays untouched;
 //! this is its 3-D counterpart with the same rules: per direction the integral of the cloud
 //! shape over a leaf interval is a difference of the hat CDF (and of its first moment), from

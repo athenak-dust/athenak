@@ -57,9 +57,9 @@ int P1Pieces(const int lobe_old, const bool sep_lo, const bool sep_hi, DPiece ou
   return n;
 }
 
-// the MeshBlock of a new or moved cloud at (x, y), searched from the block m of its parent (on
-// the actual leaves; the parent's block if no block holds the position, or if
-// the block is on another rank: the particle migration then moves it)
+// the MeshBlock of a new or moved cloud at (x, y), searched from the block m of its parent on
+// the actual leaves; the parent's block if no block holds the position, or if the block is on
+// another rank (the particle migration then moves it)
 KOKKOS_INLINE_FUNCTION
 int NewCloudBlock(const LeafTraversal &lt, const Real x, const Real y, const int m,
                   const int ncell12) {
@@ -137,8 +137,8 @@ int DustGasDrag::SplitCloudsP1Device() {
   const int ncell12 = qdep.extent_int(4)*qdep.extent_int(3);
 
   // pieces per particle (0 = not flagged), and the numbers of parents / lobed events.
-  // The work arrays persist between cycles (per-cycle allocations and frees
-  // dominated the host side of a mixed-mesh cycle).
+  // The work arrays persist between cycles (per-cycle allocations and frees dominated the
+  // host side of a mixed-mesh cycle).
   if (split_np.extent_int(0) < npart) {
     split_np = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing,
                                                    "dust_split_np"), npart + npart/4);
@@ -180,8 +180,8 @@ int DustGasDrag::SplitCloudsP1Device() {
   }
   auto prv = ppar->prtcl_rdata;
   auto piv = ppar->prtcl_idata;
-  // tags of this rank: tag0, tag0 + nranks, ... (unique over the ranks;
-  // 64-bit, the counter is moved on, with a check, before the fill)
+  // tags of this rank: tag0, tag0 + nranks, ... (unique over the ranks; 64-bit, the counter is
+  // moved on, with a check, before the fill)
   const std::uint64_t tag0 = IssueTags(static_cast<std::uint64_t>(ntags));
   const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
   Kokkos::parallel_for("dust_split_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -295,12 +295,12 @@ struct KeyCSR {
   int Last(const std::int64_t key) const {const int u = Find(key); return (u < 0) ? 0 : start(u + 1);}
 };
 
-// The device buffers of the sparse key tables, grown when needed
+// the device buffers of the sparse key tables, grown when needed
 // and kept across passes.  Allocating and freeing them in every pass (cudaMalloc and cudaFree
 // synchronise the device; thrust's sort allocated its own storage in every call) made the first
 // sparse version 1-3% slower than the dense tables at BA 128/256.  Released at Kokkos::finalize.
 // Slots: KeyCSR 0 pieces, 1 level-L clouds, 2 lobed clouds, 3 q-stage walk; CellLists 1 tent
-// commits (slot 0 held the commits of the quantum absorption, removed 2026-10-20).  A slot is
+// commits (slot 0 held the commits of the removed quantum absorption).  A slot is
 // rebuilt only after the tables built in it are out of use (kernels on the one stream run in
 // order).
 struct KeyScratch {
@@ -661,7 +661,7 @@ int DustGasDrag::MergeCloudsDevice() {
 
 
   // one field-error budget for the whole pass (stage G, and X with
-  // cloud_merge_budget_x; stage C and the absorption were removed on 2026-10-20).  lent:
+  // cloud_merge_budget_x).  lent:
   // leaf mass and momentum at the entry of the pass; lcum: the change made so far (recomputed from
   // the actual state after stage X of each level, then advanced by what each stage accepts)
   const bool pbud = cloud_merge_mode == 1 && cloud_merge_budget > 0.0;
@@ -671,7 +671,7 @@ int DustGasDrag::MergeCloudsDevice() {
   Kokkos::Timer tpass;
   double tbud = 0.0;                 // seconds in the budget kernels
   bool bdirty = false;               // the pass has changed the particle set
-  // G / C: rejected groups, pieces, mass; evaluations (C, removed 2026-10-20: zero, kept for the
+  // G / C: rejected groups, pieces, mass; evaluations (stage C was removed: zero, kept for the
   // log columns)
   double gcb[2][4] = {{0.0, 0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 0.0}};
   double bcap = 0.0;                 // stages that hit the evaluation limit
@@ -722,6 +722,7 @@ int DustGasDrag::MergeCloudsDevice() {
       }, ntags);
       DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata, nnew);
       DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata, nnew);
+      // tags unique over the ranks, 64-bit
       const std::uint64_t tag0 = IssueTags(static_cast<std::uint64_t>(ntags));
       const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
       Kokkos::parallel_for("rel_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -842,13 +843,13 @@ int DustGasDrag::MergeCloudsDevice() {
   // cloud_merge_lobe_wait says (old inputs and restarts carry 1)
   const bool lobe_keys = cloud_merge_mode != 1 && lobe_wait;
 
-  // quantum mode: counters over levels (the slots 13..21 of the removed stage C
-  // stay zero and keep the log columns)
+  // quantum mode: counters over levels (the slots 13..21 of the removed stage C stay zero and
+  // keep the log columns)
   double qtot[24] = {0.0};
   unsigned long long q_events = 0, q_in = 0;
   double xwtot[2] = {0.0, 0.0};     // X protection: waiting pieces, their mass
-  // absorptions rejected by the budget, their mass, evaluations (the absorption was
-  // removed on 2026-10-20: zero, kept for the log columns)
+  // absorptions rejected by the budget, their mass, evaluations (the absorption was removed:
+  // zero, kept for the log columns)
   const double budtot[3] = {0.0, 0.0, 0.0};
 
   for (int lev=1; lev<=nlev; ++lev) {
@@ -884,7 +885,7 @@ int DustGasDrag::MergeCloudsDevice() {
     const std::int64_t kbnd = SpeciesKeyBound(nsp, ncl, 0);   // keys sp ncl + cell
     BuildKeyCSR(kp, kbnd, 0, spc);
     // the level-L clouds are looked up by the tent pass only (in quantum mode they were read by
-    // the absorption, removed on 2026-10-20)
+    // the absorption, since removed)
     if (cloud_merge_mode != 1) BuildKeyCSR(kc, kbnd, 1, scc);
     if (lobe_keys) BuildKeyCSR(kl, kbnd, 2, slc);
     if (cloud_merge_mode == 1) {
@@ -893,7 +894,7 @@ int DustGasDrag::MergeCloudsDevice() {
       // G: mass-quantum grouping of plain level-lev pieces in level-L merge cells into level-L
       //    clouds (true-velocity and position bounding boxes, K open groups, rotated walks);
       // then the compaction.  (Stage C, the same walk at level lev in the fine interior, and the
-      // absorption of G residuals were removed on 2026-10-20; tag pre-cleanup-20261020.)
+      // absorption of G residuals were removed.)
       const int nmax = (npart > 0) ? npart : 1;
       DvceArray2D<Real> nr("q_nr", nrdata, nmax);
       DvceArray2D<int> ni("q_ni", nidata, nmax);
@@ -995,7 +996,7 @@ int DustGasDrag::MergeCloudsDevice() {
           Kokkos::atomic_add(&qc(3), M*vn1 - (sxx - sx*sx/M + M*vo1));
           Kokkos::atomic_add(&qc(4), M*vn2 - (syy - sy*sy/M + M*vo2));
         });
-        // ---- stage X is decided by the pass budget like stages G and C.  The kernel
+        // ---- stage X is decided by the pass budget like stage G.  The kernel
         // above only claimed and built the new clouds; the cumulated leaf change of the standing
         // families (new cloud - nine members) is tested on top of the change made so far, families
         // touching a violating leaf are rejected with their members kept exactly as they are.
@@ -1986,8 +1987,8 @@ int DustGasDrag::MergeCloudsDevice() {
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::SortParticles
 //! \brief Timing diagnostic: reorders the
-//! particle arrays by (block, cell of the block, old position): the cells of a block row by row
-//! (the Morton order, cloud_sort_order = morton, was removed on 2026-10-20), stable inside a
+//! particle arrays by (block, cell of the block, old position): the cells of a block row by row,
+//! stable inside a
 //! cell; cloud_sort_order = random (test) takes a random permutation instead.  Every nrdata / nidata column moves; the arrays are swapped with spare arrays
 //! of the same extent (kept for the next call).  Runs at the start of a cycle (RefineClouds),
 //! where no send list is pending.  The resampling and the merge pass take their candidates in
@@ -2093,7 +2094,7 @@ void DustGasDrag::UpdateCloudOrder() {
   if (npart < 2) {cloud_ord_n = 0; return;}
   Kokkos::Timer t;
   const int nx1 = pmy_pack->pmesh->mb_indcs.nx1, nx2 = pmy_pack->pmesh->mb_indcs.nx2;
-  // 2026-10-25 (Codex perf review item 2): 3-D keys (block, k, j, i); in 2-D nx3 = 1, k = 0
+  // 3-D keys (block, k, j, i); in 2-D nx3 = 1, k = 0
   const int nx3 = clouds3d ? pmy_pack->pmesh->mb_indcs.nx3 : 1;
   const bool z3 = clouds3d;
   const int gids = pmy_pack->gids, nmb = pmy_pack->nmb_thispack;
@@ -2204,7 +2205,7 @@ struct MergeMask3D {
 //! by the pass number) into level-L clouds of the quantum m_root / 8^L, position and velocity
 //! bounding boxes, K open groups; the pass budget (with the structure-relative beta over the
 //! six neighbour leaves) accepts or rejects whole groups; the compaction.
-//! One rank (stage 2); no stage-X budget, no X protection.  Returns the merges.
+//! No stage-X budget, no X protection.  Returns the merges.
 
 int DustGasDrag::MergeCloudsDevice3D() {
   particles::Particles *ppar = pmy_pack->ppart;

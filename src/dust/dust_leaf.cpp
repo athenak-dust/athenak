@@ -4,8 +4,8 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_leaf.cpp
-//! \brief The actual-leaf traversal: the block geometry of
-//! LeafTraversal (dust.hpp), rebuilt with the leaf maps after every regrid.
+//! \brief The block geometry of LeafTraversal (dust.hpp), the traversal of the actual
+//! leaves under a cloud, rebuilt with the leaf maps after every regrid.
 
 #include <algorithm>
 #include <unordered_map>

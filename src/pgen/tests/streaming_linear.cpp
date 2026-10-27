@@ -16,7 +16,7 @@
 //!     f(x,z,t) = -[Re(f~)sin(kx x - wR t) + Im(f~)cos(kx x - wR t)] e^{st} sin(kz z)
 //! The complex amplitudes f~ (in code units), the wavenumbers, and the complex
 //! frequency are supplied through <problem> parameters (computed by an external
-//! eigensolver; see the phase-2 validation notebook). The particle density wave is
+//! eigensolver). The particle density wave is
 //! imprinted by radial lattice displacements proportional to cos(kz z) (YJ07 App. C).
 //!
 //! With <problem>/user_hist = true, the history records the complex Fourier projection
@@ -178,9 +178,10 @@ void SolveNSH2(const Real omega0, const Real qshear, const Real ax,
 //! \brief Problem Generator for linear streaming-instability eigenmodes
 
 void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) {
-  dust::RequireLegacySpeciesInit(pin, "streaming_linear");  // legacy species keys only
-  // in 3-D the mode lies in the x1-x3 plane (x2 the azimuth, the state uniform in x2)
-  // (StreamingLinearHistory also projects the 3-D lattice with x3 vertical)
+  // stop on <dust> abundance/sampling keys, which this generator does not implement
+  dust::RequireLegacySpeciesInit(pin, "streaming_linear");
+  // in 3-D the mode lies in the x1-x3 plane (x2 the azimuth, the state uniform in x2);
+  // StreamingLinearHistory also projects the 3-D point-particle lattice with x3 vertical
   user_hist_func = (pmy_mesh_->three_d && pmy_mesh_->pmb_pack->pdust != nullptr &&
                     pmy_mesh_->pmb_pack->pdust->Clouds3D()) ? StreamingLinearHistory3D
                                                            : StreamingLinearHistory;
@@ -188,7 +189,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   if (pmy_mesh_->adaptive && pin->DoesBlockExist("dust")) {
     dust::SetupScheduledRefinement(pin);
     user_ref_func = dust::ScheduledRefinement;
-    // the dust-density request instead of the schedule
+    // optional: refine on the dust density instead of the schedule
     if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {
       dust::SetupDensityTrigger(pin);
       user_ref_func = dust::DensityRefinement;
@@ -255,9 +256,9 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // also a 3-D shearing box (x1 radial, x2 azimuthal, x3 vertical),
-  // the mode independent of x2, with the lattice (point particles; none of the 2-D diagnostics
-  // below).  Refinable clouds in 3-D: their setup is the 3-D branch below
+  // also a 3-D shearing box (x1 radial, x2 azimuthal, x3 vertical), the mode independent
+  // of x2, with the lattice (point particles; none of the 2-D diagnostics below).
+  // Refinable clouds in 3-D: their setup is the 3-D branch below
   const bool lina3d = pmy_mesh_->three_d;
   if (pmbp->pdust->nspecies != 1 ||
       (lina3d && ((pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
