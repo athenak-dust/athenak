@@ -220,8 +220,9 @@ void Observe(Mesh *pm) {
   const auto fv = Homologous(pm->time);
   std::ostringstream o;
   o << std::setprecision(10) << "{\"time\":" << pm->time << ",\"t_over_tff\":" << pm->time/ff.tff
-    << ",\"cycle\":" << pm->ncycle << ",\"f\":" << fv.first << ",\"fdot\":" << fv.second
-    << ",\"rq_over_f_rq0\":[";
+    << ",\"cycle\":" << pm->ncycle << ",\"f\":" << fv.first << ",\"fdot\":";
+  if (std::isfinite(fv.second)) o << fv.second; else o << "null";   // after the analytic collapse
+  o << ",\"rq_over_f_rq0\":[";
   for (std::size_t n=0; n<rq.size(); ++n) {
     o << (n ? "," : "") << ((fv.first > 0 && ff.rq0[n] > 0) ? rq[n]/(fv.first*ff.rq0[n]) : -1.0);
   }
