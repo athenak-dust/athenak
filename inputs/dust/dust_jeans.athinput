@@ -64,6 +64,8 @@ cloud_merge = false
 cloud_resample = false
 
 <gravity>
+source = both                    # the default is dust
+experimental_gas_source = true   # the gas as a source is experimental for now
 enabled = true
 setup = distributed
 solver = multigrid

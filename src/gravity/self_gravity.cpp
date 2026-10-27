@@ -23,6 +23,7 @@
 #include "gravity/slab_boundary.hpp"
 #include "gravity/vacuum_boundary.hpp"
 #include "hydro/hydro.hpp"
+#include "bvals/bvals.hpp"
 #include "dust/dust.hpp"
 #include "parameter_input.hpp"
 #include "shearing_box/shearing_box.hpp"
@@ -117,8 +118,14 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
       else if (value == "dust") {gas = false; dust = true;}
       else Fail("<gravity>/" + key + " must be gas, dust or both");
     };
-    const std::string src = pin->GetOrAddString("gravity", "source", coupled_dust_ ? "both" : "gas");
+    const std::string src = pin->GetOrAddString("gravity", "source", coupled_dust_ ? "dust" : "gas");
     parse("source", src, source_gas_, source_dust_);
+    // Rixin: the gas as a gravity source needs further development (the gas
+    // energy of the kicks; the flux form exists only for one level and periodic boxes): source =
+    // gas or both stops unless <gravity>/experimental_gas_source = true (tests, development)
+    if (source_gas_ && !pin->GetOrAddBoolean("gravity", "experimental_gas_source", false))
+      Fail("<gravity>/source = " + src + ": the gas as a gravity source needs further development "
+           "first; use source = dust, or experimental_gas_source = true for tests");
     parse("kick", pin->GetOrAddString("gravity", "kick", src), kick_gas_, kick_dust_);
     if (!coupled_dust_ && (source_dust_ || kick_dust_))
       Fail("<gravity>/source or kick includes dust, but the run has no dust module");
@@ -127,6 +134,31 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     if (coupled_dust_ && (source_dust_ || kick_dust_) &&
         pin->GetOrAddString("gravity","dust_x3_assignment","fold")!="fold")
       Fail("dust gravity/dust_x3_assignment supports fold only; drag deposit policy is independent");
+  }
+  pin_ = pin;
+  {
+    const std::string em = pin->GetOrAddString("gravity", "energy_source", "kick");
+    if (em == "kick") energy_mode = 0;
+    else if (em == "diag") energy_mode = 1;
+    else if (em == "flux") energy_mode = 2;
+    else Fail("<gravity>/energy_source must be kick, flux or diag");
+    if (energy_mode > 0) {
+      const std::string why = "<gravity>/energy_source = " + em + " ";
+      if (!pack->phydro || !pack->phydro->peos->eos_data.is_ideal)
+        Fail(why + "needs the gas energy equation (ideal gas)");
+      if (!kick_gas_) Fail(why + "acts on the gas energy: <gravity>/kick must include gas");
+      if (pin->GetString("time", "evolution") != "dynamic" ||
+          (pin->GetOrAddString("time", "integrator", "rk2") != "rk1" &&
+           pin->GetOrAddString("time", "integrator", "rk2") != "rk2" &&
+           pin->GetOrAddString("time", "integrator", "rk2") != "rk3"))
+        Fail(why + "supports rk1/rk2/rk3 for now");
+      if (pm->multilevel) Fail(why + "supports one refinement level for now (SMR/AMR: further development)");
+      for (int f = 0; f < (pm->three_d ? 6 : (pm->multi_d ? 4 : 2)); ++f) {
+        if (pm->mesh_bcs[f] != BoundaryFlag::periodic)
+          Fail(why + "supports boxes periodic in every direction for now (shearing box, isolated "
+               "or other boundaries: further development)");
+      }
+    }
   }
   four_pi_G = pin->GetReal("gravity", "four_pi_G");
   tolerance_ = pin->GetOrAddReal("gravity", "rtol", 1.0e-10);
@@ -202,6 +234,7 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
 }
 
 SelfGravity::~SelfGravity() {
+  delete energy_bval_;
   if (global_variable::my_rank == 0) {
     std::cout << std::setprecision(16) << "# SELF_GRAVITY_SUMMARY solves=" << solve_count
               << " cache_hits=" << cache_hit_count
@@ -1012,6 +1045,8 @@ void SelfGravity::KickHydro(Real dt) {
   auto u = pack_->phydro->u0;
   auto acc = acceleration;
   const bool energy = pack_->phydro->peos->eos_data.is_ideal;
+  const int emode = energy_mode;
+  auto ek = energy_kick_;
   Kokkos::parallel_for("sg_hydro_kick",Kokkos::RangePolicy<DevExeSpace>(0,n),
   KOKKOS_LAMBDA(const int q) {
     int t = q;
@@ -1026,7 +1061,112 @@ void SelfGravity::KickHydro(Real dt) {
       u(t,IM1+d,k,j,i) += rho*dv;
     }
     if (energy) u(t,IEN,k,j,i) += de;
+    if (emode > 0) ek(t,0,k,j,i) += de;
   });
+}
+
+void SelfGravity::BeginEnergyStep() {
+  if (energy_mode == 0) return;
+  const auto ind = pack_->pmesh->mb_indcs;
+  const int nmb = pack_->nmb_thispack;
+  const int ni = ind.nx1+2*ind.ng, nj = pack_->pmesh->multi_d ? ind.nx2+2*ind.ng : 1;
+  const int nk = pack_->pmesh->three_d ? ind.nx3+2*ind.ng : 1;
+  if (energy_kick_.extent_int(0) != nmb) {
+    energy_phi_old_ = DvceArray5D<Real>("sg_energy_phi_old",nmb,1,nk,nj,ni);
+    energy_phibar_ = DvceArray5D<Real>("sg_energy_phibar",nmb,1,nk,nj,ni);
+    energy_kick_ = DvceArray5D<Real>("sg_energy_kick",nmb,1,nk,nj,ni);
+    for (int d = 0; d < 3; ++d)
+      energy_mflx_[d] = DvceArray5D<Real>("sg_energy_mflx",nmb,1,nk+1,nj+1,ni+1);
+    const int cni = ind.cnx1+2*ind.ng, cnj = pack_->pmesh->multi_d ? ind.cnx2+2*ind.ng : 1;
+    const int cnk = pack_->pmesh->three_d ? ind.cnx3+2*ind.ng : 1;
+    energy_cdummy_ = DvceArray5D<Real>("sg_energy_cdummy",nmb,1,cnk,cnj,cni);
+  }
+  if (energy_bval_ == nullptr) {
+    energy_bval_ = new MeshBoundaryValuesCC(pack_,pin_,false);
+    energy_bval_->InitializeBuffers(1);
+  }
+  Kokkos::deep_copy(energy_phi_old_,phi);
+  Kokkos::deep_copy(energy_kick_,0.0);
+  for (int d = 0; d < 3; ++d) Kokkos::deep_copy(energy_mflx_[d],0.0);
+}
+
+// after each explicit stage: S <- gam0 S + beta dt F_mass (the stage's u1 holds u^n, whose flux sum
+// is zero, for rk1/rk2/rk3), so that u^{n+1} = u^n - div S
+void SelfGravity::AccumulateMassFlux(Real gam0, Real beta_dt) {
+  if (energy_mode == 0) return;
+  const auto ind = pack_->pmesh->mb_indcs;
+  const bool md = pack_->pmesh->multi_d, td = pack_->pmesh->three_d;
+  auto &flx = pack_->phydro->uflx;
+  auto f1 = flx.x1f, f2 = flx.x2f, f3 = flx.x3f;
+  auto s1 = energy_mflx_[0], s2 = energy_mflx_[1], s3 = energy_mflx_[2];
+  const int ke1 = td ? ind.ke+1 : ind.ke, je1 = md ? ind.je+1 : ind.je;
+  par_for("sg_energy_mflx",DevExeSpace(),0,pack_->nmb_thispack-1,ind.ks,ke1,ind.js,je1,
+      ind.is,ind.ie+1,KOKKOS_LAMBDA(int m,int k,int j,int i) {
+    if (k <= ind.ke && j <= ind.je) s1(m,0,k,j,i) = gam0*s1(m,0,k,j,i) + beta_dt*f1(m,IDN,k,j,i);
+    if (md && k <= ind.ke && i <= ind.ie)
+      s2(m,0,k,j,i) = gam0*s2(m,0,k,j,i) + beta_dt*f2(m,IDN,k,j,i);
+    if (td && j <= ind.je && i <= ind.ie)
+      s3(m,0,k,j,i) = gam0*s3(m,0,k,j,i) + beta_dt*f3(m,IDN,k,j,i);
+  });
+}
+
+void SelfGravity::EndEnergyStep() {
+  if (energy_mode == 0) return;
+  const auto ind = pack_->pmesh->mb_indcs;
+  const bool md = pack_->pmesh->multi_d, td = pack_->pmesh->three_d;
+  const int nmb = pack_->nmb_thispack;
+  // phibar on the active cells, then its ghost cells (periodic, one level: plain copies)
+  auto p0 = energy_phi_old_, p1 = phi, pb = energy_phibar_;
+  par_for("sg_energy_phibar",DevExeSpace(),0,nmb-1,ind.ks,ind.ke,ind.js,ind.je,ind.is,ind.ie,
+      KOKKOS_LAMBDA(int m,int k,int j,int i) {
+    pb(m,0,k,j,i) = 0.5*(p0(m,0,k,j,i) + p1(m,0,k,j,i));
+  });
+  auto ok = [this](TaskStatus st, const char *what) {
+    if (st == TaskStatus::fail) Fail(std::string("energy_source phibar exchange failed: ") + what);
+  };
+  ok(energy_bval_->InitRecv(1),"InitRecv");
+  ok(energy_bval_->PackAndSendCC(energy_phibar_,energy_cdummy_),"send");
+  TaskStatus st;
+  do {
+    st = energy_bval_->RecvAndUnpackCC(energy_phibar_,energy_cdummy_);
+    ok(st,"receive");
+  } while (st == TaskStatus::incomplete);
+  ok(energy_bval_->ClearSend(),"ClearSend");
+  ok(energy_bval_->ClearRecv(),"ClearRecv");
+  auto u = pack_->phydro->u0;
+  auto ek = energy_kick_;
+  auto s1 = energy_mflx_[0], s2 = energy_mflx_[1], s3 = energy_mflx_[2];
+  auto &size = pack_->pmb->mb_size;
+  const bool apply = (energy_mode == 2);
+  Real total = 0;
+  const int nk = ind.ke-ind.ks+1, nj = ind.je-ind.js+1, ni = ind.ie-ind.is+1;
+  const int ks = ind.ks, js = ind.js, is = ind.is;
+  Kokkos::parallel_reduce("sg_energy_end",Kokkos::RangePolicy<DevExeSpace>(0,nmb*nk*nj*ni),
+      KOKKOS_LAMBDA(int q,Real &sum) {
+    int t = q;
+    const int i = t%ni+is; t /= ni;
+    const int j = t%nj+js; t /= nj;
+    const int k = t%nk+ks; const int m = t/nk;
+    const Real c = pb(m,0,k,j,i);
+    const Real dx1 = size.d_view(m).dx1, dx2 = size.d_view(m).dx2, dx3 = size.d_view(m).dx3;
+    Real w = -0.5*(s1(m,0,k,j,i+1)*(pb(m,0,k,j,i+1) - c) + s1(m,0,k,j,i)*(c - pb(m,0,k,j,i-1)))/dx1;
+    Real vol = dx1;
+    if (md) {
+      w -= 0.5*(s2(m,0,k,j+1,i)*(pb(m,0,k,j+1,i) - c) + s2(m,0,k,j,i)*(c - pb(m,0,k,j-1,i)))/dx2;
+      vol *= dx2;
+    }
+    if (td) {
+      w -= 0.5*(s3(m,0,k+1,j,i)*(pb(m,0,k+1,j,i) - c) + s3(m,0,k,j,i)*(c - pb(m,0,k-1,j,i)))/dx3;
+      vol *= dx3;
+    }
+    const Real d = w - ek(m,0,k,j,i);
+    if (apply) u(m,IEN,k,j,i) += d;
+    sum += d*vol;
+  },total);
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE,&total,1,MPI_ATHENA_REAL,MPI_SUM,MPI_COMM_WORLD);
+#endif
+  energy_mismatch_total += total;
 }
 
 void SelfGravity::KickMatter(Real dt) {

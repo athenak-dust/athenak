@@ -18,6 +18,7 @@
 
 class Driver;
 class MeshBlockPack;
+class MeshBoundaryValuesCC;
 class ParameterInput;
 
 namespace gravity {
@@ -43,6 +44,21 @@ class SelfGravity {
   void KickHydro(Real dt);
   // Both species receive the field sampled by the immediately preceding Solve.
   void KickMatter(Real dt);
+  // <gravity>/energy_source = kick (default) | flux | diag.  The half-kicks change
+  // the gas energy by the kinetic-energy change of the cell-centred momentum kick, sum rho v.g dt;
+  // the potential energy W = 1/2 sum rho phi V changes with the face mass fluxes, so total
+  // K + U + W drifts (12.3% / 5.4% at 32^3 / 64^3, all of it this mismatch).  flux
+  // replaces, at the end of each step, the gas energy of the two kicks by the face work
+  //   -1/2 sum_d [S_{i+1/2}(phibar_{i+1} - phibar_i) + S_{i-1/2}(phibar_i - phibar_{i-1})]/dx_d,
+  // S the time-integrated RK mass flux and phibar = (phi^n + phi^{n+1})/2 (the difference goes
+  // to the internal energy; K + U + W then holds to the solver tolerance); diag only adds up the
+  // difference (energy_mismatch_total).  For now: ideal gas, gas kicked, rk1/rk2/rk3, one
+  // refinement level, periodic in every direction (no shearing box, no isolated x3).
+  void BeginEnergyStep();
+  void AccumulateMassFlux(Real gam0, Real beta_dt);
+  void EndEnergyStep();
+  int energy_mode = 0;               // 0 kick, 1 diag, 2 flux
+  Real energy_mismatch_total = 0;    // sum over steps of sum_cells (face work - kick energy) V
   void UpdateTimeStep();
   // Gravity-enabled 3D hydro uses symmetric orbital halfsteps around residual
   // RK hydro. This corrects operator splitting; limited PLM remapping can still
@@ -105,6 +121,10 @@ class SelfGravity {
   DvceArray1D<int> physical_rows_;
   DvceArray1D<Real> cached_source_;  // physical source cells, independent of MG padding
   DvceArray5D<Real> extra_density_;
+  // the energy_source = flux / diag work arrays and the phibar ghost exchange
+  DvceArray5D<Real> energy_phi_old_, energy_phibar_, energy_kick_, energy_mflx_[3], energy_cdummy_;
+  MeshBoundaryValuesCC *energy_bval_ = nullptr;
+  ParameterInput *pin_ = nullptr;
   DvceArray5D<Real> dust_density_;
   DvceArray2D<Real> particle_acceleration_;
   ExtraDensitySource extra_source_;

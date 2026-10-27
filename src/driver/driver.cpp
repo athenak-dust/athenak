@@ -422,6 +422,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       if (pgrav != nullptr) {
         if (pgrav->UsesOrbitalSplit()) pgrav->SetHydroBoundaryTime(pmesh->time);
         pgrav->Solve(pmesh->time);
+        pgrav->BeginEnergyStep();   // a no-op unless energy_source = flux / diag
         pgrav->KickMatter(0.5*pmesh->dt);
         InitBoundaryValuesAndPrimitives(pmesh);
         if (pgrav->UsesOrbitalSplit()) {
@@ -444,6 +445,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         ExecuteTaskList(pmesh, "before_stagen", stage);
         ExecuteTaskList(pmesh, "stagen", stage);
         ExecuteTaskList(pmesh, "after_stagen", stage);
+        if (pgrav != nullptr) pgrav->AccumulateMassFlux(gam0[stage-1], beta[stage-1]*pmesh->dt);
       }
 
       // Work after time integrator indicated by "1" in stage
@@ -476,6 +478,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         }
         pgrav->Solve(pmesh->time+pmesh->dt);
         pgrav->KickMatter(0.5*pmesh->dt);
+        pgrav->EndEnergyStep();     // a no-op unless energy_source = flux / diag
       }
 
       // Work outside of TaskLists:
