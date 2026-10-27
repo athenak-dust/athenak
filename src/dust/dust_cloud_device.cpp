@@ -611,6 +611,17 @@ void BudgetDeposit(const LeafTraversal &lt, const DvceArray2D<Real> &r,
   });
 }
 
+// a G group's hash in [0, 1) from its new cloud's tag (splitmix64; the same on every
+// rank and in every run), for cloud_merge_budget_thin
+KOKKOS_INLINE_FUNCTION
+Real GroupHash01(const int tag) {
+  std::uint64_t z = static_cast<std::uint64_t>(static_cast<std::uint32_t>(tag)) + 0x9E3779B97F4A7C15ULL;
+  z = (z ^ (z >> 30))*0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27))*0x94D049BB133111EBULL;
+  z ^= z >> 31;
+  return static_cast<Real>(z >> 11)*(1.0/9007199254740992.0);
+}
+
 // the leaf change (dm, d1..d3) in units of the budget: returns |dm| / (beta Mf) and sets
 // rmom = |dp|_inf / (beta Mf vref), Mf = max(M, mfloor), vref = max(vmin, |P|_inf / M)
 KOKKOS_INLINE_FUNCTION
@@ -2938,6 +2949,8 @@ int DustGasDrag::MergeCloudsDevice3D() {
     DvceArray1D<int> krej("q3_krej", nmax);
     DvceArray2D<Real> ldelg("q3_ldel", 4, nbt);
     DvceArray1D<int> lviolg("q3_lviol", nbt);
+    const bool bthin = cloud_merge_budget_thin;
+    DvceArray2D<Real> lpacc("q3_lpacc", 1, bthin ? nbt : 1);   // accepted share
     // ---- stage G: the cell walk.  Pieces at level lev in level-L merge cells -> level-L clouds
     DvceArray1D<int> gid("q3_gid", npart), gknew("q3_gknew", nmax);
     DvceArray1D<int> ngroup("q3_ngroup", 1);
@@ -3186,13 +3199,19 @@ int DustGasDrag::MergeCloudsDevice3D() {
                   lcum(0,t) + ldelg(0,t), lcum(1,t) + ldelg(1,t), lcum(2,t) + ldelg(2,t),
                   lcum(3,t) + ldelg(3,t), rp);
               bad = (rm > 1.0 || rp > 1.0) ? 1 : 0;
+              if (bthin) lpacc(0,t) = bad ? 0.9/Kokkos::fmax(rm, rp) : 1.0;
+            } else if (bthin) {
+              lpacc(0,t) = 1.0;
             }
             lviolg(t) = bad;
             sum += bad;
           }, nviol);
           HaloForwardFlags(lviolg);                       // the owners' verdicts on the halo
+          if (bthin) HaloForwardFlat(lpacc, 1);
           nviol = static_cast<int>(SumRanks(nviol));      // the same number of rounds everywhere
           if (nviol == 0) break;
+          // thinning in the rounds before the last one, the strict rule in the last
+          const bool thin_now = bthin && nev < maxev - 1;
           if (nev >= maxev) {
             Kokkos::parallel_for("q3b_rej_all", Kokkos::RangePolicy<>(DevExeSpace(), k0, k1),
             KOKKOS_LAMBDA(const int k) {krej(k) = 1;});
@@ -3204,9 +3223,10 @@ int DustGasDrag::MergeCloudsDevice3D() {
           KOKKOS_LAMBDA(const int k) {
             if (krej(k)) return;
             int bad = 0;
+            const Real u = thin_now ? GroupHash01(ni(PTAG,k)) : 0.0;
             lt.ForEachCloudWeight(nr(IPX,k), nr(IPY,k), nr(IPZ,k), ni(PLEV,k),
                                   lt.Anchor(ni(PGID,k)), [&](const int t, const Real w) {
-              if (w != 0.0 && lviolg(t)) bad = 1;
+              if (w != 0.0 && lviolg(t) && (!thin_now || u >= lpacc(0,t))) bad = 1;
             });
             if (bad) krej(k) = 1;
           });
@@ -3216,9 +3236,10 @@ int DustGasDrag::MergeCloudsDevice3D() {
             const int k = gknew(gid(p));
             if (k < 0 || krej(k)) return;
             int bad = 0;
+            const Real u = thin_now ? GroupHash01(ni(PTAG,k)) : 0.0;
             lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p),
                                   lt.Anchor(pi(PGID,p)), [&](const int t, const Real w) {
-              if (w != 0.0 && lviolg(t)) bad = 1;
+              if (w != 0.0 && lviolg(t) && (!thin_now || u >= lpacc(0,t))) bad = 1;
             });
             if (bad) Kokkos::atomic_exchange(&krej(k), 1);
           });

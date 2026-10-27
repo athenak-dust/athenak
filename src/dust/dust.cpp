@@ -655,6 +655,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_merge_budget_kappa = quiet_real("cloud_merge_budget_kappa",
                                             cloud_quiet_protection ? 1.0 : 0.0);
       cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
+      cloud_merge_budget_thin = pin->GetOrAddBoolean("dust", "cloud_merge_budget_thin", false);
       // The test offset of the pass budget is gone; it
       // acted only with quantum G and the pass budget on
       RemovedKey(pin, "cloud_merge_budget_prior",
