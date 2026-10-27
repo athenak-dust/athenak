@@ -4,15 +4,14 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_cloud3d.cpp
-//! \brief Stage S3b: refinable clouds on a 3-D mesh
-//! (<dust>/experimental_3d).  The 2-D paths are not touched; in 3-D these replace them:
+//! \brief Stage S3b: refinable clouds on a 3-D mesh.  The 2-D paths
+//! are not touched; in 3-D these replace them:
 //!  - BuildLeafTraversal3D: the block geometry of LeafTraversal3D (dust_leaf3d.hpp);
 //!  - CheckLeafTraversal3D: the traversal against a brute-force integration over the finest
 //!    cells (weights, first moments, the split eligibility);
 //!  - SplitCloudsP1Device3D: the moving P1 split, the 2-D rules along each of three directions;
 //!  - CloudPredictor3D / CloudAdvance3D: the two production PC2 cloud kernels (linear gather);
 //!  - DepositCloudDensity3D: dust density and momentum on the leaves (diagnostics).
-//! Stage 1: one rank, static mesh, split only.
 
 #include <algorithm>
 #include <array>
@@ -140,22 +139,11 @@ double Uniform01(const std::uint64_t key) {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::CheckClouds3D
-//! \brief Refinable clouds in 3-D need <dust>/experimental_3d; stage 1 runs the
-//! production split and PC2 kernels on one rank and a static mesh, without G and R.
+//! \brief The options that 3-D refinable clouds do not support.
 
 void DustGasDrag::CheckClouds3D() {
   if (!pmy_pack->pmesh->three_d || smr_transfer_mode != DustSMRTransfer::refinable_cloud) return;
-  if (!experimental_3d) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "refinable clouds on a 3-D mesh need <dust>/experimental_3d = true"
-              << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
   std::vector<std::string> bad;
-  // several ranks (stage 3): <dust>/experimental_mpi and the options of CheckMultiRank
-  if (global_variable::nranks != 1 && !experimental_mpi) {
-    bad.push_back("several MPI ranks without <dust>/experimental_mpi");
-  }
   if (!(coupling == DustCoupling::imex ||
         (coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2))) {
     bad.push_back("a coupling other than PC2 or IMEX (coupling = pc2 / imex)");
@@ -189,7 +177,6 @@ void DustGasDrag::CheckClouds3D() {
     // faces to be non-periodic and <dust>/particle_x3_bc)
     bad.push_back("x3 faces other than periodic, reflect, outflow or user");
   }
-  if (cloud_instant_switch) bad.push_back("cloud_instant_switch");
   // 2026-10-25 (Codex perf review item 2): the execution-order index (cloud_order_interval) has
   // 3-D keys; the physical sort (cloud_sort_interval) still has 2-D keys only
   if (cloud_sort_interval > 0) {

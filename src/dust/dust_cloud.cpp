@@ -796,58 +796,12 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
 }
 
 //----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::SwitchCloudsToLeafLevel
-//! \brief The instant switch, the owner-level (OO) control on the
-//! cloud framework.  Every cloud takes the level of the leaf that holds its centre: its hat then
-//! has the cell width of that leaf, and it changes width at once when it crosses into a leaf of
-//! another level or when the mesh changes under it.  Deposit and gather stay the exact leaf
-//! integrals of the hat (the same transfer as the refinable clouds), so only the cloud widths
-//! differ from the production path.  Mass and position are unchanged; the anchor is set to the
-//! owner block.  Returns the number of clouds whose level changed.
-
-int DustGasDrag::SwitchCloudsToLeafLevel() {
-  ++gravity_mass_epoch;   // new cloud widths change the deposit
-  particles::Particles *ppar = pmy_pack->ppart;
-  const int npart = ppar->nprtcl_thispack;
-  if (npart == 0) return 0;
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  const auto lt = leaf_traversal;
-  auto &indcs = pmy_pack->pmesh->mb_indcs;
-  const int ncell12 = (indcs.nx1 + 2*indcs.ng)*(indcs.nx2 + 2*indcs.ng);
-  const int nmb = pmy_pack->nmb_thispack;
-  const int gids = pmy_pack->gids;
-  int nchange = 0, nbad = 0;
-  Kokkos::parallel_reduce("dust_instant_switch", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &nc, int &bad) {
-    SMRCompositeTransfer::WrapParticle(pr, p, lt.x1min, lt.x1max, lt.x2min, lt.x2max);
-    const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)));
-    const int owner = (leaf < 0) ? -1 : leaf/ncell12;
-    if (owner < 0 || owner >= nmb) {++bad; return;}
-    pi(PGID,p) = gids + owner;
-    const int lev = lt.blev(owner);
-    if (pi(PLEV,p) != lev) {pi(PLEV,p) = lev; ++nc;}
-  }, Kokkos::Sum<int>(nchange), Kokkos::Sum<int>(nbad));
-  if (nbad > 0) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "instant switch: " << nbad << " clouds without an owning block on this rank"
-              << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  cloud_switch_count += static_cast<unsigned long long>(nchange);
-  return nchange;
-}
-
-//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::SplitAndMergeClouds
 //! \brief The split of the cycle: the moving P1 split (SplitCloudsP1, on the device by
-//! default), or the instant switch of the OO control.  (The old 3x3 two-scale host split
-//! with coincident-child merging, cloud_p1_split = false, and its transition clouds
-//! MakeTransitionClouds were removed.)
+//! default).
 
 int DustGasDrag::SplitAndMergeClouds() {
   if (!cloud_split_enable) return 0;   // test switch
-  if (cloud_instant_switch) return SwitchCloudsToLeafLevel();
   return SplitCloudsP1();
 }
 

@@ -151,7 +151,6 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
 
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud && three_d) {
     // ---- 3-D refinable clouds: the exact leaf integrals of the coupling's traversal
-    if (!clouds3d) ScienceFail("3-D refinable clouds need <dust>/experimental_3d = true");
     if (!mass_only) {
       // collective (halo), shear geometry at pm->time
       DepositCloudDensity3D(science_work_, species);

@@ -81,7 +81,7 @@ class ShearingBox {
   MPI_Comm comm_sbox;
 #endif
 
-  // (S2b) <shearing_box>/experimental_face_levels: the blocks on the x1
+  // (S2b) face_levels (on with shear-periodic x1): the blocks on the x1
   // faces may change level along x2.  The x1 ghost zones (and those of the coarse arrays) are
   // then collected by each face block from the opposite face, converted to its level by the
   // senders and remapped by the receiver (ShearingBox::PlanPull, ShearingBoxCC::PullSend/
@@ -131,10 +131,8 @@ class ShearingBox {
   TaskStatus InitRecv(Real time);
   TaskStatus ClearRecv();
   TaskStatus ClearSend();
-  // the lists of x1-face MeshBlocks and the MPI requests, again after a regrid; and the
-  // check that the levels are constant along x2 (the exchange is between blocks of one level)
+  // the lists of x1-face MeshBlocks and the MPI requests, again after a regrid
   void BuildBoundaryLists();
-  void CheckLevelsAlongX2() const;
   void CheckSupportedSetup(const bool coarse_bcs) const;   // block widths, periodic x3
   // function to find target MB offset by shear.  Returns GID and rank
   void FindTargetMB(const int igid, const int jshift, int &gid, int &rank);

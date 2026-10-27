@@ -4,9 +4,8 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_amr.cpp
-//! \brief Experimental dynamic mesh for the refinable-cloud dust (AMR
-//! stage A: the particles are kept as they are, only the mesh changes).  2-D, one MPI
-//! rank, ordinary periodic boundaries; opt-in with <dust>/experimental_amr = true.
+//! \brief Dynamic mesh for the dust (stage A: the particles are kept as
+//! they are, only the mesh changes).
 //!
 //! AthenaK regrids at the end of a cycle, after every stage, the time increment and the
 //! outputs (Driver::Execute), so a regrid never falls between the predictor and the
@@ -375,7 +374,7 @@ void SetupDensityTrigger(ParameterInput *pin) {
 //! \fn ShearFaceLevelLimit
 //! \brief The levels across the shear-periodic x1 faces.  The tree's 2:1
 //! balance does not see these neighbours (they slide with the shear), so the trigger keeps them
-//! within what the shearing-box face exchange (experimental_face_levels) can fill.  A face block
+//! within what the shearing-box face exchange (x1-face levels along x2) can fill.  A face block
 //! at level l receives its x1 ghosts at level l and, above the root level, those of its coarse
 //! array at l - 1; an opposite block finer by d needs nghost*2^d <= nx1 (and nx2, nx3 divisible
 //! by 2^d).  With dmax the largest such d, the opposite face may be at most
@@ -1357,7 +1356,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
 void DustGasDrag::ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin) {
   Mesh *pm = pmy_pack->pmesh;
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) ResetPGIDFromPositions("restart");
-  if (!experimental_amr || !pm->adaptive || pm->pmr == nullptr) return;
+  if (!pm->adaptive || pm->pmr == nullptr) return;
   if (!amr_restart_state_found) {
     if (global_variable::my_rank == 0) {
       std::cout << "# dust AMR restart: the file has no amr_state record: cooldown ages "
@@ -1833,7 +1832,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   const bool oo = (smr_transfer_mode == DustSMRTransfer::owner_overlap);
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud && !oo) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "dust on a dynamic mesh needs experimental_smr_transfer = refinable_cloud "
+              << "dust on a dynamic mesh needs <dust>/amr_pic = refinable_cloud "
               << "(or owner_overlap)" << std::endl;
     std::exit(EXIT_FAILURE);
   }

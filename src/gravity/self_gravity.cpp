@@ -930,7 +930,7 @@ void SelfGravity::RememberSource(const DvceArray1D<Real> &physical_source) {
 // The field of the last accepted solve may serve the opening kick of the next step
 // when that solve was at this very time on the same mesh, phase, operator and constant, no
 // source callback exists, the gas density (a gas source) is bitwise unchanged, and the dust
-// module reports no mass-changing operation (G, R, instant switch, regrid) since; problem
+// module reports no mass-changing operation (G, R, regrid) since; problem
 // loop work must declare that it keeps the particles. What remains possible in between are
 // the exact representation changes (split, lobe release, migration, reordering, removal of
 // massless outflow clouds), which change the deposit only by round-off.

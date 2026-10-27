@@ -56,9 +56,6 @@ class MeshRefinement {
   // physical boundary values on the coarse arrays before the ghost
   // prolongation (<mesh_refinement>/coarse_physical_bcs, default true; false = AthenaK before)
   bool coarse_physical_bcs = true;
-  // 3-D shearing box with experimental_smr (S1'): one refinement decision
-  // per column along x2 (level, lx1, lx3), so that the levels stay constant along x2
-  bool sbox_columns = false;
   // <mesh_refinement>/prolong_amplitude_eps (diagnostic; default 0 = off):
   // amplitude-aware central/MC blend for the hydro ghost-zone prolongation (static,
   // isothermal); switch counters, see ProlongCCAmplitudeAware

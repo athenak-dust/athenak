@@ -629,7 +629,7 @@ void GatherToRoot(std::vector<T> &v, MPI_Datatype type) {
 // instead of a cancellation residue).  The deposit is the exact one the run uses: the
 // composite-transfer cloud weights, or canonical TSC on a uniform periodic mesh.
 // Geometry (x, z, dx, dz per active leaf, f64) is written once; fields are f32.
-// Several ranks (2026-10-21): refinable clouds with <dust>/experimental_mpi deposit on the leaves
+// Several ranks (2026-10-21): refinable clouds deposit on the leaves
 // of their own and of the halo blocks; the halo parts are added to their owners
 // (and, for the second pass, the owners' mass and momentum sent back), and rank 0 writes the
 // leaves of all ranks in gid order, i.e. the files of one rank with the same mesh.  The
@@ -640,10 +640,9 @@ void WriteBAFields(Mesh *pm) {
   const bool composite = pdust->UsesCompositeTransfer();
   const int nranks = global_variable::nranks;
   if (nranks > 1 && !composite) {WriteBAFieldsGlobal(pm); return;}
-  if (nranks > 1 && !(pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
-                      pdust->experimental_mpi)) {
-    std::cerr << "BA fields on several ranks: refinable clouds need <dust>/experimental_mpi"
-              << std::endl;
+  if (nranks > 1 && pdust->smr_transfer_mode != DustSMRTransfer::refinable_cloud) {
+    std::cerr << "BA fields on several ranks: refinable clouds, or point particles on a uniform "
+              << "mesh" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   auto &ind = pm->mb_indcs;
@@ -1259,17 +1258,16 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   p3d_dt_ = pin->GetOrAddReal("problem", "p3d_snapshot_dt", -1.0);
   p3d_t0_ = pin->GetOrAddReal("problem", "p3d_snapshot_t0", 0.0);
   // several ranks: fields of the canonical TSC deposit on a uniform mesh (WriteBAFieldsGlobal), or
-  // of refinable clouds with <dust>/experimental_mpi (2026-10-21, WriteBAFields); not ba_history
+  // of refinable clouds (2026-10-21, WriteBAFields); not ba_history
   const bool fields_mpi = dust_active && !ba_history_ &&
       ((!pmy_mesh_->multilevel && pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none) ||
-       (pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
-        pmbp->pdust->experimental_mpi));
+       pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud);
   if (ba_fields_ || ba_history_) {
     if ((global_variable::nranks != 1 && !fields_mpi) || !dust_active || pmy_mesh_->three_d ||
         !pin->GetOrAddBoolean("problem", "user_hist", false)) {
       std::cerr << "BA fields/history require 2-D dust, user_hist=true and one MPI rank (several "
-                << "ranks: fields only, canonical TSC on a uniform mesh or refinable clouds with "
-                << "<dust>/experimental_mpi)" << std::endl;
+                << "ranks: fields only, canonical TSC on a uniform mesh or refinable clouds)"
+                << std::endl;
       std::exit(EXIT_FAILURE);
     }
     ba_snapshot_basename_ = pin->GetString("job", "basename");
@@ -1287,18 +1285,18 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   bool canonical_root = cloud_root_random && dust_active &&
       ((pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none && !pmy_mesh_->multilevel) ||
        pmbp->pdust->smr_transfer_mode == DustSMRTransfer::owner_overlap);
-  // several ranks: refinable clouds with <dust>/experimental_mpi; every rank
-  // draws the same parents and keeps those in its blocks
+  // several ranks: refinable clouds; every rank draws the same parents and keeps
+  // those in its blocks
   const bool ranks_ok = (global_variable::nranks == 1) ||
-      (dust_active && pmbp->pdust->experimental_mpi && !canonical_root) ||
+      (dust_active && !canonical_root) ||
       (dust_active && canonical_root && pmy_mesh_->three_d);   // 3-D point particles
-  // 3-D with refinable clouds (<dust>/experimental_3d) or the canonical deposit
+  // 3-D with refinable clouds or the canonical deposit
   // (several ranks: the clouds only, ranks_ok)
   const bool root3d_ok = dust_active && (pmbp->pdust->Clouds3D() || canonical_root);
   if (cloud_root_random && (!ranks_ok || !dust_active ||
       !(pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud ||
         canonical_root) || (pmy_mesh_->three_d && !root3d_ok))) {
-    std::cerr << "cloud_root_random requires single-rank (or <dust>/experimental_mpi) 2-D "
+    std::cerr << "cloud_root_random requires (several ranks: refinable clouds) 2-D "
               << "dust with refinable_cloud transfer, or (one rank) the canonical deposit on a "
               << "uniform mesh or the owner_overlap transfer" << std::endl;
     std::exit(EXIT_FAILURE);
@@ -1323,7 +1321,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   // Keep this enrolled in dust-free runs as well so an otherwise unchanged input
   // with user_hist=true remains valid; the callback emits no dust columns in that mode.
   user_hist_func = DustNSHHistory;
-  // experimental dynamic mesh: the scheduled refinement request of
+  // dynamic mesh: the scheduled refinement request of
   // <dust>/amr_sched_* answers <amr_criterionN>/method = user
   if (pmy_mesh_->adaptive && pin->DoesBlockExist("dust")) {
     dust::SetupScheduledRefinement(pin);
@@ -1429,7 +1427,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     std::exit(EXIT_FAILURE);
   }
   // in 3-D with the lattice (or random) placement instead of the root parents;
-  // or with the 3-D root parents of refinable clouds (<dust>/experimental_3d) or of the
+  // or with the 3-D root parents of refinable clouds or of the
   // canonical deposit
   if (dtest && (!dust_active || pin->DoesBlockExist("shearing_box") ||
                 (pmy_mesh_->three_d && cloud_root_random && !root3d_ok))) {
@@ -1950,7 +1948,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
     }
   }
   if (cloud_root_random && three_d) {
-    // the root parents in 3-D (refinable clouds with <dust>/experimental_3d, or the
+    // the root parents in 3-D (refinable clouds, or the
     // canonical deposit on a uniform mesh), one rank: random, lattice (ppc = n^3) or generic
     const auto &ms = pmy_mesh_->mesh_size;
     const auto &mi = pmy_mesh_->mesh_indcs;

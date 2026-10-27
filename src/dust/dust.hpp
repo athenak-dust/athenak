@@ -40,6 +40,7 @@
 #include "parameter_input.hpp"
 #include "tasklist/task_list.hpp"
 #include "bvals/bvals.hpp"
+#include "dust_input.hpp"
 
 // a device function kept out of line (rare paths of the hot cloud kernels)
 #if defined(__CUDACC__)
@@ -80,6 +81,18 @@ enum class HybridForceMode {automatic=0, pc2=1, split_be=2};
 // the cloud over active leaf cells, and clouds change size only by the exact B-spline
 // two-scale split (see DustGasDrag::SplitCloudsP1).
 enum class DustSMRTransfer {none=0, owner_overlap=1, smooth_p2=2, refinable_cloud=3};
+
+// <dust>/refinable_mode: the validated parameter sets of the refinable clouds.
+//   standard (input value "default"): the moving P1 split, G (quantum merge under the pass budget
+//     beta = cloud_merge_budget) and R (resampling with the cap eta = cloud_resample_eta), both
+//     on their schedules;
+//   careful_merge: default plus the quiet-state gates: stage X (the exact stencil
+//     re-merge of complete P1 families before G; off in a 3-D shearing box, where the shear
+//     separates the members of a family), the structure-relative budget kappa = 1 and the cold
+//     gate of R (cloud_resample_cold_alpha = 0.05);
+//   split_only: the split alone (no X, no G, no R).
+// A key given explicitly overrides its preset value (advanced use).
+enum class RefinableMode {standard, careful_merge, split_only};
 
 // Device-copyable description of the smooth composite transfer. Each virtual coarse
 // or fine cell stores a short linear map to active leaf-cell degrees of freedom. The
@@ -1529,10 +1542,11 @@ class DustGasDrag {
   // kappa > 0: the budget of a leaf is min(beta, kappa s), s the largest dust
   // density difference to its four neighbour leaves relative to its own (structure-relative); 0 = off
   Real cloud_merge_budget_kappa = 0.0;
-  // Rixin: <dust>/cloud_quiet_protection = true turns the three quiet-state
-  // switches on by default (stage X, the cold-patch gate of R, the structure-relative G budget);
-  // a key given in the input wins.  Off by default.
-  bool cloud_quiet_protection = false;
+  // <dust>/refinable_mode (see RefinableMode); refinable_given: the preset keys given in the
+  // input or the restart file ("key=value ..."), printed with the resolved preset
+  RefinableMode refinable_mode = RefinableMode::standard;
+  std::string refinable_given;
+  void PrintRefinablePreset() const;
                                        // change for the whole pass (stage G; X with budget_x)
   Real cloud_absorb_floor = 0.1;       // ... with the leaf mass floored at this fraction of a
                                        // root cloud mass per root-cell volume (the name is
@@ -1604,11 +1618,6 @@ class DustGasDrag {
                                       // cells beyond the refined gas
   DvceArray1D<int> split_np, split_off;  // device split work arrays, kept between cycles
   bool cloud_split_enable = true;     // test only: false = no splitting at all
-  // Instant switch, the OO control on the cloud framework: at the
-  // start of every cycle (and in the initial split) each cloud takes the level of the leaf that
-  // holds its centre; no split, merge or resampling, fixed particle number and masses
-  bool cloud_instant_switch = false;
-  unsigned long long cloud_switch_count = 0;   // level changes made by the instant switch
   bool cloud_split_device = false;    // P1 split on the device; the split log,
                                       // and split_oracle keep the host path
   bool cloud_split_log = false;       // diagnostic: log every P1 split event (parent,
@@ -1744,7 +1753,7 @@ class DustGasDrag {
   void SetDefaultMasses(ParameterInput *pin);
   void BuildSMRCompositeTransfer(ParameterInput *pin);
   void BuildRefinableCloudTransfer(ParameterInput *pin);
-  // experimental dynamic mesh (dust_amr.cpp): rebuild the leaf maps, mark
+  // dynamic mesh (dust_amr.cpp): rebuild the leaf maps, mark
   // the cached masks stale, set PGID from the positions and the particle time step again
   void BeforeRegrid(int nnew, int ndel);  // particle count and checksum before the mesh changes
   // For the scaling on several ranks: <dust>/load_balance_cloud_weight w > 0 gives the
@@ -1789,7 +1798,6 @@ class DustGasDrag {
   bool amr_restart_state_found = false, amr_restart_pending = false;
   std::vector<int> amr_restart_ages;
   void ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin);
-  bool experimental_amr = false;      // <dust>/experimental_amr
   int amr_regrids = 0;                // regrids seen by RebuildAfterRegrid
   bool cloud_map_announced = false;   // the map banner is printed once
   // native restart (dust_restart.cpp): the records of what changes during
@@ -1801,7 +1809,6 @@ class DustGasDrag {
   std::string species_record;
   bool species_record_found = false;
   int SplitAndMergeClouds();   // returns the number of clouds split
-  int SwitchCloudsToLeafLevel();   // instant switch; returns the clouds changed
   int SplitCloudsP1();         // moving-particle P1 split
   int SplitCloudsP1Device();   // device P1 split without the diagnostics
   TaskStatus RefineClouds(Driver *pdrive, int stage);
@@ -1827,16 +1834,15 @@ class DustGasDrag {
   void PackGasGather(const DvceArray5D<Real> &u);       // ... from a conserved state
   // block-local traversal of the actual leaves (dust_leaf.cpp)
   LeafTraversal leaf_traversal;
-  // S3b: 3-D refinable clouds (<dust>/experimental_3d): the 3-D leaf traversal, the
-  // packed gather field (velocity and its central differences in x1, x2, x3: 12 numbers per
-  // cell) and the 3-D paths (dust_cloud3d.cpp)
-  bool experimental_3d = false;
+  // S3b: 3-D refinable clouds: the 3-D leaf traversal, the packed gather field
+  // (velocity and its central differences in x1, x2, x3: 12 numbers per cell) and the 3-D paths
+  // (dust_cloud3d.cpp)
   LeafTraversal3D leaf_traversal3d;
   DvceArray5D<Real> gpack3;
-  bool clouds3d = false;               // experimental_3d on a 3-D mesh (set by the constructor)
+  bool clouds3d = false;               // refinable clouds on a 3-D mesh (set by the constructor)
   bool Clouds3D() const {return clouds3d;}
-  // stage 4: 3-D clouds in a shearing box with shear-periodic x1 (not the test
-  // option experimental_3d_shear_plain); the shear neighbours of LeafTraversal3D for the shear
+  // stage 4: 3-D clouds in a shearing box with shear-periodic x1; the shear
+  // neighbours of LeafTraversal3D for the shear
   // offset at a time (UpdateShear3D: rebuilt when the offset changes), from the finest-cell boxes
   // of the slots, the slots near the inner / outer x1 face and the reach of every local block
   bool shear3d = false;
@@ -1944,7 +1950,7 @@ class DustGasDrag {
                                                DvceArray2D<Real> &particle_acceleration);
   void RecordGravityGather(Real time);   // (public for NVCC device lambdas)
   // incremented by every operation that may change the deposited dust mass other
-  // than by an exact refinement or reordering (G, R, the instant switch, a regrid)
+  // than by an exact refinement or reordering (G, R, a regrid)
   std::uint64_t gravity_mass_epoch = 0;
   void CheckClouds3D();   // the restrictions of 3-D stage 1
   void WrapParticles3D();
@@ -1972,9 +1978,8 @@ class DustGasDrag {
   unsigned long long cloud_ord_builds = 0;
   void UpdateCloudOrder();
   void BuildLeafTraversal();
-  // multi-rank refinable clouds (<dust>/experimental_mpi): the gid of every block
-  // slot of the leaf traversal, the halo lists and the exchanges (dust_halo.cpp)
-  bool experimental_mpi = false;
+  // multi-rank refinable clouds: the gid of every block slot of the leaf traversal,
+  // the halo lists and the exchanges (dust_halo.cpp)
   // test (Codex review): u* set to a known linear field before its ghost
   // exchange; the packed gather field on the leaf cells and every cloud's linear gather are compared
   // with the exact values (CheckUstarLinear).  skip_exchange (negative control, one rank): no u*

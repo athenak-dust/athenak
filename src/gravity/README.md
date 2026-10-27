@@ -113,7 +113,7 @@ hardware validation separately verified distinct GPU assignments.
 | `phase_threads` | `0`: up to sixteen affinity-limited host workers in GPU builds, one in CPU builds; `1` forces serial assembly |
 | `setup_threads` | `0`: every affinity CPU in GPU builds, one in CPU builds; host workers of a full hierarchy setup (rebuild/refresh). Exact: coefficients do not depend on it |
 | `phase_prefetch` | `true` in GPU builds, `false` in CPU builds: the shear-phase host assembly and the host part of the operator updates of the closing solve run in a background thread during the step; used only for exactly the requested shift/mesh. Exact |
-| `kdk_reuse` | `false`; `true` keeps the closing field at the next opening solve unless the mesh, phase, operator, constant, gas density (gas sources) or the dust mass (G, R, instant switch, regrid) changed; only clouds with changed gather inputs are regathered. Differs from a re-solve by the deposit round-off of the exact P1 splits |
+| `kdk_reuse` | `false`; `true` keeps the closing field at the next opening solve unless the mesh, phase, operator, constant, gas density (gas sources) or the dust mass (G, R, regrid) changed; only clouds with changed gather inputs are regathered. Differs from a re-solve by the deposit round-off of the exact P1 splits |
 | `reuse_check` | `false`; with `kdk_reuse`, diagnostic fresh deposit, true residual of the kept potential and a full regather per reuse (`SG_REUSE_CHECK`) |
 | `guess` | `previous`; `extrapolate` starts a solve at a new time from the linear time extrapolation of the last two accepted potentials (fewer iterations; result changes within `rtol`) |
 

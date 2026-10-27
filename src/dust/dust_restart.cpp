@@ -163,7 +163,7 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   // dynamic mesh: pending mesh check after these outputs, cooldown age per block
   {
     Mesh *pm = pmy_pack->pmesh;
-    if (experimental_amr && pm->adaptive && pm->pmr != nullptr) {
+    if (pm->adaptive && pm->pmr != nullptr) {
       std::vector<std::int32_t> v(2 + pm->nmb_total);
       v[0] = amr_check_after_output ? 1 : 0;
       v[1] = pm->nmb_total;

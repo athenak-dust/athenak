@@ -85,7 +85,6 @@ TaskStatus OrbitalAdvection::InitRecv() {
                                  MPI_ATHENA_REAL, srank, CreateBvals_MPI_Tag(m, base+sf),
                                  comm_orb_advect, &(mrreq[n][4*m+sf]));
             if (ierr != MPI_SUCCESS) {no_errors=false;}
-            if (!oa_flux_correct) continue;
             ierr = MPI_Irecv(Kokkos::subview(frecv[n], m, sf, Kokkos::ALL).data(), sff,
                              MPI_ATHENA_REAL, srank, CreateBvals_MPI_Tag(m, 16+base+sf),
                              comm_orb_advect, &(frreq[n][4*m+sf]));

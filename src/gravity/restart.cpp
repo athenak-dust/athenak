@@ -226,7 +226,7 @@ void ResumeRestart(Mesh *pm, Driver *driver, ParameterInput *pin) {
         if (dust->amr_restart_pending != state.pending || dust->amr_restart_ages != state.ages) {
           Broken("dust and gravity AMR replay metadata disagree");
         }
-      } else if (dust->experimental_amr) {
+      } else if (pm->adaptive) {
         dust->amr_restart_state_found = true;
         dust->amr_restart_pending = state.pending;
         dust->amr_restart_ages = state.ages;
@@ -235,7 +235,7 @@ void ResumeRestart(Mesh *pm, Driver *driver, ParameterInput *pin) {
   }
   // This also maps/routs clouds before any pending topology change. The dust
   // route owns replay when active; otherwise gravity handles a hydro AMR replay.
-  const bool dust_replays = dust->experimental_amr && pm->adaptive && pm->pmr != nullptr;
+  const bool dust_replays = pm->adaptive && pm->pmr != nullptr;
   dust->ResumeAmrAfterRestart(driver, pin);
   if (grav != nullptr) {
     if (dust_replays) grav->ClearRestartState();

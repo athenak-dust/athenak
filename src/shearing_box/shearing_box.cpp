@@ -35,17 +35,13 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   qshear = pin->GetReal("shearing_box","qshear");
   omega0 = pin->GetReal("shearing_box","omega0");
   is_stratified = pin->GetOrAddBoolean("shearing_box","stratified",false);
-  // Blocks on the x1 faces may change level along x2.  Rixin: on by default after the
-  // fix of Codex Astra's review; false = the two-step exchange with columns
-  face_levels = pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", true);
-  // face_levels only across shear-periodic x1 faces.  PlanPull picks the receivers
-  // by position (the blocks on the x1 faces) but the senders from the shear-periodic boundary
-  // lists, so with periodic x1 the face blocks got collected x1 ghosts without any sender and the
-  // gas mass leaked through the x1 faces (mr_lina3d_32_pl lost 93% in 0.026 time units)
-  if (ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic ||
-      ppack->pmesh->mesh_bcs[BoundaryFace::outer_x1] != BoundaryFlag::shear_periodic) {
-    face_levels = false;
-  }
+  // (S2b) the blocks on the x1 faces may change level along x2: their x1 ghost
+  // zones are collected from the opposite face (PlanPull).  Only across
+  // shear-periodic x1 faces.  PlanPull picks the receivers by position (the blocks on the x1
+  // faces) but the senders from the shear-periodic boundary lists, so with periodic x1 the face
+  // blocks got collected x1 ghosts without any sender and the gas mass leaked through the x1 faces
+  face_levels = ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic &&
+                ppack->pmesh->mesh_bcs[BoundaryFace::outer_x1] == BoundaryFlag::shear_periodic;
   report_timing = pin->GetOrAddBoolean("shearing_box", "report_timing", false);
   // (S2c) non-periodic x3 needs the coarse-array physical
   // boundaries for the corners the collected ghost zones leave to them; dust
@@ -55,13 +51,12 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
       pin->DoesBlockExist("mesh_refinement") &&
       !pin->GetOrAddBoolean("mesh_refinement", "coarse_physical_bcs", true)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<shearing_box>/experimental_face_levels with non-periodic x3 needs "
+              << "3-D shearing box with non-periodic x3 needs "
               << "<mesh_refinement>/coarse_physical_bcs = true" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
   BuildBoundaryLists();
-  CheckLevelsAlongX2();
   // MeshRefinement is built after the physics: read its key here
   CheckSupportedSetup(!pin->DoesParameterExist("mesh_refinement", "coarse_physical_bcs") ||
                       pin->GetBoolean("mesh_refinement", "coarse_physical_bcs"));
@@ -131,41 +126,6 @@ void ShearingBox::BuildBoundaryLists() {
 
   FreeRequests();
   AllocateRequests();
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn void ShearingBox::CheckLevelsAlongX2()
-//! \brief With mesh refinement in 3-D (S1') the shear exchange (and the
-//! orbital advection) shifts data between MeshBlocks of one level: FindTargetMB looks for the
-//! shifted block at the sender's level and x3 location.  Every MeshBlock on a shear-periodic x1
-//! face must have its x2 neighbours on its level (refinement in columns along x2 there).  Coarser partners across the x1 boundary
-//! are allowed: their data reach the fine block's coarse array, which is sheared as well.
-
-void ShearingBox::CheckLevelsAlongX2() const {
-  if (face_levels) return;   // the collected ghost zones need no uniform columns
-  Mesh *pm = pmy_pack->pmesh;
-  if (!(pm->multilevel && pm->three_d &&
-        pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic)) return;
-  // (S2) only the blocks on the shear-periodic x1 faces (the orbital
-  // advection handles x2 neighbours on other levels in the interior); all x2 face slots
-  auto &nghbr = pmy_pack->pmb->nghbr;
-  auto &lev = pmy_pack->pmb->mb_lev;
-  auto &mbbcs = pmy_pack->pmb->mb_bcs;
-  bool ok = true;
-  for (int m=0; m<pmy_pack->nmb_thispack; ++m) {
-    if (mbbcs.h_view(m,BoundaryFace::inner_x1) != BoundaryFlag::shear_periodic &&
-        mbbcs.h_view(m,BoundaryFace::outer_x1) != BoundaryFlag::shear_periodic) continue;
-    for (int n=8; n<16; ++n) {
-      if (nghbr.h_view(m,n).gid >= 0 && nghbr.h_view(m,n).lev != lev.h_view(m)) ok = false;
-    }
-  }
-  if (!ok) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Shearing box with mesh refinement (experimental_smr): the x2 neighbours of "
-              << "every MeshBlock on a shear-periodic x1 face must be on its level (the "
-              << "blocks there refine in columns along x2)" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
 }
 
 //----------------------------------------------------------------------------------------

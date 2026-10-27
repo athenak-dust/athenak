@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
 
 #include "athena.hpp"
@@ -105,9 +106,43 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
               << "or hybrid requires integrator=rk2" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // <dust>/experimental_mpi: refinable clouds on several MPI ranks with the dust
-  // halo (dust_halo.cpp); the supported options in CheckMultiRank
-  experimental_mpi = pin->GetOrAddBoolean("dust", "experimental_mpi", false);
+  // keys of the development branches that are no longer read (one NOTE each; the run goes on).
+  // Refined meshes, adaptive refinement, 3-D and several MPI ranks need no opt-in (the supported
+  // configurations are checked below, in CheckMultiRank and in CheckClouds3D).
+  if (global_variable::my_rank == 0) {
+    NoteDroppedKey(pin, "dust", "experimental_static_smr", "refined meshes need no opt-in");
+    NoteDroppedKey(pin, "dust", "experimental_amr", "adaptive meshes need no opt-in");
+    NoteDroppedKey(pin, "dust", "experimental_3d", "3-D refinable clouds need no opt-in");
+    NoteDroppedKey(pin, "dust", "experimental_mpi", "several MPI ranks need no opt-in");
+    NoteDroppedKey(pin, "dust", "experimental_3d_shear_plain",
+                   "test option removed: 3-D clouds take the sheared image across shear-periodic x1");
+    NoteDroppedKey(pin, "dust", "experimental_smr_measure_correction",
+                   "acted only with the removed smooth_p2 transfer");
+    NoteDroppedKey(pin, "dust", "experimental_smr_blend_width_cells",
+                   "acted only with the removed smooth_p2 transfer");
+    if (pin->DoesParameterExist("dust", "experimental_smr_transfer")) {
+      std::cout << "# NOTE: <dust>/experimental_smr_transfer = "
+                << pin->GetString("dust", "experimental_smr_transfer")
+                << " is read as <dust>/amr_pic (replace the old key)" << std::endl;
+    }
+  }
+  // <dust>/amr_pic (dust_input.hpp): refinable_cloud (default on a refined mesh) or
+  // owner_overlap; on a uniform mesh the point particles (none) unless refinable_cloud is given
+  {
+    const bool ml = pmy_pack->pmesh->multilevel;
+    const AmrPic pic = ResolveAmrPic(pin, ml);
+    smr_transfer_mode = (pic == AmrPic::refinable_cloud) ? DustSMRTransfer::refinable_cloud :
+                        (pic == AmrPic::owner_overlap) ? DustSMRTransfer::owner_overlap :
+                                                         DustSMRTransfer::none;
+    if (!ml && pin->DoesParameterExist("dust", "amr_pic") && global_variable::my_rank == 0) {
+      std::cout << "# NOTE (dust): amr_pic = " << pin->GetString("dust", "amr_pic")
+                << " on a uniform mesh: "
+                << ((pic == AmrPic::refinable_cloud) ?
+                    "refinable clouds (exact TSC clouds, the cloud path of the refined runs)" :
+                    "point particles with TSC (owner_overlap acts only on a refined mesh)")
+                << std::endl;
+    }
+  }
   // <dust>/test_tag_start = N (tests only; decimal, < 2^64): the tag counter, when it
   // is set (EnsureNextTag), issues no tag below N, e.g. 4294967000 to cross 2^32 within a few
   // splits.  Read only when present, so that the input (and the rst header) of a run without
@@ -132,18 +167,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                 << " (tests only): new tags start at this value or above" << std::endl;
     }
   }
-  // S3b: refinable clouds on a 3-D mesh (dust_cloud3d.cpp); stage 1: one rank, static
-  // mesh, split only.  <dust>/experimental_3d_shear_plain (test): a 3-D shearing box with
-  // shear-periodic x1, the cloud supports across the radial boundaries taken in the plain
-  // periodic image (correct only for states uniform in x2, e.g. LinA in a thin box)
-  experimental_3d = pin->GetOrAddBoolean("dust", "experimental_3d", false);
-  clouds3d = experimental_3d && pmy_pack->pmesh->three_d;
-  const bool shear_plain3d = clouds3d &&
-      pin->GetOrAddBoolean("dust", "experimental_3d_shear_plain", false) &&
-      pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
+  // S3b: refinable clouds on a 3-D mesh (dust_cloud3d.cpp)
+  clouds3d = pmy_pack->pmesh->three_d && smr_transfer_mode == DustSMRTransfer::refinable_cloud;
   // Stage 4: shear-periodic x1 in the leaf traversal (the cloud supports across
   // the radial boundaries on the sheared image)
-  shear3d = clouds3d && !shear_plain3d &&
+  shear3d = clouds3d &&
       pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
   // (test) false: particles crossing an x1 face after the push take the shear offset of the start
   // of the step, as the routing of point particles does
@@ -174,37 +202,18 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     std::exit(EXIT_FAILURE);
   }
   if (pmy_pack->pmesh->multilevel) {
-    bool experimental_smr = pin->GetOrAddBoolean(
-        "dust", "experimental_static_smr", false);
-    // <dust>/experimental_amr (dust_amr.cpp): adaptive refinement with the
-    // refinable-cloud transfer; the dust state is rebuilt after every regrid
-    experimental_amr = pin->GetOrAddBoolean("dust", "experimental_amr", false);
     // The fenced phase profile (DUST_AMR_PROFILE) only on request; its fences make the
     // host wait for the device several times per cycle
     ProfOn() = pin->GetOrAddBoolean("dust", "amr_profile", false);
-    const bool ranks_ok = (global_variable::nranks == 1) || experimental_mpi;
-    // S3a: 3-D with the owner_overlap transfer (point particles, TSC on the
-    // own block, ghost deposits remapped by DepRemapPlan), periodic or 3-D shearing box
-    const bool oo3d = pmy_pack->pmesh->three_d &&
-        pin->DoesParameterExist("dust", "experimental_smr_transfer") &&
-        pin->GetString("dust", "experimental_smr_transfer") == "owner_overlap";
-    const bool sh3 = pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] ==
-                     BoundaryFlag::shear_periodic;
-    // S3b: 3-D refinable clouds (<dust>/experimental_3d), periodic or shear-periodic
-    // x1 (or, test, the plain periodic image across it); OO also with physical x3 faces
-    const bool x3p = pmy_pack->pmesh->three_d &&
-        pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic;
-    if (!(experimental_smr && (!(pmy_pack->pmesh->adaptive) || experimental_amr) && ranks_ok &&
-          ((pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic) ||
-           (oo3d && (pmy_pack->pmesh->strictly_periodic || sh3 || x3p)) ||
-           (clouds3d && (pmy_pack->pmesh->strictly_periodic || shear_plain3d || shear3d ||
-                         x3p))))) {
+    // static or adaptive refinement (dust_amr.cpp: the dust state is rebuilt
+    // after every regrid): a 2-D periodic mesh, or a 3-D mesh with periodic or shear-periodic x1
+    // (for owner_overlap and refinable clouds), periodic x2 and periodic or physical x3
+    // faces; the boundaries are checked below
+    if (!((pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic) ||
+          pmy_pack->pmesh->three_d)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "Dust drag does not support SMR/AMR. The current "
-                << "experimental exception requires explicit opt-in, static 2-D SMR, "
-                << "ordinary periodic boundaries, and one MPI rank (several ranks: "
-                << "<dust>/experimental_mpi); or 3-D with experimental_smr_transfer = "
-                << "owner_overlap (periodic or shearing box)" << std::endl;
+                << std::endl << "Dust on a refined mesh needs a 2-D mesh with periodic "
+                << "boundaries or a 3-D mesh" << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
@@ -348,9 +357,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   if (pmy_pack->pmesh->multilevel && drag_solver != DustDragSolver::local) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "Experimental static-SMR dust currently supports only "
-              << "drag_solver=local; coupled solvers require a certified adjoint "
-              << "composite transfer" << std::endl;
+              << std::endl << "dust on a refined mesh supports only drag_solver = local "
+              << "(the coupled solvers have no composite transfer)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   drag_rtol = pin->GetOrAddReal("dust", "drag_rtol", 1.0e-11);
@@ -438,74 +446,91 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     }
   }
   {
-    // The refinable-cloud path may also be selected on a uniform mesh: its clouds are
-    // then exact TSC and the gather/deposit options apply unchanged, which gives uniform
-    // reference runs with the same coupling as the mixed-resolution runs.
+    // The refinable-cloud path may also be selected on a uniform mesh (amr_pic =
+    // refinable_cloud): its clouds are then exact TSC and the gather/deposit options apply
+    // unchanged, which gives uniform reference runs with the same coupling as the
+    // mixed-resolution runs.
     bool multilevel = pmy_pack->pmesh->multilevel;
-    // Rixin: the defaults serve production, so a
-    // multilevel mesh defaults to the refinable clouds (was smooth_p2, a control now)
-    std::string transfer = pin->GetOrAddString(
-        "dust", "experimental_smr_transfer", multilevel ? "refinable_cloud" : "none");
-    if (transfer.compare("none") == 0 && !multilevel) {
-      smr_transfer_mode = DustSMRTransfer::none;
-    } else if (transfer.compare("owner_overlap") == 0 && multilevel) {
-      smr_transfer_mode = DustSMRTransfer::owner_overlap;
-    } else if (transfer.compare("smooth_p2") == 0 && multilevel) {
-      smr_transfer_mode = DustSMRTransfer::smooth_p2;
-    } else if (transfer.compare("refinable_cloud") == 0) {
-      smr_transfer_mode = DustSMRTransfer::refinable_cloud;
-      // The defaults now serve
-      // production.  An input that leaves one of the changed keys out runs the new default; say
-      // so once (a restart file carries every key, so a restarted run prints nothing).  Inputs
-      // written before can be pinned to the old values with
-      // a helper script outside the repository.
-      // Rixin: one key for the three quiet-state switches (their defaults)
-      cloud_quiet_protection = pin->GetOrAddBoolean("dust", "cloud_quiet_protection", false);
-      // Codex review: the three keys it sets enter the parameter list (and so the
-      // restart header) only when given: a restart can then switch the flag on.  Restart files
-      // written before 2026-10-22 hold all three; the WARNING below names them.
-      auto quiet_bool = [pin](const char *key, bool def) {
-        return pin->DoesParameterExist("dust", key) ? pin->GetBoolean("dust", key) : def;
-      };
-      auto quiet_real = [pin](const char *key, Real def) {
-        return pin->DoesParameterExist("dust", key) ? pin->GetReal("dust", key) : def;
-      };
-      if (global_variable::my_rank == 0) {
-        const char *changed[][3] = {
-          {"cloud_split_device", "true", "false"}, {"cloud_merge_device", "true", "false"},
-          {"cloud_merge_mode", "quantum", "tent"}, {"cloud_merge_stencil", "false", "true"},
-          {"cloud_merge", "true", "false"}, {"cloud_merge_schedule", "time if omega0", "cycle"},
-          {"cloud_merge_alpha", "0.05 (3-D: 0.2 since 2026-10-27)", "0.2"}, {"cloud_merge_budget", "0.3", "-1"},
-          {"cloud_resample", "true", "false"}, {"cloud_resample_schedule", "time if omega0", "cycle"},
-          {"cloud_resample_eta", "1.5", "2.0"},
-          // Rixin: chose G and R on their schedules only, both every 0.25 / omega0
-          {"cloud_resample_after_regrid", "false", "true"},
-          {"cloud_resample_dt_omega", "0.25 if omega0", "1"}};
-        std::string unset;
-        for (const auto &c : changed) {
-          if (cloud_quiet_protection && std::string(c[0]) == "cloud_merge_stencil") continue;
-          if (!pin->DoesParameterExist("dust", c[0])) {
-            unset += std::string(" ") + c[0] + "=" + c[1] + " (was " + c[2] + ")";
+    if (smr_transfer_mode == DustSMRTransfer::none && multilevel) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "dust on a refined mesh needs <dust>/amr_pic = refinable_cloud or "
+                << "owner_overlap" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
+      // <dust>/refinable_mode: the validated parameter sets of the refinable
+      // clouds (RefinableMode, dust.hpp).  A preset key given explicitly (input or restart file)
+      // overrides the preset value; PrintRefinablePreset lists the resolved values.
+      {
+        const bool given = pin->DoesParameterExist("dust", "refinable_mode");
+        std::string mode = given ? pin->GetString("dust", "refinable_mode") : "default";
+        // the switch of the development branches maps onto careful_merge
+        if (pin->DoesParameterExist("dust", "cloud_quiet_protection")) {
+          const bool q = pin->GetBoolean("dust", "cloud_quiet_protection");
+          if (q && given && mode != "careful_merge") {
+            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                      << "<dust>/cloud_quiet_protection = true contradicts refinable_mode = "
+                      << mode << " (drop the old key; careful_merge holds the quiet gates)"
+                      << std::endl;
+            std::exit(EXIT_FAILURE);
+          }
+          if (q) mode = "careful_merge";
+          if (global_variable::my_rank == 0) {
+            std::cout << "# NOTE: <dust>/cloud_quiet_protection = " << (q ? "true" : "false")
+                      << (q ? " is read as refinable_mode = careful_merge" : " is ignored")
+                      << " (replace the old key)" << std::endl;
           }
         }
-        if (multilevel && !pin->DoesParameterExist("dust", "experimental_smr_transfer")) {
-          unset += " experimental_smr_transfer=refinable_cloud (was smooth_p2)";
+        mode = pin->GetOrAddString("dust", "refinable_mode", mode);
+        if (mode == "default") {
+          refinable_mode = RefinableMode::standard;
+        } else if (mode == "careful_merge") {
+          refinable_mode = RefinableMode::careful_merge;
+        } else if (mode == "split_only") {
+          refinable_mode = RefinableMode::split_only;
+        } else {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << "<dust>/refinable_mode = '" << mode << "' not recognized (default, "
+                    << "careful_merge or split_only)" << std::endl;
+          std::exit(EXIT_FAILURE);
         }
-        if (!unset.empty()) {
-          std::cout << "# NOTE (dust): defaults changed on 2026-10-20 / 21 apply to:" << unset << std::endl;
+      }
+      // the keys that differ between the presets: the given value, else the preset's.  They are
+      // not added to the parameter list (nor to the restart header), so that a restart with
+      // another refinable_mode takes that mode's values
+      auto preset_bool = [pin](const char *key, bool def) {
+        return pin->DoesParameterExist("dust", key) ? pin->GetBoolean("dust", key) : def;
+      };
+      auto preset_real = [pin](const char *key, Real def) {
+        return pin->DoesParameterExist("dust", key) ? pin->GetReal("dust", key) : def;
+      };
+      const bool careful = (refinable_mode == RefinableMode::careful_merge);
+      const bool split_only = (refinable_mode == RefinableMode::split_only);
+      {
+        static const char *const keys[] = {
+            "cloud_merge", "cloud_merge_stencil", "cloud_merge_budget_kappa", "cloud_merge_alpha",
+            "cloud_merge_alpha_leaf", "cloud_merge_budget", "cloud_merge_schedule",
+            "cloud_merge_dt_omega", "cloud_merge_interval", "cloud_merge_mode", "cloud_resample",
+            "cloud_resample_eta", "cloud_resample_cold_alpha", "cloud_resample_schedule",
+            "cloud_resample_dt", "cloud_resample_dt_omega", "cloud_resample_interval",
+            "cloud_resample_after_regrid"};
+        refinable_given.clear();
+        for (const char *k : keys) {
+          if (pin->DoesParameterExist("dust", k)) {
+            refinable_given += std::string(" ") + k + "=" + pin->GetString("dust", k);
+          }
         }
       }
       const bool x3phys3d = clouds3d &&
           pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic;
       if (!multilevel && !((pmy_pack->pmesh->two_d || clouds3d) &&
-                           (pmy_pack->pmesh->strictly_periodic || shear_plain3d || shear3d ||
-                            x3phys3d) &&
-                           (global_variable::nranks == 1 || (clouds3d && experimental_mpi)) &&
+                           (pmy_pack->pmesh->strictly_periodic || shear3d || x3phys3d) &&
+                           (global_variable::nranks == 1 || clouds3d) &&
                            drag_solver == DustDragSolver::local)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "refinable_cloud on a uniform mesh requires supported "
                   << "2-D/3-D cloud geometry and drag_solver=local; several ranks require "
-                  << "3-D clouds and experimental_mpi=true"
+                  << "3-D clouds"
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
@@ -562,11 +587,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                  "the node-convention prolongation of the host P1 split");
       // Test switch: false keeps every cloud at its level whatever the mesh
       cloud_split_enable = pin->GetOrAddBoolean("dust", "cloud_split_enable", true);
-      // Instant switch (the OO control on a dynamic mesh), see dust.hpp
-      cloud_instant_switch = pin->GetOrAddBoolean("dust", "cloud_instant_switch", false);
-      // Rixin: turned G on by default with the refinable clouds (a full AMR
-      // needs a coarsening channel); tests without it say cloud_merge = false
-      cloud_merge = pin->GetOrAddBoolean("dust", "cloud_merge", true);
+      // G (quantum merge under the pass budget): on in default and careful_merge (a full AMR
+      // needs a coarsening channel), off in split_only
+      cloud_merge = preset_bool("cloud_merge", !split_only);
       cloud_merge_buffer = pin->GetOrAddInteger("dust", "cloud_merge_buffer", 2);
       // Rixin: production alpha
       // 0.2 in 3-D (0.05 in 2-D); alpha H / tau lets the merged cloud's
@@ -642,9 +665,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           std::exit(EXIT_FAILURE);
         }
       }
-      // Stage X (the exact stencil re-merge before G in quantum mode)
-      // off by default, as in production; it stays a research control
-      cloud_merge_stencil = quiet_bool("cloud_merge_stencil", cloud_quiet_protection);
+      // stage X (the exact stencil re-merge before G in quantum mode): careful_merge only
+      cloud_merge_stencil = preset_bool("cloud_merge_stencil", careful);
       // Rixin: no X in a 3-D shearing box: the background shear pulls the
       // members of a P1 family apart in x2 (q Omega l per unit time), so no family is ever complete
       // again.  G with its budget (beta, kappa) and R with the cold gate stay available there.
@@ -657,8 +679,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         }
         cloud_merge_stencil = false;
         if (global_variable::my_rank == 0) {
-          std::cout << "# NOTE (dust): stage X off in the 3-D shearing box (cloud_quiet_protection "
-                    << "keeps the cold gate and kappa)" << std::endl;
+          std::cout << "# NOTE (dust): refinable_mode = careful_merge in the 3-D shearing box: "
+                    << "stage X off (the shear separates the members of a family); "
+                    << "the cold gate of R and kappa stay" << std::endl;
         }
       }
       cloud_merge_stencil_tol = pin->GetOrAddReal("dust", "cloud_merge_stencil_tol", 0.02);
@@ -677,9 +700,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // Rixin: the production pass budget beta = 0.3 (was -1,
       // no budget); cloud_merge_budget = -1 switches it off
       cloud_merge_budget = pin->GetOrAddReal("dust", "cloud_merge_budget", 0.3);
-      // The structure-relative budget (0 = off, as before)
-      cloud_merge_budget_kappa = quiet_real("cloud_merge_budget_kappa",
-                                            cloud_quiet_protection ? 1.0 : 0.0);
+      // The structure-relative budget (careful_merge: 1; 0 = off)
+      cloud_merge_budget_kappa = preset_real("cloud_merge_budget_kappa", careful ? 1.0 : 0.0);
       cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
       cloud_merge_budget_thin = pin->GetOrAddBoolean("dust", "cloud_merge_budget_thin", false);
       // The test offset of the pass budget is gone; it
@@ -692,9 +714,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       cloud_audit_rejected = pin->GetOrAddBoolean("dust", "cloud_audit_rejected", false);
       cloud_merge_budget_x = pin->GetOrAddBoolean("dust", "cloud_merge_budget_x", false);
       cloud_audit_only = pin->GetOrAddBoolean("dust", "cloud_audit_only", false);
-      // Rixin: turned R on by default with the refinable clouds, with the
-      // production clock below (tests without it say cloud_resample = false)
-      cloud_resample = pin->GetOrAddBoolean("dust", "cloud_resample", true);
+      // R (resampling) on in default and careful_merge, with the production clock below; off in
+      // split_only
+      cloud_resample = preset_bool("cloud_resample", !split_only);
       // <dust>/cloud_resample_schedule = cycle (default: every
       // cloud_resample_interval cycles, as before) or time (event k at t0 + k dt, dt from
       // cloud_resample_dt in code time or cloud_resample_dt_omega in units of 1/omega0).  Only
@@ -764,30 +786,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       // Rixin: the production cap factor (was 2.0)
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 1.5);
-      // Resampling leaves cold patches alone (0 = off, as before)
-      cloud_resample_cold_alpha = quiet_real("cloud_resample_cold_alpha",
-                                             cloud_quiet_protection ? 0.05 : 0.0);
-      if (cloud_quiet_protection && global_variable::my_rank == 0) {
-        std::cout << "# NOTE (dust): cloud_quiet_protection: stage X " << cloud_merge_stencil
-                  << ", cloud_resample_cold_alpha " << cloud_resample_cold_alpha
-                  << ", cloud_merge_budget_kappa " << cloud_merge_budget_kappa
-                  << std::endl;
-        // Codex review: explicit sub-keys win, and a restart file written before
-        // 2026-10-22 without the flag holds all three at their off values: say which stay off
-        std::string off;
-        if (!cloud_merge_stencil && !(shear_x1 && pmy_pack->pmesh->three_d)) {
-          off += " cloud_merge_stencil=false";
-        }
-        if (cloud_resample_cold_alpha <= 0.0) off += " cloud_resample_cold_alpha<=0";
-        if (cloud_merge_budget_kappa <= 0.0) off += " cloud_merge_budget_kappa<=0";
-        if (!off.empty()) {
-          std::cout << "# WARNING (dust): cloud_quiet_protection is on, but" << off
-                    << " is set in the input or the restart file and stays off; set these "
-                    << "keys explicitly (on a restart file written before 2026-10-22 by a run "
-                    << "without the flag: all three)"
-                    << std::endl;
-        }
-      }
+      // Resampling leaves cold patches alone (careful_merge: 0.05; 0 = off)
+      cloud_resample_cold_alpha = preset_real("cloud_resample_cold_alpha", careful ? 0.05 : 0.0);
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       // Patches inside one MeshBlock of min(cloud_resample_patch 2^level,
       // cloud_resample_patch_cells)^2 of its cells (cloud_resample_patches = block).
@@ -1040,18 +1040,12 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << std::endl << "<dust>/cloud_gather_order must be 1 or 2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-    } else {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "<dust>/experimental_smr_transfer = '" << transfer
-                << "' not recognized (must be owner_overlap, smooth_p2, or "
-                << "refinable_cloud on a refined mesh; none or refinable_cloud on a "
-                << "uniform mesh)" << std::endl;
-      std::exit(EXIT_FAILURE);
+      PrintRefinablePreset();
     }
     if (UsesCompositeTransfer() && deposit != DustDeposit::tsc) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "experimental_smr_transfer=" << transfer
-                << " currently requires <dust>/deposit=tsc" << std::endl;
+                << std::endl << "<dust>/amr_pic = refinable_cloud requires <dust>/deposit = tsc"
+                << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
@@ -1105,22 +1099,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
     Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
   }
-  if (cloud_instant_switch && (smr_transfer_mode != DustSMRTransfer::refinable_cloud ||
-                               cloud_merge || cloud_resample || !cloud_split_enable)) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<dust>/cloud_instant_switch needs experimental_smr_transfer = refinable_cloud, "
-              << "cloud_merge = false, cloud_resample = false and cloud_split_enable = true "
-              << "(it replaces the split)" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
   // The old owner_overlap transfer also runs on a dynamic mesh (one rank)
   // In 3-D also on several ranks (the general deposit remap)
   if (pmy_pack->pmesh->adaptive && smr_transfer_mode != DustSMRTransfer::refinable_cloud &&
       !(smr_transfer_mode == DustSMRTransfer::owner_overlap &&
         (global_variable::nranks == 1 || pmy_pack->pmesh->three_d))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<dust>/experimental_amr requires experimental_smr_transfer = "
-              << "refinable_cloud (or owner_overlap on one rank)" << std::endl;
+              << "dust on an adaptive mesh needs <dust>/amr_pic = refinable_cloud (or "
+              << "owner_overlap: one rank in 2-D)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
@@ -1137,24 +1123,17 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       Kokkos::realloc(cdummy, nmb, 3, nccells3, nccells2, nccells1);
     }
     CheckMultiRank();
-    CheckClouds3D();   // the 3-D stage-1 restrictions
-    if (global_variable::my_rank == 0) {
-      std::cout << "# WARNING (dust): experimental static-SMR refinable_cloud transfer "
-                << "is enabled (hat clouds, exact leaf integrals, two-scale split; "
-                << "single rank, 2-D, static mesh). SI convergence is not certified"
-                << std::endl;
-    }
+    CheckClouds3D();   // the 3-D restrictions
   } else if (pmy_pack->pmesh->multilevel) {
     if (smr_transfer_mode == DustSMRTransfer::owner_overlap) {
+      if (global_variable::my_rank == 0) {
+        std::cout << "# DUST_PIC amr_pic = owner_overlap (point particles, TSC on the block that "
+                  << "owns them, ghost deposits remapped to the leaves)" << std::endl;
+      }
       int nccells1 = indcs.cnx1 + 2*(indcs.ng);
       int nccells2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*(indcs.ng)) : 1;
       int nccells3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*(indcs.ng)) : 1;
       Kokkos::realloc(cdummy, nmb, 3, nccells3, nccells2, nccells1);
-      if (global_variable::my_rank == 0) {
-        std::cout << "# WARNING (dust): experimental static-SMR owner_overlap transfer "
-                  << "is enabled only as a negative control; it is not a certified "
-                  << "gather/deposit adjoint" << std::endl;
-      }
     } else {
       BuildSMRCompositeTransfer(pin);
       if (global_variable::my_rank == 0) {
@@ -1213,7 +1192,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           smr_transfer_mode == DustSMRTransfer::none)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "3-D dust with refinement or a shearing box: drag_solver = local and "
-                << "experimental_smr_transfer = owner_overlap (none on a uniform mesh)" << std::endl;
+                << "point particles (amr_pic = owner_overlap on a refined mesh)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     const auto &id = pmy_pack->pmesh->mb_indcs;
@@ -1250,6 +1229,51 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::PrintRefinablePreset
+//! \brief The resolved parameter set of the refinable clouds (<dust>/refinable_mode), once on
+//! rank 0: split, G (merge) and R (resampling) with their schedules, and the preset keys that
+//! the input or the restart file gives explicitly.
+
+void DustGasDrag::PrintRefinablePreset() const {
+  if (global_variable::my_rank != 0) return;
+  const char *mode = (refinable_mode == RefinableMode::careful_merge) ? "careful_merge" :
+                     (refinable_mode == RefinableMode::split_only) ? "split_only" : "default";
+  const Real om = cloud_resample_omega;   // <shearing_box>/omega0 (0 without a shearing box)
+  auto sched = [om](bool by_time, Real dt, int interval) {
+    std::ostringstream o;
+    if (by_time) {
+      o << "every " << dt*om << "/omega0";
+    } else {
+      o << "every " << interval << " cycles";
+    }
+    return o.str();
+  };
+  std::ostringstream g, r;
+  g << "G " << (cloud_merge ? "on" : "off");
+  if (cloud_merge) {
+    g << " (" << (cloud_merge_mode == 1 ? "quantum" : "tent") << ", stage X "
+      << (cloud_merge_stencil ? "on" : "off") << ", alpha " << cloud_merge_alpha;
+    if (clouds3d) g << ", alpha_leaf " << (cloud_merge_alpha_leaf ? "on" : "off");
+    g << ", budget beta " << cloud_merge_budget << " kappa " << cloud_merge_budget_kappa << ", "
+      << sched(cloud_merge_by_time, cloud_merge_dt, cloud_merge_interval) << ")";
+  }
+  r << "R " << (cloud_resample ? "on" : "off");
+  if (cloud_resample) {
+    r << " (eta " << cloud_resample_eta << ", cold gate alpha " << cloud_resample_cold_alpha
+      << ", " << sched(cloud_resample_by_time, cloud_resample_dt, cloud_resample_interval)
+      << ", after regrids " << (cloud_resample_after_regrid ? "on" : "off") << ")";
+  }
+  std::cout << "# DUST_PIC amr_pic = refinable_cloud, refinable_mode = " << mode << std::endl
+            << "#   split: moving P1 (" << (cloud_split_enable ? "on" : "off") << "), gather order "
+            << cloud_gather_order << ", transition " << cloud_transition << "; " << g.str()
+            << std::endl
+            << "#   " << r.str() << std::endl;
+  if (!refinable_given.empty()) {
+    std::cout << "#   given explicitly:" << refinable_given << std::endl;
+  }
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::CheckMultiRank
 //! \brief With several MPI ranks, refinable clouds run only the production path
 //! that the dust halo covers (PC2 linear gather, quantum G with or without the pass budget,
@@ -1258,7 +1282,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
 void DustGasDrag::CheckMultiRank() {
   if (global_variable::nranks == 1) return;
   std::vector<std::string> bad;
-  if (!experimental_mpi) bad.push_back("<dust>/experimental_mpi = false");
   // PC2, or imex2+ (2026-10-17: its deposit and gather-kick kernels use the halo); not the
   // automatic hybrid, whose split-BE preparation pass has no halo exchange yet
   if (!(coupling == DustCoupling::imex ||
@@ -1360,8 +1383,6 @@ DustGasDrag::~DustGasDrag() {
               << (cloud_resample_cold_alpha > 0.0 ? " resample_cold_skips=" +
                   std::to_string(cloud_resample_cold_skips) : std::string())
               << " lobe_splits=" << cloud_lobe_split_count
-              << (cloud_instant_switch ? " instant_switches=" + std::to_string(cloud_switch_count)
-                                       : std::string())
               << (cloud_merge ? " coarsen_events=" + std::to_string(cloud_coarsen_events) +
                   " coarsen_in=" + std::to_string(cloud_coarsen_in) +
                   " coarsen_reject=" + std::to_string(cloud_coarsen_reject) +

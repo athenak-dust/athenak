@@ -34,6 +34,7 @@
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
 #include "bvals.hpp"
+#include "dust/dust_input.hpp"
 
 //----------------------------------------------------------------------------------------
 // MeshBoundaryValuesDep constructor:
@@ -43,55 +44,37 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
 #if MPI_PARALLEL_ENABLED
   MPI_Comm_dup(MPI_COMM_WORLD, &comm_dep_);   // for the general path
 #endif
-  // A 3-D mesh with refinement (stage S3a) uses the general remap
-  // (DepRemapPlan, bvals_dep_general.cpp), which the dust module sets up; it checks the rest
-  if (pp->pmesh->multilevel && pp->pmesh->three_d &&
-      pin->GetOrAddString("dust", "experimental_smr_transfer", "smooth_p2") == "owner_overlap") {
-    return;
+  if (!pp->pmesh->multilevel) return;
+  const dust::AmrPic pic = dust::ResolveAmrPic(pin, true);
+  // A 3-D mesh with refinement and owner_overlap (stage S3a) uses the general
+  // remap (DepRemapPlan, bvals_dep_general.cpp), which the dust module sets up; it checks the rest
+  if (pp->pmesh->three_d && pic == dust::AmrPic::owner_overlap) return;
+  // refinable clouds deposit into the leaves directly (in 2-D and in 3-D); several
+  // ranks only for them (the dust halo): this exchange is not used then
+  const bool rc = (pic == dust::AmrPic::refinable_cloud);
+  const bool clouds3d = rc && pp->pmesh->three_d;
+  // (the sheared image and physical x3 faces in the leaf traversal)
+  const bool shear3d = clouds3d &&
+      (pp->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic ||
+       pp->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic);
+  if (!((pp->pmesh->two_d || clouds3d) && (pp->pmesh->strictly_periodic || shear3d) &&
+        (global_variable::nranks == 1 || rc))) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Additive deposit exchange does not support this "
+              << "SMR/AMR configuration" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
-  if (pp->pmesh->multilevel) {
-    bool experimental_smr = pin->GetOrAddBoolean(
-        "dust", "experimental_static_smr", false);
-    bool experimental_amr = pin->GetOrAddBoolean("dust", "experimental_amr", false);
-    // several ranks only for refinable clouds with the dust halo, which deposit
-    // into the leaves directly: this exchange is not used then
-    bool experimental_mpi = pin->GetOrAddBoolean("dust", "experimental_mpi", false) &&
-        pin->GetOrAddString("dust", "experimental_smr_transfer", "smooth_p2") == "refinable_cloud";
-    // 3-D refinable clouds (<dust>/experimental_3d) deposit into the leaves directly
-    // too; with experimental_3d_shear_plain also on a shear-periodic 3-D mesh (test)
-    const bool rc = pin->GetOrAddString("dust", "experimental_smr_transfer", "smooth_p2") ==
-                    "refinable_cloud";
-    const bool clouds3d = rc && pp->pmesh->three_d &&
-                          pin->GetOrAddBoolean("dust", "experimental_3d", false);
-    const bool plain3d = clouds3d &&
-                         pin->GetOrAddBoolean("dust", "experimental_3d_shear_plain", false);
-    // (or the sheared image, in the leaf traversal)
-    const bool shear3d = clouds3d &&
-        (pp->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic ||
-         pp->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic);   // (physical x3 faces)
-    if (!(experimental_smr && (!(pp->pmesh->adaptive) || experimental_amr) &&
-          (pp->pmesh->two_d || clouds3d) &&
-          (pp->pmesh->strictly_periodic || plain3d || shear3d) &&
-          (global_variable::nranks == 1 || experimental_mpi))) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "Additive deposit exchange does not support this "
-                << "SMR/AMR configuration" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    std::string transfer = pin->GetOrAddString(
-        "dust", "experimental_smr_transfer", "smooth_p2");
-    if (transfer.compare("smooth_p2") == 0 || transfer.compare("refinable_cloud") == 0) {
-      // The composite dust kernels deposit directly into active leaf cells.
-      local_smr_direct_ = true;
-    } else if (transfer.compare("owner_overlap") == 0) {
-      local_smr_remap_ = true;
-      BuildLocalSMRMap();
-    } else {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "Unknown experimental static-SMR deposit transfer"
-                << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
+  if (rc) {
+    // The composite dust kernels deposit directly into active leaf cells.
+    local_smr_direct_ = true;
+  } else if (pic == dust::AmrPic::owner_overlap) {
+    local_smr_remap_ = true;
+    BuildLocalSMRMap();
+  } else {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "dust on a refined mesh needs <dust>/amr_pic = refinable_cloud "
+              << "or owner_overlap" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
 }
 

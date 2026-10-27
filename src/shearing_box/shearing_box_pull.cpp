@@ -5,7 +5,7 @@
 //========================================================================================
 //! \file shearing_box_pull.cpp
 //! \brief S2b: x1 ghost zones of the shearing box when the blocks on
-//! the x1 faces change level along x2 (<shearing_box>/experimental_face_levels).
+//! the x1 faces change level along x2 (ShearingBox::face_levels, on with shear-periodic x1).
 //!
 //! Every block on a shear-periodic x1 face has up to two receivers per face: its x1 ghost
 //! columns (level of the block) and those of its coarse array (one level coarser; only with
@@ -175,7 +175,7 @@ void ShearingBox::PlanPull() {
   }
   if (bad) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "shearing box (experimental_face_levels): the opposite face is too many "
+              << "shearing box (x1-face levels along x2): the opposite face is too many "
               << "levels finer (nghost*2^d must fit in meshblock/nx1, nx2 and nx3 divisible "
               << "by 2^d)" << std::endl;
     std::exit(EXIT_FAILURE);

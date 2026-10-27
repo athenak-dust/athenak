@@ -242,8 +242,8 @@ void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out,
   if (!pm->three_d || clouds3d || !std::isfinite(time) ||
       !(smr_transfer_mode==DustSMRTransfer::owner_overlap ||
         (smr_transfer_mode==DustSMRTransfer::none && !pm->multilevel)))
-    PointFail("science fields of point particles need a 3-D mesh with "
-              "experimental_smr_transfer = none (uniform) or owner_overlap");
+    PointFail("science fields of point particles need a 3-D mesh with point particles "
+              "(uniform, or amr_pic = owner_overlap)");
   if (!science_points_) science_points_=std::make_shared<GravityPointTransfer>();
   auto &state=*science_points_;
   const int seq=pm->GetAMRLoadBalanceUpdateSeq();

@@ -44,8 +44,6 @@ OrbitalAdvection::OrbitalAdvection(MeshBlockPack *ppack, ParameterInput *pin) :
   // called by the derived classes, which know the number of variables)
   any_mixed = false;
   nvar_oa = 0;
-  // the control without the flux correction (tests only)
-  oa_flux_correct = pin->GetOrAddBoolean("shearing_box", "experimental_oa_flux_correct", true);
   nrow = ppack->pmesh->mb_indcs.ng + maxjshift;
 #if MPI_PARALLEL_ENABLED
   nreq_mixed = 0;

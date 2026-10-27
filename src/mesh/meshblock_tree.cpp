@@ -11,8 +11,6 @@
 #include <sstream>
 #include <stdexcept>
 
-#include <vector>
-#include <algorithm>
 #include "athena.hpp"
 #include "parameter_input.hpp"
 #include "mesh.hpp"
@@ -305,120 +303,6 @@ void MeshBlockTree::Derefine(int &ndel) {
   pleaf_ = nullptr;
   ndel+=nleaf_-1;
   return;
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn bool MeshBlockTree::CanDerefine()
-//! \brief The neighbour test of Derefine without changing the tree
-
-bool MeshBlockTree::CanDerefine() {
-  if (pleaf_ == nullptr) return false;
-  int s2=0, e2=0, s3=0, e3=0;
-  if (pmesh_->multi_d) s2=-1, e2=1;
-  if (pmesh_->three_d) s3=-1, e3=1;
-  for (int ox3=s3; ox3<=e3; ox3++) {
-    for (int ox2=s2; ox2<=e2; ox2++) {
-      for (int ox1=-1; ox1<=1; ox1++) {
-        MeshBlockTree *bt = proot_->FindNeighbor(lloc_, ox1, ox2, ox3, true);
-        if (bt != nullptr && bt->pleaf_ != nullptr) {
-          int lis = (ox1 == -1) ? 1 : 0, lie = (ox1 == 1) ? 0 : 1;
-          int ljs = 0, lje = 0, lks = 0, lke = 0;
-          if (pmesh_->multi_d) {ljs = (ox2 == -1) ? 1 : 0; lje = (ox2 == 1) ? 0 : 1;}
-          if (pmesh_->three_d) {lks = (ox3 == -1) ? 1 : 0; lke = (ox3 == 1) ? 0 : 1;}
-          for (int lk=lks; lk<=lke; lk++) {
-            for (int lj=ljs; lj<=lje; lj++) {
-              for (int li=lis; li<=lie; li++) {
-                if (bt->pleaf_[li + (lj<<1) + (lk<<2)]->pleaf_ != nullptr) return false;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  return true;
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn void MeshBlockTree::CollectShearFaceLeaves()
-//! \brief The leaves touching the inner (face[0]) and outer (face[1]) x1 boundary
-
-void MeshBlockTree::CollectShearFaceLeaves(std::vector<MeshBlockTree*> face[2]) {
-  if (pleaf_ == nullptr) {
-    if (lloc_.level < pmesh_->root_level) return;
-    const std::int32_t nx = pmesh_->nmb_rootx1 << (lloc_.level - pmesh_->root_level);
-    if (lloc_.lx1 == 0) face[0].push_back(this);
-    if (lloc_.lx1 == nx - 1) face[1].push_back(this);
-    return;
-  }
-  for (int n=0; n<nleaf_; n++) {
-    if (pleaf_[n] != nullptr) pleaf_[n]->CollectShearFaceLeaves(face);
-  }
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn void MeshBlockTree::RefineShearFaceColumns(int &nnew)
-//! \brief 3-D shearing box with refinement (S2): the shear exchange is between blocks
-//! of one level, so the leaves on each shear-periodic x1 face must have one level along x2 at
-//! every x3 position.  Refines every face leaf that a finer face leaf of the same face overlaps
-//! in x3, until there is none (the 2:1 rule may cascade).  Called on the root; every rank
-//! changes its whole tree the same way.  After an AMR refinement step the face leaves differ
-//! by at most one level, so only leaves of the old tree are refined (their children inherit
-//! the right old gid).
-
-void MeshBlockTree::RefineShearFaceColumns(int &nnew) {
-  for (int iter=0; iter<64; ++iter) {
-    std::vector<MeshBlockTree*> face[2];
-    proot_->CollectShearFaceLeaves(face);
-    std::vector<MeshBlockTree*> todo;
-    for (int f=0; f<2; ++f) {
-      int lmax = 0;
-      for (auto *b : face[f]) lmax = std::max(lmax, b->lloc_.level);
-      for (auto *a : face[f]) {
-        const int sa = lmax - a->lloc_.level;
-        const std::int64_t a0 = static_cast<std::int64_t>(a->lloc_.lx3) << sa;
-        const std::int64_t a1 = static_cast<std::int64_t>(a->lloc_.lx3 + 1) << sa;
-        for (auto *b : face[f]) {
-          if (b->lloc_.level <= a->lloc_.level) continue;
-          const int sb = lmax - b->lloc_.level;
-          const std::int64_t b0 = static_cast<std::int64_t>(b->lloc_.lx3) << sb;
-          const std::int64_t b1 = static_cast<std::int64_t>(b->lloc_.lx3 + 1) << sb;
-          if (a0 < b1 && b0 < a1) {todo.push_back(a); break;}
-        }
-      }
-    }
-    if (todo.empty()) return;
-    for (auto *a : todo) a->Refine(nnew);
-  }
-  std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-            << "RefineShearFaceColumns did not converge" << std::endl;
-  std::exit(EXIT_FAILURE);
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn bool MeshBlockTree::ShearFaceColumnsUniform()
-//! \brief True if no face leaf is overlapped in x3 by a finer one of its face
-
-bool MeshBlockTree::ShearFaceColumnsUniform(MeshBlockTree *root) {
-  std::vector<MeshBlockTree*> face[2];
-  root->CollectShearFaceLeaves(face);
-  for (int f=0; f<2; ++f) {
-    int lmax = 0;
-    for (auto *b : face[f]) lmax = std::max(lmax, b->lloc_.level);
-    for (auto *a : face[f]) {
-      const int sa = lmax - a->lloc_.level;
-      const std::int64_t a0 = static_cast<std::int64_t>(a->lloc_.lx3) << sa;
-      const std::int64_t a1 = static_cast<std::int64_t>(a->lloc_.lx3 + 1) << sa;
-      for (auto *b : face[f]) {
-        if (b->lloc_.level <= a->lloc_.level) continue;
-        const int sb = lmax - b->lloc_.level;
-        const std::int64_t b0 = static_cast<std::int64_t>(b->lloc_.lx3) << sb;
-        const std::int64_t b1 = static_cast<std::int64_t>(b->lloc_.lx3 + 1) << sb;
-        if (a0 < b1 && b0 < a1) return false;
-      }
-    }
-  }
-  return true;
 }
 
 //----------------------------------------------------------------------------------------

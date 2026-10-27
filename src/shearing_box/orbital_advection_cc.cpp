@@ -484,7 +484,7 @@ void OrbitalAdvectionCC::UnpackMixedCC() {
 //! column has 4 fine columns of half the width in x2), to the coarser block
 
 TaskStatus OrbitalAdvectionCC::SendFluxCC() {
-  if (!any_mixed || !oa_flux_correct) return TaskStatus::complete;
+  if (!any_mixed) return TaskStatus::complete;
   const int nmb = pmy_pack->nmb_thispack;
   const int nvar = nvar_oa;
   const int my_rank = global_variable::my_rank;
@@ -551,7 +551,7 @@ TaskStatus OrbitalAdvectionCC::SendFluxCC() {
 //! face by theirs: the cell next to the face changes by the difference
 
 TaskStatus OrbitalAdvectionCC::RecvFluxCC(DvceArray5D<Real> &a) {
-  if (!any_mixed || !oa_flux_correct) return TaskStatus::complete;
+  if (!any_mixed) return TaskStatus::complete;
   const int nmb = pmy_pack->nmb_thispack;
 #if MPI_PARALLEL_ENABLED
   bool done = true, no_errors = true;

@@ -145,17 +145,14 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     psbox_u = new ShearingBoxCC(ppack, pin, (nhydro+nscalars));
     // with mesh refinement in 3-D the coarse arrays are sheared too
     // (fine x1-face blocks with a coarser partner across the boundary prolongate from them)
-    // (<shearing_box>/experimental_coarse_shear = false: the control without it, tests only)
     if (ppack->pmesh->multilevel && ppack->pmesh->three_d &&
-        ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic &&
-        pin->GetOrAddBoolean("shearing_box", "experimental_coarse_shear", true)) {
+        ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
       psbox_u->coarse_on = true;
       psbox_u->AllocateBuffers();
     }
     // and no flux correction across the shear-periodic x1 boundaries
     if (ppack->pmesh->multilevel && ppack->pmesh->three_d &&
-        ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic &&
-        pin->GetOrAddBoolean("shearing_box", "experimental_shear_flux_skip", true)) {
+        ppack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
       pbval_u->skip_shear_x1_flux = true;
     }
     // collected ghost zones: AthenaK's prolongation and restriction stay out of the

@@ -1,7 +1,5 @@
 #ifndef MESH_MESHBLOCK_TREE_HPP_
 #define MESH_MESHBLOCK_TREE_HPP_
-
-#include <vector>
 //========================================================================================
 // AthenaXXX astrophysical plasma code
 // Copyright(C) 2020 James M. Stone <jmstone@ias.edu> and the Athena code team
@@ -51,12 +49,6 @@ class MeshBlockTree {
   void CreateZOrderedLLList(LogicalLocation *list, int *pglist, int& count);
   MeshBlockTree* FindNeighbor(LogicalLocation myloc, int ox1, int ox2, int ox3,
                               bool amrflag=false);
-  // 3-D shearing box with refinement: the leaves on the shear-periodic x1 faces
-  // keep one level along x2 at every x3 position
-  bool CanDerefine();
-  void RefineShearFaceColumns(int &nnew);
-  void CollectShearFaceLeaves(std::vector<MeshBlockTree*> face[2]);
-  static bool ShearFaceColumnsUniform(MeshBlockTree *root);
 
  private:
   // data: note private variable names have trailing underscore for this class

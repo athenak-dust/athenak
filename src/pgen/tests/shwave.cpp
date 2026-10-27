@@ -76,7 +76,7 @@ void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
   int ipert = pin->GetInteger("problem", "ipert");
 
   // (S1') <problem>/band_n bands of refinement for tests of the adaptive
-  // shearing box (experimental_smr): bandK_t0, _t1, _x1min, _x1max, _x3min, _x3max, _level; a
+  // shearing box: bandK_t0, _t1, _x1min, _x1max, _x3min, _x3max, _level; a
   // block whose centre is inside an active band is wanted at its level (whole x2)
   shw_bands.clear();
   const int nband = pin->GetOrAddInteger("problem", "band_n", 0);

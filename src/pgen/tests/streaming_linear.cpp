@@ -186,7 +186,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   user_hist_func = (pmy_mesh_->three_d && pmy_mesh_->pmb_pack->pdust != nullptr &&
                     pmy_mesh_->pmb_pack->pdust->Clouds3D()) ? StreamingLinearHistory3D
                                                            : StreamingLinearHistory;
-  // experimental dynamic mesh: scheduled refinement request
+  // dynamic mesh: scheduled refinement request
   if (pmy_mesh_->adaptive && pin->DoesBlockExist("dust")) {
     dust::SetupScheduledRefinement(pin);
     user_ref_func = dust::ScheduledRefinement;
@@ -265,8 +265,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   }
   // also a 3-D shearing box (x1 radial, x2 azimuthal, x3 vertical),
   // the mode independent of x2, with the lattice (point particles; none of the 2-D diagnostics
-  // below).  Refinable clouds in 3-D need <dust>/experimental_3d; their setup is
-  // the 3-D branch below
+  // below).  Refinable clouds in 3-D: their setup is the 3-D branch below
   const bool lina3d = pmy_mesh_->three_d;
   if (pmbp->pdust->nspecies != 1 ||
       (lina3d && ((pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud &&

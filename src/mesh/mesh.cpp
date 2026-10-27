@@ -26,6 +26,7 @@
 #include "diffusion/viscosity.hpp"
 #include "diffusion/resistivity.hpp"
 #include "diffusion/conduction.hpp"
+#include "dust/dust_input.hpp"
 #include "radiation/radiation.hpp"
 #include "particles/particles.hpp"
 #include "srcterms/srcterms.hpp"
@@ -181,63 +182,35 @@ Mesh::Mesh(ParameterInput *pin) :
   multilevel = (adaptive || pin->GetString("mesh_refinement","refinement") == "static")
     ?  true : false;
 
-  // The 2-D r-z shearing-box equations use only local source terms when all mesh
-  // boundaries are ordinary periodic boundaries. Permit that narrow configuration
-  // only as part of the explicitly enabled experimental static-SMR dust test. In
-  // particular, a non-dust input retains the original fail-closed behavior.
-  // S1: <shearing_box>/experimental_smr admits static refinement of a 3-D
-  // shearing box whose MeshBlocks at the shear-periodic x1 faces are all on one level and whose
-  // x2 neighbours are always on the same level (refinement in bands of x1); ShearingBox and
-  // OrbitalAdvection check both (the shear exchange and the orbital advection are same-level)
-  // S1': also adaptive refinement (one decision per column along x2,
-  // MeshRefinement::CheckForRefinement); hydro only for now (no MHD, dust or particles)
-  const bool sbox_smr = multilevel && pin->DoesBlockExist("shearing_box") && three_d &&
-      pin->GetOrAddBoolean("shearing_box", "experimental_smr", false);
-  // S3a: dust particles with the owner_overlap transfer (the dust
-  // module checks the rest), or (S3b) 3-D refinable clouds (<dust>/experimental_3d);
-  // no MHD, no other particles
-  const bool sbox_dust_oo = pin->DoesParameterExist("dust", "experimental_smr_transfer") &&
-      pin->GetString("dust", "experimental_smr_transfer") == "owner_overlap";
-  const bool sbox_dust_rc = pin->DoesBlockExist("dust") &&
-      pin->GetOrAddBoolean("dust", "experimental_3d", false);
-  if (sbox_smr && (pin->DoesBlockExist("mhd") ||
-                   ((pin->DoesBlockExist("dust") || pin->DoesBlockExist("particles")) &&
-                    !sbox_dust_oo && !sbox_dust_rc))) {
+  // Shearing box with mesh refinement: in 3-D (shear-periodic x1) hydro, or dust
+  // (refinable clouds or owner_overlap; the dust module checks the rest), no MHD and no other
+  // particles; in 2-D (the r-z shearing box, local source terms) only dust with periodic
+  // boundaries.  A non-dust 2-D input keeps the original fail-closed behaviour.
+  if (global_variable::my_rank == 0 && pin->DoesBlockExist("shearing_box")) {
+    dust::NoteDroppedKey(pin, "shearing_box", "experimental_smr",
+                         "a 3-D shearing box admits mesh refinement");
+    dust::NoteDroppedKey(pin, "shearing_box", "experimental_face_levels",
+                         "the x1-face blocks may always change level along x2");
+    dust::NoteDroppedKey(pin, "shearing_box", "experimental_shear_flux_skip",
+                         "always on with refinement");
+    dust::NoteDroppedKey(pin, "shearing_box", "experimental_oa_flux_correct", "always on");
+    dust::NoteDroppedKey(pin, "shearing_box", "experimental_coarse_shear",
+                         "always on with refinement");
+  }
+  if (multilevel && pin->DoesBlockExist("shearing_box") && three_d &&
+      (pin->DoesBlockExist("mhd") ||
+       (pin->DoesBlockExist("particles") && !pin->DoesBlockExist("dust")))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "<shearing_box>/experimental_smr: hydro, or dust with experimental_smr_transfer "
-              << "= owner_overlap or experimental_3d refinable clouds (no MHD, no other particles)"
-              << std::endl;
+              << "3-D shearing box with mesh refinement: hydro, or hydro with dust (no MHD, "
+              << "no other particles)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (sbox_smr && global_variable::my_rank == 0) {
-    std::cout << "# WARNING (mesh): experimental " << (adaptive ? "adaptive" : "static")
-              << " refinement of the 3-D shearing box (levels constant along x2)" << std::endl;
-  }
-  if (multilevel && pin->DoesBlockExist("shearing_box") && !sbox_smr) {
-    bool experimental_dust_smr = pin->DoesBlockExist("dust") &&
-        pin->GetOrAddBoolean("dust", "experimental_static_smr", false);
-    // <dust>/experimental_amr also admits adaptive refinement, with the
-    // same restrictions
-    bool experimental_dust_amr = pin->DoesBlockExist("dust") &&
-        pin->GetOrAddBoolean("dust", "experimental_amr", false);
-    // <dust>/experimental_mpi: several ranks; the dust module checks
-    // the rest
-    bool experimental_dust_mpi = pin->DoesBlockExist("dust") &&
-        pin->GetOrAddBoolean("dust", "experimental_mpi", false);
-    if (!(experimental_dust_smr && (!adaptive || experimental_dust_amr) && two_d &&
-          strictly_periodic &&
-          (global_variable::nranks == 1 || experimental_dust_mpi))) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "Shearing box is not currently compatible with mesh "
-                << "refinement, except the explicitly enabled experimental dust "
-                << "configuration with static 2-D SMR, ordinary periodic boundaries, "
-                << "and one MPI rank" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    if (global_variable::my_rank == 0) {
-      std::cout << "# WARNING (mesh): experimental static SMR with the 2-D r-z "
-                << "shearing-box source terms is enabled" << std::endl;
-    }
+  if (multilevel && pin->DoesBlockExist("shearing_box") && !three_d &&
+      !(pin->DoesBlockExist("dust") && two_d && strictly_periodic)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Shearing box with mesh refinement in 2-D: only the r-z "
+              << "shearing box with dust and periodic boundaries" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
 
   // error check physical size of mesh (root level) from input file.

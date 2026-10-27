@@ -45,7 +45,6 @@ class OrbitalAdvection {
   DualArray2D<int> xlev;
   DualArray2D<int> xslot;   // (m,n): the slot (nghbr index) of the coarser neighbour
   bool any_mixed;           // on this rank
-  bool oa_flux_correct;     // <shearing_box>/experimental_oa_flux_correct (default true)
   int nvar_oa;              // variables (set by the CC class)
   int nrow;                 // ng + maxjshift: rows exchanged at the receiver's resolution
   DvceArray3D<Real> msend[2], mrecv[2];   // mixed-level data (m, subface, flat) for MPI

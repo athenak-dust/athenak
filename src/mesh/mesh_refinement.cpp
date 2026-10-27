@@ -17,8 +17,6 @@
 #include <cmath>     // abs
 #include <algorithm> // sort
 #include <utility>   // pair
-#include <map>
-#include <tuple>
 #include <vector>
 
 #include "athena.hpp"
@@ -75,14 +73,6 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
     }
     prolong_amp_eps = pin->GetOrAddReal("mesh_refinement", "prolong_amplitude_eps", 0.0);
     coarse_physical_bcs = pin->GetOrAddBoolean("mesh_refinement", "coarse_physical_bcs", true);
-    // (no columns with <shearing_box>/experimental_face_levels)
-    // Codex review: only with shear-periodic x1 faces, as
-    // build_tree.cpp; with plain periodic x1 there are no shear faces to keep in columns
-    sbox_columns = pm->adaptive && pm->three_d && pin->DoesBlockExist("shearing_box") &&
-                   pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic &&
-                   pm->mesh_bcs[BoundaryFace::outer_x1] == BoundaryFlag::shear_periodic &&
-                   pin->GetOrAddBoolean("shearing_box", "experimental_smr", false) &&
-                   !pin->GetOrAddBoolean("shearing_box", "experimental_face_levels", true);
     if (prolong_amp_eps > 0.0) {
       if (pm->adaptive || prolong_prims) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -188,14 +178,13 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
       // Mark one mesh-topology update event (AMR and any resulting load balancing).
       pmy_mesh->MarkMeshUpdated();
 
-      // S1': the shearing box lists of x1-face blocks, its buffers and the level check
-      // on the new mesh, before the boundary values are exchanged again
+      // S1': the shearing box lists of x1-face blocks and its buffers on the new
+      // mesh, before the boundary values are exchanged again
       if (pmy_mesh->pmb_pack->phydro != nullptr &&
           pmy_mesh->pmb_pack->phydro->psbox_u != nullptr) {
         auto *ps = pmy_mesh->pmb_pack->phydro->psbox_u;
         ps->BuildBoundaryLists();
         ps->AllocateBuffers();
-        ps->CheckLevelsAlongX2();
       }
       // S2: the orbital advection's x2 faces with a level change
       if (pmy_mesh->pmb_pack->phydro != nullptr &&
@@ -312,33 +301,6 @@ void MeshRefinement::CheckForRefinement(MeshBlockPack* pmbp) {
                    MPI_INT, refine_flag.h_view.data(), pmy_mesh->nmb_eachrank,
                    pmy_mesh->gids_eachrank, MPI_INT, MPI_COMM_WORLD);
 #endif
-  // 3-D shearing box (S1'): one decision per column along x2 (the same
-  // level and lx1, lx3): refine if any block of the column asks for it, derefine only if all do.
-  // (S2: only the columns on the shear-periodic x1 faces; the orbital advection handles
-  // other blocks with x2 neighbours on other levels.  UpdateMeshBlockTree keeps the face
-  // columns uniform through the 2:1 rule.)
-  if (sbox_columns) {
-    std::map<std::tuple<int, std::int32_t, std::int32_t>, std::pair<int, int>> col;
-    auto on_face = [this](const LogicalLocation &ll) {
-      const std::int32_t nx = pmy_mesh->nmb_rootx1 << (ll.level - pmy_mesh->root_level);
-      return ll.lx1 == 0 || ll.lx1 == nx - 1;
-    };
-    for (int g=0; g<(pmy_mesh->nmb_total); ++g) {
-      const auto &ll = pmy_mesh->lloc_eachmb[g];
-      if (!on_face(ll)) continue;
-      auto key = std::make_tuple(ll.level, ll.lx1, ll.lx3);
-      auto it = col.find(key);
-      if (it == col.end()) it = col.emplace(key, std::make_pair(0, 1)).first;
-      if (refine_flag.h_view(g) > 0) it->second.first = 1;
-      if (refine_flag.h_view(g) >= 0) it->second.second = 0;
-    }
-    for (int g=0; g<(pmy_mesh->nmb_total); ++g) {
-      const auto &ll = pmy_mesh->lloc_eachmb[g];
-      if (!on_face(ll)) continue;
-      const auto &c = col[std::make_tuple(ll.level, ll.lx1, ll.lx3)];
-      refine_flag.h_view(g) = c.first ? 1 : (c.second ? -1 : 0);
-    }
-  }
   // sync host array with device
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
@@ -480,47 +442,11 @@ void MeshRefinement::UpdateMeshBlockTree(int &nnew, int &ndel) {
   if (tnref != 0) {
     delete [] llref;
   }
-  // Shearing box (S2): the 2:1 rule may have refined single blocks of a face column;
-  // refine the rest of the column
-  if (sbox_columns) pmy_mesh->ptree->RefineShearFaceColumns(nnew);
 
   // Step 2. perform derefinement
-  // A face column derefines as a whole or not at all: every parent of the column
-  // (all x2 positions) must be in the list and pass the 2:1 test (a refusal later would leave
-  // the column non-uniform, and refining it again would break the new-to-old gid map)
-  std::vector<bool> skip(ctnd, false);
-  if (sbox_columns && ctnd > 0) {
-    std::map<std::tuple<int, std::int32_t, std::int32_t>, std::pair<int, bool>> fcol;
-    auto on_face = [this](const LogicalLocation &ll) {
-      const std::int32_t nx = pmy_mesh->nmb_rootx1 << (ll.level - pmy_mesh->root_level);
-      return ll.lx1 == 0 || ll.lx1 == nx - 1;
-    };
-    for (int n=0; n<ctnd; n++) {
-      if (!on_face(cllderef[n])) continue;
-      auto key = std::make_tuple(cllderef[n].level, cllderef[n].lx1, cllderef[n].lx3);
-      auto it = fcol.find(key);
-      if (it == fcol.end()) it = fcol.emplace(key, std::make_pair(0, true)).first;
-      it->second.first++;
-      if (!pmy_mesh->ptree->FindMeshBlock(cllderef[n])->CanDerefine()) it->second.second = false;
-    }
-    for (int n=0; n<ctnd; n++) {
-      if (!on_face(cllderef[n])) continue;
-      const auto &c = fcol[std::make_tuple(cllderef[n].level, cllderef[n].lx1,
-                                           cllderef[n].lx3)];
-      const int ny = pmy_mesh->nmb_rootx2 << (cllderef[n].level - pmy_mesh->root_level);
-      if (c.first != ny || !c.second) skip[n] = true;
-    }
-  }
   for (int n=0; n<ctnd; n++) {
-    if (skip[n]) continue;
     MeshBlockTree *bt = pmy_mesh->ptree->FindMeshBlock(cllderef[n]);
     bt->Derefine(ndel);
-  }
-  if (sbox_columns && !MeshBlockTree::ShearFaceColumnsUniform(pmy_mesh->ptree.get())) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "shearing box: a face column is not uniform along x2 after the regrid "
-              << std::endl;
-    std::exit(EXIT_FAILURE);
   }
   if (tnderef >= nleaf) {
     delete [] cllderef;
