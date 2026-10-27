@@ -148,6 +148,30 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
     int iy = static_cast<int>((x2 - mbsize.d_view(m).x2min + ly)/ly) - 1;
     int iz = static_cast<int>((x3 - mbsize.d_view(m).x3min + lz)/lz) - 1;
 
+    // A particle the offset test keeps in its block (offset 0) may
+    // still lie outside the block's half-open box by round-off: just below a face at coordinate 0
+    // (|x| far below the precision of x - xmin + l), or at xmax after a rounded x - xmin.  Put it
+    // onto the box (the largest value below xmax at the upper face), so that every particle lies
+    // in [xmin, xmax) of its block; the RK register moves with the position.
+    auto snap = [&](const int off, Real &x, const Real xa, const Real xb, const int ip,
+                    const int ir) {
+      if (off != 0) return;
+      Real xs = x;
+      if (x < xa) {
+        xs = xa;
+      } else if (x >= xb) {
+        xs = Kokkos::nextafter(xb, xa);
+      }
+      if (xs != x) {
+        if (has_reg) {pr(ir,p) += xs - x;}
+        pr(ip,p) = xs;
+        x = xs;
+      }
+    };
+    snap(ix, x1, mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, IPX, IPX1);
+    if (multi_d) {snap(iy, x2, mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, IPY, IPY1);}
+    if (three_d) {snap(iz, x3, mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, IPZ, IPZ1);}
+
     // sublock indices for faces and edges with S/AMR
     int fx = (x1 < 0.5*(mbsize.d_view(m).x1min + mbsize.d_view(m).x1max))? 0 : 1;
     int fy = (x2 < 0.5*(mbsize.d_view(m).x2min + mbsize.d_view(m).x2max))? 0 : 1;
