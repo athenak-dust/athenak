@@ -100,13 +100,10 @@ struct DensityTrigger {
   // With map = block, the block values on the device (default) or on the host; check:
   // both, every value compared (diagnostic)
   bool device = true, device_check = false;
-  // <dust>/amr_shear_face_limit = on (the default: the 2:1 rule
-  // of all other neighbours, and within what the face exchange can fill), auto (only the exchange's
-  // limit, and only when some level could exceed it), off (ShearFaceLevelLimit)
-  int shear_face_limit = 1;   // 0 auto, 1 on (default since 2026-10-27), -1 off
-  // <dust>/amr_shear_face_dmax >= 0 caps the exchange's dmax (a 16^3 run that will be
-  // converted to 8x16x8 blocks: 1); -1 = from the block shape
-  int shear_face_dmax = -1;
+  // <dust>/amr_shear_face_limit = on (the default: the 2:1 rule of
+  // all other neighbours, within what the face exchange can fill) | off (ShearFaceLevelLimit).
+  // Rixin: auto and amr_shear_face_dmax (for 8x16x8 blocks) were removed (16^3 blocks)
+  bool shear_face_limit = true;
 };
 DensityTrigger trig_;
 // Per-block audit of the trigger
@@ -272,11 +269,11 @@ void SetupDensityTrigger(ParameterInput *pin) {
     // Rixin: default on (the shear-periodic x1 faces follow the 2:1 rule of all other
     // neighbours, within what the face exchange can fill); auto = only the exchange's limit
     const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
-    if (sfl == "auto") trig_.shear_face_limit = 0;
-    else if (sfl == "on") trig_.shear_face_limit = 1;
-    else if (sfl == "off") trig_.shear_face_limit = -1;
-    else fatal("<dust>/amr_shear_face_limit must be auto, on or off");
-    trig_.shear_face_dmax = pin->GetOrAddInteger("dust", "amr_shear_face_dmax", -1);
+    if (sfl == "on") trig_.shear_face_limit = true;
+    else if (sfl == "off") trig_.shear_face_limit = false;
+    else fatal("<dust>/amr_shear_face_limit must be on or off (auto was removed on 2026-10-27)");
+    if (pin->DoesParameterExist("dust", "amr_shear_face_dmax"))
+      fatal("<dust>/amr_shear_face_dmax was removed on 2026-10-27 (it served the 8x16x8 conversion)");
   }
   audit_ = pin->GetOrAddBoolean("dust", "amr_trigger_audit", false);
   audit_max_ = pin->GetOrAddInteger("dust", "amr_trigger_audit_max", 40);
@@ -311,8 +308,8 @@ void SetupDensityTrigger(ParameterInput *pin) {
 //! array at l - 1; an opposite block finer by d needs nghost*2^d <= nx1 (and nx2, nx3 divisible
 //! by 2^d).  With dmax the largest such d, the opposite face may be at most
 //!   omax(l) = dmax (l = 0),  l + dmax - 1 (l > 0)
-//! (8x16x8, nghost 4: dmax = 1, a block above the root may not face a finer one; 16^3: dmax = 2).
-//! amr_shear_face_limit = on adds the 2:1 rule of all other neighbours, omax(l) <= l + 1.
+//! (8x16x8, nghost 4: dmax = 1, a block above the root may not face a finer one; 16^3: dmax = 2),
+//! and by the 2:1 rule of all other neighbours, omax(l) <= l + 1 (amr_shear_face_limit = on).
 //! Targets are level + max(flag, 0).  A face block whose target is below what the opposite face
 //! needs is refined (or kept from derefining); if one level up is not enough, the refinement of
 //! the opposite blocks above omax of its target is cancelled instead.  Repeated until nothing
@@ -323,25 +320,13 @@ void SetupDensityTrigger(ParameterInput *pin) {
 void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
   Mesh *pm = pmbp->pmesh;
   if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) return;
-  if (trig_.shear_face_limit < 0) return;
+  if (!trig_.shear_face_limit) return;
   const auto &ind = pm->mb_indcs;
   int dmax = 0;
   while (ind.ng*(1 << (dmax + 1)) <= ind.nx1 && ind.nx2 % (1 << (dmax + 1)) == 0 &&
          ind.nx3 % (1 << (dmax + 1)) == 0) ++dmax;
-  if (trig_.shear_face_dmax >= 0) dmax = std::min(dmax, trig_.shear_face_dmax);
-  const bool two_to_one = (trig_.shear_face_limit == 1);
-  auto omax = [dmax, two_to_one](int l) {
-    int o = (l == 0) ? dmax : l + dmax - 1;
-    if (two_to_one) o = std::min(o, l + 1);
-    return o;
-  };
+  auto omax = [dmax](int l) {return std::min((l == 0) ? dmax : l + dmax - 1, l + 1);};
   const int lmax = pm->max_level - pm->root_level;
-  // auto: only when some level could face a level it cannot take
-  if (!two_to_one) {
-    bool need = false;
-    for (int l=0; l<=lmax; ++l) need = need || (omax(l) < lmax);
-    if (!need) return;
-  }
   auto &refine_flag = pm->pmr->refine_flag;
   auto &mbsz = pmbp->pmb->mb_size;
   const int nmb = pmbp->nmb_thispack, mbs = pmbp->gids;
@@ -402,7 +387,7 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
   // keep them from derefining) until nothing changes (monotone up); where one level up cannot
   // satisfy the opposite face, forbid the opposite refinements that cause it (monotone: the set
   // only grows) and start the round again.  A block whose current level already violates the limit
-  // (an invalid starting mesh, or a 16^3 run prepared for 8x16x8 with amr_shear_face_dmax) is
+  // (an invalid starting mesh, e.g. a restart file written without the limit) is
   // repaired: raised one level per regrid even if that is not yet enough, and nothing is
   // forbidden for it (forbidding there could block the repair for good).
   const auto tcur = targets(true);
@@ -489,7 +474,7 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
 #endif
   if (cnt[0] + cnt[1] + cnt[2] > 0 && global_variable::my_rank == 0) {
     std::cout << "# dust density trigger: shear-periodic x1 face levels (dmax " << dmax
-              << (two_to_one ? ", 2:1" : "") << "): " << cnt[0] << " blocks refined, " << cnt[1]
+              << ", 2:1): " << cnt[0] << " blocks refined, " << cnt[1]
               << " kept from derefining, " << cnt[2] << " refinements cancelled (" << rounds
               << (rounds >= 64 ? " rounds, limit reached" : " rounds") << ")" << std::endl;
   }
