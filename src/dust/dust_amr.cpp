@@ -406,6 +406,17 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
   // repaired: raised one level per regrid even if that is not yet enough, and nothing is
   // forbidden for it (forbidding there could block the repair for good).
   const auto tcur = targets(true);
+  std::vector<char> repair(nmb, 0);   // the block's current level already violates the limit
+  for (int m=0; m<nmb; ++m) {
+    const auto &sz = mbsz.h_view(m);
+    const int f = face(sz);
+    if (f < 0) continue;
+    int k0, k1; zrange(sz, k0, k1);
+    const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
+    int ocur = -1;
+    slots(k0, k1, l, [&](int k) {ocur = std::max(ocur, tcur[(1 - f)*nzf + k]);});
+    repair[m] = (omax(l) < ocur) ? 1 : 0;
+  }
   int rounds = 0;
   for (bool again = true; again && rounds < 64; ++rounds) {
     for (int m=0; m<nmb; ++m) refine_flag.h_view(m + mbs) = (forbid[m] && orig[m] > 0) ? 0 : orig[m];
@@ -423,13 +434,10 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
           return o;
         };
         const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
-        int ocur = -1;
-        slots(k0, k1, l, [&](int k) {ocur = std::max(ocur, tcur[(1 - f)*nzf + k]);});
-        const bool repair = omax(l) < ocur;
         int &flag = refine_flag.h_view(m + mbs);
         if (flag < 0 && omax(l - 1) < other_at(l - 1)) {flag = 0; up = 1;}
         if (flag <= 0 && !forbid[m] && l < lmax && omax(l) < other_at(l) &&
-            (repair || omax(l + 1) >= other_at(l + 1))) {flag = 1; up = 1;}
+            (repair[m] || omax(l + 1) >= other_at(l + 1))) {flag = 1; up = 1;}
       }
       up = any(up);
     }
@@ -442,11 +450,9 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
       int k0, k1; zrange(sz, k0, k1);
       const int t = pm->lloc_eachmb[m + mbs].level - pm->root_level +
                     std::max(0, refine_flag.h_view(m + mbs));
-      const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
-      int o = -1, ocur = -1;
+      int o = -1;
       slots(k0, k1, t, [&](int k) {o = std::max(o, tmax[(1 - f)*nzf + k]);});
-      slots(k0, k1, l, [&](int k) {ocur = std::max(ocur, tcur[(1 - f)*nzf + k]);});
-      if (omax(t) < o && !(omax(l) < ocur)) {
+      if (omax(t) < o && !repair[m]) {
         const int c = omax(t);
         slots(k0, k1, t, [&](int k) {cap[(1 - f)*nzf + k] = std::min(cap[(1 - f)*nzf + k], c);});
       }
@@ -460,7 +466,7 @@ void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
     for (int m=0; m<nmb; ++m) {
       const auto &sz = mbsz.h_view(m);
       const int f = face(sz);
-      if (f < 0 || forbid[m] || refine_flag.h_view(m + mbs) <= 0) continue;
+      if (f < 0 || forbid[m] || repair[m] || refine_flag.h_view(m + mbs) <= 0) continue;
       int k0, k1; zrange(sz, k0, k1);
       int c = big;
       for (int k=k0; k<k1; ++k) c = std::min(c, cap[f*nzf + k]);
