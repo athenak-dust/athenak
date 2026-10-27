@@ -215,6 +215,13 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     // representation changes); reuse_check adds the fresh deposit, the true residual of
     // the reused potential and a full regather for comparison (diagnostic only)
     kdk_reuse_ = pin->GetOrAddBoolean("gravity", "kdk_reuse", false);
+    // initial guess of a solve at a new time: previous (default: the last accepted
+    // potential) or extrapolate (linear in time from the last two; the converged field then
+    // differs from the default within the solver tolerance)
+    const std::string guess = pin->GetOrAddString("gravity", "guess", "previous");
+    if (guess != "previous" && guess != "extrapolate")
+      Fail("<gravity>/guess must be previous or extrapolate");
+    guess_extrapolate_ = guess == "extrapolate";
     reuse_check_ = pin->GetOrAddBoolean("gravity", "reuse_check", false);
   }
   setup_ = pin->GetOrAddString("gravity", "setup", "distributed");
@@ -287,6 +294,7 @@ SelfGravity::~SelfGravity() {
               << " phase_updates=" << phase_update_count
               << " preconditioner_refreshes=" << preconditioner_refresh_count
               << " rebuilds=" << rebuild_count << " kdk_reuses=" << reuse_count_
+              << " extrapolated_guesses=" << guess_extrapolations_
               << " phase_prefetch_used=" << prefetch_used_
               << " phase_prefetch_discarded=" << prefetch_discarded_
               << " iterations=" << last_solve.iterations
@@ -1054,6 +1062,45 @@ void SelfGravity::ReuseCheck(Real time, long long regathered) {
   }
 }
 
+// solution_ holds the accepted potential of time guess_t_cur_ on this mesh. For a
+// solve at a new time, keep that vector (guess_tmp_) and replace the guess by
+// x + r (x - x_prev), r = (t - t_cur)/(t_cur - t_prev). Returns whether it did.
+bool SelfGravity::ExtrapolateGuess(Real time, int solver_n) {
+  if (!guess_extrapolate_ || !guess_cur_valid_ || guess_topology_ != topology_
+      || time == guess_t_cur_ || solution_.extent_int(0) != solver_n) return false;
+  if (guess_tmp_.extent_int(0) != solver_n) {
+    guess_tmp_ = DvceArray1D<Real>("sg_guess_tmp",solver_n);
+    guess_prev_ = DvceArray1D<Real>("sg_guess_prev",solver_n);
+    guess_prev_valid_ = false;
+  }
+  Kokkos::deep_copy(guess_tmp_,solution_);
+  if (!guess_prev_valid_ || guess_t_cur_ == guess_t_prev_) return false;
+  const Real r = (time-guess_t_cur_)/(guess_t_cur_-guess_t_prev_);
+  if (!std::isfinite(r) || !(r > 0) || r > 4) return false;
+  auto x = solution_, cur = guess_tmp_, prev = guess_prev_;
+  Kokkos::parallel_for("sg_guess_extrapolate",Kokkos::RangePolicy<DevExeSpace>(0,solver_n),
+  KOKKOS_LAMBDA(const int q) { x(q) = cur(q)+r*(cur(q)-prev(q)); });
+  ++guess_extrapolations_;
+  return true;
+}
+
+// After an accepted solve at time: the previous accepted potential (guess_tmp_, kept by
+// ExtrapolateGuess) becomes x_prev when the solve was at a new time on the same mesh.
+void SelfGravity::RecordGuess(Real time, bool extrapolation_history) {
+  if (!guess_extrapolate_) return;
+  if (extrapolation_history) {
+    std::swap(guess_prev_,guess_tmp_);
+    guess_t_prev_ = guess_t_cur_;
+    guess_prev_valid_ = true;
+  } else if (guess_topology_ != topology_ || guess_prev_.extent_int(0) != solution_.extent_int(0)) {
+    guess_prev_valid_ = false;
+  }
+  if (time != guess_t_cur_ && !extrapolation_history) guess_prev_valid_ = false;
+  guess_t_cur_ = time;
+  guess_cur_valid_ = true;
+  guess_topology_ = topology_;
+}
+
 void SelfGravity::UpdateDustField(Real time) {
   if (coupled_dust_ && kick_dust_)
     pack_->pdust->GatherGravityAcceleration(time,acceleration,particle_acceleration_,kdk_reuse_);
@@ -1224,6 +1271,11 @@ void SelfGravity::Solve(Real time) {
   SolveStats cached_attempt;
   double cached_attempt_s = 0, hierarchy_refresh_s = 0, fresh_attempt_s = 0;
   bool refreshed = false;
+  // guess = extrapolate: the history step is valid when solution_ holds the
+  // accepted potential of the last solve time on this mesh (kept in guess_tmp_)
+  const bool guess_history = guess_extrapolate_ && guess_cur_valid_ && guess_topology_ == topology_
+      && time != guess_t_cur_ && solution_.extent_int(0) == solver_n;
+  const bool extrapolated = ExtrapolateGuess(time,solver_n);
   try {
     const double attempt_begin = ProfileTime(true);
     last_solve = mg_->Solve(rhs_,solution_,tolerance_,attempt_cap,restart_);
@@ -1278,6 +1330,7 @@ void SelfGravity::Solve(Real time) {
   }
   hierarchy_fresh_ = false;
   const double t_solve = ProfileTime(profile_);
+  RecordGuess(time,guess_history);
   auto sol = solution_;
   Real gauge = 0;
   if (vacuum_) gauge = vacuum_->GaugeShift(solution_);
@@ -1350,7 +1403,7 @@ void SelfGravity::Solve(Real time) {
               << " timestep_s=" << t_timestep-t_gather
               << " iterations=" << last_solve.iterations
               << " matvecs=" << last_solve.matrix_applications
-              << " vcycles=" << last_solve.vcycles
+              << " vcycles=" << last_solve.vcycles << " extrapolated_guess=" << extrapolated
               << " residual=" << last_solve.relative_residual
               << " cached=0 residual_cached=0 cache_hits=" << cache_hit_count
               << " physical_mass=" << global_physical_mass

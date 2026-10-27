@@ -49,6 +49,8 @@ class SelfGravity {
   bool KdkReuseAllowed(Real time, Real shift);
   void RememberReuseState();
   void ReuseCheck(Real time, long long regathered);
+  bool ExtrapolateGuess(Real time, int solver_n);
+  void RecordGuess(Real time, bool extrapolation_history);
   // Symmetric half-kicks around the existing hydro/OA update. Density does not
   // change during a kick; ideal-gas internal energy is preserved exactly.
   void KickHydro(Real dt);
@@ -132,6 +134,13 @@ class SelfGravity {
   Real reuse_check_max_residual_ = 0, reuse_check_max_source_ = 0, reuse_check_max_gather_ = 0;
   DvceArray1D<Real> reuse_gas_;  // gas density of the source cells (gas sources only)
   Real last_physical_mass_ = 0;
+  // <gravity>/guess = extrapolate (default previous): linear extrapolation in time of
+  // the last two accepted potentials as the initial guess of a solve at a new time
+  bool guess_extrapolate_ = false, guess_prev_valid_ = false, guess_cur_valid_ = false;
+  DvceArray1D<Real> guess_prev_, guess_tmp_;
+  Real guess_t_prev_ = 0, guess_t_cur_ = 0;
+  int guess_topology_ = -1;
+  std::uint64_t guess_extrapolations_ = 0;
   bool prefetch_enabled_ = false;
   std::uint64_t geometry_epoch_ = 0, prefetch_used_ = 0, prefetch_discarded_ = 0;
   CompositeDomain solver_domain_;
