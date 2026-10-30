@@ -146,7 +146,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
         // Production refinable-cloud advance: linear gather at the
         // midpoint, implicit-midpoint kick and drift, cloud-weight impulse deposit.  Same
         // arithmetic as dust_pc2_advance below, kept separate because the paths there
-        // (TSC, owner_overlap, the analytic gather) cost registers and occupancy.
+        // (TSC, instant_switch, the analytic gather) cost registers and occupancy.
         if (clouds3d) {CloudAdvance3D(); return TaskStatus::complete;}
         PackGatherField(ustar);
         auto gp = gpack;
@@ -244,6 +244,7 @@ TaskStatus DustGasDrag::ExplicitPush(Driver *pdrive, int stage) {
             lt.ForEachCloudWeight(xh, yh, pi(PLEV,p), am, add);
           }
         };
+        CloudOrderCount(cloud_ord_n > 0);
         if (cloud_ord_n > 0) {   // in the order of the cell-sorted index
           CloudParForOrdered("dust_pc2_advance_linear", npart, cloud_ord, cloud_ord_n,
                              adv_body);

@@ -170,11 +170,8 @@ void DustGasDrag::CheckClouds3D() {
     // faces to be non-periodic and <dust>/particle_x3_bc)
     bad.push_back("x3 faces other than periodic, reflect, outflow or user");
   }
-  // the execution-order index (cloud_order_interval) has 3-D keys; the physical sort
-  // (cloud_sort_interval) still has 2-D keys only
-  if (cloud_sort_interval > 0) {
-    bad.push_back("the particle sort (cloud_sort_interval)");
-  }
+  // the execution-order index (cloud_order_interval) and the physical sort
+  // (cloud_sort_interval, off by default in 3-D) have 3-D keys (block, k, j, i)
   if (!bad.empty()) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "3-D refinable clouds do not support:";

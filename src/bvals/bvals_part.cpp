@@ -681,28 +681,10 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
     pmy_part->pmy_pack->pmesh->nprtcl_eachrank[0] = pmy_part->nprtcl_thispack;
     return TaskStatus::complete;
   }
-  // Sort sendlist on host by index in particle array
-  std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByIndex);
-  // Copy only the sorted valid prefix back to the device.
-  if (nprtcl_send > 0) {
-    auto h_prefix = Kokkos::subview(sendlist.h_view,
-                                    std::make_pair(0, nprtcl_send));
-    auto d_prefix = Kokkos::subview(sendlist.d_view,
-                                    std::make_pair(0, nprtcl_send));
-    Kokkos::deep_copy(d_prefix, h_prefix);
-  }
-
-  // increase size of particle arrays if needed.  The arrays keep their capacity (their
-  // extent may exceed the number of particles) and grow with 25% headroom, so that a net
-  // inflow of a few particles does not reallocate them every cycle
-  int new_npart = pmy_part->nprtcl_thispack + (nprtcl_recv - nprtcl_send);
-  if (new_npart > pmy_part->prtcl_rdata.extent_int(1) ||
-      new_npart > pmy_part->prtcl_idata.extent_int(1)) {
-    Kokkos::resize(pmy_part->prtcl_idata, pmy_part->nidata, new_npart + new_npart/4);
-    Kokkos::resize(pmy_part->prtcl_rdata, pmy_part->nrdata, new_npart + new_npart/4);
-  }
-
-  // check that particle communications have all completed
+  // check that particle communications have all completed.  This comes first: the caller
+  // polls this function until it returns complete, and on MPI backends that need MPI calls
+  // to make progress, a host sort on every poll delays the communication (with millions of
+  // particles sent at a regrid, the repeated sorts made the exchange take minutes)
   bool bflag = false;
   bool no_errors=true;
   for (int n=0; n<nrecvs; ++n) {
@@ -727,6 +709,27 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
   }
   // exit if particle communications have not completed
   if (bflag) {return TaskStatus::incomplete;}
+
+  // Sort sendlist on host by index in particle array
+  std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByIndex);
+  // Copy only the sorted valid prefix back to the device.
+  if (nprtcl_send > 0) {
+    auto h_prefix = Kokkos::subview(sendlist.h_view,
+                                    std::make_pair(0, nprtcl_send));
+    auto d_prefix = Kokkos::subview(sendlist.d_view,
+                                    std::make_pair(0, nprtcl_send));
+    Kokkos::deep_copy(d_prefix, h_prefix);
+  }
+
+  // increase size of particle arrays if needed.  The arrays keep their capacity (their
+  // extent may exceed the number of particles) and grow with 25% headroom, so that a net
+  // inflow of a few particles does not reallocate them every cycle
+  int new_npart = pmy_part->nprtcl_thispack + (nprtcl_recv - nprtcl_send);
+  if (new_npart > pmy_part->prtcl_rdata.extent_int(1) ||
+      new_npart > pmy_part->prtcl_idata.extent_int(1)) {
+    Kokkos::resize(pmy_part->prtcl_idata, pmy_part->nidata, new_npart + new_npart/4);
+    Kokkos::resize(pmy_part->prtcl_rdata, pmy_part->nrdata, new_npart + new_npart/4);
+  }
 
   // unpack particles into positions of sent particles
   if (nprtcl_recv > 0) {

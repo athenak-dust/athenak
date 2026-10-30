@@ -40,7 +40,7 @@
 //! The sibling, 2:1 and refinement_interval rules of MeshRefinement apply as usual.  Each
 //! check decides the refinement flags.
 //!
-//! The old owner_overlap transfer (kept for comparison) also runs on the dynamic mesh, one
+//! The old instant_switch transfer (kept for comparison) also runs on the dynamic mesh, one
 //! rank.  Point particles, TSC on the block that
 //! holds them, ghost deposits added by volume to the leaves they overlap (the remap of
 //! MeshBoundaryValuesDep, rebuilt after every regrid); after a regrid the block of every
@@ -112,9 +112,6 @@ struct DensityTrigger {
   }
   // the block values on the device (default) or on the host
   bool device = true;
-  // <dust>/amr_shear_face_limit = on (default: the 2:1 rule of
-  // all other neighbours, within what the face exchange can fill) | off (ShearFaceLevelLimit).
-  bool shear_face_limit = true;
 };
 DensityTrigger trig_;
 // per-block audit of the trigger
@@ -280,10 +277,14 @@ void SetupDensityTrigger(ParameterInput *pin) {
   {
     // default on (the shear-periodic x1 faces follow the 2:1 rule of all other
     // neighbours, within what the face exchange can fill); auto = only the exchange's limit
+    // the rule is the mesh refinement's for every AMR shearing box
+    // (MeshRefinement::ShearFaceLevelLimit), always on; the key is still read (restart files hold it)
     const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
-    if (sfl == "on") trig_.shear_face_limit = true;
-    else if (sfl == "off") trig_.shear_face_limit = false;
-    else fatal("<dust>/amr_shear_face_limit must be on or off");
+    if (sfl != "on" && sfl != "off") fatal("<dust>/amr_shear_face_limit must be on or off");
+    if (sfl == "off" && global_variable::my_rank == 0) {
+      std::cout << "# NOTE (dust): amr_shear_face_limit = off is ignored: the mesh refinement keeps the "
+                << "shear-periodic x1 faces within one level whatever the criteria" << std::endl;
+    }
   }
   if (!(trig_.rho_derefine >= 0.0 && trig_.rho_derefine < trig_.rho_refine) || trig_.buffer < 0) {
     fatal("amr_density_trigger needs 0 <= amr_rho_derefine < amr_rho_refine and amr_rho_buffer >= 0");
@@ -313,186 +314,6 @@ void SetupDensityTrigger(ParameterInput *pin) {
 //! every periodic image; the widened box must be covered); the thresholds and the log line as
 //! in 2-D.  Several ranks: the halo slots, each with the cells it receives.
 
-//----------------------------------------------------------------------------------------
-//! \fn ShearFaceLevelLimit
-//! \brief The levels across the shear-periodic x1 faces.  The tree's 2:1
-//! balance does not see these neighbours (they slide with the shear), so the trigger keeps them
-//! within what the shearing-box face exchange (x1-face levels along x2) can fill.  A face block
-//! at level l receives its x1 ghosts at level l and, above the root level, those of its coarse
-//! array at l - 1; an opposite block finer by d needs nghost*2^d <= nx1 (and nx2, nx3 divisible
-//! by 2^d).  With dmax the largest such d, the opposite face may be at most
-//!   omax(l) = dmax (l = 0),  l + dmax - 1 (l > 0)
-//! (8x16x8, nghost 4: dmax = 1, a block above the root may not face a finer one; 16^3: dmax = 2),
-//! and by the 2:1 rule of all other neighbours, omax(l) <= l + 1 (amr_shear_face_limit = on).
-//! Targets are level + max(flag, 0).  A face block whose target is below what the opposite face
-//! needs is refined (or kept from derefining); if one level up is not enough, the refinement of
-//! the opposite blocks above omax of its target is cancelled instead.  Repeated until nothing
-//! changes (the current mesh is assumed valid, so cancelling always succeeds).  Not covered: the
-//! tree's 2:1 balance after the trigger can refine further face blocks, up to lmax - 1; omax(l) >=
-//! dmax for every l, so this is safe while lmax <= dmax + 1 (8x16x8: up to 3 levels, 16^3: up to
-//! 4); with more levels the exchange may stop with its own error.
-void ShearFaceLevelLimit(MeshBlockPack *pmbp, int &nref, int &nder) {
-  Mesh *pm = pmbp->pmesh;
-  if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) return;
-  if (!trig_.shear_face_limit) return;
-  const auto &ind = pm->mb_indcs;
-  int dmax = 0;
-  while (ind.ng*(1 << (dmax + 1)) <= ind.nx1 && ind.nx2 % (1 << (dmax + 1)) == 0 &&
-         ind.nx3 % (1 << (dmax + 1)) == 0) ++dmax;
-  auto omax = [dmax](int l) {return std::min((l == 0) ? dmax : l + dmax - 1, l + 1);};
-  const int lmax = pm->max_level - pm->root_level;
-  auto &refine_flag = pm->pmr->refine_flag;
-  auto &mbsz = pmbp->pmb->mb_size;
-  const int nmb = pmbp->nmb_thispack, mbs = pmbp->gids;
-  const Real z0 = pm->mesh_size.x3min, lz = pm->mesh_size.x3max - pm->mesh_size.x3min;
-  const Real x0 = pm->mesh_size.x1min, x1 = pm->mesh_size.x1max;
-  const int nzf = pm->mesh_indcs.nx3 << lmax;   // x3 cells of the finest level
-  const Real dzf = lz/nzf;
-  auto zrange = [&](const RegionSize &sz, int &k0, int &k1) {
-    k0 = std::max(0, static_cast<int>(std::floor((sz.x3min - z0)/dzf + 0.5)));
-    k1 = std::min(nzf, static_cast<int>(std::floor((sz.x3max - z0)/dzf + 0.5)));
-  };
-  auto face = [&](const RegionSize &sz) {
-    const Real tol = 1.0e-9*(x1 - x0);
-    return (std::fabs(sz.x1min - x0) < tol) ? 0 : ((std::fabs(sz.x1max - x1) < tol) ? 1 : -1);
-  };
-  // the receivers' x3 rows include nghost ghost rows at the receiver's level (the coarse array's,
-  // one level coarser, above the root): a block at level lev reads the opposite face over
-  // [k0 - e, k1 + e), e = nghost 2^(lmax - lev + 1) finest cells (2^(lmax) at the root), periodic in
-  // x3 or cut at the x3 boundaries as the exchange does (shearing_box_pull.cpp, "pieces")
-  const bool zper = (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic);
-  auto slots = [&](int k0, int k1, int lev, auto &&fn) {
-    const int e = ind.ng << (lmax - lev + ((lev > 0) ? 1 : 0));
-    for (int kk=k0 - e; kk<k1 + e; ++kk) {
-      int k = kk;
-      if (zper) {k = ((k % nzf) + nzf) % nzf;} else if (k < 0 || k >= nzf) {continue;}
-      fn(k);
-    }
-  };
-  const int big = 1 << 20;
-  // the density trigger's flags of this rank's blocks; refinements forbidden for this regrid
-  std::vector<int> orig(nmb), forbid(nmb, 0);
-  for (int m=0; m<nmb; ++m) orig[m] = refine_flag.h_view(m + mbs);
-  auto targets = [&](bool current) {   // [face][z]: largest target (or current) level on the face
-    std::vector<int> tmax(2*nzf, -1);
-    for (int m=0; m<nmb; ++m) {
-      const auto &sz = mbsz.h_view(m);
-      const int f = face(sz);
-      if (f < 0) continue;
-      const int t = pm->lloc_eachmb[m + mbs].level - pm->root_level +
-                    (current ? 0 : std::max(0, refine_flag.h_view(m + mbs)));
-      int k0, k1; zrange(sz, k0, k1);
-      for (int k=k0; k<k1; ++k) tmax[f*nzf + k] = std::max(tmax[f*nzf + k], t);
-    }
-#if MPI_PARALLEL_ENABLED
-    if (global_variable::nranks > 1) {
-      MPI_Allreduce(MPI_IN_PLACE, tmax.data(), 2*nzf, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    }
-#endif
-    return tmax;
-  };
-  auto any = [](int v) {
-#if MPI_PARALLEL_ENABLED
-    if (global_variable::nranks > 1) MPI_Allreduce(MPI_IN_PLACE, &v, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-#endif
-    return v;
-  };
-  // Each round: the trigger's flags without the forbidden refinements, then raise face blocks (or
-  // keep them from derefining) until nothing changes (monotone up); where one level up cannot
-  // satisfy the opposite face, forbid the opposite refinements that cause it (monotone: the set
-  // only grows) and start the round again.  A block whose current level already violates the limit
-  // (an invalid starting mesh, e.g. a restart file written without the limit) is
-  // repaired: raised one level per regrid even if that is not yet enough, and nothing is
-  // forbidden for it (forbidding there could block the repair for good).
-  const auto tcur = targets(true);
-  std::vector<char> repair(nmb, 0);   // the block's current level already violates the limit
-  for (int m=0; m<nmb; ++m) {
-    const auto &sz = mbsz.h_view(m);
-    const int f = face(sz);
-    if (f < 0) continue;
-    int k0, k1; zrange(sz, k0, k1);
-    const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
-    int ocur = -1;
-    slots(k0, k1, l, [&](int k) {ocur = std::max(ocur, tcur[(1 - f)*nzf + k]);});
-    repair[m] = (omax(l) < ocur) ? 1 : 0;
-  }
-  int rounds = 0;
-  for (bool again = true; again && rounds < 64; ++rounds) {
-    for (int m=0; m<nmb; ++m) refine_flag.h_view(m + mbs) = (forbid[m] && orig[m] > 0) ? 0 : orig[m];
-    for (int up = 1; up; ) {
-      const auto tmax = targets(false);
-      up = 0;
-      for (int m=0; m<nmb; ++m) {
-        const auto &sz = mbsz.h_view(m);
-        const int f = face(sz);
-        if (f < 0) continue;
-        int k0, k1; zrange(sz, k0, k1);
-        auto other_at = [&](int lev) {
-          int o = -1;
-          slots(k0, k1, lev, [&](int k) {o = std::max(o, tmax[(1 - f)*nzf + k]);});
-          return o;
-        };
-        const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
-        int &flag = refine_flag.h_view(m + mbs);
-        if (flag < 0 && omax(l - 1) < other_at(l - 1)) {flag = 0; up = 1;}
-        if (flag <= 0 && !forbid[m] && l < lmax && omax(l) < other_at(l) &&
-            (repair[m] || omax(l + 1) >= other_at(l + 1))) {flag = 1; up = 1;}
-      }
-      up = any(up);
-    }
-    const auto tmax = targets(false);
-    std::vector<int> cap(2*nzf, big);   // [face][z]: refinements above this target are forbidden
-    for (int m=0; m<nmb; ++m) {
-      const auto &sz = mbsz.h_view(m);
-      const int f = face(sz);
-      if (f < 0) continue;
-      int k0, k1; zrange(sz, k0, k1);
-      const int t = pm->lloc_eachmb[m + mbs].level - pm->root_level +
-                    std::max(0, refine_flag.h_view(m + mbs));
-      int o = -1;
-      slots(k0, k1, t, [&](int k) {o = std::max(o, tmax[(1 - f)*nzf + k]);});
-      if (omax(t) < o && !repair[m]) {
-        const int c = omax(t);
-        slots(k0, k1, t, [&](int k) {cap[(1 - f)*nzf + k] = std::min(cap[(1 - f)*nzf + k], c);});
-      }
-    }
-#if MPI_PARALLEL_ENABLED
-    if (global_variable::nranks > 1) {
-      MPI_Allreduce(MPI_IN_PLACE, cap.data(), 2*nzf, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    }
-#endif
-    int grow = 0;
-    for (int m=0; m<nmb; ++m) {
-      const auto &sz = mbsz.h_view(m);
-      const int f = face(sz);
-      if (f < 0 || forbid[m] || repair[m] || refine_flag.h_view(m + mbs) <= 0) continue;
-      int k0, k1; zrange(sz, k0, k1);
-      int c = big;
-      for (int k=k0; k<k1; ++k) c = std::min(c, cap[f*nzf + k]);
-      if (pm->lloc_eachmb[m + mbs].level - pm->root_level + 1 > c) {forbid[m] = 1; grow = 1;}
-    }
-    again = any(grow) != 0;
-  }
-  int nraise = 0, nkeep = 0, nveto = 0;
-  for (int m=0; m<nmb; ++m) {
-    const int f0 = orig[m], f1 = refine_flag.h_view(m + mbs);
-    if (f0 == f1) continue;
-    if (f0 > 0) {--nref; ++nveto;}
-    if (f0 < 0) {--nder; if (f1 == 0) ++nkeep;}
-    if (f1 > 0) {++nref; ++nraise;}
-    if (f1 < 0) ++nder;
-  }
-  int cnt[3] = {nraise, nkeep, nveto};
-#if MPI_PARALLEL_ENABLED
-  if (global_variable::nranks > 1) MPI_Allreduce(MPI_IN_PLACE, cnt, 3, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-#endif
-  if (cnt[0] + cnt[1] + cnt[2] > 0 && global_variable::my_rank == 0) {
-    std::cout << "# dust density trigger: shear-periodic x1 face levels (dmax " << dmax
-              << ", 2:1): " << cnt[0] << " blocks refined, " << cnt[1]
-              << " kept from derefining, " << cnt[2] << " refinements cancelled (" << rounds
-              << (rounds >= 64 ? " rounds, limit reached" : " rounds") << ")" << std::endl;
-  }
-}
 
 void DensityRefinement3D(MeshBlockPack *pmbp) {
   Mesh *pm = pmbp->pmesh;
@@ -670,7 +491,9 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     if (flag > 0) ++nref;
     if (flag < 0) ++nder;
   }
-  ShearFaceLevelLimit(pmbp, nref, nder);
+  // (the levels across the shear-periodic x1 faces: MeshRefinement::ShearFaceLevelLimit after all
+  // criteria)
+  (void) nref; (void) nder;
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
 }
@@ -681,7 +504,7 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
 
 //----------------------------------------------------------------------------------------
 //! \fn dust::DensityRefinement3DPoint
-//! \brief The dust-density request in 3-D (point particles, owner_overlap or a
+//! \brief The dust-density request in 3-D (point particles, instant_switch or a
 //! uniform root): the particle mass of every block on its own cells (NGP), the largest rho_d /
 //! mean of the block (mean over the whole mesh) against amr_rho_refine / amr_rho_derefine, times
 //! amr_rho_level_factor^level as in 2-D.  No buffer: the 2:1 rule and the shear-face columns of
@@ -765,10 +588,10 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   double dummy_t = 0.0; long long dummy_c = 0;   // profile timer
   ProfTimer prof_timer(pdust ? pdust->prof_time[DustGasDrag::kProfTrigger] : dummy_t,
                        pdust ? pdust->prof_count[DustGasDrag::kProfTrigger] : dummy_c);
-  // the old owner_overlap transfer has its own deposit (TSC on the owner blocks, the
+  // the old instant_switch transfer has its own deposit (TSC on the owner blocks, the
   // ghost parts added to the leaves they overlap); the block values below are the same
   const bool oo = (pdust != nullptr) &&
-                  pdust->smr_transfer_mode == DustSMRTransfer::owner_overlap;
+                  pdust->smr_transfer_mode == DustSMRTransfer::instant_switch;
   // 3-D refinable clouds have their own (exact leaf deposit, halo on several ranks)
   if (pdust != nullptr && pdust->Clouds3D()) {
     DensityRefinement3D(pmbp);
@@ -776,7 +599,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   }
   if (pdust == nullptr || !(pdust->UsesCompositeTransfer() || oo) || pm->three_d) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "amr_density_trigger needs 2-D refinable-cloud or owner_overlap dust" << std::endl;
+              << "amr_density_trigger needs 2-D refinable-cloud or instant_switch dust" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   // several ranks: the deposit below traverses the supports, so
@@ -1312,7 +1135,7 @@ int DustGasDrag::RouteToOwnerBlocks(const char *when) {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::RouteOO3D
-//! \brief 3-D owner_overlap after a regrid: every particle's new block from its old
+//! \brief 3-D instant_switch after a regrid: every particle's new block from its old
 //! block (PGID still holds the old id) and the octant of its position in the old block
 //! (RegridCosts), and the particles of blocks now on other ranks through the AthenaK particle
 //! exchange.  Returns how many particles were sent.
@@ -1454,8 +1277,8 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
 void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_lloc,
                               const int new_nmb, float *cost) {
   Mesh *pm = pmy_pack->pmesh;
-  // 3-D owner_overlap: the new block of every old block by the octant of a position
-  if (smr_transfer_mode == DustSMRTransfer::owner_overlap && pm->three_d) {
+  // 3-D instant_switch: the new block of every old block by the octant of a position
+  if (smr_transfer_mode == DustSMRTransfer::instant_switch && pm->three_d) {
     const int old_nmb = pm->nmb_total;
     oo_newgid = DvceArray2D<int>("dust_oo_newgid", std::max(1, old_nmb), 8);
     oo_oldctr = DvceArray2D<Real>("dust_oo_oldctr", std::max(1, old_nmb), 3);
@@ -1510,8 +1333,67 @@ void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_ll
     tot += c[n];
   }
   const double mean = tot/std::max(1, new_nmb);
+  lb_est_clouds.assign(c.begin(), c.end());
   if (mean <= 0.0) return;
   for (int n=0; n<new_nmb; ++n) cost[n] = static_cast<float>(1.0 + lb_cloud_weight*c[n]/mean);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::LogRegridBalance
+//! \brief <dust>/load_balance_log > 0: after the load balance of a regrid, per rank the new
+//! blocks, their summed cost and their estimated clouds (RegridCosts: counts of the old blocks,
+//! 3^d/2^d of the parent for a refined block); rank 0 prints one line.
+
+void DustGasDrag::LogRegridBalance(const int *new_rank, const float *cost, const int new_nmb) {
+  if (lb_log_interval <= 0 || global_variable::my_rank != 0) return;
+  const int nr = global_variable::nranks;
+  std::vector<double> nb(nr, 0.0), cs(nr, 0.0), ec(nr, 0.0);
+  const bool est = (static_cast<int>(lb_est_clouds.size()) == new_nmb);
+  for (int n=0; n<new_nmb; ++n) {
+    const int r = new_rank[n];
+    if (r < 0 || r >= nr) continue;
+    nb[r] += 1.0;
+    cs[r] += cost[n];
+    if (est) ec[r] += lb_est_clouds[n];
+  }
+  auto row = [&](const char *name, const std::vector<double> &v) {
+    double mx = 0.0, sum = 0.0;
+    for (const double x : v) {mx = std::max(mx, x); sum += x;}
+    std::cout << " | " << name;
+    for (const double x : v) std::cout << " " << x;
+    std::cout << " (max/mean " << ((sum > 0.0) ? mx*nr/sum : 0.0) << ")";
+  };
+  std::cout << "# LB regrid cycle " << pmy_pack->pmesh->ncycle << " time " << pmy_pack->pmesh->time;
+  row("blocks", nb);
+  row("cost", cs);
+  if (est) row("est_clouds", ec);
+  std::cout << std::endl;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::LogRankClouds
+//! \brief <dust>/load_balance_log = K: every K cycles the actual clouds and blocks of every rank
+//! (collective; rank 0 prints one line).
+
+void DustGasDrag::LogRankClouds() {
+  const int nr = global_variable::nranks;
+  long long mine[2] = {static_cast<long long>(pmy_pack->ppart->nprtcl_thispack),
+                       static_cast<long long>(pmy_pack->nmb_thispack)};
+  std::vector<long long> all(2*nr, 0);
+#if MPI_PARALLEL_ENABLED
+  MPI_Gather(mine, 2, MPI_LONG_LONG, all.data(), 2, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+#else
+  all[0] = mine[0]; all[1] = mine[1];
+#endif
+  if (global_variable::my_rank != 0) return;
+  double mx = 0.0, sum = 0.0;
+  for (int r=0; r<nr; ++r) {mx = std::max(mx, static_cast<double>(all[2*r])); sum += all[2*r];}
+  std::cout << "# LB cycle " << pmy_pack->pmesh->ncycle << " time " << pmy_pack->pmesh->time
+            << " | clouds";
+  for (int r=0; r<nr; ++r) std::cout << " " << all[2*r];
+  std::cout << " (max/mean " << ((sum > 0.0) ? mx*nr/sum : 0.0) << ") | blocks";
+  for (int r=0; r<nr; ++r) std::cout << " " << all[2*r + 1];
+  std::cout << std::endl;
 }
 
 //----------------------------------------------------------------------------------------
@@ -1523,11 +1405,11 @@ void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_ll
 
 void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   ++gravity_mass_epoch;   // a new mesh (the gravity field is rebuilt anyway)
-  const bool oo = (smr_transfer_mode == DustSMRTransfer::owner_overlap);
+  const bool oo = (smr_transfer_mode == DustSMRTransfer::instant_switch);
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud && !oo) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "dust on a dynamic mesh needs <dust>/amr_pic = refinable_cloud "
-              << "(or owner_overlap)" << std::endl;
+              << "(or instant_switch)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   Mesh *pmesh = pmy_pack->pmesh;
@@ -1554,7 +1436,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       Kokkos::Sum<double>(msum));
     }
   } else if (oo) {
-    // the old owner_overlap path: point particles, nothing to split or merge; the boxes,
+    // the old instant_switch path: point particles, nothing to split or merge; the boxes,
     // the block table, the deposit remaps and the block of every particle on the new mesh
     BuildOwnerOverlapMesh(true);
     ResetPGIDOwnerOverlap(nullptr);
@@ -1716,7 +1598,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::BuildOwnerOverlapMesh
-//! \brief The old owner_overlap transfer on a dynamic mesh, one rank.
+//! \brief The old instant_switch transfer on a dynamic mesh, one rank.
 //! For the current mesh (after the constructor and after every regrid): the block boxes in
 //! leaf_traversal (boxes only: nfld = nall = nmb; the density trigger reads them), the table of
 //! the block of every finest-level block cell (the block of a position), and, with remap, the
@@ -1730,7 +1612,7 @@ void DustGasDrag::BuildOwnerOverlapMesh(const bool remap) {
   auto &mbsize = pmy_pack->pmb->mb_size;
   if (global_variable::nranks != 1) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "owner_overlap on a dynamic mesh: one MPI rank only" << std::endl;
+              << "instant_switch on a dynamic mesh: one MPI rank only" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   auto &lt = leaf_traversal;
@@ -1770,7 +1652,7 @@ void DustGasDrag::BuildOwnerOverlapMesh(const bool remap) {
   for (int b=0; b<nby; ++b) for (int a=0; a<nbx; ++a) if (map(b,a) < 0) ++nbad;
   if (nbad > 0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "owner_overlap block table: " << nbad << " cells without exactly one block"
+              << "instant_switch block table: " << nbad << " cells without exactly one block"
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -1819,7 +1701,7 @@ int DustGasDrag::ResetPGIDOwnerOverlap(const char *when) {
   }
   if (nbad > 0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << nbad << " particles have no owning MeshBlock (owner_overlap)" << std::endl;
+              << nbad << " particles have no owning MeshBlock (instant_switch)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (when != nullptr && global_variable::my_rank == 0) {
@@ -1831,7 +1713,7 @@ int DustGasDrag::ResetPGIDOwnerOverlap(const char *when) {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::OwnerOverlapDeposit
-//! \brief The leaf fields of the old owner_overlap transfer.  Every particle deposits
+//! \brief The leaf fields of the old instant_switch transfer.  Every particle deposits
 //! with the coupling's stencil (PMWeights, <dust>/deposit) on its own block, ghost cells
 //! included; the ghost parts are then added to the leaf cells they overlap, by volume, with the
 //! remap of the coupling's deposit exchange (MeshBoundaryValuesDep::RemapLocalSMRDeposit).
@@ -1850,7 +1732,7 @@ void DustGasDrag::OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments,
   const int ncells1 = indcs.nx1 + 2*indcs.ng, ncells2 = indcs.nx2 + 2*indcs.ng;
   if (!pbval_dm->LocalSMRRemap()) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "owner_overlap leaf deposit needs the static/dynamic SMR remap" << std::endl;
+              << "instant_switch leaf deposit needs the static/dynamic SMR remap" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (a.extent_int(0) != nmb || a.extent_int(1) != nvar || a.extent_int(3) != ncells2 ||
@@ -1902,7 +1784,7 @@ void DustGasDrag::OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments,
   }
   if (nbad > 0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "owner_overlap leaf deposit: " << nbad << " particles outside their block's "
+              << "instant_switch leaf deposit: " << nbad << " particles outside their block's "
               << "stencil" << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -1917,7 +1799,7 @@ void DustGasDrag::OwnerOverlapDeposit(DvceArray5D<Real> &a, const bool moments,
   }, Kokkos::Sum<double>(mleaf));
   if (!(std::fabs(mleaf - mpart) <= 1.0e-9*mpart)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "owner_overlap leaf deposit: dust mass on the leaves " << mleaf
+              << "instant_switch leaf deposit: dust mass on the leaves " << mleaf
               << " != particle mass " << mpart << std::endl;
     std::exit(EXIT_FAILURE);
   }

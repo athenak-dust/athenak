@@ -46,9 +46,9 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
 #endif
   if (!pp->pmesh->multilevel) return;
   const dust::AmrPic pic = dust::ResolveAmrPic(pin, true);
-  // a 3-D mesh with refinement and owner_overlap uses the general
+  // a 3-D mesh with refinement and instant_switch uses the general
   // remap (DepRemapPlan, bvals_dep_general.cpp), which the dust module sets up; it checks the rest
-  if (pp->pmesh->three_d && pic == dust::AmrPic::owner_overlap) return;
+  if (pp->pmesh->three_d && pic == dust::AmrPic::instant_switch) return;
   // refinable clouds deposit into the leaves directly (2-D and 3-D), and several ranks
   // are supported only for them (through the dust halo): this exchange is not used then
   const bool rc = (pic == dust::AmrPic::refinable_cloud);
@@ -67,13 +67,13 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
   if (rc) {
     // The composite dust kernels deposit directly into active leaf cells.
     local_smr_direct_ = true;
-  } else if (pic == dust::AmrPic::owner_overlap) {
+  } else if (pic == dust::AmrPic::instant_switch) {
     local_smr_remap_ = true;
     BuildLocalSMRMap();
   } else {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "dust on a refined mesh needs <dust>/amr_pic = refinable_cloud "
-              << "or owner_overlap" << std::endl;
+              << "or instant_switch" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 }

@@ -62,8 +62,14 @@ void DustGasDrag::DepositGravityDensity(Real time, DvceArray5D<Real> &owned) {
   auto pi=particles->prtcl_idata;
   const int npart=particles->nprtcl_thispack, gids=pmy_pack->gids;
   int bad=0;
-  Kokkos::parallel_reduce("gravity_dust_deposit",
-      Kokkos::RangePolicy<DevExeSpace>(0,npart),KOKKOS_LAMBDA(int p,int &invalid) {
+  // the launch bound and the cell order of the drag kernels (CloudPolicy, cloud_ord): the same
+  // clouds, each once; only the order of the atomic sums changes
+  const int nord=CloudOrderLength(npart), nq=(nord>npart) ? nord : npart;
+  auto ord=cloud_ord;
+  Kokkos::parallel_reduce(nord>0 ? "gravity_dust_deposit" : "gravity_dust_deposit_storage",
+      CloudPolicy(0,nq),KOKKOS_LAMBDA(int q,int &invalid) {
+    const int p=(q<nord) ? ord(q) : q;
+    if (p>=npart) return;   // (cloud_order_keep) an index slot past the end
     const Real mass=pr(IPM,p);
     if (!(mass>=0) || !Kokkos::isfinite(mass)) {++invalid;return;}
     if (mass==0) return;  // existing outflow tombstones carry no gravity mass
@@ -76,6 +82,8 @@ void DustGasDrag::DepositGravityDensity(Real time, DvceArray5D<Real> &owned) {
       [&](int target,Real weight) {
         int b,k,j,i;lt.Decode(target,b,k,j,i);
         const Real volume=lt.box(b,3)*lt.box(b,4)*lt.box(b,5);
+        // plain atomic add: the warp aggregation (DepositAddWarp) made this one-component
+        // deposit about 23% slower on two of four GH200 ranks
         DepositAdd(&field(b,0,k,j,i),mass*weight/volume);
         sum+=weight;
       });
@@ -126,8 +134,13 @@ void DustGasDrag::GatherGravityAcceleration(Real time,
   auto pr=particles->prtcl_rdata;
   auto pi=particles->prtcl_idata;
   int bad=0;
-  Kokkos::parallel_reduce("gravity_dust_gather",
-      Kokkos::RangePolicy<DevExeSpace>(0,npart),KOKKOS_LAMBDA(int p,int &invalid) {
+  // as the deposit: launch bound and cell order (each cloud writes only its own result)
+  const int nord=CloudOrderLength(npart), nq=(nord>npart) ? nord : npart;
+  auto ord=cloud_ord;
+  Kokkos::parallel_reduce(nord>0 ? "gravity_dust_gather" : "gravity_dust_gather_storage",
+      CloudPolicy(0,nq),KOKKOS_LAMBDA(int q,int &invalid) {
+    const int p=(q<nord) ? ord(q) : q;
+    if (p>=npart) return;   // (cloud_order_keep) an index slot past the end
     for (int d=0;d<3;++d) result(d,p)=0;
     const Real mass=pr(IPM,p);
     if (!(mass>=0) || !Kokkos::isfinite(mass)) {++invalid;return;}
@@ -136,15 +149,16 @@ void DustGasDrag::GatherGravityAcceleration(Real time,
         !Kokkos::isfinite(pr(IPZ,p))) {++invalid;return;}
     const int anchor=pi(PGID,p)-gids;
     if (anchor<0 || anchor>=nmb) {++invalid;return;}
-    Real sum=0;
+    Real sum=0, acc[3]={0,0,0};   // (in registers: the same sums in the same order)
     lt.ForEachCloudWeight(pr(IPX,p),pr(IPY,p),pr(IPZ,p),pi(PLEV,p),anchor,
       [&](int target,Real weight) {
         int b,k,j,i;lt.Decode(target,b,k,j,i);
-        for (int d=0;d<3;++d) result(d,p)+=weight*field(b,d,k,j,i);
+        for (int d=0;d<3;++d) acc[d]+=weight*field(b,d,k,j,i);
         sum+=weight;
       });
+    for (int d=0;d<3;++d) result(d,p)=acc[d];
     if (!Kokkos::isfinite(sum) || fabs(sum-1)>Real(1.e-9)) ++invalid;
-    for (int d=0;d<3;++d) if (!Kokkos::isfinite(result(d,p))) ++invalid;
+    for (int d=0;d<3;++d) if (!Kokkos::isfinite(acc[d])) ++invalid;
   },bad);
   CheckParticles(bad);
   if (record) {
@@ -205,8 +219,12 @@ long long DustGasDrag::RegatherGravityAccelerationChanged(Real time,
   auto pr=particles->prtcl_rdata;
   auto pi=particles->prtcl_idata;
   int bad=0, changed=0;
-  Kokkos::parallel_reduce("gravity_dust_regather",
-      Kokkos::RangePolicy<DevExeSpace>(0,npart),KOKKOS_LAMBDA(int p,int &invalid,int &count) {
+  const int nord=CloudOrderLength(npart), nq=(nord>npart) ? nord : npart;
+  auto ord=cloud_ord;
+  Kokkos::parallel_reduce(nord>0 ? "gravity_dust_regather" : "gravity_dust_regather_storage",
+      CloudPolicy(0,nq),KOKKOS_LAMBDA(int q,int &invalid,int &count) {
+    const int p=(q<nord) ? ord(q) : q;
+    if (p>=npart) return;   // (cloud_order_keep) an index slot past the end
     if (p<nold && rs(0,p)==pr(IPX,p) && rs(1,p)==pr(IPY,p) && rs(2,p)==pr(IPZ,p) &&
         rs(3,p)==pr(IPM,p) && is(0,p)==pi(PLEV,p) && is(1,p)==pi(PGID,p)) {
       if (copy) for (int d=0;d<3;++d) result(d,p)=old(d,p);
@@ -222,15 +240,16 @@ long long DustGasDrag::RegatherGravityAccelerationChanged(Real time,
         !Kokkos::isfinite(pr(IPZ,p))) {++invalid;return;}
     const int anchor=pi(PGID,p)-gids;
     if (anchor<0 || anchor>=nmb) {++invalid;return;}
-    Real sum=0;
+    Real sum=0, acc[3]={0,0,0};   // (in registers: the same sums in the same order)
     lt.ForEachCloudWeight(pr(IPX,p),pr(IPY,p),pr(IPZ,p),pi(PLEV,p),anchor,
       [&](int target,Real weight) {
         int b,k,j,i;lt.Decode(target,b,k,j,i);
-        for (int d=0;d<3;++d) result(d,p)+=weight*field(b,d,k,j,i);
+        for (int d=0;d<3;++d) acc[d]+=weight*field(b,d,k,j,i);
         sum+=weight;
       });
+    for (int d=0;d<3;++d) result(d,p)=acc[d];
     if (!Kokkos::isfinite(sum) || fabs(sum-1)>Real(1.e-9)) ++invalid;
-    for (int d=0;d<3;++d) if (!Kokkos::isfinite(result(d,p))) ++invalid;
+    for (int d=0;d<3;++d) if (!Kokkos::isfinite(acc[d])) ++invalid;
   },bad,changed);
   CheckParticles(bad);
   particle_acceleration=result;

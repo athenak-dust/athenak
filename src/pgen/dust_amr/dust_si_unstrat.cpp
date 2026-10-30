@@ -13,7 +13,7 @@
 //! The particles: <problem>/cloud_root_random = true places root parents over the whole box
 //! (<problem>/root_placement = random by default, or lattice | generic) that split exactly to
 //! the leaves of a refined mesh as refinable clouds (on a uniform mesh, or with
-//! <dust>/amr_pic = owner_overlap, the same parents as point particles); otherwise point
+//! <dust>/amr_pic = instant_switch, the same parents as point particles); otherwise point
 //! particles with <problem>/particle_placement = random (default) or lattice.  <problem>/ba_*
 //! adds the 2-D diagnostic outputs of dust_snapshots.cpp.  Works in the 2D r-z shearing box
 //! (azimuthal components in IM3/IPVZ) and in 3D (azimuthal in IM2/IPVY, shear-periodic x1).

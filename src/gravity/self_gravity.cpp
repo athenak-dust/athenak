@@ -149,7 +149,7 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     if (!coupled_dust_ && (source_dust_ || kick_dust_))
       Fail("<gravity>/source or kick includes dust, but the run has no dust module");
     if (coupled_dust_ && (source_dust_ || kick_dust_) && !pack->pdust->GravityTransferSupported())
-      Fail("dust gravity requires supported 3D refinable clouds, uniform TSC, or owner_overlap TSC");
+      Fail("dust gravity requires supported 3D refinable clouds, uniform TSC, or instant_switch TSC");
     if (coupled_dust_ && (source_dust_ || kick_dust_) &&
         pin->GetOrAddString("gravity","dust_x3_assignment","fold")!="fold")
       Fail("dust gravity/dust_x3_assignment supports fold only; drag deposit policy is independent");

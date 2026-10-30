@@ -162,13 +162,13 @@ struct GravityPointTransfer {
 bool DustGasDrag::PointGravityTransferSupported() const {
   const auto *pm=pmy_pack->pmesh;
   return pm->three_d && !clouds3d && deposit==DustDeposit::tsc &&
-      (smr_transfer_mode==DustSMRTransfer::owner_overlap ||
+      (smr_transfer_mode==DustSMRTransfer::instant_switch ||
        (smr_transfer_mode==DustSMRTransfer::none && !pm->multilevel));
 }
 
 void DustGasDrag::PreparePointGravity(Real time) {
   if (!PointGravityTransferSupported() || !std::isfinite(time))
-    PointFail("requires 3D uniform canonical TSC or owner_overlap TSC and finite field time");
+    PointFail("requires 3D uniform canonical TSC or instant_switch TSC and finite field time");
   auto *pm=pmy_pack->pmesh;
   if (!gravity_points_) gravity_points_=std::make_shared<GravityPointTransfer>();
   auto &state=*gravity_points_;
@@ -240,10 +240,10 @@ void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out,
                                             const bool mass_only,const int species) {
   auto *pm=pmy_pack->pmesh;
   if (!pm->three_d || clouds3d || !std::isfinite(time) ||
-      !(smr_transfer_mode==DustSMRTransfer::owner_overlap ||
+      !(smr_transfer_mode==DustSMRTransfer::instant_switch ||
         (smr_transfer_mode==DustSMRTransfer::none && !pm->multilevel)))
     PointFail("science fields of point particles need a 3-D mesh with point particles "
-              "(uniform, or amr_pic = owner_overlap)");
+              "(uniform, or amr_pic = instant_switch)");
   if (!science_points_) science_points_=std::make_shared<GravityPointTransfer>();
   auto &state=*science_points_;
   const int seq=pm->GetAMRLoadBalanceUpdateSeq();

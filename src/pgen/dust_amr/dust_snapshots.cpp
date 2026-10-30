@@ -584,15 +584,15 @@ void WriteBAFields(Mesh *pm) {
   int n1 = pm->mesh_indcs.nx1, n2 = pm->mesh_indcs.nx2;
   Real gx1 = pm->mesh_size.x1min, gx2 = pm->mesh_size.x2min;
   Real h1 = (pm->mesh_size.x1max - gx1)/n1, h2 = (pm->mesh_size.x2max - gx2)/n2;
-  // the old owner_overlap transfer on a multilevel mesh: its own leaf deposit (TSC on the
+  // the old instant_switch transfer on a multilevel mesh: its own leaf deposit (TSC on the
   // owner blocks, the ghost parts added to the leaves they overlap); one pass, the central
   // moments from the raw ones (a ghost cell feeds leaves with different means)
-  const bool oo = pdust->smr_transfer_mode == DustSMRTransfer::owner_overlap && pm->multilevel;
+  const bool oo = pdust->smr_transfer_mode == DustSMRTransfer::instant_switch && pm->multilevel;
   DualArray2D<int> tgt("ba_tsc_target", (composite || oo) ? 1 : n2, (composite || oo) ? 1 : n1);
   if (!composite && !oo) {
     if (pm->multilevel || pdust->deposit != DustDeposit::tsc) {
       std::cerr << "BA fields: canonical deposit requires TSC on a uniform mesh (static SMR with "
-                << "owner_overlap: no leaf deposit to write; with coupling = pc2 the run does not "
+                << "instant_switch: no leaf deposit to write; with coupling = pc2 the run does not "
                 << "deposit a density either; use the pbin output and an offline estimator)"
                 << std::endl;
       std::exit(EXIT_FAILURE);

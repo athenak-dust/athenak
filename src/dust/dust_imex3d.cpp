@@ -38,6 +38,7 @@ void DustGasDrag::CloudDepositImplicit3D(Driver *pdrive, int stage) {
   UpdateShear3D(pmy_pack->pmesh->time);
   const auto lt = leaf_traversal3d;
   auto qp = qdep;  // cleared, including halo slots, by DepositDrag
+  const std::size_t sq = qp.stride(1);
   auto body = KOKKOS_LAMBDA(const int p) {
     const Real mass_c = pr(IPM,p)*a_dt/(pr(IPTS,p) + a_dt);
     const Real vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
@@ -47,17 +48,15 @@ void DustGasDrag::CloudDepositImplicit3D(Driver *pdrive, int stage) {
       int b, k, j, i;
       lt.Decode(target, b, k, j, i);
       const Real dw = mass_c*w/(lt.box(b,3)*lt.box(b,4)*lt.box(b,5));
-      DepositAdd(&qp(b,0,k,j,i), dw);
-      DepositAdd(&qp(b,1,k,j,i), dw*vx);
-      DepositAdd(&qp(b,2,k,j,i), dw*vy);
-      DepositAdd(&qp(b,3,k,j,i), dw*vz);
+      Real v[4] = {dw, dw*vx, dw*vy, dw*vz};
+      DepositAddWarp(&qp(b,0,k,j,i), sq, target, v);
     });
   };
   // Migration can change the number of particles between the two working stages.
-  if (cloud_ord_n > 0 && cloud_ord_n <= npart) {
-    CloudParForOrdered("dust_imex_cloud3d_deposit", npart, cloud_ord, cloud_ord_n, body);
+  if (const int nord = CloudOrderLength(npart)) {
+    CloudParForOrdered("dust_imex_cloud3d_deposit", npart, cloud_ord, nord, body);
   } else {
-    CloudParFor("dust_imex_cloud3d_deposit", npart, body);
+    CloudParFor("dust_imex_cloud3d_deposit_storage", npart, body);   // (label: the storage order)
   }
   HaloReverseAdd(qdep, 0, 4);
 }
@@ -79,6 +78,7 @@ void DustGasDrag::CloudGatherImplicit3D(Driver *pdrive, int stage) {
   PackGatherField3D(ustar);
   auto gp = gpack3;
   auto dm = dmom;  // cleared, including halo slots, by GatherKickPMBR
+  const std::size_t sd = dm.stride(1);
   auto body = KOKKOS_LAMBDA(const int p) {
     using T = SMRCompositeTransfer;
     constexpr int cache = 27;
@@ -122,9 +122,8 @@ void DustGasDrag::CloudGatherImplicit3D(Driver *pdrive, int stage) {
       const Real dw = mass*w/(lt.box(b,3)*lt.box(b,4)*lt.box(b,5));
       // Deposit the actual applied particle impulse. This remains conservative with
       // a linear gather and across refinement even though that gather differs from W.
-      DepositAdd(&dm(b,0,k,j,i), dw*dvx);
-      DepositAdd(&dm(b,1,k,j,i), dw*dvy);
-      DepositAdd(&dm(b,2,k,j,i), dw*dvz);
+      Real v[3] = {dw*dvx, dw*dvy, dw*dvz};
+      DepositAddWarp(&dm(b,0,k,j,i), sd, target, v);
     };
     if (same && nt <= cache) {
       for (int q=0; q<nt; ++q) if (tw[q] != 0.0) add(tt[q], tw[q]);
@@ -132,10 +131,10 @@ void DustGasDrag::CloudGatherImplicit3D(Driver *pdrive, int stage) {
       lt.ForEachCloudWeight(xp, yp, zp, lev, am, add);
     }
   };
-  if (cloud_ord_n > 0 && cloud_ord_n <= npart) {
-    CloudParForOrdered("dust_imex_cloud3d_gather", npart, cloud_ord, cloud_ord_n, body);
+  if (const int nord = CloudOrderLength(npart)) {
+    CloudParForOrdered("dust_imex_cloud3d_gather", npart, cloud_ord, nord, body);
   } else {
-    CloudParFor("dust_imex_cloud3d_gather", npart, body);
+    CloudParFor("dust_imex_cloud3d_gather_storage", npart, body);   // (label: the storage order)
   }
   if (br) HaloReverseAdd(dmom, 0, 3);
 }
@@ -202,7 +201,12 @@ void DustGasDrag::CloudImplicitConsistency3D(Driver *pdrive, int stage) {
     // the drag rate of this stage (consumed by the next working stage) includes the correction
     pr(IPRX,p) += cj*rv[0]/a_dt; pr(IPRY,p) += cj*rv[1]/a_dt; pr(IPRZ,p) += cj*rv[2]/a_dt;
   };
-  CloudParFor("dust_imex_consistent_dust", npart, body);
+  // in cell order as the two kernels above (each cloud writes only its own velocity)
+  if (const int nord = CloudOrderLength(npart)) {
+    CloudParForOrdered("dust_imex_consistent_dust", npart, cloud_ord, nord, body);
+  } else {
+    CloudParFor("dust_imex_consistent_dust_storage", npart, body);   // (label: the storage order)
+  }
 }
 
 }  // namespace dust

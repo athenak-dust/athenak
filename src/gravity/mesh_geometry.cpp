@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cmath>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -1204,6 +1205,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   // in row order, which balances the much more expensive interface rows.
   const int workers = static_cast<int>(std::max<GlobalIndex>(1,std::min<GlobalIndex>(
       SetupThreads(),(end-begin)/4096)));
+  std::size_t interface_fallbacks = 0, x_image_fallbacks = 0;  // parallel path only
   if (workers == 1) {
     // Serial: write straight into the output (identical to the original loop).
     Part part;
@@ -1231,11 +1233,18 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
     std::vector<QuadraticCache> quadratics(workers);
     std::vector<ReconstructionFaces> faces(workers);
     std::vector<std::exception_ptr> errors(workers);
+    std::vector<std::vector<GlobalIndex>> interface_ids(workers), x_image_ids(workers);
     std::atomic<int> next{0};
     auto run = [&](int w) {
       try {
         for (int c = next++; c < chunks; c = next++)
           assemble(begin+rows*c/chunks,begin+rows*(c+1)/chunks,parts[c],quadratics[w],faces[w]);
+        // Keep only the ids of fallback fits and release this worker's caches here.
+        for (const auto &q : quadratics[w]) {
+          if (q.second.interface_fallback) interface_ids[w].push_back(q.first);
+          if (q.second.x_image_fallback) x_image_ids[w].push_back(q.first);
+        }
+        quadratics[w] = QuadraticCache{}; faces[w] = ReconstructionFaces{};
       } catch (...) { errors[w] = std::current_exception(); next = chunks; }
     };
     std::vector<std::thread> threads;
@@ -1249,37 +1258,94 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
     run(0);
     for (auto &thread : threads) thread.join();
     for (const auto &error : errors) if (error) std::rethrow_exception(error);
-    // Concatenate in row order: no floating-point arithmetic, the serial entry order.
-    auto join = [](LocalCsr &destination, LocalCsr &source) {
-      const int offset = static_cast<int>(destination.values.size());
-      if (destination.values.size()+source.values.size() >
-          static_cast<size_t>(std::numeric_limits<int>::max()))
-        throw std::overflow_error("Gravity local CSR exceeds 32-bit offsets");
-      for (size_t i = 1; i < source.rowptr.size(); ++i)
-        destination.rowptr.push_back(offset+source.rowptr[i]);
-      destination.colidx.insert(destination.colidx.end(),source.colidx.begin(),source.colidx.end());
-      destination.values.insert(destination.values.end(),source.values.begin(),source.values.end());
-      source = LocalCsr{};
+    // Concatenation in row order without floating-point arithmetic, as a serial join:
+    // exact-size outputs (each vector resized by one task), then every part is copied
+    // into its slot and released by a worker. The serial join of all parts and the merge
+    // of the fit caches took ~0.8 s of a ~1 s fine setup with 2M rows on GH200.
+    auto component = [](auto &system, int k) -> LocalCsr & {
+      if (k == 0) return system.matrix;
+      if (k == 1) return system.boundary_rhs;
+      if (k < 5) return system.acceleration[k-2];
+      return system.boundary_acceleration[k-5];
     };
-    for (auto &part : parts) {
-      join(out.matrix,part.matrix);
-      if (forces) join(out.boundary_rhs,part.boundary_rhs);
-      for (int d = 0; forces && d < 3; ++d) {
-        join(out.acceleration[d],part.acceleration[d]);
-        join(out.boundary_acceleration[d],part.boundary_acceleration[d]);
+    const int components = forces ? 8 : 1;
+    std::vector<size_t> row_offset(chunks+1,0);
+    std::vector<std::vector<size_t>> entry_offset(components,std::vector<size_t>(chunks+1,0));
+    for (int c = 0; c < chunks; ++c) {
+      auto &part = parts[c];
+      row_offset[c+1] = row_offset[c]+part.matrix.LocalRows();
+      for (int k = 0; k < components; ++k) {
+        if (component(part,k).LocalRows() != part.matrix.LocalRows())
+          throw std::logic_error("Gravity setup part components disagree on rows");
+        entry_offset[k][c+1] = entry_offset[k][c]+component(part,k).values.size();
       }
-      out.volume.insert(out.volume.end(),part.volume.begin(),part.volume.end());
-      out.cells.insert(out.cells.end(),part.cells.begin(),part.cells.end());
-      out.interface.insert(out.interface.end(),part.interface.begin(),part.interface.end());
       if (discover_phase_rows)
         m.phase_rows.insert(m.phase_rows.end(),part.phase_rows.begin(),part.phase_rows.end());
+    }
+    for (int k = 0; k < components; ++k)
+      if (entry_offset[k][chunks] > static_cast<size_t>(std::numeric_limits<int>::max()))
+        throw std::overflow_error("Gravity local CSR exceeds 32-bit offsets");
+    const size_t total = row_offset[chunks];
+    auto parallel = [&](int tasks, const std::function<void(int)> &task) {
+      const int count = std::max(1,std::min(workers,tasks));
+      std::vector<std::exception_ptr> failures(count);
+      std::atomic<int> claim{0};
+      auto work = [&](int w) {
+        try { for (int t = claim++; t < tasks; t = claim++) task(t); }
+        catch (...) { failures[w] = std::current_exception(); claim = tasks; }
+      };
+      std::vector<std::thread> pool;
+      pool.reserve(count-1);
+      try {
+        for (int w = 1; w < count; ++w) pool.emplace_back(work,w);
+      } catch (...) { for (auto &thread : pool) thread.join(); throw; }
+      work(0);
+      for (auto &thread : pool) thread.join();
+      for (const auto &failure : failures) if (failure) std::rethrow_exception(failure);
+    };
+    parallel(3*components+(forces ? 3 : 0),[&](int t) {
+      if (t < 3*components) {
+        auto &a = component(out,t/3);
+        if (t%3 == 0) a.rowptr.resize(total+1);
+        else if (t%3 == 1) a.colidx.resize(entry_offset[t/3][chunks]);
+        else a.values.resize(entry_offset[t/3][chunks]);
+      } else if (t == 3*components) {
+        out.volume.resize(total);
+      } else if (t == 3*components+1) {
+        out.cells.resize(total);
+      } else {
+        out.interface.resize(total);
+      }
+    });
+    parallel(chunks,[&](int c) {
+      auto &part = parts[c];
+      for (int k = 0; k < components; ++k) {
+        auto &source = component(part,k);
+        auto &destination = component(out,k);
+        const int offset = static_cast<int>(entry_offset[k][c]);
+        for (size_t i = 1; i < source.rowptr.size(); ++i)
+          destination.rowptr[row_offset[c]+i] = offset+source.rowptr[i];
+        std::copy(source.colidx.begin(),source.colidx.end(),
+                  destination.colidx.begin()+entry_offset[k][c]);
+        std::copy(source.values.begin(),source.values.end(),
+                  destination.values.begin()+entry_offset[k][c]);
+      }
+      if (forces) {
+        std::copy(part.volume.begin(),part.volume.end(),out.volume.begin()+row_offset[c]);
+        std::copy(part.cells.begin(),part.cells.end(),out.cells.begin()+row_offset[c]);
+        std::copy(part.interface.begin(),part.interface.end(),
+                  out.interface.begin()+row_offset[c]);
+      }
       part = Part{};
-    }
+    });
     // The fallback diagnostics count unique fits, as the shared serial cache does.
-    for (auto &cache : quadratics) {
-      for (auto &q : cache) m.quadratics.emplace(q.first,std::move(q.second));
-      cache.clear();
-    }
+    auto unique = [](std::vector<std::vector<GlobalIndex>> &ids) {
+      std::vector<GlobalIndex> all;
+      for (auto &list : ids) all.insert(all.end(),list.begin(),list.end());
+      std::sort(all.begin(),all.end());
+      return static_cast<std::size_t>(std::unique(all.begin(),all.end())-all.begin());
+    };
+    interface_fallbacks = unique(interface_ids); x_image_fallbacks = unique(x_image_ids);
   }
   m.phase_rows_ready = true;
   for (int p : m.row_order) if (forces && m.patches[p].owner == m.rank) {
@@ -1297,6 +1363,8 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   }
   // Gradient maps are assembly scratch, and must not survive alongside device CSR.
   m.gradients.clear(); m.gradients.rehash(0);
+  out.quadratic_interface_fallbacks = interface_fallbacks;
+  out.quadratic_x_image_fallbacks = x_image_fallbacks;
   for (const auto &q : m.quadratics) {
     out.quadratic_interface_fallbacks += q.second.interface_fallback;
     out.quadratic_x_image_fallbacks += q.second.x_image_fallback;

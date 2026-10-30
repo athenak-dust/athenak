@@ -1986,14 +1986,20 @@ int DustGasDrag::MergeCloudsDevice() {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::SortParticles
-//! \brief Timing diagnostic: reorders the
-//! particle arrays by (block, cell of the block, old position): the cells of a block row by row,
-//! stable inside a
-//! cell; cloud_sort_order = random (test) takes a random permutation instead.  Every nrdata / nidata column moves; the arrays are swapped with spare arrays
-//! of the same extent (kept for the next call).  Runs at the start of a cycle (RefineClouds),
-//! where no send list is pending.  The resampling and the merge pass take their candidates in
-//! array order, so their results change with the order (statistically the same).  One line per
-//! call in cloud_sort_log.txt (fenced stage times).
+//! \brief Reorders the particle arrays by (block, cell of the block, old position): the cells
+//! of a block row by row (2-D: (j, i); 3-D clouds: (k, j, i)), stable inside a cell;
+//! cloud_sort_order = random (test) takes a random permutation instead.  Every nrdata / nidata
+//! column moves (tags with their particles); the arrays are swapped with spare arrays of the
+//! same extent (kept for the next call).  Runs at the start of a cycle (RefineClouds), after
+//! the split, R, G and their migration, where no send list is pending.  State kept per particle
+//! slot across this point: the cell-order index (set to the identity here: a rebuild would give
+//! the same), and with self-gravity the particle accelerations of the last gather with their
+//! per-slot snapshot (x, y, z, m, PLEV, PGID; dust_gravity.cpp), which the opening solve
+//! compares slot by slot and regathers where they differ: a moved particle is regathered, to
+//! the same value (the field and the gather inputs are unchanged).  Conservation does not
+//! depend on the order.  The resampling and the merge pass take their candidates in array
+//! order, so their results change with the order (statistically the same; not bitwise equal
+//! to an unsorted run), as do the round-off of the deposits.
 
 void DustGasDrag::SortParticles() {
   particles::Particles *ppar = pmy_pack->ppart;
@@ -2005,11 +2011,14 @@ void DustGasDrag::SortParticles() {
   auto pi = ppar->prtcl_idata;
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
   const int nx1 = pmy_pack->pmesh->mb_indcs.nx1, nx2 = pmy_pack->pmesh->mb_indcs.nx2;
+  // 3-D keys (block, k, j, i) as the cell-order index (UpdateCloudOrder); in 2-D nx3 = 1, k = 0
+  const int nx3 = clouds3d ? pmy_pack->pmesh->mb_indcs.nx3 : 1;
+  const bool z3 = clouds3d;
   const int gids = pmy_pack->gids, nmb = pmy_pack->nmb_thispack;
   auto &mbsize = pmy_pack->pmb->mb_size;
   const bool randomize = cloud_sort_random;
   const int cyc = pmy_pack->pmesh->ncycle;
-  const std::int64_t ncell = static_cast<std::int64_t>(nx1)*nx2, np = npart;
+  const std::int64_t ncell = static_cast<std::int64_t>(nx1)*nx2*nx3, np = npart;
   KeyScratch &s = Scratch();
   auto key = Grow(s.skey, npart, "sort_key");
   Kokkos::parallel_for("sort_keys", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -2020,7 +2029,12 @@ void DustGasDrag::SortParticles() {
     int j = static_cast<int>(Kokkos::floor((pr(IPY,p) - mbsize.d_view(m).x2min)/mbsize.d_view(m).dx2));
     i = (i < 0) ? 0 : ((i >= nx1) ? nx1 - 1 : i);
     j = (j < 0) ? 0 : ((j >= nx2) ? nx2 - 1 : j);
-    const std::int64_t cell = static_cast<std::int64_t>(j)*nx1 + i;
+    int k = 0;
+    if (z3) {
+      k = static_cast<int>(Kokkos::floor((pr(IPZ,p) - mbsize.d_view(m).x3min)/mbsize.d_view(m).dx3));
+      k = (k < 0) ? 0 : ((k >= nx3) ? nx3 - 1 : k);
+    }
+    const std::int64_t cell = (static_cast<std::int64_t>(k)*nx2 + j)*nx1 + i;
     if (randomize) {   // (diagnostic) a random permutation instead (splitmix64 of p, cycle)
       std::uint64_t z = static_cast<std::uint64_t>(p) + 0x9E3779B97F4A7C15ull*(static_cast<std::uint64_t>(cyc) + 1);
       z = (z ^ (z >> 30))*0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27))*0x94D049BB133111EBull; z ^= z >> 31;
@@ -2059,8 +2073,31 @@ void DustGasDrag::SortParticles() {
   ppar->prtcl_idata = ni;
   sort_spare_r = pr;
   sort_spare_i = pi;
+  ++cloud_sort_count;
+  // the cell-order index: after a sort in cell order it is the identity (what a rebuild would
+  // give, the same keys); after a random permutation it is rebuilt (UpdateCloudOrder)
+  if (cloud_order_interval > 0) {
+    if (randomize) {
+      cloud_ord_n = 0;
+    } else {
+      if (cloud_ord.extent_int(0) < npart) {
+        cloud_ord = DvceArray1D<int>();
+        cloud_ord_tag = DvceArray1D<std::uint64_t>();
+        cloud_ord = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "cloud_ord"),
+                                     npart + npart/4);
+        cloud_ord_tag = DvceArray1D<std::uint64_t>(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                                   "cloud_ord_tag"), npart + npart/4);
+      }
+      auto ord = cloud_ord; auto tg = cloud_ord_tag;
+      Kokkos::parallel_for("cloud_order_identity", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int k) {ord(k) = k; tg(k) = GetTag(ni,k);});
+      cloud_ord_n = npart;
+      cloud_sort_cycle = cyc;
+    }
+  }
   Kokkos::fence();
   const double t_move = t.seconds();
+  (void) t_key; (void) t_sort; (void) t_move; (void) moved;
 }
 
 //----------------------------------------------------------------------------------------
@@ -2078,6 +2115,8 @@ void DustGasDrag::UpdateCloudOrder() {
   const int npart = ppar->nprtcl_thispack;
   auto pr = ppar->prtcl_rdata;
   auto pi = ppar->prtcl_idata;
+  // the sort of this cycle (cell order) left the identity index: nothing to rebuild
+  if (cloud_sort_cycle == pmy_pack->pmesh->ncycle && cloud_ord_n == npart) return;
   bool rebuild = (pmy_pack->pmesh->ncycle % cloud_order_interval == 0) || cloud_ord_n == 0 ||
                  cloud_ord_n > npart;
   if (!rebuild) {

@@ -350,6 +350,20 @@ void MeshBlockTree::CreateZOrderedLLList(LogicalLocation *list, int *pglist, int
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn void MeshBlockTree::GetLeafLocations(std::vector<LogicalLocation> &list)
+//! \brief Appends the logical locations of the leaves under this node in Z order (gids untouched).
+
+void MeshBlockTree::GetLeafLocations(std::vector<LogicalLocation> &list) {
+  if (pleaf_ == nullptr) {
+    list.push_back(lloc_);
+    return;
+  }
+  for (int n=0; n<nleaf_; n++) {
+    if (pleaf_[n] != nullptr) {pleaf_[n]->GetLeafLocations(list);}
+  }
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn MeshBlockTree* MeshBlockTree::FindNeighbor(LogicalLocation myloc,
 //!                                   int ox1, int ox2, int ox3, bool amrflag)
 //! \brief find a neighboring block, called from the root of the tree

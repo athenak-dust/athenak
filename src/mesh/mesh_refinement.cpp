@@ -17,6 +17,7 @@
 #include <cmath>     // abs
 #include <algorithm> // sort
 #include <utility>   // pair
+#include <limits>
 #include <vector>
 
 #include "athena.hpp"
@@ -42,6 +43,142 @@
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
 #endif
+
+namespace {
+//----------------------------------------------------------------------------------------
+//! \struct ShearFaceGeom
+//! \brief Geometry of the rule on the levels across the shear-periodic x1 faces (AMR with a
+//! shearing box: at most one level, for every refinement criterion).  The
+//! tree's 2:1 balance treats these faces as plain periodic ones (the neighbour at the same x2),
+//! but the neighbours slide along x2 with the shear.  A face block at level l receives its x1
+//! ghosts at level l and, above the root level, those of its coarse array at l - 1, from every
+//! opposite block that overlaps the rows it reads (shearing_box_pull.cpp): its own x2 rows and
+//! nghost + 3 remap rows on each side at the receiver's level, shifted by the shear offset, and
+//! its x3 rows with nghost ghost rows (periodic in x3 or cut at the x3 boundaries).  An opposite
+//! block finer by d needs nghost*2^d <= nx1 (and nx2, nx3 divisible by 2^d); with dmax the
+//! largest such d, every opposite block a block reads may be at most
+//!   omax(l) = min(dmax (l = 0) or l + dmax - 1 (l > 0), l + 1)
+//! (16^3 blocks: dmax = 2, so omax(l) = l + 1; 8x16x8 with nghost 4: dmax = 1).  The rule holds
+//! for the blocks read from now until a given time (MeshRefinement::ShearWindow): the x2 rows
+//! are widened on both sides by the drift of the offset until then and by one more row for the
+//! fractional shift, and MeshRefinement::ShearFaceCheckDue checks the mesh again before a step
+//! could pass that time.  Queries test the actual face blocks for overlap (extents in cells of
+//! the finest level, as doubles), so time and memory scale with the face blocks, not with the
+//! finest level.  Without a shearing-box object (no offset known) or a window, all x2 are taken.
+//! Levels l are relative to the root level.
+
+struct ShearFaceGeom {
+  bool on = false, three_d = false, zper = false, allx2 = false;
+  int dmax = 0, lmax = 0, ng = 0, nx2 = 1, nx3 = 1, root = 0, nrx1 = 1;
+  double nyf = 1.0, nzf = 1.0;   // x2 and x3 cells of the finest level
+  double ys = 0.0, dr = 0.0;     // shear offset and its drift over the window (finest cells)
+  // twin: the time from now until which the rule must hold (not positive: all x2)
+  ShearFaceGeom(Mesh *pm, double twin) {
+    on = pm->adaptive && pm->multi_d &&
+         pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
+    if (!on) return;
+    three_d = pm->three_d;
+    const auto &ind = pm->mb_indcs;
+    ng = ind.ng;
+    while (ind.ng*(1 << (dmax + 1)) <= ind.nx1 && ind.nx2 % (1 << (dmax + 1)) == 0 &&
+           (!three_d || ind.nx3 % (1 << (dmax + 1)) == 0)) ++dmax;
+    root = pm->root_level;
+    lmax = pm->max_level - pm->root_level;
+    nrx1 = pm->nmb_rootx1;
+    nx2 = ind.nx2;
+    nx3 = three_d ? ind.nx3 : 1;
+    nyf = std::ldexp(static_cast<double>(pm->nmb_rootx2)*nx2, lmax);
+    nzf = three_d ? std::ldexp(static_cast<double>(pm->nmb_rootx3)*nx3, lmax) : 1.0;
+    zper = three_d && pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic;
+    const ShearingBox *sb = nullptr;
+    MeshBlockPack *pp = pm->pmb_pack;
+    if (pp != nullptr && pp->phydro != nullptr && pp->phydro->psbox_u != nullptr) {
+      sb = pp->phydro->psbox_u;
+    } else if (pp != nullptr && pp->pmhd != nullptr && pp->pmhd->psbox_u != nullptr) {
+      sb = pp->pmhd->psbox_u;
+    }
+    if (sb == nullptr || !(twin > 0.0)) {allx2 = true; return;}
+    const double lx = pm->mesh_size.x1max - pm->mesh_size.x1min;
+    const double dyf = (pm->mesh_size.x2max - pm->mesh_size.x2min)/nyf;
+    const double v = sb->qshear*sb->omega0*lx;   // (ShearingBox::InitRecv: yshear = v t)
+    ys = std::fmod(v*pm->time/dyf, nyf);
+    dr = std::abs(v)*twin/dyf;
+    if (!std::isfinite(ys) || !std::isfinite(dr) || dr >= nyf) allx2 = true;
+  }
+  int omax(int l) const {
+    if (dmax == 0) return l;   // blocks too small for any level jump: equal levels only
+    return std::min((l == 0) ? dmax : l + dmax - 1, l + 1);
+  }
+  int level(const LogicalLocation &ll) const {return ll.level - root;}
+  // is the block on face f (0: inner x1, 1: outer x1)?
+  bool onface(const LogicalLocation &ll, int f) const {
+    const std::int64_t nxl = static_cast<std::int64_t>(nrx1) << level(ll);
+    return (f == 0) ? (ll.lx1 == 0) : (ll.lx1 == nxl - 1);
+  }
+  // the extent of a block in cells of the finest level
+  void Extent(const LogicalLocation &ll, double &y0, double &y1, double &z0, double &z1) const {
+    const double c = std::ldexp(1.0, lmax - level(ll));
+    y0 = static_cast<double>(ll.lx2)*nx2*c;
+    y1 = y0 + nx2*c;
+    z0 = three_d ? static_cast<double>(ll.lx3)*nx3*c : 0.0;
+    z1 = three_d ? z0 + nx3*c : 1.0;
+  }
+  // do [a0, a1) and [b0, b1) overlap, b inside [0, p) and its periodic images (p > 0)?
+  static bool Overlap(double a0, double a1, double b0, double b1, double p) {
+    if (!(p > 0.0)) return b0 < a1 && b1 > a0;
+    if (a1 - a0 >= p) return true;
+    const double s = std::floor(a0/p)*p;
+    a0 -= s;
+    a1 -= s;
+    return (b0 < a1 && b1 > a0) || (b0 + p < a1 && b1 + p > a0);
+  }
+  // the indices of the given blocks on face 0 and on face 1
+  void Faces(const LogicalLocation *bl, int n, std::vector<int> (&fl)[2]) const {
+    fl[0].clear();
+    fl[1].clear();
+    for (int j=0; j<n; ++j) {
+      for (int f=0; f<2; ++f) {
+        if (onface(bl[j], f)) fl[f].push_back(j);
+      }
+    }
+  }
+  // fn(j) for every block j of the opposite face (indices opp into bl) that a block on face f,
+  // receiving at level lev (its x1 ghosts; above the root also its coarse array's at lev - 1),
+  // reads until the end of the window
+  template <typename F>
+  void ForRead(const LogicalLocation *bl, const std::vector<int> &opp, const LogicalLocation &ll,
+               int f, int lev, F &&fn) const {
+    const int lr = (lev > 0) ? lev - 1 : 0;
+    double y0, y1, z0, z1;
+    Extent(ll, y0, y1, z0, z1);
+    if (!allx2) {
+      const double ey = (ng + 4.0)*std::ldexp(1.0, lmax - lr);
+      const double sh = (f == 0) ? ys : -ys;
+      y0 += -ey - sh - dr;
+      y1 += ey - sh + dr;
+    }
+    if (three_d) {
+      const double ez = ng*std::ldexp(1.0, lmax - lr);
+      z0 -= ez;
+      z1 += ez;
+    }
+    for (const int j : opp) {
+      double b0, b1, c0, c1;
+      Extent(bl[j], b0, b1, c0, c1);
+      if (!allx2 && !Overlap(y0, y1, b0, b1, nyf)) continue;
+      if (three_d && !Overlap(z0, z1, c0, c1, zper ? nzf : 0.0)) continue;
+      fn(j);
+    }
+  }
+  // the largest value val[j] over the opposite blocks a block on face f, receiving at lev, reads
+  int Opposite(const std::vector<int> &val, const LogicalLocation *bl, const std::vector<int> &opp,
+               const LogicalLocation &ll, int f, int lev) const {
+    int o = -1;
+    ForRead(bl, opp, ll, f, lev, [&](int j) {o = std::max(o, val[j]);});
+    return o;
+  }
+};
+}  // namespace
 
 //----------------------------------------------------------------------------------------
 // MeshRefinement constructor:
@@ -73,6 +210,10 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
     }
     prolong_amp_eps = pin->GetOrAddReal("mesh_refinement", "prolong_amplitude_eps", 0.0);
     coarse_physical_bcs = pin->GetOrAddBoolean("mesh_refinement", "coarse_physical_bcs", true);
+    // test control only (not written to restart files when absent)
+    if (pin->DoesParameterExist("mesh_refinement", "test_shear_face_check")) {
+      test_shear_face_check = pin->GetBoolean("mesh_refinement", "test_shear_face_check");
+    }
     if (prolong_amp_eps > 0.0) {
       if (pm->adaptive || prolong_prims) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -158,6 +299,18 @@ MeshRefinement::~MeshRefinement() {
 void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin) {
   // first check refinement criteria
   CheckForRefinement(pmy_mesh->pmb_pack);
+  // test control <mesh_refinement>/test_shear_face_check: the shear-face rule of the mesh in
+  // effect for the next step, every cycle (the next step ends before time + 2 dt)
+  struct TestShearCheck {
+    MeshRefinement *mr;
+    ~TestShearCheck() {
+      // (not when the run stops at max_nmb_per_rank: the dropped regrid may be the one the rule
+      // needed, and the final outputs and restart file must still be written)
+      if (mr->test_shear_face_check && !mr->pmy_mesh->stop_max_nmb) {
+        mr->CheckShearFaceLevels(2.0*mr->pmy_mesh->dt);
+      }
+    }
+  } test_shear_check_{this};
 
   // then update mesh tree if MeshBlock anywhere (on any rank) is flagged for refinement
   // indicated by the refine_flag[m] value being true (1) for any m.
@@ -174,6 +327,7 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
                          pd ? pd->prof_count[pd->kProfRegridMesh] : dummy_c);
       RedistAndRefineMeshBlocks(pin, nnew, ndel);
       if (pmy_mesh->stop_max_nmb) return;   // (dropped: the run stops, see there)
+      CheckShearFaceLevels();
 
       // Mark one mesh-topology update event (AMR and any resulting load balancing).
       pmy_mesh->MarkMeshUpdated();
@@ -247,8 +401,43 @@ void MeshRefinement::CheckForRefinement(MeshBlockPack* pmbp) {
   for (int m=0; m<(pmy_mesh->nmb_total); ++m) {
     ncyc_since_ref(m) += 1;
   }
-  if ((pmy_mesh->ncycle)%(ncyc_check_amr) != 0) {return;}  // not cycle to check
+  // a mesh check, or between the checks a check of the shear-face rule alone when the next step
+  // could pass the time until which the rule holds (ShearFaceCheckDue): no criterion, all flags
+  // 0, so that check can only refine face blocks (time steps may grow faster than the window)
+  const bool regular = ((pmy_mesh->ncycle)%(ncyc_check_amr) == 0);
+  if (!regular && !ShearFaceCheckDue()) {return;}  // not cycle to check
+  // the window: from a mesh check until the next one (ShearWindow); between the checks only the
+  // next step, so such a check refines only what that step needs.  Both depend only on the time
+  // step of the restart file, so a restarted run decides as the run that went on (a restart
+  // checks between the mesh checks until its first one: it does not know the earlier window)
+  shear_twin = regular ? ShearWindow() : 2.0*pmy_mesh->dt;
+  if (regular) {
+    CheckCriteria(pmbp);
+  } else if (global_variable::my_rank == 0) {
+    std::cout << "# AMR shear-periodic x1 faces: check between the mesh checks at cycle "
+              << pmy_mesh->ncycle << ", time " << pmy_mesh->time << std::endl;
+  }
+  // the levels across the shear-periodic x1 faces (AMR + shearing box), for every criterion
+  ShearFaceLevelLimit(pmbp);
 
+#if MPI_PARALLEL_ENABLED
+  // Pass (host) refine_flag between all ranks
+    MPI_Allgatherv(MPI_IN_PLACE, pmy_mesh->nmb_eachrank[global_variable::my_rank],
+                   MPI_INT, refine_flag.h_view.data(), pmy_mesh->nmb_eachrank,
+                   pmy_mesh->gids_eachrank, MPI_INT, MPI_COMM_WORLD);
+#endif
+  // sync host array with device
+  refine_flag.template modify<HostMemSpace>();
+  refine_flag.template sync<DevExeSpace>();
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void MeshRefinement::CheckCriteria(MeshBlockPack* pmbp)
+//! \brief The refinement criteria of a mesh check and the filters at the maximum / root level
+//! and of the refinement interval (the flags of this rank's blocks; CheckForRefinement).
+
+void MeshRefinement::CheckCriteria(MeshBlockPack* pmbp) {
   // calculate derived refinement variables
   if (pmrc->nderived > 0) {
     pmrc->SetRefinementData(pmbp, false, true);
@@ -294,17 +483,285 @@ void MeshRefinement::CheckForRefinement(MeshBlockPack* pmbp) {
   for (int m=0; m<nmb; ++m) {
     if (ncyc_since_ref(m+mbs) < refinement_interval) {refine_flag.h_view(m+mbs) = 0;}
   }
+}
 
+//----------------------------------------------------------------------------------------
+//! \fn void MeshRefinement::ShearFaceLevelLimit(MeshBlockPack* pmbp)
+//! \brief The flags of this rank's blocks after all refinement criteria, for the rule of
+//! ShearFaceGeom (it acted only in the 3-D dust-cloud trigger before, for clouds only).  Targets are level + max(flag, 0).  A face block whose target is below what the
+//! opposite face needs is refined (or kept from derefining); if one level up is not enough, the
+//! refinement of the opposite blocks above omax of its target is cancelled instead.  Repeated
+//! until nothing changes.  The tree's 2:1 balance may still refine further face blocks; those
+//! cases are handled on the tree (ShearFaceTreeRefine, ShearFaceDerefineOK).
+
+void MeshRefinement::ShearFaceLevelLimit(MeshBlockPack* pmbp) {
+  Mesh *pm = pmy_mesh;
+  const double twin = shear_twin;
+  const ShearFaceGeom g(pm, twin);
+  if (!g.on) return;
+  const int nmb = pmbp->nmb_thispack;
+  const int mbs = pm->gids_eachrank[global_variable::my_rank];
+  const int nb = pm->nmb_total;
+  const LogicalLocation *bl = pm->lloc_eachmb;
+  std::vector<int> fl[2];
+  g.Faces(bl, nb, fl);
+  const int big = 1 << 20;
+  static bool told = false;
+  if (!told && global_variable::my_rank == 0) {
+    std::cout << "# AMR shear-periodic x1 faces: at most " << (g.dmax > 0 ? 1 : 0) << " level(s) "
+              << "between a face block and the opposite blocks it reads until it is checked again ("
+              << (g.allx2 ? "all x2" : "offset window") << ")" << std::endl;
+    told = true;
+  }
+  auto any = [](int v) {
 #if MPI_PARALLEL_ENABLED
-  // Pass (host) refine_flag between all ranks
-    MPI_Allgatherv(MPI_IN_PLACE, pmy_mesh->nmb_eachrank[global_variable::my_rank],
-                   MPI_INT, refine_flag.h_view.data(), pmy_mesh->nmb_eachrank,
-                   pmy_mesh->gids_eachrank, MPI_INT, MPI_COMM_WORLD);
+    if (global_variable::nranks > 1) {
+      MPI_Allreduce(MPI_IN_PLACE, &v, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    }
 #endif
-  // sync host array with device
-  refine_flag.template modify<HostMemSpace>();
-  refine_flag.template sync<DevExeSpace>();
-  return;
+    return v;
+  };
+  // [block]: the target (or current) level of every face block, over all ranks
+  auto targets = [&](bool current) {
+    std::vector<int> t(nb, -1);
+    for (int m=0; m<nmb; ++m) {
+      const auto &ll = bl[m + mbs];
+      if (!g.onface(ll, 0) && !g.onface(ll, 1)) continue;
+      t[m + mbs] = g.level(ll) + (current ? 0 : std::max(0, refine_flag.h_view(m + mbs)));
+    }
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      MPI_Allreduce(MPI_IN_PLACE, t.data(), nb, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    }
+#endif
+    return t;
+  };
+  // the flags of all criteria; refinements forbidden for this regrid
+  std::vector<int> orig(nmb), forbid(nmb, 0);
+  for (int m=0; m<nmb; ++m) orig[m] = refine_flag.h_view(m + mbs);
+  // a block whose current level already violates the rule (e.g. a restart file written without
+  // it) is repaired: raised one level per regrid even if that is not yet enough, and nothing is
+  // forbidden for it (forbidding there could block the repair for good)
+  const auto tcur = targets(true);
+  std::vector<char> repair(nmb, 0);
+  for (int m=0; m<nmb; ++m) {
+    const auto &ll = bl[m + mbs];
+    const int l = g.level(ll);
+    for (int f=0; f<2; ++f) {
+      if (g.onface(ll, f) && g.omax(l) < g.Opposite(tcur, bl, fl[1 - f], ll, f, l)) repair[m] = 1;
+    }
+  }
+  // each round: the flags without the forbidden refinements, then raise face blocks (or keep them
+  // from derefining) until nothing changes (monotone up); where one level up cannot satisfy the
+  // opposite face, forbid the opposite refinements that cause it (the set only grows) and start
+  // the round again
+  int rounds = 0;
+  for (bool again = true; again && rounds < 64; ++rounds) {
+    for (int m=0; m<nmb; ++m) {
+      refine_flag.h_view(m + mbs) = (forbid[m] && orig[m] > 0) ? 0 : orig[m];
+    }
+    for (int up = 1; up; ) {
+      const auto tmax = targets(false);
+      up = 0;
+      for (int m=0; m<nmb; ++m) {
+        const auto &ll = bl[m + mbs];
+        const int l = g.level(ll);
+        int &flag = refine_flag.h_view(m + mbs);
+        for (int f=0; f<2; ++f) {
+          if (!g.onface(ll, f)) continue;
+          const auto &opp = fl[1 - f];
+          if (flag < 0 && g.omax(l - 1) < g.Opposite(tmax, bl, opp, ll, f, l - 1)) {
+            flag = 0;
+            up = 1;
+          }
+          if (flag <= 0 && !forbid[m] && l < g.lmax &&
+              g.omax(l) < g.Opposite(tmax, bl, opp, ll, f, l) &&
+              (repair[m] || g.omax(l + 1) >= g.Opposite(tmax, bl, opp, ll, f, l + 1))) {
+            flag = 1;
+            up = 1;
+          }
+        }
+      }
+      up = any(up);
+    }
+    const auto tmax = targets(false);
+    std::vector<int> cap(nb, big);   // [block]: refinements above this target are forbidden
+    for (int m=0; m<nmb; ++m) {
+      const auto &ll = bl[m + mbs];
+      if (repair[m]) continue;
+      const int t = g.level(ll) + std::max(0, refine_flag.h_view(m + mbs));
+      for (int f=0; f<2; ++f) {
+        if (!g.onface(ll, f)) continue;
+        if (g.omax(t) < g.Opposite(tmax, bl, fl[1 - f], ll, f, t)) {
+          const int c = g.omax(t);
+          g.ForRead(bl, fl[1 - f], ll, f, t, [&](int j) {cap[j] = std::min(cap[j], c);});
+        }
+      }
+    }
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      MPI_Allreduce(MPI_IN_PLACE, cap.data(), nb, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    }
+#endif
+    int grow = 0;
+    for (int m=0; m<nmb; ++m) {
+      if (forbid[m] || repair[m] || refine_flag.h_view(m + mbs) <= 0) continue;
+      if (g.level(bl[m + mbs]) + 1 > cap[m + mbs]) {forbid[m] = 1; grow = 1;}
+    }
+    again = any(grow) != 0;
+  }
+  int cnt[3] = {0, 0, 0};   // raised, kept from derefining, refinements cancelled
+  for (int m=0; m<nmb; ++m) {
+    const int f0 = orig[m], f1 = refine_flag.h_view(m + mbs);
+    if (f0 == f1) continue;
+    if (f0 > 0) ++cnt[2];
+    if (f0 < 0 && f1 == 0) ++cnt[1];
+    if (f1 > 0) ++cnt[0];
+  }
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, cnt, 3, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
+  if (cnt[0] + cnt[1] + cnt[2] > 0 && global_variable::my_rank == 0) {
+    std::cout << "# AMR shear-periodic x1 faces (dmax " << g.dmax << ", 2:1): " << cnt[0]
+              << " blocks refined, " << cnt[1] << " kept from derefining, " << cnt[2]
+              << " refinements cancelled (" << rounds
+              << (rounds >= 64 ? " rounds, limit reached" : " rounds") << ")" << std::endl;
+  }
+  // the mesh after this regrid satisfies the rule until time + twin (CheckShearFaceLevels stops
+  // the run otherwise); ShearFaceCheckDue checks again before a step could pass it
+  shear_checked_until = g.allx2 ? std::numeric_limits<double>::max() : pm->time + twin;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn double MeshRefinement::ShearWindow()
+//! \brief The time from a mesh check until which the shear-face rule is made to hold: twice the
+//! time step for every cycle up to the next mesh check, plus one cycle (the time step only, which
+//! restart files keep).  0 (all x2) before the first time step.  Steps may grow faster than that
+//! (they may double from one step to the next); ShearFaceCheckDue then checks the mesh earlier.
+
+double MeshRefinement::ShearWindow() const {
+  const double dtw = pmy_mesh->dt;
+  if (!(dtw > 0.0) || !std::isfinite(dtw)) return 0.0;
+  return 2.0*(std::max(ncyc_check_amr, 1) + 1)*dtw;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn bool MeshRefinement::ShearFaceCheckDue()
+//! \brief Between the mesh checks: could the next step pass the time until which the shear-face
+//! rule holds?  The next step ends before time + 2 dt (a step at most doubles).  Every rank
+//! decides the same (time and dt are global).
+
+bool MeshRefinement::ShearFaceCheckDue() const {
+  const Mesh *pm = pmy_mesh;
+  if (!pm->adaptive || !pm->multi_d ||
+      pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) {
+    return false;
+  }
+  return !(pm->time + 2.0*pm->dt < shear_checked_until);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn int MeshRefinement::ShearFaceTreeRefine(int &nnew)
+//! \brief After the refinement of the tree (Step 1 of UpdateMeshBlockTree), with its 2:1
+//! balance: refine every face leaf whose opposite face is finer than ShearFaceGeom allows, until
+//! none is left (levels only grow and stay below the maximum, so this ends).  Every rank holds
+//! the whole tree and does the same, so no communication.  Returns the number of leaves refined.
+
+int MeshRefinement::ShearFaceTreeRefine(int &nnew) {
+  const ShearFaceGeom g(pmy_mesh, shear_twin);
+  if (!g.on) return 0;
+  int nraise = 0;
+  for (int pass=0; pass<4*(g.lmax + 2); ++pass) {
+    std::vector<LogicalLocation> leaves;
+    pmy_mesh->ptree->GetLeafLocations(leaves);
+    const int n = static_cast<int>(leaves.size());
+    std::vector<int> fl[2];
+    g.Faces(leaves.data(), n, fl);
+    std::vector<int> lev(n);
+    for (int j=0; j<n; ++j) lev[j] = g.level(leaves[j]);
+    std::vector<LogicalLocation> up;
+    for (int j=0; j<n; ++j) {
+      const auto &ll = leaves[j];
+      if (lev[j] >= g.lmax) continue;
+      for (int f=0; f<2; ++f) {
+        if (g.onface(ll, f) &&
+            g.omax(lev[j]) < g.Opposite(lev, leaves.data(), fl[1 - f], ll, f, lev[j])) {
+          up.push_back(ll);
+          break;
+        }
+      }
+    }
+    if (up.empty()) return nraise;
+    for (const auto &ll : up) {
+      MeshBlockTree *bt = pmy_mesh->ptree->FindMeshBlock(ll);
+      if (bt != nullptr && bt->GetLevel() == ll.level) {
+        bt->Refine(nnew);
+        ++nraise;
+      }
+    }
+  }
+  return nraise;   // (CheckShearFaceLevels stops the run if the rule still fails)
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn bool MeshRefinement::ShearFaceDerefineOK(const LogicalLocation &parent)
+//! \brief May the children of this node be merged (Step 2 of UpdateMeshBlockTree)?  Not if the
+//! merged block would be on a shear-periodic x1 face and the opposite face is finer than
+//! ShearFaceGeom allows for its level (the current tree).
+
+bool MeshRefinement::ShearFaceDerefineOK(const LogicalLocation &parent) {
+  const ShearFaceGeom g(pmy_mesh, shear_twin);
+  if (!g.on) return true;
+  const int lp = g.level(parent);
+  if (!g.onface(parent, 0) && !g.onface(parent, 1)) return true;
+  std::vector<LogicalLocation> leaves;
+  pmy_mesh->ptree->GetLeafLocations(leaves);
+  const int n = static_cast<int>(leaves.size());
+  std::vector<int> fl[2];
+  g.Faces(leaves.data(), n, fl);
+  std::vector<int> lev(n);
+  for (int j=0; j<n; ++j) lev[j] = g.level(leaves[j]);
+  for (int f=0; f<2; ++f) {
+    if (g.onface(parent, f) &&
+        g.omax(lp) < g.Opposite(lev, leaves.data(), fl[1 - f], parent, f, lp)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void MeshRefinement::CheckShearFaceLevels()
+//! \brief The rule of ShearFaceGeom on the current mesh (every rank has every block) for the
+//! window twin (negative: the window of this cycle's check); stops the run with the first violating block instead of
+//! a later failure of the shearing-box exchange.
+
+void MeshRefinement::CheckShearFaceLevels(const double twin) {
+  const ShearFaceGeom g(pmy_mesh, (twin < 0.0) ? shear_twin : twin);
+  if (!g.on) return;
+  const LogicalLocation *bl = pmy_mesh->lloc_eachmb;
+  const int nb = pmy_mesh->nmb_total;
+  std::vector<int> fl[2];
+  g.Faces(bl, nb, fl);
+  std::vector<int> lev(nb);
+  for (int j=0; j<nb; ++j) lev[j] = g.level(bl[j]);
+  for (int f=0; f<2; ++f) {
+    for (const int j : fl[f]) {
+      const auto &ll = bl[j];
+      const int l = lev[j];
+      const int o = g.Opposite(lev, bl, fl[1 - f], ll, f, l);
+      if (g.omax(l) < o) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "AMR with a shearing box: block (level " << l << ", lx1 " << ll.lx1
+                  << ", lx2 " << ll.lx2 << ", lx3 " << ll.lx3 << ") on x1 face " << f
+                  << " faces level " << o << " on the opposite face (at most " << g.omax(l)
+                  << " allowed)" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+    }
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -442,11 +899,20 @@ void MeshRefinement::UpdateMeshBlockTree(int &nnew, int &ndel) {
   if (tnref != 0) {
     delete [] llref;
   }
+  // Step 1b. the shear-periodic x1 faces after the tree's 2:1 balance (same on every rank)
+  const int nface_raise = ShearFaceTreeRefine(nnew);
 
-  // Step 2. perform derefinement
+  // Step 2. perform derefinement (not where a merged face block would break the shear-face rule)
+  int nface_keep = 0;
   for (int n=0; n<ctnd; n++) {
+    if (!ShearFaceDerefineOK(cllderef[n])) {++nface_keep; continue;}
     MeshBlockTree *bt = pmy_mesh->ptree->FindMeshBlock(cllderef[n]);
     bt->Derefine(ndel);
+  }
+  if ((nface_raise > 0 || nface_keep > 0) && global_variable::my_rank == 0) {
+    std::cout << "# AMR shear-periodic x1 faces on the tree: " << nface_raise
+              << " blocks refined after the 2:1 balance, " << nface_keep
+              << " derefinements skipped" << std::endl;
   }
   if (tnderef >= nleaf) {
     delete [] cllderef;
@@ -525,6 +991,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   }
   pm->LoadBalance(new_cost_eachmb, new_rank_eachmb, new_gids_eachrank, new_nmb_eachrank,
                   new_nmb_total);
+  if (pm->pmb_pack->pdust != nullptr) {   // (<dust>/load_balance_log)
+    pm->pmb_pack->pdust->LogRegridBalance(new_rank_eachmb, new_cost_eachmb, new_nmb);
+  }
   // more MeshBlocks on some rank than max_nmb_per_rank (the
   // arrays are allocated for that many): instead of exiting at once, every rank (the counts are
   // the same everywhere) drops this regrid, keeps the old mesh and its data (nothing of the Mesh

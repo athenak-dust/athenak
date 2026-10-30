@@ -77,12 +77,12 @@ enum class HybridMode {pc2=0, split_be=1};
 enum class HybridForceMode {automatic=0, pc2=1, split_be=2};
 
 // Experimental transfer choices on the narrowly supported static-SMR path. The
-// owner_overlap choice is retained only as a negative control. refinable_cloud gives
+// instant_switch choice is retained only as a negative control. refinable_cloud gives
 // every particle its own hat cloud: weights are exact integrals of
 // the cloud over active leaf cells, and clouds change size only by the exact B-spline
 // two-scale split (see DustGasDrag::SplitCloudsP1).
 // (the value 2 belonged to a transfer that has been removed)
-enum class DustSMRTransfer {none=0, owner_overlap=1, refinable_cloud=3};
+enum class DustSMRTransfer {none=0, instant_switch=1, refinable_cloud=3};
 
 // <dust>/refinable_mode: preset parameter sets of the refinable clouds.
 //   standard (input value "default"): the moving P1 split, G (quantum merge under the pass budget
@@ -1156,6 +1156,42 @@ void DepositAdd(Real *destination, const Real value) {
   }
 }
 
+// N components of one leaf cell, dst[c*stride] += v[c].  On a CUDA device the lanes of a warp
+// that add to the same cell (key) in the same step first sum their values in registers, a
+// tree over the peers (__match_any_sync, __shfl_sync); the lowest of them adds the sums.  In
+// the cell order of the cloud kernels (cloud_ord) neighbouring lanes often share a cell, and
+// atomic adds to one address serialize.  Only the order of the sums changes, as between any
+// two runs with atomics; elsewhere (host backends, CUDA devices before compute capability 7.0)
+// the plain DepositAdd in the old order.
+template <int N>
+KOKKOS_FORCEINLINE_FUNCTION
+void DepositAddWarp(Real *dst, const std::size_t stride, const int key, Real (&v)[N]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)   // __match_any_sync: compute capability 7.0+
+  const unsigned act = __activemask();
+  const unsigned peers = __match_any_sync(act, key);
+  unsigned lane;
+  asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+  const unsigned below = peers & ((1u << lane) - 1u);
+  unsigned rest = peers & ~below & ~(1u << lane);   // the peers above this lane
+  unsigned rel = __popc(below);                     // its rank among its peers
+  // round r: each lane adds the partial sum of the next remaining peer above it; then the
+  // lanes whose rank has bit r set leave (their sums are in a lower lane's)
+  while (__any_sync(act, rest != 0u)) {
+    const int src = (__ffs(rest) - 1) & 31;
+#pragma unroll
+    for (int c=0; c<N; ++c) {
+      const Real t = __shfl_sync(act, v[c], src);
+      if (rest != 0u) v[c] += t;
+    }
+    rest &= ~__ballot_sync(act, rel & 1u);
+    rel >>= 1;
+  }
+  if (below != 0u) return;
+#endif
+#pragma unroll
+  for (int c=0; c<N; ++c) DepositAdd(dst + c*stride, v[c]);
+}
+
 // Tried and not adopted: splitting each of the two production cloud kernels into a gather
 // kernel and a deposit kernel that forms the leaf weights again (fewer registers per kernel)
 // was about 10% slower on a GB200 GPU; keeping the 25-entry leaf-weight cache in team scratch
@@ -1187,12 +1223,18 @@ void CloudParFor(const std::string &name, const int n, const Function &f) {
 }
 
 // cloud_order_interval: the same kernels over the particles in the order of an
-// index (ord(k) for k < nidx, k itself for the particles appended since the index was built)
+// index (ord(k) for k < nidx, k itself for the particles appended since the index was built).
+// The index is a permutation of 0..nidx-1; with nidx > n (cloud_order_keep: the migration of
+// the stage left fewer particles than the index holds) its slots past the end are skipped, so
+// every particle 0..n-1 still runs once
 template <typename Function>
 void CloudParForOrdered(const std::string &name, const int n,
                         const DvceArray1D<int> &ord, const int nidx, const Function &f) {
-  auto g = KOKKOS_LAMBDA(const int k) {f((k < nidx) ? ord(k) : k);};
-  CloudParFor(name, n, g);
+  auto g = KOKKOS_LAMBDA(const int k) {
+    const int p = (k < nidx) ? ord(k) : k;
+    if (p < n) f(p);
+  };
+  CloudParFor(name, (nidx > n) ? nidx : n, g);
 }
 
 // Shared NGP/CIC/TSC stencil for deposits, matrix-free gathers, and the final kick.
@@ -1381,6 +1423,11 @@ class DustGasDrag {
   int cloud_resample_patch_cells = 4;  // ... at most this many cells of the block per side
   int cloud_resample_patch_split = 1024;   // ... a patch (or quadrant) with more pool
                                       //     clouds is split into quadrants, down to cells (0: never)
+  int cloud_resample_patch_max = 4096;   // ... (3-D) a patch with more pool clouds (a crowded
+                                         //     cell) is solved as sub-patches of at most this many
+  long long cloud_resample_batch_pairs = 1LL << 30;   // ... (3-D) the patches of a rank in batches of
+                                         //     about this many (cloud, leaf) pairs (32-bit tables;
+                                         //     a larger patch is a batch of its own)
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
   bool cloud_resample_rank_screen = true;   // ... (3-D only) skip the patches whose
                                       //     clouds do not outnumber their nominal rows (false: all)
@@ -1539,7 +1586,14 @@ class DustGasDrag {
   // particles), a derefined parent takes the sum of its children).
   Real lb_cloud_weight = 4.0;   // default 4
   std::vector<float> lb_old_counts;
-  // 3-D owner_overlap on a dynamic mesh: the new block of every old block (8 entries:
+  // <dust>/load_balance_log = K > 0 (diagnostic): after every regrid the blocks, cost and estimated
+  // clouds of every rank (LogRegridBalance), and every K cycles the actual clouds and blocks of
+  // every rank (LogRankClouds); rank 0 prints
+  int lb_log_interval = 0;
+  std::vector<double> lb_est_clouds;   // the estimated clouds of every new block (RegridCosts)
+  void LogRegridBalance(const int *new_rank, const float *cost, int new_nmb);
+  void LogRankClouds();
+  // 3-D instant_switch on a dynamic mesh: the new block of every old block (8 entries:
   // the child by octant of the position; one value repeated if not refined) and the old block
   // centres, from RegridCosts (the old mesh), for RouteOO3D after the regrid
   DvceArray2D<int> oo_newgid;
@@ -1547,7 +1601,7 @@ class DustGasDrag {
   void RegridCosts(const int *newtoold, const LogicalLocation *new_lloc, const int new_nmb, float *cost);
   int ResetPGIDFromPositions(const char *when);  // refinable clouds
   void RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin);
-  // the owner_overlap transfer on a dynamic mesh (dust_amr.cpp).  The
+  // the instant_switch transfer on a dynamic mesh (dust_amr.cpp).  The
   // block boxes (leaf_traversal: boxes only, read by the density trigger), the finest-block table
   // of the block of a position and the ghost-to-leaf remaps of the deposit exchanges, for the
   // current mesh; the block of every particle from its position; the TSC deposit on the owner
@@ -1618,7 +1672,7 @@ class DustGasDrag {
   // of the slots, the slots near the inner / outer x1 face and the reach of every local block
   bool shear3d = false;
   bool shear3d_route_fix = true;   // <dust>/cloud_shear_route_time (test: false = AthenaK's time)
-  // the same for point particles (owner_overlap, uniform / static / AMR) in a 3-D shearing
+  // the same for point particles (instant_switch, uniform / static / AMR) in a 3-D shearing
   // box, <dust>/shear_route_time (default true; false = AthenaK's time).  ShearRouteTime: the time
   // whose shear offset a particle crossing an x1 face at this migration needs (the end of the step
   // for PC2 / hybrid; for imex the stages still to come move it with the sheared x, see dust.cpp);
@@ -1746,6 +1800,25 @@ class DustGasDrag {
   int cloud_ord_n = 0;
   unsigned long long cloud_ord_builds = 0;
   void UpdateCloudOrder();
+  // cloud_order_keep (default true): the kernels keep the index when the
+  // migration of the stage left fewer particles than it holds (they skip its slots past the end);
+  // false: they run in storage order then (the old rule; only the 3-D IMEX and the gravity cloud
+  // kernels check it, the 2-D PC2 kernels always use the index)
+  bool cloud_order_keep = false;
+  // the index length the cloud kernels use for npart particles (0: storage order); counts
+  // the launches in and out of the index order
+  int CloudOrderLength(const int npart) {
+    const bool use = cloud_ord_n > 0 && (cloud_ord_n <= npart || cloud_order_keep);
+    ++(use ? cloud_ord_used : cloud_ord_fallback);
+    return use ? cloud_ord_n : 0;
+  }
+  unsigned long long cloud_ord_used = 0, cloud_ord_fallback = 0, cloud_sort_count = 0;
+  // the count only, for kernels that always use the index when there is one (PC2)
+  void CloudOrderCount(const bool ordered) {++(ordered ? cloud_ord_used : cloud_ord_fallback);}
+  // per-rank sums over the cycles (RefineClouds) of the particles and blocks (DUST_CLOUD_ORDER)
+  double ord_stat_npart = 0.0, ord_stat_nmb = 0.0;
+  long long ord_stat_cycles = 0;
+  int cloud_sort_cycle = -1;   // the cycle of the last sort in cell order (index = identity)
   void BuildLeafTraversal();
   // multi-rank refinable clouds: the gid of every block slot of the leaf traversal,
   // the halo lists and the exchanges (dust_halo.cpp)
@@ -1789,7 +1862,7 @@ class DustGasDrag {
   bool CheckHaloReach(const char *when);
   int SplitToLeaves();   // the initial split of a problem generator
   int RouteToOwnerBlocks(const char *when);   // after a regrid / restart
-  int RouteOO3D();   // 3-D owner_overlap: the particles to their new blocks / ranks
+  int RouteOO3D();   // 3-D instant_switch: the particles to their new blocks / ranks
   // several ranks: seconds and calls of 0 MigrateClouds, 1 the migration after the
   // push, 2 the kernels these waited for (a fence before each); the halo exchanges keep their
   // own split (DustHalo::tsec)

@@ -125,19 +125,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     }
   }
   // <dust>/amr_pic (dust_input.hpp): refinable_cloud (default on a refined mesh) or
-  // owner_overlap; on a uniform mesh the point particles (none) unless refinable_cloud is given
+  // instant_switch; on a uniform mesh the point particles (none) unless refinable_cloud is given
   {
     const bool ml = pmy_pack->pmesh->multilevel;
     const AmrPic pic = ResolveAmrPic(pin, ml);
     smr_transfer_mode = (pic == AmrPic::refinable_cloud) ? DustSMRTransfer::refinable_cloud :
-                        (pic == AmrPic::owner_overlap) ? DustSMRTransfer::owner_overlap :
+                        (pic == AmrPic::instant_switch) ? DustSMRTransfer::instant_switch :
                                                          DustSMRTransfer::none;
     if (!ml && pin->DoesParameterExist("dust", "amr_pic") && global_variable::my_rank == 0) {
       std::cout << "# NOTE (dust): amr_pic = " << pin->GetString("dust", "amr_pic")
                 << " on a uniform mesh: "
                 << ((pic == AmrPic::refinable_cloud) ?
                     "refinable clouds (exact TSC clouds, the cloud path of the refined runs)" :
-                    "point particles with TSC (owner_overlap acts only on a refined mesh)")
+                    "point particles with TSC (instant_switch acts only on a refined mesh)")
                 << std::endl;
     }
   }
@@ -164,6 +164,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // default 4 (the best balance of clouds per rank, fastest of 1 / 2 / 4); 0 gives
   // every new block the cost 1 as AthenaK does; one rank never uses it
   lb_cloud_weight = pin->GetOrAddReal("dust", "load_balance_cloud_weight", 4.0);
+  lb_log_interval = pin->GetOrAddInteger("dust", "load_balance_log", 0);
   if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {   // (block map: the only one)
     halo_trigger_cells = std::max(0, pin->GetOrAddInteger("dust", "amr_rho_buffer", 2));
   }
@@ -173,7 +174,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     ProfOn() = pin->GetOrAddBoolean("dust", "amr_profile", false);
     // static or adaptive refinement (dust_amr.cpp: the dust state is rebuilt
     // after every regrid): a 2-D periodic mesh, or a 3-D mesh with periodic or shear-periodic x1
-    // (owner_overlap or refinable clouds), periodic x2 and periodic or physical x3
+    // (instant_switch or refinable clouds), periodic x2 and periodic or physical x3
     // faces; the boundaries are checked below
     if (!((pmy_pack->pmesh->two_d && pmy_pack->pmesh->strictly_periodic) ||
           pmy_pack->pmesh->three_d)) {
@@ -419,7 +420,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     if (smr_transfer_mode == DustSMRTransfer::none && multilevel) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "dust on a refined mesh needs <dust>/amr_pic = refinable_cloud or "
-                << "owner_overlap" << std::endl;
+                << "instant_switch" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
@@ -700,6 +701,16 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                             pow2(cloud_resample_patch) && pow2(cloud_resample_patch_cells);
       cloud_resample_patch_split = pin->GetOrAddInteger("dust", "cloud_resample_patch_split",
                                                         split_ok ? 1024 : 0);
+      // (3-D) a patch with more pool clouds than this (one cell of a dense core can hold 1e5 to
+      // 1e6) is solved as sub-patches of consecutive pool clouds, each keeping its own share of
+      // every row, so that the solves stay small and run in parallel; 0 = never
+      cloud_resample_patch_max = pin->GetOrAddInteger("dust", "cloud_resample_patch_max", 4096);
+      // (3-D) the (cloud, leaf cell) pairs of the pool are held in tables with 32-bit offsets: the
+      // block patches of a rank are resampled in consecutive batches of about this many pairs
+      // (patches are independent, so the result is that of one pass).  A target: a base patch with
+      // more pairs is a batch of its own; the hard limit is 2^31 - 1 pairs per batch
+      cloud_resample_batch_pairs = static_cast<long long>(pin->GetOrAddReal("dust",
+          "cloud_resample_batch_pairs", 1073741824.0));
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
       // (3-D refinable clouds only; 2-D ignores it): the device solve leaves out the
       // patches of n clouds on nl leaves with n <= 7 nl + 9 (the nominal rows: no null vector is
@@ -802,12 +813,16 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                                          "cloud_resample_after_derefine", false);
       if (cloud_resample && ((!cloud_resample_by_time && cloud_resample_interval < 1) ||
                              cloud_resample_patch < 1 || cloud_resample_patch_split < 0 ||
+                             cloud_resample_patch_max < 0 || cloud_resample_patch_max == 1 ||
+                             cloud_resample_batch_pairs < 1 ||
+                             cloud_resample_batch_pairs > std::numeric_limits<int>::max() ||
                              (cloud_resample_patch_split > 0 && !split_ok) ||
                              cloud_gather_order != 2)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                   << "cloud_resample requires cloud_resample_interval >= 1, cloud_resample_patch >= 1,"
                   << " cloud_resample_patch_split >= 0 (> 0 only with block patches whose"
                   << " cloud_resample_patch and cloud_resample_patch_cells <= 16 are powers of two),"
+                  << " cloud_resample_patch_max = 0 or >= 2, 1 <= cloud_resample_batch_pairs < 2^31,"
                   << " cloud_gather_order = 2" << std::endl;
         std::exit(EXIT_FAILURE);
       }
@@ -900,14 +915,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
     Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
   }
-  // the owner_overlap transfer also runs on a dynamic mesh (one rank), in 3-D also on several
+  // the instant_switch transfer also runs on a dynamic mesh (one rank), in 3-D also on several
   // ranks (the general deposit remap)
   if (pmy_pack->pmesh->adaptive && smr_transfer_mode != DustSMRTransfer::refinable_cloud &&
-      !(smr_transfer_mode == DustSMRTransfer::owner_overlap &&
+      !(smr_transfer_mode == DustSMRTransfer::instant_switch &&
         (global_variable::nranks == 1 || pmy_pack->pmesh->three_d))) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "dust on an adaptive mesh needs <dust>/amr_pic = refinable_cloud (or "
-              << "owner_overlap: one rank in 2-D)" << std::endl;
+              << "instant_switch: one rank in 2-D)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
@@ -926,9 +941,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     CheckMultiRank();
     CheckClouds3D();   // the 3-D restrictions
   } else if (pmy_pack->pmesh->multilevel) {
-    if (smr_transfer_mode == DustSMRTransfer::owner_overlap) {
+    if (smr_transfer_mode == DustSMRTransfer::instant_switch) {
       if (global_variable::my_rank == 0) {
-        std::cout << "# DUST_PIC amr_pic = owner_overlap (point particles, TSC on the block that "
+        std::cout << "# DUST_PIC amr_pic = instant_switch (point particles, TSC on the block that "
                   << "owns them, ghost deposits remapped to the leaves)" << std::endl;
       }
       int nccells1 = indcs.cnx1 + 2*(indcs.ng);
@@ -974,11 +989,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   if (pmy_pack->pmesh->three_d && !clouds3d &&
       (pmy_pack->pmesh->multilevel || shear_x1 || x3_phys)) {
     if (drag_solver != DustDragSolver::local ||
-        !(smr_transfer_mode == DustSMRTransfer::owner_overlap ||
+        !(smr_transfer_mode == DustSMRTransfer::instant_switch ||
           smr_transfer_mode == DustSMRTransfer::none)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "3-D dust with refinement or a shearing box: drag_solver = local and "
-                << "point particles (amr_pic = owner_overlap on a refined mesh)" << std::endl;
+                << "point particles (amr_pic = instant_switch on a refined mesh)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
     const auto &id = pmy_pack->pmesh->mb_indcs;
@@ -1006,9 +1021,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     pbval_dm->SetGeneralPlan(dep_plan);
     if (x3mode == 2) pbval_dm->dropped_sum.assign(3, 0.0);   // the record from the start
   }
-  // owner_overlap on a dynamic mesh: the block boxes and the block table of the
+  // instant_switch on a dynamic mesh: the block boxes and the block table of the
   // initial mesh (the exchanges above built their remaps); 2-D only
-  if (pmy_pack->pmesh->adaptive && smr_transfer_mode == DustSMRTransfer::owner_overlap &&
+  if (pmy_pack->pmesh->adaptive && smr_transfer_mode == DustSMRTransfer::instant_switch &&
       !pmy_pack->pmesh->three_d) {
     BuildOwnerOverlapMesh(false);
   }
@@ -1169,6 +1184,19 @@ DustGasDrag::~DustGasDrag() {
               << " particles=" << ((global_variable::nranks > 1) ? pmy_pack->pmesh->nprtcl_total
                                                                   : pmy_pack->ppart->nprtcl_thispack)
               << ((global_variable::nranks > 1) ? " counters=rank0" : "") << std::endl;
+  }
+  if (smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
+      (cloud_order_interval > 0 || cloud_sort_interval > 0)) {
+    // every rank: launches of the cloud kernels in the index order and in storage order (the
+    // index longer than the particles after a migration, cloud_order_keep = false), index
+    // builds and sorts
+    std::ostringstream os;
+    os << "# DUST_CLOUD_ORDER rank=" << global_variable::my_rank << " ordered=" << cloud_ord_used
+       << " storage_order=" << cloud_ord_fallback << " index_builds=" << cloud_ord_builds
+       << " sorts=" << cloud_sort_count << " keep=" << (cloud_order_keep ? 1 : 0)
+       << " mean_particles=" << ord_stat_npart/std::max(1LL, ord_stat_cycles)
+       << " mean_blocks=" << ord_stat_nmb/std::max(1LL, ord_stat_cycles) << "\n";
+    std::cout << os.str() << std::flush;
   }
   if (global_variable::my_rank == 0 && shear3d) {   // shear-image list counters
     std::cout << "# DUST_SHEAR_LISTS rank0 ysh_updates=" << shear3d_updates << " list_rebuilds="

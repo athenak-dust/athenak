@@ -197,6 +197,7 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
             lt.ForEachCloudWeight(xp, yp, lev, am, add);
           }
         };
+        CloudOrderCount(cloud_ord_n > 0);
         if (cloud_ord_n > 0) {   // in the order of the cell-sorted index
           CloudParForOrdered("dust_pc2_cloud_predictor_linear", npart, cloud_ord,
                              cloud_ord_n, pred_body);
@@ -349,11 +350,11 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
         DepositAdd(&qdep_(tm,3,ks,tj,ti), density_weight*vz);
       });
     };
-    if (cloud_ord_n > 0 && cloud_ord_n <= npart) {
+    if (const int nord = CloudOrderLength(npart)) {
       // in the order of the cell-sorted index (a permutation of its slots,
       // which the migration of this stage may have refilled)
       CloudParForOrdered("dust_composite_scatter", npart, cloud_ord,
-                         cloud_ord_n, scat_body);
+                         nord, scat_body);
     } else {
       par_for("dust_composite_scatter",DevExeSpace(),0,(npart-1), scat_body);
     }
@@ -727,10 +728,10 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
         if (three_d) pr(IPZ,p) += dt*pr(IPVZ,p);
       }
     };
-    if (cloud_ord_n > 0 && cloud_ord_n <= npart) {
+    if (const int nord = CloudOrderLength(npart)) {
       // in the order of the cell-sorted index (a permutation of its slots)
       CloudParForOrdered("dust_cloud_gather_kick", npart, cloud_ord,
-                         cloud_ord_n, gk_body);
+                         nord, gk_body);
     } else {
       CloudParFor("dust_cloud_gather_kick", npart, gk_body);
     }

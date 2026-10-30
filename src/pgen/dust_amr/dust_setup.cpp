@@ -224,7 +224,7 @@ void InitUniformGas(Mesh *pm, const Real rho0, const Real ugx, const Real ugp) {
 //! <problem>/cloud_root_random = true: root parents placed over the whole box
 //! (<problem>/root_placement = random | lattice | generic) and split to the leaves as
 //! refinable clouds, or (canonical_root) kept as point particles with the standard deposit on
-//! a uniform mesh or with the owner_overlap transfer.
+//! a uniform mesh or with the instant_switch transfer.
 
 void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
   MeshBlockPack *pmbp = pm->pmb_pack;
@@ -236,11 +236,11 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
   bool cloud_root_random = pin->GetOrAddBoolean("problem", "cloud_root_random", false);
   // canonical_root: the same root parents with the standard deposit on a uniform mesh,
   // so a uniform control shares the parent positions of a refinable-cloud run
-  // also the old owner_overlap transfer on any mesh (point particles, each in the block
+  // also the old instant_switch transfer on any mesh (point particles, each in the block
   // that holds it), so that it starts from the parents of the refinable-cloud runs
   bool canonical_root = cloud_root_random &&
       ((pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none && !pm->multilevel) ||
-       pmbp->pdust->smr_transfer_mode == DustSMRTransfer::owner_overlap);
+       pmbp->pdust->smr_transfer_mode == DustSMRTransfer::instant_switch);
   // several ranks: refinable clouds; every rank draws the same parents and keeps
   // those in its blocks
   const bool ranks_ok = (global_variable::nranks == 1) || !canonical_root ||
@@ -253,7 +253,7 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
         canonical_root) || (three_d && !root3d_ok))) {
     Fatal("cloud_root_random requires (several ranks: refinable clouds) 2-D dust with "
           "refinable_cloud transfer, or (one rank) the canonical deposit on a uniform mesh or "
-          "the owner_overlap transfer; in 3-D the root parents of 3-D refinable clouds");
+          "the instant_switch transfer; in 3-D the root parents of 3-D refinable clouds");
   }
   std::string placement = pin->GetOrAddString("problem","particle_placement",d.placement);
   const bool random_placement = (placement.compare("random") == 0);

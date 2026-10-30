@@ -759,29 +759,90 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       sz(q, 2) = 0;
     });
   }
-  // sizes, buckets and patch lists on the device; only a few totals go to the host
-  int emax = 1;
+  // sizes, buckets and patch lists on the device; only a few totals go to the host.
+  // The distinct leaves of a patch are counted in a hash table of at least twice as many slots
+  // as CSR entries.  Patches of at most ecut entries use team scratch sized for the largest of
+  // them; the larger ones (a crowded cell of a dense core can hold millions of entries) use
+  // slots of one table in device memory, as many slots as cloud_resample_device_mem_mb allows.
+  // (Team scratch is allocated for every resident team, so sizing it for the largest patch
+  // asked for 152-304 GiB per GPU once cells of a dense core held that many clouds.)
+  // The counts do not depend on the table size.
+  const int ecut = 8192;
+  int emax = 1, elarge = 0, nlarge = 0;
   Kokkos::parallel_reduce("rs_dev_emax", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-  KOKKOS_LAMBDA(const int q, int &m) {if (sz(q, 0) >= 2 && sz(q, 1) > m) m = sz(q, 1);},
-  Kokkos::Max<int>(emax));
+  KOKKOS_LAMBDA(const int q, int &m, int &ml, int &nq) {
+    if (sz(q, 0) < 2) return;
+    const int ne = sz(q, 1);
+    if (ne <= ecut) {
+      if (ne > m) m = ne;
+    } else {
+      if (ne > ml) ml = ne;
+      ++nq;
+    }
+  }, Kokkos::Max<int>(emax), Kokkos::Max<int>(elarge), nlarge);
   emax = std::max(emax, 1);
+  elarge = std::max(elarge, 0);
+  auto pptr = pb.pptr; auto sptr = pb.sptr; auto stgt = pb.stgt;
   {
     using ScratchInt = Kokkos::View<int*, DevExeSpace::scratch_memory_space,
                                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
     int hpre = 4;
     while (hpre < 2*emax) hpre *= 2;
     const std::size_t bytes = ScratchInt::shmem_size(hpre);
-    auto pptr = pb.pptr; auto sptr = pb.sptr; auto stgt = pb.stgt;
     Kokkos::parallel_for("rs_dev_leaves",
     Policy(npatch, Kokkos::AUTO).set_scratch_size(1, Kokkos::PerTeam(bytes)),
     KOKKOS_LAMBDA(const Member &tm) {
       const int q = tm.league_rank();
-      if (sz(q, 0) < 2) return;
+      if (sz(q, 0) < 2 || sz(q, 1) > ecut) return;
       const int e0 = sptr(pptr(q)), ne = sz(q, 1);
       ScratchInt tab(tm.team_scratch(1), hpre);
       const int nl = DistinctSorted(tm, ne, [&](const int e) {return stgt(e0 + e);}, tab.data(),
                                     hpre - 1, nullptr, nullptr);
       Kokkos::single(Kokkos::PerTeam(tm), [&]() {sz(q, 2) = nl;});
+    });
+  }
+  if (nlarge > 0) {
+    if (elarge > (1 << 29)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "device resampling: a patch with " << elarge << " CSR entries (more than 2^29)"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    int hbig = 4;
+    while (hbig < 2*elarge) hbig *= 2;
+    const double lbudget = static_cast<double>(std::max(mem_mb, 64))*1048576.0;
+    int nslot = static_cast<int>(std::min<double>(nlarge, std::max(1.0, lbudget/(4.0*hbig))));
+    nslot = std::min(nslot, 4096);
+    DvceArray1D<int> qbig(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_leaves_list"),
+                          nlarge);
+    Kokkos::parallel_scan("rs_dev_leaves_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+    KOKKOS_LAMBDA(const int q, int &u, const bool final) {
+      if (sz(q, 0) >= 2 && sz(q, 1) > ecut) {
+        if (final) qbig(u) = q;
+        ++u;
+      }
+    });
+    DvceArray1D<int> tbig(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_leaves_tab"),
+                          static_cast<std::size_t>(nslot)*hbig);
+    DvceArray1D<int> ctr("rs_dev_leaves_counter", 1);
+    const int nq = nlarge;
+    Kokkos::parallel_for("rs_dev_leaves_large", Policy(nslot, Kokkos::AUTO),
+    KOKKOS_LAMBDA(const Member &tm) {
+      int *tab = tbig.data() + static_cast<std::size_t>(tm.league_rank())*hbig;
+      while (true) {
+        int i = 0;
+        Kokkos::single(Kokkos::PerTeam(tm), [&](int &v) {
+          v = Kokkos::atomic_fetch_add(&ctr(0), 1);
+        }, i);
+        if (i >= nq) break;
+        const int q = qbig(i);
+        const int e0 = sptr(pptr(q)), ne = sz(q, 1);
+        int h = 4;   // this patch's table: the slot is sized for the largest
+        while (h < 2*ne) h *= 2;
+        const int nl = DistinctSorted(tm, ne, [&](const int e) {return stgt(e0 + e);}, tab,
+                                      h - 1, nullptr, nullptr);
+        Kokkos::single(Kokkos::PerTeam(tm), [&]() {sz(q, 2) = nl;});
+      }
     });
   }
   // 3-D, cloud_resample_rank_screen: a patch of n clouds on nl leaves has at most
@@ -868,6 +929,12 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       const double per = 8.0*ws.nd + 4.0*ws.ni;
       int nslot = static_cast<int>(std::min<double>(nq, std::max(1.0, budget/per)));
       nslot = std::min(nslot, 4096);
+      if (b == 2 && (nmx[b] >= 16384 || per > budget)) {
+        std::cout << "# device resampling (rank " << global_variable::my_rank << "): " << nq
+                  << " large patches; per patch at most " << nmx[b] << " clouds, at most "
+                  << emx[b] << " entries, at most " << lmx[b] << " leaves (separate maxima); " << per/1048576.0 << " MB per slot, "
+                  << nslot << " slots" << std::endl;
+      }
       DvceArray1D<int> qlist(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_list"), nq);
       {
         const int off = (b == 0) ? 0 : ((b == 1) ? nqb[0] : nqb[0] + nqb[1]);

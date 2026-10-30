@@ -359,7 +359,7 @@ class MeshBoundaryValuesDep : public MeshBoundaryValues {
   TaskStatus RecvAndSumDeposit(DvceArray5D<Real> &a);
   // Public because CUDA extended lambdas cannot be enclosed by a private member.
   TaskStatus RemapLocalSMRDeposit(DvceArray5D<Real> &a);
-  // the remap of the owner_overlap path from the current mesh; called again by the dust module
+  // the remap of the instant_switch path from the current mesh; called again by the dust module
   // after every regrid of a dynamic mesh
   void BuildLocalSMRMap();
   bool LocalSMRRemap() const {return local_smr_remap_;}

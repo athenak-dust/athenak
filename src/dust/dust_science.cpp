@@ -18,8 +18,8 @@
 //!        leaves (ForEachCompositeWeight), the halo parts added to their owners;
 //!      point particles, 3-D: the coupling's stencil (<dust>/deposit) on the owner block, the
 //!        ghost parts remapped conservatively onto the leaves they overlap (DepRemapPlan:
-//!        uniform, owner_overlap SMR / AMR, shear-periodic x1, physical x3 faces folded back);
-//!      point particles, 2-D: owner_overlap on a refined mesh (OwnerOverlapDeposit), on a
+//!        uniform, instant_switch SMR / AMR, shear-periodic x1, physical x3 faces folded back);
+//!      point particles, 2-D: instant_switch on a refined mesh (OwnerOverlapDeposit), on a
 //!        uniform mesh the owner stencil with the coupling's additive ghost exchange.
 //!    The masses and momenta of the particles and of the fields are compared (science_audit,
 //!    one log line per call); outputs never change the particle, gas or coupling state.
@@ -100,8 +100,8 @@ void DustGasDrag::ScienceRepresentation(std::ostream &os) const {
     os << "stencil = " << StencilName(deposit) << "  # on the cells of the owner MeshBlock "
        << "(the block whose half-open box holds x_p)\n";
     os << "transfer = "
-       << ((smr_transfer_mode == DustSMRTransfer::owner_overlap) ? "owner_overlap" : "none")
-       << "  # owner_overlap: deposits in ghost cells are added to the active leaf cells "
+       << ((smr_transfer_mode == DustSMRTransfer::instant_switch) ? "instant_switch" : "none")
+       << "  # instant_switch: deposits in ghost cells are added to the active leaf cells "
        << "they overlap, by volume\n";
     os << "mesh_deposit = owner-block stencil, ghost-cell deposits remapped conservatively\n";
   }
@@ -217,8 +217,8 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
   } else if (three_d) {
     // ---- 3-D point particles: owner stencil + conservative ghost remap
     DepositPointScienceFields(pm->time, out, mass_only, species);
-  } else if (smr_transfer_mode == DustSMRTransfer::owner_overlap) {
-    // ---- 2-D point particles on a refined mesh: the owner_overlap leaf deposit
+  } else if (smr_transfer_mode == DustSMRTransfer::instant_switch) {
+    // ---- 2-D point particles on a refined mesh: the instant_switch leaf deposit
     DvceArray5D<Real> &work = mass_only ? science_mass_ : science_work_;
     OwnerOverlapDeposit(work, !mass_only, species);   // stops on a mass mismatch
     auto g = work;
@@ -230,7 +230,7 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
   } else {
     // ---- 2-D point particles on a uniform mesh: owner stencil + the coupling's additive
     // ghost exchange (pbval_qp, 5 components as in the coupling; idle between cycles)
-    if (pm->multilevel) ScienceFail("2-D point particles on a refined mesh need owner_overlap");
+    if (pm->multilevel) ScienceFail("2-D point particles on a refined mesh need instant_switch");
     if (pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
       ScienceFail("2-D point particles with shear-periodic x1 faces are not supported");
     }

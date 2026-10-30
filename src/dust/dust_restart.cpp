@@ -282,6 +282,8 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
       amr_restart_state_found = true;
       amr_restart_pending = (v[0] != 0);
       amr_restart_ages.assign(v.begin() + 2, v.end());
+    } else if (name == "shear_until") {
+      want(sizeof(double));   // (written by an interim version; the shear-face window needs no state)
     } else if (name == "resample_clk") {
       double rc[2]; std::int64_t rn[4]; want(sizeof(rc) + sizeof(rn));
       std::memcpy(rc, d, sizeof(rc)); std::memcpy(rn, d + sizeof(rc), sizeof(rn));

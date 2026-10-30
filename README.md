@@ -63,7 +63,6 @@ guess = extrapolate      # first guess from the last two potentials
 - Gas as a source (`source = gas | both`) needs `experimental_gas_source = true` (still experimental).
 - Validation inputs: [`dust_freefall_u128`](inputs/dust_amr/dust_freefall_u128.athinput), [`dust_freefall_amr`](inputs/dust_amr/dust_freefall_amr.athinput) (homologous collapse of a cold sphere; Lagrangian radii and energy in `freefall_history.jsonl`) and [`dust_jeans_u128`](inputs/dust_amr/dust_jeans_u128.athinput) (linear growth of a dusty Jeans mode).
 - Outputs `gravity_phi`, `gravity_g1..3` (or `gravity`) write the potential and acceleration.
-- Solver details, operators and validation: [src/gravity/README.md](src/gravity/README.md).
 
 ## 3. Dust on refined meshes
 
@@ -82,7 +81,7 @@ G and R run on a schedule (every `0.25 / Omega` in a shearing box, every N cycle
 
 ```ini
 <dust>
-amr_pic = refinable_cloud       # refinable_cloud (default on a refined mesh) | owner_overlap
+amr_pic = refinable_cloud       # refinable_cloud (default on a refined mesh) | instant_switch
 refinable_mode = default        # default | careful_merge | split_only
 ```
 
@@ -94,7 +93,7 @@ refinable_mode = default        # default | careful_merge | split_only
 
 **Quiet linear tests** (LinA and similar) need `careful_merge` or `split_only`. The production `default` (G and R without the quiet gates) destroys a linear mode: on LinA the growth-rate error is +14% to +147% and the eigenfunction is about 100% off-mode. `default` is for nonlinear runs (BA, stratified SI). On LinA `careful_merge` matches `split_only` within 0.01-0.17 percentage points of the growth rate with about 30% fewer particles.
 
-`amr_pic = owner_overlap` uses point particles with TSC on the block that owns them (no clouds); it needs no further keys. Any preset key given explicitly (see section 4) overrides the preset's value; the resolved set is printed at start-up (`# DUST_PIC ...`). The old `experimental_*` switches are no longer needed and are ignored with a note.
+`amr_pic = instant_switch` uses point particles with TSC on the block that owns them (no clouds): a particle's kernel switches to the cell size of a level as soon as it enters a block of that level. It needs no further keys. Any preset key given explicitly (see section 4) overrides the preset's value; the resolved set is printed at start-up (`# DUST_PIC ...`). The old `experimental_*` switches are no longer needed and are ignored with a note.
 
 ### Refinement criteria
 
@@ -140,7 +139,7 @@ Every dust problem has its own problem generator (`<problem>/pgen_name`). The pi
 | `dust_freefall` | collapse of a cold dust sphere under its own gravity | `dust_freefall_u128`, `dust_freefall_amr` |
 | `dust_jeans` | linear dusty Jeans mode | `dust_jeans_u128` |
 
-`dust_nsh` is in `src/pgen/tests/`, the others in `src/pgen/dust_amr/`. A key that belongs to another of these problem generators (for example `stratified_dust` in `dust_nsh`) stops the run with the name of the right one. On a refined mesh the particles start as root parents: `<problem>/cloud_root_random = true` places `ppc` parents per root cell over the whole box (`root_placement = random`, `lattice` or `generic`), and each parent is split exactly to the leaves it overlaps. On a uniform mesh (or with `amr_pic = owner_overlap`) the same keys give the same parents as point particles, so uniform and refined runs start from the same samples. Without `cloud_root_random` the particles are point particles on a lattice or at random positions (`particle_placement`). The `<problem>/ba_*` keys (2-D) add the field snapshots and the particle density distribution of [`dust_snapshots.cpp`](src/pgen/dust_amr/dust_snapshots.cpp).
+`dust_nsh` is in `src/pgen/tests/`, the others in `src/pgen/dust_amr/`. A key that belongs to another of these problem generators (for example `stratified_dust` in `dust_nsh`) stops the run with the name of the right one. On a refined mesh the particles start as root parents: `<problem>/cloud_root_random = true` places `ppc` parents per root cell over the whole box (`root_placement = random`, `lattice` or `generic`), and each parent is split exactly to the leaves it overlaps. On a uniform mesh (or with `amr_pic = instant_switch`) the same keys give the same parents as point particles, so uniform and refined runs start from the same samples. Without `cloud_root_random` the particles are point particles on a lattice or at random positions (`particle_placement`). The `<problem>/ba_*` keys (2-D) add the field snapshots and the particle density distribution of [`dust_snapshots.cpp`](src/pgen/dust_amr/dust_snapshots.cpp).
 
 ## 4. Tuning parameters
 

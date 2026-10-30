@@ -67,17 +67,10 @@ ShwaveTestVariables shw_var;
 //  \brief
 
 void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
-  if (restart) return;
-
-  // read parameters from input file
-  Real d0 = pin->GetReal("problem", "d0");
-  Real p0 = pin->GetOrAddReal("problem", "p0",1.0);
-  Real amp = pin->GetReal("problem", "amp");
-  int ipert = pin->GetInteger("problem", "ipert");
-
   // <problem>/band_n bands of refinement for tests of the adaptive
   // shearing box: bandK_t0, _t1, _x1min, _x1max, _x3min, _x3max, _level; a
-  // block whose centre is inside an active band is wanted at its level (whole x2)
+  // block whose centre is inside an active band is wanted at its level (whole x2).
+  // Also on a restart: the refinement function is enrolled again
   shw_bands.clear();
   const int nband = pin->GetOrAddInteger("problem", "band_n", 0);
   for (int b=1; b<=nband; ++b) {
@@ -94,6 +87,14 @@ void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
     shw_bands.push_back(bd);
   }
   if (pmy_mesh_->adaptive && nband > 0) user_ref_func = ShwaveBands;
+  if (restart) return;
+
+  // read parameters from input file
+  Real d0 = pin->GetReal("problem", "d0");
+  Real p0 = pin->GetOrAddReal("problem", "p0",1.0);
+  Real amp = pin->GetReal("problem", "amp");
+  int ipert = pin->GetInteger("problem", "ipert");
+
 
   // box size and wavenumbers
   auto &msize = pmy_mesh_->mesh_size;

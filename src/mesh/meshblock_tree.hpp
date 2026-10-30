@@ -1,5 +1,7 @@
 #ifndef MESH_MESHBLOCK_TREE_HPP_
 #define MESH_MESHBLOCK_TREE_HPP_
+
+#include <vector>
 //========================================================================================
 // AthenaXXX astrophysical plasma code
 // Copyright(C) 2020 James M. Stone <jmstone@ias.edu> and the Athena code team
@@ -47,6 +49,9 @@ class MeshBlockTree {
   MeshBlockTree* FindMeshBlock(LogicalLocation tloc);
   void CountMeshBlocks(int& count);
   void CreateZOrderedLLList(LogicalLocation *list, int *pglist, int& count);
+  // the logical locations of the leaves under this node, in Z order; unlike
+  // CreateZOrderedLLList it does not renumber the gids (shear-face levels)
+  void GetLeafLocations(std::vector<LogicalLocation> &list);
   MeshBlockTree* FindNeighbor(LogicalLocation myloc, int ox1, int ox2, int ox3,
                               bool amrflag=false);
 

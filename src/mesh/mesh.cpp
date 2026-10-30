@@ -183,7 +183,7 @@ Mesh::Mesh(ParameterInput *pin) :
     ?  true : false;
 
   // Shearing box with mesh refinement: in 3-D (shear-periodic x1) hydro, or dust
-  // (refinable clouds or owner_overlap; the dust module checks the rest), no MHD and no other
+  // (refinable clouds or instant_switch; the dust module checks the rest), no MHD and no other
   // particles; in 2-D (the r-z shearing box, local source terms) only dust with periodic
   // boundaries.  A non-dust 2-D input keeps the original fail-closed behaviour.
   if (global_variable::my_rank == 0 && pin->DoesBlockExist("shearing_box")) {

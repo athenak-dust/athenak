@@ -84,19 +84,23 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   // (false: whole blocks)
   cloud_halo_strips = pin->GetOrAddBoolean("dust", "cloud_halo_strips", true);
   // every cloud_sort_interval cycles (0: never) the particle arrays are reordered
-  // by block, cell in the block (row by row) and old position, after
+  // by block, cell in the block (row by row; 3-D clouds: (k, j, i)) and old position, after
   // the split, resampling and merge pass of the cycle (SortParticles).  By default every 64
-  // cycles on the configuration where it was timed and
+  // cycles on the 2-D configuration where it was timed and
   // its effect on G checked (production PC2 path, device G and R, cloud_merge_exact_ts, stopping
-  // times fixed per species: stopping_time_mode = species_fixed); 0 is the control
+  // times fixed per species: stopping_time_mode = species_fixed); 0 is the control.  3-D clouds:
+  // every 8 cycles by default, any coupling (4-level 3-D self-gravity run on four GPUs: 0.37 s
+  // per cycle without, 0.28 with it, 0.27 with cloud_order_keep).  The order changes the R and
+  // G decisions, so a sorted run is not bitwise equal to an unsorted one; conservation is
+  // unaffected.  (Restart files carry the value of the run that wrote them.)
   {
     const bool prod = coupling == DustCoupling::hybrid &&
                       hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2;
-    // not in 3-D yet (the sort keys are 2-D cells)
     const bool sortdef = prod && !clouds3d && (!cloud_merge || cloud_merge_device) &&
                          (!cloud_resample || cloud_resample_device) && cloud_merge_exact_ts &&
                          stopping_time_mode == DustStoppingTimeMode::species_fixed;
-    cloud_sort_interval = pin->GetOrAddInteger("dust", "cloud_sort_interval", sortdef ? 64 : 0);
+    cloud_sort_interval = pin->GetOrAddInteger("dust", "cloud_sort_interval",
+                                               clouds3d ? 8 : (sortdef ? 64 : 0));
   }
   {
     const std::string so = pin->GetOrAddString("dust", "cloud_sort_order", "linear");
@@ -107,13 +111,18 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
     cloud_sort_random = (so == "random");   // diagnostic: a random permutation
     cloud_merge_position_order = pin->GetOrAddBoolean("dust", "cloud_merge_position_order", false);
     // the cell-sorted index is on by default (every 8 cycles) where the two production cloud
-    // kernels run (hybrid / PC2 coupling, linear gather), in 2-D and in 3-D (keys (block, k, j,
-    // i)); 0 turns it off
+    // kernels run (hybrid / PC2 coupling, linear gather) and for 3-D clouds with any coupling
+    // (IMEX included; keys (block, k, j, i)); 0 turns it off
     {
       const bool prod = coupling == DustCoupling::hybrid &&
                         hybrid_force_mode != HybridForceMode::split_be && cloud_gather_order == 2;
-      cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval", prod ? 8 : 0);
+      cloud_order_interval = pin->GetOrAddInteger("dust", "cloud_order_interval",
+                                                  (prod || clouds3d) ? 8 : 0);
     }
+    // the kernels keep the index when the migration of a stage leaves fewer particles than it
+    // holds (they skip its slots past the end); false: they run in storage order then.  On by
+    // default (on that run 0.37 -> 0.31 s per cycle; only the order of summation changes)
+    cloud_order_keep = pin->GetOrAddBoolean("dust", "cloud_order_keep", true);
   }
   std::string users;
   auto user = [&](const bool on, const char *name) {if (on) users += std::string(" ") + name;};
@@ -168,9 +177,21 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   t.root_dx2 = (t.x2max - t.x2min)/static_cast<Real>(t.ncoarse2);
   t.fine_dx1 = t.root_dx1/static_cast<Real>(1 << nlev);
   t.fine_dx2 = t.root_dx2/static_cast<Real>(1 << nlev);
-  // controls: cloud_max_level=0 keeps every cloud at root size (translation-invariant
-  // dust on the mixed gas mesh); cloud_split_everywhere refines the whole lattice
-  t.cloud_max_level = pin->GetOrAddInteger("dust", "cloud_max_level", nlev);
+  // The clouds follow the mesh down to its finest level in every run.  A cap
+  // on their level is a test control only, <dust>/test_cloud_max_level (0 keeps every cloud at
+  // root size); it is never added to the parameters as a default.  The old key cloud_max_level
+  // was added with the run's level count as its default, so a restart with more levels kept the
+  // clouds at the old finest level: it is ignored.
+  t.cloud_max_level = nlev;
+  if (pin->DoesParameterExist("dust", "test_cloud_max_level")) {
+    t.cloud_max_level = pin->GetInteger("dust", "test_cloud_max_level");
+  }
+  if (pin->DoesParameterExist("dust", "cloud_max_level") && global_variable::my_rank == 0) {
+    std::cout << "# NOTE (dust): <dust>/cloud_max_level = "
+              << pin->GetString("dust", "cloud_max_level") << " is ignored (the clouds follow the "
+              << "mesh; a cap for tests is <dust>/test_cloud_max_level)" << std::endl;
+  }
+  // cloud_split_everywhere refines the whole lattice
   t.cloud_split_everywhere = pin->GetOrAddBoolean("dust", "cloud_split_everywhere", false);
   // split on the first overlap with finer leaves by default (the production rule; false is
   // the older rule, kept for comparison)
@@ -563,6 +584,7 @@ void DustGasDrag::FrameToBlock(const Real tpos) {
 //! \brief Task wrapper: split eligible clouds at the start of every cycle.
 
 TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
+  if (lb_log_interval > 0 && pmy_pack->pmesh->ncycle % lb_log_interval == 0) LogRankClouds();
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) return TaskStatus::complete;
   ProfTimer prof_all(prof_time[kProfRefineClouds], prof_count[kProfRefineClouds]);
   UpdateShear3D(pmy_pack->pmesh->time);   // the positions at the start of the step
@@ -621,6 +643,9 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   }
 #endif
   CheckHaloReach("refine");   // before this cycle's gathers and deposits
+  ++ord_stat_cycles;
+  ord_stat_npart += pmy_pack->ppart->nprtcl_thispack;
+  ord_stat_nmb += pmy_pack->nmb_thispack;
   if (cloud_sort_interval > 0 &&
       pmy_pack->pmesh->ncycle % cloud_sort_interval == 0) {
     ProfTimer pt(prof_time[kProfSort], prof_count[kProfSort]);
