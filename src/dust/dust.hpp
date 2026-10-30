@@ -1464,9 +1464,10 @@ class DustGasDrag {
   bool cloud_resample = false;         // conservative same-level resampling
   int cloud_resample_interval = 625;   // ... cycles between resamplings
   Real cloud_resample_eta = 2.0;       // ... base eta of the mass cap (<= 0: no cap)
-  // ... cap eta_L m0 / 2^(d L) of a cloud of level L.  <dust>/cloud_resample_eta_levels =
-  // e0 e1 e2 ... sets eta_L (the last value holds for the deeper levels); without it
-  // eta_L = min(eta 2^(L/2), max(4, eta)) in 3-D and min(eta 2^(L/4), max(2, eta)) in 2-D
+  // ... cap eta_L m0 / 2^(d L) of a cloud of level L: eta_L = eta on every level, or by
+  // <dust>/cloud_resample_eta_levels: auto gives eta_L = min(eta 2^(L/2), max(4, eta)) in 3-D and
+  // min(eta 2^(L/4), max(2, eta)) in 2-D; e0 e1 e2 ... gives eta_L (the last value holds for the
+  // deeper levels)
   std::vector<Real> cloud_resample_eta_lev;
   ResampleCapTable cloud_resample_cap{};
   // > 0 keeps cold patches out of the pool: every velocity component

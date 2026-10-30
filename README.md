@@ -157,8 +157,8 @@ All in `<dust>` unless noted. The defaults are the validated production values; 
 | `cloud_merge_stencil` (P) | off (on in `careful_merge`) | stage X |
 | `cloud_merge_buffer` | 2 | G merge cells lie at least this many cells (of the target level) from any finer leaf |
 | `cloud_resample` (P) | on (off in `split_only`) | stage R |
-| `cloud_resample_eta` (P) | 1.5 | R mass cap: a cloud of level L ends at most at eta_L times the level's nominal cloud mass; eta sets the default eta_L (next row) |
-| `cloud_resample_eta_levels` | (none) | eta_L per level, taken as given (also above 4; <= 0: no cap on that level), e.g. `2 2.83 4 4` for levels 0-3 (the last value holds for deeper levels; one value gives every level the same cap). If this key is not set, eta_L = `min(eta 2^(L/2), max(4, eta))` in 3-D and `min(eta 2^(L/4), max(2, eta))` in 2-D: the cap grows with the level up to 4 in 3-D (2 in 2-D), below 2^d, at which a level-L cloud would carry the nominal mass of level L-1 |
+| `cloud_resample_eta` (P) | 1.5 | R mass cap: a cloud of level L ends at most at eta_L times the level's nominal cloud mass; eta_L = eta on every level unless `cloud_resample_eta_levels` is set |
+| `cloud_resample_eta_levels` | (none) | `auto`: eta_L = `min(eta 2^(L/2), max(4, eta))` in 3-D and `min(eta 2^(L/4), max(2, eta))` in 2-D (with eta = 2 in 3-D: 2, 2.83, 4, 4, ...), a cap that grows with the level up to 4 in 3-D and 2 in 2-D (unless eta is larger), below 2^d, at which a level-L cloud would carry the nominal mass of level L-1. A list of numbers gives eta_L per level as given (also above 4; <= 0: no cap on that level), e.g. `2 2.83 4 4` for levels 0-3; the last value holds for deeper levels |
 | `cloud_resample_schedule`, `cloud_resample_dt_omega` (P) | `time`, 0.25 | R every 0.25/Omega (shearing box); `cloud_resample_dt` in code time instead |
 | `cloud_resample_interval` (P) | 625 | R every N cycles (`cloud_resample_schedule = cycle`) |
 | `cloud_resample_after_regrid` (P) | false | also resample right after each regrid |

@@ -7,6 +7,7 @@
 //! \brief implementation of DustGasDrag class constructor and support functions
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -707,16 +708,22 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // the production cap factor
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 1.5);
       {
-        // per-level eta_L: an explicit list, or the default growth with level up to a ceiling
-        // (in 3-D eta = 8 would give a cloud of level L the nominal mass of level L - 1)
+        // per-level eta_L: without <dust>/cloud_resample_eta_levels the same eta on every level;
+        // "auto": growth with the level up to a ceiling (in 3-D eta = 8 would give a cloud of
+        // level L the nominal mass of level L - 1); a list of numbers: eta_L as given
         const bool three = pmy_pack->pmesh->three_d;
         std::vector<Real> given;
+        bool grow = false;
         if (pin->DoesParameterExist("dust", "cloud_resample_eta_levels")) {
           const std::string lv = pin->GetString("dust", "cloud_resample_eta_levels");
-          if (!ParseRealList(lv, given) || given.empty()) {
+          std::string word;
+          for (char c : lv) if (!std::isspace(static_cast<unsigned char>(c))) word += std::tolower(c);
+          if (word == "auto") {
+            grow = true;
+          } else if (!ParseRealList(lv, given) || given.empty()) {
             std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                      << "<dust>/cloud_resample_eta_levels = '" << lv << "' must be one or more "
-                      << "numbers" << std::endl;
+                      << "<dust>/cloud_resample_eta_levels = '" << lv << "' must be auto or one or "
+                      << "more numbers" << std::endl;
             std::exit(EXIT_FAILURE);
           }
         }
@@ -726,7 +733,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           Real e;
           if (!given.empty()) {
             e = given[std::min(l, static_cast<int>(given.size()) - 1)];
-          } else if (cloud_resample_eta <= 0.0) {
+          } else if (!grow || cloud_resample_eta <= 0.0) {
             e = cloud_resample_eta;
           } else {
             const Real top = three ? std::max<Real>(4.0, cloud_resample_eta)
