@@ -85,6 +85,23 @@ struct SelfGravity::PhaseAssembly {
   std::exception_ptr error;
 };
 
+// Inputs and host-only products of one hierarchy assembly (RebuildDistributed).
+struct SelfGravity::HierarchyAssembly {
+  Real shift = 0;
+  int topology = -1;
+  int rank = 0, nranks = 1, threads = 1;
+  bool vacuum = false;                     // isolated x3 by the vacuum mesh
+  std::vector<GravityPatch> patches;       // moved into the assembly
+  CompositeDomain domain;
+  std::unique_ptr<VacuumMesh> vacuum_mesh;
+  bool neumann_z = false;
+  GeometricSystem setup;
+  HierarchyBuildTimes times;
+  double geometry_s = 0, assembly_s = 0;   // host seconds (vacuum mesh, hierarchy)
+  std::thread worker;
+  std::exception_ptr error;
+};
+
 SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack) {
   auto *pm = pack->pmesh;
   if (pack->phydro == nullptr || pack->pmhd != nullptr ||
@@ -186,6 +203,7 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   restart_ = pin->GetOrAddInteger("gravity", "gmres_restart", 24);
   report_each_solve_ = pin->GetOrAddBoolean("gravity", "report_each_solve", false);
   profile_ = pin->GetOrAddBoolean("gravity", "profile", false);
+  SetupTimesOn() = profile_;
   phase_threads_ = pin->GetOrAddInteger("gravity", "phase_threads", 0);
   if (phase_threads_ < 0) Fail("gravity/phase_threads must be nonnegative");
   // Host workers of a full hierarchy setup (0: every affinity CPU in device
@@ -215,6 +233,9 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
 #endif
     prefetch_enabled_ = pin->GetOrAddBoolean("gravity", "phase_prefetch", device_build)
                         && !phase_serial_only_;
+    // the host assembly of the next hierarchy during the rest of a regrid (same defaults)
+    hierarchy_prefetch_enabled_ = pin->GetOrAddBoolean("gravity", "rebuild_prefetch",
+                                                       device_build) && !phase_serial_only_;
     // KDK reuse of the closing field at the next opening solve (default off: the
     // reused field differs from a re-solve by the deposit round-off of the exact
     // representation changes); reuse_check adds the fresh deposit, the true residual of
@@ -283,6 +304,8 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
 SelfGravity::~SelfGravity() {
   JoinPrefetch();
   prefetch_.reset();
+  JoinHierarchyPrefetch();
+  hierarchy_prefetch_.reset();
   delete energy_bval_;
   if (reuse_check_ && global_variable::my_rank == 0) {
     std::cout << std::setprecision(6) << "# SG_REUSE_CHECK_SUMMARY reuses=" << reuse_count_
@@ -302,6 +325,8 @@ SelfGravity::~SelfGravity() {
               << " extrapolated_guesses=" << guess_extrapolations_
               << " phase_prefetch_used=" << prefetch_used_
               << " phase_prefetch_discarded=" << prefetch_discarded_
+              << " rebuild_prefetch_used=" << hierarchy_prefetch_used_
+              << " rebuild_prefetch_discarded=" << hierarchy_prefetch_discarded_
               << " iterations=" << last_solve.iterations
               << " relative_residual=" << last_solve.relative_residual
               << " source_mean=" << last_source_mean << " time=" << last_time << '\n';
@@ -507,18 +532,18 @@ void SelfGravity::Rebuild(Real shear_offset) {
   system_.reset();
 }
 
-void SelfGravity::RebuildDistributed(Real shear_offset) {
-  const double t0 = ProfileTime(profile_);
-  BuildTimes() = HierarchyBuildTimes{};
+// The patches and domain of the current mesh for a hierarchy assembly (main thread).
+void SelfGravity::HierarchyInputs(Real shear_offset, int threads,
+                                  HierarchyAssembly &job) const {
   auto *pm = pack_->pmesh;
   const auto ind = pm->mb_indcs;
-  const int rank = global_variable::my_rank, nranks = global_variable::nranks;
-  const GlobalIndex nc64 = GlobalIndex(ind.nx1)*ind.nx2*ind.nx3;
-  if (nc64*pack_->nmb_thispack > std::numeric_limits<int>::max()) {
-    Fail("owned hydro cells exceed the local device index capacity");
-  }
-  const int nc = static_cast<int>(nc64), physical_n = pack_->nmb_thispack*nc;
-  CompositeDomain domain;
+  const int nranks = global_variable::nranks;
+  job.shift = shear_offset;
+  job.topology = pm->GetAMRLoadBalanceUpdateSeq();
+  job.rank = global_variable::my_rank;
+  job.nranks = nranks;
+  job.threads = threads;
+  CompositeDomain &domain = job.domain;
   domain.ndim = pm->three_d ? 3 : 2;
   domain.lo = {pm->mesh_size.x1min,pm->mesh_size.x2min,pm->mesh_size.x3min};
   domain.hi = {pm->mesh_size.x1max,pm->mesh_size.x2max,pm->mesh_size.x3max};
@@ -526,7 +551,9 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
   domain.shear_offset = shear_offset;
   domain.isolated_z = vertical_bc_ == "isolated";
   domain.shear_phase_updates = pm->mesh_bcs[0] == BoundaryFlag::shear_periodic;
-  std::vector<GravityPatch> patches(pm->nmb_total);
+  job.vacuum = domain.isolated_z && isolated_method_ == "vacuum";
+  auto &patches = job.patches;
+  patches.assign(pm->nmb_total,GravityPatch{});
   const int counts[3] = {ind.nx1,ind.nx2,ind.nx3};
   for (int m = 0; m < pm->nmb_total; ++m) {
     const auto loc = pm->lloc_eachmb[m];
@@ -547,20 +574,104 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
       }
     }
   }
-  std::unique_ptr<VacuumMesh> vacuum_mesh;
-  solver_neumann_z_ = false;
-  if (domain.isolated_z && isolated_method_ == "vacuum") {
-    try {
-      vacuum_mesh = std::make_unique<VacuumMesh>(BuildVacuumMesh(patches,domain,nranks));
-      patches = vacuum_mesh->patches;
-      domain = vacuum_mesh->domain;
-      solver_neumann_z_ = vacuum_mesh->neumann_z;
-    } catch (const std::exception &e) { Fail(e.what()); }
+}
+
+// Host only (no MPI, no device work, no SelfGravity state): the vacuum mesh and the
+// geometric hierarchy of the job's patches.
+void SelfGravity::AssembleHierarchy(HierarchyAssembly &job) {
+  auto now = []() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  const double t0 = now();
+  BuildTimes() = HierarchyBuildTimes{};
+  job.neumann_z = false;
+  if (job.vacuum) {
+    job.vacuum_mesh = std::make_unique<VacuumMesh>(
+        BuildVacuumMesh(job.patches,job.domain,job.nranks));
+    job.patches = job.vacuum_mesh->patches;
+    job.domain = job.vacuum_mesh->domain;
+    job.neumann_z = job.vacuum_mesh->neumann_z;
   }
+  const double t1 = now();
+  job.setup = BuildGeometricHierarchy(std::move(job.patches),job.domain,job.rank,job.nranks,
+                                      job.neumann_z,true,job.threads);
+  job.times = BuildTimes();
+  job.geometry_s = t1-t0;
+  job.assembly_s = now()-t1;
+}
+
+void SelfGravity::JoinHierarchyPrefetch() {
+  if (hierarchy_prefetch_ && hierarchy_prefetch_->worker.joinable())
+    hierarchy_prefetch_->worker.join();
+}
+
+void SelfGravity::PrefetchHierarchy(Real time) {
+  if (!hierarchy_prefetch_enabled_ || setup_ != "distributed" || !std::isfinite(time)) return;
+  JoinPrefetch();   // a phase assembly of the old mesh first (it would only compete for the cores)
+  if (hierarchy_prefetch_) {   // an unused earlier request
+    JoinHierarchyPrefetch();
+    hierarchy_prefetch_.reset();
+    ++hierarchy_prefetch_discarded_;
+  }
+  // one core less than the synchronous setup: the main thread goes on with the regrid
+  const int threads = phase_serial_only_ ? 1 : setup_threads_;
+  const int workers = std::max(1,MeshGeometry::ResolveSetupThreads(threads)-1);
+  auto job = std::make_unique<HierarchyAssembly>();
+  HierarchyInputs(ShearShift(time),workers,*job);
+  auto *p = job.get();
+  p->worker = std::thread([p]() {
+    try { AssembleHierarchy(*p); } catch (...) { p->error = std::current_exception(); }
+  });
+  hierarchy_prefetch_ = std::move(job);
+}
+
+void SelfGravity::RebuildDistributed(Real shear_offset) {
+  const double t0 = ProfileTime(profile_);
+  auto *pm = pack_->pmesh;
+  const auto ind = pm->mb_indcs;
+  const int rank = global_variable::my_rank;
+  const GlobalIndex nc64 = GlobalIndex(ind.nx1)*ind.nx2*ind.nx3;
+  if (nc64*pack_->nmb_thispack > std::numeric_limits<int>::max()) {
+    Fail("owned hydro cells exceed the local device index capacity");
+  }
+  const int nc = static_cast<int>(nc64), physical_n = pack_->nmb_thispack*nc;
+  // the assembly started by PrefetchHierarchy, if it is the one of this mesh and offset;
+  // otherwise the same assembly here
+  std::unique_ptr<HierarchyAssembly> job;
+  bool prefetched = false;
+  double prefetch_wait_s = 0;
+  if (hierarchy_prefetch_) {
+    const auto t_wait = std::chrono::steady_clock::now();
+    JoinHierarchyPrefetch();
+    prefetch_wait_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now()-t_wait).count();
+    job = std::move(hierarchy_prefetch_);
+    prefetched = job->topology == pm->GetAMRLoadBalanceUpdateSeq() && job->shift == shear_offset;
+    if (prefetched) {
+      ++hierarchy_prefetch_used_;
+    } else {
+      ++hierarchy_prefetch_discarded_;
+      job.reset();
+    }
+  }
+  if (!job) {
+    job = std::make_unique<HierarchyAssembly>();
+    HierarchyInputs(shear_offset,phase_serial_only_ ? 1 : setup_threads_,*job);
+    try { AssembleHierarchy(*job); } catch (...) { job->error = std::current_exception(); }
+  }
+  if (job->error) {
+    try { std::rethrow_exception(job->error); } catch (const std::exception &e) { Fail(e.what()); }
+  }
+  BuildTimes() = job->times;
+  const double job_geometry_s = job->geometry_s, job_assembly_s = job->assembly_s;
+  CompositeDomain domain = job->domain;
+  std::unique_ptr<VacuumMesh> vacuum_mesh = std::move(job->vacuum_mesh);
+  solver_neumann_z_ = job->neumann_z;
   const double t_geometry = ProfileTime(profile_);
   try {
-    auto setup = BuildGeometricHierarchy(std::move(patches),domain,rank,nranks,solver_neumann_z_,
-                                         true,phase_serial_only_ ? 1 : setup_threads_);
+    auto setup = std::move(job->setup);
+    job.reset();
     const double t_assembly = ProfileTime(profile_);
     const auto old_partition = partition_;
     partition_ = setup.fine.row_partition;
@@ -582,7 +693,17 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
     if (std::find(physical_rows.begin(),physical_rows.end(),-1) != physical_rows.end()) {
       Fail("distributed gravity omitted an owned hydro source cell");
     }
+    // the host loops of the operator construction on the setup threads (results
+    // independent of the count); 1 again afterwards (phase updates)
+    struct OperatorThreads {
+      explicit OperatorThreads(int n) { OperatorSetupThreads() = std::max(1,n); }
+      ~OperatorThreads() { OperatorSetupThreads() = 1; }
+    };
+    const int op_threads = setup.fine_geometry->SetupThreads();
+    OperatorThreads operator_threads(op_threads);
+    SetupTimes() = OperatorSetupTimes{};
     mg_ = std::make_unique<SparseMultigrid>(setup.hierarchy);
+    const double t_multigrid = ProfileTime(profile_);
     for (int d = 0; d < domain.ndim; ++d) {
       force_[d] = std::make_unique<DistributedOperator>(setup.fine.acceleration[d],
                                                        partition_,partition_);
@@ -612,6 +733,7 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
     }
     const double t_slab = ProfileTime(profile_);
     AllocateFields(setup.fine.volume,physical_rows,keep_guess);
+    const double t_fields = ProfileTime(profile_);
     solver_domain_ = domain;
     solver_patches_ = setup.patches[0];
     geometry_ = std::move(setup.fine_geometry);
@@ -672,14 +794,29 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
                 << std::accumulate(setup.quadratic_interface_fallbacks.begin(),
                     setup.quadratic_interface_fallbacks.end(),std::size_t(0))
                 << " fine_quadratic_interface_fallbacks=" << setup.fine.quadratic_interface_fallbacks
-                << " geometry_s=" << t_geometry-t0 << " assembly_s=" << t_assembly-t_geometry
+                << " geometry_s=" << job_geometry_s << " assembly_s=" << job_assembly_s
+                << " hierarchy_prefetched=" << prefetched
+                << " hierarchy_wait_s=" << t_geometry-t0
+                << " prefetch_wait_s=" << prefetch_wait_s
                 << " assembly_geometry_s=" << BuildTimes().geometry
                 << " assembly_fine_s=" << BuildTimes().fine_system
                 << " assembly_transfers_s=" << BuildTimes().transfers
                 << " assembly_coarse_s=" << BuildTimes().coarse_system
                 << " operators_s=" << t_operators-t_assembly
+                << " op_multigrid_s=" << t_multigrid-t_assembly
+                << " op_force_s=" << t_operators-t_multigrid
+                << " op_threads=" << op_threads
+                << " op_partition_s=" << SetupTimes().partition
+                << " op_check_s=" << SetupTimes().check
+                << " op_diagonal_s=" << SetupTimes().diagonal
+                << " op_ghosts_s=" << SetupTimes().ghosts
+                << " op_halo_s=" << SetupTimes().halo
+                << " op_columns_s=" << SetupTimes().columns
+                << " op_upload_s=" << SetupTimes().upload
+                << " op_coarse_s=" << SetupTimes().coarse
                 << " slab_setup_s=" << t_slab-t_operators
                 << " boundary_setup_s=" << t_slab-t_operators
+                << " fields_s=" << t_fields-t_slab
                 << " vectors_s=" << ProfileTime(true)-t_slab
                 << " global_a_nnz=" << global_nnz << " local_a_nnz=" << storage.a_nnz
                 << " local_p_nnz=" << storage.p_nnz << " local_r_nnz=" << storage.r_nnz

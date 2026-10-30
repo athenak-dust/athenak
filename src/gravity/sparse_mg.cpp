@@ -3,14 +3,19 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 #include "gravity/sparse_mg.hpp"
+#include "gravity/host_workers.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <exception>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <unordered_map>
 
@@ -19,10 +24,39 @@ PhaseUpdateTimes &PhaseTimes() {
   static PhaseUpdateTimes times;
   return times;
 }
+OperatorSetupTimes &SetupTimes() {
+  static OperatorSetupTimes times;
+  return times;
+}
+bool &SetupTimesOn() {
+  static bool on = false;
+  return on;
+}
+int &OperatorSetupThreads() {
+  static int threads = 1;
+  return threads;
+}
 namespace {
 double HostSeconds() {
   return std::chrono::duration<double>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// adds the host seconds of its scope to a bucket of SetupTimes()
+// (only with <gravity>/profile: SetupTimesOn)
+struct SetupLap {
+  double &bucket;
+  const bool on;
+  const double begin;
+  explicit SetupLap(double &b) : bucket(b), on(SetupTimesOn()), begin(on ? HostSeconds() : 0.0) {}
+  ~SetupLap() { if (on) bucket += HostSeconds()-begin; }
+};
+
+// host workers and consecutive chunks for `items` loop iterations of the operator setup
+// (one worker per 64k items, at most OperatorSetupThreads(); four chunks per worker)
+void SetupChunks(std::size_t items, int &workers, int &chunks) {
+  const std::size_t threads = std::max(1,OperatorSetupThreads());
+  workers = static_cast<int>(std::max<std::size_t>(1,std::min(threads,items/65536)));
+  chunks = workers == 1 ? 1 : 4*workers;
 }
 using Vector = DvceArray1D<Real>;
 using Indices = DvceArray1D<int>;
@@ -66,12 +100,17 @@ void MergeScaledSquares(void *input, void *inout, int *length, MPI_Datatype *) {
 }
 #endif
 
+// the device copy of a host vector: no zero fill of the new view, no host mirror (the
+// vector's storage is copied directly)
 template <typename T>
 DvceArray1D<T> DeviceCopy(const std::vector<T> &data, const char *name) {
-  DvceArray1D<T> result(std::string(name), data.size());
-  auto host = Kokkos::create_mirror_view(result);
-  for (std::size_t i = 0; i < data.size(); ++i) host(i) = data[i];
-  Kokkos::deep_copy(result, host);
+  DvceArray1D<T> result(Kokkos::view_alloc(Kokkos::WithoutInitializing,std::string(name)),
+                        data.size());
+  if (!data.empty()) {
+    Kokkos::View<const T *, LayoutWrapper, HostMemSpace,
+                 Kokkos::MemoryTraits<Kokkos::Unmanaged>> host(data.data(),data.size());
+    Kokkos::deep_copy(result, host);
+  }
   return result;
 }
 
@@ -307,14 +346,47 @@ struct SparseMultigrid::Impl {
         && a.rowptr.size()-1 == static_cast<size_t>(rows[rank+1]-rows[rank]);
     if (good) {
       good = a.rowptr.front() == 0
-          && a.rowptr.back() == static_cast<int>(a.values.size())
-          && std::is_sorted(a.rowptr.begin(), a.rowptr.end());
-      for (size_t k = 0; good && k < a.values.size(); ++k) {
-        good = a.colidx[k] >= 0 && a.colidx[k] < a.global_cols
-            && std::isfinite(a.values[k]);
-      }
+          && a.rowptr.back() == static_cast<int>(a.values.size());
+    }
+    if (good) {
+      // sorted offsets, columns in range and finite values, checked in chunks
+      SetupLap lap(SetupTimes().check);
+      const std::size_t steps = a.rowptr.size()-1, nnz = a.values.size();
+      int workers = 1, chunks = 1;
+      SetupChunks(steps+nnz,workers,chunks);
+      std::vector<char> chunk_good(chunks,1);
+      ParallelChunks(workers,chunks,[&](int c) {
+        bool g = true;
+        for (std::size_t i = steps*c/chunks; g && i < steps*(c+1)/chunks; ++i)
+          g = !(a.rowptr[i+1] < a.rowptr[i]);
+        for (std::size_t k = nnz*c/chunks; g && k < nnz*(c+1)/chunks; ++k)
+          g = a.colidx[k] >= 0 && a.colidx[k] < a.global_cols && std::isfinite(a.values[k]);
+        chunk_good[c] = g;
+      });
+      good = std::find(chunk_good.begin(),chunk_good.end(),0) == chunk_good.end();
     }
     Require(good, "invalid owned CSR shape, offsets, columns, values, or ownership");
+  }
+
+  // The summed diagonal entries of the owned rows of a (in each row's entry order),
+  // computed in row chunks.
+  static std::vector<Real> DiagonalSums(const LocalCsr &a) {
+    const int n = a.LocalRows();
+    std::vector<Real> diagonal(n);
+    int workers = 1, chunks = 1;
+    SetupChunks(a.values.size(),workers,chunks);
+    ParallelChunks(workers,chunks,[&](int c) {
+      const int first = static_cast<int>(static_cast<std::int64_t>(n)*c/chunks);
+      const int last = static_cast<int>(static_cast<std::int64_t>(n)*(c+1)/chunks);
+      for (int i = first; i < last; ++i) {
+        Real d = 0;
+        for (int k = a.rowptr[i]; k < a.rowptr[i+1]; ++k) {
+          if (a.colidx[k] == a.row_begin+i) d += a.values[k];
+        }
+        diagonal[i] = d;
+      }
+    });
+    return diagonal;
   }
 
   static LocalCsr Slice(const HostCsr &a, const std::vector<GlobalIndex> &part,
@@ -389,25 +461,74 @@ struct SparseMultigrid::Impl {
     op.ghost_host = HostArray1D<Real>("gravity_halo_host_recv",ghosts.size());
   }
 
+  // The sorted unique columns of a outside [lo, hi): sorted unique lists of entry chunks,
+  // merged pairwise.
+  static std::vector<GlobalIndex> GhostColumns(const LocalCsr &a, GlobalIndex lo,
+                                               GlobalIndex hi) {
+    const std::size_t nnz = a.colidx.size();
+    int workers = 1, chunks = 1;
+    SetupChunks(nnz,workers,chunks);
+    std::vector<std::vector<GlobalIndex>> pieces(chunks);
+    ParallelChunks(workers,chunks,[&](int c) {
+      auto &g = pieces[c];
+      for (std::size_t k = nnz*c/chunks; k < nnz*(c+1)/chunks; ++k) {
+        const GlobalIndex j = a.colidx[k];
+        if (j < lo || j >= hi) g.push_back(j);
+      }
+      std::sort(g.begin(),g.end());
+      g.erase(std::unique(g.begin(),g.end()),g.end());
+    });
+    for (int width = 1; width < chunks; width *= 2) {
+      const int pairs = (chunks+2*width-1)/(2*width);
+      ParallelChunks(workers,pairs,[&](int q) {
+        const int left = 2*width*q, right = left+width;
+        if (right >= chunks) return;
+        auto &x = pieces[left];
+        auto &y = pieces[right];
+        std::vector<GlobalIndex> merged;
+        merged.reserve(x.size()+y.size());
+        std::set_union(x.begin(),x.end(),y.begin(),y.end(),std::back_inserter(merged));
+        x.swap(merged);
+        std::vector<GlobalIndex>().swap(y);
+      });
+    }
+    return std::move(pieces[0]);
+  }
+
   Operator Build(const LocalCsr &a, const std::vector<GlobalIndex> &outpart,
                  const std::vector<GlobalIndex> &inpart) {
     Operator op;
     op.rows = a.LocalRows(); op.inputs = static_cast<int>(inpart[rank+1]-inpart[rank]);
     op.global_rows = a.global_rows; op.global_cols = a.global_cols; op.row_begin = a.row_begin;
     op.input_partition = inpart;
+    const GlobalIndex lo = inpart[rank], hi = inpart[rank+1];
     std::vector<GlobalIndex> ghosts;
-    for (GlobalIndex j : a.colidx) {
-      if (j < inpart[rank] || j >= inpart[rank+1]) ghosts.push_back(j);
+    {
+      SetupLap lap(SetupTimes().ghosts);
+      ghosts = GhostColumns(a,lo,hi);
     }
-    std::sort(ghosts.begin(),ghosts.end());
-    ghosts.erase(std::unique(ghosts.begin(),ghosts.end()),ghosts.end());
-    BuildHalo(op,ghosts);
-    std::vector<int> columns(a.colidx.size());
-    for (size_t k = 0; k < a.colidx.size(); ++k) {
-      const GlobalIndex j = a.colidx[k];
-      columns[k] = j >= inpart[rank] && j < inpart[rank+1] ? static_cast<int>(j-inpart[rank]) :
-          op.inputs+static_cast<int>(std::lower_bound(ghosts.begin(),ghosts.end(),j)-ghosts.begin());
+    {
+      SetupLap lap(SetupTimes().halo);
+      BuildHalo(op,ghosts);
     }
+    std::vector<int> columns;
+    {
+      SetupLap lap(SetupTimes().columns);
+      const std::size_t nnz = a.colidx.size();
+      columns.resize(nnz);
+      int workers = 1, chunks = 1;
+      SetupChunks(nnz,workers,chunks);
+      const int inputs = op.inputs;
+      ParallelChunks(workers,chunks,[&](int c) {
+        for (std::size_t k = nnz*c/chunks; k < nnz*(c+1)/chunks; ++k) {
+          const GlobalIndex j = a.colidx[k];
+          columns[k] = j >= lo && j < hi ? static_cast<int>(j-lo) :
+              inputs+static_cast<int>(std::lower_bound(ghosts.begin(),ghosts.end(),j)
+                                      -ghosts.begin());
+        }
+      });
+    }
+    SetupLap lap(SetupTimes().upload);
     op.rowptr = DeviceCopy(a.rowptr,"gravity_csr_rows");
     op.colidx = DeviceCopy(columns,"gravity_csr_columns");
     op.values = DeviceCopy(a.values,"gravity_csr_values");
@@ -688,19 +809,23 @@ struct SparseMultigrid::Impl {
 #endif
     Require(null_min == null_max, "inconsistent hierarchy nullspace flag");
     levels.resize(h.matrices.size());
+    // the summed diagonal of every level's owned rows (smoothing check, inverse diagonal)
+    std::vector<std::vector<Real>> diagonals(levels.size());
     for (size_t l = 0; l < levels.size(); ++l) {
-      levels[l].partition = Partition(h.row_partitions,l,h.matrices[l].global_rows);
+      {
+        SetupLap lap(SetupTimes().partition);
+        levels[l].partition = Partition(h.row_partitions,l,h.matrices[l].global_rows);
+      }
       CheckLocal(h.matrices[l],levels[l].partition,levels[l].partition);
       bool good_diagonal = true;
-      if (l+1 < levels.size()) {
-        const auto &a = h.matrices[l];
-        for (int i = 0; i < a.LocalRows(); ++i) {
-          Real diagonal = 0;
-          for (int k = a.rowptr[i]; k < a.rowptr[i+1]; ++k) {
-            if (a.colidx[k] == a.row_begin+i) diagonal += a.values[k];
+      {
+        SetupLap lap(SetupTimes().diagonal);
+        diagonals[l] = DiagonalSums(h.matrices[l]);
+        if (l+1 < levels.size()) {
+          for (Real diagonal : diagonals[l]) {
+            good_diagonal = good_diagonal && diagonal != 0 && std::isfinite(diagonal)
+                && std::isfinite(Real(1)/diagonal);
           }
-          good_diagonal = good_diagonal && diagonal != 0 && std::isfinite(diagonal)
-              && std::isfinite(Real(1)/diagonal);
         }
       }
       Require(good_diagonal, "invalid owned smoothing diagonal");
@@ -717,19 +842,20 @@ struct SparseMultigrid::Impl {
       const auto &a = h.matrices[l];
       level.a = Build(a,part,part);
       const int n = a.LocalRows();
-      std::vector<Real> diagonal(n);
-      for (int i = 0; i < n; ++i) {
-        Real d = 0;
-        for (int k = a.rowptr[i]; k < a.rowptr[i+1]; ++k) {
-          if (a.colidx[k] == a.row_begin+i) d += a.values[k];
+      {
+        SetupLap lap(SetupTimes().upload);
+        auto &diagonal = diagonals[l];
+        for (int i = 0; i < n; ++i) {
+          const Real d = diagonal[i];
+          diagonal[i] = d == 0 ? 0 : 1/d;
         }
-        diagonal[i] = d == 0 ? 0 : 1/d;
+        level.inverse_diagonal = DeviceCopy(diagonal, "gravity_inverse_diagonal");
+        std::vector<Real>().swap(diagonal);
+        level.b = Vector("gravity_level_rhs",n);
+        level.x = Vector("gravity_level_solution",n);
+        level.residual = Vector("gravity_level_residual",n);
+        level.temp = Vector("gravity_level_product",n);
       }
-      level.inverse_diagonal = DeviceCopy(diagonal, "gravity_inverse_diagonal");
-      level.b = Vector("gravity_level_rhs",n);
-      level.x = Vector("gravity_level_solution",n);
-      level.residual = Vector("gravity_level_residual",n);
-      level.temp = Vector("gravity_level_product",n);
       if (l+1 < levels.size()) {
         level.p = Build(h.prolongation[l],part,levels[l+1].partition);
         level.r = Build(h.restriction[l],levels[l+1].partition,part);
@@ -737,6 +863,7 @@ struct SparseMultigrid::Impl {
     }
     // Shared CSR views remain immutable in the cached hierarchy. Halo scratch is
     // used sequentially. First refresh detaches outer values; new patterns rebuild CSR.
+    SetupLap lap(SetupTimes().coarse);
     current_a = levels[0].a;
     current_rowptr = h.matrices[0].rowptr;
     current_columns = h.matrices[0].colidx;
@@ -1474,8 +1601,12 @@ struct DistributedOperator::Impl {
        const std::vector<GlobalIndex> &cols) : backend(new SparseMultigrid::Impl()) {
 #endif
     const std::vector<std::vector<GlobalIndex>> supplied{rows,cols};
-    auto row_partition = backend->Partition(supplied,0,a.global_rows);
-    auto col_partition = backend->Partition(supplied,1,a.global_cols);
+    std::vector<GlobalIndex> row_partition, col_partition;
+    {
+      SetupLap lap(SetupTimes().partition);
+      row_partition = backend->Partition(supplied,0,a.global_rows);
+      col_partition = backend->Partition(supplied,1,a.global_cols);
+    }
     backend->CheckLocal(a,row_partition,col_partition);
     op = backend->Build(a,row_partition,col_partition);
   }

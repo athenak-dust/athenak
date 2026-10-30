@@ -7,7 +7,9 @@
 //! \brief implementation of DustGasDrag class constructor and support functions
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -28,6 +30,22 @@
 #include "dust_resample.hpp"
 
 namespace dust {
+
+bool ParseRealList(const std::string &text, std::vector<Real> &out) {
+  std::string s = text;
+  for (char &c : s) if (c == ',') c = ' ';
+  std::istringstream in(s);
+  std::string tok;
+  out.clear();
+  while (in >> tok) {
+    char *end = nullptr;
+    errno = 0;
+    const double v = std::strtod(tok.c_str(), &end);
+    if (end == tok.c_str() || *end != '\0' || errno == ERANGE || !std::isfinite(v)) return false;
+    out.push_back(static_cast<Real>(v));
+  }
+  return true;
+}
 
 //----------------------------------------------------------------------------------------
 // constructor: parses input, validates configuration, allocates deposit fields and
@@ -165,6 +183,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // every new block the cost 1 as AthenaK does; one rank never uses it
   lb_cloud_weight = pin->GetOrAddReal("dust", "load_balance_cloud_weight", 4.0);
   lb_log_interval = pin->GetOrAddInteger("dust", "load_balance_log", 0);
+  lb_octant_count = pin->GetOrAddBoolean("dust", "load_balance_octant_count", true);
+  // the partition of the regrids with the smallest largest rank cost (Mesh::LoadBalance)
+  pmy_pack->pmesh->lb_minmax = pin->GetOrAddBoolean("dust", "load_balance_minmax", true);
   if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {   // (block map: the only one)
     halo_trigger_cells = std::max(0, pin->GetOrAddInteger("dust", "amr_rho_buffer", 2));
   }
@@ -685,6 +706,38 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       // the production cap factor
       cloud_resample_eta = pin->GetOrAddReal("dust", "cloud_resample_eta", 1.5);
+      {
+        // per-level eta_L: an explicit list, or the default growth with level up to a ceiling
+        // (in 3-D eta = 8 would give a cloud of level L the nominal mass of level L - 1)
+        const bool three = pmy_pack->pmesh->three_d;
+        std::vector<Real> given;
+        if (pin->DoesParameterExist("dust", "cloud_resample_eta_levels")) {
+          const std::string lv = pin->GetString("dust", "cloud_resample_eta_levels");
+          if (!ParseRealList(lv, given) || given.empty()) {
+            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                      << "<dust>/cloud_resample_eta_levels = '" << lv << "' must be one or more "
+                      << "numbers" << std::endl;
+            std::exit(EXIT_FAILURE);
+          }
+        }
+        const int nlev = ResampleCapTable::kLevels;
+        cloud_resample_eta_lev.assign(nlev, 0.0);
+        for (int l=0; l<nlev; ++l) {
+          Real e;
+          if (!given.empty()) {
+            e = given[std::min(l, static_cast<int>(given.size()) - 1)];
+          } else if (cloud_resample_eta <= 0.0) {
+            e = cloud_resample_eta;
+          } else {
+            const Real top = three ? std::max<Real>(4.0, cloud_resample_eta)
+                                   : std::max<Real>(2.0, cloud_resample_eta);
+            e = std::min(cloud_resample_eta*std::exp2(three ? 0.5*l : 0.25*l), top);
+          }
+          cloud_resample_eta_lev[l] = e;
+          // eta_L / 2^(d L) exactly (a power of two)
+          cloud_resample_cap.f[l] = (e > 0.0) ? std::ldexp(e, -(three ? 3 : 2)*l) : -1.0;
+        }
+      }
       // resampling leaves cold patches alone (careful_merge: 0.05; 0 = off)
       cloud_resample_cold_alpha = preset_real("cloud_resample_cold_alpha", careful ? 0.05 : 0.0);
       cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
@@ -1060,7 +1113,13 @@ void DustGasDrag::PrintRefinablePreset() const {
   }
   r << "R " << (cloud_resample ? "on" : "off");
   if (cloud_resample) {
-    r << " (eta " << cloud_resample_eta << ", cold gate alpha " << cloud_resample_cold_alpha
+    // eta_L of the levels of this mesh
+    const int nshow = std::min<int>(ResampleCapTable::kLevels,
+                                    pmy_pack->pmesh->max_level - pmy_pack->pmesh->root_level + 1);
+    std::ostringstream el;
+    for (int l=0; l<nshow; ++l) el << (l ? " " : "") << std::setprecision(4) << cloud_resample_eta_lev[l];
+    r << " (eta " << cloud_resample_eta << ", per level " << el.str() << ", cold gate alpha "
+      << cloud_resample_cold_alpha
       << ", " << sched(cloud_resample_by_time, cloud_resample_dt, cloud_resample_interval)
       << ", after regrids " << (cloud_resample_after_regrid ? "on" : "off") << ")";
   }

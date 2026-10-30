@@ -12,6 +12,7 @@
 #include <vector>
 #include <algorithm>
 #include <Kokkos_Core.hpp>
+#include <Kokkos_Sort.hpp>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -420,6 +421,14 @@ TaskStatus ParticlesBoundaryValues::CountSendsAndRecvs() {
     nsends = 0; nrecvs = 0; nprtcl_send = 0; nprtcl_recv = 0;
     return TaskStatus::complete;
   }
+  if (send_sort_device && nprtcl_send > kDeviceSortMin && DevExeSpace().concurrency() > 1) {
+    // (destination rank, particle index) on the device (see send_sort_device); the host
+    // copy for the message counts below
+    auto d_prefix = Kokkos::subview(sendlist.d_view, std::make_pair(0, nprtcl_send));
+    auto h_prefix = Kokkos::subview(sendlist.h_view, std::make_pair(0, nprtcl_send));
+    Kokkos::sort(DevExeSpace(), d_prefix, ParticleRankIndexLess());
+    Kokkos::deep_copy(h_prefix, d_prefix);
+  } else {
   // Sort sendlist on host by destrank.
   std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByRank);
   // Copy only the sorted valid prefix back to the device.
@@ -429,6 +438,7 @@ TaskStatus ParticlesBoundaryValues::CountSendsAndRecvs() {
     auto d_prefix = Kokkos::subview(sendlist.d_view,
                                     std::make_pair(0, nprtcl_send));
     Kokkos::deep_copy(d_prefix, h_prefix);
+  }
   }
 
   // load STL::vector of ParticleMessageData with <sendrank, recvrank, nprtcls> for sends
@@ -710,15 +720,23 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
   // exit if particle communications have not completed
   if (bflag) {return TaskStatus::incomplete;}
 
-  // Sort sendlist on host by index in particle array
-  std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByIndex);
-  // Copy only the sorted valid prefix back to the device.
-  if (nprtcl_send > 0) {
-    auto h_prefix = Kokkos::subview(sendlist.h_view,
-                                    std::make_pair(0, nprtcl_send));
-    auto d_prefix = Kokkos::subview(sendlist.d_view,
-                                    std::make_pair(0, nprtcl_send));
-    Kokkos::deep_copy(d_prefix, h_prefix);
+  // Sort sendlist by index in particle array.  The indices are unique, so every sort gives
+  // the same list: long lists are sorted on the device (the device copy is the rank-sorted
+  // list of CountSendsAndRecvs), and their holes are filled on the device below
+  const bool device_list = nprtcl_send > kDeviceSortMin && DevExeSpace().concurrency() > 1;
+  if (device_list) {
+    auto d_prefix = Kokkos::subview(sendlist.d_view, std::make_pair(0, nprtcl_send));
+    Kokkos::sort(DevExeSpace(), d_prefix, ParticleIndexLess());
+  } else {
+    std::sort(sendlist.h_view.data(), sendlist.h_view.data() + nprtcl_send, SortByIndex);
+    // Copy only the sorted valid prefix back to the device.
+    if (nprtcl_send > 0) {
+      auto h_prefix = Kokkos::subview(sendlist.h_view,
+                                      std::make_pair(0, nprtcl_send));
+      auto d_prefix = Kokkos::subview(sendlist.d_view,
+                                      std::make_pair(0, nprtcl_send));
+      Kokkos::deep_copy(d_prefix, h_prefix);
+    }
   }
 
   // increase size of particle arrays if needed.  The arrays keep their capacity (their
@@ -762,7 +780,35 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
   // If (nprtcl_recv < nprtcl_send), have to move particles from end of arrays to fill
   // remaining holes
   int nremain = nprtcl_send - nprtcl_recv;
-  if (nremain > 0) {
+  if (nremain > 0 && device_list) {
+    // the same (hole, last particle) pairs as the host loop below, on the device: the
+    // particles of the tail [npart - nremain, npart) that are not holes, from the end, into
+    // the holes below the tail in increasing order (sendlist(nrecv), sendlist(nrecv+1), ...;
+    // every hole of a received particle lies below the tail)
+    const int npart = pmy_part->nprtcl_thispack;
+    const int first_tail = npart - nremain, nrecv = nprtcl_recv, nsend = nprtcl_send;
+    auto sl = sendlist.d_view;
+    DvceArray1D<int> tail_hole("prtcl_tail_hole", nremain);
+    par_for("prtcl_tail_holes",DevExeSpace(),nrecv,nsend-1, KOKKOS_LAMBDA(const int k) {
+      const int p = sl(k).prtcl_indx;
+      if (p >= first_tail) tail_hole(p - first_tail) = 1;
+    });
+    auto &pr = pmy_part->prtcl_rdata;
+    auto &pi = pmy_part->prtcl_idata;
+    const int nrdata = pmy_part->nrdata, nidata = pmy_part->nidata;
+    Kokkos::parallel_scan("prtcl_fill_holes_scan",
+                          Kokkos::RangePolicy<>(DevExeSpace(), 0, nremain),
+    KOKKOS_LAMBDA(const int j, int &q, const bool final) {
+      const int src = npart - 1 - j;
+      if (tail_hole(src - first_tail)) return;
+      if (final) {
+        const int dst = sl(nrecv + q).prtcl_indx;
+        for (int i=0; i<nrdata; ++i) pr(i,dst) = pr(i,src);
+        for (int i=0; i<nidata; ++i) pi(i,dst) = pi(i,src);
+      }
+      ++q;
+    });
+  } else if (nremain > 0) {
     // the (hole, last particle) pairs as before, found on the host; the copies in one kernel
     // instead of two device copies per pair
     int &npart = pmy_part->nprtcl_thispack;

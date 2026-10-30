@@ -11,7 +11,7 @@
 //! the new masses keep, to round-off, every leaf's deposited mass and momentum, the three
 //! components of the frozen-gas drag feedback of every leaf (AuditFeedback), the centre of
 //! mass and the six velocity second moments of the patch; a mass never exceeds its cap
-//! eta m0 / 4^level.  Clouds above the cap are left alone, and so are the clouds already at
+//! eta_L m0 / 2^(d level) (DustGasDrag::cloud_resample_cap).  Clouds above the cap are left alone, and so are the clouds already at
 //! the cap.
 //!
 //! Device: selection of the pool, production gather of the gas velocity, cloud weights as a
@@ -575,7 +575,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
   // the root cloud mass (reduced over the ranks): also before any return
   if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
   if (npart == 0) return 0;
-  // the root cloud mass of every species (cap eta m0 / 4^level): cloud_resample_m0 for all of
+  // the root cloud mass of every species (cap eta_L m0 / 4^level): cloud_resample_m0 for all of
   // them, else the merge pass's per-species value.  The patches are also split by
   // species, so every species keeps its own leaf masses (one species: no change)
   // A species without such a value (no plain level-0/1 cloud) has a cap of zero: its clouds
@@ -698,7 +698,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
   // square is one patch in the slot of its lower-left cell
   const int psplit = cloud_resample_patch_split;
   const int psub = (psplit > 0) ? kc*kc : 1;
-  const Real eta = cloud_resample_eta;
+  const ResampleCapTable rcap = cloud_resample_cap;   // eta_L m0 / 2^(d L) per level
   auto t_all = Clock::now();
   Kokkos::fence();
   auto t0 = Clock::now();
@@ -746,7 +746,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
       if (use_mask && (am < 0 || am >= nmbp || rmask(am) == 0)) return;
       const int lev = SMRCompositeTransfer::CloudLevel(code);
       const int sp = (pic(PSP,p) >= 0 && pic(PSP,p) < nsp) ? pic(PSP,p) : 0;
-      const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
+      const Real cap = rcap.Cap(m0sp(sp), lev);
       if (!(prc(IPM,p) <= cap*(1.0 + kPoolTol)) || prc(IPM,p) >= cap*(1.0 - kCapTol)) return;
       const int t = lt.LeafOwner(prc(IPX,p), prc(IPY,p), am);
       if (t < 0) return;
@@ -794,7 +794,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
       if (am < 0 || am >= nmbp || rmask(am) == 0) return;
     }
     const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-    const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
+    const Real cap = rcap.Cap(m0sp(sp), lev);
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
     if (pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
     if (calpha > 0.0 && cq(p) >= 0 && ccold(cq(p)) == 1) {ncold += 1.0; return;}   // cold patch
@@ -924,7 +924,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     pd(a,3) = pr(IPVX,p); pd(a,4) = pr(IPVY,p); pd(a,5) = pr(IPVZ,p); pd(a,6) = pr(IPTS,p);
     pd(a,7) = ugx; pd(a,8) = ugy; pd(a,9) = ugz;
     const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-    pd(a,10) = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(1 << (2*lev)) : 1.0e300;
+    pd(a,10) = rcap.Cap(m0sp(sp), lev);
     {
       // the leaf that holds the particle: its block and cell
       const int am = lt.Anchor(pi(PGID,p));
@@ -1250,7 +1250,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ResampleClouds3D
 //! \brief ResampleClouds for 3-D refinable clouds, the device solve only.
-//! The same pool (plain clouds below their cap eta m0 / 8^level, the cold gate, the local event
+//! The same pool (plain clouds below their cap eta_L m0 / 8^level, the cold gate, the local event
 //! mask), patches of k x k x k cells inside one MeshBlock with k = min(s 2^level, kc), split
 //! into octants down to single cells while a patch holds more than cloud_resample_patch_split
 //! clouds, and the rows of every patch: leaf mass, momentum and feedback, the three
@@ -1376,7 +1376,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
   const bool use_mask = local;
   const int psplit = cloud_resample_patch_split;
   const int psub = (psplit > 0) ? kc*kc*kc : 1;
-  const Real eta = cloud_resample_eta;
+  const ResampleCapTable rcap = cloud_resample_cap;   // eta_L m0 / 2^(d L) per level
   auto t_all = Clock::now();
   auto pr = ppar->prtcl_rdata;
   auto pi = ppar->prtcl_idata;
@@ -1423,8 +1423,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       if (use_mask && rmask(am) == 0) return;
       const int lev = T::CloudLevel(code);
       const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-      const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(std::int64_t(1) << (3*lev))
-                                   : 1.0e300;
+      const Real cap = rcap.Cap(m0sp(sp), lev);
       if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol)) || pr(IPM,p) >= cap*(1.0 - kCapTol)) return;
       const int t = lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), am);
       if (t < 0) return;
@@ -1464,8 +1463,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
     if (T::CloudLobe1(code) || T::CloudLobe2(code) || T::CloudLobe3(code)) {nl += 1.0; return;}
     if (use_mask && rmask(lt.Anchor(pi(PGID,p))) == 0) return;
     const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-    const Real cap = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(std::int64_t(1) << (3*lev))
-                                 : 1.0e300;
+    const Real cap = rcap.Cap(m0sp(sp), lev);
     if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
     if (pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}
     if (calpha > 0.0 && cq(p) >= 0 && ccold(cq(p)) == 1) {ncold += 1.0; return;}
@@ -1628,8 +1626,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       pd(a,resample::JVZ) = pr(IPVZ,p); pd(a,resample::JTS) = pr(IPTS,p);
       pd(a,resample::JUX) = ugx; pd(a,resample::JUY) = ugy; pd(a,resample::JUZ) = ugz;
       const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-      pd(a,resample::JCAP) = (eta > 0.0) ? eta*m0sp(sp)/static_cast<Real>(std::int64_t(1) << (3*lev))
-                                         : 1.0e300;
+      pd(a,resample::JCAP) = rcap.Cap(m0sp(sp), lev);
       const int t = lt.LeafOwner(xp, yp, zp, am);
       if (t < 0) Kokkos::abort("3-D resampling: a pool cloud without a leaf");
       int b, q, cell;

@@ -978,7 +978,9 @@ int DustGasDrag::RouteToOwnerBlocks3D(const char *when) {
   auto *pb = ppar->pbval_part;
   int nchanged = 0, nbad = 0;
 #if MPI_PARALLEL_ENABLED
+  ProfLaps laps(false);   // this rank's phases (only with <dust>/amr_profile)
   WrapParticles3D();
+  laps.Lap("wrap");
   const int npart = ppar->nprtcl_thispack;
   auto pr = ppar->prtcl_rdata;
   auto pi = ppar->prtcl_idata;
@@ -1021,18 +1023,28 @@ int DustGasDrag::RouteToOwnerBlocks3D(const char *when) {
     Kokkos::deep_copy(h, d);
   }
   const int nsent = pb->nprtcl_send;
+  laps.Lap("owner");
   pb->CountSendsAndRecvs();
+  laps.Lap("count");
   pb->InitPrtclRecv();
   pb->PackAndSendPrtcls();
+  laps.Lap("post");
   while (pb->RecvAndUnpackPrtcls() != TaskStatus::complete) {}
+  laps.Lap("recv");
   pb->ClearPrtclSend();
   pb->ClearPrtclRecv();
+  laps.Lap("clear");
   Mesh *pm = pmy_pack->pmesh;
   long long tot = 0;
   for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
   pm->nprtcl_total = static_cast<int>(tot);
   long long sums[2] = {nchanged, nsent};
   MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  laps.Lap("sums");
+  if (ProfOn() && when != nullptr) {
+    std::cout << "# regrid laps route rank=" << global_variable::my_rank << " sent=" << nsent
+              << laps.text << std::endl;
+  }
   if (global_variable::my_rank == 0 && when != nullptr) {   // nullptr: quiet (SplitToLeaves)
     std::cout << "# dust (3-D): MeshBlock ids set from the positions at the " << when
               << ": " << sums[0] << " of " << tot << " changed, " << sums[1]
@@ -1396,7 +1408,8 @@ void DustGasDrag::CloudAdvance3D() {
 //! ranks: the deposits on halo blocks are added to their owners (the halo slots keep this rank's
 //! share).  species >= 0: the clouds of that species (0-based) alone.
 
-void DustGasDrag::DepositCloudDensity3D(DvceArray5D<Real> &f, const int species) {
+void DustGasDrag::DepositCloudDensity3D(DvceArray5D<Real> &f, const int species,
+                                        const bool density_only) {
   if (f.extent_int(0) != qdep.extent_int(0) || f.extent_int(1) != 4 ||
       f.extent_int(2) != qdep.extent_int(2) || f.extent_int(3) != qdep.extent_int(3) ||
       f.extent_int(4) != qdep.extent_int(4)) {
@@ -1420,12 +1433,14 @@ void DustGasDrag::DepositCloudDensity3D(DvceArray5D<Real> &f, const int species)
       lt.Decode(target, tb, tk, tj, ti);
       const Real d = m*w/(lt.box(tb,3)*lt.box(tb,4)*lt.box(tb,5));
       DepositAdd(&ff(tb,0,tk,tj,ti), d);
+      if (density_only) return;
       DepositAdd(&ff(tb,1,tk,tj,ti), d*vx);
       DepositAdd(&ff(tb,2,tk,tj,ti), d*vy);
       DepositAdd(&ff(tb,3,tk,tj,ti), d*vz);
     });
   });
-  HaloReverseAdd(f, 0, 4);   // several ranks: the owners hold every rank's clouds
+  // several ranks: the owners hold every rank's clouds
+  HaloReverseAdd(f, 0, density_only ? 1 : 4);
 }
 
 }  // namespace dust

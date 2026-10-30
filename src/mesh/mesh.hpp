@@ -123,6 +123,10 @@ class Mesh {
   // max_nmb_per_rank: the regrid is not done and the run stops with its final outputs (a restart
   // file) instead of exiting at once
   bool stop_max_nmb = false;
+  // LoadBalance: the contiguous partition with the smallest largest rank cost (set by
+  // <dust>/load_balance_minmax, default true in dust runs) instead of the greedy fill from the
+  // last rank
+  bool lb_minmax = false;
 
   int root_level; // logical level of root (physical) grid (e.g. Fig. 3 of method paper)
   int max_level;  // logical level of maximum refinement grid in Mesh

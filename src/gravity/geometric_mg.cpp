@@ -3,6 +3,7 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 #include "gravity/geometric_mg.hpp"
+#include "gravity/host_workers.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -283,7 +284,7 @@ void ProlongationRow(const MeshGeometry &fine, const MeshGeometry &coarse,
 void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
     const CompositeDomain &domain, int rank, LocalCsr &p, LocalCsr &r,
     TransferDiagnostics &diagnostics, bool neumann_z, std::vector<int> &phase_rows,
-    ProlongationCacheStats &cache_statistics) {
+    ProlongationCacheStats &cache_statistics, int threads) {
   p.global_rows = fine.GlobalRows(); p.global_cols = coarse.GlobalRows();
   p.row_begin = fine.RowPartition()[rank];
   r.global_rows = coarse.GlobalRows(); r.global_cols = fine.GlobalRows();
@@ -375,13 +376,7 @@ void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
     auto run = [&](int w) {
       try { task(w); } catch (...) { errors[w] = std::current_exception(); }
     };
-    std::vector<std::thread> threads;
-    threads.reserve(workers-1);
-    try {
-      for (int w = 1; w < workers; ++w) threads.emplace_back(run,w);
-    } catch (...) { for (auto &thread : threads) thread.join(); throw; }
-    run(0);
-    for (auto &thread : threads) thread.join();
+    ThreadWorkers().Run(workers,run);
     for (const auto &error : errors) if (error) std::rethrow_exception(error);
   };
   auto join = [](LocalCsr &destination, LocalCsr &source) {
@@ -395,7 +390,6 @@ void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
     destination.values.insert(destination.values.end(),source.values.begin(),source.values.end());
     source = LocalCsr{};
   };
-  const int threads = fine.SetupThreads();
   // consecutive chunks (>= 512 rows, up to 16 per worker) taken in any order, joined in order
   auto chunking = [threads](GlobalIndex rows, int &workers, int &chunks) {
     workers = static_cast<int>(std::max<GlobalIndex>(1,std::min<GlobalIndex>(threads,rows/4096)));
@@ -460,41 +454,85 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
   auto lap = [&](double &bucket) { const double t = now(); bucket += t-clock; clock = t; };
   GeometricSystem out;
   out.fine_geometry.reset(new MeshGeometry(std::move(patches),domain,rank,nranks,neumann_z));
-  MeshGeometry *fine = out.fine_geometry.get();
-  fine->SetSetupThreads(threads);
+  // The geometry (patch metadata) of every level first. Then the systems of all levels and
+  // the transfers between them are independent: a transfer only reads the two geometries
+  // (cells, queries, virtual averages), a system writes only the assembly scratch and phase
+  // rows of its own geometry.
+  std::vector<MeshGeometry *> geometry{out.fine_geometry.get()};
+  while (geometry.back()->GlobalRows() > 128) {
+    if (geometry.size() > 64) throw std::runtime_error("Gravity geometric hierarchy exceeded 64 levels");
+    auto coarse_patches = Coarsen(geometry.back()->Patches(),domain);
+    if (Count(coarse_patches) >= geometry.back()->GlobalRows())
+      throw std::runtime_error("Gravity geometric coarsening did not reduce global rows");
+    out.coarse_geometry.emplace_back(new MeshGeometry(std::move(coarse_patches),domain,
+                                                      rank,nranks,neumann_z,true));
+    geometry.push_back(out.coarse_geometry.back().get());
+  }
+  const int levels = static_cast<int>(geometry.size());
+  for (auto *g : geometry) g->SetSetupThreads(threads);
+  const int workers = geometry[0]->SetupThreads();
   lap(times.geometry);
-  out.fine = fine->BuildSystem(fine_forces);
-  lap(times.fine_system);
+  std::vector<LocalCompositeSystem> systems(levels);
+  std::vector<LocalCsr> p(levels-1), r(levels-1);
+  std::vector<TransferDiagnostics> checks(levels-1);
+  std::vector<std::vector<int>> phase_rows(levels-1);
+  std::vector<ProlongationCacheStats> caches(levels-1);
+  // the transfers and coarse systems, level by level, on `chain` workers
+  double chain_transfers = 0, chain_coarse = 0;
+  auto coarse_chain = [&](int chain) {
+    double t = now();
+    for (int l = 0; l+1 < levels; ++l) {
+      Transfers(*geometry[l],*geometry[l+1],domain,rank,p[l],r[l],checks[l],neumann_z,
+                phase_rows[l],caches[l],chain);
+      double u = now(); chain_transfers += u-t; t = u;
+      systems[l+1] = geometry[l+1]->BuildSystem(false);
+      u = now(); chain_coarse += u-t; t = u;
+    }
+  };
+  if (workers >= 2 && levels > 1) {
+    // the fine system on two thirds of the workers, the coarse chain on the rest (both scale
+    // poorly to all cores; the fine system is the larger part: 4-level 3-D GPU run with
+    // 35 workers, fine 0.42 s and chain 0.28 s at a 1:1 split); the coefficients do not
+    // depend on the split
+    // (at most workers in all: the fine system keeps at least one for the chain)
+    const int fine_workers = std::min(workers-1, (2*workers+2)/3), chain = workers-fine_workers;
+    geometry[0]->SetSetupThreads(fine_workers);
+    for (int l = 1; l < levels; ++l) geometry[l]->SetSetupThreads(chain);
+    std::exception_ptr chain_error;
+    std::thread worker([&]() {
+      try { coarse_chain(chain); } catch (...) { chain_error = std::current_exception(); }
+    });
+    try {
+      systems[0] = geometry[0]->BuildSystem(fine_forces);
+    } catch (...) { worker.join(); throw; }
+    lap(times.fine_system);
+    worker.join();
+    lap(times.fine_system);   // (the wait for the coarse chain)
+    if (chain_error) std::rethrow_exception(chain_error);
+    for (auto *g : geometry) g->SetSetupThreads(threads);
+  } else {
+    systems[0] = geometry[0]->BuildSystem(fine_forces);
+    lap(times.fine_system);
+    coarse_chain(workers);
+    clock = now();
+  }
+  times.transfers += chain_transfers;
+  times.coarse_system += chain_coarse;
+  out.fine = std::move(systems[0]);
   out.quadratic_interface_fallbacks.push_back(out.fine.quadratic_interface_fallbacks);
   out.hierarchy.constant_nullspace = !domain.isolated_z || neumann_z;
   out.hierarchy.matrices.push_back(std::move(out.fine.matrix));
-  out.hierarchy.row_partitions.push_back(fine->RowPartition());
-  out.patches.push_back(fine->Patches());
-  for (int level = 0; fine->GlobalRows() > 128; ++level) {
-    if (level >= 64) throw std::runtime_error("Gravity geometric hierarchy exceeded 64 levels");
-    auto coarse_patches = Coarsen(fine->Patches(),domain);
-    if (Count(coarse_patches) >= fine->GlobalRows())
-      throw std::runtime_error("Gravity geometric coarsening did not reduce global rows");
-    std::unique_ptr<MeshGeometry> coarse(new MeshGeometry(std::move(coarse_patches),domain,
-                                                        rank,nranks,neumann_z,true));
-    coarse->SetSetupThreads(threads);
-    lap(times.geometry);
-    LocalCsr p, r; TransferDiagnostics check; std::vector<int> phase_rows;
-    ProlongationCacheStats cache_statistics;
-    Transfers(*fine,*coarse,domain,rank,p,r,check,neumann_z,phase_rows,cache_statistics);
-    lap(times.transfers);
-    out.initial_prolongation_cache.push_back(cache_statistics);
-    auto system = coarse->BuildSystem(false);
-    lap(times.coarse_system);
-    out.quadratic_interface_fallbacks.push_back(system.quadratic_interface_fallbacks);
-    out.hierarchy.matrices.push_back(std::move(system.matrix));
-    out.hierarchy.row_partitions.push_back(coarse->RowPartition());
-    out.hierarchy.prolongation.push_back(std::move(p));
-    out.hierarchy.restriction.push_back(std::move(r));
-    out.prolongation_phase_rows.push_back(std::move(phase_rows));
-    out.patches.push_back(coarse->Patches()); out.transfer_checks.push_back(check);
-    out.coarse_geometry.push_back(std::move(coarse));
-    fine = out.coarse_geometry.back().get();
+  out.hierarchy.row_partitions.push_back(geometry[0]->RowPartition());
+  out.patches.push_back(geometry[0]->Patches());
+  for (int l = 0; l+1 < levels; ++l) {
+    out.initial_prolongation_cache.push_back(caches[l]);
+    out.quadratic_interface_fallbacks.push_back(systems[l+1].quadratic_interface_fallbacks);
+    out.hierarchy.matrices.push_back(std::move(systems[l+1].matrix));
+    out.hierarchy.row_partitions.push_back(geometry[l+1]->RowPartition());
+    out.hierarchy.prolongation.push_back(std::move(p[l]));
+    out.hierarchy.restriction.push_back(std::move(r[l]));
+    out.prolongation_phase_rows.push_back(std::move(phase_rows[l]));
+    out.patches.push_back(geometry[l+1]->Patches()); out.transfer_checks.push_back(checks[l]);
   }
   return out;
 }

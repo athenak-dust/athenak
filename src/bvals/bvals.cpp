@@ -493,6 +493,7 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
   }
   Kokkos::deep_copy(x3_removed.h_view, 0.0);
   Kokkos::deep_copy(x3_removed.d_view, 0.0);
+  send_sort_device = pin->GetOrAddBoolean("particles", "send_sort_device", false);
   if (shear_periodic_x1) {
     qshear_sp = pin->GetReal("shearing_box","qshear");
     omega0_sp = pin->GetReal("shearing_box","omega0");

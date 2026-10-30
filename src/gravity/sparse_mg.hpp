@@ -118,6 +118,23 @@ struct PhaseUpdateTimes {
 };
 PhaseUpdateTimes &PhaseTimes();
 
+// Host wall-clock seconds of the operator construction (SparseMultigrid and
+// DistributedOperator constructors) since the last reset; for <gravity>/profile output
+// only. Device work is counted where a host copy or MPI call waits for it.
+struct OperatorSetupTimes {
+  double partition = 0, check = 0, diagonal = 0, ghosts = 0, halo = 0, columns = 0;
+  double upload = 0, coarse = 0;
+};
+OperatorSetupTimes &SetupTimes();
+// SetupTimes is filled only when this is true (<gravity>/profile)
+bool &SetupTimesOn();
+
+// Host threads (the calling thread included) of the host loops of the operator
+// construction: validation, diagonals, ghost lists and column remapping. The results do
+// not depend on it (integer maps and per-row sums in row order). 1 unless a caller sets it
+// (SelfGravity: its setup threads, during a hierarchy rebuild).
+int &OperatorSetupThreads();
+
 // Restarted flexible GMRES preconditioned by the supplied multigrid V-cycle. The
 // production path accepts independent A/P/R; the legacy adapter uses Galerkin R=P^T.
 // Supports nonsymmetric conservative FV operators without assuming CG symmetry.

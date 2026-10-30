@@ -297,6 +297,7 @@ MeshRefinement::~MeshRefinement() {
 //! \brief Simple driver function for adaptive mesh refinement
 
 void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin) {
+  ProfLaps laps;   // fenced phases of a regrid (only with <dust>/amr_profile)
   // first check refinement criteria
   CheckForRefinement(pmy_mesh->pmb_pack);
   // test control <mesh_refinement>/test_shear_face_check: the shear-face rule of the mesh in
@@ -319,7 +320,9 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
 
   // Refine/derefine mesh and evolved data, set boundary conditions/timestep on new mesh
   if (nnew != 0 || ndel != 0) { // at least one (de)refinement flagged
+    laps.Lap("check_tree");
     if (pmy_mesh->pmb_pack->pdust != nullptr) pmy_mesh->pmb_pack->pdust->BeforeRegrid(nnew, ndel);
+    laps.Lap("dust_before");
     {
       auto *pd = pmy_mesh->pmb_pack->pdust;   // dust profile timer (counters on the pack)
       double dummy_t = 0.0; long long dummy_c = 0;
@@ -327,10 +330,17 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
                          pd ? pd->prof_count[pd->kProfRegridMesh] : dummy_c);
       RedistAndRefineMeshBlocks(pin, nnew, ndel);
       if (pmy_mesh->stop_max_nmb) return;   // (dropped: the run stops, see there)
+      laps.Lap("redist_refine");
       CheckShearFaceLevels();
+      laps.Lap("shear_face_check");
 
       // Mark one mesh-topology update event (AMR and any resulting load balancing).
       pmy_mesh->MarkMeshUpdated();
+      // the host assembly of the new gravity hierarchy runs in the background during the
+      // rest of the regrid (boundary values, dust rebuild); the Solve below takes it
+      if (pmy_mesh->pmb_pack->pgrav != nullptr) {
+        pmy_mesh->pmb_pack->pgrav->PrefetchHierarchy(pmy_mesh->time);
+      }
 
       // the shearing box lists of x1-face blocks and its buffers on the new
       // mesh, before the boundary values are exchanged again
@@ -345,8 +355,10 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
           pmy_mesh->pmb_pack->phydro->porb_u != nullptr) {
         pmy_mesh->pmb_pack->phydro->porb_u->BuildMixedLists();
       }
+      laps.Lap("sbox_orb_lists");
 
       pdriver->InitBoundaryValuesAndPrimitives(pmy_mesh);
+      laps.Lap("bvals_prim");
     }
 
     MeshBlockPack* pmbp = pmy_mesh->pmb_pack;
@@ -357,12 +369,14 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
       ProfTimer pt(pd->prof_time[pd->kProfRebuild], pd->prof_count[pd->kProfRebuild]);
       pmbp->pdust->RebuildAfterRegrid(pdriver, pin);
     }
+    laps.Lap("dust_rebuild");
     // Gravity sources may consume dust on the new leaves. Complete the particle
     // routing/representation rebuild before invalidating and sampling the field.
     if (pmbp->pgrav != nullptr) {
       pmbp->pgrav->Invalidate();
       pmbp->pgrav->Solve(pmy_mesh->time);
     }
+    laps.Lap("gravity");
     if (pmbp->phydro != nullptr) {
       (void) pmbp->phydro->NewTimeStep(pdriver, pdriver->nexp_stages);
     }
@@ -374,6 +388,12 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
     }
     if (pmbp->pz4c != nullptr) {
       (void) pmbp->pz4c->NewTimeStep(pdriver, pdriver->nexp_stages);
+    }
+
+    laps.Lap("new_dt");
+    if (ProfOn() && global_variable::my_rank == 0) {
+      std::cout << "# regrid profile cycle=" << pmy_mesh->ncycle << " created=" << nnew
+                << " deleted=" << ndel << laps.text << std::endl;
     }
 
     nmb_created += nnew;
@@ -999,13 +1019,22 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   // the same everywhere) drops this regrid, keeps the old mesh and its data (nothing of the Mesh
   // has changed yet; the tree is not used again) and asks the driver to stop, which writes the
   // final outputs, a restart file among them.  Restart with a larger max_nmb_per_rank.
+  // The same for fewer MeshBlocks than ranks (a derefinement): every rank needs at least one
+  // block (the partition is not defined otherwise).  Restart with fewer ranks.
   {
+    const bool too_few = (new_nmb_total < global_variable::nranks);
     int worst = 0, worst_rank = 0;
-    for (int r=0; r<global_variable::nranks; ++r) {
+    for (int r=0; r<global_variable::nranks && !too_few; ++r) {
       if (new_nmb_eachrank[r] > worst) {worst = new_nmb_eachrank[r]; worst_rank = r;}
     }
-    if (worst > pm->nmb_maxperrank) {
-      if (global_variable::my_rank == 0) {
+    if (too_few || worst > pm->nmb_maxperrank) {
+      if (global_variable::my_rank == 0 && too_few) {
+        std::cout << "### WARNING in " << __FILE__ << " at line " << __LINE__ << std::endl
+            << "cycle " << pm->ncycle << ": the new tree would have " << new_nmb_total
+            << " MeshBlocks, fewer than the " << global_variable::nranks << " ranks; the regrid "
+            << "is dropped and the run stops with its outputs (restart file): restart with fewer "
+            << "ranks" << std::endl;
+      } else if (global_variable::my_rank == 0) {
         std::cout << "### WARNING in " << __FILE__ << " at line " << __LINE__ << std::endl
             << "cycle " << pm->ncycle << ": the new tree would put " << worst
             << " MeshBlocks on rank " << worst_rank << ", more than <mesh_refinement>/"

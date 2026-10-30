@@ -254,11 +254,10 @@ void SetupDensityTrigger(ParameterInput *pin) {
     trig_.level_factor = pin->GetOrAddReal("dust", "amr_rho_level_factor", 1.0);
     if (!(trig_.level_factor >= 1.0)) fatal("<dust>/amr_rho_level_factor must be >= 1");
     if (pin->DoesParameterExist("dust", "amr_rho_refine_levels")) {
-      std::string lv = pin->GetString("dust", "amr_rho_refine_levels");
-      for (char &c : lv) if (c == ',') c = ' ';
-      std::istringstream in(lv);
-      Real v;
-      while (in >> v) trig_.refine_levels.push_back(v);
+      const std::string lv = pin->GetString("dust", "amr_rho_refine_levels");
+      if (!ParseRealList(lv, trig_.refine_levels)) {
+        fatal("<dust>/amr_rho_refine_levels = '" + lv + "' must be a list of numbers");
+      }
       const int nl = pin->GetOrAddInteger("mesh_refinement", "num_levels", 1) - 1;
       if (static_cast<int>(trig_.refine_levels.size()) < nl) {
         fatal("<dust>/amr_rho_refine_levels needs one threshold per refinement level (num_levels - 1)");
@@ -322,7 +321,7 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
   // halo is checked first; the deposit adds the halo parts to their owners, and with a buffer the
   // owners' sums go back to the halo slots
   pd->CheckHaloReach("density trigger");
-  pd->DepositCloudDensity3D(pd->trig_f3);
+  pd->DepositCloudDensity3D(pd->trig_f3, -1, true);   // (the trigger reads the density alone)
   if (trig_.buffer > 0) pd->HaloForward5D(pd->trig_f3, 0, 1);
   auto f = pd->trig_f3;
   particles::Particles *ppar = pmbp->ppart;
@@ -1242,25 +1241,54 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
   amr_checksum = ParticleChecksum(pmy_pack->ppart);
   lb_old_counts.clear();
 #if MPI_PARALLEL_ENABLED
-  // the clouds of every block of the old mesh for the cost-weighted load balance (RegridCosts)
+  // the clouds of every block of the old mesh for the cost-weighted load balance (RegridCosts):
+  // one count per block, or with <dust>/load_balance_octant_count 2 * 2^d counts per block (lb_ncount)
   if (lb_cloud_weight > 0.0 && global_variable::nranks > 1) {
     Mesh *pm = pmy_pack->pmesh;
     const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
     const int npart = pmy_pack->ppart->nprtcl_thispack;
-    DvceArray1D<int> cnt("dust_lb_counts", std::max(1, nmb));
+    const int nleaf = pm->three_d ? 8 : (pm->two_d ? 4 : 2);
+    const int nc = lb_octant_count ? 2*nleaf : 1;
+    lb_ncount = nc;
+    DvceArray2D<int> cnt("dust_lb_counts", std::max(1, nmb), nc);
     auto pi = pmy_pack->ppart->prtcl_idata;
-    if (npart > 0) {
+    if (npart > 0 && lb_octant_count) {
+      // per octant of the block (bit 0 x1, bit 1 x2, bit 2 x3 upper half, as the children of a
+      // refinement) the clouds finer than the block, which keep their level in a child, and
+      // (refinable clouds) those at the block level or coarser, which split into 3^d children
+      auto pr = pmy_pack->ppart->prtcl_rdata;
+      auto msz = pmy_pack->pmb->mb_size.d_view;
+      auto mlev = pmy_pack->pmb->mb_lev.d_view;
+      const int root = pm->root_level;
+      const bool split = (smr_transfer_mode == DustSMRTransfer::refinable_cloud);
+      const bool d2 = pm->multi_d, d3 = pm->three_d;
+      par_for("dust_lb_count_oct", DevExeSpace(), 0, npart - 1, KOKKOS_LAMBDA(const int p) {
+        const int m = pi(PGID,p) - gids;
+        if (m < 0 || m >= nmb) return;
+        int b = (pr(IPX,p) >= 0.5*(msz(m).x1min + msz(m).x1max)) ? 1 : 0;
+        if (d2 && pr(IPY,p) >= 0.5*(msz(m).x2min + msz(m).x2max)) b |= 2;
+        if (d3 && pr(IPZ,p) >= 0.5*(msz(m).x3min + msz(m).x3max)) b |= 4;
+        const bool sp = split &&
+                        SMRCompositeTransfer::CloudLevel(pi(PLEV,p)) <= mlev(m) - root;
+        Kokkos::atomic_add(&cnt(m, sp ? nleaf + b : b), 1);
+      });
+    } else if (npart > 0) {
       par_for("dust_lb_count", DevExeSpace(), 0, npart - 1, KOKKOS_LAMBDA(const int p) {
         const int m = pi(PGID,p) - gids;
-        if (m >= 0 && m < nmb) Kokkos::atomic_add(&cnt(m), 1);
+        if (m >= 0 && m < nmb) Kokkos::atomic_add(&cnt(m,0), 1);
       });
     }
     auto ch = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cnt);
-    std::vector<float> mine(nmb);
-    for (int m=0; m<nmb; ++m) mine[m] = static_cast<float>(ch(m));
-    lb_old_counts.assign(pm->nmb_total, 0.0f);
-    MPI_Allgatherv(mine.data(), nmb, MPI_FLOAT, lb_old_counts.data(), pm->nmb_eachrank,
-                   pm->gids_eachrank, MPI_FLOAT, MPI_COMM_WORLD);
+    std::vector<float> mine(static_cast<size_t>(nmb)*nc);
+    for (int m=0; m<nmb; ++m) {
+      for (int k=0; k<nc; ++k) mine[static_cast<size_t>(m)*nc + k] = static_cast<float>(ch(m,k));
+    }
+    const int nr = global_variable::nranks;
+    std::vector<int> rc(nr), rd(nr);
+    for (int r=0; r<nr; ++r) {rc[r] = pm->nmb_eachrank[r]*nc; rd[r] = pm->gids_eachrank[r]*nc;}
+    lb_old_counts.assign(static_cast<size_t>(pm->nmb_total)*nc, 0.0f);
+    MPI_Allgatherv(mine.data(), nmb*nc, MPI_FLOAT, lb_old_counts.data(), rc.data(), rd.data(),
+                   MPI_FLOAT, MPI_COMM_WORLD);
   }
 #endif
 }
@@ -1272,7 +1300,9 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
 //! 1 + w * clouds / mean, with the clouds of the old blocks (BeforeRegrid): an unchanged block
 //! keeps its count, a refined block gives each child 1/2^d of its clouds times the 3^d children
 //! of the split of refinable clouds (1/2^d for point particles), a derefined
-//! parent takes the sum of its children.  The old mesh (lloc_eachmb) is still in place when it is called.
+//! parent takes the sum of its children.  With <dust>/load_balance_octant_count a child gets the
+//! clouds of its own octant of the parent, 3^d times those at the parent's level or coarser
+//! (they split) and once those already finer (they keep their level).  The old mesh (lloc_eachmb) is still in place when it is called.
 
 void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_lloc,
                               const int new_nmb, float *cost) {
@@ -1320,20 +1350,39 @@ void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_ll
                         (pm->three_d ? 27.0 : (pm->two_d ? 9.0 : 3.0)) : 1.0;
   std::vector<double> c(new_nmb, 0.0);
   double tot = 0.0;
+  const int nc = lb_ncount;
+  // all clouds of old block o (with octant counts: the sum of its 2 * 2^d counts)
+  auto all = [&](const int o) {
+    double a = 0.0;
+    for (int k=0; k<nc; ++k) a += lb_old_counts[static_cast<size_t>(o)*nc + k];
+    return a;
+  };
   for (int n=0; n<new_nmb; ++n) {
     const int o = newtoold[n];
     const int lo = pm->lloc_eachmb[o].level, ln = new_lloc[n].level;
     if (ln == lo) {
-      c[n] = lb_old_counts[o];
+      c[n] = all(o);
     } else if (ln > lo) {
-      c[n] = lb_old_counts[o]*nsplit/static_cast<double>(nleaf);
+      if (nc == 2*nleaf) {   // <dust>/load_balance_octant_count: the clouds of the child's octant
+        const LogicalLocation &l = new_lloc[n];
+        const int b = (pm->three_d ? ((l.lx3 & 1) << 2) : 0) | (pm->multi_d ? ((l.lx2 & 1) << 1) : 0) |
+                      (l.lx1 & 1);
+        c[n] = lb_old_counts[static_cast<size_t>(o)*nc + b] +
+               nsplit*lb_old_counts[static_cast<size_t>(o)*nc + nleaf + b];
+      } else {
+        c[n] = all(o)*nsplit/static_cast<double>(nleaf);
+      }
     } else {
-      for (int k=0; k<nleaf && o + k < pm->nmb_total; ++k) c[n] += lb_old_counts[o + k];
+      for (int k=0; k<nleaf && o + k < pm->nmb_total; ++k) c[n] += all(o + k);
     }
     tot += c[n];
   }
   const double mean = tot/std::max(1, new_nmb);
-  lb_est_clouds.assign(c.begin(), c.end());
+  if (lb_log_interval > 0) {   // (<dust>/load_balance_log only)
+    lb_est_clouds.assign(c.begin(), c.end());
+  } else {
+    lb_est_clouds.clear();
+  }
   if (mean <= 0.0) return;
   for (int n=0; n<new_nmb; ++n) cost[n] = static_cast<float>(1.0 + lb_cloud_weight*c[n]/mean);
 }
@@ -1404,6 +1453,7 @@ void DustGasDrag::LogRankClouds() {
 //! over the leaves add up to one and point into existing blocks.
 
 void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
+  ProfLaps laps;   // fenced phases (only with <dust>/amr_profile)
   ++gravity_mass_epoch;   // a new mesh (the gravity field is rebuilt anyway)
   const bool oo = (smr_transfer_mode == DustSMRTransfer::instant_switch);
   if (smr_transfer_mode != DustSMRTransfer::refinable_cloud && !oo) {
@@ -1447,7 +1497,9 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       Kokkos::Sum<double>(msum));
     }
   } else {
+  laps.Lap("start");
   BuildRefinableCloudTransfer(pin);
+  laps.Lap("cloud_transfer");
   // Cloud IMEX exchanges u* at each working stage. PC2 did not read this shear
   // object, whose topology must follow the same regrid as the cloud/gas lists.
   if (psbox_us != nullptr) {
@@ -1456,11 +1508,14 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   }
   // shear-periodic x1: the particle routing across the radial faces on the new mesh
   if (ppar->pbval_part->shear_periodic_x1) ppar->pbval_part->BuildShearMaps();
+  laps.Lap("shear_lists");
   // several ranks: the particles follow their blocks to the ranks that hold
   // them on the new mesh (load balancing may move blocks anywhere)
   if (global_variable::nranks > 1) {
     RouteToOwnerBlocks("regrid");
+    laps.Lap("route");
     CheckHaloReach("regrid");   // clouds one level behind the new mesh
+    laps.Lap("halo_reach");
   }
   npart = ppar->nprtcl_thispack;
   // every regrid is an event, handled at the start of the next cycle after
@@ -1482,6 +1537,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
 
   if (clouds3d) {   // the blocks and the weight check on the 3-D leaves
     ResetBlocks3D("regrid", true, dwmax, msum);
+    laps.Lap("reset_blocks");
   } else {
   const auto lt = leaf_traversal;   // the actual leaves
   auto pr = ppar->prtcl_rdata;
@@ -1562,8 +1618,10 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     std::exit(EXIT_FAILURE);
   }
 
+  laps.Lap("checksum");
   // the particle time step with the new cell sizes (the gas step is set by the caller)
   (void) ComputeNewTimeStep(pdrive, pdrive->nexp_stages);
+  laps.Lap("dt");
 
   ++amr_regrids;
   int nlev1 = 0;
@@ -1593,6 +1651,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
               << pmesh->time << " blocks=" << nblk << " (above root " << nlev1 << ", created "
               << amr_regrid_nnew << ", deleted " << amr_regrid_ndel << ") particles="
               << nprt << " max|sum w - 1|=" << dwmax << std::endl;
+    if (ProfOn()) std::cout << "# dust rebuild profile" << laps.text << std::endl;
   }
 }
 

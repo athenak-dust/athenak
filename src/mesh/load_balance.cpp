@@ -45,6 +45,41 @@ void Mesh::LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb)
     max_cost = std::max(max_cost,clist[i]);
   }
 
+  const int nr = global_variable::nranks;
+  // (fewer blocks than ranks leaves ranks without blocks: their entries stay empty, and the regrid
+  // that asked for such a partition is dropped by the caller)
+  for (int r=0; r<nr; ++r) {slist[r] = nb; nlist[r] = 0;}
+  if (lb_minmax && nr > 1 && nb >= nr) {
+    // the contiguous partition whose largest rank cost B is smallest: bisection on B, where B is
+    // feasible if filling the ranks from the last one, each up to B, needs at most nr ranks; then
+    // that fill (rank 0, filled last, takes the rest and has the least load), keeping at least one
+    // block for every rank still to fill
+    auto nparts = [&](const double b) {
+      int k = 1; double s = 0.0;
+      for (int i=nb-1; i>=0; --i) {
+        if (s + clist[i] > b && s > 0.0) {++k; s = 0.0;}
+        s += clist[i];
+      }
+      return k;
+    };
+    double tot = 0.0, cmax = 0.0;
+    for (int i=0; i<nb; ++i) {tot += clist[i]; cmax = std::max(cmax, static_cast<double>(clist[i]));}
+    double lo = std::max(cmax, tot/nr), hi = tot;
+    if (nparts(lo) > nr) {
+      for (int it=0; it<60 && hi - lo > 1.0e-6*hi; ++it) {
+        const double mid = 0.5*(lo + hi);
+        if (nparts(mid) <= nr) {hi = mid;} else {lo = mid;}
+      }
+    } else {
+      hi = lo;
+    }
+    int j = nr - 1; double s = 0.0;
+    for (int i=nb-1; i>=0; --i) {
+      if (j > 0 && ((s + clist[i] > hi && s > 0.0) || i < j)) {--j; s = 0.0;}
+      s += clist[i];
+      rlist[i] = j;
+    }
+  } else {
   int j = (global_variable::nranks) - 1;
   float targetcost = totalcost/global_variable::nranks;
   float mycost = 0.0;
@@ -70,8 +105,9 @@ void Mesh::LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb)
       targetcost = totalcost/(j+1);
     }
   }
+  }
   slist[0] = 0;
-  j = 0;
+  int j = 0;
   for (int i=1; i<nb; i++) { // make the list of nbstart and nblocks
     if (rlist[i] != rlist[i-1]) {
       nlist[j] = i-slist[j];

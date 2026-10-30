@@ -3,6 +3,7 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 #include "gravity/mesh_geometry.hpp"
+#include "gravity/host_workers.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1235,10 +1236,29 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
     std::vector<std::exception_ptr> errors(workers);
     std::vector<std::vector<GlobalIndex>> interface_ids(workers), x_image_ids(workers);
     std::atomic<int> next{0};
+    // the storage of a chunk reserved as the serial output's (fewer reallocations)
+    auto reserve_part = [&](Part &part, GlobalIndex part_rows) {
+      const size_t r = static_cast<size_t>(part_rows);
+      part.matrix.rowptr.reserve(r+1);
+      part.matrix.colidx.reserve(r*(2*m.nd+1)); part.matrix.values.reserve(r*(2*m.nd+1));
+      if (!forces) return;
+      part.boundary_rhs.rowptr.reserve(r+1);
+      for (int d = 0; d < 3; ++d) {
+        part.acceleration[d].rowptr.reserve(r+1);
+        part.boundary_acceleration[d].rowptr.reserve(r+1);
+        if (d < m.nd) {
+          part.acceleration[d].colidx.reserve(2*r); part.acceleration[d].values.reserve(2*r);
+        }
+      }
+      part.volume.reserve(r); part.cells.reserve(r); part.interface.reserve(r);
+    };
     auto run = [&](int w) {
       try {
-        for (int c = next++; c < chunks; c = next++)
-          assemble(begin+rows*c/chunks,begin+rows*(c+1)/chunks,parts[c],quadratics[w],faces[w]);
+        for (int c = next++; c < chunks; c = next++) {
+          const GlobalIndex first = begin+rows*c/chunks, last = begin+rows*(c+1)/chunks;
+          reserve_part(parts[c],last-first);
+          assemble(first,last,parts[c],quadratics[w],faces[w]);
+        }
         // Keep only the ids of fallback fits and release this worker's caches here.
         for (const auto &q : quadratics[w]) {
           if (q.second.interface_fallback) interface_ids[w].push_back(q.first);
@@ -1247,16 +1267,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
         quadratics[w] = QuadraticCache{}; faces[w] = ReconstructionFaces{};
       } catch (...) { errors[w] = std::current_exception(); next = chunks; }
     };
-    std::vector<std::thread> threads;
-    threads.reserve(workers-1);
-    try {
-      for (int w = 1; w < workers; ++w) threads.emplace_back(run,w);
-    } catch (...) {
-      for (auto &thread : threads) thread.join();
-      throw;
-    }
-    run(0);
-    for (auto &thread : threads) thread.join();
+    ThreadWorkers().Run(workers,run);
     for (const auto &error : errors) if (error) std::rethrow_exception(error);
     // Concatenation in row order without floating-point arithmetic, as a serial join:
     // exact-size outputs (each vector resized by one task), then every part is copied
@@ -1294,13 +1305,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
         try { for (int t = claim++; t < tasks; t = claim++) task(t); }
         catch (...) { failures[w] = std::current_exception(); claim = tasks; }
       };
-      std::vector<std::thread> pool;
-      pool.reserve(count-1);
-      try {
-        for (int w = 1; w < count; ++w) pool.emplace_back(work,w);
-      } catch (...) { for (auto &thread : pool) thread.join(); throw; }
-      work(0);
-      for (auto &thread : pool) thread.join();
+      ThreadWorkers().Run(count,work);
       for (const auto &failure : failures) if (failure) std::rethrow_exception(failure);
     };
     parallel(3*components+(forces ? 3 : 0),[&](int t) {
@@ -1393,7 +1398,7 @@ void MeshGeometry::SetPhaseThreads(int threads) {
   impl_->phase_threads = std::min(threads,AvailablePhaseCpus());
 }
 
-void MeshGeometry::SetSetupThreads(int threads) {
+int MeshGeometry::ResolveSetupThreads(int threads) {
   if (threads < 0) throw std::invalid_argument("Gravity setup thread count must be nonnegative");
   if (threads == 0) {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
@@ -1402,7 +1407,11 @@ void MeshGeometry::SetSetupThreads(int threads) {
     threads = 1;
 #endif
   }
-  impl_->setup_threads = std::min(threads,AvailablePhaseCpus());
+  return std::min(threads,AvailablePhaseCpus());
+}
+
+void MeshGeometry::SetSetupThreads(int threads) {
+  impl_->setup_threads = ResolveSetupThreads(threads);
 }
 
 int MeshGeometry::SetupThreads() const {

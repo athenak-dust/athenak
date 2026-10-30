@@ -426,6 +426,23 @@ struct {
   bool operator()(ParticleLocationData a, ParticleLocationData b)
     const { return a.prtcl_indx < b.prtcl_indx; }
 } SortByIndex;
+// Device sorts (Kokkos::sort) of send lists longer than kDeviceSortMin entries: by particle
+// index (the receive; unique keys, so the same list as the host sort) and by (destination
+// rank, particle index) (<particles>/send_sort_device)
+struct ParticleIndexLess {
+  KOKKOS_INLINE_FUNCTION bool operator()(const ParticleLocationData &a,
+                                         const ParticleLocationData &b) const {
+    return a.prtcl_indx < b.prtcl_indx;
+  }
+};
+struct ParticleRankIndexLess {
+  KOKKOS_INLINE_FUNCTION bool operator()(const ParticleLocationData &a,
+                                         const ParticleLocationData &b) const {
+    return a.dest_rank < b.dest_rank ||
+           (a.dest_rank == b.dest_rank && a.prtcl_indx < b.prtcl_indx);
+  }
+};
+constexpr int kDeviceSortMin = 65536;
 
 //----------------------------------------------------------------------------------------
 //! \struct ParticleMessageData
@@ -470,6 +487,13 @@ class ParticlesBoundaryValues {
   // to x3_removed, mass set to 0, parked at rest in its block; DustGasDrag removes it at the start
   // of the next cycle)
   int x3bc_dust = 0;
+  // <particles>/send_sort_device (default false): long send lists (more than kDeviceSortMin
+  // particles, e.g. at a regrid) are ordered by (destination rank, particle index) on the device
+  // instead of by destination rank on the host.  The messages then hold the particles of a rank
+  // in index order, independent of the order in which the routing kernel listed them; the
+  // host sort leaves an order that depends on it, so the particle storage order on the
+  // receiving rank (and the summation order of later deposits) differs from the default.
+  bool send_sort_device = false;
   DualArray1D<Real> x3_removed;        // (mass, count) since the last removal
 
   // Data needed to count number of messages and particles to send between ranks

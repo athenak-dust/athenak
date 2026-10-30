@@ -216,7 +216,20 @@ void ResumeRestart(Mesh *pm, Driver *driver, ParameterInput *pin) {
   auto *dust = pm->pmb_pack->pdust;
   auto *grav = pm->pmb_pack->pgrav;
   if (dust == nullptr) {
-    if (grav != nullptr) grav->ResumeAmrAfterRestart(driver, pin);
+    if (grav != nullptr) {
+      grav->ResumeAmrAfterRestart(driver, pin);
+    } else if (pm->adaptive && pm->pmr != nullptr && pm->pmr->ShearFaceCheckDue()) {
+      // gas alone, AMR in a shearing box: no record says whether the mesh check that follows the
+      // outputs of a cycle had run when the file was written (a restart file written during the
+      // run: it had not).  Do it now, before the first step, so that the shear-face rule holds
+      // for that step as in the run that went on (after a restart the check is always due; a
+      // check the file already had refines nothing more for the rule)
+      if (global_variable::my_rank == 0) {
+        std::cout << "# AMR restart (gas): the mesh check of cycle " << pm->ncycle
+                  << " before the first step" << std::endl;
+      }
+      pm->pmr->AdaptiveMeshRefinement(driver, pin);
+    }
     return;
   }
   if (grav != nullptr) {

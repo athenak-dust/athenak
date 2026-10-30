@@ -45,6 +45,13 @@ class SelfGravity {
   // is discarded and assembled again. The assembly is the same code on the same data, so
   // the operator coefficients are bitwise those of the synchronous path.
   void PrefetchPhase(Real time);
+  // Start the HOST assembly of the hierarchy of the current mesh (vacuum mesh and
+  // BuildGeometricHierarchy: no MPI, no device work) for a later Solve(time) in a background
+  // thread, overlapping the rest of a regrid (boundary values, dust rebuild). The rebuild uses
+  // it only if the mesh and the shear offset are still those of the request; otherwise it is
+  // discarded. Same code on the same data: the operators are bitwise those of the synchronous
+  // path. <gravity>/rebuild_prefetch (default as phase_prefetch).
+  void PrefetchHierarchy(Real time);
   // kdk_reuse helpers; public only because NVCC device lambdas require it
   bool KdkReuseAllowed(Real time, Real shift);
   void RememberReuseState();
@@ -106,9 +113,13 @@ class SelfGravity {
 
  private:
   struct PhaseAssembly;
+  struct HierarchyAssembly;
   Real ShearShift(Real time) const;
   void AssemblePhase(Real shear_offset, PhaseAssembly &out);
   void JoinPrefetch();
+  void HierarchyInputs(Real shear_offset, int threads, HierarchyAssembly &job) const;
+  static void AssembleHierarchy(HierarchyAssembly &job);
+  void JoinHierarchyPrefetch();
   void Rebuild(Real shear_offset);
   void RebuildDistributed(Real shear_offset);
   void UpdatePhase(Real shear_offset);
@@ -126,6 +137,9 @@ class SelfGravity {
   std::vector<std::vector<int>> prolongation_phase_rows_;
   std::vector<GravityPatch> solver_patches_;
   std::unique_ptr<PhaseAssembly> prefetch_;
+  std::unique_ptr<HierarchyAssembly> hierarchy_prefetch_;
+  bool hierarchy_prefetch_enabled_ = false;
+  std::uint64_t hierarchy_prefetch_used_ = 0, hierarchy_prefetch_discarded_ = 0;
   // <gravity>/kdk_reuse (default off): the opening solve of a step keeps the
   // closing field of the previous step when nothing but exact representation changes
   // (split, lobe release, migration, reordering) happened in between; see KdkReuseAllowed.

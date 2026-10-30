@@ -424,6 +424,22 @@ struct SMRCompositeTransfer {
 };
 
 //----------------------------------------------------------------------------------------
+//! \struct ResampleCapTable
+//! The R mass cap of a plain cloud of level L: eta_L m0 / 2^(d L) (d = 3 in 3-D, else 2),
+//! eta_L <= 0: no cap.  Stored as eta_L / 2^(d L), so Cap() is bit-identical to
+//! eta m0 / 2^(d L) for a constant eta.  Small enough to be captured by value in kernels.
+
+struct ResampleCapTable {
+  static constexpr int kLevels = SMRCompositeTransfer::kCloudLevelMask + 1;
+  Real f[kLevels];
+  KOKKOS_INLINE_FUNCTION
+  Real Cap(const Real m0, const int lev) const {
+    const Real g = f[lev & SMRCompositeTransfer::kCloudLevelMask];
+    return (g > 0.0) ? g*m0 : 1.0e300;
+  }
+};
+
+//----------------------------------------------------------------------------------------
 //! \struct LeafTraversal
 //! Block-local traversal of the actual leaves under a
 //! refinable cloud, without the global virtual finest grid of SMRCompositeTransfer.
@@ -1115,6 +1131,36 @@ struct ProfTimer {
   }
 };
 
+// fenced laps of one regrid, collected into " name=seconds" text for one log line
+// (only with <dust>/amr_profile).  barrier: every lap also waits for all ranks, so that a
+// lap is the time of the slowest rank in that phase (several ranks)
+struct ProfLaps {
+  std::chrono::steady_clock::time_point t;
+  std::string text;
+  bool barrier;
+  explicit ProfLaps(bool barrier_ = true) : barrier(barrier_) {
+    if (!ProfOn()) return;
+    Sync();
+    t = std::chrono::steady_clock::now();
+  }
+  void Sync() const {
+    Kokkos::fence();
+#if MPI_PARALLEL_ENABLED
+    if (barrier) MPI_Barrier(MPI_COMM_WORLD);
+#endif
+  }
+  void Lap(const char *name) {
+    if (!ProfOn()) return;
+    Sync();
+    const auto now = std::chrono::steady_clock::now();
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), " %s=%.4f", name,
+                  std::chrono::duration<double>(now - t).count());
+    text += buf;
+    t = now;
+  }
+};
+
 struct DustGasDragTaskIDs {
   // "before_timeintegrator" tasks
   TaskID gswitch, cloud, x3out;
@@ -1135,6 +1181,10 @@ struct DustGasDragTaskIDs {
 };
 
 namespace dust {
+
+// a list of numbers "a b c" or "a, b, c" (input keys such as <dust>/cloud_resample_eta_levels): false
+// if any token is not a whole finite number (nothing is dropped silently)
+bool ParseRealList(const std::string &text, std::vector<Real> &out);
 struct GravityPointTransfer;
 
 // Particle deposits need atomic updates on parallel execution spaces because stencil
@@ -1413,7 +1463,12 @@ class DustGasDrag {
   bool cloud_merge_budget_thin = false;
   bool cloud_resample = false;         // conservative same-level resampling
   int cloud_resample_interval = 625;   // ... cycles between resamplings
-  Real cloud_resample_eta = 2.0;       // ... mass cap eta m0 / 4^level (<= 0: no cap)
+  Real cloud_resample_eta = 2.0;       // ... base eta of the mass cap (<= 0: no cap)
+  // ... cap eta_L m0 / 2^(d L) of a cloud of level L.  <dust>/cloud_resample_eta_levels =
+  // e0 e1 e2 ... sets eta_L (the last value holds for the deeper levels); without it
+  // eta_L = min(eta 2^(L/2), max(4, eta)) in 3-D and min(eta 2^(L/4), max(2, eta)) in 2-D
+  std::vector<Real> cloud_resample_eta_lev;
+  ResampleCapTable cloud_resample_cap{};
   // > 0 keeps cold patches out of the pool: every velocity component
   // spans at most alpha H / tau over the patch (H its cell size, tau = min(ts, 1/omega)); 0 = off
   Real cloud_resample_cold_alpha = 0.0;
@@ -1585,7 +1640,14 @@ class DustGasDrag {
   // 3^d/2^d of its clouds to each child (the P1 split; 1/2^d for point
   // particles), a derefined parent takes the sum of its children).
   Real lb_cloud_weight = 4.0;   // default 4
-  std::vector<float> lb_old_counts;
+  std::vector<float> lb_old_counts;   // lb_ncount values per old block
+  // <dust>/load_balance_octant_count (default true): count the clouds of every old block per octant,
+  // separately those finer than the block (they keep their level in a child) and those that split
+  // (refinable clouds at the block level or coarser), so a child of a refined block gets the clouds of
+  // its own octant, 3^d times those that split, instead of 3^d/2^d of all its parent's clouds (most
+  // clouds of a dense block that refines are already finer and do not split)
+  bool lb_octant_count = true;
+  int lb_ncount = 1;   // counts per old block in lb_old_counts: 1, or 2 * 2^d with octant counts
   // <dust>/load_balance_log = K > 0 (diagnostic): after every regrid the blocks, cost and estimated
   // clouds of every rank (LogRegridBalance), and every K cycles the actual clouds and blocks of
   // every rank (LogRankClouds); rank 0 prints
@@ -1710,7 +1772,9 @@ class DustGasDrag {
   }
   void CloudDepositImplicit3D(Driver *pdrive, int stage);
   void CloudGatherImplicit3D(Driver *pdrive, int stage);
-  void DepositCloudDensity3D(DvceArray5D<Real> &f, const int species = -1);
+  // density_only: component 0 alone (the density trigger; components 1-3 stay zero)
+  void DepositCloudDensity3D(DvceArray5D<Real> &f, const int species = -1,
+                             const bool density_only = false);
   // Gravity uses the physical mass assignment, independently of drag's linear
   // velocity reconstruction. Fields contain owned active leaves; halo exchange
   // is performed internally at the explicitly supplied geometry time.
