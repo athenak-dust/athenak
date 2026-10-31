@@ -112,18 +112,19 @@ amr_rho_buffer = 2              # cells of the block's level around the dense ce
 
 Scheduled refinement (`amr_sched_n = K` and for `k = 1..K`: `amr_schedk_t0`, `_t1`, `_x1min`, `_x1max`, `_x2min`, `_x2max`, optional `_x3min`, `_x3max`, `_level`) refines boxes in given time windows; it excludes the density trigger. Static meshes use the usual `<refined_regionN>` blocks.
 
-### Examples (`inputs/dust_amr/`)
+### Examples (`inputs/dust_amr/`, `inputs/shearing_box/`)
 
 | Input | Set-up |
 | --- | --- |
 | [`lina_smr_careful_merge`](inputs/dust_amr/lina_smr_careful_merge.athinput) | LinA linear SI mode on a nested static mesh (64^2 root, central square at 128^2), `careful_merge`, to t = 2 pi; growth-rate error about -0.40% (uniform 64^2: -0.24%, 128^2: -0.059%); with `<mesh_refinement>/prolong_amplitude_eps = 1e-3` (amplitude-aware gas prolongation) about -0.23% |
 | [`ba2d_amr`](inputs/dust_amr/ba2d_amr.athinput) | 2-D BA streaming instability (tau_s = 1, eps = 0.2), root 128^2, 5 levels, density trigger 10 * 2^l / 3.3 * 2^(l-1), `default`, to t = 600 |
-| [`si3d_strat_amr1280`](inputs/dust_amr/si3d_strat_amr1280.athinput) | 3-D stratified SI, root 320/H, AMR to 1280/H, trigger 64 / 256 (code units), WENO-Z + HLLC, Li & Youdin (2018) vertical boundaries, to 25 orbits |
+| [`si3d_strat_amr1280`](inputs/dust_amr/si3d_strat_amr1280.athinput) | 3-D stratified SI, root 320/H, AMR to 1280/H, trigger 64 / 256 (code units), WENO-Z + HLLC, Li et al. (2018) vertical boundaries, to 25 orbits |
 | [`si3d_strat_amr1280_selfgrav_restart`](inputs/dust_amr/si3d_strat_amr1280_selfgrav_restart.athinput) | restart of the run above with dust self-gravity and a fourth level at rho_d >= 5120 |
 | [`damping3d_sched_amr`](inputs/dust_amr/damping3d_sched_amr.athinput) | 3-D drag damping with a refined slab moving through the box |
 | [`dustywave2d_sched_amr`](inputs/dust_amr/dustywave2d_sched_amr.athinput) | 2-D damped dusty sound wave with a band refined to level 1, then 2, then coarsened |
 | [`nsh2d_sched_amr`](inputs/dust_amr/nsh2d_sched_amr.athinput) | 2-D three-species NSH drift equilibrium with a refined square switched on and off; `dust_species` output |
 | [`dust_freefall_u128`](inputs/dust_amr/dust_freefall_u128.athinput), [`dust_freefall_amr`](inputs/dust_amr/dust_freefall_amr.athinput), [`dust_jeans_u128`](inputs/dust_amr/dust_jeans_u128.athinput) | self-gravity validation (section 2) |
+| [`hydro_shwave_smr_box`](inputs/shearing_box/hydro_shwave_smr_box.athinput), [`hydro_shwave_smr_facebox`](inputs/shearing_box/hydro_shwave_smr_facebox.athinput), [`hydro_shwave_amr`](inputs/shearing_box/hydro_shwave_amr.athinput) | gas only: linear compressible shearing wave (Johnson & Gammie 2005) in a 3-D shearing box with local refinement: a static box inside the domain, a static box at the shear-periodic x1 face, and an adaptive box moved through the domain; the refined runs lie between the uniform 128^2 and 256^2 runs and conserve the mass to round-off |
 
 ### Problem generators
 
