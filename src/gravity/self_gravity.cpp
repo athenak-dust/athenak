@@ -12,7 +12,9 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <sys/resource.h>
 #include <thread>
 
@@ -81,6 +83,13 @@ struct SelfGravity::PhaseAssembly {
   std::array<PhaseRowPlan,3> force_plans, boundary_force_plans;
   PhaseRowPlan boundary_rhs_plan;
   double fine_s = 0, coarse_s = 0, prolongation_s = 0, plan_s = 0;
+  double fine_rows_s = 0, fine_join_s = 0;   // of fine_s: row assembly, join of the worker chunks
+  // <gravity>/profile: per coarse level (index l-1 = level l) A and P assembly seconds
+  std::vector<double> level_a_s, level_p_s;
+  // per level (0: finest, always 1) whether its operators are updated, and the phase of
+  // coarse level l (index l-1)
+  std::vector<char> due;
+  std::vector<Real> target;
   std::thread worker;
   std::exception_ptr error;
 };
@@ -90,6 +99,7 @@ struct SelfGravity::HierarchyAssembly {
   Real shift = 0;
   int topology = -1;
   int rank = 0, nranks = 1, threads = 1;
+  Real coarse_quantum = 0;                 // <gravity>/coarse_phase_quantum (0: exact phase)
   bool vacuum = false;                     // isolated x3 by the vacuum mesh
   std::vector<GravityPatch> patches;       // moved into the assembly
   CompositeDomain domain;
@@ -210,6 +220,17 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   // builds, one in CPU builds; the coefficients do not depend on it)
   setup_threads_ = pin->GetOrAddInteger("gravity", "setup_threads", 0);
   if (setup_threads_ < 0) Fail("gravity/setup_threads must be nonnegative");
+  // Shear-periodic boxes: the coarse levels of the multigrid preconditioner follow the shear
+  // phase in steps of coarse_phase_quantum times the level's smallest y cell width (the phase
+  // rounded to that grid; default 1: at most half a cell behind), the finest level exactly at
+  // every solve. FGMRES converges with the exact finest operator to the same rtol; only the
+  // preconditioner lags. 0: every level at the exact phase at every update (the former behaviour).
+  coarse_phase_quantum_ = pin->GetOrAddReal("gravity", "coarse_phase_quantum", 1.0);
+  if (!(coarse_phase_quantum_ >= 0) || !std::isfinite(coarse_phase_quantum_))
+    Fail("gravity/coarse_phase_quantum must be finite and nonnegative");
+  // explicit zeros that keep a phase row's stored pattern (see PhasePatternPadding)
+  PhasePatternPadding() = pin->GetOrAddInteger("gravity", "phase_pattern_padding", 2);
+  if (PhasePatternPadding() < 0) Fail("gravity/phase_pattern_padding must be nonnegative");
 #if MPI_PARALLEL_ENABLED
   int mpi_thread_level = MPI_THREAD_SINGLE, mpi_main_thread = 0;
   MPI_Query_thread(&mpi_thread_level);
@@ -327,6 +348,8 @@ SelfGravity::~SelfGravity() {
               << " phase_prefetch_discarded=" << prefetch_discarded_
               << " rebuild_prefetch_used=" << hierarchy_prefetch_used_
               << " rebuild_prefetch_discarded=" << hierarchy_prefetch_discarded_
+              << " coarse_level_updates=" << coarse_level_updates_
+              << " coarse_level_skips=" << coarse_level_skips_
               << " iterations=" << last_solve.iterations
               << " relative_residual=" << last_solve.relative_residual
               << " source_mean=" << last_source_mean << " time=" << last_time << '\n';
@@ -543,6 +566,7 @@ void SelfGravity::HierarchyInputs(Real shear_offset, int threads,
   job.rank = global_variable::my_rank;
   job.nranks = nranks;
   job.threads = threads;
+  job.coarse_quantum = pm->mesh_bcs[0] == BoundaryFlag::shear_periodic ? coarse_phase_quantum_ : 0;
   CompositeDomain &domain = job.domain;
   domain.ndim = pm->three_d ? 3 : 2;
   domain.lo = {pm->mesh_size.x1min,pm->mesh_size.x2min,pm->mesh_size.x3min};
@@ -595,7 +619,7 @@ void SelfGravity::AssembleHierarchy(HierarchyAssembly &job) {
   }
   const double t1 = now();
   job.setup = BuildGeometricHierarchy(std::move(job.patches),job.domain,job.rank,job.nranks,
-                                      job.neumann_z,true,job.threads);
+                                      job.neumann_z,true,job.threads,job.coarse_quantum);
   job.times = BuildTimes();
   job.geometry_s = t1-t0;
   job.assembly_s = now()-t1;
@@ -740,6 +764,15 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
     geometry_->SetPhaseThreads(phase_serial_only_ ? 1 : phase_threads_);
     coarse_geometry_ = std::move(setup.coarse_geometry);
     prolongation_phase_rows_ = std::move(setup.prolongation_phase_rows);
+    // the phases BuildGeometricHierarchy gave the coarse levels (the same function of the same
+    // patches and shift)
+    const Real quantum = pm->mesh_bcs[0] == BoundaryFlag::shear_periodic ? coarse_phase_quantum_ : 0;
+    level_width_.assign(coarse_geometry_.size(),0);
+    level_phase_.assign(coarse_geometry_.size(),shear_offset);
+    for (size_t l = 0; l < coarse_geometry_.size(); ++l) {
+      if (quantum > 0) level_width_[l] = quantum*MinCellWidth(coarse_geometry_[l]->Patches(),1);
+      level_phase_[l] = CoarsePhase(shear_offset,level_width_[l]);
+    }
     for (auto &coarse : coarse_geometry_) {
       const int threads = coarse->PhaseRows().size() < 256 || phase_serial_only_ ? 1 : phase_threads_;
       coarse->SetPhaseThreads(threads);
@@ -850,31 +883,65 @@ void SelfGravity::AssemblePhase(Real shear_offset, PhaseAssembly &out) {
   const auto begin = Clock::now();
   out.fine = geometry_->BuildPhaseUpdate(shear_offset);
   const auto fine_assembled = Clock::now();
+  out.fine_rows_s = geometry_->LastPhaseUpdateSeconds()[0];
+  out.fine_join_s = geometry_->LastPhaseUpdateSeconds()[1];
+  const size_t nc = coarse_geometry_.size();
   out.a.clear(); out.p.clear();
-  out.a.reserve(coarse_geometry_.size()+1); out.a.push_back(std::move(out.fine.matrix));
-  for (auto &coarse : coarse_geometry_)
-    out.a.push_back(std::move(coarse->BuildPhaseUpdate(shear_offset,false).matrix));
+  out.a.reserve(nc+1); out.a.push_back(std::move(out.fine.matrix));
+  out.level_a_s.assign(nc,0.); out.level_p_s.assign(nc,0.);
+  // coarse level l (index l-1) is updated when its phase CoarsePhase(shift) moved; A_l and
+  // P_{l-1} (which reads level l's geometry only) at that phase, else kept (empty placeholders)
+  out.due.assign(nc+1,1); out.target.assign(nc,shear_offset);
+  for (size_t l = 0; l < nc; ++l) {
+    out.target[l] = CoarsePhase(shear_offset,level_width_[l]);
+    out.due[l+1] = out.target[l] != level_phase_[l];
+  }
+  for (size_t l = 0; l < nc; ++l) {
+    const auto t = Clock::now();
+    if (out.due[l+1]) {
+      out.a.push_back(std::move(coarse_geometry_[l]->BuildPhaseUpdate(out.target[l],false).matrix));
+    } else {
+      out.a.emplace_back();
+    }
+    out.level_a_s[l] = seconds(t,Clock::now());
+  }
   const auto coarse_assembled = Clock::now();
-  out.p.reserve(coarse_geometry_.size());
+  out.p.reserve(nc);
   auto current_domain = solver_domain_;
   current_domain.shear_offset = shear_offset;
-  for (size_t l = 0; l < coarse_geometry_.size(); ++l) {
+  for (size_t l = 0; l < nc; ++l) {
     const auto &fine = l == 0 ? *geometry_ : *coarse_geometry_[l-1];
-    out.p.push_back(BuildProlongationPhaseUpdate(fine,*coarse_geometry_[l],current_domain,
-        global_variable::my_rank,prolongation_phase_rows_[l]));
+    const auto t = Clock::now();
+    if (out.due[l+1]) {
+      out.p.push_back(BuildProlongationPhaseUpdate(fine,*coarse_geometry_[l],current_domain,
+          global_variable::my_rank,prolongation_phase_rows_[l]));
+    } else {
+      out.p.emplace_back();
+    }
+    out.level_p_s[l] = seconds(t,Clock::now());
   }
   const auto assembled = Clock::now();
   // The host part of every operator update, read-only on the idle operators
-  mg_->PrepareHierarchyPhaseRows(out.a,out.p,out.a_plans,out.p_plans);
-  for (int d = 0; d < 3; ++d) {
-    out.force_plans[d] = d < solver_domain_.ndim ?
-        force_[d]->PreparePhaseRows(out.fine.acceleration[d]) : PhaseRowPlan{};
+  // (on the phase workers: each plan's loops in row chunks; the plans do not depend on the count)
+  std::vector<SparseMultigrid::PhaseExtra> extra;
+  std::vector<PhaseRowPlan *> extra_plan;
+  for (int d = 0; d < solver_domain_.ndim; ++d) {
+    extra.push_back({force_[d].get(),&out.fine.acceleration[d],nullptr});
+    extra_plan.push_back(&out.force_plans[d]);
   }
+  for (int d = solver_domain_.ndim; d < 3; ++d) out.force_plans[d] = PhaseRowPlan{};
   if (slab_ || vacuum_) {
-    out.boundary_rhs_plan = boundary_rhs_op_->PreparePhaseRows(out.fine.boundary_rhs);
-    for (int d = 0; d < 3; ++d)
-      out.boundary_force_plans[d] = boundary_force_[d]->PreparePhaseRows(out.fine.boundary_acceleration[d]);
+    extra.push_back({boundary_rhs_op_.get(),&out.fine.boundary_rhs,nullptr});
+    extra_plan.push_back(&out.boundary_rhs_plan);
+    for (int d = 0; d < 3; ++d) {
+      extra.push_back({boundary_force_[d].get(),&out.fine.boundary_acceleration[d],nullptr});
+      extra_plan.push_back(&out.boundary_force_plans[d]);
+    }
   }
+  std::vector<PhaseRowPlan> plans;
+  mg_->PrepareHierarchyPhaseRows(out.a,out.p,out.a_plans,out.p_plans,&out.due,extra,plans,
+                                 std::max(1,geometry_->PhaseThreads()));
+  for (size_t x = 0; x < extra.size(); ++x) *extra_plan[x] = std::move(plans[x]);
   const auto planned = Clock::now();
   out.shift = shear_offset;
   out.fine_s = seconds(begin,fine_assembled);
@@ -933,16 +1000,81 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
     auto &a = job.a;
     auto &p = job.p;
     const double assembled = ProfileTime(profile_);
-    mg_->UpdateHierarchyPhaseRows(a,p,&job.a_plans,&job.p_plans);
+    // the force and boundary operators after the hierarchy, in the former order; their
+    // validity and ghost-change flags join the hierarchy's collective (ATHENA_SG_PHASE_FORCE_OLD=1:
+    // their own two collectives each, see sparse_mg.cpp)
+    std::vector<SparseMultigrid::PhaseExtra> extra;
     for (int d = 0; d < solver_domain_.ndim; ++d) {
-      force_[d]->UpdatePhaseRows(update.acceleration[d],&job.force_plans[d]);
+      extra.push_back({force_[d].get(),&update.acceleration[d],&job.force_plans[d]});
     }
     if (slab_ || vacuum_) {
-      boundary_rhs_op_->UpdatePhaseRows(update.boundary_rhs,&job.boundary_rhs_plan);
-      for (int d = 0; d < 3; ++d)
-        boundary_force_[d]->UpdatePhaseRows(update.boundary_acceleration[d],&job.boundary_force_plans[d]);
-      if (slab_) slab_->SetShearOffset(shear_offset);
+      extra.push_back({boundary_rhs_op_.get(),&update.boundary_rhs,&job.boundary_rhs_plan});
+      for (int d = 0; d < 3; ++d) {
+        extra.push_back({boundary_force_[d].get(),&update.boundary_acceleration[d],
+                         &job.boundary_force_plans[d]});
+      }
     }
+    // (profile) per level: rows, nnz and whether the pattern is unchanged, before the release
+    std::string level_line;
+    if (profile_) {
+      std::ostringstream o;
+      o << std::setprecision(4);
+      auto list = [&o](const char *name, auto value, size_t n) {
+        o << ' ' << name << '=';
+        for (size_t l = 0; l < n; ++l) o << (l ? "," : "") << value(l);
+      };
+      list("a_due",[&](size_t l) { return int(job.due[l]); },a.size());
+      list("a_rows",[&](size_t l) { return a[l].rows.size(); },a.size());
+      list("a_nnz",[&](size_t l) { return a[l].values.size(); },a.size());
+      list("a_same",[&](size_t l) {
+        return l < job.a_plans.size() ? int(job.a_plans[l].same) : -1; },a.size());
+      list("a_s",[&](size_t l) { return l == 0 ? job.fine_s : job.level_a_s[l-1]; },a.size());
+      list("p_rows",[&](size_t l) { return p[l].rows.size(); },p.size());
+      list("p_nnz",[&](size_t l) { return p[l].values.size(); },p.size());
+      list("p_same",[&](size_t l) {
+        return l < job.p_plans.size() ? int(job.p_plans[l].same) : -1; },p.size());
+      list("p_s",[&](size_t l) { return job.level_p_s[l]; },p.size());
+      list("x_same",[&](size_t x) { return int(extra[x].plan->same); },extra.size());
+      list("a_changed",[&](size_t l) {
+        return l < job.a_plans.size() ? job.a_plans[l].changed_rows : 0; },a.size());
+      list("p_changed",[&](size_t l) {
+        return l < job.p_plans.size() ? job.p_plans[l].changed_rows : 0; },p.size());
+      // a few changed fine rows: cell center, old -> new length
+      // a few changed fine rows: cell center; old -> new length; the first column only in the
+      // new (+) / old (-) row as its cell offset in row-cell widths, and its new value relative
+      // to the largest of the row
+      if (!job.a_plans.empty()) for (const auto &c : job.a_plans[0].changed_sample) {
+        const auto &u = a[0];
+        const auto cell = geometry_->Cell(u.row_begin+u.rows[c[0]]);
+        o << " fine_changed=(" << cell.center[0] << ',' << cell.center[1] << ',' << cell.center[2]
+          << ';' << cell.width[0] << ':' << c[1] << "->" << c[2];
+        Real largest = 0, value = 0;
+        for (int k = u.rowptr[c[0]]; k < u.rowptr[c[0]+1]; ++k) {
+          largest = std::max(largest,std::abs(u.values[k]));
+          if (u.colidx[k] == c[3]) value = u.values[k];
+        }
+        for (int s = 3; s < 5; ++s) if (c[s] >= 0 && c[s] < geometry_->GlobalRows()) {
+          const auto other = geometry_->Cell(c[s]);
+          o << (s == 3 ? " +" : " -") << '[';
+          for (int d = 0; d < 3; ++d)
+            o << (d ? "," : "") << (other.center[d]-cell.center[d])/cell.width[d];
+          o << ']';
+          if (s == 3) o << " rel=" << value/largest;
+        } else if (c[s] >= 0) {
+          o << (s == 3 ? " +ghost" : " -ghost");
+        }
+        o << ')';
+      }
+      level_line = o.str();
+    }
+    const double t_update0 = ProfileTime(profile_);
+    mg_->UpdateHierarchyPhaseRows(a,p,&job.a_plans,&job.p_plans,&extra,&job.due);
+    const double t_update1 = ProfileTime(profile_);
+    for (size_t l = 0; l < level_phase_.size(); ++l) {
+      if (job.due[l+1]) { level_phase_[l] = job.target[l]; ++coarse_level_updates_; }
+      else ++coarse_level_skips_;
+    }
+    if (slab_) slab_->SetShearOffset(shear_offset);
     // Release the host CSR rows and plans (the next assembly builds new ones).
     job.fine = LocalCompositeUpdate{};
     std::vector<CsrRowUpdate>().swap(job.a);
@@ -952,6 +1084,7 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
     for (auto &plan : job.force_plans) plan = PhaseRowPlan{};
     for (auto &plan : job.boundary_force_plans) plan = PhaseRowPlan{};
     job.boundary_rhs_plan = PhaseRowPlan{};
+    const double t_release = ProfileTime(profile_);
     solver_domain_.shear_offset = shear_offset;
     phase_ = shear_offset;
     field_cache_valid_ = false;
@@ -966,7 +1099,8 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
                 << " phase_threads_config=" << phase_threads_
                 << " prefetched=" << prefetched << " prefetch_wait_s=" << wait_s
                 << " assembly_s=" << assembled-begin
-                << " fine_assembly_s=" << job.fine_s
+                << " fine_assembly_s=" << job.fine_s << " fine_rows_s=" << job.fine_rows_s
+                << " fine_join_s=" << job.fine_join_s
                 << " coarse_assembly_s=" << job.coarse_s
                 << " prolongation_assembly_s=" << job.prolongation_s
                 << " plan_s=" << job.plan_s << " op_planned=" << PhaseTimes().planned
@@ -985,16 +1119,24 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
                 << " hierarchy_halo_rebuilds=" << hierarchy.halo_rebuilds
                 << " hierarchy_halo_reuses=" << hierarchy.halo_reuses
                 << " hierarchy_phase_map_payload_bytes=" << hierarchy.host_map_peak_bytes
+                << " op_update_s=" << t_update1-t_update0 << " op_release_s=" << t_release-t_update1
                 << '\n';
+      std::cout << "# SG_PROFILE_PHASE_LEVELS rank=" << global_variable::my_rank
+                << " phase_updates=" << phase_update_count << level_line << '\n';
     }
   } catch (const std::exception &e) { Fail(e.what()); }
 }
 
 void SelfGravity::RefreshHierarchy() {
   JoinPrefetch();
+  const Real quantum = pack_->pmesh->mesh_bcs[0] == BoundaryFlag::shear_periodic
+                      ? coarse_phase_quantum_ : 0;
   auto refreshed = BuildGeometricHierarchy(solver_patches_,solver_domain_,
       global_variable::my_rank,global_variable::nranks,solver_neumann_z_,false,
-      phase_serial_only_ ? 1 : setup_threads_);
+      phase_serial_only_ ? 1 : setup_threads_,quantum);
+  // its coarse levels are at the phases of the current shift
+  for (size_t l = 0; l < level_phase_.size(); ++l)
+    level_phase_[l] = CoarsePhase(solver_domain_.shear_offset,level_width_[l]);
   if (refreshed.hierarchy.row_partitions[0] != partition_
       || refreshed.hierarchy.matrices[0].LocalRows() != solution_.extent_int(0)) {
     Fail("hierarchy-only refresh changed fine ownership; full rebuild required");
@@ -1272,12 +1414,14 @@ void SelfGravity::Solve(Real time) {
   const double t0 = ProfileTime(profile_);
   auto *pm = pack_->pmesh;
   const Real shift = ShearShift(time);
+  Kokkos::Profiling::pushRegion("SG:phase");
   if (!phase_valid_ || topology_ != pm->GetAMRLoadBalanceUpdateSeq()) {
     Rebuild(shift);
   } else if (shift != phase_) {
     if (setup_ == "distributed") UpdatePhase(shift);
     else Rebuild(shift);
   }
+  Kokkos::Profiling::popRegion();
   const double t_setup = ProfileTime(profile_);
   const auto ind = pm->mb_indcs;
   const int n = pack_->nmb_thispack*ind.nx1*ind.nx2*ind.nx3;
@@ -1298,6 +1442,7 @@ void SelfGravity::Solve(Real time) {
           dust->stopping_time_mode == DustStoppingTimeMode::dynamic)
         dust->RefreshStoppingTimeMaximum();
     }
+    Kokkos::Profiling::pushRegion("SG:gather_reuse");
     if (coupled_dust_ && kick_dust_) {
       if (pack_->pdust->PointGravityTransferSupported()) {
         UpdateDustField(time);
@@ -1311,6 +1456,7 @@ void SelfGravity::Solve(Real time) {
       }
       reuse_regathered_ += regathered;
     }
+    Kokkos::Profiling::popRegion();
     const double t_gather = ProfileTime(profile_);
     if (reuse_check_) ReuseCheck(time,regathered);
     UpdateTimeStep();
@@ -1339,7 +1485,9 @@ void SelfGravity::Solve(Real time) {
     if (!dust->stopping_times_initialized ||
         dust->stopping_time_mode==DustStoppingTimeMode::dynamic)
       dust->RefreshStoppingTimeMaximum();
+    Kokkos::Profiling::pushRegion("SG:deposit");
     dust->DepositGravityDensity(time,dust_density_);
+    Kokkos::Profiling::popRegion();
   }
   const double t_deposit = ProfileTime(profile_);
   if (extra.extent(0) < static_cast<std::size_t>(pack_->nmb_thispack)
@@ -1439,7 +1587,9 @@ void SelfGravity::Solve(Real time) {
   const bool extrapolated = ExtrapolateGuess(time,solver_n);
   try {
     const double attempt_begin = ProfileTime(true);
+    Kokkos::Profiling::pushRegion("SG:mg");
     last_solve = mg_->Solve(rhs_,solution_,tolerance_,attempt_cap,restart_);
+    Kokkos::Profiling::popRegion();
     const double attempt_seconds = ProfileTime(true)-attempt_begin;
     if (cached_preconditioner) {
       cached_attempt = last_solve;
@@ -1513,6 +1663,7 @@ void SelfGravity::Solve(Real time) {
     potential(t,0,k,j,i) = sol(rows(q));
   });
   auto acc = acceleration;
+  Kokkos::Profiling::pushRegion("SG:force");
   Kokkos::deep_copy(acc,0.0);
   for (int d = 0; d < (pm->three_d ? 3 : 2); ++d) {
     force_[d]->Apply(solution_,work_);
@@ -1536,10 +1687,13 @@ void SelfGravity::Solve(Real time) {
       });
     }
   }
+  Kokkos::Profiling::popRegion();
   const double t_acceleration = ProfileTime(profile_);
   ++solve_count;
   last_time = time;
+  Kokkos::Profiling::pushRegion("SG:gather");
   UpdateDustField(time);
+  Kokkos::Profiling::popRegion();
   const double t_gather = ProfileTime(profile_);
   UpdateTimeStep();
   const double t_timestep = ProfileTime(profile_);

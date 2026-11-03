@@ -97,8 +97,10 @@ TaskStatus Hydro::InitRecv(Driver *pdrive, int stage) {
   if (tstat != TaskStatus::complete) return tstat;
 
   // with SMR/AMR post receives for fluxes of U
-  // do not post receives for fluxes when stage < 0 (i.e. ICs)
-  if (pmy_pack->pmesh->multilevel && (stage >= 0)) {
+  // do not post receives for fluxes when stage < 0 (i.e. ICs), nor on an identity stage
+  // (imex2+ stage 3: no fluxes are computed or sent, Driver::SkipIdentityStage)
+  const bool skip_flux = pdrive->SkipIdentityStage(stage);
+  if (pmy_pack->pmesh->multilevel && (stage >= 0) && !skip_flux) {
     tstat = pbval_u->InitFluxRecv(nhydro+nscalars);
   }
   if (tstat != TaskStatus::complete) return tstat;
@@ -129,7 +131,7 @@ TaskStatus Hydro::InitRecv(Driver *pdrive, int stage) {
       }
       tstat = psbox_u->InitRecv(time);
       // the pieces of the shear flux matching with this yshear; posts its receives
-      if (stage >= 0 && psbox_u->flux_on) psbox_u->PlanFluxMatch();
+      if (stage >= 0 && psbox_u->flux_on && !skip_flux) psbox_u->PlanFluxMatch();
     }
   }
 
@@ -171,6 +173,8 @@ TaskStatus Hydro::CopyCons(Driver *pdrive, int stage) {
 //! of conserved variables
 
 TaskStatus Hydro::Fluxes(Driver *pdrive, int stage) {
+  // identity stage (imex2+ stage 3, beta = 0): the fluxes would be added with weight zero
+  if (pdrive->SkipIdentityStage(stage)) return TaskStatus::complete;
   // select which calculate_flux function to call based on rsolver_method
   if (rsolver_method == Hydro_RSolver::advect) {
     CalculateFluxes<Hydro_RSolver::advect>(pdrive, stage);
@@ -221,6 +225,8 @@ TaskStatus Hydro::Fluxes(Driver *pdrive, int stage) {
 
 TaskStatus Hydro::SendFlux(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
+  // identity stage: no fluxes (their receives are not posted either, InitRecv)
+  if (pdrive->SkipIdentityStage(stage)) return tstat;
   // Only execute BoundaryVaLUES function with SMR/SMR
   if (pmy_pack->pmesh->multilevel) {
     tstat = pbval_u->PackAndSendFluxCC(uflx);
@@ -241,6 +247,7 @@ TaskStatus Hydro::SendFlux(Driver *pdrive, int stage) {
 
 TaskStatus Hydro::RecvFlux(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
+  if (pdrive->SkipIdentityStage(stage)) return tstat;   // identity stage: no fluxes
   // Only execute BoundaryValues function with SMR/SMR
   // once per stage: while the shear flux matching below is still waiting this task
   // is called again, and the unpack must not run each time (on several nodes it did, thousands
@@ -265,15 +272,21 @@ TaskStatus Hydro::RecvFlux(Driver *pdrive, int stage) {
 
 TaskStatus Hydro::HydroSrcTerms(Driver *pdrive, int stage) {
   Real beta_dt = (pdrive->beta[stage-1])*(pmy_pack->pmesh->dt);
+  // identity stage (imex2+ stage 3): the physics, shearing-box and GR source terms are
+  // all proportional to beta_dt = 0 and are skipped; the user source terms still run (a
+  // user function may act independently of beta_dt, e.g. streaming_linear's kx0 filter)
+  const bool skip = pdrive->SkipIdentityStage(stage);
 
   // Add physics source terms (must be computed from primitives)
-  if (psrc != nullptr) psrc->ApplySrcTerms(w0, peos->eos_data,  beta_dt, u0);
+  if (psrc != nullptr && !skip) psrc->ApplySrcTerms(w0, peos->eos_data,  beta_dt, u0);
 
   // Add shearing box source terms for cell-centered hydro variables
-  if (psbox_u != nullptr) psbox_u->SourceTermsCC(w0, peos->eos_data, beta_dt, u0);
+  if (psbox_u != nullptr && !skip) {
+    psbox_u->SourceTermsCC(w0, peos->eos_data, beta_dt, u0);
+  }
 
   // Add coordinate source terms in GR.  Again, must be computed with only primitives.
-  if (pmy_pack->pcoord->is_general_relativistic) {
+  if (pmy_pack->pcoord->is_general_relativistic && !skip) {
     pmy_pack->pcoord->CoordSrcTerms(w0, peos->eos_data, beta_dt, u0);
   }
 
@@ -486,8 +499,9 @@ TaskStatus Hydro::ClearSend(Driver *pdrive, int stage) {
   }
 
   // with SMR/AMR check sends of restricted fluxes of U complete
-  // do not check flux send for ICs (stage < 0)
-  if (pmy_pack->pmesh->multilevel && (stage >= 0)) {
+  // do not check flux send for ICs (stage < 0), nor on an identity stage (none were sent)
+  const bool skip_flux = pdrive->SkipIdentityStage(stage);
+  if (pmy_pack->pmesh->multilevel && (stage >= 0) && !skip_flux) {
     tstat = pbval_u->ClearFluxSend();
     if (tstat != TaskStatus::complete) return tstat;
   }
@@ -511,7 +525,7 @@ TaskStatus Hydro::ClearSend(Driver *pdrive, int stage) {
       if (tstat != TaskStatus::complete) return tstat;
     }
     // the shear flux matching of this stage
-    if (stage >= 0 && psbox_u->flux_on) {
+    if (stage >= 0 && psbox_u->flux_on && !skip_flux) {
       tstat = psbox_u->ClearFluxMatch();
       if (tstat != TaskStatus::complete) return tstat;
     }
@@ -538,8 +552,8 @@ TaskStatus Hydro::ClearRecv(Driver *pdrive, int stage) {
   }
 
   // with SMR/AMR check receives of restricted fluxes of U complete
-  // do not check flux receives when stage < 0 (i.e. ICs)
-  if (pmy_pack->pmesh->multilevel && (stage >= 0)) {
+  // do not check flux receives when stage < 0 (i.e. ICs), nor on an identity stage
+  if (pmy_pack->pmesh->multilevel && (stage >= 0) && !pdrive->SkipIdentityStage(stage)) {
     tstat = pbval_u->ClearFluxRecv();
     if (tstat != TaskStatus::complete) return tstat;
   }

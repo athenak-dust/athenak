@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>      // fwrite(), fclose(), fopen(), fnprintf(), snprintf()
 #include <cstdlib>
 #include <iomanip>
@@ -25,6 +26,7 @@
 #include "globals.hpp"
 #include "mesh/mesh.hpp"
 #include "particles/particles.hpp"
+#include "particles/particle_counts.hpp"
 #include "outputs.hpp"
 
 //----------------------------------------------------------------------------------------
@@ -145,18 +147,18 @@ void ParticleVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   if (!big_end) {
     for (int i=0; i<(3*npout_thisrank); ++i) { Swap4Bytes(&data[i]); }
   }
-  // calculate local data offset
-  std::vector<int> rank_offset(global_variable::nranks, 0);
+  // calculate local data offset (64-bit: the particles of all ranks before this one)
+  const std::int64_t rank_offset = particles::RankOffset(pm->nprtcl_eachrank,
+                                                         global_variable::my_rank);
   int npout_min = pm->nprtcl_eachrank[0];
   for (int n=1; n<global_variable::nranks; ++n) {
-    rank_offset[n] = rank_offset[n-1] + pm->nprtcl_eachrank[n-1];
     npout_min = std::min(npout_min, pm->nprtcl_eachrank[n]);
   }
 
   // Write particle positions
   {
     std::size_t datasize = sizeof(float);
-    std::size_t myoffset=header_offset + 3*rank_offset[global_variable::my_rank]*datasize;
+    std::size_t myoffset=header_offset + 3*rank_offset*datasize;
     // collective writes for minimum number of particles across ranks
     if (partfile.Write_any_type_at_all(&(data[0]),3*npout_min,myoffset,"float")
           != static_cast<size_t>(3*npout_min)) {
@@ -230,7 +232,7 @@ void ParticleVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
 
     // calculate local data offset and write gid
     std::size_t datasize = sizeof(float);
-    std::size_t myoffset=header_offset + rank_offset[global_variable::my_rank]*datasize;
+    std::size_t myoffset=header_offset + rank_offset*datasize;
     // collective writes for minimum number of particles across ranks
     if (partfile.Write_any_type_at_all(&(data[0]),npout_min,myoffset,"float")
           != static_cast<size_t>(npout_min)) {
@@ -278,7 +280,7 @@ void ParticleVTKOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     }
 
     std::size_t datasize = sizeof(float);
-    std::size_t myoffset=header_offset + 3*rank_offset[global_variable::my_rank]*datasize;
+    std::size_t myoffset=header_offset + 3*rank_offset*datasize;
     // collective writes for minimum number of particles across ranks
     if (partfile.Write_any_type_at_all(&(data[0]),3*npout_min,myoffset,"float")
           != static_cast<size_t>(3*npout_min)) {

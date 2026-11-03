@@ -292,6 +292,13 @@ void CheckRadialForcing(ParameterInput *pin, const Real ax);
 void InitUniformGas(Mesh *pm, const Real rho0, const Real ugx, const Real ugp);
 // the particles of every species (lattice, random, or root parents of refinable clouds)
 void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d);
+// a uniform run from the restart file of a uniform run with half the resolution: gas
+// prolongated (minmod, conservative), every particle split into eight (dust_refine_from.cpp)
+void RefineFromRestart(ParameterInput *pin, Mesh *pm, const std::string &path);
+// a run of 3-D refinable clouds (adaptive mesh allowed) from the restart file of a uniform
+// point-particle run with the same root grid: gas copied, every particle a level-0 cloud
+// (dust_clouds_from.cpp)
+void CloudsFromRestart(ParameterInput *pin, Mesh *pm, const std::string &path);
 // the particle time step from the largest drift speed
 void SetParticleDt(Mesh *pm, const std::vector<Real> &vx, const std::vector<Real> &vp,
                    const Real vextra);

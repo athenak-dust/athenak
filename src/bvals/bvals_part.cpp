@@ -6,8 +6,10 @@
 //! \file bvals_part.cpp
 //! \brief
 
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <utility>
 #include <vector>
 #include <algorithm>
@@ -24,6 +26,81 @@
 #include "dust/dust.hpp"
 
 namespace particles {
+namespace {
+// ATHENA_PART_SENDLIST_OLD=1: the send list is reallocated to exactly the particle count and
+// cleared (host and device) whenever that count passes its high-water mark (the former path)
+bool SendlistOld() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_PART_SENDLIST_OLD");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+#if MPI_PARALLEL_ENABLED
+// Post the count elements at buf (a message of the particle exchange) as consecutive MPI
+// messages of at most chunk elements each (MPI counts are int), all with the same tag: MPI's
+// non-overtaking order matches them to the receives that the other rank posts in the same
+// order with the same sizes.  A message of at most chunk elements is one MPI message, as
+// before.  Returns the number of MPI messages.
+template <typename T>
+int PostPrtclMessage(const bool send, T *buf, const std::size_t count, const std::size_t chunk,
+                     MPI_Datatype type, const int peer, const int tag, MPI_Comm comm,
+                     std::vector<MPI_Request> &req, bool &no_errors) {
+  std::size_t done = 0;
+  int nmpi = 0;
+  do {
+    const std::size_t n = std::min(chunk, count - done);
+    req.push_back(MPI_REQUEST_NULL);
+    const int ierr = send ?
+        MPI_Isend(buf + done, static_cast<int>(n), type, peer, tag, comm, &req.back()) :
+        MPI_Irecv(buf + done, static_cast<int>(n), type, peer, tag, comm, &req.back());
+    if (ierr != MPI_SUCCESS) {no_errors = false;}
+    done += n;
+    ++nmpi;
+  } while (done < count);
+  return nmpi;
+}
+#endif
+
+// Capacity of a particle message buffer (send or receive, reals or ints) for `required`
+// values: half again above the new high-water mark, at least 4096 particles' worth.  The exact
+// size reallocated a buffer whenever a message set a new maximum
+// (with 32 ranks and four buffers each, about once per cycle on some rank after 100 cycles);
+// a new device buffer must be registered with the network/IPC layers at its first message,
+// which held the receiver for 5-30 ms while all others waited in the MPI_Allgather that ends
+// RecvAndUnpackPrtcls.  Only valid prefixes are packed and passed
+// to MPI, so the capacity does not change any result.
+template <typename View>
+void ReserveMessageBuffer(View &buf, const std::size_t required, const int nvals) {
+  if (buf.extent(0) >= required) return;
+  const std::size_t cap = std::max(required + required/2, static_cast<std::size_t>(4096)*nvals);
+  Kokkos::realloc(buf, cap);
+}
+}  // namespace
+
+//----------------------------------------------------------------------------------------
+//! \fn void ParticlesBoundaryValues::ReserveSendlist(int npart)
+//! \brief capacity of the send list for npart particles.  The capacity grows to an eighth above
+//! the new high-water mark and is not cleared (only the valid prefix is ever written and read):
+//! with the exact size, a rank whose particle count keeps growing (splits, inflow) reallocated
+//! and cleared the whole list, 12 bytes per particle on the host and on the device, at nearly
+//! every migration (on a deep adaptive run almost every cycle, a delay that the other ranks
+//! waited for).  ATHENA_PART_SENDLIST_OLD=1 restores the exact size with
+//! initialization.
+
+void ParticlesBoundaryValues::ReserveSendlist(int npart) {
+  const int required_capacity = std::max(npart, 1);
+  if (sendlist.extent_int(0) >= required_capacity) return;
+  if (SendlistOld()) {
+    Kokkos::realloc(sendlist, required_capacity);
+  } else {
+    const std::size_t cap = std::min<std::size_t>(
+        static_cast<std::size_t>(required_capacity) + required_capacity/8,
+        static_cast<std::size_t>(std::numeric_limits<int>::max()));
+    Kokkos::realloc(Kokkos::WithoutInitializing, sendlist, cap);
+  }
+}
+
 //----------------------------------------------------------------------------------------
 //! \fn void ParticlesBoundaryValues::UpdateGID()
 //! \brief Updates GID of particles that cross boundary of their parent MeshBlock.  If
@@ -85,10 +162,7 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
   // Keep a worst-case-capacity send list, but allocate only when the local particle
   // high-water mark grows. nprtcl_send below is the logical valid-prefix length.  The
   // persistent allocation avoids the previous grow-to-npart/shrink-to-nsend churn.
-  int required_capacity = std::max(npart, 1);
-  if (static_cast<int>(sendlist.extent(0)) < required_capacity) {
-    Kokkos::realloc(sendlist, required_capacity);
-  }
+  ReserveSendlist(npart);
   Kokkos::deep_copy(send_count.d_view, 0);
   pcounter = send_count.d_view.data();
 #endif
@@ -513,64 +587,66 @@ TaskStatus ParticlesBoundaryValues::InitPrtclRecv() {
   }
   nrecvs = recvs_thisrank.size();
 
-  // Figure out how many particles will be received from all ranks
-  nprtcl_recv=0;
+  // Figure out how many particles will be received from all ranks (int: per-rank counts and
+  // particle indices are int; the sum in 64 bits for the check)
+  std::int64_t nrecv64 = 0;
   for (int n=0; n<nrecvs; ++n) {
-    nprtcl_recv += recvs_thisrank[n].nprtcls;
+    nrecv64 += recvs_thisrank[n].nprtcls;
   }
+  if (nrecv64 > std::numeric_limits<int>::max()) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "rank " << global_variable::my_rank << " would receive " << nrecv64
+              << " particles in one exchange (more than 2^31 - 1 per rank)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  nprtcl_recv = static_cast<int>(nrecv64);
 
   // Retain high-water capacities across migration stages.  MPI uses only the valid
   // prefixes described by nprtcl_recv, so no buffer contents need to be preserved.
   std::size_t rrecv_required = static_cast<std::size_t>(pmy_part->nrdata)*nprtcl_recv;
   std::size_t irecv_required = static_cast<std::size_t>(pmy_part->nidata)*nprtcl_recv;
-  if (prtcl_rrecvbuf.extent(0) < rrecv_required) {
-    Kokkos::realloc(prtcl_rrecvbuf, rrecv_required);
-  }
-  if (prtcl_irecvbuf.extent(0) < irecv_required) {
-    Kokkos::realloc(prtcl_irecvbuf, irecv_required);
-  }
+  ReserveMessageBuffer(prtcl_rrecvbuf, rrecv_required, pmy_part->nrdata);
+  ReserveMessageBuffer(prtcl_irecvbuf, irecv_required, pmy_part->nidata);
 
-  // Post non-blocking receives
+  // Post non-blocking receives.  Offsets and sizes in 64 bits (nrdata Reals per particle pass
+  // 2^31 above 126M particles); a message longer than msg_chunk_bytes as several MPI messages
+  // (PostPrtclMessage), so the requests are one per MPI message
   bool no_errors=true;
   rrecv_req.clear();
   irecv_req.clear();
-  for (int n=0; n<nrecvs; ++n) {
-    rrecv_req.emplace_back(MPI_REQUEST_NULL);
-    irecv_req.emplace_back(MPI_REQUEST_NULL);
-  }
+  const std::size_t rchunk = std::max<std::size_t>(1, msg_chunk_bytes/sizeof(Real));
+  const std::size_t ichunk = std::max<std::size_t>(1, msg_chunk_bytes/sizeof(int));
 
   // Init receives for Reals
-  int data_start=0;
+  std::size_t data_start=0;
   for (int n=0; n<nrecvs; ++n) {
-    // calculate amount of data to be passed, get pointer to variables
-    int data_size = (pmy_part->nrdata)*(recvs_thisrank[n].nprtcls);
-    int data_end = data_start + data_size;
-    auto recv_ptr = Kokkos::subview(prtcl_rrecvbuf, std::make_pair(data_start, data_end));
+    // calculate amount of data to be passed
+    const std::size_t data_size =
+        static_cast<std::size_t>(pmy_part->nrdata)*(recvs_thisrank[n].nprtcls);
     int drank = recvs_thisrank[n].sendrank;
     int tag = 0; // 0 for Reals, 1 for ints
 
     // Post non-blocking receive
-    int ierr = MPI_Irecv(recv_ptr.data(), data_size, MPI_ATHENA_REAL, drank, tag,
-                         mpi_comm_part, &(rrecv_req[n]));
-    if (ierr != MPI_SUCCESS) {no_errors=false;}
+    nmsg_mpi += PostPrtclMessage(false, prtcl_rrecvbuf.data() + data_start, data_size, rchunk,
+                                 MPI_ATHENA_REAL, drank, tag, mpi_comm_part, rrecv_req,
+                                 no_errors);
     data_start += data_size;
   }
   // Init receives for ints
   data_start=0;
   for (int n=0; n<nrecvs; ++n) {
-    // calculate amount of data to be passed, get pointer to variables
-    int data_size = (pmy_part->nidata)*(recvs_thisrank[n].nprtcls);
-    int data_end = data_start + data_size;
-    auto recv_ptr = Kokkos::subview(prtcl_irecvbuf, std::make_pair(data_start, data_end));
+    // calculate amount of data to be passed
+    const std::size_t data_size =
+        static_cast<std::size_t>(pmy_part->nidata)*(recvs_thisrank[n].nprtcls);
     int drank = recvs_thisrank[n].sendrank;
     int tag = 1; // 0 for Reals, 1 for ints
 
     // Post non-blocking receive
-    int ierr = MPI_Irecv(recv_ptr.data(), data_size, MPI_INT, drank, tag,
-                         mpi_comm_part, &(irecv_req[n]));
-    if (ierr != MPI_SUCCESS) {no_errors=false;}
+    nmsg_mpi += PostPrtclMessage(false, prtcl_irecvbuf.data() + data_start, data_size, ichunk,
+                                 MPI_INT, drank, tag, mpi_comm_part, irecv_req, no_errors);
     data_start += data_size;
   }
+  nmsg_prtcl += 2*static_cast<std::uint64_t>(nrecvs);
 
   // Quit if MPI error detected
   if (!(no_errors)) {
@@ -601,12 +677,8 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
     // prefixes are packed and passed to MPI.
     std::size_t rsend_required = static_cast<std::size_t>(pmy_part->nrdata)*nprtcl_send;
     std::size_t isend_required = static_cast<std::size_t>(pmy_part->nidata)*nprtcl_send;
-    if (prtcl_rsendbuf.extent(0) < rsend_required) {
-      Kokkos::realloc(prtcl_rsendbuf, rsend_required);
-    }
-    if (prtcl_isendbuf.extent(0) < isend_required) {
-      Kokkos::realloc(prtcl_isendbuf, isend_required);
-    }
+    ReserveMessageBuffer(prtcl_rsendbuf, rsend_required, pmy_part->nrdata);
+    ReserveMessageBuffer(prtcl_isendbuf, isend_required, pmy_part->nidata);
 
     // sendlist on device is already sorted by destrank in CountSendAndRecvs()
     // Use sendlist on device to load particles into send buffer ordered by dest_rank
@@ -619,55 +691,55 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
     auto sendlist_d = sendlist.d_view;
     par_for("ppack",DevExeSpace(),0,(nprtcl_send-1), KOKKOS_LAMBDA(const int n) {
       int p = sendlist_d(n).prtcl_indx;
+      // the row of particle n in 64 bits (nrdata*n passes 2^31 above 126M particles)
+      const std::int64_t ib = static_cast<std::int64_t>(nidata)*n;
+      const std::int64_t rb = static_cast<std::int64_t>(nrdata)*n;
       for (int i=0; i<nidata; ++i) {
-        isendbuf(nidata*n + i) = pi(i,p);
+        isendbuf(ib + i) = pi(i,p);
       }
       for (int i=0; i<nrdata; ++i) {
-        rsendbuf(nrdata*n + i) = pr(i,p);
+        rsendbuf(rb + i) = pr(i,p);
       }
     });
 
-    // Post non-blocking sends
+    // Post non-blocking sends: offsets and sizes in 64 bits, a message longer than
+    // msg_chunk_bytes as several MPI messages (PostPrtclMessage; the receives match)
     Kokkos::fence();
     rsend_req.clear();
     isend_req.clear();
-    for (int n=0; n<nsends; ++n) {
-      rsend_req.emplace_back(MPI_REQUEST_NULL);
-      isend_req.emplace_back(MPI_REQUEST_NULL);
-    }
+    const std::size_t rchunk = std::max<std::size_t>(1, msg_chunk_bytes/sizeof(Real));
+    const std::size_t ichunk = std::max<std::size_t>(1, msg_chunk_bytes/sizeof(int));
 
     // Send Reals
-    int data_start=0;
+    std::size_t data_start=0;
     for (int n=0; n<nsends; ++n) {
-      // calculate amount of data to be passed, get pointer to variables
-      int data_size = nrdata*(sends_thisrank[n].nprtcls);
-      int data_end = data_start + data_size;
-      auto send_ptr = Kokkos::subview(prtcl_rsendbuf,std::make_pair(data_start,data_end));
+      // calculate amount of data to be passed
+      const std::size_t data_size =
+          static_cast<std::size_t>(nrdata)*(sends_thisrank[n].nprtcls);
       int drank = sends_thisrank[n].recvrank;
       int tag = 0; // 0 for Reals, 1 for ints
 
       // Post non-blocking sends
-      int ierr = MPI_Isend(send_ptr.data(), data_size, MPI_ATHENA_REAL, drank, tag,
-                           mpi_comm_part, &(rsend_req[n]));
-      if (ierr != MPI_SUCCESS) {no_errors=false;}
+      nmsg_mpi += PostPrtclMessage(true, prtcl_rsendbuf.data() + data_start, data_size, rchunk,
+                                   MPI_ATHENA_REAL, drank, tag, mpi_comm_part, rsend_req,
+                                   no_errors);
       data_start += data_size;
     }
     // Send ints
     data_start=0;
     for (int n=0; n<nsends; ++n) {
-      // calculate amount of data to be passed, get pointer to variables
-      int data_size = nidata*(sends_thisrank[n].nprtcls);
-      int data_end = data_start + data_size;
-      auto send_ptr = Kokkos::subview(prtcl_isendbuf,std::make_pair(data_start,data_end));
+      // calculate amount of data to be passed
+      const std::size_t data_size =
+          static_cast<std::size_t>(nidata)*(sends_thisrank[n].nprtcls);
       int drank = sends_thisrank[n].recvrank;
       int tag = 1; // 0 for Reals, 1 for ints
 
       // Post non-blocking sends
-      int ierr = MPI_Isend(send_ptr.data(), data_size, MPI_INT, drank, tag,
-                           mpi_comm_part, &(isend_req[n]));
-      if (ierr != MPI_SUCCESS) {no_errors=false;}
+      nmsg_mpi += PostPrtclMessage(true, prtcl_isendbuf.data() + data_start, data_size, ichunk,
+                                   MPI_INT, drank, tag, mpi_comm_part, isend_req, no_errors);
       data_start += data_size;
     }
+    nmsg_prtcl += 2*static_cast<std::uint64_t>(nsends);
   }
 
   // Quit if MPI error detected
@@ -695,19 +767,26 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
   // polls this function until it returns complete, and on MPI backends that need MPI calls
   // to make progress, a host sort on every poll delays the communication (with millions of
   // particles sent at a regrid, the repeated sorts made the exchange take minutes)
+  // (one request per MPI message: nrecvs each, unless a message was split)
   bool bflag = false;
   bool no_errors=true;
-  for (int n=0; n<nrecvs; ++n) {
+  const std::size_t nreq = std::max(rrecv_req.size(), irecv_req.size());
+  for (std::size_t n=0; n<nreq; ++n) {
     int test;
-    int ierr = MPI_Test(&(rrecv_req[n]), &test, MPI_STATUS_IGNORE);
-    if (ierr != MPI_SUCCESS) {no_errors=false;}
-    if (!(static_cast<bool>(test))) {
-      bflag = true;
+    int ierr;
+    if (n < rrecv_req.size()) {
+      ierr = MPI_Test(&(rrecv_req[n]), &test, MPI_STATUS_IGNORE);
+      if (ierr != MPI_SUCCESS) {no_errors=false;}
+      if (!(static_cast<bool>(test))) {
+        bflag = true;
+      }
     }
-    ierr = MPI_Test(&(irecv_req[n]), &test, MPI_STATUS_IGNORE);
-    if (ierr != MPI_SUCCESS) {no_errors=false;}
-    if (!(static_cast<bool>(test))) {
-      bflag = true;
+    if (n < irecv_req.size()) {
+      ierr = MPI_Test(&(irecv_req[n]), &test, MPI_STATUS_IGNORE);
+      if (ierr != MPI_SUCCESS) {no_errors=false;}
+      if (!(static_cast<bool>(test))) {
+        bflag = true;
+      }
     }
   }
   // Quit if MPI error detected
@@ -742,11 +821,23 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
   // increase size of particle arrays if needed.  The arrays keep their capacity (their
   // extent may exceed the number of particles) and grow with 25% headroom, so that a net
   // inflow of a few particles does not reallocate them every cycle
-  int new_npart = pmy_part->nprtcl_thispack + (nprtcl_recv - nprtcl_send);
+  // (the count in 64 bits for the check: per-rank counts and particle indices are int; the
+  // headroom stops at 2^31 - 1)
+  const std::int64_t new_npart64 =
+      static_cast<std::int64_t>(pmy_part->nprtcl_thispack) + (nprtcl_recv - nprtcl_send);
+  if (new_npart64 > std::numeric_limits<int>::max()) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "rank " << global_variable::my_rank << " would hold " << new_npart64
+              << " particles (more than 2^31 - 1 per rank)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  int new_npart = static_cast<int>(new_npart64);
   if (new_npart > pmy_part->prtcl_rdata.extent_int(1) ||
       new_npart > pmy_part->prtcl_idata.extent_int(1)) {
-    Kokkos::resize(pmy_part->prtcl_idata, pmy_part->nidata, new_npart + new_npart/4);
-    Kokkos::resize(pmy_part->prtcl_rdata, pmy_part->nrdata, new_npart + new_npart/4);
+    const std::int64_t cap = std::min<std::int64_t>(std::numeric_limits<int>::max(),
+                                                    new_npart64 + new_npart64/4);
+    Kokkos::resize(pmy_part->prtcl_idata, pmy_part->nidata, cap);
+    Kokkos::resize(pmy_part->prtcl_rdata, pmy_part->nrdata, cap);
   }
 
   // unpack particles into positions of sent particles
@@ -767,11 +858,14 @@ TaskStatus ParticlesBoundaryValues::RecvAndUnpackPrtcls() {
       } else {
         p = npart + (n - nsend);           // place particle at end of arrays
       }
+      // the row of particle n in 64 bits (nrdata*n passes 2^31 above 126M particles)
+      const std::int64_t ib = static_cast<std::int64_t>(nidata)*n;
+      const std::int64_t rb = static_cast<std::int64_t>(nrdata)*n;
       for (int i=0; i<nidata; ++i) {
-        pi(i,p) = irecvbuf(nidata*n + i);
+        pi(i,p) = irecvbuf(ib + i);
       }
       for (int i=0; i<nrdata; ++i) {
-        pr(i,p) = rrecvbuf(nrdata*n + i);
+        pr(i,p) = rrecvbuf(rb + i);
       }
     });
   }
@@ -863,11 +957,18 @@ TaskStatus ParticlesBoundaryValues::ClearPrtclSend() {
   if (global_variable::nranks == 1) return TaskStatus::complete;
   bool no_errors=true;
   // wait for all non-blocking sends for vars to finish before continuing
-  for (int n=0; n<nsends; ++n) {
-    int ierr = MPI_Wait(&(rsend_req[n]), MPI_STATUS_IGNORE);
-    if (ierr != MPI_SUCCESS) {no_errors=false;}
-    ierr = MPI_Wait(&(isend_req[n]), MPI_STATUS_IGNORE);
-    if (ierr != MPI_SUCCESS) {no_errors=false;}
+  // (one request per MPI message: nsends each, unless a message was split)
+  const std::size_t nreq = std::max(rsend_req.size(), isend_req.size());
+  for (std::size_t n=0; n<nreq; ++n) {
+    int ierr;
+    if (n < rsend_req.size()) {
+      ierr = MPI_Wait(&(rsend_req[n]), MPI_STATUS_IGNORE);
+      if (ierr != MPI_SUCCESS) {no_errors=false;}
+    }
+    if (n < isend_req.size()) {
+      ierr = MPI_Wait(&(isend_req[n]), MPI_STATUS_IGNORE);
+      if (ierr != MPI_SUCCESS) {no_errors=false;}
+    }
   }
   // Quit if MPI error detected
   if (!(no_errors)) {
@@ -891,11 +992,18 @@ TaskStatus ParticlesBoundaryValues::ClearPrtclRecv() {
   if (global_variable::nranks == 1) return TaskStatus::complete;
   bool no_errors=true;
   // wait for all non-blocking receives to finish before continuing
-  for (int n=0; n<nrecvs; ++n) {
-    int ierr = MPI_Wait(&(rrecv_req[n]), MPI_STATUS_IGNORE);
-    if (ierr != MPI_SUCCESS) {no_errors=false;}
-    ierr = MPI_Wait(&(irecv_req[n]), MPI_STATUS_IGNORE);
-    if (ierr != MPI_SUCCESS) {no_errors=false;}
+  // (one request per MPI message: nrecvs each, unless a message was split)
+  const std::size_t nreq = std::max(rrecv_req.size(), irecv_req.size());
+  for (std::size_t n=0; n<nreq; ++n) {
+    int ierr;
+    if (n < rrecv_req.size()) {
+      ierr = MPI_Wait(&(rrecv_req[n]), MPI_STATUS_IGNORE);
+      if (ierr != MPI_SUCCESS) {no_errors=false;}
+    }
+    if (n < irecv_req.size()) {
+      ierr = MPI_Wait(&(irecv_req[n]), MPI_STATUS_IGNORE);
+      if (ierr != MPI_SUCCESS) {no_errors=false;}
+    }
   }
   // Quit if MPI error detected
   if (!(no_errors)) {

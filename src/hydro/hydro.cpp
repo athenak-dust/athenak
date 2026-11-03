@@ -143,6 +143,13 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   if (pin->DoesBlockExist("shearing_box")) {
     porb_u = new OrbitalAdvectionCC(ppack, pin, (nhydro+nscalars));
     psbox_u = new ShearingBoxCC(ppack, pin, (nhydro+nscalars));
+    // non-negative conserved variables for the face pull's one-sided edge slopes: density,
+    // the Newtonian total energy, the passive scalars
+    const bool newton = !(pmy_pack->pcoord->is_special_relativistic ||
+                          pmy_pack->pcoord->is_general_relativistic);
+    psbox_u->pull_pos_mask = (1 << IDN) |
+                             ((peos->eos_data.is_ideal && newton) ? (1 << IEN) : 0);
+    psbox_u->pull_pos_from = nhydro;
     // with mesh refinement in 3-D the coarse arrays are sheared too
     // (fine x1-face blocks with a coarser partner across the boundary prolongate from them)
     if (ppack->pmesh->multilevel && ppack->pmesh->three_d &&
@@ -175,9 +182,15 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   if (evolution_t.compare("stationary") != 0) {
     // determine if FOFC is enabled
     use_fofc = pin->GetOrAddBoolean("hydro","fofc",false);
-    // default: on for device builds (the device memory is not host accessible)
-    x2_face_parallel = pin->GetOrAddBoolean("hydro","x2_face_parallel",
-        !Kokkos::SpaceAccessibility<Kokkos::HostSpace, DevMemSpace>::accessible);
+    // default off: the x2 walk in chunks (flux_walk_teams below) is faster than one team per
+    // face row on a GPU too (the same results); true selects the face-parallel kernel
+    x2_face_parallel = pin->GetOrAddBoolean("hydro","x2_face_parallel", false);
+    // read only when present (the parameter dump of the outputs stays as it was)
+    flux_walk_teams = Kokkos::SpaceAccessibility<Kokkos::HostSpace, DevMemSpace>::accessible ?
+                      0 : 1024;
+    if (pin->DoesParameterExist("hydro", "flux_walk_teams")) {
+      flux_walk_teams = pin->GetInteger("hydro", "flux_walk_teams");
+    }
 
     // select reconstruction method (default PLM)
     std::string xorder = pin->GetOrAddString("hydro","reconstruct","plm");

@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -145,6 +146,73 @@ void ProblemGenerator::DustSIStrat(ParameterInput *pin, const bool restart) {
   const Real etavk = pin->GetReal("problem","etavk");
   std::vector<Real> eps, taus;
   dust_setup::ReadSpecies(pin, pmbp, true, eps, taus);
+  // <problem>/clouds_from = FILE: the state of a uniform point-particle run with the root
+  // grid of this run at <time>/start_time, on the mesh of this input (any block size, adaptive):
+  // gas copied cell by cell, every particle a level-0 refinable cloud (dust_clouds_from.cpp); the
+  // li2018 totals vbc_mean0 / vbc_dm from the input, else from the file's input text.  (Only
+  // looked up, never added: runs without it keep their parameter list.)
+  if (pin->DoesParameterExist("problem", "clouds_from")) {
+    const std::string cfrom = pin->GetString("problem", "clouds_from");
+    if (!dust_active) Fatal("clouds_from needs dust particles");
+    if (pin->DoesParameterExist("problem", "refine_from") &&
+        !pin->GetString("problem", "refine_from").empty()) {
+      Fatal("<problem>/clouds_from and refine_from exclude each other");
+    }
+    dust_setup::CloudsFromRestart(pin, pmy_mesh_, cfrom);
+    if (livbc_.on) {
+      if (pin->DoesParameterExist("problem", "vbc_mean0")) {
+        livbc_.mean0 = pin->GetReal("problem", "vbc_mean0");
+        livbc_.dm = pin->GetOrAddReal("problem", "vbc_dm", 0.0);
+      } else {   // (neither the input nor the file has it) the mean of the copied gas
+        livbc_.mean0 = LiGasMass(pmy_mesh_)/LiBoxVolume(pmy_mesh_);
+        livbc_.dm = 0.0;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.17g", livbc_.mean0);
+        pin->SetString("problem", "vbc_mean0", buf);
+        pin->SetString("problem", "vbc_dm", "0");
+      }
+      if (global_variable::my_rank == 0) {
+        std::cout << std::setprecision(17) << "# vertical_bc = li2018 (clouds_from): vbc_mean0 "
+                  << livbc_.mean0 << ", vbc_dm " << livbc_.dm << std::endl;
+      }
+    }
+    return;
+  }
+  // <problem>/refine_from = FILE: the state of a uniform run with half the resolution at
+  // <time>/start_time (gas prolongated, particles split into eight); the li2018 totals
+  // vbc_mean0 / vbc_dm come from the input (copied from that run)
+  {
+    const std::string rfrom = pin->GetOrAddString("problem", "refine_from", "");
+    if (!rfrom.empty()) {
+      if (!dust_active) Fatal("refine_from needs dust particles");
+      dust_setup::RefineFromRestart(pin, pmy_mesh_, rfrom);
+      if (livbc_.on) {
+        if (pin->DoesParameterExist("problem", "vbc_mean0")) {
+          livbc_.mean0 = pin->GetReal("problem", "vbc_mean0");
+          livbc_.dm = pin->GetOrAddReal("problem", "vbc_dm", 0.0);
+        } else {
+          // without vbc_mean0 (a box cut from the coarse one): the mean gas density of the
+          // prolongated state, so that the renormalisation starts without a jump; vbc_dm from 0
+          livbc_.mean0 = LiGasMass(pmy_mesh_)/LiBoxVolume(pmy_mesh_);
+          livbc_.dm = 0.0;
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), "%.17g", livbc_.mean0);
+          pin->SetString("problem", "vbc_mean0", buf);
+          pin->SetString("problem", "vbc_dm", "0");
+          if (global_variable::my_rank == 0) {
+            const auto &ms = pmy_mesh_->mesh_size;
+            const Real h = std::sqrt(livbc_.h2), r0 = pin->GetOrAddReal("problem", "rho0", 1.0);
+            const Real m_init = r0*h*std::sqrt(0.5*M_PI)*(std::erf(ms.x3max/(std::sqrt(2.0)*h)) -
+                                std::erf(ms.x3min/(std::sqrt(2.0)*h)))/(ms.x3max - ms.x3min);
+            std::cout << "# vertical_bc = li2018 (refine_from, no vbc_mean0): mean gas density of the "
+                      << "prolongated state " << buf << " (the initial profile rho0 exp(-z^2/2H^2) has "
+                      << std::setprecision(17) << m_init << " over this x3 range)" << std::endl;
+          }
+        }
+      }
+      return;
+    }
+  }
   int nspec = static_cast<int>(eps.size());
   Real ax = 2.0*omega0*etavk;
   const Real hg = pmbp->phydro->peos->eos_data.iso_cs/omega0;

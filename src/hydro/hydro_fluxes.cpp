@@ -275,13 +275,21 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
       }
     });
     } else {
-    par_for_outer("hflux_x2",DevExeSpace(), scr_size, scr_level, 0, nmb1, kl, ku,
-    KOKKOS_LAMBDA(TeamMember_t member, const int m, const int k) {
+    // the walk over j in nch2 chunks of faces (WalkChunks): each chunk reconstructs the
+    // row before its first face once more; the same arithmetic per face for any nch2
+    const int nch2 = WalkChunks(nmb1 + 1, ku - kl + 1, ju - jl);
+    const int nf2 = ju - jl;
+    const int q2 = nf2/nch2, r2 = nf2 - q2*nch2;   // c nf2/nch2 = c q2 + c r2/nch2 in 32 bits
+    par_for_outer("hflux_x2",DevExeSpace(), scr_size, scr_level, 0, nmb1, kl, ku, 0, nch2-1,
+    KOKKOS_LAMBDA(TeamMember_t member, const int m, const int k, const int c) {
       ScrArray2D<Real> scr1(member.team_scratch(scr_level), nvars, ncells1);
       ScrArray2D<Real> scr2(member.team_scratch(scr_level), nvars, ncells1);
       ScrArray2D<Real> scr3(member.team_scratch(scr_level), nvars, ncells1);
+      // first row (no face of this chunk) and last face of the chunk (c r2 < nch2^2 < 2^30)
+      const int jw = jl + c*q2 + (c*r2)/nch2;
+      const int jw1 = jl + (c + 1)*q2 + ((c + 1)*r2)/nch2;
 
-      for (int j=jl; j<=ju; ++j) {
+      for (int j=jw; j<=jw1; ++j) {
         // Permute scratch arrays.
         auto wl     = scr1;
         auto wl_jp1 = scr2;
@@ -312,7 +320,7 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
         member.team_barrier();
 
         // compute fluxes over [js,je+1].  RS returns flux in input wr array
-        if (j>jl) {
+        if (j>jw) {
           // NOTE(@pdmullen): Capture variables prior to if constexpr.
           auto eos = eos_;
           auto indcs = indcs_;
@@ -343,8 +351,9 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
           member.team_barrier();
         }
 
-        // calculate fluxes of scalars (if any)
-        if (nvars > nhyd_) {
+        // calculate fluxes of scalars (if any); the first row of a later chunk is a face
+        // of the chunk before
+        if (nvars > nhyd_ && (j > jw || c == 0)) {
           for (int n=nhyd_; n<nvars; ++n) {
             par_for_inner(member, is, ie, [&](const int i) {
               if (flx2_(m,IDN,k,j,i) >= 0.0) {
@@ -371,13 +380,23 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
     il = is, iu = ie, jl = js, ju = je, kl = ks-1, ku = ke+1;
     if (use_fofc) { il = is-1, iu = ie+1, jl = js-1, ju = je+1, kl = ks-2, ku = ke+2; }
 
-    par_for_outer("hflux_x3",DevExeSpace(), scr_size, scr_level, 0, nmb1, jl, ju,
-    KOKKOS_LAMBDA(TeamMember_t member, const int m, const int j) {
+    // the walk over k in nch3 chunks of faces (WalkChunks): with one or two MeshBlocks per
+    // rank one team per (m,j) row left most of a GPU idle (x3 2.5 ms vs x1 0.9 ms per cycle
+    // on one 128x128x256 block); each chunk reconstructs the cell before its first face once
+    // more, the same arithmetic per face for any nch3
+    const int nch3 = WalkChunks(nmb1 + 1, ju - jl + 1, ku - kl);
+    const int nf3 = ku - kl;
+    const int q3 = nf3/nch3, r3 = nf3 - q3*nch3;   // c nf3/nch3 = c q3 + c r3/nch3 in 32 bits
+    par_for_outer("hflux_x3",DevExeSpace(), scr_size, scr_level, 0, nmb1, 0, nch3-1, jl, ju,
+    KOKKOS_LAMBDA(TeamMember_t member, const int m, const int c, const int j) {
       ScrArray2D<Real> scr1(member.team_scratch(scr_level), nvars, ncells1);
       ScrArray2D<Real> scr2(member.team_scratch(scr_level), nvars, ncells1);
       ScrArray2D<Real> scr3(member.team_scratch(scr_level), nvars, ncells1);
+      // first cell (no face of this chunk) and last face of the chunk (c r3 < nch3^2 < 2^30)
+      const int kw = kl + c*q3 + (c*r3)/nch3;
+      const int kw1 = kl + (c + 1)*q3 + ((c + 1)*r3)/nch3;
 
-      for (int k=kl; k<=ku; ++k) {
+      for (int k=kw; k<=kw1; ++k) {
         // Permute scratch arrays.
         auto wl     = scr1;
         auto wl_kp1 = scr2;
@@ -408,7 +427,7 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
         member.team_barrier();
 
         // compute fluxes over [ks,ke+1].  RS returns flux in input wr array
-        if (k>kl) {
+        if (k>kw) {
           // NOTE(@pdmullen): Capture variables prior to if constexpr.
           auto eos = eos_;
           auto indcs = indcs_;
@@ -439,8 +458,9 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
           member.team_barrier();
         }
 
-        // calculate fluxes of scalars (if any)
-        if (nvars > nhyd_) {
+        // calculate fluxes of scalars (if any); the first cell of a later chunk is a face
+        // of the chunk before
+        if (nvars > nhyd_ && (k > kw || c == 0)) {
           for (int n=nhyd_; n<nvars; ++n) {
             par_for_inner(member, is, ie, [&](const int i) {
               if (flx3_(m,IDN,k,j,i) >= 0.0) {

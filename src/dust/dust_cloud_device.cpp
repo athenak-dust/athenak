@@ -29,6 +29,7 @@
 #include "particles/particles.hpp"
 #include "hydro/hydro.hpp"
 #include "dust.hpp"
+#include "dust_split_velocity.hpp"
 #include <Kokkos_Sort.hpp>
 #if defined(KOKKOS_ENABLE_CUDA)
 #include <thrust/execution_policy.h>
@@ -124,7 +125,11 @@ int DustGasDrag::SplitCloudsP1Device() {
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   const int npart = ppar->nprtcl_thispack;
-  if (npart == 0) return 0;
+  // (cloud_split_velocity = mesh_gradient, several ranks) SplitVelocityPrepare is collective
+  // (AnyRank, then the moments' deposit and halo exchange): every exit calls it, with 0 rows on
+  // the early ones, as the 3-D split does (Codex review: a rank without clouds or without events
+  // skipped the MPI_Allreduce that a splitting rank entered)
+  if (npart == 0) {SplitVelocityPrepare(0); return 0;}
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
@@ -160,7 +165,7 @@ int DustGasDrag::SplitCloudsP1Device() {
     sf += 1;
     if (parent) sp += 1;
   }, Kokkos::Sum<int>(nflag), Kokkos::Sum<int>(nparent));
-  if (nflag == 0) return 0;
+  if (nflag == 0) {SplitVelocityPrepare(0); return 0;}   // (collective with mesh_gradient)
   EnsureNextTag();
 
   // In place: the centre piece (k = 0, which keeps the tag) overwrites its parent's slot,
@@ -173,6 +178,9 @@ int DustGasDrag::SplitCloudsP1Device() {
     if (final) tagoff(p) = upd;
     upd += (np(p) > 0) ? np(p) - 1 : 0;
   }, ntags);
+  // (cloud_split_velocity = mesh_gradient) the parents' mean-flow gradients, rows tagoff(p)
+  const bool ai = SplitVelocityPrepare(ntags);
+  auto vg = split_vgrad;
   const int nnew = npart + ntags;
   if (ppar->prtcl_rdata.extent_int(1) < nnew) {
     Kokkos::resize(ppar->prtcl_rdata, nrdata, nnew + nnew/4);
@@ -212,8 +220,16 @@ int DustGasDrag::SplitCloudsP1Device() {
       prv(IPM,s) = mass*p1[a].frac*p2[b].frac;
       piv(PLEV,s) = clev | (p1[a].lobe << sh1) | (p2[b].lobe << sh2);
       piv(PGID,s) = gids + NewCloudBlock(lt, cx, cy, lt.Anchor(piv(PGID,s)), ncell12);
+      if (ai && n1*n2 > 1) {   // mesh_gradient: v += G (piece centroid - parent centroid)
+        const Real d1 = p1[a].off*e1 + SplitLobeShift(p1[a].lobe, e1) -
+            (parent ? 0.0 : SplitLobeShift(SMRCompositeTransfer::CloudLobe1(code), e1));
+        const Real d2 = p2[b].off*e2 + SplitLobeShift(p2[b].lobe, e2) -
+            (parent ? 0.0 : SplitLobeShift(SMRCompositeTransfer::CloudLobe2(code), e2));
+        SplitAddGradient(prv, s, vg, tagoff(p), d1, d2, 0.0, 1.0);
+      }
     }
   });
+  if (ai) SplitVelocityCheck(npart, nnew);
   cloud_split_count += nparent;
   cloud_lobe_split_count += nflag - nparent;
   ppar->nprtcl_thispack = nnew;
@@ -574,7 +590,9 @@ void DustGasDrag::EnsureRootCloudMass() {
       MPI_Allreduce(MPI_IN_PLACE, mm, 2, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
       m0 = mm[0]; m1 = mm[1];
 #endif
-      // a level-1 cloud carries 1/4 of a root cloud in 2-D, 1/8 in 3-D
+      // a level-1 cloud carries 1/4 of a root cloud in 2-D, 1/8 in 3-D (with
+      // cloud_split_max_level the value is recorded before the first instant switch, while the
+      // levels are still those of the split lattice: CloudInstantSwitch)
       cloud_merge_mroot[sp] = (m0 > 0.0) ? m0 : (clouds3d ? 8.0 : 4.0)*m1;
     }
   }
@@ -852,7 +870,10 @@ int DustGasDrag::MergeCloudsDevice() {
   // zero, kept for the log columns)
   const double budtot[3] = {0.0, 0.0, 0.0};
 
-  for (int lev=1; lev<=nlev; ++lev) {
+  // cloud_split_max_level = L: levels <= L only (a cloud above L is a level-L cloud in mass; it
+  // widens back by the cloud instant switch when the mesh coarsens)
+  const int lev_g = (cloud_split_max_level >= 0) ? std::min(nlev, cloud_split_max_level) : nlev;
+  for (int lev=1; lev<=lev_g; ++lev) {
     const int L = lev - 1;
     auto pr = ppar->prtcl_rdata;
     auto pi = ppar->prtcl_idata;
@@ -1472,8 +1493,8 @@ int DustGasDrag::MergeCloudsDevice() {
               sum += bad;
             }, nviol);
             HaloForwardFlags(lviolg);                       // the owners' verdicts on the halo
-            nviol = static_cast<int>(SumRanks(nviol));      // the same number of rounds everywhere
-            if (nviol == 0) break;
+            // the same number of rounds everywhere (the sum of all ranks is 64-bit: not narrowed)
+            if (SumRanks(nviol) == 0) break;
             if (nev >= maxev) {   // no convergence: the rest of stage G is rejected
               Kokkos::parallel_for("qb_rej_all", Kokkos::RangePolicy<>(DevExeSpace(), k0, k1),
               KOKKOS_LAMBDA(const int k) {krej(k) = 1;});
@@ -2012,8 +2033,10 @@ void DustGasDrag::SortParticles() {
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
   const int nx1 = pmy_pack->pmesh->mb_indcs.nx1, nx2 = pmy_pack->pmesh->mb_indcs.nx2;
   // 3-D keys (block, k, j, i) as the cell-order index (UpdateCloudOrder); in 2-D nx3 = 1, k = 0
-  const int nx3 = clouds3d ? pmy_pack->pmesh->mb_indcs.nx3 : 1;
-  const bool z3 = clouds3d;
+  // (point particles, <dust>/point_sort_interval: 3-D keys on any 3-D mesh; clouds3d implies
+  // three_d, so the cloud keys are unchanged)
+  const bool z3 = clouds3d || pmy_pack->pmesh->three_d;
+  const int nx3 = z3 ? pmy_pack->pmesh->mb_indcs.nx3 : 1;
   const int gids = pmy_pack->gids, nmb = pmy_pack->nmb_thispack;
   auto &mbsize = pmy_pack->pmb->mb_size;
   const bool randomize = cloud_sort_random;
@@ -2427,7 +2450,10 @@ int DustGasDrag::MergeCloudsDevice3D() {
   const bool exact_ts = cloud_merge_exact_ts;
   const bool alpha_leaf = cloud_merge_alpha_leaf;
   double qtot[8] = {0.0};   // X families, mass; G groups, pieces, mass; deferred, residual pieces
-  for (int lev=1; lev<=nlev; ++lev) {
+  // cloud_split_max_level = L: levels <= L only (a cloud above L is a level-L cloud in mass; it
+  // widens back by the cloud instant switch when the mesh coarsens)
+  const int lev_g = (cloud_split_max_level >= 0) ? std::min(nlev, cloud_split_max_level) : nlev;
+  for (int lev=1; lev<=lev_g; ++lev) {
     const int L = lev - 1;
     auto pr = ppar->prtcl_rdata;
     auto pi = ppar->prtcl_idata;
@@ -2829,8 +2855,8 @@ int DustGasDrag::MergeCloudsDevice3D() {
           }, nviol);
           HaloForwardFlags(lviolg);                       // the owners' verdicts on the halo
           if (bthin) HaloForwardFlat(lpacc, 1);
-          nviol = static_cast<int>(SumRanks(nviol));      // the same number of rounds everywhere
-          if (nviol == 0) break;
+          // the same number of rounds everywhere (the sum of all ranks is 64-bit: not narrowed)
+          if (SumRanks(nviol) == 0) break;
           // thinning in the rounds before the last one, the strict rule in the last
           const bool thin_now = bthin && nev < maxev - 1;
           if (nev >= maxev) {

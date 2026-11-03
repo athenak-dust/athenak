@@ -53,6 +53,8 @@ add_executable(
         pgen/dust_amr/dust_freefall.cpp
         pgen/dust_amr/dust_jeans.cpp
         pgen/dust_amr/dust_setup.cpp
+        pgen/dust_amr/dust_refine_from.cpp
+        pgen/dust_amr/dust_clouds_from.cpp
         pgen/dust_amr/dust_snapshots.cpp
         pgen/dust_amr/dust_si_unstrat.cpp
         pgen/dust_amr/dust_si_strat.cpp
@@ -74,6 +76,7 @@ add_executable(
         dust/dust_gravity.cpp
         dust/dust_gravity_points.cpp
         dust/dust_halo.cpp
+        dust/dust_split_velocity.cpp
         dust/dust_amr.cpp
         dust/dust_restart.cpp
         dust/dust_science.cpp

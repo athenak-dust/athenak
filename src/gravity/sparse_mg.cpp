@@ -9,17 +9,28 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <iostream>
 #include <string>
 #include <thread>
 #include <utility>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <unordered_map>
 
 namespace gravity {
+int &PhasePatternPadding() {
+  static int padding = 2;
+  return padding;
+}
 PhaseUpdateTimes &PhaseTimes() {
   static PhaseUpdateTimes times;
   return times;
@@ -60,6 +71,36 @@ void SetupChunks(std::size_t items, int &workers, int &chunks) {
 }
 using Vector = DvceArray1D<Real>;
 using Indices = DvceArray1D<int>;
+
+// the host copies into the pinned stages of a phase update (values of every operator, ~10^6
+// to 10^7 entries per update at L3/L4) on up to 8 host threads of this rank's CPU set, in chunks
+// of at least 2^16 entries; memcpy of the same bytes
+int StageCopyWorkers() {
+  static const int n = [] {
+    int cpus = 1;
+#if defined(__linux__)
+    cpu_set_t affinity;
+    CPU_ZERO(&affinity);
+    if (sched_getaffinity(0,sizeof(affinity),&affinity) == 0) cpus = std::max(1,CPU_COUNT(&affinity));
+#endif
+    return std::min(8,cpus);
+  }();
+  return n;
+}
+template <typename T>
+void StageCopy(T *dst, const T *src, std::size_t n) {
+  constexpr std::size_t piece = std::size_t(1) << 16;
+  const int workers = static_cast<int>(std::min<std::size_t>(StageCopyWorkers(),n/piece));
+  if (workers <= 1) {
+    if (n > 0) std::memcpy(dst,src,n*sizeof(T));
+    return;
+  }
+  const int chunks = 4*workers;
+  ParallelChunks(workers,chunks,[&](int c) {
+    const std::size_t b = n*c/chunks, e = n*(c+1)/chunks;
+    if (e > b) std::memcpy(dst+b,src+b,(e-b)*sizeof(T));
+  });
+}
 
 // LASSQ representation: ||x|| = scale*sqrt(squares), without squaring an
 // unscaled component. A negative scale propagates any NaN/Inf collectively.
@@ -163,6 +204,155 @@ void Scale(Real alpha, const Vector &x) {
   Kokkos::parallel_for("gravity_scale", Kokkos::RangePolicy<DevExeSpace>(0, n),
                        KOKKOS_LAMBDA(int i) { x(i) *= alpha; });
 }
+// ATHENA_SG_DEVICE_MPI=1: the multigrid halo exchange hands device buffers to MPI (needs a
+// GPU-aware MPI; experimental, for timing), otherwise pinned host buffers.
+bool DeviceMpi() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_SG_DEVICE_MPI");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+// ATHENA_SG_HALO_ALLTOALLV=1: the former halo exchange (one MPI_Alltoallv per matrix-vector
+// product, blocking deep copies with global fences), kept for A/B timing.  Default: point-to-
+// point messages with the ranks that share halo entries only, copies queued on the device
+// stream.  The same values arrive in the same places: results are bitwise identical.
+// Operators with at least n nonzeros per row on average (the coarse multigrid levels: 42-69,
+// rows up to 300 entries) use the row-team product kernel, which gives bitwise the same
+// results; in our tests n = 40 was faster than 16, and n = 1 (the fine level too) slower.
+// Default n = 40 on GPU backends, 0 (the
+// one-thread-per-row kernel everywhere) on host backends; ATHENA_SG_SPMV_ROWS=<n> overrides
+// (0: off).
+int SpmvRowTeams() {
+  static const int n = [] {
+    const char *e = std::getenv("ATHENA_SG_SPMV_ROWS");
+    if (e != nullptr) return std::atoi(e);
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
+    return 40;
+#else
+    return 0;
+#endif
+  }();
+  return n;
+}
+// ATHENA_SG_PHASE_ALLOC_OLD=1: the phase updates allocate fresh device and pinned views
+// for every changed pattern or halo (cudaMalloc/cudaFree, cudaHostAlloc/cudaFreeHost on the main
+// thread, milliseconds per cycle on every rank) and upload the values with blocking copies.
+// Default: the views of an operator's phase pattern and halo are subviews of stores that keep
+// their capacity (grown by an eighth when too small), new device vectors are zeroed as the fresh
+// ones were, and the value uploads are queued on the device stream with one fence per update.
+// The same values reach the same places: results are bitwise identical.
+bool PhaseAllocOld() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_SG_PHASE_ALLOC_OLD");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+// ATHENA_SG_PHASE_FORCE_OLD=1: the force and boundary operators of a phase update keep
+// their own two collectives each (validity, ghost change).  Default: their flags join the
+// hierarchy's one collective (UpdateHierarchyPhaseRows with extras); the updates run in the
+// former order with the same plans.  An MPI-pattern switch: checked collectively.
+bool PhaseForceOld() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_SG_PHASE_FORCE_OLD");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+// ATHENA_SG_MG_SYNC_COPIES=1: the device-to-device copies and fills of the V-cycle and the
+// FGMRES basis are blocking (a device synchronization each, as before).  Default: queued on the
+// device stream in the same order; every host read of device data still follows a fence.
+bool MgSyncCopies() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_SG_MG_SYNC_COPIES");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+// ATHENA_SG_GHOST_MAP_OLD=1: a phase-configured operator keeps a hash map of its ghost
+// columns (rebuilt at configuration and whenever its ghost list changes; L4: ~10^6 entries per
+// rebuild) to find the base slot of a column.  Default: a binary search in the sorted base ghost
+// list (the base slots are its positions; the same slots and ghost lists).
+bool GhostMapOld() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_SG_GHOST_MAP_OLD");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+// ATHENA_SG_PROJECT_FUSE=1 (opt-in): in the V-cycle a projection followed by a product of
+// the same vector (smoothing sweeps, the residual, the restriction, the prolongation of the coarse
+// correction) exchanges the halo of the unprojected vector at the same time as the mean's
+// MPI_Allreduce (one stream fence for both); the owner then subtracts the mean from its entries
+// and every receiver from the received halo values.  This is the same subtraction of the same two
+// numbers ONLY IF MPI_Allreduce returns bitwise the same sum on every rank.  The MPI standard asks
+// for that, but not every implementation delivers it: UCC 1.3.0 (TL/UCP knomial, radix 4) adds in
+// a rank-dependent order, and local sums {1, -1, 2^-54, 0} can come back as 0 on some ranks and
+// 2^-54 on others; then a receiver's ghost value differs from the owner's (Codex review;
+// OpenMPI 5 tuned/HAN and UCC >= 1.5 add in the same order everywhere).  Hence: off by default
+// (every projection completes before the next product packs its halo, as before), and when it is
+// requested a probe at every solver construction (ProbeAllreduceIdentical) sums such values and
+// compares the result bits of all ranks; a mismatch keeps the former order and prints a note.
+// An MPI-pattern switch: checked collectively.
+bool ProjectFuse() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_SG_PROJECT_FUSE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+// (test hook) ATHENA_SG_PROJECT_FUSE_PROBE_TEST=1: the probe sees rank 0's sums with the last bit
+// flipped, as an MPI with rank-dependent sums would deliver them (the probe must then refuse)
+bool ProjectFuseProbeTest() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_SG_PROJECT_FUSE_PROBE_TEST");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+// completion of the queued phase uploads (StagedCopy, the value copies) at every exit of a
+// public phase update, also by an exception: the pinned stages may be written again as soon as
+// the call has returned (Codex review: two consecutive fine updates, or a batch that throws after
+// the fine upload, could otherwise rewrite a stage under a copy still in flight).
+// Two exits (Codex review, round 3): a normal return calls Complete() as its last statement, a
+// plain fence that throws what Kokkos throws on a failed device synchronization (CUDA/HIP errors
+// of the queued copies or kernels), so the update does not report success for failed device
+// work.  The destructor fences only when Complete() was not reached, i.e. while an exception
+// unwinds the call; that fence must not throw (a second exception during unwinding terminates),
+// and the exception already in flight is the one the caller sees.  The two fences carry
+// different labels (gravity_phase_uploads / gravity_phase_uploads_unwind; the regression check
+// gravity_phase_update_check counts them through a Kokkos Tools fence callback).
+struct PhaseUploadFence {
+  PhaseUploadFence() = default;
+  PhaseUploadFence(const PhaseUploadFence &) = delete;
+  PhaseUploadFence &operator=(const PhaseUploadFence &) = delete;
+  void Complete() {   // the normal exit: may throw
+    done_ = true;
+    if (PhaseAllocOld()) return;
+    Kokkos::fence("gravity_phase_uploads");
+  }
+  ~PhaseUploadFence() {
+    if (done_ || PhaseAllocOld()) return;
+    try { Kokkos::fence("gravity_phase_uploads_unwind"); } catch (...) {}
+  }
+ private:
+  bool done_ = false;
+};
+bool PhaseCollectivesOld() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_SG_PHASE_COLLECTIVES");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+bool HaloAlltoallv() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_SG_HALO_ALLTOALLV");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
 }  // namespace
 
 struct SparseMultigrid::Impl {
@@ -174,32 +364,97 @@ struct SparseMultigrid::Impl {
     Indices rowptr, colidx, send_indices;
     Vector values, send_device, ghost_device, recv_device;
     Indices recv_slots;
-    HostArray1D<Real> send_host, ghost_host;
+    // pinned staging buffers (page-locked: no driver staging copy; DMA straight from/to them)
+    Kokkos::View<Real*, Kokkos::SharedHostPinnedSpace> send_host, ghost_host;
     std::vector<int> send_counts, recv_counts, send_offsets, recv_offsets;
+    // the ranks with nonzero send / receive counts (point-to-point halo exchange), set by
+    // BuildHalo; requests reused by every exchange
+    std::vector<int> send_peers, recv_peers;
+#if MPI_PARALLEL_ENABLED
+    std::vector<MPI_Request> halo_requests;
+#endif
     std::vector<GlobalIndex> input_partition, ghost_ids;
     bool phase_configured = false, phase_active = false;
     Indices phase_map, phase_rows, phase_rowptr, phase_colidx;
     Vector phase_values;
+    Kokkos::View<Real*, Kokkos::SharedHostPinnedSpace> phase_values_pinned;   // upload buffer, kept
     std::vector<int> phase_rows_host, phase_rowptr_host;
     std::vector<GlobalIndex> phase_columns_host, phase_base_ghosts;
     std::unordered_map<GlobalIndex,int> phase_ghost_slots;
+    // phase_base_ghosts sorted and unique: base slots by binary search, no map
+    bool phase_base_sorted = false;
     std::uint64_t phase_masked_base_nnz = 0;
     FineOperatorStats phase_updates;
+    // the stores behind the views above that BuildHalo and the phase updates replace
+    // (ATHENA_SG_PHASE_ALLOC_OLD=1: fresh views instead)
+    struct Stores {
+      Indices send_indices, recv_slots, phase_rowptr, phase_colidx;
+      Vector send_device, ghost_device, recv_device, phase_values;
+      Kokkos::View<Real*, Kokkos::SharedHostPinnedSpace> send_host, ghost_host;
+      // pinned staging of the phase pattern uploads (queued copies; fenced once per update)
+      Kokkos::View<int*, Kokkos::SharedHostPinnedSpace> stage_rowptr, stage_colidx;
+      Kokkos::View<Real*, Kokkos::SharedHostPinnedSpace> stage_values;
+    } store;
   };
+  // the first n entries of a store (grown to n + n/8 if smaller; the old allocation is
+  // released first)
+  template <typename V>
+  static V FromStore(V &store, std::size_t n, const char *label) {
+    if (store.extent(0) < n) {
+      store = V();
+      store = V(Kokkos::view_alloc(Kokkos::WithoutInitializing,std::string(label)),n+n/8);
+    }
+    V v = Kokkos::subview(store,std::make_pair(std::size_t(0),n));
+    return v;
+  }
+  // the same, cleared on the device stream as a freshly constructed device vector
+  static Vector ZeroFromStore(Vector &store, std::size_t n, const char *label) {
+    Vector v = FromStore(store,n,label);
+    if (n > 0) Kokkos::deep_copy(DevExeSpace(),v,Real(0));
+    return v;
+  }
+  // the contents of data in the first entries of a device store, through a pinned stage,
+  // the copy queued on the device stream (the caller fences before the stage is written again)
+  template <typename T>
+  static DvceArray1D<T> StagedCopy(DvceArray1D<T> &store,
+                                   Kokkos::View<T*, Kokkos::SharedHostPinnedSpace> &stage,
+                                   const std::vector<T> &data, const char *label,
+                                   const char *stage_label) {
+    DvceArray1D<T> v = FromStore(store,data.size(),label);
+    if (!data.empty()) {
+      auto h = FromStore(stage,data.size(),stage_label);
+      StageCopy(h.data(),data.data(),data.size());
+      Kokkos::deep_copy(DevExeSpace(),v,h);
+    }
+    return v;
+  }
+  // DeviceCopy into a store
+  template <typename T>
+  static DvceArray1D<T> StoreCopy(DvceArray1D<T> &store, const std::vector<T> &data,
+                                  const char *label) {
+    if (PhaseAllocOld()) return DeviceCopy(data,label);
+    DvceArray1D<T> v = FromStore(store,data.size(),label);
+    if (!data.empty()) {
+      Kokkos::View<const T *, LayoutWrapper, HostMemSpace,
+                   Kokkos::MemoryTraits<Kokkos::Unmanaged>> host(data.data(),data.size());
+      Kokkos::deep_copy(v,host);
+    }
+    return v;
+  }
   struct Level {
     std::vector<GlobalIndex> partition;
     Operator a, p, r;
     Vector inverse_diagonal, b, x, residual, temp;
   };
   static void AddPhaseStorage(const Operator &op, StorageStats &s) {
-    s.csr_bytes += (op.phase_rowptr.size()+op.phase_colidx.size())*sizeof(int)
+    s.logical_csr_bytes += (op.phase_rowptr.size()+op.phase_colidx.size())*sizeof(int)
         +op.phase_values.size()*sizeof(Real);
     s.phase_map_bytes += (op.phase_map.size()+op.phase_rows.size())*sizeof(int);
     s.phase_rows += op.phase_rows_host.size();
     s.phase_nnz += op.phase_values.size();
-    s.halo_bytes += op.recv_slots.size()*sizeof(int);
+    s.logical_halo_bytes += op.recv_slots.size()*sizeof(int);
     if (op.recv_device.data() != op.ghost_device.data()) {
-      s.halo_bytes += op.recv_device.size()*sizeof(Real);
+      s.logical_halo_bytes += op.recv_device.size()*sizeof(Real);
     }
     s.host_pattern_bytes += (op.input_partition.capacity()+op.ghost_ids.capacity()
         +op.phase_base_ghosts.capacity()+op.phase_columns_host.capacity())*sizeof(GlobalIndex)
@@ -210,14 +465,55 @@ struct SparseMultigrid::Impl {
     s.host_pattern_bytes += map_bytes;
   }
   static void AddStorage(const Operator &op, StorageStats &s) {
-    s.csr_bytes += (op.rowptr.size()+op.colidx.size())*sizeof(int)
+    s.logical_csr_bytes += (op.rowptr.size()+op.colidx.size())*sizeof(int)
                    +op.values.size()*sizeof(Real);
-    s.halo_bytes += op.send_indices.size()*sizeof(int)
+    s.logical_halo_bytes += op.send_indices.size()*sizeof(int)
         +(op.send_device.size()+op.ghost_device.size()+op.send_host.size()
           +op.ghost_host.size())*sizeof(Real)
         +(op.send_counts.size()+op.recv_counts.size()+op.send_offsets.size()
           +op.recv_offsets.size())*sizeof(int);
     AddPhaseStorage(op,s);
+  }
+  // the allocations behind an operator's views: [begin, end) byte ranges of the views and
+  // of the stores and pinned stages behind them (Storage merges overlapping ranges, so a subview,
+  // a view shared by two operators, or a store and its subview count once)
+  using Ranges = std::vector<std::pair<std::uintptr_t,std::uintptr_t>>;
+  template <typename V>
+  static void AddRange(Ranges &r, const V &v) {
+    if (v.data() == nullptr || v.span() == 0) return;
+    const auto b = reinterpret_cast<std::uintptr_t>(v.data());
+    r.emplace_back(b,b+v.span()*sizeof(typename V::value_type));
+  }
+  static void AddAllocations(const Operator &op, Ranges &csr, Ranges &halo) {
+    AddRange(csr,op.rowptr); AddRange(csr,op.colidx); AddRange(csr,op.values);
+    AddRange(csr,op.phase_rowptr); AddRange(csr,op.phase_colidx); AddRange(csr,op.phase_values);
+    AddRange(csr,op.phase_values_pinned);
+    const auto &st = op.store;
+    AddRange(csr,st.phase_rowptr); AddRange(csr,st.phase_colidx); AddRange(csr,st.phase_values);
+    AddRange(csr,st.stage_rowptr); AddRange(csr,st.stage_colidx); AddRange(csr,st.stage_values);
+    AddRange(halo,op.send_indices); AddRange(halo,op.recv_slots);
+    AddRange(halo,op.send_device); AddRange(halo,op.ghost_device); AddRange(halo,op.recv_device);
+    AddRange(halo,op.send_host); AddRange(halo,op.ghost_host);
+    AddRange(halo,st.send_indices); AddRange(halo,st.recv_slots);
+    AddRange(halo,st.send_device); AddRange(halo,st.ghost_device); AddRange(halo,st.recv_device);
+    AddRange(halo,st.send_host); AddRange(halo,st.ghost_host);
+  }
+  static std::uint64_t MergedBytes(Ranges r) {
+    std::sort(r.begin(),r.end());
+    std::uint64_t total = 0;
+    std::uintptr_t b = 0, e = 0;
+    bool open = false;
+    for (const auto &x : r) {
+      if (open && x.first <= e) { e = std::max(e,x.second); continue; }
+      if (open) total += e-b;
+      b = x.first; e = x.second; open = true;
+    }
+    if (open) total += e-b;
+    return total;
+  }
+  static std::uint64_t CountBytes(const Operator &op) {   // host count/offset vectors
+    return (op.send_counts.size()+op.recv_counts.size()+op.send_offsets.size()
+            +op.recv_offsets.size())*sizeof(int);
   }
   static std::uint64_t Nonzeros(const Operator &op) {
     return op.phase_active ? op.values.size()-op.phase_masked_base_nnz+op.phase_values.size()
@@ -240,6 +536,8 @@ struct SparseMultigrid::Impl {
   std::vector<Real> krylov_h, krylov_cosine, krylov_sine, krylov_g, krylov_y;
   int krylov_restart = 0;
   bool nullspace;
+  // ATHENA_SG_PROJECT_FUSE=1 and the probe passed (CheckSwitches)
+  bool fuse_projection = false;
   int rank = 0, nranks = 1;
   int matrix_applications = 0, vcycles = 0;
 #if MPI_PARALLEL_ENABLED
@@ -256,11 +554,13 @@ struct SparseMultigrid::Impl {
     MPI_Comm_dup(input_comm, &comm);
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &nranks);
+    CheckSwitches();
   }
   Impl(const HostHierarchy &h, MPI_Comm input_comm) : nullspace(h.constant_nullspace) {
     MPI_Comm_dup(input_comm, &comm);
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &nranks);
+    CheckSwitches();
     try {
       Initialize(h);
     } catch (...) {
@@ -272,6 +572,7 @@ struct SparseMultigrid::Impl {
     MPI_Comm_dup(input_comm, &comm);
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &nranks);
+    CheckSwitches();
     try {
       Initialize(h);
     } catch (...) {
@@ -295,6 +596,64 @@ struct SparseMultigrid::Impl {
     if (!finalized && comm != MPI_COMM_NULL) MPI_Comm_free(&comm);
 #endif
   }
+
+#if MPI_PARALLEL_ENABLED
+  // The MPI-pattern switches must agree on every rank: a mismatch would pair MPI_Alltoallv
+  // with point-to-point halo messages, or Allreduce calls of different sizes.  Collective
+  // (called right after MPI_Comm_dup); frees comm before throwing, since no destructor runs.
+  void CheckSwitches() {
+    const int a = HaloAlltoallv() ? 1 : 0, b = PhaseCollectivesOld() ? 1 : 0;
+    const int c = PhaseForceOld() ? 1 : 0, d = ProjectFuse() ? 1 : 0;
+    const int e = DeviceMpi() ? 1 : 0;
+    int v[10] = {a, b, c, d, e, -a, -b, -c, -d, -e};
+    MPI_Allreduce(MPI_IN_PLACE, v, 10, MPI_INT, MPI_MAX, comm);
+    if (v[0] != -v[5] || v[1] != -v[6] || v[2] != -v[7] || v[3] != -v[8] || v[4] != -v[9]) {
+      MPI_Comm_free(&comm);
+      throw std::runtime_error("self-gravity: ATHENA_SG_HALO_ALLTOALLV / "
+                               "ATHENA_SG_PHASE_COLLECTIVES / ATHENA_SG_PHASE_FORCE_OLD / "
+                               "ATHENA_SG_PROJECT_FUSE / ATHENA_SG_DEVICE_MPI must be set alike "
+                               "on every rank");
+    }
+    // the fused projection only where the probe finds rank-independent sums (collective:
+    // every rank has the same ATHENA_SG_PROJECT_FUSE, checked above)
+    fuse_projection = ProjectFuse() && ProbeAllreduceIdentical();
+    if (ProjectFuse() && !fuse_projection && rank == 0) {
+      static bool told = false;
+      if (!told) {
+        told = true;
+        std::cout << "# NOTE (self-gravity): ATHENA_SG_PROJECT_FUSE=1 ignored: MPI_Allreduce "
+                  << "returned different sums on different ranks in the probe; every projection "
+                  << "completes before the next product (the default order)" << std::endl;
+      }
+    }
+  }
+  // Collective.  Sums of probe values with one MPI_Allreduce each, as the projection
+  // does (one MPI_ATHENA_REAL, MPI_SUM), then one exact integer reduction of the result bits:
+  // true if every rank received bitwise the same sums.  The values are the UCC 1.3 counterexample
+  // ({1, -1, 2^-54, 0} by rank modulo 4) in four rotations and a set of near-cancelling numbers.
+  bool ProbeAllreduceIdentical() const {
+    const Real tiny = std::ldexp(Real(1), -54);
+    const Real base[4] = {Real(1), Real(-1), tiny, Real(0)};
+    constexpr int kProbes = 5;
+    std::int64_t bits[2*kProbes];
+    for (int k = 0; k < kProbes; ++k) {
+      Real local = k < 4 ? base[(rank+k)%4]
+                         : (rank%2 == 0 ? Real(1) : Real(-1))*(Real(1)+rank*std::ldexp(Real(1),-52));
+      Real sum = 0;
+      MPI_Allreduce(&local, &sum, 1, MPI_ATHENA_REAL, MPI_SUM, comm);
+      std::int64_t b = 0;
+      std::memcpy(&b, &sum, sizeof(sum) < sizeof(b) ? sizeof(sum) : sizeof(b));
+      if (ProjectFuseProbeTest() && rank == 0) b ^= 1;
+      bits[k] = b; bits[kProbes+k] = -b;
+    }
+    // min and max of every result's bits at once: max(b) and max(-b) = -min(b)
+    std::int64_t r[2*kProbes];
+    MPI_Allreduce(bits, r, 2*kProbes, MPI_INT64_T, MPI_MAX, comm);
+    bool same = true;
+    for (int k = 0; k < kProbes; ++k) same = same && r[k] == -r[kProbes+k];
+    return same;
+  }
+#endif
 
   void Require(bool local_good, const char *message) const {
     int good = local_good ? 1 : 0;
@@ -427,10 +786,16 @@ struct SparseMultigrid::Impl {
     }
     Require(sends <= std::numeric_limits<int>::max()
         && receives <= std::numeric_limits<int>::max(),"halo exceeds MPI count capacity");
+    op.send_peers.clear(); op.recv_peers.clear();
     for (int r = 0; r < nranks; ++r) {
       op.recv_offsets[r+1] = op.recv_offsets[r]+op.recv_counts[r];
       op.send_offsets[r+1] = op.send_offsets[r]+op.send_counts[r];
+      if (op.send_counts[r] > 0) op.send_peers.push_back(r);
+      if (op.recv_counts[r] > 0) op.recv_peers.push_back(r);
     }
+#if MPI_PARALLEL_ENABLED
+    op.halo_requests.assign(op.send_peers.size()+op.recv_peers.size(),MPI_REQUEST_NULL);
+#endif
     // Union ghost slots deliberately retain base indices, so their order need
     // not match MPI owner groups. Receive into grouped order, then scatter.
     std::vector<GlobalIndex> grouped(ghosts.size()), requested(op.send_offsets.back());
@@ -452,13 +817,31 @@ struct SparseMultigrid::Impl {
       if (valid) send_indices[k] = static_cast<int>(requested[k]-input_begin);
     }
     Require(valid,"halo request addressed to a nonowner");
-    op.send_indices = DeviceCopy(send_indices,"gravity_halo_indices");
-    op.send_device = Vector("gravity_halo_send",requested.size());
-    op.ghost_device = Vector("gravity_halo_recv",ghosts.size());
-    op.recv_device = identity ? op.ghost_device : Vector("gravity_grouped_recv",ghosts.size());
-    op.recv_slots = identity ? Indices() : DeviceCopy(slots,"gravity_union_slots");
-    op.send_host = HostArray1D<Real>("gravity_halo_host_send",requested.size());
-    op.ghost_host = HostArray1D<Real>("gravity_halo_host_recv",ghosts.size());
+    if (PhaseAllocOld()) {
+      op.send_indices = DeviceCopy(send_indices,"gravity_halo_indices");
+      op.send_device = Vector("gravity_halo_send",requested.size());
+      op.ghost_device = Vector("gravity_halo_recv",ghosts.size());
+      op.recv_device = identity ? op.ghost_device : Vector("gravity_grouped_recv",ghosts.size());
+      op.recv_slots = identity ? Indices() : DeviceCopy(slots,"gravity_union_slots");
+      op.send_host = Kokkos::View<Real*, Kokkos::SharedHostPinnedSpace>(
+          Kokkos::view_alloc(Kokkos::WithoutInitializing,"gravity_halo_host_send"),
+          requested.size());
+      op.ghost_host = Kokkos::View<Real*, Kokkos::SharedHostPinnedSpace>(
+          Kokkos::view_alloc(Kokkos::WithoutInitializing,"gravity_halo_host_recv"),ghosts.size());
+      return;
+    }
+    // the same views as subviews of the operator's stores; the device vectors zeroed
+    // as the freshly constructed ones were.  The kernels and copies of an earlier halo plan
+    // that read these stores were ordered before this point (the copies above fence).
+    auto &st = op.store;
+    op.send_indices = StoreCopy(st.send_indices,send_indices,"gravity_halo_indices");
+    op.send_device = ZeroFromStore(st.send_device,requested.size(),"gravity_halo_send");
+    op.ghost_device = ZeroFromStore(st.ghost_device,ghosts.size(),"gravity_halo_recv");
+    op.recv_device = identity ? op.ghost_device
+        : ZeroFromStore(st.recv_device,ghosts.size(),"gravity_grouped_recv");
+    op.recv_slots = identity ? Indices() : StoreCopy(st.recv_slots,slots,"gravity_union_slots");
+    op.send_host = FromStore(st.send_host,requested.size(),"gravity_halo_host_send");
+    op.ghost_host = FromStore(st.ghost_host,ghosts.size(),"gravity_halo_host_recv");
   }
 
   // The sorted unique columns of a outside [lo, hi): sorted unique lists of entry chunks,
@@ -559,7 +942,11 @@ struct SparseMultigrid::Impl {
     Kokkos::parallel_reduce("gravity_phase_base_nnz",Kokkos::RangePolicy<DevExeSpace>(0,count),
     KOKKOS_LAMBDA(int j, std::uint64_t &sum) { sum += rp(indices(j)+1)-rp(indices(j)); },masked);
     op.phase_masked_base_nnz = masked;
-    if (!rows.empty()) BuildGhostSlots(op);
+    op.phase_base_sorted = !GhostMapOld()
+        && std::is_sorted(op.phase_base_ghosts.begin(),op.phase_base_ghosts.end())
+        && std::adjacent_find(op.phase_base_ghosts.begin(),op.phase_base_ghosts.end())
+           == op.phase_base_ghosts.end();
+    if (!rows.empty() && !op.phase_base_sorted) BuildGhostSlots(op);
     op.phase_configured = true;
   }
 
@@ -577,7 +964,8 @@ struct SparseMultigrid::Impl {
 
   // Host only: validation, pattern comparison, next ghost list and remapped columns of a
   // compact update, from op's state after its previous update (op is only read).
-  PhaseRowPlan Plan(const Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal) const {
+  PhaseRowPlan Plan(const Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal,
+                    int workers = 1) const {
     PhaseRowPlan plan;
     plan.prepared = true;
     plan.version = op.phase_updates.updates;
@@ -589,50 +977,219 @@ struct SparseMultigrid::Impl {
     if (valid) {
       valid = a.rowptr.front() == 0 && a.rowptr.back() == static_cast<int>(a.values.size())
           && std::is_sorted(a.rowptr.begin(),a.rowptr.end());
-      for (size_t k = 0; valid && k < a.values.size(); ++k) {
-        valid = a.colidx[k] >= 0 && a.colidx[k] < op.global_cols && std::isfinite(a.values[k]);
-      }
-      if (smoothing_diagonal) for (size_t j = 0; valid && j < a.rows.size(); ++j) {
-        Real diagonal = 0;
-        for (int k = a.rowptr[j]; k < a.rowptr[j+1]; ++k) {
-          if (a.colidx[k] == a.row_begin+a.rows[j]) diagonal += a.values[k];
+    }
+    // Consecutive row chunks on up to `workers` host threads of the calling thread: every
+    // chunk writes only its own rows or its own partial result, combined in chunk order, so
+    // the plan does not depend on the count.
+    const size_t nrows = a.rows.size();
+    const int chunks = static_cast<int>(std::max<size_t>(1,std::min<size_t>(
+        16*static_cast<size_t>(std::max(1,workers)),nrows/2048+1)));
+    auto first = [&](int c) { return nrows*c/chunks; };
+    auto parallel = [&](const auto &task) { ParallelChunks(std::max(1,workers),chunks,task); };
+    if (valid) {
+      std::vector<char> good(chunks,1);
+      parallel([&](int c) {
+        const size_t j0 = first(c), j1 = first(c+1);
+        bool ok = true;
+        for (int k = a.rowptr[j0]; ok && k < a.rowptr[j1]; ++k) {
+          ok = a.colidx[k] >= 0 && a.colidx[k] < op.global_cols && std::isfinite(a.values[k]);
         }
-        valid = diagonal != 0 && std::isfinite(diagonal)
-            && std::isfinite(Real(1)/diagonal);
-      }
+        if (smoothing_diagonal) for (size_t j = j0; ok && j < j1; ++j) {
+          Real diagonal = 0;
+          for (int k = a.rowptr[j]; k < a.rowptr[j+1]; ++k) {
+            if (a.colidx[k] == a.row_begin+a.rows[j]) diagonal += a.values[k];
+          }
+          ok = diagonal != 0 && std::isfinite(diagonal) && std::isfinite(Real(1)/diagonal);
+        }
+        good[c] = ok;
+      });
+      valid = std::find(good.begin(),good.end(),0) == good.end();
     }
     plan.valid = valid;
     if (!valid) return plan;
-    plan.same = a.rowptr == op.phase_rowptr_host && a.colidx == op.phase_columns_host;
-    if (plan.same) return plan;
+    // the stored pattern: the update's own, or (padding) per row the union with the current row
+    // when it exceeds the new row by at most `pad` entries (zeros at the columns not in the new row)
+    const int pad = PhasePatternPadding();
+    const std::vector<int> *rowptr = &a.rowptr;
+    const std::vector<GlobalIndex> *colidx = &a.colidx;
+    const auto &rp = op.phase_rowptr_host; const auto &ci = op.phase_columns_host;
+    if (pad <= 0 || rp.size() != a.rowptr.size()) {
+      plan.same = a.rowptr == rp && a.colidx == ci;
+      if (plan.same) return plan;
+    } else {
+      // per row: 0 the same pattern, 1 held by the stored row (a subset with at most `pad`
+      // stored zeros), 2 changed
+      std::vector<char> kind(nrows);
+      parallel([&](int c) {
+        for (size_t j = first(c); j < first(c+1); ++j) {
+          const int o0 = rp[j], o1 = rp[j+1], n0 = a.rowptr[j], n1 = a.rowptr[j+1];
+          if (o1-o0 == n1-n0 && std::equal(ci.begin()+o0,ci.begin()+o1,a.colidx.begin()+n0)) {
+            kind[j] = 0;
+          } else {
+            kind[j] = o1-o0 <= n1-n0+pad && std::includes(ci.begin()+o0,ci.begin()+o1,
+                a.colidx.begin()+n0,a.colidx.begin()+n1) ? 1 : 2;
+          }
+        }
+      });
+      const bool holds = std::find(kind.begin(),kind.end(),2) == kind.end();
+      if (holds && std::find(kind.begin(),kind.end(),1) == kind.end()) {
+        plan.same = true;   // the update's own pattern is the stored one
+        return plan;
+      }
+      if (holds) {   // values only, scattered into the stored rows
+        plan.same = true; plan.padded = true;
+        plan.values.resize(ci.size());
+        parallel([&](int c) {
+          for (size_t j = first(c); j < first(c+1); ++j) {
+            const int o0 = rp[j], o1 = rp[j+1], n0 = a.rowptr[j], n1 = a.rowptr[j+1];
+            if (kind[j] == 0) {
+              std::copy(a.values.begin()+n0,a.values.begin()+n1,plan.values.begin()+o0);
+              continue;
+            }
+            std::fill(plan.values.begin()+o0,plan.values.begin()+o1,Real(0));
+            for (int k = n0, m = o0; k < n1; ++k) {
+              while (ci[m] != a.colidx[k]) ++m;
+              plan.values[m++] = a.values[k];
+            }
+          }
+        });
+        return plan;
+      }
+      // a changed pattern: per chunk the stored rows (the union where it is within `pad` of the
+      // new row, else the new row), then joined in order
+      struct Part { std::vector<int> length; std::vector<GlobalIndex> colidx; std::vector<Real> values; };
+      std::vector<Part> parts(chunks);
+      parallel([&](int c) {
+        auto &part = parts[c];
+        std::vector<GlobalIndex> merged;
+        for (size_t j = first(c); j < first(c+1); ++j) {
+          const int o0 = rp[j], o1 = rp[j+1], n0 = a.rowptr[j], n1 = a.rowptr[j+1];
+          const size_t before = part.colidx.size();
+          // both rows are sorted by column without repeats (Append)
+          merged.clear();
+          std::set_union(ci.begin()+o0,ci.begin()+o1,a.colidx.begin()+n0,a.colidx.begin()+n1,
+                         std::back_inserter(merged));
+          if (merged.size() <= static_cast<size_t>(n1-n0+pad)) {
+            int k = n0;
+            for (GlobalIndex col : merged) {
+              part.colidx.push_back(col);
+              part.values.push_back(k < n1 && a.colidx[k] == col ? a.values[k++] : Real(0));
+            }
+          } else {
+            part.colidx.insert(part.colidx.end(),a.colidx.begin()+n0,a.colidx.begin()+n1);
+            part.values.insert(part.values.end(),a.values.begin()+n0,a.values.begin()+n1);
+          }
+          part.length.push_back(static_cast<int>(part.colidx.size()-before));
+        }
+      });
+      size_t nnz = 0;
+      std::vector<size_t> offset(chunks+1,0);
+      for (int c = 0; c < chunks; ++c) offset[c+1] = offset[c]+parts[c].colidx.size();
+      nnz = offset[chunks];
+      if (nnz > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        plan.valid = false; return plan;
+      }
+      plan.padded = true;
+      plan.rowptr.resize(nrows+1); plan.rowptr[0] = 0;
+      plan.colidx.resize(nnz); plan.values.resize(nnz);
+      parallel([&](int c) {
+        auto &part = parts[c];
+        int at = static_cast<int>(offset[c]);
+        for (size_t i = 0; i < part.length.size(); ++i) {
+          at += part.length[i]; plan.rowptr[first(c)+i+1] = at;
+        }
+        std::copy(part.colidx.begin(),part.colidx.end(),plan.colidx.begin()+offset[c]);
+        std::copy(part.values.begin(),part.values.end(),plan.values.begin()+offset[c]);
+        part = Part{};
+      });
+      rowptr = &plan.rowptr; colidx = &plan.colidx;
+    }
+    const auto &np = *rowptr; const auto &nc = *colidx;
+    // (diagnostics) the rows whose stored pattern changes, and up to four of them (first rows)
+    if (rp.size() == np.size()) {
+      std::vector<std::uint64_t> changed(chunks,0);
+      std::vector<std::vector<std::array<GlobalIndex,5>>> sample(chunks);
+      parallel([&](int c) {
+        for (size_t j = first(c); j < first(c+1); ++j) {
+          const int n0 = rp[j+1]-rp[j], n1 = np[j+1]-np[j];
+          if (n0 == n1 && std::equal(ci.begin()+rp[j],ci.begin()+rp[j+1],nc.begin()+np[j])) continue;
+          ++changed[c];
+          if (sample[c].size() < 4) {
+            const auto o0 = ci.begin()+rp[j], o1 = ci.begin()+rp[j+1];
+            const auto c0 = nc.begin()+np[j], c1 = nc.begin()+np[j+1];
+            GlobalIndex added = -1, removed = -1;
+            for (auto x = c0; x != c1 && added < 0; ++x) if (std::find(o0,o1,*x) == o1) added = *x;
+            for (auto x = o0; x != o1 && removed < 0; ++x) if (std::find(c0,c1,*x) == c1) removed = *x;
+            sample[c].push_back({{static_cast<GlobalIndex>(j),n0,n1,added,removed}});
+          }
+        }
+      });
+      for (int c = 0; c < chunks; ++c) {
+        plan.changed_rows += changed[c];
+        for (const auto &x : sample[c]) if (plan.changed_sample.size() < 4) plan.changed_sample.push_back(x);
+      }
+    }
     const auto begin = op.input_partition[rank], end = op.input_partition[rank+1];
     const int base = static_cast<int>(op.phase_base_ghosts.size());
-    plan.ghosts = op.phase_base_ghosts;
-    std::vector<GlobalIndex> extra;
-    for (GlobalIndex j : a.colidx) {
-      if (j >= begin && j < end) continue;
+    // the slot of a base ghost column (its position in the base list, the prefix of the current
+    // ghost list), -1 for any other column (read only: safe on several threads)
+    auto base_slot = [&op,base](GlobalIndex j) -> int {
+      if (op.phase_base_sorted) {
+        const auto &g = op.phase_base_ghosts;
+        const auto it = std::lower_bound(g.begin(),g.end(),j);
+        return it != g.end() && *it == j ? static_cast<int>(it-g.begin()) : -1;
+      }
       const auto slot = op.phase_ghost_slots.find(j);
-      if (slot == op.phase_ghost_slots.end() || slot->second >= base) extra.push_back(j);
-    }
+      return slot != op.phase_ghost_slots.end() && slot->second < base ? slot->second : -1;
+    };
+    plan.ghosts = op.phase_base_ghosts;
+    std::vector<std::vector<GlobalIndex>> extras(chunks);
+    parallel([&](int c) {
+      auto &extra = extras[c];
+      for (int k = np[first(c)]; k < np[first(c+1)]; ++k) {
+        const GlobalIndex j = nc[k];
+        if (j >= begin && j < end) continue;
+        if (base_slot(j) < 0) extra.push_back(j);
+      }
+      std::sort(extra.begin(),extra.end());
+      extra.erase(std::unique(extra.begin(),extra.end()),extra.end());
+    });
+    std::vector<GlobalIndex> extra;
+    for (auto &part : extras) extra.insert(extra.end(),part.begin(),part.end());
     std::sort(extra.begin(),extra.end());
     extra.erase(std::unique(extra.begin(),extra.end()),extra.end());
     plan.ghosts.insert(plan.ghosts.end(),extra.begin(),extra.end());
     // The slot of a ghost is its position in the next list: a base ghost keeps its
     // current (prefix) slot, an extra one follows the base in sorted order.
-    plan.columns.resize(a.colidx.size());
-    for (size_t k = 0; k < a.colidx.size(); ++k) {
-      const GlobalIndex j = a.colidx[k];
-      if (j >= begin && j < end) { plan.columns[k] = static_cast<int>(j-begin); continue; }
-      const auto slot = op.phase_ghost_slots.find(j);
-      const int position = slot != op.phase_ghost_slots.end() && slot->second < base ? slot->second
-          : base+static_cast<int>(std::lower_bound(extra.begin(),extra.end(),j)-extra.begin());
-      plan.columns[k] = op.inputs+position;
-    }
+    plan.columns.resize(nc.size());
+    parallel([&](int c) {
+      for (int k = np[first(c)]; k < np[first(c+1)]; ++k) {
+        const GlobalIndex j = nc[k];
+        if (j >= begin && j < end) { plan.columns[k] = static_cast<int>(j-begin); continue; }
+        const int found = base_slot(j);
+        const int position = found >= 0 ? found
+            : base+static_cast<int>(std::lower_bound(extra.begin(),extra.end(),j)-extra.begin());
+        plan.columns[k] = op.inputs+position;
+      }
+    });
     return plan;
   }
 
+  // the plan of a phase update: the given one if it was prepared for the operator's current
+  // version, else computed into `computed` (host only, no MPI)
+  const PhaseRowPlan *PhasePlan(const Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal,
+                                const PhaseRowPlan *given, PhaseRowPlan &computed) const {
+    if (given == nullptr || !given->prepared || given->version != op.phase_updates.updates) {
+      computed = Plan(op,a,smoothing_diagonal);
+      return &computed;
+    }
+    return given;
+  }
+  // known (xnode): {any rank invalid, any rank's ghost list changed} of this operator, already
+  // reduced over all ranks by the caller (one collective for many operators); nullptr: the two
+  // collectives here
   bool UpdatePhase(Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal = false,
-                   const PhaseRowPlan *given = nullptr) {
+                   const PhaseRowPlan *given = nullptr, const int *known = nullptr) {
     auto &times = PhaseTimes();
     double clock = HostSeconds();
     auto lap = [&clock](double &bucket) {
@@ -648,7 +1205,12 @@ struct SparseMultigrid::Impl {
       ++times.planned;
     }
     lap(times.validate);
-    Require(plan->valid,"invalid compact phase CSR, ownership, row set, or smoothing diagonal");
+    if (known == nullptr) {
+      Require(plan->valid,"invalid compact phase CSR, ownership, row set, or smoothing diagonal");
+    } else if (known[0]) {
+      throw std::runtime_error("self-gravity: invalid compact phase CSR, ownership, row set, "
+                               "or smoothing diagonal");
+    }
     lap(times.mpi);
     const bool same = plan->same;
     if (!same) ++op.phase_updates.local_pattern_changes;
@@ -659,7 +1221,8 @@ struct SparseMultigrid::Impl {
 #if MPI_PARALLEL_ENABLED
     // A remote rank may change requests addressed to this rank even when our
     // own CSR/ghost list is unchanged. Every rank must rebuild the send plan.
-    MPI_Allreduce(MPI_IN_PLACE,&global_ghost_change,1,MPI_INT,MPI_MAX,comm);
+    if (known == nullptr) MPI_Allreduce(MPI_IN_PLACE,&global_ghost_change,1,MPI_INT,MPI_MAX,comm);
+    else global_ghost_change = known[1];
 #endif
     lap(times.mpi);
     op.phase_updates.local_ghost_changes += local_ghost_change;
@@ -671,36 +1234,87 @@ struct SparseMultigrid::Impl {
       ++op.phase_updates.halo_reuses;
     }
     lap(times.halo);
-    if (local_ghost_change) BuildGhostSlots(op);
+    if (local_ghost_change && !op.phase_base_sorted) BuildGhostSlots(op);
     lap(times.ghosts);
     // No MPI occurs below this point: CSR/value uploads are local decisions.
     if (same) {
-      auto host = Kokkos::create_mirror_view(op.phase_values);
-      for (size_t k = 0; k < a.values.size(); ++k) host(k) = a.values[k];
-      Kokkos::deep_copy(op.phase_values,host);
+      // a kept pinned buffer instead of a fresh zero-initialised mirror per update (22
+      // operators per phase update: allocation, memset and a pageable copy each)
+      const size_t nv = op.phase_values.extent(0);
+      Kokkos::View<Real*, Kokkos::SharedHostPinnedSpace> host;
+      if (PhaseAllocOld()) {
+        if (op.phase_values_pinned.extent(0) != nv) {
+          op.phase_values_pinned = Kokkos::View<Real*, Kokkos::SharedHostPinnedSpace>(
+              Kokkos::view_alloc(Kokkos::WithoutInitializing,"gravity_phase_values_pinned"),nv);
+        }
+        host = op.phase_values_pinned;
+      } else {   // a store with capacity: no new pinned allocation when nv changes
+        host = FromStore(op.phase_values_pinned,nv,"gravity_phase_values_pinned");
+      }
+      const auto &values = plan->padded ? plan->values : a.values;   // (padded: current pattern)
+      const size_t nc = std::min(nv,values.size());
+      if (PhaseAllocOld()) {
+        for (size_t k = 0; k < nc; ++k) host(k) = values[k];
+      } else {
+        StageCopy(host.data(),values.data(),nc);   // the same bytes, several threads
+      }
+      for (size_t k = nc; k < nv; ++k) host(k) = 0;   // (as the zero-initialised mirror did)
+      // queued on the device stream; the caller fences once per update before the host
+      // writes the pinned buffer again (UpdateHierarchyPhaseRows, DistributedOperator)
+      if (PhaseAllocOld()) Kokkos::deep_copy(op.phase_values,host);
+      else Kokkos::deep_copy(DevExeSpace(),op.phase_values,host);
       ++op.phase_updates.value_updates;
       ++times.value_only;
       lap(times.upload);
     } else {
       const auto &columns = plan->columns;
+      // the stored pattern: the update's own, or its padded union with the current one
+      const auto &rowptr = plan->padded ? plan->rowptr : a.rowptr;
+      const auto &colidx = plan->padded ? plan->colidx : a.colidx;
+      const auto &values = plan->padded ? plan->values : a.values;
       lap(times.remap);
-      if (op.phase_rowptr.size() == a.rowptr.size()) {
-        auto host = Kokkos::create_mirror_view(op.phase_rowptr);
-        for (size_t k = 0; k < a.rowptr.size(); ++k) host(k) = a.rowptr[k];
-        Kokkos::deep_copy(op.phase_rowptr,host);
+      if (PhaseAllocOld()) {
+        if (op.phase_rowptr.size() == rowptr.size()) {
+          auto host = Kokkos::create_mirror_view(op.phase_rowptr);
+          for (size_t k = 0; k < rowptr.size(); ++k) host(k) = rowptr[k];
+          Kokkos::deep_copy(op.phase_rowptr,host);
+        } else {
+          op.phase_rowptr = DeviceCopy(rowptr,"gravity_phase_rowptr");
+        }
+        op.phase_colidx = DeviceCopy(columns,"gravity_phase_columns");
+        op.phase_values = DeviceCopy(values,"gravity_phase_values");
       } else {
-        op.phase_rowptr = DeviceCopy(a.rowptr,"gravity_phase_rowptr");
+        // the same contents in the operator's stores; the copies are queued on the
+        // device stream after the kernels that still read the previous pattern, and the
+        // caller fences once per update before the pinned stages are written again
+        auto &st = op.store;
+        op.phase_rowptr = StagedCopy(st.phase_rowptr,st.stage_rowptr,rowptr,
+                                     "gravity_phase_rowptr","gravity_phase_stage_rowptr");
+        op.phase_colidx = StagedCopy(st.phase_colidx,st.stage_colidx,columns,
+                                     "gravity_phase_columns","gravity_phase_stage_columns");
+        op.phase_values = StagedCopy(st.phase_values,st.stage_values,values,
+                                     "gravity_phase_values","gravity_phase_stage_values");
       }
-      op.phase_colidx = DeviceCopy(columns,"gravity_phase_columns");
-      op.phase_values = DeviceCopy(a.values,"gravity_phase_values");
-      op.phase_rowptr_host = a.rowptr;
-      op.phase_columns_host = a.colidx;
+      op.phase_rowptr_host = rowptr;
+      op.phase_columns_host = colidx;
       ++op.phase_updates.structure_rebuilds;
       lap(times.upload);
     }
     op.phase_active = true;
     ++op.phase_updates.updates;
     return same != 0;
+  }
+
+  // the fine phase update with its uploads still queued (internal: the public entries
+  // complete them with a PhaseUploadFence)
+  void UpdateFineQueued(const CsrRowUpdate &a, const PhaseRowPlan *plan, const int *known) {
+    const bool smooth = levels.size() > 1;
+    const bool same = UpdatePhase(current_a,a,smooth,plan,known);
+    if (smooth) UpdatePhaseDiagonal(current_a,levels[0].inverse_diagonal,fine_diagonal_dirty);
+    fine_diagonal_dirty = false;
+    ++fine_updates.updates;
+    if (same) ++fine_updates.value_updates;
+    else ++fine_updates.structure_rebuilds;
   }
 
   void UpdatePhaseDiagonal(Operator &op, const Vector &inverse, bool all_rows = false) {
@@ -861,10 +1475,35 @@ struct SparseMultigrid::Impl {
         level.r = Build(h.restriction[l],levels[l+1].partition,part);
       }
     }
+    // ATHENA_SG_LEVEL_STATS=1 (xnode diagnostics): rows, nonzeros, longest row and halo of
+    // every local operator of the hierarchy, one line per rank and level
+    if (const char *e = std::getenv("ATHENA_SG_LEVEL_STATS"); e != nullptr && e[0] == '1') {
+      auto stat = [](const LocalCsr &m, const Operator &op) {
+        int longest = 0;
+        for (int i = 0; i < m.LocalRows(); ++i)
+          longest = std::max(longest, m.rowptr[i+1]-m.rowptr[i]);
+        return std::to_string(m.LocalRows())+"/"+std::to_string(m.colidx.size())+"/"
+            +std::to_string(longest)+"/"+std::to_string(op.ghost_ids.size())+"/"
+            +std::to_string(op.recv_peers.size());
+      };
+      for (size_t l = 0; l < levels.size(); ++l) {
+        std::cout << "# SG_LEVEL_STATS rank=" << rank << " level=" << l
+                  << " global_rows=" << h.matrices[l].global_rows
+                  << " A(rows/nnz/longest/ghosts/peers)=" << stat(h.matrices[l],levels[l].a);
+        if (l+1 < levels.size())
+          std::cout << " P=" << stat(h.prolongation[l],levels[l].p)
+                    << " R=" << stat(h.restriction[l],levels[l].r);
+        std::cout << '\n';
+      }
+    }
     // Shared CSR views remain immutable in the cached hierarchy. Halo scratch is
     // used sequentially. First refresh detaches outer values; new patterns rebuild CSR.
     SetupLap lap(SetupTimes().coarse);
     current_a = levels[0].a;
+    // the current operator shares the cached views, not the stores behind them: its
+    // first phase update that rebuilds the halo or the pattern allocates its own (as the fresh
+    // views did), so the cached operator's send indices stay immutable
+    current_a.store = Operator::Stores{};
     current_rowptr = h.matrices[0].rowptr;
     current_columns = h.matrices[0].colidx;
     current_values_shared = true;
@@ -1036,22 +1675,158 @@ struct SparseMultigrid::Impl {
     SetupCoarse(terminal_matrix);
   }
 
-  void Multiply(Operator &op, const Vector &x, const Vector &y) {
-    if (x.extent_int(0) != op.inputs || y.extent_int(0) != op.rows) {
-      throw std::runtime_error("self-gravity: local matrix/vector shape mismatch");
+#if MPI_PARALLEL_ENABLED
+  // The halo values of one product: messages only with the ranks in send_peers/recv_peers
+  // (no global synchronization; a rank without halo entries returns at once).  The packed
+  // send buffer is copied to the pinned host buffer on the device stream, one stream fence
+  // before MPI, and the received values are copied back on the stream (the kernels that
+  // read them follow on the same stream; the next exchange fences before MPI writes the
+  // host buffer again).  ATHENA_SG_DEVICE_MPI=1 hands the device buffers to MPI instead.
+  void ExchangeHalo(Operator &op) {
+    const int ns = op.send_peers.size(), nr = op.recv_peers.size();
+    if (ns == 0 && nr == 0) return;
+    DevExeSpace exec;
+    const bool device = DeviceMpi();
+    const int nsend = op.send_device.extent_int(0);
+    if (!device && nsend > 0) {
+      Kokkos::deep_copy(exec, Kokkos::subview(op.send_host,std::make_pair(0,nsend)),
+                        op.send_device);
     }
+    exec.fence("gravity_halo_send_ready");
+    PostHalo(op);
+    FinishHalo(op);
+  }
+  // the receives and sends of the packed halo (the send buffer complete)
+  void PostHalo(Operator &op) {
+    const int ns = op.send_peers.size(), nr = op.recv_peers.size();
+    if (ns == 0 && nr == 0) return;
+    const bool device = DeviceMpi();
+    Real *sbuf = device ? op.send_device.data() : op.send_host.data();
+    Real *rbuf = device ? op.recv_device.data() : op.ghost_host.data();
+    auto *req = op.halo_requests.data();
+    for (int q = 0; q < nr; ++q) {
+      const int r = op.recv_peers[q];
+      MPI_Irecv(rbuf+op.recv_offsets[r], op.recv_counts[r], MPI_ATHENA_REAL, r, 0, comm,
+                &req[q]);
+    }
+    for (int q = 0; q < ns; ++q) {
+      const int r = op.send_peers[q];
+      MPI_Isend(sbuf+op.send_offsets[r], op.send_counts[r], MPI_ATHENA_REAL, r, 0, comm,
+                &req[nr+q]);
+    }
+  }
+  // completion of PostHalo and the copy of the received values to the device (queued)
+  void FinishHalo(Operator &op) {
+    const int ns = op.send_peers.size(), nr = op.recv_peers.size();
+    if (ns == 0 && nr == 0) return;
+    DevExeSpace exec;
+    const int nrecv = op.recv_device.extent_int(0);
+    MPI_Waitall(nr+ns, op.halo_requests.data(), MPI_STATUSES_IGNORE);
+    if (!DeviceMpi() && nrecv > 0) {
+      Kokkos::deep_copy(exec, op.recv_device,
+                        Kokkos::subview(op.ghost_host,std::make_pair(0,nrecv)));
+    }
+  }
+#endif
+
+  // the halo entries of x into the device send buffer
+  void PackHalo(Operator &op, const Vector &x) {
     auto send = op.send_device;
     auto send_indices = op.send_indices;
     const int nsend = send.extent_int(0);
     Kokkos::parallel_for("gravity_halo_pack", Kokkos::RangePolicy<DevExeSpace>(0, nsend),
                          KOKKOS_LAMBDA(int i) { send(i) = x(send_indices(i)); });
-    Kokkos::deep_copy(op.send_host, send);
+  }
+
+  // Project(x) followed by Multiply(op, x, y), see ProjectFuse: the halo of the
+  // unprojected x travels while the mean is reduced; owner and receivers subtract the same mean
+  void ProjectMultiply(const Vector &x, GlobalIndex global_size, Operator &op, const Vector &y) {
 #if MPI_PARALLEL_ENABLED
-    MPI_Alltoallv(op.send_host.data(), op.send_counts.data(), op.send_offsets.data(),
-                  MPI_ATHENA_REAL, op.ghost_host.data(), op.recv_counts.data(),
-                  op.recv_offsets.data(), MPI_ATHENA_REAL, comm);
+    if (!nullspace || !fuse_projection || HaloAlltoallv() || DeviceMpi()) {
+      Project(x, global_size);
+      Multiply(op, x, y);
+      return;
+    }
+    if (x.extent_int(0) != op.inputs || y.extent_int(0) != op.rows) {
+      throw std::runtime_error("self-gravity: local matrix/vector shape mismatch");
+    }
+    DevExeSpace exec;
+    PackHalo(op, x);
+    const int nsend = op.send_device.extent_int(0);
+    const int nrecv = op.recv_device.extent_int(0);
+    if (nsend > 0) {
+      Kokkos::deep_copy(exec, Kokkos::subview(op.send_host,std::make_pair(0,nsend)),
+                        op.send_device);
+    }
+    // the local sum as in Project (the same reduction); a reduction into a host scalar returns
+    // only when the stream has completed it, so the packed halo is in the host buffer too
+    Real local = 0;
+    const int n = x.extent_int(0);
+    Kokkos::parallel_reduce("gravity_mean", Kokkos::RangePolicy<DevExeSpace>(0, n),
+                            KOKKOS_LAMBDA(int i, Real &s) { s += x(i); }, local);
+    PostHalo(op);
+    const Real mean = Sum(local)/global_size;
+    // the received values minus the mean: a short halo on the host before its copy to the
+    // device (IEEE subtraction, the same result as on the device), a long one on the device
+    const int ns = op.send_peers.size(), nr = op.recv_peers.size();
+    const bool host_halo = nrecv > 0 && nrecv <= 16384 && (ns > 0 || nr > 0);
+    if (ns > 0 || nr > 0) {
+      MPI_Waitall(nr+ns, op.halo_requests.data(), MPI_STATUSES_IGNORE);
+      if (host_halo) {
+        Real *h = op.ghost_host.data();
+        for (int q = 0; q < nrecv; ++q) h[q] -= mean;
+      }
+      if (nrecv > 0) {
+        Kokkos::deep_copy(exec, op.recv_device,
+                          Kokkos::subview(op.ghost_host,std::make_pair(0,nrecv)));
+      }
+    }
+    Kokkos::parallel_for("gravity_null_projection", Kokkos::RangePolicy<DevExeSpace>(0, n),
+                         KOKKOS_LAMBDA(int i) { x(i) -= mean; });
+    if (nrecv > 0 && !host_halo) {
+      auto received = op.recv_device;
+      Kokkos::parallel_for("gravity_null_projection_halo",
+                           Kokkos::RangePolicy<DevExeSpace>(0, nrecv),
+                           KOKKOS_LAMBDA(int q) { received(q) -= mean; });
+    }
+    ScatterAndProduct(op, x, y);
+#else
+    Project(x, global_size);
+    Multiply(op, x, y);
 #endif
+  }
+
+  void Multiply(Operator &op, const Vector &x, const Vector &y) {
+    if (x.extent_int(0) != op.inputs || y.extent_int(0) != op.rows) {
+      throw std::runtime_error("self-gravity: local matrix/vector shape mismatch");
+    }
+    auto send = op.send_device;
+    PackHalo(op, x);
+#if MPI_PARALLEL_ENABLED
+    if (!HaloAlltoallv()) {
+      ExchangeHalo(op);
+    } else if (DeviceMpi()) {
+      // GPU-aware MPI: the device buffers themselves (the pack must be complete first)
+      Kokkos::fence("gravity_halo_device_mpi");
+      MPI_Alltoallv(send.data(), op.send_counts.data(), op.send_offsets.data(),
+                    MPI_ATHENA_REAL, op.recv_device.data(), op.recv_counts.data(),
+                    op.recv_offsets.data(), MPI_ATHENA_REAL, comm);
+    } else {
+      Kokkos::deep_copy(op.send_host, send);
+      MPI_Alltoallv(op.send_host.data(), op.send_counts.data(), op.send_offsets.data(),
+                    MPI_ATHENA_REAL, op.ghost_host.data(), op.recv_counts.data(),
+                    op.recv_offsets.data(), MPI_ATHENA_REAL, comm);
+      Kokkos::deep_copy(op.recv_device, op.ghost_host);
+    }
+#else
+    Kokkos::deep_copy(op.send_host, send);
     Kokkos::deep_copy(op.recv_device, op.ghost_host);
+#endif
+    ScatterAndProduct(op, x, y);
+  }
+
+  // the received halo values to their ghost slots, then the local product y = A x
+  void ScatterAndProduct(Operator &op, const Vector &x, const Vector &y) {
     if (op.recv_slots.extent(0) != 0) {
       auto received = op.recv_device;
       auto targets = op.ghost_device;
@@ -1069,6 +1844,48 @@ struct SparseMultigrid::Impl {
     auto pav = op.phase_values;
     const bool phase_active = op.phase_active;
     const int ni = op.inputs;
+    const int row_teams = SpmvRowTeams();
+    if (row_teams > 0 && op.rows > 0
+        && static_cast<std::int64_t>(op.colidx.extent(0)) >= static_cast<std::int64_t>(row_teams)*op.rows) {
+      // one team per row (xnode; see SpmvRowTeams): the vector lanes load
+      // a chunk of the row's values and inputs into team scratch at once, then one lane adds
+      // them up in the row order -- the same multiply-adds in the same order as the loop
+      // below, so a long row costs a few memory latencies instead of one per entry
+      using Policy = Kokkos::TeamPolicy<DevExeSpace>;
+      using Member = Policy::member_type;
+      using Scratch = Kokkos::View<Real*, DevExeSpace::scratch_memory_space,
+                                   Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+      const int vl = std::min(32, Policy::vector_length_max());
+      const size_t bytes = 2*Scratch::shmem_size(vl);
+      Kokkos::parallel_for("gravity_sparse_matvec_rows",
+          Policy(op.rows, 1, vl).set_scratch_size(0, Kokkos::PerTeam(bytes)),
+          KOKKOS_LAMBDA(const Member &m) {
+        const int i = m.league_rank();
+        Scratch sa(m.team_scratch(0), vl), sx(m.team_scratch(0), vl);
+        const int selected = phase_active ? phase_map(i) : -1;
+        const bool ph = selected >= 0;
+        const int kb = ph ? prp(selected) : rp(i), ke = ph ? prp(selected+1) : rp(i+1);
+        Real sum = 0;
+        for (int k0 = kb; k0 < ke;) {  // k0 advances by cnt: never past ke (no int overflow)
+          const int cnt = (ke-k0 < vl) ? ke-k0 : vl;
+          Kokkos::parallel_for(Kokkos::ThreadVectorRange(m, cnt), [&](const int q) {
+            const int k = k0+q;
+            const int j = ph ? pci(k) : ci(k);
+            sa(q) = ph ? pav(k) : av(k);
+            sx(q) = j < ni ? x(j) : ghosts(j-ni);
+          });
+          m.team_barrier();
+          Kokkos::single(Kokkos::PerThread(m), [&]() {
+            for (int q = 0; q < cnt; ++q) sum += sa(q)*sx(q);
+          });
+          m.team_barrier();
+          k0 += cnt;
+        }
+        Kokkos::single(Kokkos::PerThread(m), [&]() { y(i) = sum; });
+      });
+      ++matrix_applications;
+      return;
+    }
     Kokkos::parallel_for("gravity_sparse_matvec", Kokkos::RangePolicy<DevExeSpace>(0, op.rows),
                          KOKKOS_LAMBDA(int i) {
       Real sum = 0;
@@ -1172,7 +1989,8 @@ struct SparseMultigrid::Impl {
     }
   }
 
-  void CoarseSolve(Level &l) {
+  // project = false (fused V-cycle): the final projection of l.x is left to the caller
+  void CoarseSolve(Level &l, bool project = true) {
     auto host_b = Kokkos::create_mirror_view_and_copy(HostMemSpace(), l.b);
     auto host_x = Kokkos::create_mirror_view(l.x);
     const int n = static_cast<int>(l.partition.back());
@@ -1201,15 +2019,20 @@ struct SparseMultigrid::Impl {
     for (int i = 0; i < n; ++i) host_x(i) = coarse_rhs[i];
 #endif
     Kokkos::deep_copy(l.x, host_x);
-    Project(l.x, n);
+    if (project) Project(l.x, n);
   }
 
   void Cycle(int index) {
+    // xnode profiling: a region per level (nested; no-op without a Kokkos tool)
+    Kokkos::Profiling::pushRegion("MG:L" + std::to_string(index));
     auto &l = levels[index];
     Project(l.b, l.partition.back());
-    Kokkos::deep_copy(l.x, Real(0));
+    // queued on the device stream (ATHENA_SG_MG_SYNC_COPIES=1: blocking, as before)
+    if (MgSyncCopies()) Kokkos::deep_copy(l.x, Real(0));
+    else Kokkos::deep_copy(DevExeSpace(), l.x, Real(0));
     if (index+1 == static_cast<int>(levels.size())) {
       CoarseSolve(l);
+      Kokkos::Profiling::popRegion();
       return;
     }
     Smooth(l);
@@ -1219,6 +2042,59 @@ struct SparseMultigrid::Impl {
     Multiply(l.p, levels[index+1].x, l.temp);
     Axpy(1, l.temp, l.x);
     Smooth(l);
+    Kokkos::Profiling::popRegion();
+  }
+
+  // Smooth without its last projection, which the caller fuses with the next product
+  // (ProjectMultiply); the sweeps after the first fuse the projection of the previous sweep
+  void SmoothFused(Level &l) {
+    auto x = l.x;
+    auto b = l.b;
+    auto temp = l.temp;
+    auto diagonal = l.inverse_diagonal;
+    const int n = x.extent_int(0);
+    for (int sweep = 0; sweep < 3; ++sweep) {
+      if (sweep == 0) Multiply(CycleMatrix(l), x, temp);
+      else ProjectMultiply(x, l.partition.back(), CycleMatrix(l), temp);
+      Kokkos::parallel_for("gravity_jacobi", Kokkos::RangePolicy<DevExeSpace>(0, n),
+                           KOKKOS_LAMBDA(int i) {
+        x(i) += Real(0.65)*diagonal(i)*(b(i)-temp(i));
+      });
+    }
+  }
+
+  // Cycle with every projection that is followed by a product of the same vector fused
+  // with that product (ProjectMultiply): the same operations in the same order on the device; it
+  // returns with the final projection of levels[index].x left to the caller
+  void CycleFused(int index) {
+    Kokkos::Profiling::pushRegion("MG:L" + std::to_string(index));
+    auto &l = levels[index];
+    Project(l.b, l.partition.back());
+    if (MgSyncCopies()) Kokkos::deep_copy(l.x, Real(0));
+    else Kokkos::deep_copy(DevExeSpace(), l.x, Real(0));
+    if (index+1 == static_cast<int>(levels.size())) {
+      CoarseSolve(l, false);
+      Kokkos::Profiling::popRegion();
+      return;
+    }
+    SmoothFused(l);
+    // Residual(l, l.b, l.x, l.residual), its product fused with the last smoothing projection
+    ProjectMultiply(l.x, l.partition.back(), CycleMatrix(l), l.residual);
+    {
+      auto r = l.residual;
+      auto b = l.b;
+      const int n = r.extent_int(0);
+      Kokkos::parallel_for("gravity_residual", Kokkos::RangePolicy<DevExeSpace>(0, n),
+                           KOKKOS_LAMBDA(int i) { r(i) = b(i)-r(i); });
+    }
+    // its projection fused with the restriction
+    ProjectMultiply(l.residual, l.partition.back(), l.r, levels[index+1].b);
+    CycleFused(index+1);
+    // the coarse level's final projection fused with the prolongation
+    ProjectMultiply(levels[index+1].x, levels[index+1].partition.back(), l.p, l.temp);
+    Axpy(1, l.temp, l.x);
+    SmoothFused(l);
+    Kokkos::Profiling::popRegion();
   }
 
   void Precondition(const Vector &rhs, const Vector &result) {
@@ -1226,9 +2102,16 @@ struct SparseMultigrid::Impl {
         || result.extent_int(0) != rhs.extent_int(0)) {
       throw std::runtime_error("self-gravity: V-cycle local vector shape mismatch");
     }
-    Kokkos::deep_copy(levels[0].b, rhs);
-    Cycle(0);
-    Kokkos::deep_copy(result, levels[0].x);
+    if (MgSyncCopies()) Kokkos::deep_copy(levels[0].b, rhs);
+    else Kokkos::deep_copy(DevExeSpace(), levels[0].b, rhs);
+    if (!fuse_projection) {
+      Cycle(0);
+    } else {
+      CycleFused(0);
+      Project(levels[0].x, levels[0].partition.back());
+    }
+    if (MgSyncCopies()) Kokkos::deep_copy(result, levels[0].x);
+    else Kokkos::deep_copy(DevExeSpace(), result, levels[0].x);
     ++vcycles;
   }
 
@@ -1304,11 +2187,13 @@ struct SparseMultigrid::Impl {
       std::fill(h.begin(), h.end(), Real(0));
       std::fill(g.begin(), g.end(), Real(0));
       g[0] = beta;
-      Kokkos::deep_copy(v[0], r);
+      if (MgSyncCopies()) Kokkos::deep_copy(v[0], r);
+      else Kokkos::deep_copy(DevExeSpace(), v[0], r);
       Scale(1/beta, v[0]);
       int used = 0;
       for (int j = 0; j < m && stats.iterations < max_iterations; ++j) {
         Precondition(v[j], z[j]);
+        Kokkos::Profiling::pushRegion("MG:krylov");
         Multiply(current_a,z[j],w);
         Project(w, global_n);
         // Reorthogonalization avoids false convergence near a tight Poisson tolerance.
@@ -1320,9 +2205,11 @@ struct SparseMultigrid::Impl {
           }
         }
         const Real next = Norm(w);
+        Kokkos::Profiling::popRegion();
         h[(j+1)*m+j] = next;
         if (next > 0) {
-          Kokkos::deep_copy(v[j+1], w);
+          if (MgSyncCopies()) Kokkos::deep_copy(v[j+1], w);
+          else Kokkos::deep_copy(DevExeSpace(), v[j+1], w);
           Scale(1/next, v[j+1]);
         }
         for (int i = 0; i < j; ++i) {
@@ -1422,17 +2309,34 @@ StorageStats SparseMultigrid::Storage() const {
   if (a.phase_active) {
     s.current_a_nnz = a.values.size()-a.phase_masked_base_nnz+a.phase_values.size();
   }
-  if (a.rowptr.data() != cached.rowptr.data()) s.csr_bytes += a.rowptr.size()*sizeof(int);
-  if (a.colidx.data() != cached.colidx.data()) s.csr_bytes += a.colidx.size()*sizeof(int);
-  if (a.values.data() != cached.values.data()) s.csr_bytes += a.values.size()*sizeof(Real);
-  if (a.send_indices.data() != cached.send_indices.data()) s.halo_bytes += a.send_indices.size()*sizeof(int);
-  if (a.send_device.data() != cached.send_device.data()) s.halo_bytes += a.send_device.size()*sizeof(Real);
-  if (a.ghost_device.data() != cached.ghost_device.data()) s.halo_bytes += a.ghost_device.size()*sizeof(Real);
-  if (a.send_host.data() != cached.send_host.data()) s.halo_bytes += a.send_host.size()*sizeof(Real);
-  if (a.ghost_host.data() != cached.ghost_host.data()) s.halo_bytes += a.ghost_host.size()*sizeof(Real);
-  s.halo_bytes += (a.send_counts.size()+a.recv_counts.size()+a.send_offsets.size()
-                  +a.recv_offsets.size())*sizeof(int);
+  if (a.rowptr.data() != cached.rowptr.data()) s.logical_csr_bytes += a.rowptr.size()*sizeof(int);
+  if (a.colidx.data() != cached.colidx.data()) s.logical_csr_bytes += a.colidx.size()*sizeof(int);
+  if (a.values.data() != cached.values.data()) s.logical_csr_bytes += a.values.size()*sizeof(Real);
+  if (a.send_indices.data() != cached.send_indices.data())
+    s.logical_halo_bytes += a.send_indices.size()*sizeof(int);
+  if (a.send_device.data() != cached.send_device.data())
+    s.logical_halo_bytes += a.send_device.size()*sizeof(Real);
+  if (a.ghost_device.data() != cached.ghost_device.data())
+    s.logical_halo_bytes += a.ghost_device.size()*sizeof(Real);
+  if (a.send_host.data() != cached.send_host.data())
+    s.logical_halo_bytes += a.send_host.size()*sizeof(Real);
+  if (a.ghost_host.data() != cached.ghost_host.data())
+    s.logical_halo_bytes += a.ghost_host.size()*sizeof(Real);
+  s.logical_halo_bytes += Impl::CountBytes(a);
   Impl::AddPhaseStorage(a,s);
+  // the allocations behind all operators, each counted once
+  {
+    Impl::Ranges csr, halo;
+    std::uint64_t counts = Impl::CountBytes(a);
+    Impl::AddAllocations(a,csr,halo);
+    for (const auto &l : impl_->levels) {
+      Impl::AddAllocations(l.a,csr,halo); Impl::AddAllocations(l.p,csr,halo);
+      Impl::AddAllocations(l.r,csr,halo);
+      counts += Impl::CountBytes(l.a)+Impl::CountBytes(l.p)+Impl::CountBytes(l.r);
+    }
+    s.csr_bytes = Impl::MergedBytes(std::move(csr));
+    s.halo_bytes = Impl::MergedBytes(std::move(halo))+counts;
+  }
   s.terminal_host_csr_bytes = impl_->terminal_matrix.rowptr.capacity()*sizeof(int)
       +impl_->terminal_matrix.colidx.capacity()*sizeof(GlobalIndex)
       +impl_->terminal_matrix.values.capacity()*sizeof(Real);
@@ -1489,14 +2393,15 @@ void SparseMultigrid::UpdateFinePhaseRows(const CsrRowUpdate &a) {
   UpdateFinePhaseRowsPlanned(a,nullptr);
 }
 void SparseMultigrid::UpdateFinePhaseRowsPlanned(const CsrRowUpdate &a, const PhaseRowPlan *plan) {
-  const bool smooth = impl_->levels.size() > 1;
-  const bool same = impl_->UpdatePhase(impl_->current_a,a,smooth,plan);
-  if (smooth) impl_->UpdatePhaseDiagonal(impl_->current_a,impl_->levels[0].inverse_diagonal,
-                                        impl_->fine_diagonal_dirty);
-  impl_->fine_diagonal_dirty = false;
-  ++impl_->fine_updates.updates;
-  if (same) ++impl_->fine_updates.value_updates;
-  else ++impl_->fine_updates.structure_rebuilds;
+  PhaseUploadFence complete;   // the queued uploads, at every exit
+  impl_->UpdateFineQueued(a,plan,nullptr);
+  complete.Complete();         // normal exit: a device error reaches the caller
+}
+void SparseMultigrid::UpdateFinePhaseRowsKnown(const CsrRowUpdate &a, const PhaseRowPlan *plan,
+                                               const int *known) {
+  PhaseUploadFence complete;   // the queued uploads, at every exit
+  impl_->UpdateFineQueued(a,plan,known);
+  complete.Complete();         // normal exit: a device error reaches the caller
 }
 void SparseMultigrid::ConfigureHierarchyPhaseRows(
     const std::vector<std::vector<int>> &a_rows,
@@ -1518,58 +2423,21 @@ void SparseMultigrid::ConfigureHierarchyPhaseRows(
 }
 void SparseMultigrid::PrepareHierarchyPhaseRows(const std::vector<CsrRowUpdate> &a,
     const std::vector<CsrRowUpdate> &p, std::vector<PhaseRowPlan> &a_plans,
-    std::vector<PhaseRowPlan> &p_plans) const {
+    std::vector<PhaseRowPlan> &p_plans, const std::vector<char> *due) const {
   a_plans.clear(); p_plans.clear();
   if (!impl_->hierarchy_phase_configured || a.size() != impl_->levels.size()
-      || p.size()+1 != a.size()) return;   // the update itself reports the inconsistency
+      || p.size()+1 != a.size() || (due != nullptr && due->size() != a.size()))
+    return;   // the update itself reports the inconsistency
+  auto is_due = [due](size_t l) { return due == nullptr || (*due)[l] != 0; };
   a_plans.reserve(a.size()); p_plans.reserve(p.size());
   a_plans.push_back(impl_->Plan(impl_->current_a,a[0],impl_->levels.size() > 1));
   for (size_t l = 1; l < a.size(); ++l)
-    a_plans.push_back(impl_->Plan(impl_->levels[l].a,a[l],l+1 < a.size()));
+    a_plans.push_back(is_due(l) ? impl_->Plan(impl_->levels[l].a,a[l],l+1 < a.size())
+                                : PhaseRowPlan{});
   for (size_t l = 0; l < p.size(); ++l)
-    p_plans.push_back(impl_->Plan(impl_->levels[l].p,p[l],false));
+    p_plans.push_back(is_due(l+1) ? impl_->Plan(impl_->levels[l].p,p[l],false) : PhaseRowPlan{});
 }
-void SparseMultigrid::UpdateHierarchyPhaseRows(const std::vector<CsrRowUpdate> &a,
-                                              const std::vector<CsrRowUpdate> &p,
-                                              const std::vector<PhaseRowPlan> *a_plans,
-                                              const std::vector<PhaseRowPlan> *p_plans) {
-  impl_->Require(impl_->hierarchy_phase_configured && a.size() == impl_->levels.size()
-      && p.size()+1 == a.size(),"unconfigured or inconsistent compact hierarchy update");
-  if (a_plans && a_plans->size() != a.size()) a_plans = nullptr;
-  if (p_plans && p_plans->size() != p.size()) p_plans = nullptr;
-  const bool terminal_full_update = a.size() == 1 && impl_->fine_diagonal_dirty;
-  UpdateFinePhaseRowsPlanned(a[0],a_plans ? &(*a_plans)[0] : nullptr);
-  for (size_t l = 1; l < a.size(); ++l) {
-    auto &level = impl_->levels[l]; const bool smooth = l+1 < a.size();
-    impl_->UpdatePhase(level.a,a[l],smooth,a_plans ? &(*a_plans)[l] : nullptr);
-    const double t0 = HostSeconds();
-    if (smooth) impl_->UpdatePhaseDiagonal(level.a,level.inverse_diagonal);
-    PhaseTimes().diagonal += HostSeconds()-t0;
-  }
-  for (size_t l = 0; l < p.size(); ++l)
-    impl_->UpdatePhase(impl_->levels[l].p,p[l],false,p_plans ? &(*p_plans)[l] : nullptr);
-  const double t0 = HostSeconds();
-  if (impl_->terminal_phase_changes || terminal_full_update) impl_->UpdateTerminal(a.back());
-  PhaseTimes().terminal += HostSeconds()-t0;
-}
-SolveStats SparseMultigrid::Solve(const Vector &rhs, const Vector &x, Real tolerance,
-                                 int max_iterations, int restart) {
-  return impl_->Solve(rhs, x, tolerance, max_iterations, restart);
-}
-void SparseMultigrid::ApplyMatrix(int l, const Vector &x, const Vector &result) {
-  if (l == 0) impl_->Multiply(impl_->current_a,x,result);
-  else impl_->Multiply(impl_->levels.at(l).a,x,result);
-}
-void SparseMultigrid::ApplyProlongation(int l, const Vector &x, const Vector &result) {
-  impl_->Multiply(impl_->levels.at(l).p,x,result);
-}
-void SparseMultigrid::ApplyRestriction(int l, const Vector &x, const Vector &result) {
-  impl_->Multiply(impl_->levels.at(l).r,x,result);
-}
-void SparseMultigrid::ApplyVCycle(const Vector &rhs, const Vector &result) {
-  impl_->Precondition(rhs, result);
-}
-
+// (defined before UpdateHierarchyPhaseRows, which updates the extra operators)
 struct DistributedOperator::Impl {
   std::unique_ptr<SparseMultigrid::Impl> backend;
   SparseMultigrid::Impl::Operator op;
@@ -1611,6 +2479,167 @@ struct DistributedOperator::Impl {
     op = backend->Build(a,row_partition,col_partition);
   }
 };
+// (after DistributedOperator::Impl: it plans the extra operators too)
+void SparseMultigrid::PrepareHierarchyPhaseRows(const std::vector<CsrRowUpdate> &a,
+    const std::vector<CsrRowUpdate> &p, std::vector<PhaseRowPlan> &a_plans,
+    std::vector<PhaseRowPlan> &p_plans, const std::vector<char> *due,
+    const std::vector<PhaseExtra> &extra, std::vector<PhaseRowPlan> &extra_plans,
+    int workers) const {
+  a_plans.clear(); p_plans.clear(); extra_plans.clear();
+  // the operators one after the other, each on the workers (the hierarchy first, in the order of
+  // the serial preparation)
+  if (impl_->hierarchy_phase_configured && a.size() == impl_->levels.size()
+      && p.size()+1 == a.size() && (due == nullptr || due->size() == a.size())) {
+    auto is_due = [due](size_t l) { return due == nullptr || (*due)[l] != 0; };
+    a_plans.reserve(a.size()); p_plans.reserve(p.size());
+    a_plans.push_back(impl_->Plan(impl_->current_a,a[0],impl_->levels.size() > 1,workers));
+    for (size_t l = 1; l < a.size(); ++l)
+      a_plans.push_back(is_due(l) ? impl_->Plan(impl_->levels[l].a,a[l],l+1 < a.size(),workers)
+                                  : PhaseRowPlan{});
+    for (size_t l = 0; l < p.size(); ++l)
+      p_plans.push_back(is_due(l+1) ? impl_->Plan(impl_->levels[l].p,p[l],false,workers)
+                                    : PhaseRowPlan{});
+  }
+  extra_plans.reserve(extra.size());
+  for (const auto &x : extra)
+    extra_plans.push_back(x.op->impl_->backend->Plan(x.op->impl_->op,*x.a,false,workers));
+}
+void SparseMultigrid::UpdateHierarchyPhaseRows(const std::vector<CsrRowUpdate> &a,
+                                              const std::vector<CsrRowUpdate> &p,
+                                              const std::vector<PhaseRowPlan> *a_plans,
+                                              const std::vector<PhaseRowPlan> *p_plans,
+                                              const std::vector<PhaseExtra> *extra,
+                                              const std::vector<char> *due) {
+  PhaseUploadFence complete;   // the queued uploads, at every exit (also a throw)
+  impl_->Require(impl_->hierarchy_phase_configured && a.size() == impl_->levels.size()
+      && p.size()+1 == a.size() && (due == nullptr || (due->size() == a.size() && (*due)[0])),
+      "unconfigured or inconsistent compact hierarchy update");
+  // a level that is not due keeps A_l, its diagonal and P_{l-1} (operator q: A_l for q < na,
+  // P_{q-na} for q >= na)
+  auto is_due = [due](size_t l) { return due == nullptr || (*due)[l] != 0; };
+  if (a_plans && a_plans->size() != a.size()) a_plans = nullptr;
+  if (p_plans && p_plans->size() != p.size()) p_plans = nullptr;
+  const bool terminal_full_update = a.size() == 1 && impl_->fine_diagonal_dirty;
+  // ATHENA_SG_LEVEL_STATS=1 (xnode diagnostics): the phase rows of the first update
+  static bool stats_done = false;
+  if (const char *e = std::getenv("ATHENA_SG_LEVEL_STATS"); !stats_done && e != nullptr && e[0] == '1') {
+    stats_done = true;
+    auto stat = [](const CsrRowUpdate &u) {
+      int longest = 0;
+      for (size_t i = 0; i+1 < u.rowptr.size(); ++i) longest = std::max(longest, u.rowptr[i+1]-u.rowptr[i]);
+      return std::to_string(u.rows.size())+"/"+std::to_string(u.colidx.size())+"/"+std::to_string(longest);
+    };
+    for (size_t l = 0; l < a.size(); ++l) {
+      std::cout << "# SG_LEVEL_PHASE rank=" << impl_->rank << " level=" << l
+                << " A(rows/nnz/longest)=" << stat(a[l]);
+      if (l < p.size()) std::cout << " P=" << stat(p[l]);
+      std::cout << '\n';
+    }
+  }
+  // xnode: the plans of all operators first (host only), then ONE collective for the validity
+  // and ghost-change flags of all of them instead of two per operator; the updates below
+  // run in the former order with the same plans (results identical).
+  // ATHENA_SG_PHASE_COLLECTIVES=1: the former two collectives per operator (A/B timing).
+  const bool batched = !PhaseCollectivesOld();
+  // the extra operators in this collective unless ATHENA_SG_PHASE_FORCE_OLD=1
+  const size_t nx = (extra != nullptr && batched && !PhaseForceOld()) ? extra->size() : 0;
+  const size_t na = a.size(), nops = na+p.size();
+  std::vector<PhaseRowPlan> computed(nops+nx);
+  std::vector<const PhaseRowPlan*> plans(nops+nx,nullptr);
+  std::vector<int> flags(2*(nops+nx),0);
+  for (size_t x = 0; x < nx; ++x) {   // host only, as the plans below
+    const auto &e = (*extra)[x];
+    auto &backend = *e.op->impl_->backend;
+    auto &op = e.op->impl_->op;
+    const size_t q = nops+x;
+    plans[q] = backend.PhasePlan(op,*e.a,false,e.plan,computed[q]);
+    flags[2*q] = plans[q]->valid ? 0 : 1;
+    const auto &ghosts = plans[q]->same ? op.ghost_ids : plans[q]->ghosts;
+    flags[2*q+1] = ghosts != op.ghost_ids ? 1 : 0;
+  }
+  if (batched) {
+    for (size_t q = 0; q < nops; ++q) {
+      const bool is_a = q < na;
+      const size_t l = is_a ? q : q-na;
+      if (!is_due(is_a ? l : l+1)) continue;   // kept: no plan, flags 0
+      Impl::Operator &op = is_a ? (l == 0 ? impl_->current_a : impl_->levels[l].a)
+                                : impl_->levels[l].p;
+      const CsrRowUpdate &u = is_a ? a[l] : p[l];
+      const bool smooth = is_a && l+1 < na;
+      const PhaseRowPlan *given = is_a ? (a_plans ? &(*a_plans)[l] : nullptr)
+                                       : (p_plans ? &(*p_plans)[l] : nullptr);
+      plans[q] = impl_->PhasePlan(op,u,smooth,given,computed[q]);
+      flags[2*q] = plans[q]->valid ? 0 : 1;
+      const auto &ghosts = plans[q]->same ? op.ghost_ids : plans[q]->ghosts;
+      flags[2*q+1] = ghosts != op.ghost_ids ? 1 : 0;
+    }
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE,flags.data(),static_cast<int>(flags.size()),MPI_INT,MPI_MAX,
+                  impl_->comm);
+#endif
+    // every reduced validity flag before the first operator is modified: an invalid
+    // update of any operator (hierarchy or extra) leaves all of them as they were, on every rank
+    for (size_t q = 0; q < nops+nx; ++q) {
+      if (flags[2*q]) {
+        throw std::runtime_error("self-gravity: invalid compact phase CSR, ownership, row set, "
+                                 "or smoothing diagonal");
+      }
+    }
+  }
+  auto plan_of = [&](size_t q, const std::vector<PhaseRowPlan> *given, size_t l) {
+    return batched ? plans[q] : (given ? &(*given)[l] : nullptr);
+  };
+  impl_->UpdateFineQueued(a[0],plan_of(0,a_plans,0),batched ? &flags[0] : nullptr);
+  for (size_t l = 1; l < a.size(); ++l) {
+    if (!is_due(l)) continue;
+    auto &level = impl_->levels[l]; const bool smooth = l+1 < a.size();
+    impl_->UpdatePhase(level.a,a[l],smooth,plan_of(l,a_plans,l),batched ? &flags[2*l] : nullptr);
+    const double t0 = HostSeconds();
+    if (smooth) impl_->UpdatePhaseDiagonal(level.a,level.inverse_diagonal);
+    PhaseTimes().diagonal += HostSeconds()-t0;
+  }
+  for (size_t l = 0; l < p.size(); ++l) {
+    if (!is_due(l+1)) continue;
+    impl_->UpdatePhase(impl_->levels[l].p,p[l],false,plan_of(na+l,p_plans,l),
+                       batched ? &flags[2*(na+l)] : nullptr);
+  }
+  const double t0 = HostSeconds();
+  if ((impl_->terminal_phase_changes && is_due(a.size()-1)) || terminal_full_update)
+    impl_->UpdateTerminal(a.back());
+  PhaseTimes().terminal += HostSeconds()-t0;
+  // the extra operators after the hierarchy, as the former separate calls did
+  if (extra != nullptr) {
+    for (size_t x = 0; x < extra->size(); ++x) {
+      const auto &e = (*extra)[x];
+      if (x < nx) {
+        e.op->impl_->backend->UpdatePhase(e.op->impl_->op,*e.a,false,plans[nops+x],
+                                          &flags[2*(nops+x)]);
+      } else {
+        e.op->UpdatePhaseRows(*e.a,e.plan);
+      }
+    }
+  }
+  complete.Complete();   // the only normal exit: a device error reaches the caller
+}
+bool SparseMultigrid::ProjectionFusion() const { return impl_->fuse_projection; }
+SolveStats SparseMultigrid::Solve(const Vector &rhs, const Vector &x, Real tolerance,
+                                 int max_iterations, int restart) {
+  return impl_->Solve(rhs, x, tolerance, max_iterations, restart);
+}
+void SparseMultigrid::ApplyMatrix(int l, const Vector &x, const Vector &result) {
+  if (l == 0) impl_->Multiply(impl_->current_a,x,result);
+  else impl_->Multiply(impl_->levels.at(l).a,x,result);
+}
+void SparseMultigrid::ApplyProlongation(int l, const Vector &x, const Vector &result) {
+  impl_->Multiply(impl_->levels.at(l).p,x,result);
+}
+void SparseMultigrid::ApplyRestriction(int l, const Vector &x, const Vector &result) {
+  impl_->Multiply(impl_->levels.at(l).r,x,result);
+}
+void SparseMultigrid::ApplyVCycle(const Vector &rhs, const Vector &result) {
+  impl_->Precondition(rhs, result);
+}
+
 #if MPI_PARALLEL_ENABLED
 DistributedOperator::DistributedOperator(const HostCsr &a, const std::vector<int> &rows,
                                          const std::vector<int> &cols, MPI_Comm comm)
@@ -1635,13 +2664,21 @@ StorageStats DistributedOperator::Storage() const {
         +impl_->op.phase_values.size();
   }
   SparseMultigrid::Impl::AddStorage(impl_->op,s);
+  // the allocations, each counted once
+  SparseMultigrid::Impl::Ranges csr, halo;
+  SparseMultigrid::Impl::AddAllocations(impl_->op,csr,halo);
+  s.csr_bytes = SparseMultigrid::Impl::MergedBytes(std::move(csr));
+  s.halo_bytes = SparseMultigrid::Impl::MergedBytes(std::move(halo))
+      +SparseMultigrid::Impl::CountBytes(impl_->op);
   return s;
 }
 void DistributedOperator::ConfigurePhaseRows(const std::vector<int> &rows) {
   impl_->backend->ConfigurePhase(impl_->op,rows);
 }
 void DistributedOperator::UpdatePhaseRows(const CsrRowUpdate &a, const PhaseRowPlan *plan) {
+  PhaseUploadFence complete;   // the queued uploads, at every exit
   impl_->backend->UpdatePhase(impl_->op,a,false,plan);
+  complete.Complete();         // normal exit: a device error reaches the caller
 }
 PhaseRowPlan DistributedOperator::PreparePhaseRows(const CsrRowUpdate &a) const {
   return impl_->backend->Plan(impl_->op,a,false);

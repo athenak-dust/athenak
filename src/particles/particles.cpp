@@ -6,9 +6,12 @@
 //! \file particles.cpp
 //! \brief implementation of Particles class constructor and assorted other functions
 
-#include <iostream>
-#include <string>
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <string>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -16,6 +19,7 @@
 #include "mesh/mesh.hpp"
 #include "bvals/bvals.hpp"
 #include "particles.hpp"
+#include "particle_counts.hpp"
 #include "dust/dust_species.hpp"
 
 namespace particles {
@@ -117,6 +121,7 @@ Particles::Particles(MeshBlockPack *ppack, ParameterInput *pin) :
 // destructor
 
 Particles::~Particles() {
+  delete pbval_part;
 }
 
 //----------------------------------------------------------------------------------------
@@ -126,32 +131,48 @@ Particles::~Particles() {
 
 void Particles::CreateParticleTags(ParameterInput *pin) {
   std::string assign = pin->GetOrAddString("particles","assign_tag","index_order");
+  // the tags are 64-bit for dust (words PTAG, PTAGH), the int32 PTAG alone for cosmic rays;
+  // all ranks together may hold more than 2^31 particles (the counts of all ranks are known)
+  const bool hiword = (nidata > PTAGH);
+  const int *count = pmy_pack->pmesh->nprtcl_eachrank;
+  const int nranks = global_variable::nranks, myrank = global_variable::my_rank;
+  auto int32_tags = [&](const std::int64_t tag_max) {   // the same decision on every rank
+    if (!hiword && tag_max > std::numeric_limits<std::int32_t>::max()) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "Particle tags are int32 for this particle type: the largest tag "
+                << tag_max << " does not fit" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  };
 
   // tags are assigned sequentially within this rank, starting at 0 with rank=0
   if (assign.compare("index_order") == 0) {
-    int tagstart = 0;
-    for (int n=1; n<=global_variable::my_rank; ++n) {
-      tagstart += pmy_pack->pmesh->nprtcl_eachrank[n-1];
-    }
-
+    const std::int64_t tagstart = RankOffset(count, myrank);
+    int32_tags(TotalCount(count, nranks) - 1);
     auto &pi = prtcl_idata;
-    const bool hiword = (nidata > PTAGH);   // dust: the 64-bit tag, high word 0
     par_for("ptags",DevExeSpace(),0,(nprtcl_thispack-1),
     KOKKOS_LAMBDA(const int p) {
-      pi(PTAG,p) = tagstart + p;
-      if (hiword) pi(PTAGH,p) = 0;
+      const std::uint64_t t = static_cast<std::uint64_t>(tagstart + p);
+      pi(PTAG,p) = TagLo(t);
+      if (hiword) pi(PTAGH,p) = TagHi(t);
     });
 
   // tags are assigned sequentially across ranks
   } else if (assign.compare("rank_order") == 0) {
-    int myrank = global_variable::my_rank;
-    int nranks = global_variable::nranks;
+    std::int64_t tag_max = -1;   // the last particle of a rank r has the tag r + nranks (n_r - 1)
+    for (int r=0; r<nranks; ++r) {
+      if (count[r] > 0) {
+        tag_max = std::max(tag_max, r + static_cast<std::int64_t>(nranks)*(count[r] - 1));
+      }
+    }
+    int32_tags(tag_max);
     auto &pi = prtcl_idata;
-    const bool hiword = (nidata > PTAGH);
     par_for("ptags",DevExeSpace(),0,(nprtcl_thispack-1),
     KOKKOS_LAMBDA(const int p) {
-      pi(PTAG,p) = myrank + nranks*p;
-      if (hiword) pi(PTAGH,p) = 0;
+      const std::uint64_t t = static_cast<std::uint64_t>(myrank) +
+                              static_cast<std::uint64_t>(nranks)*static_cast<std::uint64_t>(p);
+      pi(PTAG,p) = TagLo(t);
+      if (hiword) pi(PTAGH,p) = TagHi(t);
     });
 
   // tag algorithm not recognized, so quit with error

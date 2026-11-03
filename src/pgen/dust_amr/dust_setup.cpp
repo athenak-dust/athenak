@@ -434,7 +434,12 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
     const auto &ms = pm->mesh_size;
     const auto &mi = pm->mesh_indcs;
     const int nc1 = mi.nx1, nc2 = mi.nx2, nc3 = mi.nx3;
-    const int nparent = static_cast<int>(ppc)*nc1*nc2*nc3;
+    // every rank draws all root parents with int indices: their number must fit an int
+    const std::int64_t nparent64 = static_cast<std::int64_t>(static_cast<int>(ppc))*nc1*nc2*nc3;
+    if (nparent64 > std::numeric_limits<int>::max()) {
+      Fatal("cloud_root_random: more than 2^31 - 1 root parents (ppc times the root cells)");
+    }
+    const int nparent = static_cast<int>(nparent64);
     if (ppc != static_cast<Real>(static_cast<int>(ppc)) || nparent <= 0) {
       Fatal("cloud_root_random requires positive integer root ppc");
     }
@@ -698,8 +703,14 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
       transfer.root_dx1 = (ms.x1max - ms.x1min)/mi.nx1;
       transfer.root_dx2 = (ms.x2max - ms.x2min)/mi.nx2;
     }
-    int nroot = transfer.ncoarse1*transfer.ncoarse2;
-    int nparent = static_cast<int>(ppc)*nroot;
+    // every rank draws all root parents with int indices: their number must fit an int (the
+    // root cells and the product in 64 bits)
+    const std::int64_t nroot = static_cast<std::int64_t>(transfer.ncoarse1)*transfer.ncoarse2;
+    const std::int64_t nparent64 = static_cast<std::int64_t>(static_cast<int>(ppc))*nroot;
+    if (nparent64 > std::numeric_limits<int>::max()) {
+      Fatal("cloud_root_random: more than 2^31 - 1 root parents (ppc times the root cells)");
+    }
+    int nparent = static_cast<int>(nparent64);
     if (ppc != static_cast<Real>(static_cast<int>(ppc)) || nparent <= 0) {
       Fatal("cloud_root_random requires positive integer root ppc");
     }

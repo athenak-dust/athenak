@@ -73,13 +73,19 @@ TaskStatus OrbitalAdvectionCC::PackAndSendCC(DvceArray5D<Real> &a) {
   auto &maxjshift_ = maxjshift;
   auto &xlev_ = xlev;
 
-  // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
+  // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)*(nsplit): one team per
+  // buffer gave only 2 nvar teams per MeshBlock, each copying nx3 (ng+maxjshift) nx1 values
+  // (the same time whether the rank held one or eight large blocks), so
+  // the cells of a buffer are split over nsplit teams; pure copies, the same result for any split
   int nmnv = nmb*2*nvar;  // only consider 2 neighbors (x2-faces)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
+  const int nsplit = std::max(1, std::min(64, 4096/std::max(1, nmnv)));
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv*nsplit, Kokkos::AUTO);
   Kokkos::parallel_for("oa-pack", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(2*nvar);
-    const int n = (tmember.league_rank() - m*(2*nvar))/nvar;
-    const int v = (tmember.league_rank() - m*(2*nvar) - n*nvar);
+    const int lr = tmember.league_rank()/nsplit;          // (m,n,v) buffer
+    const int part = tmember.league_rank() - lr*nsplit;   // its share of the cells
+    const int m = (lr)/(2*nvar);
+    const int n = (lr - m*(2*nvar))/nvar;
+    const int v = (lr - m*(2*nvar) - n*nvar);
 
     // indices of x2-face buffers in nghbr view
     int nnghbr;
@@ -112,8 +118,13 @@ TaskStatus OrbitalAdvectionCC::PackAndSendCC(DvceArray5D<Real> &a) {
       int dm = nghbr.d_view(m,nnghbr).gid - mbgid.d_view(0);
       int dn = (n+1) % 2;
 
-      // Middle loop over k,j,i
-      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkji), [&](const int idx) {
+      // Middle loop over k,j,i (this team's share)
+      // this team's share [part nkji/nsplit, (part+1) nkji/nsplit) without overflow in
+      // 32 bits: nkji = nq nsplit + nr, so part nq + part nr/nsplit with part nr < nsplit^2
+      const int nq = nkji/nsplit, nr = nkji - nq*nsplit;
+      const int r0 = part*nq + (part*nr)/nsplit;
+      const int r1 = (part + 1)*nq + ((part + 1)*nr)/nsplit;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, r0, r1), [&](const int idx) {
         int k = (idx)/nji;
         int j = (idx - k*nji)/ni;
         int i = (idx - k*nji - j*ni) + il;

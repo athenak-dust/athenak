@@ -21,6 +21,7 @@ enum class BoundaryFlag {undef=-1,block, reflect, inflow, outflow, diode, user, 
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "athena.hpp"
@@ -298,11 +299,15 @@ struct DepRemapMap {
 //! bvals_part.cpp).  Built on the host from the global block list (no finest-grid table): the
 //! static part once per mesh, the shear part at every stage.  Shared by the deposit exchanges.
 
+struct DepHostPart;       // host products of one build of a part (bvals_dep_general.cpp)
+struct DepShearPrefetch;  // the shear part of the next one-cell offset, built on a host thread
+
 class DepRemapPlan {
  public:
   // x3mode (a 3-D mesh with physical x3 faces): 0 periodic x3, 1 the ghost cells beyond
   // a physical x3 face fold back onto their mirror cells, 2 they are dropped (and recorded)
   DepRemapPlan(MeshBlockPack *pp, bool shear_x1, Real qshear, Real omega0, int x3mode = 0);
+  ~DepRemapPlan();                 // (joins a running prefetch thread)
   void BuildStatic();              // after construction and after every regrid
   void UpdateShear(Real time);     // the shear part for the offset at time (no-op without shear)
   bool Shear() const {return shear_x1_;}
@@ -311,7 +316,9 @@ class DepRemapPlan {
   Real shear_time = -1.0;
   // Public because CUDA extended lambdas cannot be enclosed by a private member.
   void BuildPart(const int part, const double shR, DepRemapMap &map);
+  bool UpdateShearWeightsDevice(const double shR);
   int shr_builds = 0, shr_updates = 0;   // full builds and weight-only updates of the shear part
+  int shr_prefetched = 0;                // shear parts taken from a prefetch (not in shr_builds)
 
  private:
   // between full builds of the shear part (same integer part of the
@@ -328,6 +335,23 @@ class DepRemapPlan {
   int x3mode_ = 0;
   Real qshear_, omega0_;
   std::vector<int> face_gids_[2];  // blocks at the inner / outer x1 face (all ranks)
+  // remap-20261102: the shear weights on the device from a device copy of the recipes
+  // (ATHENA_DEP_WEIGHTS_HOST=1: the host loop and upload as before), and the next one-cell
+  // offset's shear part built ahead on a host thread (ATHENA_DEP_PREFETCH_OLD=1: a full build
+  // at every one-cell shift as before); ATHENA_DEP_VERIFY=1 (diagnostic) compares both with the
+  // host path in the run
+  bool dev_weights_ = true, prefetch_on_ = true, verify_ = false;
+  DvceArray1D<double> shr_rc_d_;          // the recipes on the device (dev_weights_)
+  std::unique_ptr<DepShearPrefetch> pf_;
+  bool have_event_ = false;               // a full build or prefetch install happened
+  std::int64_t event_floor_ = 0;          // the floor of the offset of the last one
+  double FinishPart(const int part, const double shR, DepHostPart &hp, DepRemapMap &map,
+                    const bool upload_w);
+  bool ShearWeights(const double shR);    // device or host, as switched
+  void LaunchPrefetch(const std::int64_t floor);
+  void DiscardPrefetch();
+  int TakePrefetch(const double shR, const std::int64_t fl);
+  void VerifyInstall(const double shR);
 };
 
 class MeshBoundaryValuesDep : public MeshBoundaryValues {
@@ -470,6 +494,8 @@ class ParticlesBoundaryValues {
   // sendlist allocation is persistent: nprtcl_send is the valid-prefix length, while
   // sendlist.extent(0) is capacity.  Never shrink the allocation after a migration.
   DualArray1D<ParticleLocationData> sendlist;
+  // capacity for npart particles (all routes that fill the send list; bvals_part.cpp)
+  void ReserveSendlist(int npart);
   DualArray1D<int> send_count;  // device-side append counter (length one)
 
   // shear-periodic x1 boundary support (uniform grids only). Particles crossing the
@@ -510,6 +536,14 @@ class ParticlesBoundaryValues {
   std::vector<MPI_Request> rrecv_req, rsend_req;  // vectors of requests for Reals
   std::vector<MPI_Request> irecv_req, isend_req;  // vectors of requests for ints
   MPI_Comm mpi_comm_part;                       // unique MPI communicators for particles
+  // MPI counts are int: the Reals (or ints) of one message longer than msg_chunk_bytes go as
+  // consecutive MPI messages of at most that many bytes, all with the message's tag (MPI's
+  // non-overtaking order matches them to the receives, posted in the same order).  1 GiB, as
+  // the pbin and rst writers; the environment variable ATHENA_PART_MSG_CHUNK (bytes, the
+  // smallest of all ranks) lowers it, to test the split path on small runs
+  std::size_t msg_chunk_bytes = std::size_t(1) << 30;
+  bool msg_chunk_forced = false;
+  std::uint64_t nmsg_prtcl = 0, nmsg_mpi = 0;   // messages, and the MPI messages they took
 #endif
 
   //functions

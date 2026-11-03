@@ -25,10 +25,22 @@
 //! potential energy
 //! W = 1/2 sum rho_d (phi - <phi>) V over the leaf cells, the energy drift (K + W - E0)/|W0|; the
 //! centre of mass; the peak deposited density; the leaf blocks per level.
+//!
+//! Spinning clump (tests of the resampling R, all keys optional; without them the set-up and the
+//! outputs are as before): ff_spin = Omega_s adds the solid-body rotation Omega_s z x (x - c)
+//! about the z axis through the centre, ff_sigma an isotropic Gaussian velocity dispersion (per
+//! component, from a hash of ff_seed and the cloud tag).  ff_cloud_level = L >= 0 replaces the
+//! root lattice and the split: about ff_ppc clouds per level-L cell of the sphere's volume, at
+//! uniform random positions inside the sphere (hash of ff_seed and the cloud number, the same on
+//! every rank), all of level L (no lobes), each of mass rho V_sphere / N; the root cloud mass of
+//! the resampling cap (cloud_resample_m0, cloud_merge_mroot) is set so that a cloud holds
+//! ff_mfrac of its level's nominal mass m0 / 8^L.  With any of these keys the diagnostics add
+//! "J", the angular momentum of all clouds about their centre of mass.
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
@@ -61,7 +73,28 @@ struct FreeFall {
   std::vector<Real> q = {0.02, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9};
   std::vector<Real> rq0, rqm0;
   int rep = 0;       // ff_repr_level: the level the clouds are expanded to for rqm
+  // spinning clump (optional keys)
+  Real spin = 0.0, sigma = 0.0, ppc = 8.0, mfrac = 0.25;
+  long long seed = 1;
+  int level = -1;
+  bool jrep = false;   // "J" in the diagnostics
 } ff;
+
+// splitmix64: uniform numbers in [0, 1) from (seed, stream, counter), the same on every rank
+std::uint64_t Mix(std::uint64_t z) {
+  z += 0x9E3779B97F4A7C15ULL;
+  z = (z ^ (z >> 30))*0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27))*0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+double Uniform(const std::uint64_t seed, const std::uint64_t stream, const std::uint64_t k) {
+  const std::uint64_t h = Mix(Mix(seed*0x632BE59BD9B4E019ULL + stream) + k);
+  return static_cast<double>(h >> 11)*(1.0/9007199254740992.0);
+}
+double Gauss(const std::uint64_t seed, const std::uint64_t stream, const std::uint64_t k) {
+  const double u1 = 1.0 - Uniform(seed, stream, 2*k), u2 = Uniform(seed, stream, 2*k + 1);
+  return std::sqrt(-2.0*std::log(u1))*std::cos(2.0*M_PI*u2);
+}
 
 void Fatal(const std::string &msg) {
   std::cout << "### FATAL ERROR in dust_freefall: " << msg << std::endl;
@@ -96,10 +129,18 @@ int Owner(MeshBlockPack *pack, const std::array<Real, 3> &p) {
   return -1;
 }
 
-// radii holding the mass fractions ff.q of the (r, m) pairs (all on rank 0 after Gatherv)
+// radii holding the mass fractions ff.q of the (r, m) pairs (all on rank 0 after Gatherv).
+// The gather has int counts and displacements: at most 2^31 - 1 doubles of all ranks together
+// (1073741823 pairs); more stop the run here, on every rank (a diagnostic of this test)
 std::vector<Real> Quantiles(const std::vector<double> &rm_local, Real mass) {
   std::vector<double> all;
 #if MPI_PARALLEL_ENABLED
+  long long ntot = static_cast<long long>(rm_local.size());
+  MPI_Allreduce(MPI_IN_PLACE, &ntot, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  if (ntot > std::numeric_limits<int>::max()) {
+    Fatal("the radius quantiles gather the (r, m) pairs of all ranks on rank 0 with int counts: " +
+          std::to_string(ntot/2) + " pairs exceed the limit of 1073741823");
+  }
   int cnt = static_cast<int>(rm_local.size());
   std::vector<int> counts(global_variable::nranks), displ(global_variable::nranks, 0);
   MPI_Gather(&cnt, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -175,6 +216,26 @@ void Observe(Mesh *pm) {
 #endif
   const Real mass = a[0], cm[3] = {a[1]/mass, a[2]/mass, a[3]/mass};
   const Real kin = a[4];
+  // (spinning clump) J about the centre of mass: sum m (x - c) x v - M (X - c) x V, c the
+  // sphere centre
+  Real jc[3] = {0.0, 0.0, 0.0};
+  if (ff.jrep) {
+    Real b[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (int p=0; p<np; ++p) {
+      const Real m = pr(IPM,p);
+      const Real x = pr(IPX,p) - ff.x, y = pr(IPY,p) - ff.y, z = pr(IPZ,p) - ff.z;
+      const Real vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
+      b[0] += m*(y*vz - z*vy); b[1] += m*(z*vx - x*vz); b[2] += m*(x*vy - y*vx);
+      b[3] += m*x; b[4] += m*y; b[5] += m*z; b[6] += m*vx; b[7] += m*vy; b[8] += m*vz;
+    }
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, b, 9, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+#endif
+    const Real xm[3] = {b[3]/mass, b[4]/mass, b[5]/mass};
+    jc[0] = b[0] - (xm[1]*b[8] - xm[2]*b[7]);
+    jc[1] = b[1] - (xm[2]*b[6] - xm[0]*b[8]);
+    jc[2] = b[2] - (xm[0]*b[7] - xm[1]*b[6]);
+  }
   const Real pot = 0.5*(s[2] - s[0]*s[1]/s[3]);   // 1/2 sum rho (phi - <phi>) V
   // Lagrangian radii about the centre of mass: of the particle centres (rq), and of every cloud
   // expanded into the points of repeated P1 splits down to the level ff_repr_level (per direction
@@ -241,7 +302,9 @@ void Observe(Mesh *pm) {
     << ",\"rho_peak\":" << peak << ",\"rho_uniform_analytic\":"
     << ((fv.first > 0) ? ff.rho/(fv.first*fv.first*fv.first) : -1.0)
     << ",\"particles\":" << static_cast<long long>(a[6]) << ",\"blocks_per_level\":[" << s[4] << "," << s[5] << "," << s[6]
-    << "," << s[7] << "],\"residual\":" << grav->last_solve.relative_residual << "}";
+    << "," << s[7] << "],\"residual\":" << grav->last_solve.relative_residual;
+  if (ff.jrep) o << ",\"J\":[" << jc[0] << "," << jc[1] << "," << jc[2] << "]";
+  o << "}";
   std::cout << "# FREEFALL " << o.str() << std::endl;
   std::ofstream out("freefall_history.jsonl", std::ios::app);
   out << o.str() << "\n";
@@ -285,6 +348,19 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
   if (ff.rep < 0 || ff.rep > 4) Fatal("ff_repr_level must be 0..4");
   ff.tff = M_PI*std::sqrt(3.0/(8.0*ff.rho*ff.fourpig));
   if (!(ff.radius > 0 && ff.rho > 0 && ff.dt > 0 && ff.n >= 1)) Fatal("invalid ff_* parameters");
+  {   // spinning clump (optional; not added to the parameters when absent)
+    auto has = [&](const char *k) {return pin->DoesParameterExist("problem", k);};
+    if (has("ff_spin")) ff.spin = pin->GetReal("problem", "ff_spin");
+    if (has("ff_sigma")) ff.sigma = pin->GetReal("problem", "ff_sigma");
+    if (has("ff_ppc")) ff.ppc = pin->GetReal("problem", "ff_ppc");
+    if (has("ff_mfrac")) ff.mfrac = pin->GetReal("problem", "ff_mfrac");
+    if (has("ff_seed")) ff.seed = pin->GetInteger("problem", "ff_seed");
+    if (has("ff_cloud_level")) ff.level = pin->GetInteger("problem", "ff_cloud_level");
+    ff.jrep = (ff.spin != 0.0 || ff.sigma != 0.0 || ff.level >= 0);
+    if (ff.level > 12 || !(ff.ppc > 0.0) || !(ff.mfrac > 0.0 && ff.mfrac <= 1.0) || ff.sigma < 0.0) {
+      Fatal("ff_cloud_level <= 12, ff_ppc > 0, 0 < ff_mfrac <= 1, ff_sigma >= 0");
+    }
+  }
   {   // the gas is irrelevant (no drag, no gravity): dust_damping_amr with the dust at rest
     const bool split = pack->pdust->cloud_split_enable;
     pack->pdust->cloud_split_enable = false;
@@ -298,7 +374,16 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
   const int nx = pmy_mesh_->mesh_indcs.nx1, ny = pmy_mesh_->mesh_indcs.nx2,
             nz = pmy_mesh_->mesh_indcs.nx3;
   const Real dx[3] = {lx/nx, ly/ny, lz/nz};
-  const Real mcl = ff.rho*dx[0]*dx[1]*dx[2]/(ff.n*ff.n*ff.n);
+  Real mcl = ff.rho*dx[0]*dx[1]*dx[2]/(ff.n*ff.n*ff.n);
+  // ff_cloud_level = L: N = ff_ppc V_sphere / V_L clouds of mass rho V_sphere / N
+  long long ncl = 0;
+  if (ff.level >= 0) {
+    const Real vs = 4.0*M_PI/3.0*ff.radius*ff.radius*ff.radius;
+    const Real vl = std::ldexp(dx[0], -ff.level)*std::ldexp(dx[1], -ff.level)*
+                    std::ldexp(dx[2], -ff.level);
+    ncl = std::max(1LL, std::llround(ff.ppc*vs/vl));
+    mcl = ff.rho*vs/static_cast<Real>(ncl);
+  }
   // the mass the solver removes: the sphere's actual (lattice) mass over the box
   long long ninside = 0;
   auto inside = [&](const std::array<Real, 3> &p) {
@@ -312,7 +397,23 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
   };
   struct Sample {std::array<Real, 3> x; long long tag; int block;};
   std::vector<Sample> local;
-  for (int k=0; k<nz; ++k) for (int j=0; j<ny; ++j) for (int i=0; i<nx; ++i)
+  // ff_cloud_level: uniform random points in the sphere (rejection from the cube; cloud i draws
+  // from its own stream, so every rank finds the same points)
+  for (long long i=0; i<ncl; ++i) {
+    std::array<Real, 3> p;
+    for (std::uint64_t k=0; ; ++k) {
+      for (int c=0; c<3; ++c) {
+        const Real cen = (c == 0) ? ff.x : ((c == 1) ? ff.y : ff.z);
+        p[c] = cen + ff.radius*(2.0*Uniform(ff.seed, static_cast<std::uint64_t>(i), 3*k + c) - 1.0);
+      }
+      if (inside(p)) break;
+    }
+    ++ninside;
+    if (restart) continue;
+    const int b = Owner(pack, p);
+    if (b >= 0) local.push_back({p, i, b});
+  }
+  for (int k=0; k<nz && ff.level < 0; ++k) for (int j=0; j<ny; ++j) for (int i=0; i<nx; ++i)
     for (int sk=0; sk<ff.n; ++sk) for (int sj=0; sj<ff.n; ++sj) for (int si=0; si<ff.n; ++si) {
       const auto p = point(i, j, k, si, sj, sk);
       if (!inside(p)) continue;
@@ -329,7 +430,13 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
     std::cout << std::setprecision(12) << "# FREEFALL_SETUP radius=" << ff.radius << " rho_s=" << ff.rho
               << " clouds=" << ninside << " mass=" << ff.mass << " R_eff="
               << std::cbrt(3.0*ff.mass/(4.0*M_PI*ff.rho)) << " rhobar=" << ff.rhobar
-              << " t_ff=" << ff.tff << " n=" << ff.n << " dx=" << dx[0] << std::endl;
+              << " t_ff=" << ff.tff << " n=" << ff.n << " dx=" << dx[0];
+    if (ff.jrep) {
+      std::cout << " spin=" << ff.spin << " sigma=" << ff.sigma << " cloud_level=" << ff.level
+                << " ppc=" << ff.ppc << " mfrac=" << ff.mfrac << " seed=" << ff.seed
+                << " m_cloud=" << mcl;
+    }
+    std::cout << std::endl;
   }
   if (restart) {
     ff.next = static_cast<int>(std::floor(pmy_mesh_->time/ff.dt + 1.0e-9)) + 1;
@@ -347,7 +454,7 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
     const auto &s = local[p];
     pi(PGID,p) = pack->gids + s.block;
     SetTag(pi, p, static_cast<std::uint64_t>(s.tag));
-    pi(PLEV,p) = 0; pi(PSP,p) = 0;
+    pi(PLEV,p) = (ff.level >= 0) ? ff.level : 0; pi(PSP,p) = 0;
     pr(IPX,p) = pr(IPX1,p) = s.x[0]; pr(IPY,p) = pr(IPY1,p) = s.x[1];
     pr(IPZ,p) = pr(IPZ1,p) = s.x[2];
     pr(IPM,p) = mcl; pr(IPTS,p) = pack->pdust->taus.h_view(0);
@@ -363,9 +470,27 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
   pmy_mesh_->nprtcl_total = 0;
   for (int r=0; r<global_variable::nranks; ++r) pmy_mesh_->nprtcl_total += pmy_mesh_->nprtcl_eachrank[r];
   if (pmy_mesh_->nprtcl_total != ninside) Fatal("lattice clouds were not owned exactly once");
-  pack->pdust->cloud_merge_mroot.assign(1, mcl);
-  pack->pdust->cloud_resample_m0 = mcl;
+  // the root cloud mass of the caps: ff_cloud_level clouds hold ff_mfrac of m0 / 8^L
+  const Real m0 = (ff.level >= 0) ? std::ldexp(mcl, 3*ff.level)/ff.mfrac : mcl;
+  pack->pdust->cloud_merge_mroot.assign(1, m0);
+  pack->pdust->cloud_resample_m0 = m0;
   pack->pdust->EnsureNextTag();
-  pack->pdust->SplitToLeaves();
+  if (ff.level < 0) pack->pdust->SplitToLeaves();
+  if (ff.spin != 0.0 || ff.sigma != 0.0) {
+    // solid-body rotation about z through the centre plus the dispersion, per cloud tag
+    auto rh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), part->prtcl_rdata);
+    auto ih = Kokkos::create_mirror_view_and_copy(HostMemSpace(), part->prtcl_idata);
+    const std::uint64_t vstream = 0x5bd1e995ULL;
+    for (int p=0; p<part->nprtcl_thispack; ++p) {
+      const std::uint64_t tag = GetTag(ih, p);
+      const Real x = rh(IPX,p) - ff.x, y = rh(IPY,p) - ff.y;
+      const Real v[3] = {-ff.spin*y + ff.sigma*Gauss(ff.seed, vstream + tag, 0),
+                         ff.spin*x + ff.sigma*Gauss(ff.seed, vstream + tag, 1),
+                         ff.sigma*Gauss(ff.seed, vstream + tag, 2)};
+      rh(IPVX,p) = rh(IPVX1,p) = v[0]; rh(IPVY,p) = rh(IPVY1,p) = v[1];
+      rh(IPVZ,p) = rh(IPVZ1,p) = v[2];
+    }
+    Kokkos::deep_copy(part->prtcl_rdata, rh);
+  }
   part->dtnew = std::numeric_limits<float>::max();
 }

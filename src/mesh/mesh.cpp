@@ -29,6 +29,7 @@
 #include "dust/dust_input.hpp"
 #include "radiation/radiation.hpp"
 #include "particles/particles.hpp"
+#include "particles/particle_counts.hpp"
 #include "srcterms/srcterms.hpp"
 #include "outputs/io_wrapper.hpp"
 
@@ -700,9 +701,7 @@ void Mesh::AddCoordinatesAndPhysics(ParameterInput *pinput) {
     // Share number of particles on each rank with all ranks
     MPI_Allgather(&nprtcl_thisrank,1,MPI_INT,nprtcl_eachrank,1,MPI_INT,MPI_COMM_WORLD);
 #endif
-    for (int n=0; n<global_variable::nranks; ++n) {
-      nprtcl_total += nprtcl_eachrank[n];
-    }
+    nprtcl_total = particles::TotalCount(nprtcl_eachrank, global_variable::nranks);
     // Assign particle IDs
     if (pmb_pack->ppart != nullptr) {
       pmb_pack->ppart->CreateParticleTags(pinput);

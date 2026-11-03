@@ -49,6 +49,7 @@
 #include "eos/eos.hpp"
 #include "hydro/hydro.hpp"
 #include "particles/particles.hpp"
+#include "particles/particle_counts.hpp"
 #include "dust/dust.hpp"
 #include "dust/dust_species.hpp"
 #include "outputs/outputs.hpp"
@@ -471,9 +472,8 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
 #if MPI_PARALLEL_ENABLED
     if (global_variable::nranks > 1) {
       MPI_Allgather(&nlattice, 1, MPI_INT, pmy_mesh_->nprtcl_eachrank, 1, MPI_INT, MPI_COMM_WORLD);
-      int tot = 0;
-      for (int r=0; r<global_variable::nranks; ++r) tot += pmy_mesh_->nprtcl_eachrank[r];
-      pmy_mesh_->nprtcl_total = tot;
+      pmy_mesh_->nprtcl_total = particles::TotalCount(pmy_mesh_->nprtcl_eachrank,
+                                                      global_variable::nranks);
     }
 #endif
     pmbp->pdust->EnsureNextTag();

@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <unordered_map>
@@ -38,6 +39,7 @@
 #include "mesh/mesh.hpp"
 #include "mesh/meshblock.hpp"
 #include "particles/particles.hpp"
+#include "particles/particle_counts.hpp"
 #include "hydro/hydro.hpp"
 #include "dust.hpp"
 
@@ -177,19 +179,54 @@ void DustGasDrag::BuildRefinableCloudTransfer(ParameterInput *pin) {
   t.root_dx2 = (t.x2max - t.x2min)/static_cast<Real>(t.ncoarse2);
   t.fine_dx1 = t.root_dx1/static_cast<Real>(1 << nlev);
   t.fine_dx2 = t.root_dx2/static_cast<Real>(1 << nlev);
-  // The clouds follow the mesh down to its finest level in every run.  A cap
-  // on their level is a test control only, <dust>/test_cloud_max_level (0 keeps every cloud at
-  // root size); it is never added to the parameters as a default.  The old key cloud_max_level
-  // was added with the run's level count as its default, so a restart with more levels kept the
-  // clouds at the old finest level: it is ignored.
+  // By default the clouds follow the mesh down to its finest level.  <dust>/test_cloud_max_level
+  // (hidden, tests only; 0 keeps every cloud at root size): above it the clouds neither split
+  // nor change size.  Neither key is ever added to the parameters as a default.  The old key
+  // cloud_max_level was added with the run's level count as its default (it is in many restart
+  // files): it is ignored.
   t.cloud_max_level = nlev;
-  if (pin->DoesParameterExist("dust", "test_cloud_max_level")) {
+  const bool test_cap = pin->DoesParameterExist("dust", "test_cloud_max_level");
+  if (test_cap) {
     t.cloud_max_level = pin->GetInteger("dust", "test_cloud_max_level");
   }
   if (pin->DoesParameterExist("dust", "cloud_max_level") && global_variable::my_rank == 0) {
     std::cout << "# NOTE (dust): <dust>/cloud_max_level = "
-              << pin->GetString("dust", "cloud_max_level") << " is ignored (the clouds follow the "
-              << "mesh; a cap for tests is <dust>/test_cloud_max_level)" << std::endl;
+              << pin->GetString("dust", "cloud_max_level") << " is ignored (an old key; the "
+              << "level cap of the split is <dust>/cloud_split_max_level)" << std::endl;
+  }
+  // <dust>/cloud_split_max_level = L (unset or negative: no limit): the clouds split up to level
+  // L; above it they keep the mass of level L while their kernel follows the mesh (the cloud
+  // instant switch, CloudInstantSwitch); R caps them as level-L clouds, G stops at level L.
+  cloud_split_max_level = -1;
+  if (pin->DoesParameterExist("dust", "cloud_split_max_level")) {
+    const int lcap = pin->GetInteger("dust", "cloud_split_max_level");
+    if (lcap >= 0) {
+      if (test_cap) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "<dust>/cloud_split_max_level and the test control "
+                  << "<dust>/test_cloud_max_level exclude each other" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      cloud_split_max_level = lcap;
+      t.cloud_max_level = std::min(nlev, lcap);
+      // R: a cloud above L has the cap of level L, eta_L m0 / 2^(d L) (the table is built)
+      for (int l=lcap+1; l<ResampleCapTable::kLevels; ++l) {
+        cloud_resample_cap.f[l] = cloud_resample_cap.f[lcap];
+      }
+    }
+    if (global_variable::my_rank == 0) {
+      if (lcap < 0) {
+        std::cout << "# DUST cloud_split_max_level = " << lcap << ": no limit (the clouds split "
+                  << "down to the finest level of the mesh)" << std::endl;
+      } else {
+        std::cout << "# DUST cloud_split_max_level = " << lcap << ": the clouds split up to level "
+                  << lcap << " (mesh levels " << nlev << "); above it every plain cloud keeps its "
+                  << "mass and takes the level of the leaf that holds its centre at the start of "
+                  << "each cycle (cloud instant switch); R caps them as level-" << lcap
+                  << " clouds, G merges levels <= " << lcap << " only"
+                  << (lcap >= nlev ? " (no level above it on this mesh)" : "") << std::endl;
+      }
+    }
   }
   // cloud_split_everywhere refines the whole lattice
   t.cloud_split_everywhere = pin->GetOrAddBoolean("dust", "cloud_split_everywhere", false);
@@ -452,9 +489,7 @@ void DustGasDrag::MigrateClouds() {
   pb->ClearPrtclRecv();
   // the counts of all ranks are known now (RecvAndUnpackPrtcls): the total for the outputs
   Mesh *pm = pmy_pack->pmesh;
-  int tot = 0;
-  for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
-  pm->nprtcl_total = tot;
+  pm->nprtcl_total = particles::TotalCount(pm->nprtcl_eachrank, global_variable::nranks);
   mpi_time[0] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   ++mpi_count[0];
 }
@@ -468,7 +503,7 @@ void DustGasDrag::MigrateClouds() {
 //! of the particle exchange), and the loop ends when no rank split anything.  One rank: the
 //! passes alone.  Returns the number of particles split.
 
-int DustGasDrag::SplitToLeaves() {
+long long DustGasDrag::SplitToLeaves() {
   long long total = 0;
   while (true) {
     long long n = SplitAndMergeClouds();
@@ -481,7 +516,7 @@ int DustGasDrag::SplitToLeaves() {
 #endif
     if (n == 0) break;
   }
-  return static_cast<int>(total);
+  return total;
 }
 
 //----------------------------------------------------------------------------------------
@@ -585,7 +620,18 @@ void DustGasDrag::FrameToBlock(const Real tpos) {
 
 TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (lb_log_interval > 0 && pmy_pack->pmesh->ncycle % lb_log_interval == 0) LogRankClouds();
-  if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) return TaskStatus::complete;
+  if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) {
+    // point particles: the cell sort of <dust>/point_sort_interval (after the x3 outflow removal
+    // of this cycle, before every gather and deposit; no send list is pending here)
+    if (point_sort_interval > 0 && pmy_pack->pmesh->ncycle % point_sort_interval == 0) {
+      Kokkos::fence();
+      Kokkos::Timer t;
+      SortParticles();
+      point_sort_seconds += t.seconds();   // SortParticles ends with a fence
+      ++point_sort_count;
+    }
+    return TaskStatus::complete;
+  }
   ProfTimer prof_all(prof_time[kProfRefineClouds], prof_count[kProfRefineClouds]);
   UpdateShear3D(pmy_pack->pmesh->time);   // the positions at the start of the step
   EnsureNextTag();
@@ -593,6 +639,13 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
     ProfTimer pt(prof_time[kProfSplit], prof_count[kProfSplit]);
     SplitAndMergeClouds();
   }
+  // the split budget's log line and the local R after a large split (collective; nothing with
+  // both keys off)
+  const bool split_r = (cloud_split_budget > 0 || cloud_split_resample) && SplitResampleWanted();
+  // the split budget, several ranks: the pieces of a held event can lie several blocks from
+  // their parent's block, beyond the neighbour step of the particle exchange; the new pieces
+  // of other ranks' blocks go there now, by position (as in SplitToLeaves; collective)
+  if (split_route_due) RouteToOwnerBlocks3D(nullptr, split_last_before);
   // the merge clock is read once per cycle (MergeDue advances it)
   const bool merge_due = cloud_merge && MergeDue();
   if (amr_event_pending && !(cloud_resample && cloud_resample_after_regrid)) {
@@ -608,22 +661,27 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
   if (event_now) {
     // the cycle after a regrid: merge pass first, then one resampling
     ProfTimer pt(prof_time[kProfEvent], prof_count[kProfEvent]);
-    HandleRegridEvent(merge_due);
+    HandleRegridEvent(merge_due, split_r);
   } else {
     // resampling before the merge pass, so that an audit-only pass of the same cycle writes
     // the resampled state; every cloud_resample_interval cycles, or at the planned physical
     // times
     const bool resample_due = cloud_resample && ResampleDue();
+    // the local R after a large split, unless the scheduled (global) one runs anyway
+    const bool split_local = split_r && !resample_due;
     // several ranks: the split pieces to the rank of their block before R and G
     // (other cycles leave them to the migration after the push; until then they keep a block
     // of this rank as their anchor, which the leaf traversal allows)
-    if (resample_due || merge_due) {
+    if (resample_due || merge_due || split_local) {
       MigrateClouds();
       CheckHaloReach("split");   // R and G traverse the supports too
     }
     if (resample_due) {
       ProfTimer pt(prof_time[kProfSchedR], prof_count[kProfSchedR]);
       ResampleClouds();
+    } else if (split_local) {
+      ProfTimer pt(prof_time[kProfSplitR], prof_count[kProfSplitR]);
+      ResampleAfterSplit();
     }
     if (merge_due) {
       ProfTimer pt(prof_time[kProfSchedG], prof_count[kProfSchedG]);
@@ -636,9 +694,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
     Mesh *pm = pmy_pack->pmesh;
     int n = pmy_pack->ppart->nprtcl_thispack;
     MPI_Allgather(&n, 1, MPI_INT, pm->nprtcl_eachrank, 1, MPI_INT, MPI_COMM_WORLD);
-    int tot = 0;
-    for (int r=0; r<global_variable::nranks; ++r) tot += pm->nprtcl_eachrank[r];
-    pm->nprtcl_total = tot;
+    pm->nprtcl_total = particles::TotalCount(pm->nprtcl_eachrank, global_variable::nranks);
     pm->nprtcl_thisrank = n;
   }
 #endif
@@ -668,7 +724,7 @@ TaskStatus DustGasDrag::RefineClouds(Driver *pdrive, int stage) {
 //! the schedule is not touched.  The event is done even if nothing could be resampled.  One
 //! line per event in the log.
 
-void DustGasDrag::HandleRegridEvent(const bool merge_due) {
+void DustGasDrag::HandleRegridEvent(const bool merge_due, const bool split_r) {
   Mesh *pmesh = pmy_pack->pmesh;
   particles::Particles *ppar = pmy_pack->ppart;
   const int nnew = amr_event_nnew, ndel = amr_event_ndel;
@@ -696,12 +752,21 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
   const bool scheduled = ResampleDue();
   // no extra resampling after a pure derefinement (unless cloud_resample_after_derefine); G
   // has run on the coarsened region, the scheduled resampling still reaches everything
-  const bool skip_r = !scheduled && nnew == 0 && ndel > 0 && !cloud_resample_after_derefine;
+  // (a large split of this cycle with cloud_split_resample: R on its blocks too)
+  const bool skip_r = !scheduled && nnew == 0 && ndel > 0 && !cloud_resample_after_derefine &&
+                      !split_r;
   timer.reset();
   // the blocks changed by every regrid of this event are fresh for the local R
   amr_event_max_age = (amr_event_first_ncycle >= 0)
                     ? static_cast<int>(pmesh->ncycle - amr_event_first_ncycle) : 0;
-  const int removed = skip_r ? 0 : ResampleClouds(cloud_resample_event_local && !scheduled);
+  const bool local = cloud_resample_event_local && !scheduled;
+  if (local && split_r && !skip_r) {
+    PrepareSplitBlocks();
+    r_split_blocks = true;
+    ++split_resample_calls;
+  }
+  const int removed = skip_r ? 0 : ResampleClouds(local);
+  r_split_blocks = false;
   amr_event_max_age = 0;
   Kokkos::fence();
   const double t_resample = timer.seconds();
@@ -733,13 +798,280 @@ void DustGasDrag::HandleRegridEvent(const bool merge_due) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::SplitResampleWanted
+//! \brief After the split of the cycle (cloud_split_budget or cloud_split_resample on): the
+//! counts of all ranks, one log line when the budget held events back or the local R runs.
+//! The local R after the split is due when the split created at least
+//! cloud_split_resample_frac of the clouds it found (all ranks together) or held events back.
+//! Collective.
+
+bool DustGasDrag::SplitResampleWanted() {
+  long long v[4] = {split_last_before, split_last_new, split_last_held, split_last_offrank};
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, v, 4, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
+  const bool want = cloud_split_resample && v[1] > 0 &&
+                    (v[2] > 0 || static_cast<double>(v[1]) >=
+                                 cloud_split_resample_frac*static_cast<double>(v[0]));
+  // (the budget, several ranks) new pieces of other ranks' blocks: routed by position now
+  split_route_due = cloud_split_budget > 0 && global_variable::nranks > 1 && v[3] > 0;
+  if (global_variable::my_rank == 0 && (v[2] > 0 || want)) {
+    std::cout << "# split: cycle " << pmy_pack->pmesh->ncycle << ", time "
+              << pmy_pack->pmesh->time << ": " << v[1] << " clouds created from " << v[0]
+              << ", " << v[2] << " split events held back by the budget";
+    if (cloud_split_budget > 0 && global_variable::nranks > 1) {
+      std::cout << ", " << v[3] << " new clouds routed to the ranks of their blocks";
+    }
+    std::cout << (want ? "; R after the split" : "") << std::endl;
+  }
+  return want;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::PrepareSplitBlocks
+//! \brief split_gid_flag: the blocks (global ids) of the split events of this cycle on any
+//! rank, as bits: 1 the block of a split parent, 2 a block a piece landed in (the pieces of a
+//! split lie in the block of their parent, in a neighbour, in a block shifted along x2 across a
+//! shear-periodic x1 face, or after a hold by the budget several blocks away).  Collective.
+
+void DustGasDrag::PrepareSplitBlocks() {
+  const int ntot = pmy_pack->pmesh->nmb_total;
+  split_gid_flag.assign(ntot, 0);
+  for (std::size_t q=0; q+1<split_gid_mark.size(); q+=2) {
+    const int g = split_gid_mark[q];
+    if (g >= 0 && g < ntot) split_gid_flag[g] |= split_gid_mark[q + 1];
+  }
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, split_gid_flag.data(), ntot, MPI_INT, MPI_BOR, MPI_COMM_WORLD);
+  }
+#endif
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::ResampleAfterSplit
+//! \brief The local R right after a large split: the clouds in the blocks of this cycle's
+//! split events (the blocks of the parents and the blocks the pieces landed in; the split
+//! pieces have been migrated).  One log line, with the number of those blocks that are neither
+//! a parent's block nor one of its MeshBlock neighbours (nghbr: across a shear-periodic x1
+//! face these are the unshifted blocks), and the number of pieces outside their own parent's
+//! block and its neighbours (across a shear-periodic face, after a hold by the budget).
+//! Collective.  Returns the number of clouds removed on this rank.
+
+int DustGasDrag::ResampleAfterSplit() {
+  PrepareSplitBlocks();
+  int nsb = 0;
+  for (const int f : split_gid_flag) nsb += (f != 0) ? 1 : 0;
+  // (the log) piece blocks of this rank that are neither a parent's block nor its neighbour
+  long long nfar = 0;
+  {
+    const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
+    const int ntot = static_cast<int>(split_gid_flag.size());
+    const auto &nb = pmy_pack->pmb->nghbr;
+    for (int m=0; m<nmb; ++m) {
+      if (gids + m >= ntot || split_gid_flag[gids + m] != 2) continue;
+      bool near = false;
+      for (int n=0; n<pmy_pack->pmb->nnghbr && !near; ++n) {
+        const int g = nb.h_view(m,n).gid;
+        if (g >= 0 && g < ntot && (split_gid_flag[g] & 1)) near = true;
+      }
+      if (!near) ++nfar;
+    }
+  }
+  // mass and momentum of this rank's clouds before and after (the log line checks them)
+  auto moments = [this](double s[4]) {
+    auto pr = pmy_pack->ppart->prtcl_rdata;
+    double a = 0.0, b = 0.0, c = 0.0, d = 0.0;
+    Kokkos::parallel_reduce("dust_split_r_sums",
+    Kokkos::RangePolicy<>(DevExeSpace(), 0, pmy_pack->ppart->nprtcl_thispack),
+    KOKKOS_LAMBDA(const int p, double &sa, double &sb, double &sc, double &sd) {
+      const double m = pr(IPM,p);
+      sa += m; sb += m*pr(IPVX,p); sc += m*pr(IPVY,p); sd += m*pr(IPVZ,p);
+    }, a, b, c, d);
+    s[0] = a; s[1] = b; s[2] = c; s[3] = d;
+  };
+  double sums[9];
+  moments(sums);
+  const int n0 = pmy_pack->ppart->nprtcl_thispack;
+  Kokkos::Timer timer;
+  r_split_blocks = true;
+  r_fresh_blocks = false;
+  const int removed = ResampleClouds(true);
+  r_split_blocks = false;
+  r_fresh_blocks = true;
+  Kokkos::fence();
+  double t = timer.seconds();
+  moments(sums + 4);
+  ++split_resample_calls;
+  long long nn[4] = {n0, removed, nfar, split_last_far};
+  // |the mass| summed: the scale of the momentum differences
+  sums[8] = 0.0;
+  {
+    auto pr = pmy_pack->ppart->prtcl_rdata;
+    double sv = 0.0;
+    Kokkos::parallel_reduce("dust_split_r_scale",
+    Kokkos::RangePolicy<>(DevExeSpace(), 0, pmy_pack->ppart->nprtcl_thispack),
+    KOKKOS_LAMBDA(const int p, double &s) {
+      s += Kokkos::fabs(pr(IPM,p))*(Kokkos::fabs(pr(IPVX,p)) + Kokkos::fabs(pr(IPVY,p)) +
+                                    Kokkos::fabs(pr(IPVZ,p)));
+    }, sv);
+    sums[8] = sv;
+  }
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, nn, 4, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &t, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, sums, 9, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
+  if (global_variable::my_rank == 0) {
+    const double dm = (sums[4] - sums[0])/std::fmax(std::fabs(sums[0]), 1.0e-300);
+    const double sc = std::fmax(sums[8], 1.0e-300);
+    const double dp = std::fmax(std::fabs(sums[5] - sums[1]),
+                                std::fmax(std::fabs(sums[6] - sums[2]), std::fabs(sums[7] - sums[3])))/sc;
+    std::cout << "# R after the split " << split_resample_calls << ": cycle "
+              << pmy_pack->pmesh->ncycle << ", " << nsb << " split blocks (" << nn[2]
+              << " of them neither a parent's block nor its neighbour; " << nn[3]
+              << " pieces outside their parent block's neighbours), "
+              << "removed " << nn[1] << " of " << nn[0] << " clouds, " << t << " s; relative "
+              << "change of the mass " << dm << ", of the momentum " << dp << std::endl;
+  }
+  return removed;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::SplitAndMergeClouds
 //! \brief The split of the cycle: the moving P1 split (SplitCloudsP1, on the device by
 //! default).
 
 int DustGasDrag::SplitAndMergeClouds() {
-  if (!cloud_split_enable) return 0;   // test switch
-  return SplitCloudsP1();
+  const int nsplit = cloud_split_enable ? SplitCloudsP1() : 0;   // (false: test switch)
+  if (cloud_split_max_level >= 0) CloudInstantSwitch();
+  return nsplit;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::CloudInstantSwitch
+//! \brief <dust>/cloud_split_max_level = L: the instant switch of the cloud framework above the
+//! cap (the former cloud_instant_switch, now for the clouds above L only; not the
+//! point particles of amr_pic = instant_switch).  Every plain cloud of level >= L takes the level
+//! max(L, level of the leaf that holds its centre): its hat has the cell width of that leaf, at
+//! once, when it crosses into a leaf of another level or the mesh changes under it.  It never
+//! splits (the split stops at L) and keeps its mass, position, velocity and block.  The deposit
+//! stays the exact leaf integrals of the switched hat, whose weights sum to one: the deposited
+//! mass is exact for any width.  The drag deposits the impulse actually applied to each cloud
+//! with those weights, so the total momentum of gas and dust is conserved (to round-off) for
+//! any kernel; this does not need the gather to be the adjoint of the deposit, and the
+//! production linear gather (cell values plus slopes) is not.  The level is fixed for the whole
+//! step, so the gather and the deposit of a step use the same kernel.  Lobed clouds (level-L
+//! transition clouds of the split lattice) keep their level; so does a cloud whose leaf is not
+//! found.  Unlike a split, a switch changes the deposit: the gravity field of the last solve is
+//! not reused.  Runs after the split of every cycle and of every pass of the initial split.
+//! Returns the clouds whose level changed (this rank).
+//!
+//! The root-cloud mass of every species (cloud_merge_mroot: R's mass caps, G's quantum) is
+//! inferred from the plain level-0 / level-1 clouds (EnsureRootCloudMass), assuming the masses
+//! of the split lattice (a level-1 cloud carries 1/4 of a root cloud in 2-D, 1/8 in 3-D).  The
+//! switch breaks that (L = 0: a root cloud of mass M at level 1 or 2; any L: a level-L cloud at
+//! a finer level), so the value is recorded here once, collectively, before the first switch
+//! changes any level, and the device G, the host G and R all read this one value (Codex
+//! review: the host G had cached 4 M from root clouds switched to level 1, and a 2-D start that
+//! switched every root cloud to level 2 left zero).  A restart reads it from the file.
+
+int DustGasDrag::CloudInstantSwitch() {
+  const int L = cloud_split_max_level;
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  // the root-cloud mass before any level changes (collective; once, then a no-op)
+  if (L >= 0 && L < smr_transfer.cloud_nlev && cloud_merge_mroot.empty()) {
+    EnsureRootCloudMass();
+    if (global_variable::my_rank == 0) {
+      std::cout << "# DUST cloud_split_max_level: root cloud mass per species (before the first "
+                << "instant switch, cycle " << pmy_pack->pmesh->ncycle << ") ="
+                << std::setprecision(17);
+      for (const Real m : cloud_merge_mroot) std::cout << " " << m;
+      std::cout << std::setprecision(6) << std::endl;
+    }
+  }
+  // (no leaf above L on this mesh: every plain cloud of level >= L is at L already)
+  if (L < 0 || L >= smr_transfer.cloud_nlev || npart == 0) return 0;
+  using T = SMRCompositeTransfer;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  int nchange = 0;
+  if (clouds3d) {
+    const auto lt = leaf_traversal3d;
+    Kokkos::parallel_reduce("dust_cloud_instant_switch3d",
+                            Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &nc) {
+      const int code = pi(PLEV,p);
+      if ((code & ~T::kCloudLevelMask) != 0 || code < L) return;   // lobed, or below the cap
+      int b = -1;
+      lt.Owner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), lt.Anchor(pi(PGID,p)), &b);
+      if (b < 0) return;
+      const int lev = (lt.blev(b) > L) ? lt.blev(b) : L;
+      if (lev != code) {pi(PLEV,p) = lev; ++nc;}
+    }, Kokkos::Sum<int>(nchange));
+  } else {
+    const auto lt = leaf_traversal;
+    Kokkos::parallel_reduce("dust_cloud_instant_switch2d",
+                            Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &nc) {
+      const int code = pi(PLEV,p);
+      if ((code & ~T::kCloudLevelMask) != 0 || code < L) return;
+      int b = -1;
+      lt.Owner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)), &b);
+      if (b < 0) return;
+      const int lev = (lt.blev(b) > L) ? lt.blev(b) : L;
+      if (lev != code) {pi(PLEV,p) = lev; ++nc;}
+    }, Kokkos::Sum<int>(nchange));
+  }
+  if (nchange > 0) {
+    cloud_instant_switch_count += static_cast<unsigned long long>(nchange);
+    ++gravity_mass_epoch;   // the deposit changed (no reuse of the gravity field)
+  }
+  return nchange;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::DepositTriggerDensityCapped3D
+//! \brief <dust>/cloud_split_max_level = L: the dust density the 3-D density trigger reads, as
+//! DepositCloudDensity3D(f, -1, true) but with every plain cloud above L deposited with the
+//! kernel of its mass level L (TriggerCloudCode): the switched (finer) kernels sample the density
+//! with fewer clouds than cells, and their grainy deposit would drive the refinement (a positive
+//! feedback with close level thresholds).  Only the trigger reads it; the dynamics and the
+//! diagnostics keep the switched kernel.
+
+void DustGasDrag::DepositTriggerDensityCapped3D(DvceArray5D<Real> &f) {
+  if (f.extent_int(0) != qdep.extent_int(0) || f.extent_int(1) != 4 ||
+      f.extent_int(2) != qdep.extent_int(2) || f.extent_int(3) != qdep.extent_int(3) ||
+      f.extent_int(4) != qdep.extent_int(4)) {
+    Kokkos::realloc(f, qdep.extent(0), 4, qdep.extent(2), qdep.extent(3), qdep.extent(4));
+  }
+  Kokkos::deep_copy(f, 0.0);
+  UpdateShear3D(pmy_pack->pmesh->time);
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  const int npart = ppar->nprtcl_thispack;
+  const auto lt = leaf_traversal3d;
+  const int lcap = cloud_split_max_level;
+  auto ff = f;
+  Kokkos::parallel_for("dust_cloud3d_trigger_density_cap",
+                       Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    const Real m = pr(IPM,p);
+    lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), TriggerCloudCode(pi(PLEV,p), lcap),
+                          lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
+      int tb, tk, tj, ti;
+      lt.Decode(target, tb, tk, tj, ti);
+      DepositAdd(&ff(tb,0,tk,tj,ti), m*w/(lt.box(tb,3)*lt.box(tb,4)*lt.box(tb,5)));
+    });
+  });
+  // several ranks: the owners hold every rank's clouds
+  HaloReverseAdd(f, 0, 1);
 }
 
 //----------------------------------------------------------------------------------------
@@ -758,6 +1090,9 @@ int DustGasDrag::SplitAndMergeClouds() {
 
 int DustGasDrag::SplitCloudsP1() {
   if (cloud_split_device) {
+    // (mesh_gradient, several ranks) the supports within the halo before the moments' deposit,
+    // including the coarser support of the fit's retry (CheckSplitVelocityReach)
+    if (cloud_split_velocity != 0) CheckSplitVelocityReach();
     return clouds3d ? SplitCloudsP1Device3D() : SplitCloudsP1Device();
   }
   RequireCloudTable("the host P1 split (cloud_split_device = false)");
@@ -1126,6 +1461,9 @@ int DustGasDrag::MergeClouds() {
   // Contributions whose velocity residual about the mass-weighted fit exceeds
   // alpha*H_L/tau_c are left out; a commit lighter than cloud_merge_min_mass*m_ref waits.
   const int nw = static_cast<int>(R.size());
+  // cloud_split_max_level: the value recorded before the first instant switch (the inference
+  // below would read switched levels), the same source as the device G and R
+  if (cloud_split_max_level >= 0) EnsureRootCloudMass();
   if (cloud_merge_mroot.empty()) {
     int nsp = 1;
     for (int s=0; s<nw; ++s) nsp = std::max(nsp, I[s][PSP] + 1);
@@ -1154,7 +1492,10 @@ int DustGasDrag::MergeClouds() {
   unsigned long long nc_shift = 0, nc_skip = 0;
   Real dk_grad = 0.0, dk_res = 0.0;
   const Real omega = is_shearing_box ? omega0 : 0.0;
-  for (int lev=1; lev<=nlev; ++lev) {
+  // cloud_split_max_level = L: levels <= L only (a cloud above L is a level-L cloud in mass; it
+  // widens back by the cloud instant switch when the mesh coarsens)
+  const int lev_g = (cloud_split_max_level >= 0) ? std::min(nlev, cloud_split_max_level) : nlev;
+  for (int lev=1; lev<=lev_g; ++lev) {
     const int L = lev - 1;
     const Real H1 = transfer.root_dx1/static_cast<Real>(1 << L);
     const Real H2 = transfer.root_dx2/static_cast<Real>(1 << L);

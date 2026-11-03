@@ -78,7 +78,7 @@ class MeshGeometry {
   // stand-alone call discovers it once without constructing matrices.
   const std::vector<int> &PhaseRows() const;
   // 1 keeps serial assembly; positive counts are capped by CPU affinity. Zero
-  // selects at most eight workers in GPU builds and one in CPU builds. Workers
+  // selects min(32, affinity CPUs - 2) workers in GPU builds and one in CPU builds. Workers
   // only assemble host rows; callers must not concurrently use this geometry.
   void SetPhaseThreads(int threads);
   int PhaseThreads() const;  // actual workers, including the calling thread
@@ -93,6 +93,8 @@ class MeshGeometry {
   // physical topology and sample ownership stay fixed across arbitrary phases.
   // false updates only A, without boundary/force CSR allocation or assembly.
   LocalCompositeUpdate BuildPhaseUpdate(Real phase, bool forces = true);
+  // host seconds of the last BuildPhaseUpdate: {row assembly, join of the worker chunks}
+  std::array<double,2> LastPhaseUpdateSeconds() const;
   const std::vector<GravityPatch> &Patches() const;
   const std::vector<GlobalIndex> &RowPartition() const;
   const std::vector<GlobalIndex> &SamplePartition() const;

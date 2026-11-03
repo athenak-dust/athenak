@@ -19,6 +19,17 @@
 #include "mesh/mesh.hpp"
 #include "bvals.hpp"
 
+namespace {
+// The (k,j) rows of one (MeshBlock, neighbour, variable) buffer are split over RowSplit teams
+// when a pack has few MeshBlocks: one team per buffer left most of a GPU idle (a 4x128x256 face
+// of a single block took ~0.2 ms per exchange, the same as eight blocks).  Pure copies: the
+// result does not depend on the split.
+int RowSplit(const int nteams) {
+  constexpr int kTarget = 4096, kMax = 32;
+  return std::max(1, std::min(kMax, kTarget/std::max(1, nteams)));
+}
+}  // namespace
+
 //----------------------------------------------------------------------------------------
 // BValCC constructor:
 
@@ -67,10 +78,14 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
   int nmnv = nmb*nnghbr*nvar;
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
-  Kokkos::parallel_for("SendBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(nnghbr*nvar);
-    const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
-    const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+  const int nsplit = RowSplit(nmnv);
+  Kokkos::TeamPolicy<> policy_rows(DevExeSpace(), nmnv*nsplit, Kokkos::AUTO);
+  Kokkos::parallel_for("SendBuff", policy_rows, KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int lr = tmember.league_rank()/nsplit;          // (m,n,v) buffer
+    const int part = tmember.league_rank() - lr*nsplit;   // its share of the rows
+    const int m = (lr)/(nnghbr*nvar);
+    const int n = (lr - m*(nnghbr*nvar))/nvar;
+    const int v = (lr - m*(nnghbr*nvar) - n*nvar);
 
     // only load buffers when neighbor exists
     if (nghbr.d_view(m,n).gid >= 0) {
@@ -111,7 +126,12 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
       int dn = nghbr.d_view(m,n).dest;
 
       // Middle loop over k,j
-      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkj), [&](const int idx) {
+      // this team's share [part nkj/nsplit, (part+1) nkj/nsplit) without overflow in
+      // 32 bits: nkj = nq nsplit + nr, so part nq + part nr/nsplit with part nr < nsplit^2
+      const int nq = nkj/nsplit, nr = nkj - nq*nsplit;
+      const int r0 = part*nq + (part*nr)/nsplit;
+      const int r1 = (part + 1)*nq + ((part + 1)*nr)/nsplit;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, r0, r1), [&](const int idx) {
         int k = idx / nj;
         int j = (idx - k * nj) + jl;
         k += kl;
@@ -173,6 +193,8 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
     tmember.team_barrier();
   }); // end par_for_outer
 
+  // the same-level coarse data of Z4c with SMR/AMR (an empty kernel otherwise)
+  if (is_z4c && multilevel) {
   Kokkos::parallel_for("SendBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
     const int m = (tmember.league_rank())/(nnghbr*nvar);
     const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
@@ -237,6 +259,7 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
     } // end if-neighbor-exists block
     tmember.team_barrier();
   }); // end par_for_outer
+  }  // is_z4c && multilevel
   }
 
 #if MPI_PARALLEL_ENABLED
@@ -323,10 +346,14 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
   Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr*nvar), Kokkos::AUTO);
-  Kokkos::parallel_for("RecvBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(nnghbr*nvar);
-    const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
-    const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+  const int nsplit = RowSplit(nmb*nnghbr*nvar);
+  Kokkos::TeamPolicy<> policy_rows(DevExeSpace(), (nmb*nnghbr*nvar)*nsplit, Kokkos::AUTO);
+  Kokkos::parallel_for("RecvBuff", policy_rows, KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int lr = tmember.league_rank()/nsplit;          // (m,n,v) buffer
+    const int part = tmember.league_rank() - lr*nsplit;   // its share of the rows
+    const int m = (lr)/(nnghbr*nvar);
+    const int n = (lr - m*(nnghbr*nvar))/nvar;
+    const int v = (lr - m*(nnghbr*nvar) - n*nvar);
     if (skip_shr) {
       const int ox = ShearSlotOx1(n);
       if ((ox == -1 && mbbcs.d_view(m,BoundaryFace::inner_x1) == BoundaryFlag::shear_periodic)
@@ -375,7 +402,12 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
 #endif
 
       // Middle loop over k,j
-      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkj), [&](const int idx) {
+      // this team's share [part nkj/nsplit, (part+1) nkj/nsplit) without overflow in
+      // 32 bits: nkj = nq nsplit + nr, so part nq + part nr/nsplit with part nr < nsplit^2
+      const int nq = nkj/nsplit, nr = nkj - nq*nsplit;
+      const int r0 = part*nq + (part*nr)/nsplit;
+      const int r1 = (part + 1)*nq + ((part + 1)*nr)/nsplit;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, r0, r1), [&](const int idx) {
         int k = idx / nj;
         int j = (idx - k * nj) + jl;
         k += kl;
@@ -410,6 +442,7 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
   });  // end par_for_outer
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
+  if (is_z4c && multilevel) {   // Z4c with SMR/AMR only (an empty kernel otherwise)
   Kokkos::parallel_for("RecvBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
     const int m = (tmember.league_rank())/(nnghbr*nvar);
     const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
@@ -456,6 +489,7 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
     }  // end if-neighbor-exists block
     tmember.team_barrier();
   });  // end par_for_outer
+  }  // is_z4c && multilevel
 
   return TaskStatus::complete;
 }

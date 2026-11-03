@@ -287,6 +287,19 @@ if (ENABLE_MPI)
   target_link_libraries(gravity_coarse_check PRIVATE MPI::MPI_CXX)
 endif()
 
+# shear-phase update regressions: consecutive updates, a failed batch and reuse, the
+# ATHENA_SG_PROJECT_FUSE probe (tst/test_suite/gravity/phase_update.cpp)
+add_executable(gravity_phase_update_check EXCLUDE_FROM_ALL
+  tst/test_suite/gravity/phase_update.cpp
+  src/gravity/sparse_mg.cpp src/gravity/geometric_mg.cpp
+  src/gravity/mesh_geometry.cpp src/gravity/composite.cpp src/gravity/vacuum_mesh.cpp)
+target_include_directories(gravity_phase_update_check PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(gravity_phase_update_check PRIVATE Kokkos::kokkos)
+if (ENABLE_MPI)
+  target_link_libraries(gravity_phase_update_check PRIVATE MPI::MPI_CXX)
+endif()
+
 add_executable(gravity_slab_window_check EXCLUDE_FROM_ALL
   tst/test_suite/gravity/slab_window.cpp src/gravity/slab_boundary.cpp src/globals.cpp)
 target_include_directories(gravity_slab_window_check PRIVATE
@@ -304,6 +317,14 @@ target_link_libraries(gravity_solver_scaling_check PRIVATE Kokkos::kokkos)
 if (ENABLE_MPI)
   target_link_libraries(gravity_solver_scaling_check PRIVATE MPI::MPI_CXX)
 endif()
+
+# refine_from child-tag guard (header only; no Kokkos)
+add_executable(dust_refine_tag_check EXCLUDE_FROM_ALL tst/test_suite/dust/refine_tags.cpp)
+target_include_directories(dust_refine_tag_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# 64-bit particle total and rank offsets of int per-rank counts (header only; no Kokkos)
+add_executable(particle_count_check EXCLUDE_FROM_ALL tst/test_suite/particles/particle_counts.cpp)
+target_include_directories(particle_count_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 install( TARGETS athena DESTINATION bin )
 

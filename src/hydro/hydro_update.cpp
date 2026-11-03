@@ -21,6 +21,8 @@ namespace hydro {
 //  \brief Explicit RK update including flux divergence terms
 
 TaskStatus Hydro::RKUpdate(Driver *pdriver, int stage) {
+  // identity stage (imex2+ stage 3: beta = 0, gam0 = 1, gam1 = 0): u0 is left unchanged
+  if (pdriver->SkipIdentityStage(stage)) return TaskStatus::complete;
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;

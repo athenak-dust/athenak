@@ -591,7 +591,7 @@ void UnpackParticleRestart(MeshBlockPack *pmbp, const int nsec,
     MPI_Allreduce(MPI_IN_PLACE, &tot, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
   }
 #endif
-  pm->nprtcl_total = static_cast<int>(tot);
+  pm->nprtcl_total = tot;
   // every rank read all sections: each particle of the file is kept by exactly one rank
   if (!exact && tot != nread) {
     Broken("the particles of the file do not fall into the blocks of this run (" +

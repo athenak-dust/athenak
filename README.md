@@ -33,7 +33,7 @@ All in `<dust>` unless noted; species are numbered `N = 1 .. nspecies` (the part
 
 | Output | Content |
 | --- | --- |
-| `file_type = pbin` | every active particle: position, velocity, mass, species, stopping time, cloud shape code (level and lobes), 64-bit tag; a per-block table (gid, rank, level, logical location, bounds); the full input in the header (species and stopping time become header constants with one species and fixed stopping times).  One file per output time, written with MPI-IO.  Reader: `vis/python/pbin.py` |
+| `file_type = pbin` | every active particle: position, velocity, mass, species, stopping time, cloud shape code (level and lobes), 64-bit tag; a per-block table (gid, rank, level, logical location, bounds); the full input in the header (species and stopping time become header constants with one species and fixed stopping times, and so does the mass when every particle has the same mass).  `precision = single` stores the particle positions, velocities, masses and stopping times as float32 (default double).  One file per output time, written with MPI-IO.  Reader: `vis/python/pbin.py` |
 | `file_type = phst` | one text line per output time: number of particles, mass, momentum, kinetic energy, `z_rms`, maximum dust density with its position and level, PC2 stiffness; with G/R also the number of merge groups and removed particles.  Reader: `vis/python/phst.py` (or `athena_read.hst`) |
 | `file_type = bin`, `variable = hydro_w` (or `hydro_u`) | adds `dust_total_rho` and `dust_total_mom1..3` automatically when dust is present (`dust_total = false` switches this off) |
 | `variable = dust_total` | `dust_total_rho`, `dust_total_mom1..3` alone |

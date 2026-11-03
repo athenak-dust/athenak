@@ -65,7 +65,10 @@ namespace {
 //! could pass that time.  Queries test the actual face blocks for overlap (extents in cells of
 //! the finest level, as doubles), so time and memory scale with the face blocks, not with the
 //! finest level.  Without a shearing-box object (no offset known) or a window, all x2 are taken.
-//! Levels l are relative to the root level.
+//! Static meshes (SMR) follow the same rule for all x2 (the mesh stays while the faces slide):
+//! MeshRefinement::ShearFaceStaticTree refines the face blocks of a new tree until it holds,
+//! ShearFaceStaticCheck stops a restart whose mesh breaks it.  Levels l are relative to the
+//! root level.
 
 struct ShearFaceGeom {
   bool on = false, three_d = false, zper = false, allx2 = false;
@@ -74,7 +77,7 @@ struct ShearFaceGeom {
   double ys = 0.0, dr = 0.0;     // shear offset and its drift over the window (finest cells)
   // twin: the time from now until which the rule must hold (not positive: all x2)
   ShearFaceGeom(Mesh *pm, double twin) {
-    on = pm->adaptive && pm->multi_d &&
+    on = pm->multilevel && pm->multi_d &&
          pm->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
     if (!on) return;
     three_d = pm->three_d;
@@ -90,6 +93,7 @@ struct ShearFaceGeom {
     nyf = std::ldexp(static_cast<double>(pm->nmb_rootx2)*nx2, lmax);
     nzf = three_d ? std::ldexp(static_cast<double>(pm->nmb_rootx3)*nx3, lmax) : 1.0;
     zper = three_d && pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic;
+    if (!pm->adaptive) {allx2 = true; return;}   // static mesh: every offset
     const ShearingBox *sb = nullptr;
     MeshBlockPack *pp = pm->pmb_pack;
     if (pp != nullptr && pp->phydro != nullptr && pp->phydro->psbox_u != nullptr) {
@@ -178,6 +182,60 @@ struct ShearFaceGeom {
     return o;
   }
 };
+
+// refine every face leaf of the tree whose opposite face is finer than g allows, with the
+// tree's 2:1 balance, until none is left (levels only grow and stay below the maximum, so this
+// ends); the number of leaves refined
+int ShearFaceRefineTree(MeshBlockTree *tree, const ShearFaceGeom &g, int &nnew) {
+  int nraise = 0;
+  for (int pass=0; pass<4*(g.lmax + 2); ++pass) {
+    std::vector<LogicalLocation> leaves;
+    tree->GetLeafLocations(leaves);
+    const int n = static_cast<int>(leaves.size());
+    std::vector<int> fl[2];
+    g.Faces(leaves.data(), n, fl);
+    std::vector<int> lev(n);
+    for (int j=0; j<n; ++j) lev[j] = g.level(leaves[j]);
+    std::vector<LogicalLocation> up;
+    for (int j=0; j<n; ++j) {
+      const auto &ll = leaves[j];
+      if (lev[j] >= g.lmax) continue;
+      for (int f=0; f<2; ++f) {
+        if (g.onface(ll, f) &&
+            g.omax(lev[j]) < g.Opposite(lev, leaves.data(), fl[1 - f], ll, f, lev[j])) {
+          up.push_back(ll);
+          break;
+        }
+      }
+    }
+    if (up.empty()) return nraise;
+    for (const auto &ll : up) {
+      MeshBlockTree *bt = tree->FindMeshBlock(ll);
+      if (bt != nullptr && bt->GetLevel() == ll.level) {
+        bt->Refine(nnew);
+        ++nraise;
+      }
+    }
+  }
+  return nraise;
+}
+
+// the first face block of bl (nb blocks) that reads an opposite block finer than g allows:
+// its index j, its face f and the level o it reads; false if the rule holds
+bool ShearFaceViolation(const ShearFaceGeom &g, const LogicalLocation *bl, int nb, int &jbad,
+                        int &fbad, int &obad) {
+  std::vector<int> fl[2];
+  g.Faces(bl, nb, fl);
+  std::vector<int> lev(nb);
+  for (int j=0; j<nb; ++j) lev[j] = g.level(bl[j]);
+  for (int f=0; f<2; ++f) {
+    for (const int j : fl[f]) {
+      const int o = g.Opposite(lev, bl, fl[1 - f], bl[j], f, lev[j]);
+      if (g.omax(lev[j]) < o) {jbad = j; fbad = f; obad = o; return true;}
+    }
+  }
+  return false;
+}
 }  // namespace
 
 //----------------------------------------------------------------------------------------
@@ -692,37 +750,74 @@ bool MeshRefinement::ShearFaceCheckDue() const {
 int MeshRefinement::ShearFaceTreeRefine(int &nnew) {
   const ShearFaceGeom g(pmy_mesh, shear_twin);
   if (!g.on) return 0;
-  int nraise = 0;
-  for (int pass=0; pass<4*(g.lmax + 2); ++pass) {
-    std::vector<LogicalLocation> leaves;
-    pmy_mesh->ptree->GetLeafLocations(leaves);
-    const int n = static_cast<int>(leaves.size());
-    std::vector<int> fl[2];
-    g.Faces(leaves.data(), n, fl);
-    std::vector<int> lev(n);
-    for (int j=0; j<n; ++j) lev[j] = g.level(leaves[j]);
-    std::vector<LogicalLocation> up;
-    for (int j=0; j<n; ++j) {
-      const auto &ll = leaves[j];
-      if (lev[j] >= g.lmax) continue;
-      for (int f=0; f<2; ++f) {
-        if (g.onface(ll, f) &&
-            g.omax(lev[j]) < g.Opposite(lev, leaves.data(), fl[1 - f], ll, f, lev[j])) {
-          up.push_back(ll);
-          break;
-        }
-      }
-    }
-    if (up.empty()) return nraise;
-    for (const auto &ll : up) {
-      MeshBlockTree *bt = pmy_mesh->ptree->FindMeshBlock(ll);
-      if (bt != nullptr && bt->GetLevel() == ll.level) {
-        bt->Refine(nnew);
-        ++nraise;
-      }
+  // (CheckShearFaceLevels stops the run if the rule still fails)
+  return ShearFaceRefineTree(pmy_mesh->ptree.get(), g, nnew);
+}
+
+//----------------------------------------------------------------------------------------
+//! n void MeshRefinement::ShearFaceStaticTree(Mesh *pm)
+//! rief A static mesh (SMR) with shear-periodic x1 faces: after the refined regions and their
+//! 2:1 balance (BuildTreeFromScratch), refine face blocks until no face block reads an opposite
+//! block finer than ShearFaceGeom allows at any shear offset (all x2), with the 2:1 balance as
+//! blocks are added, as AMR does at every regrid.  Every rank builds the same tree.  One line
+//! on rank 0; stops the run if the rule still fails.
+
+void MeshRefinement::ShearFaceStaticTree(Mesh *pm) {
+  const ShearFaceGeom g(pm, -1.0);
+  if (!g.on || pm->adaptive) return;
+  int nb0 = 0, nb1 = 0, nnew = 0;
+  pm->ptree->CountMeshBlocks(nb0);
+  const int nraise = ShearFaceRefineTree(pm->ptree.get(), g, nnew);
+  pm->ptree->CountMeshBlocks(nb1);
+  std::vector<LogicalLocation> leaves;
+  pm->ptree->GetLeafLocations(leaves);
+  int j = 0, f = 0, o = 0;
+  if (ShearFaceViolation(g, leaves.data(), static_cast<int>(leaves.size()), j, f, o)) {
+    const auto &ll = leaves[j];
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "static mesh with shear-periodic x1 faces: the level rule cannot be met; block "
+              << "(level " << g.level(ll) << ", lx1 " << ll.lx1 << ", lx2 " << ll.lx2 << ", lx3 "
+              << ll.lx3 << ") on x1 face " << f << " faces level " << o << " on the opposite face "
+              << "(at most " << g.omax(g.level(ll)) << " allowed, dmax " << g.dmax << ")"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (global_variable::my_rank == 0) {
+    std::cout << "# static mesh, shear-periodic x1 faces (dmax " << g.dmax << "): ";
+    if (nraise == 0) {
+      std::cout << "the level rule holds, no MeshBlocks added" << std::endl;
+    } else {
+      std::cout << "the level rule refined " << nraise << " face blocks, MeshBlocks " << nb0
+                << " -> " << nb1 << " (+" << nb1 - nb0 << ")" << std::endl;
     }
   }
-  return nraise;   // (CheckShearFaceLevels stops the run if the rule still fails)
+}
+
+//----------------------------------------------------------------------------------------
+//! n void MeshRefinement::ShearFaceStaticCheck(Mesh *pm)
+//! rief The rule of ShearFaceStaticTree on the blocks of a restart of a static mesh
+//! (BuildTreeFromRestart): blocks cannot be added there (no data), so a file whose mesh breaks
+//! the rule stops the run.
+
+void MeshRefinement::ShearFaceStaticCheck(Mesh *pm) {
+  const ShearFaceGeom g(pm, -1.0);
+  if (!g.on || pm->adaptive) return;
+  int j = 0, f = 0, o = 0;
+  if (ShearFaceViolation(g, pm->lloc_eachmb, pm->nmb_total, j, f, o)) {
+    const auto &ll = pm->lloc_eachmb[j];
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "restart of a static mesh with shear-periodic x1 faces: block (level "
+              << g.level(ll) << ", lx1 " << ll.lx1 << ", lx2 " << ll.lx2 << ", lx3 " << ll.lx3
+              << ") on x1 face " << f << " faces level " << o << " on the opposite face (at most "
+              << g.omax(g.level(ll)) << " allowed, dmax " << g.dmax << "); the file's mesh breaks "
+              << "the level rule across the shear-periodic faces (written before the rule held "
+              << "for static meshes): start the run again from its input" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (global_variable::my_rank == 0) {
+    std::cout << "# static mesh, shear-periodic x1 faces (dmax " << g.dmax << "): the level rule "
+              << "holds for the restart file" << std::endl;
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -760,27 +855,18 @@ bool MeshRefinement::ShearFaceDerefineOK(const LogicalLocation &parent) {
 
 void MeshRefinement::CheckShearFaceLevels(const double twin) {
   const ShearFaceGeom g(pmy_mesh, (twin < 0.0) ? shear_twin : twin);
-  if (!g.on) return;
+  if (!g.on || !pmy_mesh->adaptive) return;   // (static meshes: ShearFaceStaticTree / Check)
   const LogicalLocation *bl = pmy_mesh->lloc_eachmb;
-  const int nb = pmy_mesh->nmb_total;
-  std::vector<int> fl[2];
-  g.Faces(bl, nb, fl);
-  std::vector<int> lev(nb);
-  for (int j=0; j<nb; ++j) lev[j] = g.level(bl[j]);
-  for (int f=0; f<2; ++f) {
-    for (const int j : fl[f]) {
-      const auto &ll = bl[j];
-      const int l = lev[j];
-      const int o = g.Opposite(lev, bl, fl[1 - f], ll, f, l);
-      if (g.omax(l) < o) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "AMR with a shearing box: block (level " << l << ", lx1 " << ll.lx1
-                  << ", lx2 " << ll.lx2 << ", lx3 " << ll.lx3 << ") on x1 face " << f
-                  << " faces level " << o << " on the opposite face (at most " << g.omax(l)
-                  << " allowed)" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-    }
+  int j = 0, f = 0, o = 0;
+  if (ShearFaceViolation(g, bl, pmy_mesh->nmb_total, j, f, o)) {
+    const auto &ll = bl[j];
+    const int l = g.level(ll);
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "AMR with a shearing box: block (level " << l << ", lx1 " << ll.lx1
+              << ", lx2 " << ll.lx2 << ", lx3 " << ll.lx3 << ") on x1 face " << f
+              << " faces level " << o << " on the opposite face (at most " << g.omax(l)
+              << " allowed)" << std::endl;
+    std::exit(EXIT_FAILURE);
   }
 }
 

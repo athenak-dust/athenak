@@ -33,7 +33,9 @@
 //!
 //! Workspaces live in global memory, one per team slot, in two buckets of patch sizes (at
 //! most 64 clouds, more than 64) sized from the largest patch of the bucket; the number of
-//! slots is limited by <dust>/cloud_resample_device_mem_mb.  The per-patch sizes (clouds,
+//! slots is limited by <dust>/cloud_resample_device_mem_mb and by half of the free device memory
+//! at the time of the allocation (CUDA/HIP; the result does not depend on the number of slots,
+//! only the parallelism does).  The per-patch sizes (clouds,
 //! CSR entries, distinct leaves) are computed on the device; only these few integers per
 //! patch go to the host to size the buckets.
 
@@ -45,6 +47,11 @@
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Sort.hpp>
+#if defined(KOKKOS_ENABLE_CUDA)
+#include <cuda_runtime.h>
+#elif defined(KOKKOS_ENABLE_HIP)
+#include <hip/hip_runtime.h>
+#endif
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -53,6 +60,29 @@
 namespace dust {
 namespace resample {
 namespace {
+
+//! Workspace budget in bytes: cloud_resample_device_mem_mb (at least 64 MB), but at most half of
+//! the device memory free right now, so that a workspace never asks for memory that the clouds
+//! and the pair tables already hold (L4: 31.7 GiB asked with 530M clouds resident, 2026-10-30).
+//! Host backends: the configured budget.
+double WorkspaceBudget(const int mem_mb, const char *what) {
+  const double conf = static_cast<double>(std::max(mem_mb, 64))*1048576.0;
+  double avail = -1.0;
+#if defined(KOKKOS_ENABLE_CUDA)
+  std::size_t f = 0, t = 0;
+  if (cudaMemGetInfo(&f, &t) == cudaSuccess) avail = static_cast<double>(f);
+#elif defined(KOKKOS_ENABLE_HIP)
+  std::size_t f = 0, t = 0;
+  if (hipMemGetInfo(&f, &t) == hipSuccess) avail = static_cast<double>(f);
+#endif
+  if (avail < 0.0 || conf <= 0.5*avail) return conf;
+  const double b = std::max(0.5*avail, 64.0*1048576.0);
+  std::cout << "# device resampling (rank " << global_variable::my_rank << "): " << what
+            << " workspace limited to " << static_cast<long long>(b/1048576.0) << " MB by the free"
+            << " device memory (" << static_cast<long long>(avail/1048576.0) << " MB free, "
+            << "cloud_resample_device_mem_mb = " << mem_mb << ")" << std::endl;
+  return b;
+}
 
 using Policy = Kokkos::TeamPolicy<DevExeSpace>;
 using Member = Policy::member_type;
@@ -82,7 +112,7 @@ WsSize Sizes(const int nmax, const int emax, const int lmax, const int extra = 0
   z.lmax = std::max(lmax, 1);
   z.hmax = 4;
   while (z.hmax < 4*z.lmax) z.hmax *= 2;
-  z.rmax = 7*lmax + 8 + extra;   // (3-D: extra = 1, the x3 centre-of-mass row)
+  z.rmax = 7*lmax + 8 + extra;   // (3-D: extra = 1, the x3 centre-of-mass row, + cross moments)
   const int rb = std::min(z.rmax, z.nmax);
   z.cmax = std::max(2*rb, rb + 32);
   const std::size_t r = z.rmax, n = z.nmax, c = z.cmax;
@@ -92,6 +122,13 @@ WsSize Sizes(const int nmax, const int emax, const int lmax, const int extra = 0
   return z;
 }
 
+
+// the frame of the cross-moment rows: rot = rotating frame (shearing box, omega0 != 0) with
+// shear parameter qsh: the inertial J needs the three spatial combinations of PatchTeam too
+struct XVParam {
+  double qsh = 0.0;
+  int rot = 0;
+};
 
 struct Ws {
   double *A, *B, *r0, *w, *bact, *qr, *z, *xs, *vn1, *vn2, *d, *wa, *ua, *tt, *zmx, *sc;
@@ -559,11 +596,13 @@ void ReduceCapTeam(const Member &tm, const double *b, const int m, const int n, 
 
 // one patch (host ResamplePatch): rows, bounded end-point reduction as a stream, row check.
 // The row matrix A (nrow x n), the scaled B (nb x n) and the active block (nb x na) are kept
-// by rows.
+// by rows.  kXV: the cross-moment rows of <dust>/cloud_resample_xv_rows (dust_resample.hpp;
+// 3-D only), a template parameter so that kXV = 0 compiles to the kernels without them.
+template <int kXV>
 KOKKOS_INLINE_FUNCTION
 void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, const Ws &ws,
                const int hmask, DvceArray1D<double> &mnew, DvceArray2D<int> &outi,
-               DvceArray1D<double> &outr) {
+               DvceArray1D<double> &outr, const XVParam xp = XVParam()) {
   const int a0 = pb.pptr(q), a1 = pb.pptr(q + 1), n = a1 - a0;
   const auto &spd = pb.spd;
   const bool prof = DUST_R_DIAG && pb.stage.extent(0) > 0 && tm.team_rank() == 0;   // stage profile
@@ -583,7 +622,9 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
   const int nl = DistinctSorted(tm, ne, [&](const int e) {return pb.stgt(e0 + e);}, ws.tab,
                                 hmask, ws.ltmp, ws.leaves);
   const int ncom = pb.three ? 3 : 2;   // centre-of-mass rows (x3 in 3-D)
-  const int nrow = 7*nl + 6 + ncom;
+  // cross-moment rows, + 3 inertial rows in a rotating frame (kXV != 0 only)
+  const int nxv = (kXV != 0) ? XVRows(kXV) + (xp.rot ? 3 : 0) : 0;
+  const int nrow = 7*nl + 6 + ncom + nxv;
   const int fb0 = 4*nl + 6 + ncom;     // the first feedback row (2-D: 4 nl + 8)
   // mass-weighted mean velocity, host order
   Kokkos::single(Kokkos::PerTeam(tm), [&]() {
@@ -623,6 +664,44 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
     }
     col(g + 2) = c[0]*c[0]; col(g + 3) = c[0]*c[1]; col(g + 4) = c[0]*c[2]; col(g + 5) = c[1]*c[1];
     col(g + 6) = c[1]*c[2]; col(g + 7) = c[2]*c[2];
+    if constexpr (kXV != 0) {
+      // the cross moments sum w (x - c)_a (v - u)_b, after the feedback rows; x unwrapped about
+      // the patch centre as in the centre-of-mass rows, u the patch mean (c[] above)
+      double dz = 0.0;
+      if (pb.three) {
+        dz = spd(a, JZ) - pb.pgeo(q,4);
+        dz -= pb.lz*Kokkos::floor(dz/pb.lz + 0.5);
+      }
+      const int x0 = 7*nl + 6 + ncom;
+      if constexpr (kXV == 1) {
+        // angmom: (x - c) x (v - u) over one length (the largest half width of the patch)
+        const double h = pb.three ? Kokkos::fmax(Kokkos::fmax(rdx, rdy), pb.pgeo(q,5))
+                                  : Kokkos::fmax(rdx, rdy);
+        const double e[3] = {dx/h, dy/h, dz/h};
+        col(x0) = e[1]*c[2] - e[2]*c[1];
+        col(x0 + 1) = e[2]*c[0] - e[0]*c[2];
+        col(x0 + 2) = e[0]*c[1] - e[1]*c[0];
+      } else {
+        // full: every ((x - c)_a / h_a) (v - u)_b
+        const double e[3] = {dx/rdx, dy/rdy, pb.three ? dz/pb.pgeo(q,5) : 0.0};
+        for (int s=0; s<3; ++s) {
+          for (int t=0; t<3; ++t) col(x0 + 3*s + t) = e[s]*c[t];
+        }
+      }
+      if (xp.rot) {
+        // rotating frame (shearing box, stored v2 shear-relative): the inertial J about the
+        // patch centre is the J of the stored velocities + omega ((q - 1) S_xz, -S_yz,
+        // (1 - q) S_xx + S_yy), S = sum m x x^T; these three combinations as rows (over one
+        // length, the largest half width), so that both J are kept
+        const double h = pb.three ? Kokkos::fmax(Kokkos::fmax(rdx, rdy), pb.pgeo(q,5))
+                                  : Kokkos::fmax(rdx, rdy);
+        const double e[3] = {dx/h, dy/h, dz/h};
+        const int x1 = x0 + XVRows(kXV);
+        col(x1) = (xp.qsh - 1.0)*e[0]*e[2];
+        col(x1 + 1) = e[1]*e[2];
+        col(x1 + 2) = (1.0 - xp.qsh)*e[0]*e[0] + e[1]*e[1];
+      }
+    }
   });
   tm.team_barrier();
   // scaled rows without the empty ones
@@ -735,6 +814,50 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
   if (prof) Kokkos::atomic_add(&pb.stage(5), (unsigned long long)(Clk() - ccheck));
 }
 
+// the patch solves of one bucket (b: 0 at most 64 clouds, 1 middle, 2 large), body the team
+// functor of the mode of the cross-moment rows.
+// The large patches set the critical path of a resampling: the widest team the kernel
+// allows (at most 512 threads); the small ones keep the automatic size.
+// A 512-thread team of the wide kernel (at most 128 registers per thread) fills the
+// register file of an SM, so the middle bucket runs the same kernel with mid_team threads
+// (several patches per SM)
+template <class Body>
+void LaunchBucket(const Body &body, const int b, const int nslot, const int mid_team,
+                  const int wide_team) {
+  if (b == 0) {
+    Kokkos::parallel_for("rs_dev_patches_small", Policy(nslot, Kokkos::AUTO), body);
+    return;
+  }
+  const int tmax = PolicyWide(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
+  int ts = 1;   // the largest power of two the backend allows, at most 512 (or mid_team)
+  const int tcap = (b == 1) ? std::max(1, mid_team) : 512;
+  while (2*ts <= tmax && 2*ts <= tcap) ts *= 2;
+  static bool told[3] = {false, false, false};
+  if (!told[b] && global_variable::my_rank == 0 && !(b == 2 && wide_team > 512)) {
+    std::cout << "# device resampling: " << ((b == 1) ? "middle" : "large")
+              << " patches with teams of " << ts << " threads (largest allowed " << tmax << ")"
+              << std::endl;
+    told[b] = true;
+  }
+  if (b == 2 && wide_team > 512) {
+    // the large bucket with teams of up to 1024 threads (at most 64
+    // registers per thread)
+    const int tmax2 = PolicyWider(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
+    int ts2 = 1;
+    while (2*ts2 <= tmax2 && 2*ts2 <= wide_team) ts2 *= 2;
+    static bool told2 = false;
+    if (!told2 && global_variable::my_rank == 0) {
+      std::cout << "# device resampling: large patches with teams of " << ts2
+                << " threads (largest allowed " << tmax2 << ", 1024-thread bound)" << std::endl;
+      told2 = true;
+    }
+    Kokkos::parallel_for("rs_dev_patches_large1024", PolicyWider(nslot, ts2), body);
+  } else {
+    Kokkos::parallel_for((b == 1) ? "rs_dev_patches_mid" : "rs_dev_patches_large",
+                         PolicyWide(nslot, ts), body);
+  }
+}
+
 }  // namespace
 
 //----------------------------------------------------------------------------------------
@@ -745,7 +868,8 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
                         const int mid, const int mid_team, const int wide_team,
-                        double timing[5], long long *screened) {
+                        double timing[5], long long *screened, const int xv,
+                        const DvceArray1D<int> &xflag, const bool xv_rot, const double xv_q) {
   Kokkos::Timer t_all, t;
   const int npatch = pb.npatch;
   // per patch: clouds, CSR entries (device), distinct leaves (team sort of a copy)
@@ -810,7 +934,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     }
     int hbig = 4;
     while (hbig < 2*elarge) hbig *= 2;
-    const double lbudget = static_cast<double>(std::max(mem_mb, 64))*1048576.0;
+    const double lbudget = WorkspaceBudget(mem_mb, "leaf table");
     int nslot = static_cast<int>(std::min<double>(nlarge, std::max(1.0, lbudget/(4.0*hbig))));
     nslot = std::min(nslot, 4096);
     DvceArray1D<int> qbig(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_leaves_list"),
@@ -850,50 +974,60 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
   // with n <= that many are left as they are, like patches of one cloud: no bucket, no workspace,
   // no rows, no QR.  A screen of benefit, not a proof: dependent rows (coincident clouds) could
   // still have allowed a reduction there.
+  // The cross-moment rows (xv != 0) go only to the flagged patches, xflag(q) != 0 (the rule of
+  // dust_resample.hpp: several cloud levels, a cloud finer than a footprint leaf, an x3 fold or an
+  // ambiguous unwrapping; ResampleClouds3D); the other patches are screened, bucketed and solved
+  // with the xv = 0 kernels, bitwise as without the rows (there the rows are provably redundant,
+  // so leaving them out of the screen drops no constraint).  xv != 0 with an xflag shorter than
+  // npatch: every patch flagged.
+  const bool xvon = (xv != 0);
+  const bool xall = xvon && xflag.extent_int(0) < npatch;
+  const DvceArray1D<int> xf = xflag;
+  auto flagged = [=] KOKKOS_FUNCTION (const int q) -> int {
+    return !xvon ? 0 : (xall ? 1 : ((xf(q) != 0) ? 1 : 0));
+  };
   DvceArray1D<int> skp("rs_dev_skip", std::max(npatch, 1));
   long long nsk[2] = {0, 0};
   if (pb.rank_screen) {
     const int ncom = pb.three ? 3 : 2;
+    const int nxr = XVRows(xv) + ((xv != 0 && xv_rot) ? 3 : 0);   // the rows of a flagged patch
     Kokkos::parallel_reduce("rs_dev_screen", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
     KOKKOS_LAMBDA(const int q, long long &np_, long long &nc_) {
       const int n = sz(q, 0);
-      const int s = (n >= 2 && n <= 7*sz(q, 2) + 6 + ncom) ? 1 : 0;
+      const int s = (n >= 2 && n <= 7*sz(q, 2) + 6 + ncom + (flagged(q) ? nxr : 0)) ? 1 : 0;
       skp(q) = s;
       if (s) {++np_; nc_ += n;}
     }, nsk[0], nsk[1]);
   }
   if (screened != nullptr) {screened[0] = nsk[0]; screened[1] = nsk[1];}
   // buckets: 0 at most 64 clouds, 1 (when mid > 64) at most mid clouds, 2 more;
-  // patches of one or no cloud only get their counters.  Per bucket the number of patches and
-  // the largest clouds / entries / leaves.  mid <= 64: no bucket 1 (buckets 0 and 2 only)
-  constexpr int NB = 3;
-  int nqb[NB] = {0, 0, 0}, nmx[NB] = {0, 0, 0}, emx[NB] = {1, 1, 1}, lmx[NB] = {1, 1, 1};
+  // patches of one or no cloud only get their counters.  Every bucket in two lists, sb = 2 b + f
+  // (f: flagged for the cross-moment rows; always 0 with xv = 0).  Per list the number of
+  // patches and the largest clouds / entries / leaves.  mid <= 64: no bucket 1
+  constexpr int NB = 3, NSB = 2*NB;
+  int nqb[NSB], nmx[NSB], emx[NSB], lmx[NSB];
   {
-    int r[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    Kokkos::parallel_reduce("rs_dev_buckets", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-    KOKKOS_LAMBDA(const int q, int &c0, int &c1, int &c2, int &n0, int &n1, int &n2, int &e0,
-                  int &e1, int &e2, int &l0, int &l1, int &l2) {
+    DvceArray2D<int> bst("rs_dev_bstat", NSB, 4);
+    Kokkos::parallel_for("rs_dev_buckets", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+    KOKKOS_LAMBDA(const int q) {
       const int n = sz(q, 0);
       if (n < 2 || skp(q) != 0) return;
-      const int b = (n <= 64) ? 0 : ((n <= mid) ? 1 : 2);
-      int &c = (b == 0) ? c0 : ((b == 1) ? c1 : c2);
-      int &nn = (b == 0) ? n0 : ((b == 1) ? n1 : n2);
-      int &ee = (b == 0) ? e0 : ((b == 1) ? e1 : e2);
-      int &ll = (b == 0) ? l0 : ((b == 1) ? l1 : l2);
-      ++c; nn = Kokkos::max(nn, n); ee = Kokkos::max(ee, sz(q, 1)); ll = Kokkos::max(ll, sz(q, 2));
-    }, Kokkos::Sum<int>(r[0]), Kokkos::Sum<int>(r[1]), Kokkos::Sum<int>(r[2]),
-       Kokkos::Max<int>(r[3]), Kokkos::Max<int>(r[4]), Kokkos::Max<int>(r[5]),
-       Kokkos::Max<int>(r[6]), Kokkos::Max<int>(r[7]), Kokkos::Max<int>(r[8]),
-       Kokkos::Max<int>(r[9]), Kokkos::Max<int>(r[10]), Kokkos::Max<int>(r[11]));
-    for (int b=0; b<NB; ++b) {
-      nqb[b] = r[b];
-      nmx[b] = std::max(r[3 + b], 0); emx[b] = std::max(r[6 + b], 1); lmx[b] = std::max(r[9 + b], 1);
+      const int sb = 2*((n <= 64) ? 0 : ((n <= mid) ? 1 : 2)) + flagged(q);
+      Kokkos::atomic_increment(&bst(sb, 0));
+      Kokkos::atomic_max(&bst(sb, 1), n);
+      Kokkos::atomic_max(&bst(sb, 2), sz(q, 1));
+      Kokkos::atomic_max(&bst(sb, 3), sz(q, 2));
+    });
+    auto bh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), bst);
+    for (int sb=0; sb<NSB; ++sb) {
+      nqb[sb] = bh(sb, 0);
+      nmx[sb] = std::max(bh(sb, 1), 0); emx[sb] = std::max(bh(sb, 2), 1); lmx[sb] = std::max(bh(sb, 3), 1);
     }
   }
-  // the patch lists: per bucket the largest patches first and by patch number among equal sizes
+  // the patch lists: per list the largest patches first and by patch number among equal sizes
   // (balance; the order does not change any result).  One sort of all patches by the key
-  // ((b 2^24 + 2^24 - 1 - n) npatch + q; patches of fewer than two clouds last): bucket b is the
-  // range off(b) .. off(b) + nqb(b) - 1
+  // ((sb 2^24 + 2^24 - 1 - n) npatch + q; patches of fewer than two clouds last): list sb is the
+  // range off(sb) .. off(sb) + nqb(sb) - 1
   DvceArray1D<std::int64_t> qkey(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_qkey"),
                                  std::max(npatch, 1));
   {
@@ -901,9 +1035,9 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     Kokkos::parallel_for("rs_dev_lists", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
     KOKKOS_LAMBDA(const int q) {
       const int n = sz(q, 0);
-      const int b = (n <= 64) ? 0 : ((n <= mid) ? 1 : 2);
+      const int sb = 2*((n <= 64) ? 0 : ((n <= mid) ? 1 : 2)) + flagged(q);
       qkey(q) = (n < 2 || skp(q) != 0) ? std::numeric_limits<std::int64_t>::max()
-                        : (b*top + top - 1 - n)*np + q;
+                        : (sb*top + top - 1 - n)*np + q;
     });
     if (npatch > 1) Kokkos::sort(qkey);
   }
@@ -919,86 +1053,87 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
       for (int a=pptr(q); a<pptr(q + 1); ++a) mnew(a) = spd(a, JM);
     });
   }
-  const double budget = static_cast<double>(std::max(mem_mb, 64))*1048576.0;
   for (int b=0; b<NB; ++b) {
     Kokkos::fence();
     t.reset();
-    const int nq = nqb[b];
-    if (nq > 0) {
-      const WsSize ws = Sizes(nmx[b], emx[b], lmx[b], pb.three ? 1 : 0);
-      const double per = 8.0*ws.nd + 4.0*ws.ni;
-      int nslot = static_cast<int>(std::min<double>(nq, std::max(1.0, budget/per)));
-      nslot = std::min(nslot, 4096);
-      if (b == 2 && (nmx[b] >= 16384 || per > budget)) {
-        std::cout << "# device resampling (rank " << global_variable::my_rank << "): " << nq
-                  << " large patches; per patch at most " << nmx[b] << " clouds, at most "
-                  << emx[b] << " entries, at most " << lmx[b] << " leaves (separate maxima); " << per/1048576.0 << " MB per slot, "
-                  << nslot << " slots" << std::endl;
-      }
-      DvceArray1D<int> qlist(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_list"), nq);
-      {
-        const int off = (b == 0) ? 0 : ((b == 1) ? nqb[0] : nqb[0] + nqb[1]);
-        const std::int64_t np = npatch;
-        Kokkos::parallel_for("rs_dev_qlist", Kokkos::RangePolicy<>(DevExeSpace(), 0, nq),
-        KOKKOS_LAMBDA(const int i) {qlist(i) = static_cast<int>(qkey(off + i) % np);});
-      }
-      DvceArray1D<double> dws(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_ws_d"),
-                              static_cast<std::size_t>(nslot)*ws.nd);
-      DvceArray1D<int> iws(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_ws_i"),
-                           static_cast<std::size_t>(nslot)*ws.ni);
-      DvceArray1D<int> counter("rs_dev_counter", 1);
-      const DevicePatchProblem p = pb;
-      auto body = KOKKOS_LAMBDA(const Member &tm) {
-        const Ws w = Carve(dws.data() + static_cast<std::size_t>(tm.league_rank())*ws.nd,
-                           iws.data() + static_cast<std::size_t>(tm.league_rank())*ws.ni, ws);
-        DvceArray1D<double> mn = mnew;
-        DvceArray2D<int> oi = outi;
-        DvceArray1D<double> orr = outr;
-        while (true) {
-          int i = 0;
-          Kokkos::single(Kokkos::PerTeam(tm), [&](int &v) {
-            v = Kokkos::atomic_fetch_add(&counter(0), 1);
-          }, i);
-          if (i >= nq) break;
-          PatchTeam(tm, p, qlist(i), w, ws.hmax - 1, mn, oi, orr);
+    for (int f=0; f<2; ++f) {
+      const int sb = 2*b + f, nq = nqb[sb];
+      const int kx = f ? xv : 0;   // the rows of this list: none (unflagged) or the mode
+      if (nq > 0) {
+        const int nxr = (kx != 0) ? XVRows(kx) + (xv_rot ? 3 : 0) : 0;
+        const WsSize ws = Sizes(nmx[sb], emx[sb], lmx[sb], (pb.three ? 1 : 0) + nxr);
+        const double per = 8.0*ws.nd + 4.0*ws.ni;
+        const double budget = WorkspaceBudget(mem_mb, "solver");
+        int nslot = static_cast<int>(std::min<double>(nq, std::max(1.0, budget/per)));
+        nslot = std::min(nslot, 4096);
+        if (b == 2 && (nmx[sb] >= 16384 || per > budget)) {
+          std::cout << "# device resampling (rank " << global_variable::my_rank << "): " << nq
+                    << " large patches; per patch at most " << nmx[sb] << " clouds, at most "
+                    << emx[sb] << " entries, at most " << lmx[sb] << " leaves (separate maxima); " << per/1048576.0 << " MB per slot, "
+                    << nslot << " slots" << std::endl;
         }
-      };
-      // the large patches set the critical path of a resampling: the widest team the kernel
-      // allows (at most 512 threads); the small ones keep the automatic size.
-      // A 512-thread team of the wide kernel (at most 128 registers per thread) fills the
-      // register file of an SM, so the middle bucket runs the same kernel with mid_team threads
-      // (several patches per SM)
-      if (b == 0) {
-        Kokkos::parallel_for("rs_dev_patches_small", Policy(nslot, Kokkos::AUTO), body);
-      } else {
-        const int tmax = PolicyWide(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
-        int ts = 1;   // the largest power of two the backend allows, at most 512 (or mid_team)
-        const int tcap = (b == 1) ? std::max(1, mid_team) : 512;
-        while (2*ts <= tmax && 2*ts <= tcap) ts *= 2;
-        static bool told[NB] = {false, false, false};
-        if (!told[b] && global_variable::my_rank == 0 && !(b == 2 && wide_team > 512)) {
-          std::cout << "# device resampling: " << ((b == 1) ? "middle" : "large")
-                    << " patches with teams of " << ts << " threads (largest allowed " << tmax << ")"
-                    << std::endl;
-          told[b] = true;
+        DvceArray1D<int> qlist(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_list"), nq);
+        {
+          int off = 0;
+          for (int c=0; c<sb; ++c) off += nqb[c];
+          const std::int64_t np = npatch;
+          Kokkos::parallel_for("rs_dev_qlist", Kokkos::RangePolicy<>(DevExeSpace(), 0, nq),
+          KOKKOS_LAMBDA(const int i) {qlist(i) = static_cast<int>(qkey(off + i) % np);});
         }
-        if (b == 2 && wide_team > 512) {
-          // the large bucket with teams of up to 1024 threads (at most 64
-          // registers per thread)
-          const int tmax2 = PolicyWider(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
-          int ts2 = 1;
-          while (2*ts2 <= tmax2 && 2*ts2 <= wide_team) ts2 *= 2;
-          static bool told2 = false;
-          if (!told2 && global_variable::my_rank == 0) {
-            std::cout << "# device resampling: large patches with teams of " << ts2
-                      << " threads (largest allowed " << tmax2 << ", 1024-thread bound)" << std::endl;
-            told2 = true;
-          }
-          Kokkos::parallel_for("rs_dev_patches_large1024", PolicyWider(nslot, ts2), body);
+        DvceArray1D<double> dws(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_ws_d"),
+                                static_cast<std::size_t>(nslot)*ws.nd);
+        DvceArray1D<int> iws(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_dev_ws_i"),
+                             static_cast<std::size_t>(nslot)*ws.ni);
+        DvceArray1D<int> counter("rs_dev_counter", 1);
+        const DevicePatchProblem p = pb;
+        // the team functor, one per mode of the cross-moment rows (each mode its own kernels;
+        // xv = 0 the kernels without them, as before)
+#define DUST_R_PATCH_BODY(KXV) KOKKOS_LAMBDA(const Member &tm) {                              \
+          const Ws w = Carve(dws.data() + static_cast<std::size_t>(tm.league_rank())*ws.nd,       \
+                             iws.data() + static_cast<std::size_t>(tm.league_rank())*ws.ni, ws);  \
+          DvceArray1D<double> mn = mnew;                                                          \
+          DvceArray2D<int> oi = outi;                                                             \
+          DvceArray1D<double> orr = outr;                                                         \
+          while (true) {                                                                          \
+            int i = 0;                                                                            \
+            Kokkos::single(Kokkos::PerTeam(tm), [&](int &v) {                                     \
+              v = Kokkos::atomic_fetch_add(&counter(0), 1);                                       \
+            }, i);                                                                                \
+            if (i >= nq) break;                                                                   \
+            PatchTeam<KXV>(tm, p, qlist(i), w, ws.hmax - 1, mn, oi, orr);                         \
+          }                                                                                       \
+        }
+        // the mode bodies also carry the frame (xp); the none body above is the old one
+#define DUST_R_PATCH_BODYX(KXV) KOKKOS_LAMBDA(const Member &tm) {                             \
+          const Ws w = Carve(dws.data() + static_cast<std::size_t>(tm.league_rank())*ws.nd,       \
+                             iws.data() + static_cast<std::size_t>(tm.league_rank())*ws.ni, ws);  \
+          DvceArray1D<double> mn = mnew;                                                          \
+          DvceArray2D<int> oi = outi;                                                             \
+          DvceArray1D<double> orr = outr;                                                         \
+          while (true) {                                                                          \
+            int i = 0;                                                                            \
+            Kokkos::single(Kokkos::PerTeam(tm), [&](int &v) {                                     \
+              v = Kokkos::atomic_fetch_add(&counter(0), 1);                                       \
+            }, i);                                                                                \
+            if (i >= nq) break;                                                                   \
+            PatchTeam<KXV>(tm, p, qlist(i), w, ws.hmax - 1, mn, oi, orr, xp);                     \
+          }                                                                                       \
+        }
+        XVParam xp;
+        xp.qsh = xv_q;
+        xp.rot = xv_rot ? 1 : 0;
+        if (kx == 1) {
+          auto body = DUST_R_PATCH_BODYX(1);
+          LaunchBucket(body, b, nslot, mid_team, wide_team);
+        } else if (kx == 2) {
+          auto body = DUST_R_PATCH_BODYX(2);
+          LaunchBucket(body, b, nslot, mid_team, wide_team);
         } else {
-          Kokkos::parallel_for((b == 1) ? "rs_dev_patches_mid" : "rs_dev_patches_large",
-                               PolicyWide(nslot, ts), body);
+          auto body = DUST_R_PATCH_BODY(0);
+          LaunchBucket(body, b, nslot, mid_team, wide_team);
         }
+#undef DUST_R_PATCH_BODY
+#undef DUST_R_PATCH_BODYX
       }
     }
     Kokkos::fence();

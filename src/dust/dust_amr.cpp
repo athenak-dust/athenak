@@ -67,6 +67,7 @@
 #include "mesh/mesh_refinement.hpp"
 #include "driver/driver.hpp"
 #include "particles/particles.hpp"
+#include "particles/particle_counts.hpp"
 #include "hydro/hydro.hpp"
 #include "shearing_box/shearing_box.hpp"
 #include "dust.hpp"
@@ -294,8 +295,10 @@ void SetupDensityTrigger(ParameterInput *pin) {
     std::cout << "# dust density trigger: refine at "
               << (trig_.code_units ? "rho_d (code units)" : "rho_d/mean") << " >= " << trig_.rho_refine
               << ", derefine below " << trig_.rho_derefine << ", buffer " << trig_.buffer
-              << " cells of the block's level, each block on its own leaf cells"
-              << "; thresholds x" << trig_.level_factor << " per level" << std::endl;
+              << " cells of the block's level, each block on its own leaf cells";
+    // the growth factor applies only without a per-level list (amr_rho_refine_levels, next line)
+    if (trig_.refine_levels.empty()) std::cout << "; thresholds x" << trig_.level_factor << " per level";
+    std::cout << std::endl;
     if (!trig_.refine_levels.empty()) {
       std::cout << "# dust density trigger: per-level thresholds (amr_rho_refine_levels)";
       for (std::size_t i=0; i<trig_.refine_levels.size(); ++i)
@@ -321,7 +324,12 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
   // halo is checked first; the deposit adds the halo parts to their owners, and with a buffer the
   // owners' sums go back to the halo slots
   pd->CheckHaloReach("density trigger");
-  pd->DepositCloudDensity3D(pd->trig_f3, -1, true);   // (the trigger reads the density alone)
+  if (pd->cloud_split_max_level < 0) {
+    pd->DepositCloudDensity3D(pd->trig_f3, -1, true);   // (the trigger reads the density alone)
+  } else {
+    // cloud_split_max_level = L: the clouds above L with the kernel of their mass level L
+    pd->DepositTriggerDensityCapped3D(pd->trig_f3);
+  }
   if (trig_.buffer > 0) pd->HaloForward5D(pd->trig_f3, 0, 1);
   auto f = pd->trig_f3;
   particles::Particles *ppar = pmbp->ppart;
@@ -338,8 +346,9 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
   }, mtot, nlev[0], nlev[1], nlev[2]);
 #if MPI_PARALLEL_ENABLED
   if (global_variable::nranks > 1) {
+    // (nlev, the clouds of this rank by level, is not summed: nothing reads it since the
+    // trigger log was removed, and an int sum over the ranks could overflow)
     MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(MPI_IN_PLACE, nlev, 3, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
   }
 #endif
   const auto &ms = pm->mesh_size;
@@ -651,6 +660,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       f(0,k) = rho(m,0,ks,r/ncells1,r % ncells1);
     });
   } else {
+  if (pdust->cloud_split_max_level < 0) {
   par_for("amr_rho_deposit", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
     const Real mass = pr(IPM,p);
     ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
@@ -660,6 +670,21 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       DepositAdd(&f(0,target), mass*w/(lt.box(tm,2)*lt.box(tm,3)));
     });
   });
+  } else {
+  // <dust>/cloud_split_max_level = L: a plain cloud above L is deposited with the kernel of its
+  // mass level L (TriggerCloudCode), so the refinement does not follow the sampling noise of the
+  // switched kernels (the dynamics keep the switched kernel)
+  const int lcap = pdust->cloud_split_max_level;
+  par_for("amr_rho_deposit_cap", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
+    const Real mass = pr(IPM,p);
+    ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), TriggerCloudCode(pi(PLEV,p), lcap),
+                           lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
+      if (w == 0.0) return;
+      const int tm = target/(ncells1*ncells2);
+      DepositAdd(&f(0,target), mass*w/(lt.box(tm,2)*lt.box(tm,3)));
+    });
+  });
+  }
   pdust->HaloReverseAddFlat(f, 1);
   // map = block: the buffer cells of a block may lie on a halo block; the owners' sums there
   // (the strips hold every cell within the reach of the local blocks, at least 3 cells of the
@@ -676,8 +701,9 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   }, mtot, nlev[0], nlev[1], nlev[2]);
 #if MPI_PARALLEL_ENABLED
   if (global_variable::nranks > 1) {
+    // (nlev, the clouds of this rank by level, is not summed: nothing reads it since the
+    // trigger log was removed, and an int sum over the ranks could overflow)
     MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(MPI_IN_PLACE, nlev, 3, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
   }
 #endif
   lap(DustGasDrag::kProfTrigDeposit);
@@ -1072,7 +1098,7 @@ int DustGasDrag::RouteToOwnerBlocks(const char *when) {
   auto srank = leaf_slot_rank_d;
   int nchanged = 0, nbad = 0;
 #if MPI_PARALLEL_ENABLED
-  if (pb->sendlist.extent_int(0) < std::max(npart, 1)) Kokkos::realloc(pb->sendlist, std::max(npart, 1));
+  pb->ReserveSendlist(npart);
   Kokkos::deep_copy(pb->send_count.d_view, 0);
   auto psendl = pb->sendlist.d_view;
   int *pcounter = pb->send_count.d_view.data();
@@ -1114,9 +1140,8 @@ int DustGasDrag::RouteToOwnerBlocks(const char *when) {
   pb->ClearPrtclSend();
   pb->ClearPrtclRecv();
   Mesh *pm = pmy_pack->pmesh;
-  long long tot = 0;
-  for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
-  pm->nprtcl_total = static_cast<int>(tot);
+  const long long tot = particles::TotalCount(pm->nprtcl_eachrank, global_variable::nranks);
+  pm->nprtcl_total = tot;
   long long sums[2] = {nchanged, nsent};
   MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
   if (global_variable::my_rank == 0 && when != nullptr) {   // nullptr: quiet (SplitToLeaves)
@@ -1157,9 +1182,7 @@ int DustGasDrag::RouteOO3D() {
   }
   int nbad = 0;
 #if MPI_PARALLEL_ENABLED
-  if (pb->sendlist.extent_int(0) < std::max(npart, 1)) {
-    Kokkos::realloc(pb->sendlist, std::max(npart, 1));
-  }
+  pb->ReserveSendlist(npart);
   Kokkos::deep_copy(pb->send_count.d_view, 0);
   auto psendl = pb->sendlist.d_view;
   int *pcounter = pb->send_count.d_view.data();
@@ -1206,9 +1229,7 @@ int DustGasDrag::RouteOO3D() {
     while (pb->RecvAndUnpackPrtcls() != TaskStatus::complete) {}
     pb->ClearPrtclSend();
     pb->ClearPrtclRecv();
-    long long tot = 0;
-    for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
-    pm->nprtcl_total = static_cast<int>(tot);
+    pm->nprtcl_total = particles::TotalCount(pm->nprtcl_eachrank, global_variable::nranks);
   }
 #endif
   return nsent;
@@ -1261,6 +1282,7 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
       auto mlev = pmy_pack->pmb->mb_lev.d_view;
       const int root = pm->root_level;
       const bool split = (smr_transfer_mode == DustSMRTransfer::refinable_cloud);
+      const int lcap = cloud_split_max_level;   // clouds of level >= it never split
       const bool d2 = pm->multi_d, d3 = pm->three_d;
       par_for("dust_lb_count_oct", DevExeSpace(), 0, npart - 1, KOKKOS_LAMBDA(const int p) {
         const int m = pi(PGID,p) - gids;
@@ -1268,8 +1290,8 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
         int b = (pr(IPX,p) >= 0.5*(msz(m).x1min + msz(m).x1max)) ? 1 : 0;
         if (d2 && pr(IPY,p) >= 0.5*(msz(m).x2min + msz(m).x2max)) b |= 2;
         if (d3 && pr(IPZ,p) >= 0.5*(msz(m).x3min + msz(m).x3max)) b |= 4;
-        const bool sp = split &&
-                        SMRCompositeTransfer::CloudLevel(pi(PLEV,p)) <= mlev(m) - root;
+        const int cl = SMRCompositeTransfer::CloudLevel(pi(PLEV,p));
+        const bool sp = split && cl <= mlev(m) - root && (lcap < 0 || cl < lcap);
         Kokkos::atomic_add(&cnt(m, sp ? nleaf + b : b), 1);
       });
     } else if (npart > 0) {
@@ -1370,7 +1392,10 @@ void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_ll
         c[n] = lb_old_counts[static_cast<size_t>(o)*nc + b] +
                nsplit*lb_old_counts[static_cast<size_t>(o)*nc + nleaf + b];
       } else {
-        c[n] = all(o)*nsplit/static_cast<double>(nleaf);
+        // (cloud_split_max_level = L: a child above L gets its share of the clouds, which switch)
+        const bool above = cloud_split_max_level >= 0 &&
+                           ln - pm->root_level > cloud_split_max_level;
+        c[n] = all(o)*(above ? 1.0 : nsplit)/static_cast<double>(nleaf);
       }
     } else {
       for (int k=0; k<nleaf && o + k < pm->nmb_total; ++k) c[n] += all(o + k);

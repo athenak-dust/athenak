@@ -422,7 +422,9 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
 //! \brief The PC2 feedback stiffness of this cycle, chi = dt max_cells
 //! sum_p w m_p/(t_s,p V rho_g) from the stage-1 predictor deposit qdep[4] (u0 still holds the
 //! start-of-step gas at this point), reduced over all ranks (the particle history, phst, reads
-//! its interval maximum).
+//! its interval maximum).  With stiff_thresh <= 0 nothing reads the global value during the
+//! cycle: the rank's records stay on the device (no host wait, no MPI collective) until
+//! SyncStiffness.
 
 void DustGasDrag::UpdateStiffness(const Real dt) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -431,15 +433,39 @@ void DustGasDrag::UpdateStiffness(const Real dt) {
   const int ncells = pmy_pack->nmb_thispack*nx3*nx2*nx1;
   auto &u0 = pmy_pack->phydro->u0;
   auto &qdep_ = qdep;
-  Real rate = 0.0;
-  Kokkos::parallel_reduce("dust_stiffness", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncells),
-  KOKKOS_LAMBDA(const int idx, Real &maximum) {
+  auto stiffness = KOKKOS_LAMBDA(const int idx, Real &maximum) {
     int q = idx;
     const int i = is + q % nx1; q /= nx1;
     const int j = js + q % nx2; q /= nx2;
     const int k = ks + q % nx3; q /= nx3;
     maximum = fmax(maximum, qdep_(q,4,k,j,i)/u0(q,IDN,k,j,i));
-  }, Kokkos::Max<Real>(rate));
+  };
+  if (stiff_thresh <= 0.0) {
+    // diagnostics only: the records stay on the device (dust.hpp, SyncStiffness)
+    if (!stiff_diag_dev.is_allocated()) {
+      stiff_rate_dev = Kokkos::View<Real, DevMemSpace>("dust_stiff_rate");
+      stiff_diag_dev = DvceArray1D<Real>("dust_stiff_diag", 3);
+      auto h = Kokkos::create_mirror_view(stiff_diag_dev);
+      h(0) = stiff_chi_last; h(1) = stiff_chi_run_max; h(2) = phst_chi_max;
+      Kokkos::deep_copy(stiff_diag_dev, h);
+    }
+    Kokkos::parallel_reduce("dust_stiffness", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncells),
+                            stiffness, Kokkos::Max<Real, DevMemSpace>(stiff_rate_dev));
+    auto rate_d = stiff_rate_dev;
+    auto diag = stiff_diag_dev;
+    const bool phst = phst_track;
+    Kokkos::parallel_for("dust_stiffness_record", Kokkos::RangePolicy<>(DevExeSpace(), 0, 1),
+    KOKKOS_LAMBDA(const int) {
+      const Real chi = dt*rate_d();
+      diag(0) = chi;
+      diag(1) = (diag(1) < chi) ? chi : diag(1);              // std::max(run max, chi)
+      if (phst) diag(2) = (diag(2) < chi) ? chi : diag(2);    // std::max(interval max, chi)
+    });
+    return;
+  }
+  Real rate = 0.0;
+  Kokkos::parallel_reduce("dust_stiffness", Kokkos::RangePolicy<>(DevExeSpace(), 0, ncells),
+                          stiffness, Kokkos::Max<Real>(rate));
 #if MPI_PARALLEL_ENABLED
   MPI_Allreduce(MPI_IN_PLACE, &rate, 1, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
 #endif
@@ -453,6 +479,24 @@ void DustGasDrag::UpdateStiffness(const Real dt) {
       phst_dt_stiff_min = (phst_dt_stiff_min < 0.0) ? d : std::min(phst_dt_stiff_min, d);
     }
   }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::SyncStiffness
+//! \brief Collective: the device records of UpdateStiffness (stiff_thresh <= 0) reduced over the
+//! ranks into stiff_chi_last, stiff_chi_run_max and phst_chi_max (no-op before the first record,
+//! which every rank makes in the same cycle; with stiff_thresh > 0 the host values are current)
+
+void DustGasDrag::SyncStiffness() {
+  if (!stiff_diag_dev.is_allocated()) return;
+  auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), stiff_diag_dev);
+  Real v[3] = {h(0), h(1), h(2)};
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, v, 3, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+#endif
+  stiff_chi_last = v[0];
+  stiff_chi_run_max = v[1];
+  phst_chi_max = v[2];
 }
 
 //----------------------------------------------------------------------------------------

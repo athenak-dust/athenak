@@ -10,7 +10,9 @@
 //! MeshBlock, so that a patch holds about the same number of leaves on every level)
 //! the new masses keep, to round-off, every leaf's deposited mass and momentum, the three
 //! components of the frozen-gas drag feedback of every leaf (AuditFeedback), the centre of
-//! mass and the six velocity second moments of the patch; a mass never exceeds its cap
+//! mass and the six velocity second moments of the patch (3-D: by default also the angular
+//! momentum, <dust>/cloud_resample_xv_rows, in the patches where the rows above do not already fix
+//! it, dust_resample.hpp); a mass never exceeds its cap
 //! eta_L m0 / 2^(d level) (DustGasDrag::cloud_resample_cap).  Clouds above the cap are left alone, and so are the clouds already at
 //! the cap.
 //!
@@ -387,6 +389,267 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
 
 }  // namespace
 
+namespace resample {
+//----------------------------------------------------------------------------------------
+//! \fn resample::AuditXVPatches
+//! \brief <dust>/cloud_resample_xv_audit (3-D): the changes one batch of patch solves makes,
+//! from the sorted pool (pb), the new masses mn and the pair tables, before the masses are
+//! written.  Extra kernels only; the solve is not touched.  Per patch (one thread, pool order):
+//! with d = new - old mass, x the position about the patch centre (unwrapped as in the
+//! centre-of-mass rows) and c = v - u (u the old mass-weighted mean velocity of the patch):
+//! |sum d| / sum m, |sum d v| / sum m |v|, |sum d x| / sum m |x|, |sum d c c^T| / sum m |c|^2,
+//! |sum d x c^T| / sum m |x||c| (Frobenius), |sum d x x c| / sum m |x||c|; J_q = sum m x x c and
+//! dJ_q = sum d x x c.  Per leaf (atomics over the (cloud, leaf) pairs): |sum_e w d| / sum_e w m
+//! and max_a |sum_e w d v_a| / sum_e w m |v_a|.  acc (this rank, summed / maximized over the
+//! batches): [0] patches of >= 2 clouds, [1..6] maxima of the six patch ratios, [7] sum |J_q|,
+//! [8] sum |dJ_q|, [9..11] sum dJ_q, [12] largest leaf mass ratio, [13] leaf momentum ratio,
+//! [14] leaves with mass.  The patch part is reduced on the device.  The leaf table has 8
+//! doubles per cell of every block slot of the traversal, so it runs only up to 2^24 cells
+//! (acc[14] = -1 marks it skipped; the solver's own row check, resmax, still covers the leaves).
+//! Shearing box (omega > 0; stored v2 is shear-relative, v2_rot = v2 - q omega x1): the inertial
+//! J about the patch also holds the spatial second moments S = sum m x x^T,
+//! J_in = sum m x x c + omega ((q - 1) S_xz, -S_yz, (1 - q) S_xx + S_yy):  [24] max over patches
+//! of |dS| / sum m |x|^2, [25] sum |J_in,q|, [26] sum |dJ_in,q|, [27..29] sum dJ_in,q (with
+//! omega = 0 these are the J of the stored velocities again).  xflag (the patches of the
+//! cross-moment rows): [30] flagged patches, [31] flagged patches whose masses changed, over the
+//! unflagged patches [32] max |dJ| / sum m |x||c|, [33] max |dS| / sum m |x|^2, [34] sum |dJ_in,q|;
+//! the patches flagged for several cloud levels only (xflag 2): [35] count, [36] changed, [37] max
+//! |dJ| / sum m |x||c|; the flagged patches: [38] max |dJ_in| / (sum m |x||c| + |omega| sum m |x|^2),
+//! [39] sum |dJ_in,q|; the patches flagged only for the boundary (xflag 4: a physical x3 fold or
+//! an ambiguous unwrapping): [40] count, [41] changed, [42] max |dJ| / sum m |x||c|.
+void AuditXVPatches(const DevicePatchProblem &pb, const DvceArray1D<double> &mn,
+                    const LeafTraversal3D &lt, const double omega, const double qsh,
+                    const DvceArray1D<int> &xflag, double acc[48]) {
+  const int npatch = pb.npatch, npool = pb.npool;
+  auto spd = pb.spd;
+  auto pptr = pb.pptr;
+  auto pgeo = pb.pgeo;
+  auto mnew = mn;
+  const double lx = pb.lx, ly = pb.ly, lz = pb.lz;
+  double cnt = 0.0, r1 = 0.0, r2 = 0.0, r3 = 0.0, r4 = 0.0, r5 = 0.0, r6 = 0.0;
+  double sj = 0.0, sdj = 0.0, djx = 0.0, djy = 0.0, djz = 0.0;
+  Kokkos::parallel_reduce("rxv_audit_patch", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+  KOKKOS_LAMBDA(const int q, double &vc, double &v1, double &v2, double &v3, double &v4,
+                double &v5, double &v6, double &vj, double &vdj, double &vx, double &vy,
+                double &vz) {
+    const int a0 = pptr(q), a1 = pptr(q + 1);
+    if (a1 - a0 < 2) return;
+    double mt = 0.0, vb[3] = {0.0, 0.0, 0.0};
+    for (int a=a0; a<a1; ++a) {
+      mt += spd(a, JM);
+      for (int k=0; k<3; ++k) vb[k] += spd(a, JM)*spd(a, JVX + k);
+    }
+    for (int k=0; k<3; ++k) vb[k] /= mt;
+    double sd = 0.0, sp = 0.0, sx = 0.0, s2 = 0.0, sk = 0.0;
+    double dp[3] = {0.0, 0.0, 0.0}, dx[3] = {0.0, 0.0, 0.0}, jp[3] = {0.0, 0.0, 0.0};
+    double dj[3] = {0.0, 0.0, 0.0}, d2[9], dk[9];
+    for (int c=0; c<9; ++c) {d2[c] = 0.0; dk[c] = 0.0;}
+    for (int a=a0; a<a1; ++a) {
+      const double m = spd(a, JM), d = mnew(a) - m;
+      double x[3] = {spd(a, JX) - pgeo(q,0), spd(a, JY) - pgeo(q,1), spd(a, JZ) - pgeo(q,4)};
+      x[0] -= lx*Kokkos::floor(x[0]/lx + 0.5);
+      x[1] -= ly*Kokkos::floor(x[1]/ly + 0.5);
+      x[2] -= lz*Kokkos::floor(x[2]/lz + 0.5);
+      const double v[3] = {spd(a, JVX), spd(a, JVY), spd(a, JVZ)};
+      const double c[3] = {v[0] - vb[0], v[1] - vb[1], v[2] - vb[2]};
+      const double xn = Kokkos::sqrt(x[0]*x[0] + x[1]*x[1] + x[2]*x[2]);
+      const double cn = Kokkos::sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]);
+      sd += d;
+      sp += m*Kokkos::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+      sx += m*xn; s2 += m*cn*cn; sk += m*xn*cn;
+      for (int k=0; k<3; ++k) {dp[k] += d*v[k]; dx[k] += d*x[k];}
+      for (int s=0; s<3; ++s) {
+        for (int t=0; t<3; ++t) {d2[3*s + t] += d*c[s]*c[t]; dk[3*s + t] += d*x[s]*c[t];}
+      }
+      const double j[3] = {x[1]*c[2] - x[2]*c[1], x[2]*c[0] - x[0]*c[2], x[0]*c[1] - x[1]*c[0]};
+      for (int k=0; k<3; ++k) {jp[k] += m*j[k]; dj[k] += d*j[k];}
+    }
+    auto nrm = [](const double *v, const int n) {
+      double s = 0.0;
+      for (int i=0; i<n; ++i) s += v[i]*v[i];
+      return Kokkos::sqrt(s);
+    };
+    auto ratio = [](const double a, const double b) {return (b > 0.0) ? a/b : 0.0;};
+    vc += 1.0;
+    v1 = Kokkos::fmax(v1, ratio(Kokkos::fabs(sd), mt));
+    v2 = Kokkos::fmax(v2, ratio(nrm(dp, 3), sp));
+    v3 = Kokkos::fmax(v3, ratio(nrm(dx, 3), sx));
+    v4 = Kokkos::fmax(v4, ratio(nrm(d2, 9), s2));
+    v5 = Kokkos::fmax(v5, ratio(nrm(dk, 9), sk));
+    v6 = Kokkos::fmax(v6, ratio(nrm(dj, 3), sk));
+    vj += nrm(jp, 3); vdj += nrm(dj, 3);
+    vx += dj[0]; vy += dj[1]; vz += dj[2];
+  }, cnt, Kokkos::Max<double>(r1), Kokkos::Max<double>(r2), Kokkos::Max<double>(r3),
+     Kokkos::Max<double>(r4), Kokkos::Max<double>(r5), Kokkos::Max<double>(r6), sj, sdj, djx, djy,
+     djz);
+  acc[0] += cnt;
+  const double rr[6] = {r1, r2, r3, r4, r5, r6};
+  for (int c=0; c<6; ++c) acc[1 + c] = std::max(acc[1 + c], rr[c]);
+  acc[7] += sj; acc[8] += sdj; acc[9] += djx; acc[10] += djy; acc[11] += djz;
+  // spatial second moments and the inertial J (second pass over the patches)
+  double rs = 0.0, ji = 0.0, dji = 0.0, dix = 0.0, diy = 0.0, diz = 0.0;
+  double nfl = 0.0, nflr = 0.0, ujm = 0.0, uxm = 0.0, udji = 0.0, nmx = 0.0, nmxr = 0.0, mjm = 0.0;
+  double fjm = 0.0, fdji = 0.0, nbd = 0.0, nbdr = 0.0, bjm = 0.0;
+  const bool hasf = xflag.extent_int(0) >= npatch;
+  const DvceArray1D<int> xf = xflag;
+  Kokkos::parallel_reduce("rxv_audit_patch_in", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+  KOKKOS_LAMBDA(const int q, double &v1, double &vj, double &vdj, double &vx, double &vy,
+                double &vz, double &wf, double &wfr, double &wj, double &wx, double &wd, double &mf,
+                double &mfr, double &mj, double &fj, double &fd, double &bf, double &bfr,
+                double &bj) {
+    const int a0 = pptr(q), a1 = pptr(q + 1);
+    if (a1 - a0 < 2) return;
+    const bool fl = hasf && xf(q) != 0;
+    double mt = 0.0, vb[3] = {0.0, 0.0, 0.0};
+    for (int a=a0; a<a1; ++a) {
+      mt += spd(a, JM);
+      for (int k=0; k<3; ++k) vb[k] += spd(a, JM)*spd(a, JVX + k);
+    }
+    for (int k=0; k<3; ++k) vb[k] /= mt;
+    double sx2 = 0.0, sk = 0.0, jp[3] = {0.0, 0.0, 0.0}, dj[3] = {0.0, 0.0, 0.0};
+    double sp[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}, ds[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    bool chg = false;
+    for (int a=a0; a<a1; ++a) {
+      const double m = spd(a, JM), d = mnew(a) - m;
+      if (d != 0.0) chg = true;
+      double x[3] = {spd(a, JX) - pgeo(q,0), spd(a, JY) - pgeo(q,1), spd(a, JZ) - pgeo(q,4)};
+      x[0] -= lx*Kokkos::floor(x[0]/lx + 0.5);
+      x[1] -= ly*Kokkos::floor(x[1]/ly + 0.5);
+      x[2] -= lz*Kokkos::floor(x[2]/lz + 0.5);
+      const double c[3] = {spd(a, JVX) - vb[0], spd(a, JVY) - vb[1], spd(a, JVZ) - vb[2]};
+      const double xx[6] = {x[0]*x[0], x[1]*x[1], x[2]*x[2], x[0]*x[1], x[0]*x[2], x[1]*x[2]};
+      sx2 += m*(xx[0] + xx[1] + xx[2]);
+      sk += m*Kokkos::sqrt(xx[0] + xx[1] + xx[2])*Kokkos::sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]);
+      for (int k=0; k<6; ++k) {sp[k] += m*xx[k]; ds[k] += d*xx[k];}
+      const double j[3] = {x[1]*c[2] - x[2]*c[1], x[2]*c[0] - x[0]*c[2], x[0]*c[1] - x[1]*c[0]};
+      for (int k=0; k<3; ++k) {jp[k] += m*j[k]; dj[k] += d*j[k];}
+    }
+    // + omega ((q - 1) S_xz, -S_yz, (1 - q) S_xx + S_yy)
+    const double jin[3] = {jp[0] + omega*(qsh - 1.0)*sp[4], jp[1] - omega*sp[5],
+                           jp[2] + omega*((1.0 - qsh)*sp[0] + sp[1])};
+    const double djin[3] = {dj[0] + omega*(qsh - 1.0)*ds[4], dj[1] - omega*ds[5],
+                            dj[2] + omega*((1.0 - qsh)*ds[0] + ds[1])};
+    double nds = 0.0;
+    for (int k=0; k<6; ++k) nds += ((k < 3) ? 1.0 : 2.0)*ds[k]*ds[k];
+    const double rxx = (sx2 > 0.0) ? Kokkos::sqrt(nds)/sx2 : 0.0;
+    const double ndjin = Kokkos::sqrt(djin[0]*djin[0] + djin[1]*djin[1] + djin[2]*djin[2]);
+    v1 = Kokkos::fmax(v1, rxx);
+    vj += Kokkos::sqrt(jin[0]*jin[0] + jin[1]*jin[1] + jin[2]*jin[2]);
+    vdj += ndjin;
+    vx += djin[0]; vy += djin[1]; vz += djin[2];
+    if (fl) {
+      wf += 1.0;
+      if (chg) wfr += 1.0;
+      // flagged patches: the inertial change against sum m |x||c| + |omega| sum m |x|^2
+      fj = Kokkos::fmax(fj, (sk + Kokkos::fabs(omega)*sx2 > 0.0)
+                            ? ndjin/(sk + Kokkos::fabs(omega)*sx2) : 0.0);
+      fd += ndjin;
+      if (xf(q) == 4) {   // flagged only for a physical x3 fold or an ambiguous unwrapping
+        bf += 1.0;
+        if (chg) bfr += 1.0;
+        const double ndjb = Kokkos::sqrt(dj[0]*dj[0] + dj[1]*dj[1] + dj[2]*dj[2]);
+        bj = Kokkos::fmax(bj, (sk > 0.0) ? ndjb/sk : 0.0);
+      }
+      if (xf(q) == 2) {   // flagged for several cloud levels only
+        mf += 1.0;
+        if (chg) mfr += 1.0;
+        const double ndj = Kokkos::sqrt(dj[0]*dj[0] + dj[1]*dj[1] + dj[2]*dj[2]);
+        mj = Kokkos::fmax(mj, (sk > 0.0) ? ndj/sk : 0.0);
+      }
+    } else {
+      const double ndj = Kokkos::sqrt(dj[0]*dj[0] + dj[1]*dj[1] + dj[2]*dj[2]);
+      wj = Kokkos::fmax(wj, (sk > 0.0) ? ndj/sk : 0.0);
+      wx = Kokkos::fmax(wx, rxx);
+      wd += ndjin;
+    }
+  }, Kokkos::Max<double>(rs), ji, dji, dix, diy, diz, nfl, nflr, Kokkos::Max<double>(ujm),
+     Kokkos::Max<double>(uxm), udji, nmx, nmxr, Kokkos::Max<double>(mjm), Kokkos::Max<double>(fjm),
+     fdji, nbd, nbdr, Kokkos::Max<double>(bjm));
+  acc[24] = std::max(acc[24], rs);
+  acc[25] += ji; acc[26] += dji; acc[27] += dix; acc[28] += diy; acc[29] += diz;
+  acc[30] += nfl; acc[31] += nflr; acc[32] = std::max(acc[32], ujm);
+  acc[33] = std::max(acc[33], uxm); acc[34] += udji;
+  acc[35] += nmx; acc[36] += nmxr; acc[37] = std::max(acc[37], mjm);
+  acc[38] = std::max(acc[38], fjm); acc[39] += fdji;
+  acc[40] += nbd; acc[41] += nbdr; acc[42] = std::max(acc[42], bjm);
+  // leaves: a table of 8 doubles per cell of every block slot, so only on small meshes (at
+  // most 2^24 cells: 1 GiB); larger ones mark the leaf part as skipped (acc[14] = -1)
+  const std::size_t ncell = static_cast<std::size_t>(lt.ncells1)*lt.ncells2*lt.ncells3;
+  const std::size_t nleaf = static_cast<std::size_t>(std::max(lt.nall, 1))*ncell;
+  if (nleaf > (static_cast<std::size_t>(1) << 24)) {
+    acc[14] = -1.0;
+    return;
+  }
+  DvceArray1D<double> lf("rxv_leaf", 8*nleaf);
+  auto sptr = pb.sptr;
+  auto stgt = pb.stgt;
+  auto swgt = pb.swgt;
+  Kokkos::parallel_for("rxv_audit_leaf", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+  KOKKOS_LAMBDA(const int k) {
+    const double m = spd(k, JM), d = mnew(k) - m;
+    const double v[3] = {spd(k, JVX), spd(k, JVY), spd(k, JVZ)};
+    for (int e=sptr(k); e<sptr(k + 1); ++e) {
+      const std::size_t t = static_cast<std::size_t>(stgt(e));
+      const double w = swgt(e);
+      Kokkos::atomic_add(&lf(8*t), w*d);
+      Kokkos::atomic_add(&lf(8*t + 4), w*m);
+      for (int c=0; c<3; ++c) {
+        Kokkos::atomic_add(&lf(8*t + 1 + c), w*d*v[c]);
+        Kokkos::atomic_add(&lf(8*t + 5 + c), w*m*Kokkos::fabs(v[c]));
+      }
+    }
+  });
+  double lm = 0.0, lp = 0.0, nl = 0.0;
+  Kokkos::parallel_reduce("rxv_audit_leafmax",
+  Kokkos::RangePolicy<>(DevExeSpace(), 0, static_cast<int64_t>(nleaf)),
+  KOKKOS_LAMBDA(const int64_t t, double &rm, double &rp, double &cnt) {
+    if (!(lf(8*t + 4) > 0.0)) return;
+    cnt += 1.0;
+    rm = Kokkos::fmax(rm, Kokkos::fabs(lf(8*t))/lf(8*t + 4));
+    for (int c=0; c<3; ++c) {
+      if (lf(8*t + 5 + c) > 0.0) rp = Kokkos::fmax(rp, Kokkos::fabs(lf(8*t + 1 + c))/lf(8*t + 5 + c));
+    }
+  }, Kokkos::Max<double>(lm), Kokkos::Max<double>(lp), nl);
+  acc[12] = std::max(acc[12], lm);
+  acc[13] = std::max(acc[13], lp);
+  if (acc[14] >= 0.0) acc[14] += nl;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn resample::AuditXVTotals
+//! \brief cloud_resample_xv_audit: totals over every cloud of this rank (m > 0), positions about
+//! the domain centre (not wrapped: a clump must not straddle a periodic face): [0] mass,
+//! [1..3] sum m x, [4..6] sum m v, [7..9] sum m x x v, [10] clouds, [11..16] sum m x_a x_b
+//! (xx, yy, zz, xy, xz, yz).
+void AuditXVTotals(particles::Particles *ppar, const RegionSize &ms, double g[17]) {
+  const int np = ppar->nprtcl_thispack;
+  auto pr = ppar->prtcl_rdata;
+  const double xc = 0.5*(ms.x1min + ms.x1max), yc = 0.5*(ms.x2min + ms.x2max);
+  const double zc = 0.5*(ms.x3min + ms.x3max);
+  for (int c=0; c<17; ++c) g[c] = 0.0;
+  Kokkos::parallel_reduce("rxv_audit_totals", Kokkos::RangePolicy<>(DevExeSpace(), 0, np),
+  KOKKOS_LAMBDA(const int p, double &m, double &mx, double &my, double &mz, double &px,
+                double &py, double &pz, double &jx, double &jy, double &jz, double &n) {
+    const double mp = pr(IPM,p);
+    if (!(mp > 0.0)) return;
+    const double x = pr(IPX,p) - xc, y = pr(IPY,p) - yc, z = pr(IPZ,p) - zc;
+    const double vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
+    m += mp; mx += mp*x; my += mp*y; mz += mp*z;
+    px += mp*vx; py += mp*vy; pz += mp*vz;
+    jx += mp*(y*vz - z*vy); jy += mp*(z*vx - x*vz); jz += mp*(x*vy - y*vx);
+    n += 1.0;
+  }, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9], g[10]);
+  Kokkos::parallel_reduce("rxv_audit_totals2", Kokkos::RangePolicy<>(DevExeSpace(), 0, np),
+  KOKKOS_LAMBDA(const int p, double &sxx, double &syy, double &szz, double &sxy, double &sxz,
+                double &syz) {
+    const double mp = pr(IPM,p);
+    if (!(mp > 0.0)) return;
+    const double x = pr(IPX,p) - xc, y = pr(IPY,p) - yc, z = pr(IPZ,p) - zc;
+    sxx += mp*x*x; syy += mp*y*y; szz += mp*z*z; sxy += mp*x*y; sxz += mp*x*z; syz += mp*y*z;
+  }, g[11], g[12], g[13], g[14], g[15], g[16]);
+}
+}  // namespace resample
+
 //----------------------------------------------------------------------------------------
 //! \fn dust::PoolInTagOrder
 //! \brief cloud_resample_order = tag with 64-bit particle tags: the pool
@@ -558,7 +821,89 @@ bool DustGasDrag::MergeDue() {
 
 int DustGasDrag::ResampleClouds(const bool local) {
   ++gravity_mass_epoch;   // R changes the deposited mass (gravity field reuse)
-  if (clouds3d) return ResampleClouds3D(local);
+  if (clouds3d && !cloud_resample_xv_audit) return ResampleClouds3D(local);
+  if (clouds3d) {
+    // cloud_resample_xv_audit: the totals before and after, the patch and leaf changes of the
+    // solves (resample::AuditXVPatches), one line per pass (rank 0, reduced over the ranks)
+    Mesh *pm = pmy_pack->pmesh;
+    constexpr int NG = 17;
+    double g0[NG], g1[NG];
+    resample::AuditXVTotals(pmy_pack->ppart, pm->mesh_size, g0);
+    for (double &a : rxv_acc) a = 0.0;
+    const int removed = ResampleClouds3D(local);
+    resample::AuditXVTotals(pmy_pack->ppart, pm->mesh_size, g1);
+    double sum[2*NG];
+    for (int c=0; c<NG; ++c) {sum[c] = g0[c]; sum[NG + c] = g1[c];}
+    constexpr int NS = 23, NM = 15;
+    const int isum[NS] = {0, 7, 8, 9, 10, 11, 14, 21, 22, 23, 25, 26, 27, 28, 29, 30, 31, 34, 35,
+                          36, 39, 40, 41};
+    const int imax[NM] = {1, 2, 3, 4, 5, 6, 12, 13, 20, 24, 32, 33, 37, 38, 42};
+    // the audit event: every rank calls ResampleClouds together, so this count agrees on all
+    // ranks (cloud_resample_pass does not advance on a rank that returns early without clouds)
+    ++rxv_events;
+    double as[NS], mx[NM];
+    for (int c=0; c<NS; ++c) as[c] = rxv_acc[isum[c]];
+    for (int c=0; c<NM; ++c) mx[c] = rxv_acc[imax[c]];
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, sum, 2*NG, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, as, NS, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, mx, NM, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+#endif
+    if (global_variable::my_rank == 0) {
+      // J about the centre of mass of the stored velocities (jcom) and the inertial J (jin: +
+      // omega ((q - 1) S_xz, -S_yz, (1 - q) S_xx + S_yy) of the second moments about the COM;
+      // = jcom without a shearing box), before (a) and after (b)
+      const double om = omega0, qs = qshear;
+      auto jcom = [](const double *g, double j[3]) {
+        const double m = g[0];
+        if (!(m > 0.0)) {j[0] = j[1] = j[2] = 0.0; return;}   // no clouds at all
+        const double x[3] = {g[1]/m, g[2]/m, g[3]/m}, p[3] = {g[4], g[5], g[6]};
+        j[0] = g[7] - (x[1]*p[2] - x[2]*p[1]);
+        j[1] = g[8] - (x[2]*p[0] - x[0]*p[2]);
+        j[2] = g[9] - (x[0]*p[1] - x[1]*p[0]);
+      };
+      auto jin = [&](const double *g, double j[3]) {
+        jcom(g, j);
+        if (!(g[0] > 0.0)) return;
+        const double m = g[0], x = g[1]/m, y = g[2]/m, z = g[3]/m;
+        const double sxx = g[11] - m*x*x, syy = g[12] - m*y*y, sxz = g[15] - m*x*z;
+        const double syz = g[16] - m*y*z;
+        j[0] += om*(qs - 1.0)*sxz; j[1] -= om*syz; j[2] += om*((1.0 - qs)*sxx + syy);
+      };
+      auto nrm3 = [](const double *v) {return std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);};
+      double ja[3], jb[3], ia[3], ib[3];
+      jcom(sum, ja); jcom(sum + NG, jb); jin(sum, ia); jin(sum + NG, ib);
+      const double dj[3] = {jb[0] - ja[0], jb[1] - ja[1], jb[2] - ja[2]};
+      const double di[3] = {ib[0] - ia[0], ib[1] - ia[1], ib[2] - ia[2]};
+      const double dp[3] = {sum[NG + 4] - sum[4], sum[NG + 5] - sum[5], sum[NG + 6] - sum[6]};
+      auto rel = [](const double a, const double b) {return (b > 0.0) ? a/b : 0.0;};
+      char line[4096];
+      std::snprintf(line, sizeof(line),
+          "# R_XV_AUDIT event=%llu cycle=%d time=%.10e xv=%d n_pre=%.0f n_post=%.0f "
+          "M=%.10e dM_rel=%.3e P=%.6e,%.6e,%.6e dP_abs=%.3e "
+          "Jcom_pre=%.10e,%.10e,%.10e dJcom=%.6e,%.6e,%.6e dJcom_rel=%.3e "
+          "Jin_pre=%.10e,%.10e,%.10e dJin=%.6e,%.6e,%.6e dJin_rel=%.3e "
+          "patches=%.0f reduced=%.0f fallbacks=%.0f resmax=%.3e "
+          "pmax_m=%.3e pmax_P=%.3e pmax_X=%.3e pmax_vv=%.3e pmax_xv=%.3e pmax_J=%.3e pmax_xx=%.3e "
+          "sumJq=%.6e sum_absdJq=%.6e sum_dJq=%.6e,%.6e,%.6e "
+          "sumJinq=%.6e sum_absdJinq=%.6e sum_dJinq=%.6e,%.6e,%.6e "
+          "leaves=%.0f lmax_m=%.3e lmax_P=%.3e "
+          "flagged=%.0f flagged_changed=%.0f umax_J=%.3e umax_xx=%.3e u_sum_absdJinq=%.6e "
+          "mixed=%.0f mixed_changed=%.0f mmax_J=%.3e fmax_Jin=%.3e f_sum_absdJinq=%.6e "
+          "boundary=%.0f boundary_changed=%.0f bmax_J=%.3e",
+          static_cast<unsigned long long>(rxv_events), pm->ncycle, pm->time,
+          cloud_resample_xv_rows, sum[10], sum[NG + 10], sum[0],
+          rel(std::fabs(sum[NG] - sum[0]), sum[0]), sum[4], sum[5], sum[6], nrm3(dp),
+          ja[0], ja[1], ja[2], dj[0], dj[1], dj[2], rel(nrm3(dj), nrm3(ja)),
+          ia[0], ia[1], ia[2], di[0], di[1], di[2], rel(nrm3(di), nrm3(ia)),
+          as[0], as[9], as[7], mx[8], mx[0], mx[1], mx[2], mx[3], mx[4], mx[5], mx[9],
+          as[1], as[2], as[3], as[4], as[5], as[10], as[11], as[12], as[13], as[14],
+          as[6], mx[6], mx[7], as[15], as[16], mx[10], mx[11], as[17], as[18], as[19], mx[12],
+          mx[13], as[20], as[21], as[22], mx[14]);
+      std::cout << line << std::endl;
+    }
+    return removed;
+  }
   using Clock = std::chrono::steady_clock;
   auto seconds = [](const Clock::time_point &a) {
     return std::chrono::duration<double>(Clock::now() - a).count();
@@ -1346,7 +1691,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       b[4] = ms.x3min + ll.lx3*w3; b[5] = b[4] + w3;
     };
     std::vector<std::array<Real, 6>> fresh;
-    for (int g=0; g<ntot; ++g) {
+    for (int g=0; g<ntot && r_fresh_blocks; ++g) {
       if (pmr->ncyc_since_ref(g) <= amr_event_max_age) {
         Real b[6]; box(g, b); fresh.push_back({b[0], b[1], b[2], b[3], b[4], b[5]});
       }
@@ -1368,6 +1713,13 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
           }
         }
         if (on) break;
+      }
+      // the blocks of this cycle's split events (cloud_split_resample): the blocks of the
+      // parents and the blocks the pieces landed in (PrepareSplitBlocks; not the static
+      // neighbours: across a shear-periodic x1 face the pieces land in blocks shifted along x2,
+      // and after a hold by the split budget several blocks away)
+      if (!on && r_split_blocks && static_cast<int>(split_gid_flag.size()) == ntot) {
+        on = (split_gid_flag[pmy_pack->gids + m] != 0) ? 1 : 0;
       }
       mh(m) = on;
     }
@@ -1815,6 +2167,82 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       int e = sptr_d(k);
       for (int j=cptr(a); j<cptr(a + 1); ++j) {stgt_d(e) = ctgt(j); swgt_d(e) = cwgt(j); ++e;}
     });
+    // the patches for the cross-moment rows (cloud_resample_xv_rows, and for the audit's counts).
+    // Unflagged only when all pool clouds of the patch have one level L and every footprint leaf
+    // is at level >= L.  Then, per direction, leaf values a_l = the centre of the level-L cell
+    // holding leaf l give sum_l a_l W_il = x_i (the hat is box * box of the L cell width), and
+    // b_l = the level-L quadratic B-spline coefficients give sum_l b_l W_il = x_i^2 + const (the
+    // cell-integrated hat is box * box * box, a B-spline of degree 2 that reproduces quadratics,
+    // the same constant for every cloud of width L): the leaf-momentum rows fix
+    // sum m (x - c)(v - u)^T and the leaf-mass rows the spatial second moments, so the extra rows
+    // are redundant and such patches are solved without them (bitwise as with none).  Every
+    // other patch is flagged: a cloud finer than a leaf, or several cloud widths in one patch
+    // (no general redundancy: moving mass between a width-2h cloud and its three width-h
+    // P1 pieces keeps every leaf deposit, the mass and the centre of mass but changes S_xx).
+    // The proof also needs the unbounded hat and one consistent unwrapping: flagged as well are
+    // the patches with a cloud whose support crosses a physical x3 face (the part beyond the face
+    // is folded back into the domain, so the weights no longer reproduce z) and the patches whose
+    // footprint spans a whole period of a periodic direction (x1, x2, periodic x3), where the
+    // unwrapping about the patch centre is ambiguous.
+    DvceArray1D<int> xfl;
+    if (cloud_resample_xv_rows != 0 || cloud_resample_xv_audit) {
+      DvceArray1D<int> klev(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_xvlev"), npool);
+      auto blev = lt.blev;
+      const bool z3per = lt.x3per;
+      const Real rdz = lt.root_dx3, z3min = lt.x3min, z3max = lt.x3max, ztol = 1.0e-12*lt.lz;
+      Kokkos::parallel_for("rs3_xvlev", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int k) {
+        int lmin = 255;
+        for (int e=sptr_d(k); e<sptr_d(k + 1); ++e) lmin = Kokkos::min(lmin, blev(stgt_d(e)/ncell123));
+        const int cl = T::CloudLevel(pi(PLEV, pid(sorder(k), 1)));
+        // bit 17: the support [z - ell, z + ell] crosses a physical x3 face (folded deposit)
+        int fold = 0;
+        if (!z3per) {
+          const Real z = spd_d(k, resample::JZ), ell = rdz/static_cast<Real>(1 << cl);
+          fold = (z - ell < z3min + ztol || z + ell > z3max - ztol) ? 1 : 0;
+        }
+        // bit 16: finer than one of its leaves
+        klev(k) = (fold << 17) | ((cl > lmin) ? (1 << 16) : 0) | (cl << 8) | lmin;
+      });
+      xfl = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_xvflag"),
+                             npatch2);
+      auto pg = pb.pgeo;
+      const Real plx = lt.lx, ply = lt.ly, plz = lt.lz;
+      const Real rdx1 = lt.root_dx1, rdx2 = lt.root_dx2;
+      Kokkos::parallel_for("rs3_xvflag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch2),
+      KOKKOS_LAMBDA(const int q) {
+        int cmin = 255, cmax = -1, lmin = 255, own = 0, fold = 0;
+        // the footprint about the patch centre, unwrapped as in the rows: [lo, hi] per direction
+        Real lo[3] = {1.0e300, 1.0e300, 1.0e300}, hi[3] = {-1.0e300, -1.0e300, -1.0e300};
+        const Real per[3] = {plx, ply, plz}, cen[3] = {pg(q,0), pg(q,1), pg(q,4)};
+        const Real rd[3] = {rdx1, rdx2, rdz};
+        for (int k=pptr_d(q); k<pptr_d(q + 1); ++k) {
+          const int cl = (klev(k) >> 8) & 255;
+          cmin = Kokkos::min(cmin, cl);
+          cmax = Kokkos::max(cmax, cl);
+          lmin = Kokkos::min(lmin, klev(k) & 255);
+          own |= (klev(k) >> 16) & 1;
+          fold |= (klev(k) >> 17) & 1;
+          for (int a=0; a<3; ++a) {
+            Real d = spd_d(k, (a == 0) ? resample::JX : ((a == 1) ? resample::JY : resample::JZ)) - cen[a];
+            if (a < 2 || z3per) d -= per[a]*Kokkos::floor(d/per[a] + 0.5);
+            const Real ell = rd[a]/static_cast<Real>(1 << cl);
+            lo[a] = Kokkos::fmin(lo[a], d - ell);
+            hi[a] = Kokkos::fmax(hi[a], d + ell);
+          }
+        }
+        // a footprint spanning a whole period (x1, x2; x3 when periodic): ambiguous unwrapping
+        const bool amb = (hi[0] - lo[0] >= per[0]*(1.0 - 1.0e-12)) ||
+                         (hi[1] - lo[1] >= per[1]*(1.0 - 1.0e-12)) ||
+                         (z3per && hi[2] - lo[2] >= per[2]*(1.0 - 1.0e-12));
+        const bool widths = (cmin == cmax && cmax <= lmin);
+        // 0 unflagged (one cloud level L, every footprint leaf at level >= L, no x3 fold, an
+        // unambiguous unwrapping); 3 a cloud finer than one of its own leaves; 2 several cloud
+        // levels (otherwise); 4 only the boundary (an x3 fold or an ambiguous unwrapping).  The
+        // solve uses != 0, the audit counts 2 ("mixed") and 4 ("boundary") separately
+        xfl(q) = (widths && !fold && !amb) ? 0 : (own ? 3 : (!widths ? 2 : 4));
+      });
+    }
     DvceArray1D<double> mn("rs3_dev_mnew", npool);
     DvceArray2D<int> outi("rs3_dev_outi", npatch2, resample::NPC);
     DvceArray1D<double> outr("rs3_dev_outr", npatch2);
@@ -1822,9 +2250,17 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
     long long scr[2] = {0, 0};
     resample::SolvePatchesDevice(pb, mn, outi, outr, cloud_resample_device_mem_mb,
                                  cloud_resample_device_mid, cloud_resample_device_mid_team,
-                                 cloud_resample_device_wide_team, tim, scr);
+                                 cloud_resample_device_wide_team, tim, scr,
+                                 cloud_resample_xv_rows, xfl, omega0 != 0.0, qshear);
     resample::PatchSummary dsum;
     resample::SummarizePatchesDevice(outi, outr, dsum);
+    if (cloud_resample_xv_audit) {
+      resample::AuditXVPatches(pb, mn, lt, omega0, qshear, xfl, rxv_acc);
+      rxv_acc[20] = std::max(rxv_acc[20], dsum.resmax);
+      rxv_acc[21] += static_cast<double>(dsum.nfall);
+      rxv_acc[22] += static_cast<double>(dsum.npat);
+      rxv_acc[23] += static_cast<double>(dsum.nred);
+    }
     const int nremoved_b = static_cast<int>(dsum.pool - dsum.kept);
     nremoved += nremoved_b;
     if (nremoved_b > 0 || dsum.csteps > 0) {

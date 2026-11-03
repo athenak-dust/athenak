@@ -11,6 +11,7 @@
 //!   file_type = pbin        # no variable key: always the complete particle science state
 //!   dt        = 6.283185307179586
 //!   id        = particles   # optional, the default
+//!   precision = double      # optional: single stores the particle real columns as float32
 //!
 //! writes pbin/<basename>.<id>.<NNNNN>.pbin.  Format version 2 (vis/python/pbin.py reads 1 and 2):
 //!
@@ -38,7 +39,12 @@
 //! with one species and species_fixed stopping times the species and
 //! stopping_time columns are constants of the header, provided every active row holds exactly
 //! species 0 and tau_s of species 0 (checked; otherwise both stay columns); with several
-//! species or per-particle stopping times both are always columns.  Every rank
+//! species or per-particle stopping times both are always columns.  The mass is a constant of
+//! the header when every active row has exactly the same mass (equal-mass point particles;
+//! refinable clouds differ and keep the column) and no row has an invalid mass (not finite or
+//! not positive: invalid_mass_rows = 0).  precision = single writes the particle real
+//! columns (x1-x3, v1-v3, mass, stopping_time) as float32 (dtype <f4 in [columns]; the
+//! constants stay float64).  Every rank
 //! writes its own rows at a global prefix offset with independent MPI-IO writes of at most
 //! 1 GiB (no gather on rank 0; ranks without particles write nothing; all offsets 64-bit and
 //! checked).  The file is written as <name>.tmp and renamed when it is complete.  Writing reads
@@ -272,6 +278,25 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
 #endif
     if (ndiffer > 0) constant_sp_ts = false;
   }
+  // equal masses (point particles of one mass): the mass is a constant of the header
+  double mlo = std::numeric_limits<double>::max(), mhi = -std::numeric_limits<double>::max();
+  if (nidx > 0) {
+    Kokkos::parallel_reduce("pbin_mass_range", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
+    KOKKOS_LAMBDA(const int q, double &lo, double &hi) {
+      const double mq = static_cast<double>(pr(IPM, idx(q)));
+      lo = fmin(lo, mq); hi = fmax(hi, mq);
+    }, Kokkos::Min<double>(mlo), Kokkos::Max<double>(mhi));
+  }
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &mlo, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &mhi, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+#endif
+  // (fmin/fmax skip NaN: [m, NaN, m] has mlo == mhi; a row the header counts as an invalid
+  // mass, not finite or not positive, keeps the mass column, so that its value is written)
+  const bool constant_mass = (ntotal > 0 && anomalies[1] == 0 && mlo == mhi);
+  const bool single_prec = out_params.pbin_single;
+  const char *rdt = single_prec ? "f4" : "f8";
+  const std::uint64_t rsz = single_prec ? 4 : 8;
   const std::uint64_t nblocks = static_cast<std::uint64_t>(pm->nmb_total);
   const std::uint64_t bprefix = static_cast<std::uint64_t>(pm->gids_eachrank[me]);
   const int nmb = pm->pmb_pack->nmb_thispack;
@@ -291,15 +316,16 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   const char *species_meaning = "species_id (0-based; input index N = species_id + 1)";
   const char *ts_meaning = "stopping time t_s (code time)";
   if (!constant_sp_ts) col("particles", "species", "u4", 4, species_meaning);
-  col("particles", "x1", "f8", 8, "position x1 (code length)");
-  col("particles", "x2", "f8", 8, "position x2 (code length)");
-  col("particles", "x3", "f8", 8, pm->three_d ? "position x3 (code length)" :
+  const char *mass_meaning = "macro-particle mass (code units; not a grain mass)";
+  col("particles", "x1", rdt, rsz, "position x1 (code length)");
+  col("particles", "x2", rdt, rsz, "position x2 (code length)");
+  col("particles", "x3", rdt, rsz, pm->three_d ? "position x3 (code length)" :
       "x3 column of a 2-D run (not a mesh direction; as stored)");
-  col("particles", "v1", "f8", 8, "velocity component 1 (see [frame])");
-  col("particles", "v2", "f8", 8, "velocity component 2 (see [frame])");
-  col("particles", "v3", "f8", 8, "velocity component 3 (see [frame])");
-  col("particles", "mass", "f8", 8, "macro-particle mass (code units; not a grain mass)");
-  if (!constant_sp_ts) col("particles", "stopping_time", "f8", 8, ts_meaning);
+  col("particles", "v1", rdt, rsz, "velocity component 1 (see [frame])");
+  col("particles", "v2", rdt, rsz, "velocity component 2 (see [frame])");
+  col("particles", "v3", rdt, rsz, "velocity component 3 (see [frame])");
+  if (!constant_mass) col("particles", "mass", rdt, rsz, mass_meaning);
+  if (!constant_sp_ts) col("particles", "stopping_time", rdt, rsz, ts_meaning);
   if (clouds) {
     col("particles", "shape", "u2", 2, "cloud shape code v1: bits 0-3 cloud level, bits 4-5 "
         "lobe along x1, 6-7 lobe along x2, 8-9 lobe along x3 (0 none, 1 lower, 2 upper, "
@@ -382,15 +408,19 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     if (clouds) h << "shape_unknown_bit_rows = " << anomalies[3] << "\n";
     h << "owner = not stored: the MeshBlock whose half-open box [min, max) holds the position "
       << "(blocks table)\n";
-    if (constant_sp_ts) {
-      h << "constant_columns = species stopping_time  # one species, species_fixed: one value "
-        << "for every row, in [constants]\n";
-    } else if (ndiffer > 0) {
-      h << "constant_columns = none  # one species, species_fixed, but " << ndiffer
-        << " rows differ from species 0 / its tau_s: kept as columns\n";
-    } else {
-      h << "constant_columns = none\n";
+    {
+      std::string names;
+      if (constant_sp_ts) names += "species stopping_time";
+      if (constant_mass) names += std::string(names.empty() ? "" : " ") + "mass";
+      h << "constant_columns = " << (names.empty() ? std::string("none") : names);
+      if (!names.empty()) h << "  # the same value in every row, given in [constants]";
+      if (!constant_sp_ts && ndiffer > 0)
+        h << (names.empty() ? "  # " : "; ") << "one species, species_fixed, but " << ndiffer
+          << " rows differ from species 0 / its tau_s: kept as columns";
+      h << "\n";
     }
+    h << "particle_real_precision = " << (single_prec ? "single" : "double")
+      << "  # positions, velocities, mass, stopping time (<outputN>/precision)\n";
     h << "[species]\n";
     {
       const int ns = pd->nspecies;
@@ -464,12 +494,14 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       h << "constant = particles stopping_time " << bo << "f8 " << static_cast<double>(ts0)
         << "\n";
     }
+    if (constant_mass) h << "constant = particles mass " << bo << "f8 " << mlo << "\n";
     h << "[meaning]\n";
     for (const auto &c : cols) h << c.table << "." << c.name << " = " << c.meaning << "\n";
     if (constant_sp_ts) {
       h << "particles.species = " << species_meaning << "\n";
       h << "particles.stopping_time = " << ts_meaning << "\n";
     }
+    if (constant_mass) h << "particles.mass = " << mass_meaning << "\n";
     h << "[input]\n";
     std::ostringstream ost;
     pin->ParameterDump(ost);
@@ -549,13 +581,23 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       if (c.name == "mass") rc = IPM;
       if (c.name == "stopping_time") rc = IPTS;
       if (rc < 0 || rc >= pp->nrdata) PbinFail("internal: column " + c.name);
-      DvceArray1D<double> d("pbin_real", nidx);
-      Kokkos::parallel_for("pbin_pack_real", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
-      KOKKOS_LAMBDA(const int q) {
-        d(q) = static_cast<double>(pr(rc, idx(q)));
-      });
-      auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
-      WriteAt(file, h.data(), nbytes, off);
+      if (c.itemsize == 4) {
+        DvceArray1D<float> d("pbin_real4", nidx);
+        Kokkos::parallel_for("pbin_pack_real4", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
+        KOKKOS_LAMBDA(const int q) {
+          d(q) = static_cast<float>(pr(rc, idx(q)));
+        });
+        auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
+        WriteAt(file, h.data(), nbytes, off);
+      } else {
+        DvceArray1D<double> d("pbin_real", nidx);
+        Kokkos::parallel_for("pbin_pack_real", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
+        KOKKOS_LAMBDA(const int q) {
+          d(q) = static_cast<double>(pr(rc, idx(q)));
+        });
+        auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
+        WriteAt(file, h.data(), nbytes, off);
+      }
     }
   }
 

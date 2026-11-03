@@ -4,9 +4,13 @@
 //========================================================================================
 #include "gravity/mesh_geometry.hpp"
 #include "gravity/host_workers.hpp"
+#include "gravity/row_index.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cmath>
 #include <exception>
 #include <functional>
@@ -52,6 +56,9 @@ struct ReconstructionFaces {
   }
   void Clear() { rows.clear(); bytes = 0; }
 };
+// Long rows (and fit sample/coefficient lists) are indexed: see row_index.hpp.
+using AccRow = IndexedRow<double>;
+
 void Add(Row &row, GlobalIndex column, double value) {
   // Most rows contain only seven entries; a short contiguous scan avoids a
   // heap node per coefficient and avoids gradient maps on aligned interiors.
@@ -60,9 +67,13 @@ void Add(Row &row, GlobalIndex column, double value) {
   row.emplace_back(column, value);
 }
 
+// As Add(Row &): the same entries and sums, with the index on long rows.
+void Add(AccRow &row, GlobalIndex column, double value) { row.Add(column, value); }
+
 template<typename Csr>
-void Append(Csr &matrix, Row &row, GlobalIndex split, bool exterior,
+void Append(Csr &matrix, AccRow &accumulated, GlobalIndex split, bool exterior,
             double sign = 1.) {
+  auto &row = accumulated.Release();   // sorted below
   std::sort(row.begin(), row.end(), [](const Entry &a, const Entry &b) {
     return a.first < b.first;
   });
@@ -98,11 +109,11 @@ std::array<Vec, 3> Inverse(std::array<Vec, 3> a, int ndim) {
 }
 
 struct RowWorkspace {
-  Row a, difference, potential;
-  std::array<Row,3> g;
+  AccRow a, difference, potential;
+  std::array<AccRow,3> g;
   RowWorkspace() {
-    a.reserve(32); difference.reserve(32); potential.reserve(48);
-    for (auto &row : g) row.reserve(32);
+    a.v.reserve(32); difference.v.reserve(32); potential.v.reserve(48);
+    for (auto &row : g) row.v.reserve(32);
   }
 };
 
@@ -117,25 +128,6 @@ int AvailablePhaseCpus() {
   return 1;
 }
 
-void JoinPhaseRows(CsrRowUpdate &out, const std::vector<CsrRowUpdate *> &parts) {
-  size_t rows = 0, nnz = 0;
-  for (const auto *part : parts) { rows += part->rows.size(); nnz += part->values.size(); }
-  if (nnz > static_cast<size_t>(std::numeric_limits<int>::max()))
-    throw std::overflow_error("Gravity compact phase CSR exceeds 32-bit offsets");
-  out.global_rows = parts.front()->global_rows; out.global_cols = parts.front()->global_cols;
-  out.row_begin = parts.front()->row_begin;
-  out.rows.reserve(rows); out.rowptr.reserve(rows+1);
-  out.colidx.reserve(nnz); out.values.reserve(nnz);
-  for (auto *part : parts) {
-    const int offset = static_cast<int>(out.values.size());
-    out.rows.insert(out.rows.end(),part->rows.begin(),part->rows.end());
-    for (size_t i = 1; i < part->rowptr.size(); ++i) out.rowptr.push_back(offset+part->rowptr[i]);
-    out.colidx.insert(out.colidx.end(),part->colidx.begin(),part->colidx.end());
-    out.values.insert(out.values.end(),part->values.begin(),part->values.end());
-    // Release each compact chunk as it is consumed; no complete fine CSR is copied.
-    *part = CsrRowUpdate{};
-  }
-}
 }  // namespace
 
 struct MeshGeometry::Impl {
@@ -159,6 +151,7 @@ struct MeshGeometry::Impl {
   };
   std::vector<PhaseContext> phase_contexts;
   int phase_threads = 1, setup_threads = 1;
+  double phase_rows_s = 0, phase_join_s = 0;   // last BuildPhaseUpdate: row assembly, join
   std::vector<int> phase_rows;
   bool phase_rows_ready = false;
 
@@ -426,6 +419,7 @@ struct MeshGeometry::Impl {
     struct Sample { GlobalIndex id; Vec delta; };
     const auto cell = Cell(row);
     std::vector<Sample> samples;
+    PositionIndex sample_index;   // (cleared with every samples.clear())
     bool one_sided = !domain.c1_z_interfaces.empty();
     // A cell spanning the entire x period has no same-side x neighbours.
     // On the deepest vacuum levels it must use periodic images from the
@@ -445,13 +439,20 @@ struct MeshGeometry::Impl {
       for (int d = 0; d < nd; ++d)
         distance += (delta[d]/cell.width[d])*(delta[d]/cell.width[d]);
       if (distance < 1.e-20) return;
-      for (const auto &s : samples) {
-        if (s.id != id) continue;
+      auto same = [&](const Sample &s) {
         double error = 0.;
         for (int d = 0; d < nd; ++d) error += std::abs(s.delta[d]-delta[d])/cell.width[d];
-        if (error < 1.e-8) return;
+        return error < 1.e-8;
+      };
+      auto key = [&samples](std::size_t i) { return samples[i].id; };
+      if (!sample_index.Active()) {
+        for (const auto &s : samples) if (s.id == id && same(s)) return;
+      } else if (sample_index.Find(id,key,[&](std::size_t i) { return same(samples[i]); }) >= 0) {
+        return;
       }
       samples.push_back({id,delta});
+      if (sample_index.Active()) sample_index.Appended(id,samples.size()-1,key);
+      else if (samples.size() > PositionIndex::kLinear) sample_index.Rebuild(samples.size(),key);
       q.phase_dependent = q.phase_dependent || x_image;
     };
     auto neighbors = [&](GlobalIndex id, const Vec &offset) {
@@ -523,7 +524,7 @@ struct MeshGeometry::Impl {
     if (!full_rank && one_sided_x) {
       // Thin x regions may not determine curvature without periodic images.
       // Keep the real source/vacuum z filter strict in this fallback.
-      one_sided_x = false; samples.clear(); q.phase_dependent = false;
+      one_sided_x = false; samples.clear(); sample_index.Clear(); q.phase_dependent = false;
       q.x_image_fallback = true;
       neighbors(row,Vec{}); first = 0; last = samples.size();
       expand(first,last); first = last; last = samples.size();
@@ -537,7 +538,7 @@ struct MeshGeometry::Impl {
       // A coarse region may have only one normal cell, so quadratic curvature
       // on that side is unknowable. Keep an elliptic preconditioner stencil;
       // expose this lower-order C1 fallback in hierarchy diagnostics.
-      one_sided = false; samples.clear(); q.interface_fallback = true;
+      one_sided = false; samples.clear(); sample_index.Clear(); q.interface_fallback = true;
       q.phase_dependent = false;
       neighbors(row,Vec{}); expand(0,samples.size());
       full_rank = invert();
@@ -545,12 +546,23 @@ struct MeshGeometry::Impl {
     if (!full_rank)
       throw std::runtime_error("Gravity singular one-sided quadratic reconstruction");
     q.coefficients.reserve(samples.size()+1);
+    PositionIndex coefficient_index;
     auto coefficient = [&](GlobalIndex id, const Modes &value) {
-      for (auto &v : q.coefficients) if (v.first == id) {
-        for (int i = 0; i < modes; ++i) v.second[i] += value[i];
+      auto &c = q.coefficients;
+      auto key = [&c](std::size_t i) { return c[i].first; };
+      std::ptrdiff_t found = -1;
+      if (!coefficient_index.Active()) {
+        for (std::size_t i = 0; i < c.size(); ++i) if (c[i].first == id) { found = i; break; }
+      } else {
+        found = coefficient_index.Find(id,key,[](std::size_t) { return true; });
+      }
+      if (found >= 0) {
+        for (int i = 0; i < modes; ++i) c[found].second[i] += value[i];
         return;
       }
-      q.coefficients.emplace_back(id,value);
+      c.emplace_back(id,value);
+      if (coefficient_index.Active()) coefficient_index.Appended(id,c.size()-1,key);
+      else if (c.size() > PositionIndex::kLinear) coefficient_index.Rebuild(c.size(),key);
     };
     Modes center{};
     for (const auto &s : samples) {
@@ -601,7 +613,7 @@ struct MeshGeometry::Impl {
       if (IsPhaseRow(row)) phase_rows.push_back(static_cast<int>(row-begin));
     phase_rows_ready = true;
   }
-  void AddPotential(Row &target, GlobalIndex column, double value) const {
+  void AddPotential(AccRow &target, GlobalIndex column, double value) const {
     if (neumann_z && column >= partition.back()) {
       const auto ghost = Ghost(column);
       Add(target,ghost.first,value); Add(target,column,value*ghost.second);
@@ -609,7 +621,7 @@ struct MeshGeometry::Impl {
   }
   // Add diagonal Hessians using cheap centered axes where all neighbors are
   // aligned and equally sized. Only irregular/one-sided cells need a full fit.
-  void AddDiagonal(Row &target, GlobalIndex row, const Vec &weights,
+  void AddDiagonal(AccRow &target, GlobalIndex row, const Vec &weights,
                    QuadraticCache &cache, ReconstructionFaces &face_cache,
                    bool *phase_dependent) const {
     const int p = Patch(row); const auto index = Indices(p,row);
@@ -663,7 +675,7 @@ struct MeshGeometry::Impl {
       }
     }
   }
-  void FacePotential(const Face &face, Row &potential, QuadraticCache &cache,
+  void FacePotential(const Face &face, AccRow &potential, QuadraticCache &cache,
                      ReconstructionFaces &face_cache, bool *phase_dependent) const {
     potential.clear();
     const GlobalIndex n = partition.back();
@@ -902,7 +914,7 @@ struct MeshGeometry::Impl {
         if (exact) { images = images || crossed; return Row{{row,1.}}; }
       }
     }
-    Row out;
+    AccRow out;
     auto integrate = [&](const Box &physical) {
       for (GlobalIndex row : QueryBox(physical)) {
         const auto c = Cell(row);
@@ -980,7 +992,7 @@ struct MeshGeometry::Impl {
         }
       }
     }
-    return out;
+    return std::move(out.v);
   }
 };
 
@@ -1388,9 +1400,9 @@ void MeshGeometry::SetPhaseThreads(int threads) {
   if (threads < 0) throw std::invalid_argument("Gravity phase thread count must be nonnegative");
   if (threads == 0) {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_SYCL)
-    // 16 so that the prefetched phase assembly of the slowest rank ends
-    // within the step on GB200 (4 ranks x 36 cores); the coefficients do not depend on it
-    threads = 16;
+    // up to 32, two affinity CPUs left to the main thread and the runtime: the prefetched
+    // phase assembly then ends within the matter step; the coefficients do not depend on it
+    threads = std::max(1,std::min(32,AvailablePhaseCpus()-2));
 #else
     threads = 1;
 #endif
@@ -1439,8 +1451,11 @@ LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase, bool forces) {
     m.phase_contexts.clear(); m.phase_contexts.resize(workers);
   }
   LocalCompositeUpdate out;
+  using Clock = std::chrono::steady_clock;
+  const auto t0 = Clock::now();
   if (workers == 1) {
     m.AssemblePhaseRange(0,m.phase_rows.size(),out,m.phase_contexts[0],forces);
+    m.phase_rows_s = std::chrono::duration<double>(Clock::now()-t0).count(); m.phase_join_s = 0;
     return out;
   }
   std::vector<LocalCompositeUpdate> parts(workers);
@@ -1463,19 +1478,55 @@ LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase, bool forces) {
   assemble(0);
   for (auto &thread : threads) thread.join();
   for (const auto &error : errors) if (error) std::rethrow_exception(error);
+  const auto t1 = Clock::now();
   // Chunks contain consecutive sorted rows. Concatenation performs no floating
-  // arithmetic, preserving serial coefficients and sparse entry order bitwise.
-  std::vector<CsrRowUpdate *> matrices(workers);
-  auto join = [&](auto select, CsrRowUpdate &destination) {
-    for (int worker = 0; worker < workers; ++worker) matrices[worker] = select(parts[worker]);
-    JoinPhaseRows(destination,matrices);
+  // arithmetic, preserving serial coefficients and sparse entry order bitwise:
+  // every (component, chunk) copies into its own slot of the exact-size outputs, on the
+  // phase workers (the serial join of ~40M entries took a third of the fine update).
+  auto component = [](LocalCompositeUpdate &u, int k) -> CsrRowUpdate & {
+    if (k == 0) return u.matrix;
+    if (k == 1) return u.boundary_rhs;
+    if (k < 5) return u.acceleration[k-2];
+    return u.boundary_acceleration[k-5];
   };
-  join([](LocalCompositeUpdate &p) { return &p.matrix; },out.matrix);
-  if (forces) join([](LocalCompositeUpdate &p) { return &p.boundary_rhs; },out.boundary_rhs);
-  for (int d = 0; forces && d < 3; ++d) {
-    join([&](LocalCompositeUpdate &p) { return &p.acceleration[d]; },out.acceleration[d]);
-    join([&](LocalCompositeUpdate &p) { return &p.boundary_acceleration[d]; },out.boundary_acceleration[d]);
+  const int components = forces ? 8 : 1;
+  std::vector<std::vector<size_t>> row_at(components,std::vector<size_t>(workers+1,0)),
+      entry_at(components,std::vector<size_t>(workers+1,0));
+  for (int k = 0; k < components; ++k) {
+    for (int w = 0; w < workers; ++w) {
+      const auto &part = component(parts[w],k);
+      row_at[k][w+1] = row_at[k][w]+part.rows.size();
+      entry_at[k][w+1] = entry_at[k][w]+part.values.size();
+    }
+    if (entry_at[k][workers] > static_cast<size_t>(std::numeric_limits<int>::max()))
+      throw std::overflow_error("Gravity compact phase CSR exceeds 32-bit offsets");
+    auto &a = component(out,k); const auto &first = component(parts[0],k);
+    a.global_rows = first.global_rows; a.global_cols = first.global_cols;
+    a.row_begin = first.row_begin;
   }
+  ParallelChunks(workers,3*components,[&](int t) {   // the exact-size outputs
+    auto &a = component(out,t/3); const int k = t/3;
+    if (t%3 == 0) { a.rows.resize(row_at[k][workers]); a.rowptr.resize(row_at[k][workers]+1); a.rowptr[0] = 0; }
+    else if (t%3 == 1) a.colidx.resize(entry_at[k][workers]);
+    else a.values.resize(entry_at[k][workers]);
+  });
+  ParallelChunks(workers,workers*components,[&](int t) {
+    const int w = t%workers, k = t/workers;
+    auto &part = component(parts[w],k); auto &a = component(out,k);
+    const size_t r0 = row_at[k][w], e0 = entry_at[k][w];
+    std::copy(part.rows.begin(),part.rows.end(),a.rows.begin()+r0);
+    for (size_t i = 1; i < part.rowptr.size(); ++i)
+      a.rowptr[r0+i] = static_cast<int>(e0)+part.rowptr[i];
+    std::copy(part.colidx.begin(),part.colidx.end(),a.colidx.begin()+e0);
+    std::copy(part.values.begin(),part.values.end(),a.values.begin()+e0);
+    part = CsrRowUpdate{};   // release each chunk as it is consumed
+  });
+  m.phase_rows_s = std::chrono::duration<double>(t1-t0).count();
+  m.phase_join_s = std::chrono::duration<double>(Clock::now()-t1).count();
   return out;
+}
+
+std::array<double,2> MeshGeometry::LastPhaseUpdateSeconds() const {
+  return {{impl_->phase_rows_s,impl_->phase_join_s}};
 }
 }  // namespace gravity

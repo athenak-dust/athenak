@@ -19,6 +19,9 @@
 #include <vector>
 #include <list>
 #include <iterator>
+#include <string>
+
+#include <Kokkos_Core.hpp>
 
 class Driver;
 
@@ -116,6 +119,8 @@ class TaskList {
  public:
   TaskList() = default;
   ~TaskList() = default;
+  std::string prof_prefix = "tl";          // xnode profiling: the region prefix of the tasks
+  std::vector<std::string> prof_names_;
 
   // functions (all implemented here)
   bool IsComplete() {
@@ -143,10 +148,22 @@ class TaskList {
 
   // cycle through task list once, do any tasks whose dependencies are clear
   TaskListStatus DoAvailable(Driver *d, int s) {
+    // xnode profiling: with a Kokkos tool loaded every task call is a profile region
+    // "<list>#<index>" (index = position in the list, from 0); no-op otherwise
+    const bool prof = Kokkos::Tools::profileLibraryLoaded();
+    if (prof && prof_names_.size() != task_list_.size()) {
+      prof_names_.clear();
+      for (std::size_t n = 0; n < task_list_.size(); ++n)
+        prof_names_.push_back(prof_prefix + "#" + std::to_string(n));
+    }
+    std::size_t index = 0;
     for (auto &task : task_list_) {
       auto dep = task.GetDependency();
+      const std::size_t my_index = index++;
       if ( tasks_completed_.CheckDependencies(dep) && !(task.IsComplete()) ) {
+        if (prof) Kokkos::Tools::pushRegion(prof_names_[my_index]);
         TaskStatus status = task(d,s);  // calls Task function using overloaded operator()
+        if (prof) Kokkos::Tools::popRegion();
         if (status == TaskStatus::complete) {
           task.SetComplete();              // set bool flag in task
           MarkTaskComplete(task.GetID());  // add TaskID to tasks_completed_

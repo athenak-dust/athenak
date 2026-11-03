@@ -93,6 +93,10 @@ class ShearingBox {
   long n_plan_pull = 0, n_plan_flux = 0;
   bool pull_ghost_valid = false;   // x1 ghosts hold collected values (not after a regrid)
   int nvar_pull = 0;
+  // non-negative variables of the pulled array (bit v of pull_pos_mask for v < 31, and every
+  // v >= pull_pos_from): the one-sided edge slopes of PullSend keep them non-negative.  The gas
+  // sets density, total energy (adiabatic) and the passive scalars; u* (velocities) has none.
+  int pull_pos_mask = 0, pull_pos_from = (1 << 30);
   ReconstructionMethod rcon_pull = ReconstructionMethod::plm;
   enum PullField {kPRGid, kPRType, kPRFace, kPRIdx, kPSGid, kPSLoc, kPSFace, kPD,
                   kPY0, kPNy, kPYS, kPZ0, kPNz, kPZS, kPOff, kPSeq, kPNField};

@@ -424,10 +424,21 @@ struct SMRCompositeTransfer {
 };
 
 //----------------------------------------------------------------------------------------
+//! TriggerCloudCode: the cloud code the density trigger uses with <dust>/cloud_split_max_level =
+//! lcap: a plain cloud above lcap (switched to a finer leaf by the cloud instant switch, the
+//! mass of level lcap) as a plain level-lcap cloud; every other code as it is.
+KOKKOS_INLINE_FUNCTION
+int TriggerCloudCode(const int code, const int lcap) {
+  return ((code & ~SMRCompositeTransfer::kCloudLevelMask) == 0 && code > lcap) ? lcap : code;
+}
+
+//----------------------------------------------------------------------------------------
 //! \struct ResampleCapTable
 //! The R mass cap of a plain cloud of level L: eta_L m0 / 2^(d L) (d = 3 in 3-D, else 2),
-//! eta_L <= 0: no cap.  Stored as eta_L / 2^(d L), so Cap() is bit-identical to
-//! eta m0 / 2^(d L) for a constant eta.  Small enough to be captured by value in kernels.
+//! eta_L <= 0: no cap.  With <dust>/cloud_split_max_level = Lc the entries above Lc are that of
+//! Lc (a cloud above the cap carries the mass of level Lc).  Stored as eta_L / 2^(d L), so Cap()
+//! is bit-identical to eta m0 / 2^(d L) for a constant eta.  Small enough to be captured by
+//! value in kernels.
 
 struct ResampleCapTable {
   static constexpr int kLevels = SMRCompositeTransfer::kCloudLevelMask + 1;
@@ -1364,6 +1375,17 @@ class DustGasDrag {
     return stiff_thresh > 0.0 || pc2_feedback_damping || phst_track;
   }
   void UpdateStiffness(const Real dt);
+  // stiff_thresh <= 0: chi only feeds diagnostics (the damping uses each cell's own chi), so
+  // UpdateStiffness keeps this rank's records on the device, without a host wait or an MPI
+  // collective per cycle: stiff_rate_dev = the local max rate of the last predictor,
+  // stiff_diag_dev = {dt*rate (last), run maximum, phst interval maximum} of this rank.
+  // SyncStiffness (collective) reduces them over the ranks where they are read
+  // (ParticleHistory; Driver::Finalize before the DUST_STIFFNESS summary).  The maxima commute
+  // with the rank maximum and dt*max = max(dt*...) (rounding is monotonic): bitwise the values
+  // of the per-cycle reduction (stiff_thresh > 0 keeps it: the dt limit reads it every cycle)
+  Kokkos::View<Real, DevMemSpace> stiff_rate_dev;
+  DvceArray1D<Real> stiff_diag_dev;
+  void SyncStiffness();
   unsigned long long hybrid_pc2_cycles = 0;
   unsigned long long hybrid_split_be_cycles = 0;
   DustSMRTransfer smr_transfer_mode = DustSMRTransfer::none;
@@ -1427,7 +1449,7 @@ class DustGasDrag {
   int amr_event_regrid = 0;                    // regrid number (amr_regrids) of the last one
   long long amr_event_handled = 0, amr_event_merged = 0;
   int amr_regrid_nnew = 0, amr_regrid_ndel = 0;  // of the regrid in progress (BeforeRegrid)
-  void HandleRegridEvent(const bool merge_due);
+  void HandleRegridEvent(const bool merge_due, const bool split_r = false);
   bool cloud_merge_nc = true;         // merge-side node convention
   int cloud_merge_lobe_wait = 0;      // a centre waits while an unreleased lobed cloud is near
                                       // 1: reach H + ell, 2: reach per lobe direction
@@ -1487,6 +1509,12 @@ class DustGasDrag {
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
   bool cloud_resample_rank_screen = true;   // ... (3-D only) skip the patches whose
                                       //     clouds do not outnumber their nominal rows (false: all)
+  int cloud_resample_xv_rows = 0;     // ... (3-D only) position-velocity cross-moment rows in the
+                                      //     flagged patches (dust_resample.hpp): 0 none, 1 angmom
+                                      //     (3-D default; 3 rows, 6 in a shearing box), 2 full
+                                      //     (9 rows, 12 in a shearing box)
+  bool cloud_resample_xv_audit = false;   // ... (3-D) one line per R pass: changes of J about the
+                                      //     COM, per-patch moments and leaf mass / momentum
   bool cloud_resample_device = true;   // ... the patch solves on the device (default)
   bool cloud_resample_qr_rows = true;  // ... row-parallel QR update on the device
                                        //     (matches the host only to round-off)
@@ -1522,7 +1550,50 @@ class DustGasDrag {
                                       // cells beyond the refined gas
   DvceArray1D<int> split_np, split_off;  // device split work arrays, kept between cycles
   bool cloud_split_enable = true;     // test only: false = no splitting at all
+  // <dust>/cloud_split_max_level = L (unset or negative: no limit, -1 here): the clouds split up
+  // to level L; above it they keep their mass (that of level L) and their kernel follows the
+  // mesh: every plain cloud of level >= L takes the level max(L, level of the leaf that holds its
+  // centre) at the start of every cycle (CloudInstantSwitch: the instant switch of the cloud
+  // framework, the former cloud_instant_switch; not the point particles of amr_pic =
+  // instant_switch); R gives them the cap of level L, G never takes them (its levels stop at L)
+  int cloud_split_max_level = -1;
+  unsigned long long cloud_instant_switch_count = 0;   // level changes made by CloudInstantSwitch
   bool cloud_split_device = false;    // P1 split on the device; false: the host split
+  // The split budget and the resampling right after a split (3-D refinable clouds; off by
+  // default).  cloud_split_budget > 0: one rank's split pass takes its events (parent splits
+  // and lobe releases) in particle index order while it has created fewer than this many
+  // clouds; the rest wait for a later cycle and stay a level coarser than their leaf until then.
+  // Several ranks: a held event's pieces can lie several blocks from their parent's block
+  // (a root cloud held until the mesh under it is four levels finer), beyond the neighbour step
+  // of the particle exchange; with the budget on, the pieces that belong to blocks of other
+  // ranks go there by position right after the split (RouteToOwnerBlocks3D from the first
+  // new piece, as SplitToLeaves).
+  // cloud_split_resample: a local R in the same cycle, right after a split pass that created at
+  // least cloud_split_resample_frac of the clouds (all ranks together) or held events back, on
+  // the blocks of the split events: the blocks of the parents and the blocks the pieces landed
+  // in (also across a shear-periodic x1 face, and several blocks away after a hold) (not when
+  // the scheduled global R falls on that cycle).
+  int cloud_split_budget = 0;
+  bool cloud_split_resample = false;
+  Real cloud_split_resample_frac = 0.05;
+  DvceArray1D<int> split_blk;         // block slots of this cycle's split events (local and
+                                      // halo slots): bit 0 parent, bit 1 a piece landed there
+  bool split_blk_mark = false;        // the split marks split_blk (cloud_split_resample)
+  int split_last_before = 0, split_last_new = 0, split_last_held = 0;   // this rank, this cycle
+  int split_last_offrank = 0;         // budget, several ranks: new pieces of other ranks' blocks
+  int split_last_far = 0;             // (split_blk_mark) pieces outside their parent block's
+                                      // MeshBlock neighbours (the R log)
+  bool split_route_due = false;       // (SplitResampleWanted) route the new pieces now
+  std::vector<int> split_gid_mark;    // (gid, bits) pairs of this rank's split_blk, this cycle
+  std::vector<int> split_gid_flag;    // blocks (global ids) of this cycle's split events: bits
+                                      // of split_blk, all ranks
+  bool r_split_blocks = false;        // the local R takes the blocks of split_gid_flag
+  bool r_fresh_blocks = true;         // the local R takes the blocks of the regrid event
+  unsigned long long cloud_split_held = 0;     // events held back by the budget (this rank)
+  unsigned long long split_resample_calls = 0; // local R passes after a split
+  bool SplitResampleWanted();         // collective: the budget log, is the local R due?
+  void PrepareSplitBlocks();          // collective: split_gid_flag from split_blk
+  int ResampleAfterSplit();           // collective: the local R on the split blocks
   // Diagnostic prescribed gas (set by a problem generator, e.g. <problem>/prescribed_gas
   // of streaming_linear): fills the gas conserved variables of every cell, ghosts
   // included, with a prescribed state at time t.  With PC2 and back_reaction=false the
@@ -1698,6 +1769,10 @@ class DustGasDrag {
   std::string species_record;
   bool species_record_found = false;
   int SplitAndMergeClouds();   // returns the number of clouds split
+  int CloudInstantSwitch();    // cloud_split_max_level: returns the clouds whose level changed
+  // cloud_split_max_level: the density of the 3-D trigger, every plain cloud above L with the
+  // kernel of level L (TriggerCloudCode); f as DepositCloudDensity3D, the density component
+  void DepositTriggerDensityCapped3D(DvceArray5D<Real> &f);
   int SplitCloudsP1();         // moving-particle P1 split
   int SplitCloudsP1Device();   // device P1 split without the diagnostics
   TaskStatus RefineClouds(Driver *pdrive, int stage);
@@ -1755,6 +1830,38 @@ class DustGasDrag {
   void UpdateShear3D(const Real time);
   void BuildLeafTraversal3D();
   int SplitCloudsP1Device3D();
+  // <dust>/cloud_split_velocity (dust_split_velocity.cpp): the velocities of the pieces of a
+  // device P1 split or lobe release.  parent (0, the default): every piece keeps the parent's
+  // velocity.  mesh_gradient (1): v_parent + G d, G the mean-flow velocity gradient fitted to the
+  // dust moments deposited on the parent's support, d the piece's centroid offset, where the
+  // deposit is single-stream (residual dispersion <= cloud_split_dispersion_max times the
+  // velocity change of G over the parent's half-width); the parent's velocity otherwise.
+  int cloud_split_velocity = 0;
+  Real cloud_split_dispersion_max = 0.5;
+  bool cloud_split_velocity_check = false;   // diagnostic: momentum of every event's pieces
+  DvceArray5D<Real> split_mom;        // deposited moments (slot, nc*species, k, j, i)
+  DvceArray2D<Real> split_vgrad;      // per event (row tagoff(p)): G (9), v_parent (3), mass
+  DvceArray1D<Real> split_vref;       // per species: the reference velocity of the deposit
+  unsigned long long split_vel_events = 0, split_vel_applied = 0, split_vel_disp = 0,
+                     split_vel_cond = 0, split_vel_uniform = 0, split_vel_deposits = 0;
+  double split_vel_dpmax = 0.0;
+  long long split_vel_hist[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};   // (check) ratio bins
+  int split_vel_samples = 0, split_vel_samples_app = 0;
+  double split_vel_blk[3] = {0.0, 0.0, 0.0};   // (check) block fractions with events, + neighbours, calls
+  unsigned long long split_vel_halo_rebuilds = 0;   // halo widenings by CheckSplitVelocityReach
+  // (check) the fit's retries on the coarser support, and those beyond the halo allowance
+  unsigned long long split_vel_retry = 0, split_vel_retry_out = 0;
+  DvceArray1D<Real> SplitReferenceVelocity();
+  void ReadSplitVelocityKeys(ParameterInput *pin);
+  bool SplitVelocityPrepare(const int nrows);   // collective (several ranks); true: offsets
+  bool CheckSplitVelocityReach();   // collective: CheckHaloReach incl. the fit's retry support
+  void DepositSplitMoments();
+  void DepositSplitMoments3D();
+  void SplitVelocityGradient(const int npart);
+  void SplitVelocityGradient3D(const int npart);
+  void SplitVelocityCheck(const int npart, const int nnew);
+  void SplitVelocitySummary();
+  Kokkos::View<unsigned long long*, DevMemSpace> split_vel_cnt;   // device counters of the fit
   void PackGatherField3D(const DvceArray5D<Real> &vel);
   void PackGasGather3D(const DvceArray5D<Real> &u);
   void CloudPredictor3D(const bool rate_dep);
@@ -1828,6 +1935,10 @@ class DustGasDrag {
   Real phst_dt_stiff_min = -1.0;   // smallest stiff_thresh/max_rate of the interval (-1: none)
   unsigned long long phst_g_events = 0;   // coarsening events (G groups, X families), this rank
   unsigned long long phst_r_removed = 0;  // particles removed by resampling, this rank
+  // cloud_resample_xv_audit: per-patch and leaf changes of the current R pass, this rank
+  // (ResampleClouds3D fills them, ResampleClouds reduces and prints; dust_resample.cpp)
+  double rxv_acc[48] = {0.0};
+  unsigned long long rxv_events = 0;   // audited R calls (the same on every rank)
   // <gravity>/kdk_reuse: after a recording GatherGravityAcceleration into the same
   // array, at the same time and with no other gather since (the exchanged field is still
   // that one), recompute only the clouds whose gather inputs (position, mass, level code,
@@ -1846,11 +1957,16 @@ class DustGasDrag {
   int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
   void FrameToBlock3D(const Real tpos);         // tpos: the time of the positions
   bool CheckHaloReach3D(const char *when);
-  int RouteToOwnerBlocks3D(const char *when);
+  int RouteToOwnerBlocks3D(const char *when, const int first = 0);   // particles first..
   int MergeCloudsDevice3D();   // (dust_cloud_device.cpp)
   int ResampleClouds3D(const bool local);   // (dust_resample.cpp)
   // timing diagnostic: storage order of the particles
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)
+  // <dust>/point_sort_interval: point particles (no refinable clouds) reordered by
+  // (block, k, j, i) every this many cycles (0: never); sorts done and their fenced seconds
+  int point_sort_interval = 0;
+  unsigned long long point_sort_count = 0;
+  double point_sort_seconds = 0.0;
   bool cloud_sort_random = false;     // diagnostic: a random permutation instead
   bool cloud_merge_position_order = false;   // diagnostic: G walk takes pieces by position
   DvceArray2D<Real> sort_spare_r;     // the arrays the reordered particles are written to
@@ -1895,7 +2011,8 @@ class DustGasDrag {
   enum ProfPhase {kProfTrigger, kProfAmr, kProfRegridMesh, kProfRebuild, kProfRefineClouds, kProfSplit,
                   kProfEvent, kProfSchedR, kProfSchedG, kProfSort, kProfOrder,
                   kProfTrigDeposit, kProfTrigCopy, kProfTrigBlocks, kProfTrigLog,
-                  kProfN};   // kProfTrig*: parts of the trigger
+                  kProfSplitR,
+                  kProfN};   // kProfTrig*: parts of the trigger; kProfSplitR: R after a split
   double prof_time[kProfN] = {0.0};
   long long prof_count[kProfN] = {0};
   std::vector<int> leaf_slot_gid;
@@ -1925,7 +2042,7 @@ class DustGasDrag {
   unsigned long long halo_widenings_ = 0;
   void HaloReach(const int lev, const std::int64_t need, std::int64_t &reach, std::int64_t &allow) const;
   bool CheckHaloReach(const char *when);
-  int SplitToLeaves();   // the initial split of a problem generator
+  long long SplitToLeaves();   // the initial split of a problem generator
   int RouteToOwnerBlocks(const char *when);   // after a regrid / restart
   int RouteOO3D();   // 3-D instant_switch: the particles to their new blocks / ranks
   // several ranks: seconds and calls of 0 MigrateClouds, 1 the migration after the
@@ -2003,7 +2120,18 @@ class DustGasDrag {
 
  private:
   DvceArray5D<Real> gravity_density_halo_, gravity_acceleration_halo_;
+  // the exchanged force with the components innermost (nfld, nk, nj, ni, 4): one cache sector
+  // per cell for the cloud gathers instead of three
+  DvceArray5D<Real> gravity_force_pack_;
   DvceArray2D<Real> gravity_gather_rsnap_;   // x, y, z, mass at the last gather
+  // the particle accelerations of the recording gathers (the kept field of <gravity>/kdk_reuse)
+  // live in two persistent buffers used in turn (a selective regather reads the old values
+  // while it writes the new ones): no device allocation and free (each a device
+  // synchronization) whenever the cloud count of the rank changes.  Each new view is zeroed as
+  // the allocation it replaces.  ATHENA_DUST_GATHER_ALLOC=1: the former per-change allocation.
+  DvceArray1D<Real> gravity_acc_store_[2];
+  int gravity_acc_turn_ = 0;
+  DvceArray2D<Real> GravityAccelerationStorage(int npart);
   DvceArray2D<int> gravity_gather_isnap_;    // level code, anchor (PGID)
   int gravity_gather_nsnap_ = -1;
   Real gravity_gather_time_ = 0;

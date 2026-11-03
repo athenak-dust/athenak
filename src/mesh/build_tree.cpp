@@ -15,6 +15,7 @@
 #include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh.hpp"
+#include "mesh_refinement.hpp"
 #include "coordinates/cell_locations.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
@@ -229,6 +230,8 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
   } // if (multilevel)
 
   if (!adaptive) max_level = current_level;
+  // static mesh with shear-periodic x1 faces: the level rule across them (all shear offsets)
+  if (multilevel && !adaptive) MeshRefinement::ShearFaceStaticTree(this);
 
   // initial mesh hierarchy construction is completed here
   ptree->CountMeshBlocks(nmb_total);
@@ -255,6 +258,7 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
   // initialize cost array with the simplest estimate; all the blocks are equal
   // TODO(@user): implement variable cost per MeshBlock as needed
   for (int i=0; i<nmb_total; i++) {cost_eachmb[i] = 1.0;}
+  SetLoadBalanceStrategy(pin);   // (the dust module's strategy, also for the first partition)
   LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
 
   // create MeshBlockPack for this rank
@@ -429,6 +433,8 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   }
   delete [] idlist;
   if (!adaptive) max_level = current_level;
+  // static mesh with shear-periodic x1 faces: the file's mesh must follow the level rule
+  if (multilevel && !adaptive) MeshRefinement::ShearFaceStaticCheck(this);
 
   // rebuild the MeshBlockTree
   ptree = std::make_unique<MeshBlockTree>(this);
@@ -461,6 +467,7 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   }
 #endif
 
+  SetLoadBalanceStrategy(pin);   // (the dust module's strategy, also for the first partition)
   LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
 
   // create MeshBlockPack for this rank

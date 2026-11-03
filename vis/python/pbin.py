@@ -10,9 +10,12 @@ directory.  The file can be read alone.  Only numpy is needed.
 
 Format version 2 may store a particle quantity once in the header ([constants])
 instead of as a column: with one species and species_fixed stopping times the
-species and stopping_time columns are constants.  The reader always returns them
-as arrays of length N (read-only broadcast views of the constant), so analysis
-code is the same for both layouts; ``snap.constant_columns`` names them.
+species and stopping_time columns are constants, and so is the mass when every
+particle has the same mass (equal-mass point particles).  The reader always returns
+them as arrays of length N (read-only broadcast views of the constant), so analysis
+code is the same for both layouts; ``snap.constant_columns`` names them.  With
+<outputN>/precision = single the particle real columns are float32 (their dtype is
+in the column directory; the constants stay float64).
 
 Example::
 
@@ -367,7 +370,10 @@ class PbinSnapshot:
         tolerance: (count, largest distance outside the box of the block found for them).
         The code now snaps particle positions when routing them, so it keeps every
         particle inside its block's box; older files may hold particles a round-off
-        outside (split children at a face with coordinate 0)."""
+        outside (split children at a face with coordinate 0).  A coordinate stored in a
+        narrower float (precision = single) is the rounding of one inside [min, max), and
+        rounding is monotonic, so it must lie in [round(min), round(max)] -- per
+        coordinate and per block, with that coordinate's own representable values."""
         n = len(self)
         if n == 0:
             return 0, 0.0
@@ -379,12 +385,26 @@ class PbinSnapshot:
         hi = np.stack([b[f"x{d+1}max"] for d in range(nd)], axis=1)
         g = np.maximum(owner, 0)
         xin = x[:, :nd]
-        inside = (owner >= 0) & np.all((xin >= lo[g]) & (xin < hi[g]), axis=1)
+        # the bounds each stored coordinate can reach: [min, max) for float64 columns,
+        # [round(min), round(max)] in the column's own precision for narrower ones
+        lo_r, hi_r, closed = lo.copy(), hi.copy(), np.zeros(nd, dtype=bool)
+        for d in range(nd):
+            col = self.columns.get(f"x{d+1}")
+            dt = np.asarray(col).dtype if col is not None else np.dtype(np.float64)
+            if dt.kind == "f" and dt.itemsize < 8:
+                lo_r[:, d] = lo[:, d].astype(dt).astype(np.float64)
+                hi_r[:, d] = hi[:, d].astype(dt).astype(np.float64)
+                closed[d] = True
+
+        def within(xp, lo_b, hi_b):
+            return (xp >= lo_b) & np.where(closed, xp <= hi_b, xp < hi_b)
+
+        inside = (owner >= 0) & np.all(within(xin, lo_r[g], hi_r[g]), axis=1)
         bad = np.nonzero(~inside)[0]
         dist = 0.0
         still = []
         for p in bad:   # a face rounding of the lookup: try every block (few particles)
-            ok = np.all((xin[p] >= lo) & (xin[p] < hi), axis=1)
+            ok = np.all(within(xin[p], lo_r, hi_r), axis=1)
             if not ok.any():
                 still.append(p)
                 dpos = np.maximum(np.maximum(lo[g[p]] - xin[p], xin[p] - hi[g[p]]), 0.0)
@@ -441,7 +461,8 @@ def read(path, columns=None):
 def check(snap, raise_on_error=False):
     """Consistency checks of a snapshot; returns a list of problems (empty: all passed).
     Checks: counts, finite positive masses and stopping times, species in range, positions
-    inside the domain and inside a block, shape bits (clouds), unique ids, the block
+    inside the domain and inside a block (float32 positions: up to one float32 spacing
+    beyond a domain face, their rounding), shape bits (clouds), unique ids, the block
     directory (count, gids) and the header's anomaly counters."""
     problems = []
     n = len(snap)
@@ -473,16 +494,21 @@ def check(snap, raise_on_error=False):
             lo, hi = float(m[f"x{d+1}min"]), float(m[f"x{d+1}max"])
             if not np.all(np.isfinite(x)):
                 problems.append(f"non-finite positions x{d+1}")
-        # no tolerance (the routing snap keeps every particle in its block's box); files
-        # written before it may hold particles a round-off outside: a warning with the
-        # count and the largest distance up to 1e-12 of the domain length, else a problem
+        # no tolerance (the routing snap keeps every particle in its block's box), except
+        # the rounding of a narrower stored precision, which outside_boxes() allows per
+        # coordinate and per block (a float32 position of a particle just inside a face
+        # that float32 cannot represent, such as 0.1, can round onto or beyond it).  Files
+        # written before the snap (float64) may hold particles a round-off outside: a
+        # warning with the count and the largest distance up to 1e-12 of the domain length,
+        # else a problem
         nout, dmax = snap.outside_boxes()
         if nout > 0:
             lmin = min(float(m[f"x{d+1}max"]) - float(m[f"x{d+1}min"])
                        for d in range(snap.ndim))
+            wide = all(np.asarray(c[f"x{d+1}"]).dtype.itemsize >= 8 for d in range(snap.ndim))
             msg = (f"{nout} particles outside the half-open box of their MeshBlock, "
                    f"by at most {dmax:.3e}")
-            if dmax <= 1e-12 * lmin:
+            if wide and dmax <= 1e-12 * lmin:
                 warnings.warn(msg + " (round-off; written before the routing snap)")
             else:
                 problems.append(msg)

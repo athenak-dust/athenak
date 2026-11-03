@@ -179,6 +179,7 @@ struct OutputParameters {
   bool mass_weighted=false;
   bool single_file_per_rank=false; // DBF: parameter for single file per rank
   bool bin_double=false;            // bin: write the variables as float64 (precision = double)
+  bool pbin_single=false;           // pbin: particle real columns as float32 (precision = single)
 };
 
 //----------------------------------------------------------------------------------------
@@ -403,7 +404,7 @@ class ParticleVTKOutput : public BaseTypeOutput {
   void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
  protected:
   int npout_thisrank;
-  int npout_total;
+  std::int64_t npout_total;   // (all ranks: may exceed 2^31)
   HostArray2D<Real> outpart_rdata;
   HostArray2D<int>  outpart_idata;
 };

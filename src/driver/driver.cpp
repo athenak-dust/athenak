@@ -10,6 +10,7 @@
 #include <iomanip>    // std::setprecision()
 #include <limits>
 #include <algorithm>
+#include <cstdlib>    // std::getenv
 #include <string> // string
 
 #include "athena.hpp"
@@ -250,6 +251,40 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
       exit(EXIT_FAILURE);
     }
   }
+
+  // The final explicit stage of imex2+ (beta = 0, gam0 = 1, gam1 = 0) leaves u unchanged:
+  // its fluxes, flux corrections, RK update and beta-weighted source terms are skipped
+  // (SkipIdentityStage), unless ATHENA_IMEX_STAGE3_OLD=1 (computed and added with weight
+  // zero, as before).  Skipping drops that stage's flux-correction messages (refined
+  // meshes, shear flux matching), so the switch must agree on every rank (collective:
+  // every rank constructs the Driver).
+  {
+    const char *e = std::getenv("ATHENA_IMEX_STAGE3_OLD");
+    skip_identity_stages = !(e != nullptr && e[0] == '1');
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      const int a = skip_identity_stages ? 1 : 0;
+      int v[2] = {a, -a};
+      MPI_Allreduce(MPI_IN_PLACE, v, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+      if (v[0] != -v[1]) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "ATHENA_IMEX_STAGE3_OLD must be set alike on every rank"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+    }
+#endif
+    for (int s=1; s<=nexp_stages; ++s) {
+      if (beta[s-1] == 0.0 && gam0[s-1] == 1.0 && gam1[s-1] == 0.0 &&
+          global_variable::my_rank == 0) {
+        std::cout << "# IMEX_STAGE3 " << integrator << " stage " << s
+                  << " is the identity: its beta-weighted hydro work is "
+                  << (skip_identity_stages ? "skipped"
+                                           : "computed (ATHENA_IMEX_STAGE3_OLD=1)")
+                  << std::endl;
+      }
+    }
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -296,6 +331,8 @@ void Driver::ExecuteTaskList(Mesh *pm, std::string tl, int stage) {
     if (!(pmbp->tl_map[tl]->Empty())) {pmbp->tl_map[tl]->Reset();}
   }
   int npack_left = (pm->nmb_packs_thisrank);
+  pmbp->tl_map[tl]->prof_prefix = tl;
+  Kokkos::Profiling::pushRegion("TL:" + tl);
   while (npack_left > 0) {
     if (pmbp->tl_map[tl]->Empty()) {
       npack_left--;
@@ -306,6 +343,7 @@ void Driver::ExecuteTaskList(Mesh *pm, std::string tl, int stage) {
       }
     }
   }
+  Kokkos::Profiling::popRegion();
   return;
 }
 
@@ -404,7 +442,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
     }
     while ((pmesh->time < tlim) && (pmesh->ncycle < nlim || nlim < 0) &&
            (elapsed_time < wall_time) && !pmesh->stop_max_nmb) {
+      Kokkos::Profiling::pushRegion("DRV:cycle_diag");
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
+      Kokkos::Profiling::popRegion();
 
       // Problem work may change density (e.g. Li2018 mass normalization).
       // Apply it before gravity samples the source or performs either kick.
@@ -421,12 +461,18 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       if (matter_prepared) ExecuteTaskList(pmesh, "before_timeintegrator", 0);
       if (pgrav != nullptr) {
         if (pgrav->UsesOrbitalSplit()) pgrav->SetHydroBoundaryTime(pmesh->time);
+        Kokkos::Profiling::pushRegion("DRV:SG_Solve_open");
         pgrav->Solve(pmesh->time);
+        Kokkos::Profiling::popRegion();
         // the shear-phase host assembly for the closing solve overlaps the step
         pgrav->PrefetchPhase(pmesh->time + pmesh->dt);
         pgrav->BeginEnergyStep();   // energy_source = flux / diag; else no-op
+        Kokkos::Profiling::pushRegion("DRV:SG_Kick_open");
         pgrav->KickMatter(0.5*pmesh->dt);
+        Kokkos::Profiling::popRegion();
+        Kokkos::Profiling::pushRegion("DRV:InitBV_open");
         InitBoundaryValuesAndPrimitives(pmesh);
+        Kokkos::Profiling::popRegion();
         if (pgrav->UsesOrbitalSplit()) {
           pgrav->OrbitalStep(0.5*pmesh->dt);
           pgrav->SetHydroBoundaryTime(pmesh->time+0.5*pmesh->dt);
@@ -447,7 +493,10 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         ExecuteTaskList(pmesh, "before_stagen", stage);
         ExecuteTaskList(pmesh, "stagen", stage);
         ExecuteTaskList(pmesh, "after_stagen", stage);
-        if (pgrav != nullptr) pgrav->AccumulateMassFlux(gam0[stage-1], beta[stage-1]*pmesh->dt);
+        // S <- gam0 S + beta dt F: the identity on a skipped stage (no fluxes computed)
+        if (pgrav != nullptr && !SkipIdentityStage(stage)) {
+          pgrav->AccumulateMassFlux(gam0[stage-1], beta[stage-1]*pmesh->dt);
+        }
       }
 
       // Work after time integrator indicated by "1" in stage
@@ -478,8 +527,12 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
           hydro->peos->ConsToPrim(hydro->u0, hydro->w0, false,
               ind.is, ind.ie, ind.js, ind.je, ind.ks, ind.ke);
         }
+        Kokkos::Profiling::pushRegion("DRV:SG_Solve_close");
         pgrav->Solve(pmesh->time+pmesh->dt);
+        Kokkos::Profiling::popRegion();
+        Kokkos::Profiling::pushRegion("DRV:SG_Kick_close");
         pgrav->KickMatter(0.5*pmesh->dt);
+        Kokkos::Profiling::popRegion();
         pgrav->EndEnergyStep();     // energy_source = flux / diag; else no-op
       }
 
@@ -489,11 +542,15 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       pmesh->ncycle++;
       pmesh->dt_last_completed = pmesh->dt;
       if (pgrav != nullptr) {
+        Kokkos::Profiling::pushRegion("DRV:InitBV_end");
         InitBoundaryValuesAndPrimitives(pmesh);
+        Kokkos::Profiling::popRegion();
         pgrav->ClearHydroBoundaryTime();
+        Kokkos::Profiling::pushRegion("DRV:NewTimeStep");
         (void) pmesh->pmb_pack->phydro->NewTimeStep(this, nexp_stages);
         if (pmesh->pmb_pack->pdust != nullptr)
           (void) pmesh->pmb_pack->pdust->ComputeNewTimeStep(this,nexp_stages);
+        Kokkos::Profiling::popRegion();
       }
       nmb_updated_ += pmesh->nmb_total;
       npart_updated_ += pmesh->nprtcl_total;
@@ -529,6 +586,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       if (pmesh->pmb_pack->pgrav != nullptr) pmesh->pmb_pack->pgrav->amr_check_after_output = false;
 
       // AMR
+      Kokkos::Profiling::pushRegion("DRV:AMR");
       if (pmesh->adaptive) {
         if (pmesh->pmb_pack->pdust != nullptr) {   // dust profile timer
           auto *pd = pmesh->pmb_pack->pdust;
@@ -538,8 +596,11 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
           pmesh->pmr->AdaptiveMeshRefinement(this, pin);
         }
       }
+      Kokkos::Profiling::popRegion();
       // compute new timestep AFTER all Meshblocks refined/derefined
+      Kokkos::Profiling::pushRegion("DRV:MeshNewTimeStep");
       pmesh->NewTimeStep(tlim);
+      Kokkos::Profiling::popRegion();
 
       // Update wall clock time if needed.
       if (wall_time > 0.) {
@@ -570,6 +631,9 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
     out->LoadOutputData(pmesh);
     out->WriteOutputFile(pmesh, pin);
   }
+  // the PC2 stiffness records kept on the device (stiff_thresh <= 0) for the end-of-run
+  // DUST_STIFFNESS summary (collective)
+  if (pmesh->pmb_pack->pdust != nullptr) pmesh->pmb_pack->pdust->SyncStiffness();
 
   // call any problem specific functions to do work after main loop
   if (pmesh->pgen->pgen_final_func != nullptr) {

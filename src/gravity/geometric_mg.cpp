@@ -4,6 +4,7 @@
 //========================================================================================
 #include "gravity/geometric_mg.hpp"
 #include "gravity/host_workers.hpp"
+#include "gravity/row_index.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -137,6 +138,12 @@ void Add(Row &row, GlobalIndex column, Real value) {
   row.emplace_back(column,value);
 }
 
+// A prolongation row: a fine cell next to a much larger (or smaller) coarse region can
+// collect thousands of virtual-average weights; indexed as mesh_geometry's rows (row_index.hpp:
+// the same entries and sums as Add(Row &)).
+using PRow = IndexedRow<Real>;
+void Add(PRow &row, GlobalIndex column, Real value) { row.Add(column,value); }
+
 template<class Matrix>
 void Append(Matrix &a, Row &row) {
   std::sort(row.begin(),row.end(),[](const auto &x, const auto &y) { return x.first < y.first; });
@@ -147,6 +154,8 @@ void Append(Matrix &a, Row &row) {
   }
   a.rowptr.push_back(static_cast<int>(a.values.size()));
 }
+template<class Matrix>
+void Append(Matrix &a, PRow &row) { Append(a,row.Release()); }
 
 GlobalIndex Count(const std::vector<GravityPatch> &patches) {
   GlobalIndex n = 0;
@@ -247,7 +256,7 @@ std::vector<GravityPatch> Coarsen(const std::vector<GravityPatch> &fine,
 }
 
 void ProlongationRow(const MeshGeometry &fine, const MeshGeometry &coarse,
-    const CompositeDomain &domain, GlobalIndex i, Row &row,
+    const CompositeDomain &domain, GlobalIndex i, PRow &row,
     bool &images, bool &shear_images, AverageCache &cache) {
   const auto cell = fine.Cell(i);
   const GlobalIndex parent = coarse.Locate(cell.center);
@@ -313,7 +322,7 @@ void Transfers(const MeshGeometry &fine, const MeshGeometry &coarse,
     Real volume_defect = 0;
   };
   auto prolongation = [&](GlobalIndex first, GlobalIndex last, PartP &part) {
-    Row row; row.reserve(64);
+    PRow row; row.v.reserve(64);
     AverageCache cache(coarse);
     auto &diag = part.diagnostics;
     for (GlobalIndex i = first; i < last; ++i) {
@@ -442,9 +451,20 @@ HierarchyBuildTimes &BuildTimes() {
   return times;
 }
 
+Real CoarsePhase(Real shift, Real width) {
+  if (!(width > 0)) return shift;
+  return width*std::round(shift/width);
+}
+
+Real MinCellWidth(const std::vector<GravityPatch> &patches, int d) {
+  Real width = std::numeric_limits<Real>::max();
+  for (const auto &p : patches) width = std::min(width,(p.hi[d]-p.lo[d])/p.cells[d]);
+  return width;
+}
+
 GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     const CompositeDomain &domain, int rank, int nranks, bool neumann_z,
-    bool fine_forces, int threads) {
+    bool fine_forces, int threads, Real coarse_quantum) {
   auto &times = BuildTimes();
   auto now = []() {
     return std::chrono::duration<double>(
@@ -464,7 +484,12 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     auto coarse_patches = Coarsen(geometry.back()->Patches(),domain);
     if (Count(coarse_patches) >= geometry.back()->GlobalRows())
       throw std::runtime_error("Gravity geometric coarsening did not reduce global rows");
-    out.coarse_geometry.emplace_back(new MeshGeometry(std::move(coarse_patches),domain,
+    CompositeDomain level_domain = domain;
+    if (coarse_quantum > 0 && domain.shear_phase_updates) {
+      level_domain.shear_offset = CoarsePhase(domain.shear_offset,
+                                              coarse_quantum*MinCellWidth(coarse_patches,1));
+    }
+    out.coarse_geometry.emplace_back(new MeshGeometry(std::move(coarse_patches),level_domain,
                                                       rank,nranks,neumann_z,true));
     geometry.push_back(out.coarse_geometry.back().get());
   }
@@ -557,7 +582,7 @@ CsrRowUpdate BuildProlongationPhaseUpdate(const MeshGeometry &fine,
       a.global_cols = coarse.GlobalRows(); a.row_begin = begin;
       const size_t first = rows.size()*worker/workers, last = rows.size()*(worker+1)/workers;
       a.rows.assign(rows.begin()+first,rows.begin()+last);
-      Row row; row.reserve(64);
+      PRow row; row.v.reserve(64);
       AverageCache cache(coarse,statistics != nullptr);
       for (size_t j = first; j < last; ++j) {
         bool images = false, shear_images = false;

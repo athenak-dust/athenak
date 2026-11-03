@@ -65,9 +65,19 @@ HierarchyBuildTimes &BuildTimes();
 // the constant nullspace is retained. This requires domain.isolated_z=true.
 // threads: host workers of the setup (BuildSystem, transfers) of every geometry
 // (MeshGeometry::SetSetupThreads semantics; 1 = serial). The coefficients do not depend on it.
+// coarse_quantum > 0 (shear-periodic domains): every coarse level l >= 1 takes the phase
+// CoarsePhase(domain.shear_offset, coarse_quantum*MinCellWidth(level patches, y)) instead of
+// domain.shear_offset (<gravity>/coarse_phase_quantum); the finest level keeps the exact phase.
 GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     const CompositeDomain &domain, int rank, int nranks, bool neumann_z = false,
-    bool fine_forces = true, int threads = 1);
+    bool fine_forces = true, int threads = 1, Real coarse_quantum = 0);
+
+// The shear phase of a coarse multigrid level: shift rounded to the nearest multiple of width
+// (width <= 0: shift itself). A function of the shift alone, so a rebuilt or restarted
+// hierarchy has the coarse operators a continuously updated one has at the same shift.
+Real CoarsePhase(Real shift, Real width);
+// the smallest cell width along axis d over the patches
+Real MinCellWidth(const std::vector<GravityPatch> &patches, int d);
 
 // Both geometries must already have the current phase. Visits only the fixed
 // local P dependency list discovered during the original transfer construction.

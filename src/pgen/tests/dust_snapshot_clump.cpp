@@ -241,10 +241,12 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 
   std::string path = pin->GetString("problem", "snapshot_file");
   ParticleSnapshot snapshot = ReadParticleVTK(path);
-  int target_count = pmy_mesh_->nprtcl_total;
-  if (target_count <= 0 || target_count > snapshot.count) {
+  // (the total is 64-bit; checked against the int count of the snapshot before narrowing)
+  const std::int64_t target_total = pmy_mesh_->nprtcl_total;
+  if (target_total <= 0 || target_total > snapshot.count) {
     Fatal("The ppc-derived target particle count must be in [1, snapshot particle count]");
   }
+  const int target_count = static_cast<int>(target_total);
 
   // Select an exact-size, deterministic, unbiased subset by sorting source indices by a
   // stable integer hash of their original particle tags.  The same result is obtained

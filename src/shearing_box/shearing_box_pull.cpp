@@ -14,8 +14,11 @@
 //! K0-ng .. K0+nz+ng-1 (periodic), with joff + eps the shear shift in Lr cells.  Every opposite
 //! block that overlaps this rectangle sends its part converted to Lr: copied (same level),
 //! averaged over 2^d cells per direction (finer by d), or prolongated with limited slopes
-//! (coarser; slopes from its own cells and ghosts, none in x at the face column: its own x1
-//! ghosts are being exchanged).  The receiver remaps the rows by eps as the two-step exchange
+//! (coarser; slopes from its own cells and ghosts: in x at the face column from the x1 ghosts
+//! of the last exchange, none right after a regrid; in y / z one-sided at an edge row whose
+//! ghosts come from a coarser neighbour, prolongated only after this exchange, and capped at
+//! the cell value for non-negative variables).  The
+//! receiver remaps the rows by eps as the two-step exchange
 //! does (DC/PLM/PPMX_RemapFlx) and writes all its x1 ghost cells.  The pieces are planned
 //! every stage from the global block list (all ranks derive the same list); one MPI message
 //! per (receiving block, sending block) pair.
@@ -38,11 +41,22 @@
 #include "bvals/bvals.hpp"
 #include "shearing_box.hpp"
 #include "remap_fluxes.hpp"
+#include "pull_slope.hpp"
 
 namespace {
 // floor division for possibly negative numerators (positive d)
 long long FloorDiv(long long a, long long d) {
   return (a >= 0) ? (a/d) : -((-a + d - 1)/d);
+}
+// a neighbour of block m on the face whose four slots start at s0 (NeighborIndex layout) is
+// coarser than m
+KOKKOS_INLINE_FUNCTION
+bool CoarserFace(const DualArray2D<NeighborBlock> &nb, const DualArray1D<int> &lev,
+                 const int m, const int s0) {
+  for (int s=s0; s<s0+4; ++s) {
+    if (nb.d_view(m,s).gid >= 0 && nb.d_view(m,s).lev < lev.d_view(m)) return true;
+  }
+  return false;
 }
 }  // namespace
 
@@ -293,6 +307,19 @@ TaskStatus ShearingBoxCC::PullSend(DvceArray5D<Real> &a) {
   const int nymax = npymax, nzmax = npzmax;
   const bool xslope = pull_ghost_valid;   // x slope at the face column only once the x1
                                           // ghosts hold collected values
+  // A coarser sender's y / z slopes read its transverse ghost rows.  Those of a same-level or
+  // finer neighbour (RecvU) and of a physical x3 boundary (set before the pack) are of this
+  // stage; those of a COARSER neighbour are prolongated only after this exchange (Prolongate,
+  // FinishUstarGhosts) and still hold the previous stage.  At such an edge row the slope is
+  // one-sided from the two interior differences (block size >= 4), its magnitude capped at the
+  // cell value for the non-negative variables (pull_pos_mask / pull_pos_from: density, total
+  // energy, passive scalars of the gas; none of u*) so that no child turns negative.  The
+  // neighbour table is read only for the edge rows.
+  const int je = indcs.je, ke = indcs.ke;
+  const int posmask = pull_pos_mask, posfrom = pull_pos_from;
+  const bool zface = pmy_pack->pmesh->three_d;
+  auto nghbr = pmy_pack->pmb->nghbr;
+  auto mblev = pmy_pack->pmb->mb_lev;
   par_for("shr-pull-pack", DevExeSpace(), 0, nppiece-1, 0, nv*ng-1, 0, nzmax-1, 0, nymax-1,
   KOKKOS_LAMBDA(const int n, const int vd, const int zz, const int yy) {
     if (pp.d_view(n,kPSLoc) == 0) return;
@@ -325,10 +352,28 @@ TaskStatus ShearingBoxCC::PullSend(DvceArray5D<Real> &a) {
       const Real oz = ((kz % f) + 0.5)*rf - 0.5;
       const Real ox = ((sface == 1) ? -1.0 : 1.0)*(((dep % f) + 0.5)*rf - 0.5);
       const Real u0 = a(m, v, kp, jp, ip);
-      Real dl = u0 - a(m, v, kp, jp-1, ip), dr = a(m, v, kp, jp+1, ip) - u0;
-      const Real my = 4.0*PROLONG_CC_SLOPE(dl, dr);
-      dl = u0 - a(m, v, kp-1, jp, ip); dr = a(m, v, kp+1, jp, ip) - u0;
-      const Real mz = 4.0*PROLONG_CC_SLOPE(dl, dr);
+      const bool pos = (v >= posfrom) || (v < 31 && ((posmask >> v) & 1));
+      Real dl, dr;
+      bool one = true;
+      if (jp == js && CoarserFace(nghbr, mblev, m, 8)) {           // x2 inner face
+        dl = a(m, v, kp, jp+1, ip) - u0; dr = a(m, v, kp, jp+2, ip) - a(m, v, kp, jp+1, ip);
+      } else if (jp == je && CoarserFace(nghbr, mblev, m, 12)) {   // x2 outer face
+        dl = a(m, v, kp, jp-1, ip) - a(m, v, kp, jp-2, ip); dr = u0 - a(m, v, kp, jp-1, ip);
+      } else {
+        dl = u0 - a(m, v, kp, jp-1, ip); dr = a(m, v, kp, jp+1, ip) - u0;
+        one = false;
+      }
+      const Real my = one ? PullOneSidedSlope(dl, dr, u0, pos) : 4.0*PROLONG_CC_SLOPE(dl, dr);
+      one = true;
+      if (zface && kp == ks && CoarserFace(nghbr, mblev, m, 24)) {          // x3 inner
+        dl = a(m, v, kp+1, jp, ip) - u0; dr = a(m, v, kp+2, jp, ip) - a(m, v, kp+1, jp, ip);
+      } else if (zface && kp == ke && CoarserFace(nghbr, mblev, m, 28)) {   // x3 outer
+        dl = a(m, v, kp-1, jp, ip) - a(m, v, kp-2, jp, ip); dr = u0 - a(m, v, kp-1, jp, ip);
+      } else {
+        dl = u0 - a(m, v, kp-1, jp, ip); dr = a(m, v, kp+1, jp, ip) - u0;
+        one = false;
+      }
+      const Real mz = one ? PullOneSidedSlope(dl, dr, u0, pos) : 4.0*PROLONG_CC_SLOPE(dl, dr);
       // the face column: its x1 ghosts hold the last collected values (one stage old), except
       // right after a regrid (no slope then)
       Real mx = 0.0;

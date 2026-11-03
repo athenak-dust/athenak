@@ -132,7 +132,9 @@ class Mesh {
   int max_level;  // logical level of maximum refinement grid in Mesh
 
   int nprtcl_thisrank;     // number of particles this rank
-  int nprtcl_total;        // total number of particles across all ranks
+  // total number of particles across all ranks (64-bit: a rank holds fewer than 2^31
+  // particles, all ranks together may hold more; particles/particle_counts.hpp)
+  std::int64_t nprtcl_total;
 
   // following 3x arrays allocated with length [nmb_total] in BuildTreeFromXXXX()
   float *cost_eachmb;            // cost of each MeshBlock
@@ -191,6 +193,9 @@ class Mesh {
  private:
   std::unique_ptr<MeshBlockTree> ptree;  // pointer to root node in binary/quad/oct-tree
   void LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb);
+  // the partition strategy of every LoadBalance of the run (lb_minmax), fixed before the first
+  // partition of BuildTreeFromScratch / BuildTreeFromRestart (load_balance.cpp)
+  void SetLoadBalanceStrategy(ParameterInput *pin);
   int amr_lb_seq_ = 0;
 };
 #endif  // MESH_MESH_HPP_

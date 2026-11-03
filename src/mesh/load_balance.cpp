@@ -15,6 +15,7 @@
 #include "athena.hpp"
 #include "globals.hpp"
 #include "mesh.hpp"
+#include "parameter_input.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
 #include "radiation/radiation.hpp"
@@ -23,6 +24,25 @@
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
 #endif
+
+//----------------------------------------------------------------------------------------
+//! \fn void Mesh::SetLoadBalanceStrategy(ParameterInput *pin)
+//! \brief The strategy of every partition of the run, set before the first one: with the
+//! dust module (<dust>, <hydro> and <particles>) its <dust>/load_balance_minmax (default true;
+//! the dust constructor reads the same key, read here without adding it so that the parameter
+//! dump keeps its order), else the greedy partition.  Before, the dust constructor set
+//! lb_minmax only after the tree was built: the first partition of a run and every restart
+//! were greedy while the regrids used minmax, so a restart on the same ranks could move blocks
+//! (and particles) to other ranks.
+
+void Mesh::SetLoadBalanceStrategy(ParameterInput *pin) {
+  lb_minmax = false;
+  if (pin->DoesBlockExist("dust") && pin->DoesBlockExist("hydro") &&
+      pin->DoesBlockExist("particles")) {
+    lb_minmax = pin->DoesParameterExist("dust", "load_balance_minmax") ?
+                pin->GetBoolean("dust", "load_balance_minmax") : true;
+  }
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn void Mesh::LoadBalance(double *clist, int *rlist, int *slist, int *nlist, int nb)

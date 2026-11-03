@@ -180,6 +180,12 @@ class SelfGravity {
   int topology_ = -1, max_iterations_, restart_;
   int slab_modes_x_ = 0, slab_modes_y_ = 0;
   int phase_threads_ = 0, setup_threads_ = 0;
+  // <gravity>/coarse_phase_quantum (see the constructor): the phase of coarse level l is
+  // CoarsePhase(shift, level_width_[l-1]); level_phase_[l-1] is the phase of its current A_l
+  // and P_{l-1}
+  Real coarse_phase_quantum_ = 0;
+  std::vector<Real> level_width_, level_phase_;
+  std::uint64_t coarse_level_updates_ = 0, coarse_level_skips_ = 0;
   bool phase_serial_only_ = false;
   Real phase_ = 0, tolerance_, gravity_cfl_;
   bool phase_valid_ = false, report_each_solve_;

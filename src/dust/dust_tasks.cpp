@@ -349,6 +349,11 @@ TaskStatus DustGasDrag::SendUstarShr(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage) || !use || psbox_us == nullptr) {
     return TaskStatus::complete;
   }
+  // collected ghost zones (face_levels): a coarser sender's z slope reads the x3 ghost rows of
+  // u*, which at a physical x3 boundary FinishUstarGhosts sets only after the exchange (they
+  // held the previous stage's values); set them now from this stage's u*, as SendU_Shr does for
+  // the gas (the pull reads the fine array only, the coarse receivers included)
+  if (psbox_us->face_levels) UstarX3BCs(ustar, false);
   TaskStatus tstat = psbox_us->PackAndSendCC(ustar, ReconstructionMethod::plm);
   if (tstat == TaskStatus::complete && psbox_us->coarse_on) {
     tstat = psbox_us->PackAndSendCoarseCC(cdummy, ReconstructionMethod::plm);

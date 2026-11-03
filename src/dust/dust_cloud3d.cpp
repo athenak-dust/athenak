@@ -35,8 +35,10 @@
 #include "mesh/meshblock_pack.hpp"
 #include "mesh/nghbr_index.hpp"
 #include "particles/particles.hpp"
+#include "particles/particle_counts.hpp"
 #include "hydro/hydro.hpp"
 #include "dust.hpp"
+#include "dust_split_velocity.hpp"
 
 namespace dust {
 
@@ -60,13 +62,19 @@ int P1Pieces3(const int lobe_old, const bool sep_lo, const bool sep_hi, DPiece3 
   return n;
 }
 
-// the MeshBlock of a new cloud, searched from the block m of its parent
+// the block slot (local or halo) that holds a new cloud, searched from the block m of its
+// parent (-1: none found)
 KOKKOS_INLINE_FUNCTION
-int NewCloudBlock3(const LeafTraversal3D &lt, const Real x, const Real y, const Real z,
-                   const int m, const int ncell123) {
+int NewCloudSlot3(const LeafTraversal3D &lt, const Real x, const Real y, const Real z,
+                  const int m, const int ncell123) {
   const int leaf = lt.LeafOwner(x, y, z, m);
-  const int b = (leaf < 0) ? m : leaf/ncell123;
-  return (b < lt.nmb) ? b : m;
+  return (leaf < 0) ? -1 : leaf/ncell123;
+}
+// the MeshBlock of a new cloud: its slot if that block is on this rank, else its parent's
+// block m (the particle exchange moves it on)
+KOKKOS_INLINE_FUNCTION
+int NewCloudBlock3(const LeafTraversal3D &lt, const int slot, const int m) {
+  return (slot >= 0 && slot < lt.nmb) ? slot : m;
 }
 
 // is the particle split (or a lobe released) now?  The 2-D rule (P1Flag) per direction.
@@ -973,13 +981,14 @@ bool DustGasDrag::CheckHaloReach3D(const char *when) {
   return true;
 }
 
-int DustGasDrag::RouteToOwnerBlocks3D(const char *when) {
+int DustGasDrag::RouteToOwnerBlocks3D(const char *when, const int first) {
   particles::Particles *ppar = pmy_pack->ppart;
   auto *pb = ppar->pbval_part;
   int nchanged = 0, nbad = 0;
 #if MPI_PARALLEL_ENABLED
   ProfLaps laps(false);   // this rank's phases (only with <dust>/amr_profile)
-  WrapParticles3D();
+  // (first > 0: the pieces of this cycle's split, already wrapped into the domain)
+  if (first == 0) WrapParticles3D();
   laps.Lap("wrap");
   const int npart = ppar->nprtcl_thispack;
   auto pr = ppar->prtcl_rdata;
@@ -989,12 +998,12 @@ int DustGasDrag::RouteToOwnerBlocks3D(const char *when) {
   const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
   auto sgid = leaf_slot_gid_d;
   auto srank = leaf_slot_rank_d;
-  if (pb->sendlist.extent_int(0) < std::max(npart, 1)) Kokkos::realloc(pb->sendlist, std::max(npart, 1));
+  pb->ReserveSendlist(npart);
   Kokkos::deep_copy(pb->send_count.d_view, 0);
   auto psendl = pb->sendlist.d_view;
   int *pcounter = pb->send_count.d_view.data();
-  if (npart > 0) {
-    Kokkos::parallel_reduce("dust_route_owner3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  if (npart > first) {
+    Kokkos::parallel_reduce("dust_route_owner3d", Kokkos::RangePolicy<>(DevExeSpace(), first, npart),
     KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
       const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), lt.Anchor(pi(PGID,p)));
       const int slot = (leaf < 0) ? -1 : leaf/ncell123;
@@ -1035,9 +1044,8 @@ int DustGasDrag::RouteToOwnerBlocks3D(const char *when) {
   pb->ClearPrtclRecv();
   laps.Lap("clear");
   Mesh *pm = pmy_pack->pmesh;
-  long long tot = 0;
-  for (int n=0; n<global_variable::nranks; ++n) tot += pm->nprtcl_eachrank[n];
-  pm->nprtcl_total = static_cast<int>(tot);
+  const long long tot = particles::TotalCount(pm->nprtcl_eachrank, global_variable::nranks);
+  pm->nprtcl_total = tot;
   long long sums[2] = {nchanged, nsent};
   MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
   laps.Lap("sums");
@@ -1051,7 +1059,7 @@ int DustGasDrag::RouteToOwnerBlocks3D(const char *when) {
               << " sent to other ranks" << std::endl;
   }
 #else
-  (void)pb; (void)nbad; (void)when;
+  (void)pb; (void)nbad; (void)when; (void)first;
 #endif
   return nchanged;
 }
@@ -1062,12 +1070,28 @@ int DustGasDrag::RouteToOwnerBlocks3D(const char *when) {
 //! \brief The device P1 split in 3-D (SplitCloudsP1Device with a third direction): pieces per
 //! particle, exclusive scan for the slots and tags, one fill kernel; the centre piece keeps its
 //! parent's slot and tag.  Returns the number of split / released particles.
+//! cloud_split_budget > 0: the events are taken in particle index order while fewer than the
+//! budget clouds have been created (the scan offset of an event is the number created before
+//! it, so the taken events are a prefix and keep their offsets); the others wait.  With
+//! cloud_split_resample the anchor blocks of the taken events are marked in split_blk.
 
 int DustGasDrag::SplitCloudsP1Device3D() {
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   const int npart = ppar->nprtcl_thispack;
-  if (npart == 0) return 0;
+  split_last_before = npart;
+  split_last_new = split_last_held = split_last_offrank = split_last_far = 0;
+  split_gid_mark.clear();
+  if (split_blk_mark) {
+    // every slot of the leaf traversal: a piece can land in a halo block (another rank's)
+    const int nslot = std::max(1, leaf_traversal3d.nall);
+    if (split_blk.extent_int(0) != nslot) {
+      split_blk = DvceArray1D<int>("dust_split_blk", nslot);
+    } else {
+      Kokkos::deep_copy(split_blk, 0);
+    }
+  }
+  if (npart == 0) {SplitVelocityPrepare(0); return 0;}   // (collective with mesh_gradient)
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
@@ -1099,14 +1123,48 @@ int DustGasDrag::SplitCloudsP1Device3D() {
     sf += 1;
     if (parent) sp += 1;
   }, Kokkos::Sum<int>(nflag), Kokkos::Sum<int>(nparent));
-  if (nflag == 0) return 0;
+  if (nflag == 0) {SplitVelocityPrepare(0); return 0;}
   EnsureNextTag();
   int ntags = 0;
-  Kokkos::parallel_scan("dust_split3d_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
-    if (final) tagoff(p) = upd;
-    upd += (np(p) > 0) ? np(p) - 1 : 0;
-  }, ntags);
+  long long ntags64 = 0;
+  if (cloud_split_budget > 0) {
+    // 64-bit sum (the clouds asked for may exceed the int range), offsets clamped at the budget
+    const long long budget = cloud_split_budget;
+    Kokkos::parallel_scan("dust_split3d_scan_budget", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, long long &upd, const bool final) {
+      if (final) tagoff(p) = static_cast<int>((upd < budget) ? upd : budget);
+      upd += (np(p) > 0) ? np(p) - 1 : 0;
+    }, ntags64);
+    if (ntags64 <= budget) ntags = static_cast<int>(ntags64);
+  } else {
+    Kokkos::parallel_scan("dust_split3d_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+      if (final) tagoff(p) = upd;
+      upd += (np(p) > 0) ? np(p) - 1 : 0;
+    }, ntags);
+  }
+  if (cloud_split_budget > 0 && ntags64 > cloud_split_budget) {
+    // (the first event has offset 0 and is always taken; at most 26 clouds above the budget)
+    const int budget = cloud_split_budget;
+    int nf = 0, npar = 0, nt = 0, nh = 0;
+    Kokkos::parallel_reduce("dust_split3d_budget", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &sf, int &sp, int &st, int &sh) {
+      if (np(p) == 0) return;
+      if (tagoff(p) >= budget) {np(p) = 0; sh += 1; return;}
+      const int code = pi(PLEV,p);
+      using T = SMRCompositeTransfer;
+      sf += 1;
+      if (T::CloudLobe1(code) == 0 && T::CloudLobe2(code) == 0 && T::CloudLobe3(code) == 0) sp += 1;
+      st += np(p) - 1;
+    }, Kokkos::Sum<int>(nf), Kokkos::Sum<int>(npar), Kokkos::Sum<int>(nt), Kokkos::Sum<int>(nh));
+    nflag = nf; nparent = npar; ntags = nt;
+    split_last_held = nh;
+    cloud_split_held += static_cast<unsigned long long>(nh);
+  }
+  split_last_new = ntags;
+  // (cloud_split_velocity = mesh_gradient) the parents' mean-flow gradients, rows tagoff(p)
+  const bool ai = SplitVelocityPrepare(ntags);
+  auto vg = split_vgrad;
   const int nnew = npart + ntags;
   if (ppar->prtcl_rdata.extent_int(1) < nnew) {
     Kokkos::resize(ppar->prtcl_rdata, nrdata, nnew + nnew/4);
@@ -1117,9 +1175,12 @@ int DustGasDrag::SplitCloudsP1Device3D() {
   // 64-bit tags, the counter moved on (checked) before the fill
   const std::uint64_t tag0 = IssueTags(static_cast<std::uint64_t>(ntags));
   const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
+  const bool mark = split_blk_mark;
+  auto sblk = split_blk;
   Kokkos::parallel_for("dust_split3d_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     if (np(p) == 0) return;
+    if (mark) Kokkos::atomic_fetch_or(&sblk(lt.Anchor(piv(PGID,p))), 1);
     const int code = piv(PLEV,p);
     const Real x = prv(IPX,p), y = prv(IPY,p), z = prv(IPZ,p), mass = prv(IPM,p);
     DPiece3 p1[3], p2[3], p3[3]; int n1, n2, n3, clev; bool parent;
@@ -1149,9 +1210,73 @@ int DustGasDrag::SplitCloudsP1Device3D() {
       if (zmir && lt.x3bc == 1) {   // a reflecting face: the velocity mirrored too
         prv(IPVZ,s) = -prv(IPVZ,s); prv(IPVZ1,s) = -prv(IPVZ1,s);
       }
-      piv(PGID,s) = gids + NewCloudBlock3(lt, cx, cy, cz, lt.Anchor(piv(PGID,s)), ncell123);
+      // mesh_gradient: v += G (piece centroid - parent centroid); a piece mirrored at a reflecting
+      // x3 face gets -(G d)_z, its v_z reversed with the rest (the wall impulse: the pieces'
+      // normal momentum is then not the parent's, as with An)
+      if (ai && n12*n3 > 1) {
+        using T = SMRCompositeTransfer;
+        const Real d1 = p1[a].off*e1 + SplitLobeShift(p1[a].lobe, e1) -
+                        (parent ? 0.0 : SplitLobeShift(T::CloudLobe1(code), e1));
+        const Real d2 = p2[b].off*e2 + SplitLobeShift(p2[b].lobe, e2) -
+                        (parent ? 0.0 : SplitLobeShift(T::CloudLobe2(code), e2));
+        const Real d3 = p3[c].off*e3 + SplitLobeShift(p3[c].lobe, e3) -
+                        (parent ? 0.0 : SplitLobeShift(T::CloudLobe3(code), e3));
+        SplitAddGradient(prv, s, vg, tagoff(p), d1, d2, d3, (zmir && lt.x3bc == 1) ? -1.0 : 1.0);
+      }
+      const int am = lt.Anchor(piv(PGID,s));
+      const int slot = NewCloudSlot3(lt, cx, cy, cz, am, ncell123);
+      if (mark && slot >= 0) Kokkos::atomic_fetch_or(&sblk(slot), 2);   // the block it landed in
+      piv(PGID,s) = gids + NewCloudBlock3(lt, slot, am);
     }
   });
+  if (mark) {
+    // the marked slots as global ids now (a halo rebuild before the R renumbers the slots)
+    auto bh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), split_blk);
+    const int nmb = pmy_pack->nmb_thispack;
+    for (int b=0; b<bh.extent_int(0); ++b) {
+      if (bh(b) == 0) continue;
+      const int g = (b < nmb) ? gids + b
+                  : ((b < static_cast<int>(leaf_slot_gid.size())) ? leaf_slot_gid[b] : -1);
+      if (g >= 0) {split_gid_mark.push_back(g); split_gid_mark.push_back(bh(b));}
+    }
+  }
+  if (mark && nnew > npart) {
+    // (the log of the R after the split) pieces that landed in a block that is neither their
+    // parent's block nor one of its MeshBlock neighbours (across a shear-periodic x1 face the
+    // neighbours are the unshifted blocks; after a hold by the budget pieces lie further away)
+    auto nbr = pmy_pack->pmb->nghbr.d_view;
+    const int nnb = pmy_pack->pmb->nnghbr, nmb = pmy_pack->nmb_thispack;
+    auto sgid = leaf_slot_gid_d;
+    int nfar = 0;
+    Kokkos::parallel_reduce("dust_split3d_far", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &n) {
+      if (np(p) < 2) return;
+      const int am = lt.Anchor(piv(PGID,p));
+      for (int k=1; k<np(p); ++k) {
+        const int s = npart + tagoff(p) + k - 1;
+        const int slot = NewCloudSlot3(lt, prv(IPX,s), prv(IPY,s), prv(IPZ,s), am, ncell123);
+        if (slot < 0 || slot == am) continue;
+        const int g = (slot < nmb) ? gids + slot : sgid(slot);
+        bool near = false;
+        for (int q=0; q<nnb && !near; ++q) near = (nbr(am,q).gid == g);
+        if (!near) ++n;
+      }
+    }, Kokkos::Sum<int>(nfar));
+    split_last_far = nfar;
+  }
+  if (cloud_split_budget > 0 && global_variable::nranks > 1 && nnew > npart) {
+    // pieces whose block is on another rank (they keep their parent's block until moved)
+    const int nmb = pmy_pack->nmb_thispack;
+    int noff = 0;
+    Kokkos::parallel_reduce("dust_split3d_offrank", Kokkos::RangePolicy<>(DevExeSpace(), npart, nnew),
+    KOKKOS_LAMBDA(const int s, int &n) {
+      const int slot = NewCloudSlot3(lt, prv(IPX,s), prv(IPY,s), prv(IPZ,s),
+                                     lt.Anchor(piv(PGID,s)), ncell123);
+      if (slot >= nmb) ++n;
+    }, Kokkos::Sum<int>(noff));
+    split_last_offrank = noff;
+  }
+  if (ai) SplitVelocityCheck(npart, nnew);
   cloud_split_count += nparent;
   cloud_lobe_split_count += nflag - nparent;
   ppar->nprtcl_thispack = nnew;

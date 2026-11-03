@@ -8,6 +8,8 @@
 //! \file hydro.hpp
 //  \brief definitions for Hydro class
 
+#include <algorithm>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -104,8 +106,22 @@ class Hydro {
   bool use_fofc = false;   // flag to enable FOFC
   // x2 fluxes: one team per row of faces (m, k, j), which reconstructs the two rows next to
   // the face itself, instead of one team per (m, k) that walks j and reuses the left states
-  // (on a GPU the walk leaves most of the device idle; the x2 flux was 5x slower than x1)
+  // (on a GPU the unchunked walk left most of the device idle with few blocks; the chunked walk,
+  // flux_walk_teams, is faster again, so this is off by default)
   bool x2_face_parallel = false;
+  // x2 and x3 flux walks (one team per row of cells walks the faces of the direction): with
+  // few MeshBlocks per rank there are too few rows for a GPU, so the faces of a row are split
+  // into chunks until about flux_walk_teams teams exist (<hydro>/flux_walk_teams, read only
+  // when present; default 1024 on device builds, 0 = one chunk per row on host builds).  Each
+  // chunk reconstructs the cell before its first face once more: the results do not depend on it
+  int flux_walk_teams = 0;
+  int WalkChunks(int nmb, int nrows, int nfaces) const {
+    if (flux_walk_teams <= 0 || nfaces < 16) return 1;
+    const int64_t nouter = static_cast<int64_t>(nmb)*nrows;
+    const int64_t n = (flux_walk_teams + nouter - 1)/nouter;
+    // at most 2^15 chunks: the chunk ends c nf/nch are formed in 32 bits with c r < nch^2 < 2^30
+    return static_cast<int>(std::max<int64_t>(1, std::min<int64_t>({n, nfaces/8, 32768})));
+  }
 #ifdef ATHENAK_HYDRO_FLUX_PROBE
   // diagnostic: x1 face states and fluxes of MeshBlock 0, row (ks,js),
   // written to flux_probe.txt for every stage of the first probe_ncycle cycles

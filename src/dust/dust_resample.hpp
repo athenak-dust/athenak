@@ -70,7 +70,8 @@ struct DevicePatchProblem {
   DvceArray1D<unsigned long long> stage;
   bool qr_rows = false;   // the QR update shares the rows as well (cloud_resample_qr_rows)
   // 3-D, <dust>/cloud_resample_rank_screen: patches whose clouds do not outnumber their nominal
-  // rows (7 leaves + 6 + centre-of-mass rows) are left as they are, before any bucket
+  // rows (7 leaves + 6 + centre-of-mass rows, + the cross-moment rows in a flagged patch) are
+  // left as they are, before any bucket
   bool rank_screen = false;
 };
 // stages: 0 rows and scaling, 1 QR, 2 null vectors, 3 end-point steps, 4 the whole stream
@@ -90,14 +91,44 @@ inline unsigned long long *StageTotals() {
   static unsigned long long t[kNStage] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   return t;
 }
+// <dust>/cloud_resample_xv_rows (3-D; default angmom): xv = 0 none, 1 angmom, 2 full.  The rows
+// follow the feedback rows (the rows of xv = 0 and their order are unchanged):
+//   angmom: sum w (x - c) x (v - u) / h, the three components, h the largest half width of
+//           the patch (one length, so the rows are the physical angular momentum),
+//   full:   sum w ((x - c)_a / h_a) (v - u)_b, a, b = 1..3 (h_a the half widths, as the
+//           centre-of-mass rows),
+// c the patch centre (pgeo), x the position unwrapped about it as for the centre-of-mass rows,
+// u the patch's mass-weighted mean velocity before R (the reference of the momentum rows).  The
+// solver scales every row by its largest entry, so the absolute scale above is cosmetic.  Each
+// mode is its own instantiation of the solve kernels, so xv = 0 compiles the kernels as before.
+// The rows go only to the flagged patches (xflag below).  A patch is unflagged only when all its
+// pool clouds have one level L, every footprint leaf is at level >= L, no cloud support crosses a
+// physical x3 face and the footprint spans less than a period in every periodic direction; there
+// the existing rows already fix all nine cross moments and the six spatial second moments (the
+// hat of a cloud is box * box of the level-L cell width: leaf values a_l = the centre of the
+// level-L cell holding leaf l give sum_l a_l W_il = x_i; the cell-integrated hat is a quadratic
+// B-spline on the level-L grid, which reproduces x^2 up to one constant per width), so those
+// patches are solved by the xv = 0 kernels, with the result of none.  Rows per flagged patch:
+// angmom 3 (+ 3 in a rotating frame, xv_rot), full 9 (+ 3).
+KOKKOS_INLINE_FUNCTION
+constexpr int XVRows(const int xv) {return (xv == 1) ? 3 : ((xv == 2) ? 9 : 0);}
 // mid > 64: patches of 65 .. mid clouds form a middle bucket solved with teams of mid_team threads;
 // mid <= 64: only the two buckets of at most 64 and of more than 64 clouds.  wide_team > 512: the
 // large bucket with teams of up to 1024 threads (a kernel bound to 1024 threads).
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
                         const int mid, const int mid_team, const int wide_team,
-                        double timing[5], long long *screened = nullptr);
+                        double timing[5], long long *screened = nullptr, const int xv = 0,
+                        const DvceArray1D<int> &xflag = DvceArray1D<int>(),
+                        const bool xv_rot = false, const double xv_q = 0.0);
 // screened (pb.rank_screen): [0] patches left out by the screen, [1] their clouds
+// xv: the cross-moment rows above (3-D only; 2-D callers leave 0).  xflag (npatch): the patches
+// that get them (ResampleClouds3D, the rule above: several cloud levels, a cloud finer than a
+// footprint leaf, an x3 fold or an ambiguous unwrapping); every other patch is solved by the
+// xv = 0 kernels, bitwise as without the rows.  xv != 0 with an empty xflag: every patch.
+// xv_rot (shearing box, omega0 != 0) with shear parameter xv_q: each flagged patch also gets the
+// three rows (q - 1) S_xz, S_yz, (1 - q) S_xx + S_yy of S = sum w (x - c)(x - c)^T, so that the
+// inertial J (stored v2 is shear-relative: J_in = J + omega (those three)) is kept as well.
 
 // Totals of one resampling over its patches (the log row), reduced on the device from outi /
 // outr, so that no per-patch data goes to the host: patches with clouds, pool,

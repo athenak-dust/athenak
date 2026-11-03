@@ -272,10 +272,11 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
         }
       }
     }, Kokkos::Sum<int>(bad));
+    long long nbad = bad;   // (all ranks: summed in 64 bits)
 #if MPI_PARALLEL_ENABLED
-    MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &nbad, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
 #endif
-    if (bad > 0) ScienceFail(std::to_string(bad) + " particles outside their block's stencil");
+    if (nbad > 0) ScienceFail(std::to_string(nbad) + " particles outside their block's stencil");
     pbval_qp->InitRecvDep(5);
     pbval_qp->PackAndSendDeposit(science_work_);
     while (pbval_qp->RecvAndSumDeposit(science_work_) != TaskStatus::complete) {}
@@ -490,11 +491,15 @@ void DustGasDrag::ParticleHistory(double row[16]) {
   for (int c=0; c<4; ++c) row[8 + c] = where[c];
 
   // ---- the interval records (UpdateStiffness, the G / R counters), then reset
+  SyncStiffness();   // stiff_thresh <= 0: the records of the ranks are on the device
   row[12] = back_reaction ? static_cast<double>(phst_chi_max) : -1.0;
   row[13] = (back_reaction && stiff_thresh > 0.0) ? static_cast<double>(phst_dt_stiff_min) : -1.0;
   row[14] = sums[kSums];
   row[15] = sums[kSums + 1];
   phst_chi_max = -1.0;
+  if (stiff_diag_dev.is_allocated()) {
+    Kokkos::deep_copy(Kokkos::subview(stiff_diag_dev, 2), static_cast<Real>(-1.0));
+  }
   phst_dt_stiff_min = -1.0;
   phst_g_events = 0;
   phst_r_removed = 0;

@@ -308,6 +308,18 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
         pnode = new MeshBinaryOutput(pin,pm,opar);
         pout_list.insert(pout_list.begin(),pnode);
       } else if (opar.file_type.compare("pbin") == 0) {
+        // the particle real columns (positions, velocities, mass, stopping time) as float32
+        // on request; float64 stays the default (the block table is always float64)
+        if (pin->DoesParameterExist(opar.block_name, "precision")) {
+          const std::string prec = pin->GetString(opar.block_name, "precision");
+          if (prec != "single" && prec != "double") {
+            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Output block '" << opar.block_name << "': precision must be "
+                << "single or double" << std::endl;
+            exit(EXIT_FAILURE);
+          }
+          opar.pbin_single = (prec == "single");
+        }
         pnode = new ParticleBinaryOutput(pin,pm,opar);
         pout_list.insert(pout_list.begin(),pnode);
       } else if (opar.file_type.compare("phst") == 0) {

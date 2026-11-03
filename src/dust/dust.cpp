@@ -162,6 +162,21 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   // refinable clouds on a 3-D mesh (dust_cloud3d.cpp)
   clouds3d = pmy_pack->pmesh->three_d && smr_transfer_mode == DustSMRTransfer::refinable_cloud;
+  // <dust>/point_sort_interval = N (default 50; 0: never): point particles (no refinable clouds)
+  // are reordered in their arrays by (MeshBlock, k, j, i) of their cell every N cycles, at the
+  // start of the cycle (RefineClouds -> SortParticles, the cloud path's sort).  The TSC
+  // deposits and gathers then touch neighbouring cells from neighbouring threads (a fresh
+  // dust_si_strat run stores its particles in random order; sorted, a large uniform run steps
+  // several times faster).  Only the order
+  // of the deposit sums changes (round-off; GPU atomics have no fixed order anyway): every
+  // column moves with its particle, tags included; no point-particle state is kept per
+  // array slot across the start of a cycle (stage registers are refilled at stage 1, the
+  // gravity kick of point particles regathers in full).
+  if (smr_transfer_mode != DustSMRTransfer::refinable_cloud) {
+    // default 50: the step time stays flat over the 50 cycles between sorts, and the sort costs
+    // little per cycle at this interval; 0 turns it off
+    point_sort_interval = std::max(0, pin->GetOrAddInteger("dust", "point_sort_interval", 50));
+  }
   // shear-periodic x1 in the leaf traversal (the cloud supports across
   // the radial boundaries on the sheared image)
   shear3d = clouds3d &&
@@ -185,7 +200,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   lb_cloud_weight = pin->GetOrAddReal("dust", "load_balance_cloud_weight", 4.0);
   lb_log_interval = pin->GetOrAddInteger("dust", "load_balance_log", 0);
   lb_octant_count = pin->GetOrAddBoolean("dust", "load_balance_octant_count", true);
-  // the partition of the regrids with the smallest largest rank cost (Mesh::LoadBalance)
+  // the partition with the smallest largest rank cost (Mesh::LoadBalance); the mesh has read
+  // the same key before its first partition (Mesh::SetLoadBalanceStrategy)
   pmy_pack->pmesh->lb_minmax = pin->GetOrAddBoolean("dust", "load_balance_minmax", true);
   if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {   // (block map: the only one)
     halo_trigger_cells = std::max(0, pin->GetOrAddInteger("dust", "amr_rho_buffer", 2));
@@ -537,6 +553,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // too); the host split needs the finite fine-grid table (few levels, one rank) and stays a
       // reference, selected explicitly
       cloud_split_device = pin->GetOrAddBoolean("dust", "cloud_split_device", true);
+      ReadSplitVelocityKeys(pin);   // <dust>/cloud_split_velocity (dust_split_velocity.cpp)
       // test switch; false keeps every cloud at its level whatever the mesh
       cloud_split_enable = pin->GetOrAddBoolean("dust", "cloud_split_enable", true);
       // G (quantum merge under the pass budget): on in default and careful_merge (a full AMR
@@ -773,9 +790,50 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           "cloud_resample_batch_pairs", 1073741824.0));
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
       // (3-D refinable clouds only; 2-D ignores it): the device solve leaves out the
-      // patches of n clouds on nl leaves with n <= 7 nl + 9 (the nominal rows: no null vector is
-      // certain there).  false: every patch is solved (the reference path)
+      // patches of n clouds on nl leaves with n <= 7 nl + 9 (+ the cross-moment rows in a flagged
+      // patch; the nominal rows: no null vector is certain there).  false: every patch is solved
+      // (the reference path)
       cloud_resample_rank_screen = pin->GetOrAddBoolean("dust", "cloud_resample_rank_screen", true);
+      // (3-D refinable clouds) rows of the position-velocity cross moments sum m (x - c)_a (v - u)_b
+      // per patch (c the patch centre, u the patch mean velocity before R), only in the flagged
+      // patches (dust_resample.hpp: several cloud levels, a cloud finer than a footprint leaf, a
+      // physical x3 fold or an ambiguous periodic unwrapping; elsewhere the existing rows already
+      // fix them and those patches solve bitwise as with none): angmom (default in 3-D; the 3
+      // components of sum m (x - c) x (v - u): with the patch mass, centre of mass and momentum
+      // kept, the patch angular momentum about its centre of mass; in a shearing box + 3 rows of
+      // spatial second moments, so that the inertial J is kept too), full (all 9 cross moments,
+      // + the same 3 in a shearing box), none (no extra rows anywhere).  2-D has no such rows: the
+      // key, read there only when present, must be none
+      {
+        std::string xv;
+        if (clouds3d) {
+          xv = pin->GetOrAddString("dust", "cloud_resample_xv_rows", "angmom");
+        } else {
+          xv = pin->DoesParameterExist("dust", "cloud_resample_xv_rows")
+             ? pin->GetString("dust", "cloud_resample_xv_rows") : "none";
+        }
+        if (xv == "none") {
+          cloud_resample_xv_rows = 0;
+        } else if (xv == "angmom") {
+          cloud_resample_xv_rows = 1;
+        } else if (xv == "full") {
+          cloud_resample_xv_rows = 2;
+        } else {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << "<dust>/cloud_resample_xv_rows must be none, angmom or full" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        if (cloud_resample_xv_rows != 0 && !clouds3d) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << "<dust>/cloud_resample_xv_rows = " << xv << " exists only for 3-D "
+                    << "refinable clouds (the 2-D resampling has no cross-moment rows)" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        // diagnostic: per R pass the changes of J about the centre of mass of all clouds, of the
+        // per-patch moments and of the leaf masses and momenta (3-D, extra kernels only)
+        cloud_resample_xv_audit = pin->DoesParameterExist("dust", "cloud_resample_xv_audit") &&
+                                  pin->GetBoolean("dust", "cloud_resample_xv_audit");
+      }
       // the per-patch solves on the device (same patches and algorithm; false keeps the host
       // solves).  The default follows the build: the device solver when the
       // default execution space is not a host space (GPU builds), the threaded host solver
@@ -871,6 +929,22 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // unless the scheduled resampling falls on that cycle
       cloud_resample_after_derefine = pin->GetOrAddBoolean("dust",
                                          "cloud_resample_after_derefine", false);
+      // the split budget (most clouds one rank's split pass creates per cycle, 0: no limit) and
+      // the local R right after a split pass that created at least cloud_split_resample_frac of
+      // the clouds or held events back; both off by default, 3-D refinable clouds only
+      cloud_split_budget = pin->GetOrAddInteger("dust", "cloud_split_budget", 0);
+      cloud_split_resample = pin->GetOrAddBoolean("dust", "cloud_split_resample", false);
+      cloud_split_resample_frac = pin->GetOrAddReal("dust", "cloud_split_resample_frac", 0.05);
+      if (cloud_split_budget < 0 || cloud_split_resample_frac < 0.0 ||
+          ((cloud_split_budget > 0 || cloud_split_resample) && !clouds3d) ||
+          (cloud_split_resample && !cloud_resample)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "<dust>/cloud_split_budget (>= 0) and cloud_split_resample "
+                  << "(cloud_split_resample_frac >= 0) are for 3-D refinable clouds; "
+                  << "cloud_split_resample needs cloud_resample" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      split_blk_mark = cloud_split_resample;
       if (cloud_resample && ((!cloud_resample_by_time && cloud_resample_interval < 1) ||
                              cloud_resample_patch < 1 || cloud_resample_patch_split < 0 ||
                              cloud_resample_patch_max < 0 || cloud_resample_patch_max == 1 ||
@@ -1135,6 +1209,16 @@ void DustGasDrag::PrintRefinablePreset() const {
             << cloud_gather_order << ", transition " << cloud_transition << "; " << g.str()
             << std::endl
             << "#   " << r.str() << std::endl;
+  if (cloud_split_budget > 0 || cloud_split_resample) {
+    std::cout << "#   split budget " << cloud_split_budget << " clouds per rank and cycle"
+              << (cloud_split_budget > 0 ? "" : " (no limit)") << "; R after a split "
+              << (cloud_split_resample ? "on" : "off");
+    if (cloud_split_resample) {
+      std::cout << " (when it created " << cloud_split_resample_frac
+                << " of the clouds or held events back)";
+    }
+    std::cout << std::endl;
+  }
   if (!refinable_given.empty()) {
     std::cout << "#   given explicitly:" << refinable_given << std::endl;
   }
@@ -1200,6 +1284,11 @@ DustGasDrag::~DustGasDrag() {
     }
     std::cout << std::endl;
   }
+  if (global_variable::my_rank == 0 && point_sort_interval > 0) {
+    std::cout << std::setprecision(6) << "# DUST_POINT_SORT interval=" << point_sort_interval
+              << " sorts=" << point_sort_count << " seconds=" << point_sort_seconds
+              << " (rank 0, fenced)" << std::endl;
+  }
   if (global_variable::my_rank == 0 && StiffnessActive()) {
     std::cout << std::setprecision(6) << "# DUST_STIFFNESS max_chi=" << stiff_chi_run_max
               << " last_chi=" << stiff_chi_last << " stiff_thresh=" << stiff_thresh
@@ -1209,7 +1298,8 @@ DustGasDrag::~DustGasDrag() {
     // rank 0's fenced phase times (s) and calls
     const char *names[kProfN] = {"trigger", "amr_total", "regrid_mesh", "regrid_dust_rebuild", "refine_clouds",
                                  "split", "regrid_event_GR", "scheduled_R", "scheduled_G", "sort", "cell_order",
-                                 "trigger_deposit", "trigger_copy", "trigger_blocks", "trigger_log"};
+                                 "trigger_deposit", "trigger_copy", "trigger_blocks", "trigger_log",
+                                 "split_R"};
     std::cout << "# DUST_AMR_PROFILE";
     for (int k=0; k<kProfN; ++k) {
       std::cout << " " << names[k] << "=" << std::setprecision(6) << prof_time[k] << "(" << prof_count[k] << ")";
@@ -1240,6 +1330,22 @@ DustGasDrag::~DustGasDrag() {
               << (cloud_resample_cold_alpha > 0.0 ? " resample_cold_skips=" +
                   std::to_string(cloud_resample_cold_skips) : std::string())
               << " lobe_splits=" << cloud_lobe_split_count
+              << (cloud_split_max_level >= 0 ? " cloud_instant_switches=" +
+                                                  std::to_string(cloud_instant_switch_count)
+                                          : std::string())
+              << (cloud_split_max_level >= 0 ? " root_mass=" + [this] {
+                    // the root-cloud masses R and G used (recorded before the first switch)
+                    std::ostringstream o;
+                    o << std::setprecision(17);
+                    for (std::size_t s=0; s<cloud_merge_mroot.size(); ++s) {
+                      o << (s ? "," : "") << cloud_merge_mroot[s];
+                    }
+                    return o.str();
+                  }() : std::string())
+              << (cloud_split_budget > 0 ? " split_held=" + std::to_string(cloud_split_held)
+                                         : std::string())
+              << (cloud_split_resample ? " split_resamples=" + std::to_string(split_resample_calls)
+                                       : std::string())
               << (cloud_merge ? " coarsen_events=" + std::to_string(cloud_coarsen_events) +
                   " coarsen_in=" + std::to_string(cloud_coarsen_in) +
                   " coarsen_reject=" + std::to_string(cloud_coarsen_reject) +
@@ -1251,6 +1357,7 @@ DustGasDrag::~DustGasDrag() {
                                                                   : pmy_pack->ppart->nprtcl_thispack)
               << ((global_variable::nranks > 1) ? " counters=rank0" : "") << std::endl;
   }
+  SplitVelocitySummary();   // (cloud_split_velocity = mesh_gradient) one line per rank
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
       (cloud_order_interval > 0 || cloud_sort_interval > 0)) {
     // every rank: launches of the cloud kernels in the index order and in storage order (the
@@ -1324,6 +1431,9 @@ DustGasDrag::~DustGasDrag() {
   if (pbval_solver_copy != nullptr) delete pbval_solver_copy;
   if (pbval_solver_add != nullptr) delete pbval_solver_add;
   if (psbox_us != nullptr) {delete psbox_us;}
+  // the general deposit remap (after the exchanges that point to it); its destructor joins a
+  // shear prefetch thread that may still run
+  if (dep_plan != nullptr) {delete dep_plan; dep_plan = nullptr;}
 }
 
 //----------------------------------------------------------------------------------------

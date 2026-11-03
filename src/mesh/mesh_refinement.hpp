@@ -117,6 +117,11 @@ class MeshRefinement {
   int ShearFaceTreeRefine(int &nnew);
   bool ShearFaceDerefineOK(const LogicalLocation &parent);
   void CheckShearFaceLevels(const double twin = -1.0);
+  // the same rule for static meshes, for every shear offset: the face blocks of a new tree are
+  // refined until it holds (BuildTreeFromScratch), a restart whose mesh breaks it stops
+  // (BuildTreeFromRestart); one line on rank 0
+  static void ShearFaceStaticTree(Mesh *pm);
+  static void ShearFaceStaticCheck(Mesh *pm);
   bool test_shear_face_check = false;   // <mesh_refinement>/test_shear_face_check (tests only)
   // the time until which the shear-face rule holds on the current mesh; between the mesh checks
   // a check of that rule alone runs when the next step could pass it.  shear_twin: the window of

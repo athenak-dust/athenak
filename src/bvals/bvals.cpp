@@ -462,6 +462,25 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
 
   // create unique communicator for particles
   MPI_Comm_dup(MPI_COMM_WORLD, &mpi_comm_part);
+
+  // the largest MPI message of the particle exchange (msg_chunk_bytes): the smallest value of
+  // ATHENA_PART_MSG_CHUNK (bytes) of all ranks if one sets it (sender and receiver must split
+  // a message alike), else 1 GiB
+  {
+    unsigned long long chunk = msg_chunk_bytes;
+    const char *e = std::getenv("ATHENA_PART_MSG_CHUNK");
+    if (e != nullptr && e[0] != '\0') {
+      const unsigned long long v = std::strtoull(e, nullptr, 10);
+      if (v > 0) chunk = std::min<unsigned long long>(chunk, v);
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &chunk, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, MPI_COMM_WORLD);
+    msg_chunk_forced = (chunk < msg_chunk_bytes);
+    msg_chunk_bytes = static_cast<std::size_t>(chunk);
+    if (msg_chunk_forced && global_variable::my_rank == 0) {
+      std::cout << "# particles: MPI messages of the particle exchange split every "
+                << msg_chunk_bytes << " bytes (ATHENA_PART_MSG_CHUNK)" << std::endl;
+    }
+  }
 #endif
 
   // With shear-periodic x1 boundaries, build the (side, lx3, lx2) -> gid/rank maps of
@@ -553,4 +572,11 @@ void particles::ParticlesBoundaryValues::BuildShearMaps() {
 // destructor
 
 particles::ParticlesBoundaryValues::~ParticlesBoundaryValues() {
+#if MPI_PARALLEL_ENABLED
+  if (msg_chunk_forced) {   // the test of the split path: how many messages were split
+    std::cout << "# particles: rank " << global_variable::my_rank << " posted " << nmsg_prtcl
+              << " particle messages as " << nmsg_mpi << " MPI messages (split every "
+              << msg_chunk_bytes << " bytes)" << std::endl;
+  }
+#endif
 }
