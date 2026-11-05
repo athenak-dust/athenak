@@ -926,6 +926,10 @@ void ProblemGenerator::CallProblemGenerator(ParameterInput *pin, bool is_restart
     DustFreeFall(pin, is_restart);
   } else if (pgen_fun_name.compare("dust_jeans") == 0) {
     DustJeans(pin, is_restart);
+  } else if (pgen_fun_name.compare("dust_sg_shwave") == 0) {
+    DustSGShwave(pin, is_restart);
+  } else if (pgen_fun_name.compare("dust_gas_shwave") == 0) {
+    DustGasShwave(pin, is_restart);
   } else if (pgen_fun_name.compare("dusty_wave") == 0) {
     DustyWave(pin, is_restart);
   } else if (pgen_fun_name.compare("linear_wave") == 0) {

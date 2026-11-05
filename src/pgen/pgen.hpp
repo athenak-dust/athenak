@@ -79,6 +79,8 @@ class ProblemGenerator {
   void DustyWaveAMR(ParameterInput *pin, const bool restart);
   void DustFreeFall(ParameterInput *pin, const bool restart);
   void DustJeans(ParameterInput *pin, const bool restart);
+  void DustSGShwave(ParameterInput *pin, const bool restart);
+  void DustGasShwave(ParameterInput *pin, const bool restart);
   void DustyWave(ParameterInput *pin, const bool restart);
   void LinearWave(ParameterInput *pin, const bool restart);
   void LWImplode(ParameterInput *pin, const bool restart);

@@ -1,0 +1,105 @@
+# Shearing wave of gas and dust particles coupled by drag, without gravity (Youdin & Johansen 2007; Yang &
+# Johansen 2016, ApJS 224, 39, Sec. 4.1, Figs. 5-8), problem generator dust_gas_shwave.
+# Units c_s = Omega = rho_g0 = 1, q = 3/2.  Box 2 pi x 2 pi in x-y (L = 2 pi c_s/Omega reproduces their figures;
+# the paper does not state L); AthenaK has no 2-D x-y shearing box, so the wave is uniform in z across 8 cubic
+# cells (periodic).  k_x0 = -2 pi/L = -1, k_y = 2 pi/L = 1; initially u_y = 1e-3 c_s cos(k.x), every other
+# amplitude zero.  64 x 64 (x 8) cells, one particle per cell on a lattice, as Yang & Johansen.
+#
+# The four cases (taus_1 = Omega t_s, eps_1 = rho_p0/rho_g0), as overrides of this file (Fig. 5):
+#   Fig. 5  (1, 1)        no override
+#   Fig. 6  (1e-3, 1)     dust/taus_1=1e-3
+#   Fig. 7  (1e-3, 10)    dust/taus_1=1e-3 dust/dust_to_gas=10 problem/eps_1=10
+#   Fig. 8  = Fig. 7 with the initial transient resolved: add problem/ysw_dt0=2.3e-5 (the first time step)
+# e.g.  mpirun -np 4 athena -i dust_gas_shwave.athinput dust/taus_1=1e-3
+#
+# Drag coupling: coupling = imex with <time>/integrator = imex2+ runs all four cases; pc2 is stable for Figs. 5-6
+# but diverges for Figs. 7-8.  Particles: refinable clouds (amr_pic = refinable_cloud, P1 hats of the cell size on
+# this uniform mesh); with point particles (TSC) the imex run stops with a deposit-halo violation in the shearing
+# box.  The time step (~0.011) is set by the particle CFL with the shear velocity (particles are not orbital-
+# advected), so dt/t_s ~ 11 for t_s = 1e-3.
+#
+# Test: yswave.dat, the complex amplitudes of rho_g, u_x, u_y, rho_p, v_x, v_y (columns 3-14) against the
+# linear solution (columns 15-26: Yang & Johansen eq. 45, RK4 in steps h <= t_s/(1 + eps)/20), to t = 6/Omega.
+# Runtime: t = 0 -> 6, ~20 s on 4 CPU cores.
+
+<job>
+basename = ysw
+
+<output1>
+file_type = hst
+dt = 0.1
+data_format = %.17e
+
+<mesh>
+nghost = 4
+nx1 = 64
+x1min = -3.141592653589793
+x1max = 3.141592653589793
+ix1_bc = shear_periodic
+ox1_bc = shear_periodic
+nx2 = 64
+x2min = -3.141592653589793
+x2max = 3.141592653589793
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 8
+x3min = -0.39269908169872414   # 8 cells of 2pi/64
+x3max = 0.39269908169872414
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 8
+
+<time>
+evolution = dynamic
+integrator = imex2+
+cfl_number = 0.3
+nlim = -1
+tlim = 6.0
+ndiag = 100
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hllc
+
+<shearing_box>
+qshear = 1.5
+omega0 = 1.0
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+ppc = 1
+
+<dust>
+nspecies = 1
+taus_1 = 1.0                  # Omega t_s
+dust_to_gas = 1.0
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+coupling = imex               # pc2 (with <time>/integrator = rk2) diverges for Fig. 7/8
+amr_pic = refinable_cloud
+
+<problem>
+pgen_name = dust_gas_shwave
+user_hist = true
+rho0 = 1.0
+eps_1 = 1.0                   # rho_p0/rho_g0
+cloud_root_random = true      # root parents (point particles on a uniform mesh)
+root_placement = lattice
+ysw_nx = -1                   # kx0 = -2pi/L
+ysw_ny = 1                    # ky = 2pi/L
+ysw_rhog = 0.0                # initial real amplitudes of cos(k.x)
+ysw_ux = 0.0
+ysw_uy = 1.0e-3
+ysw_rhop = 0.0
+ysw_vx = 0.0
+ysw_vy = 0.0
+ysw_dt = 0.02                 # yswave.dat cadence
+ysw_dt0 = 0.0                 # >0: the first time step (resolves the initial transient)
