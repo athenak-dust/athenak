@@ -52,6 +52,8 @@ add_executable(
         pgen/tests/self_gravity_wave.cpp
         pgen/dust_amr/dust_freefall.cpp
         pgen/dust_amr/dust_jeans.cpp
+        pgen/dust_amr/dust_sg_shwave.cpp
+        pgen/dust_amr/dust_gas_shwave.cpp
         pgen/dust_amr/dust_setup.cpp
         pgen/dust_amr/dust_refine_from.cpp
         pgen/dust_amr/dust_clouds_from.cpp
