@@ -40,7 +40,7 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
   // faces.  PlanPull picks the receivers by position (the blocks on the x1
   // faces) but the senders from the shear-periodic boundary lists, so with periodic x1 the face
   // blocks got collected x1 ghosts without any sender and the gas mass leaked through the x1 faces
-  // The face-centred (MHD) shearing-box exchange has no collected (pull) version: with MHD the
+  // The face-centered (MHD) shearing-box exchange has no collected (pull) version: with MHD the
   // shearing box keeps the original two-step exchange, which supports a uniform mesh only.
   const bool mhd = pin->DoesBlockExist("mhd");
   face_levels = !mhd &&
@@ -54,6 +54,9 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
     std::exit(EXIT_FAILURE);
   }
   report_timing = pin->GetOrAddBoolean("shearing_box", "report_timing", false);
+  // test switch (default false): true = the collected x1 ghost zones in one round, with the x
+  // slope of a coarser sender from its x1 ghosts of the previous stage (PullSend)
+  pull_lagged_xslope = pin->GetOrAddBoolean("shearing_box", "test_pull_lagged_xslope", false);
   // with face_levels, non-periodic x3 needs the physical boundary values of the coarse
   // arrays for the corners the collected ghost zones leave to them; dust
   // (u* through the same collection, deposits through the general remap, particle routing by the
@@ -86,7 +89,8 @@ ShearingBox::~ShearingBox() {
   if (report_timing) {   // per rank
     std::cout << "# shearing box timing rank " << global_variable::my_rank << ": PlanPull "
               << n_plan_pull << " calls " << t_plan_pull << " s, flux plans " << n_plan_flux
-              << " calls " << t_plan_flux << " s (host)" << std::endl;
+              << " calls " << t_plan_flux << " s (host); plans with several rounds "
+              << n_pull_multi << ", with a one-sided edge row " << n_pull_edge << std::endl;
   }
   FreeRequests();
 }

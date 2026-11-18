@@ -9,6 +9,8 @@
 //  \brief provides classes to handle ALL types of data output
 
 #include <cctype>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -420,7 +422,16 @@ class ParticleBinaryOutput : public BaseTypeOutput {
   ParticleBinaryOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
   void LoadOutputData(Mesh *pm) override;
   void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+  // pack this rank's active rows of each named particle column on the device and hand the
+  // host copy to sink(column index, data, bytes); columns of a rank without rows are skipped
+  // (public: nvcc does not allow extended device lambdas in a private or protected member)
+  void PackParticleColumns(Mesh *pm, const std::vector<std::string> &names,
+                           const std::vector<std::uint64_t> &itemsizes,
+                           const std::function<void(std::size_t, const void *,
+                                                    std::uint64_t)> &sink);
  protected:
+  bool compress_ = false;           // hidden <outputN>/test_pbin_compress = shuffle_deflate
+  std::uint64_t chunk_rows_ = 0;     // rows per compressed chunk (test_pbin_chunk_rows)
   DvceArray1D<int> active_;          // indices of this rank's active rows (mass != 0)
   int nactive_ = 0;                  // number of them
   long long nzero_ = 0;              // zero-mass rows left out (this rank)

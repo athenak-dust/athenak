@@ -404,8 +404,8 @@ void DustGasDrag::DepositSpeciesScienceFields(DvceArray5D<Real> &out) {
 //!   velocities); row[5] ekin = sum m |v|^2/2; row[6] z_rms = sqrt(sum m z^2/sum m), z = x3 in
 //!   3-D, x2 (the vertical of the 2-D r-z box) in 2-D; row[7] rho_max, the largest dust density
 //!   on the active cells (DepositScienceFields, mass only: the representation of the run,
-//!   deposited from the particles of this time, bit for bit dust_total_rho); row[8..10] the centre of that cell, row[11] its level above
-//!   the root (if rho_max = 0: centre 0, level -1); row[12] chi_max, row[13] dt_stiff_min (the
+//!   deposited from the particles of this time, bit for bit dust_total_rho); row[8..10] the center of that cell, row[11] its level above
+//!   the root (if rho_max = 0: center 0, level -1); row[12] chi_max, row[13] dt_stiff_min (the
 //!   interval records of UpdateStiffness; -1 without back-reaction, without a PC2 cycle in the
 //!   interval, or, for dt_stiff_min, without stiff_thresh); row[14] coarsening events (G groups,
 //!   and stage X families where X is on) and row[15] particles removed by R since the previous

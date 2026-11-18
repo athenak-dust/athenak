@@ -65,9 +65,9 @@ int PostPrtclMessage(const bool send, T *buf, const std::size_t count, const std
 // Capacity of a particle message buffer (send or receive, reals or ints) for `required`
 // values: half again above the new high-water mark, at least 4096 particles' worth.  The exact
 // size reallocated a buffer whenever a message set a new maximum
-// (with 32 ranks and four buffers each, about once per cycle on some rank after 100 cycles);
-// a new device buffer must be registered with the network/IPC layers at its first message,
-// which held the receiver for 5-30 ms while all others waited in the MPI_Allgather that ends
+// (with many ranks, often on some rank); a new device buffer must be registered with the
+// network/IPC layers at its first message, which held the receiver while all others waited
+// in the MPI_Allgather that ends
 // RecvAndUnpackPrtcls.  Only valid prefixes are packed and passed
 // to MPI, so the capacity does not change any result.
 template <typename View>
@@ -332,7 +332,7 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
       };
       // An empty edge or corner slot: the region is covered by a coarser MeshBlock
       // that is stored only once, under the lower-dimensional direction from which it is
-      // reached (e.g. the x1 face neighbour also covers the x1x2 edge when the x2 crossing
+      // reached (e.g. the x1 face neighbor also covers the x1x2 edge when the x2 crossing
       // stays inside this MeshBlock's parent).  That direction keeps the components of the
       // crossing that leave the parent; the parity of the logical location tells which half
       // of its parent this MeshBlock is.
@@ -443,7 +443,7 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
   });
 #if MPI_PARALLEL_ENABLED
   // one rank: nothing can leave it, so no count, no copy to the host and no MPI calls
-  // (they made an MPI build about 13% slower than a serial one on one GPU)
+  // (they made an MPI build on one GPU noticeably slower than a serial one)
   if (global_variable::nranks == 1) {
     nprtcl_send = 0;
     return TaskStatus::complete;

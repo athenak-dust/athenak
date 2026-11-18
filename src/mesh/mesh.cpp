@@ -27,6 +27,7 @@
 #include "diffusion/resistivity.hpp"
 #include "diffusion/conduction.hpp"
 #include "dust/dust_input.hpp"
+#include "dust/dust.hpp"
 #include "radiation/radiation.hpp"
 #include "particles/particles.hpp"
 #include "particles/particle_counts.hpp"
@@ -186,7 +187,7 @@ Mesh::Mesh(ParameterInput *pin) :
   // Shearing box with mesh refinement: in 3-D (shear-periodic x1) hydro, or dust
   // (refinable clouds or instant_switch; the dust module checks the rest), no MHD and no other
   // particles; in 2-D (the r-z shearing box, local source terms) only dust with periodic
-  // boundaries.  A non-dust 2-D input keeps the original fail-closed behaviour.
+  // boundaries.  A non-dust 2-D input keeps the original fail-closed behavior.
   if (global_variable::my_rank == 0 && pin->DoesBlockExist("shearing_box")) {
     dust::NoteDroppedKey(pin, "shearing_box", "experimental_smr",
                          "a 3-D shearing box admits mesh refinement");
@@ -664,10 +665,21 @@ void Mesh::NewTimeStep(const Real tlim) {
     dt = std::min(dt, (pmb_pack->ppart->dtnew) );
   }
 
+  // hidden diagnostic <dust>/test_dt_diag: this rank's limits before the global minimum
+  const Real dtd_hydro = (pmb_pack->phydro != nullptr) ? cfl_no*(pmb_pack->phydro->dtnew) :
+                         std::numeric_limits<Real>::max();
+  const Real dtd_grav = (pmb_pack->pgrav != nullptr) ? pmb_pack->pgrav->dtnew :
+                        std::numeric_limits<Real>::max();
+  const Real dtd_part = (pmb_pack->ppart != nullptr) ? pmb_pack->ppart->dtnew :
+                        std::numeric_limits<Real>::max();
 #if MPI_PARALLEL_ENABLED
   // get minimum dt over all MPI ranks
   MPI_Allreduce(MPI_IN_PLACE, &dt, 1, MPI_ATHENA_REAL, MPI_MIN, MPI_COMM_WORLD);
 #endif
+  if (pmb_pack->pdust != nullptr && pmb_pack->pdust->dt_diag_thr > 0.0 &&
+      dt < pmb_pack->pdust->dt_diag_thr) {
+    pmb_pack->pdust->DtDiag(dt, dtd_hydro, dtd_grav, dtd_part);
+  }
 
   // optional hard cap (<time>/dtmax), e.g. for fixed-timestep convergence tests
   dt = std::min(dt, dtmax);

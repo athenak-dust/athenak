@@ -42,7 +42,7 @@ class Particles;
 //! lid that can be encoded is set by (NUM_BITS_LID) macro defined in athena.hpp.
 //! The convention in AthenaK is lid and bufid are both for the *receiving* process.
 //! \fn int ShearSlotOx1(int n)
-//! \brief x1 direction (-1, 0, +1) of neighbour slot n (NeighborIndex layout, 3-D)
+//! \brief x1 direction (-1, 0, +1) of neighbor slot n (NeighborIndex layout, 3-D)
 KOKKOS_INLINE_FUNCTION
 int ShearSlotOx1(const int n) {
   if (n < 4) return -1;
@@ -151,10 +151,10 @@ class MeshBlockPack;
 class MeshBoundaryValues {
  public:
   // no flux correction across the shear-periodic x1 boundaries (the
-  // neighbour of the unsheared periodic topology is not the sheared one; the uniform shearing box
+  // neighbor of the unsheared periodic topology is not the sheared one; the uniform shearing box
   // does no flux correction there either).  Set by Hydro with mesh refinement in 3-D.
   bool skip_shear_x1_flux=false;
-  // no prolongation or same-level restriction through neighbour slots across a
+  // no prolongation or same-level restriction through neighbor slots across a
   // shear-periodic x1 face: the shearing box collects those ghost zones itself
   bool skip_shear_x1_prol = false;
   MeshBoundaryValues(MeshBlockPack *ppack, ParameterInput *pin, bool z4c);
@@ -183,8 +183,8 @@ class MeshBoundaryValues {
   // only for the one-shot header exchange in BuildRankPackedVarMetadata that
   // teaches each receiver its peers' pack order.
   HostArray1D<int> rank_sendhdr_vars_, rank_recvhdr_vars_;
-  // Per-(MeshBlock,neighbour) base offsets into the rank-packed aggregate
-  // buffers, dimensioned (nmb*nnghbr). For off-rank neighbours these hold the
+  // Per-(MeshBlock,neighbor) base offsets into the rank-packed aggregate
+  // buffers, dimensioned (nmb*nnghbr). For off-rank neighbors these hold the
   // entry's offset in rank_{send,recv}buf_vars_; on-rank/non-existent entries
   // are -1. Built once in BuildRankPackedVarMetadata so the pack/unpack kernels
   // read/write the aggregate buffer directly (fusing the former
@@ -335,7 +335,7 @@ class DepRemapPlan {
   int x3mode_ = 0;
   Real qshear_, omega0_;
   std::vector<int> face_gids_[2];  // blocks at the inner / outer x1 face (all ranks)
-  // remap-20261102: the shear weights on the device from a device copy of the recipes
+  // the shear weights on the device from a device copy of the recipes
   // (ATHENA_DEP_WEIGHTS_HOST=1: the host loop and upload as before), and the next one-cell
   // offset's shear part built ahead on a host thread (ATHENA_DEP_PREFETCH_OLD=1: a full build
   // at every one-cell shift as before); ATHENA_DEP_VERIFY=1 (diagnostic) compares both with the

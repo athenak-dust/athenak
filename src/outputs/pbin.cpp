@@ -13,7 +13,8 @@
 //!   id        = particles   # optional, the default
 //!   precision = double      # optional: single stores the particle real columns as float32
 //!
-//! writes pbin/<basename>.<id>.<NNNNN>.pbin.  Format version 2 (vis/python/pbin.py reads 1 and 2):
+//! writes pbin/<basename>.<id>.<NNNNN>.pbin.  Format version 2 (vis/python/pbin.py reads 1, 2
+//! and 3):
 //!
 //!   preamble, 64 bytes
 //!     char[8] "AKPBIN01"; uint32 0x01020304 (byte-order mark); uint32 format version (2);
@@ -49,10 +50,37 @@
 //! 1 GiB (no gather on rank 0; ranks without particles write nothing; all offsets 64-bit and
 //! checked).  The file is written as <name>.tmp and renamed when it is complete.  Writing reads
 //! the particle arrays only: the run state is not changed.
+//!
+//! Format version 3 (hidden test key, off by default; needs zlib at build time):
+//!
+//!   <output2>
+//!   test_pbin_compress   = shuffle_deflate   # none (default): format version 2 as above
+//!   test_pbin_chunk_rows = 1048576           # optional: rows per chunk at most
+//!
+//! stores every particle column losslessly compressed; the block columns, the preamble, the
+//! text header and the footer are as in version 2.  Each rank cuts its rows of a column into
+//! chunks of at most chunk_rows rows; a chunk is byte-shuffled (byte k of every value
+//! together: stored[k*rows + i] = raw[i*itemsize + k], the HDF5 / blosc shuffle) and deflated
+//! as one complete zlib stream (RFC 1950, level 1).  The chunks of a column follow one another
+//! without padding, by rank and then by row; a rank without rows has one empty chunk (rows 0,
+//! nothing stored).  In the header [columns] gains a 7th field, the encoding (raw or
+//! shuffle_deflate), and its bytes field is the stored size; [encoding] describes the coding
+//! and [chunks] lists every chunk as "chunk = <column> <rank> <first_row> <rows> <offset>
+//! <stored_bytes>" (offset from data_start; raw bytes = rows * itemsize).  The ranks compress
+//! their chunks with the CPU threads of their affinity mask (at most 32); the file does not
+//! depend on the thread count.  The sizes are exchanged with MPI_Allgather (column totals)
+//! and MPI_Gatherv (the chunk table, on rank 0).  A rank holds its compressed columns in host
+//! memory until it writes them (about raw size / ratio); rank 0 prints one line per file with
+//! the ratio and the compression time.
 
 #include <sys/stat.h>  // mkdir
+#if defined(__linux__)
+#include <sched.h>     // sched_getaffinity: the CPUs of this rank
+#endif
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -63,7 +91,13 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
+
+#if ATHENA_HAVE_ZLIB
+#include <zlib.h>
+#endif
 
 #include "athena.hpp"
 #include "config.hpp"
@@ -84,6 +118,8 @@ namespace {
 constexpr char kMagic[9] = "AKPBIN01";
 constexpr char kEnd[9] = "AKPBEND1";
 constexpr std::uint32_t kVersion = 2;   // 1: no [constants] (first files)
+constexpr std::uint32_t kVersionCompressed = 3;   // particle columns shuffle_deflate
+constexpr std::uint64_t kChunkRowsDefault = std::uint64_t(1) << 20;
 constexpr std::uint64_t kAlign = 64;
 constexpr std::uint64_t kPreamble = 64;
 constexpr std::uint64_t kFooter = 16;
@@ -154,7 +190,123 @@ std::uint64_t TopologyHash(const Mesh *pm) {
 struct Column {
   std::string table, name, dtype, meaning;
   std::uint64_t itemsize = 0, count = 0, offset = 0, bytes = 0;
+  bool encoded = false;                       // version 3: shuffle_deflate
+  std::vector<unsigned char> stored;          // version 3: this rank's chunks, concatenated
+  std::vector<std::uint64_t> chunk_bytes;     // version 3: this rank's stored chunk sizes
 };
+
+// number of chunks of a rank's slice of n rows (a rank without rows has one empty chunk)
+std::uint64_t NumChunks(const std::uint64_t n, const std::uint64_t chunk_rows) {
+  return (n == 0) ? 1 : (n - 1)/chunk_rows + 1;
+}
+
+// CPU threads for the compression: the CPUs this rank may run on, at most 32
+int CompressThreads() {
+  int n = 0;
+#if defined(__linux__)
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(0, sizeof(set), &set) == 0) n = CPU_COUNT(&set);
+#endif
+  if (n <= 0) n = static_cast<int>(std::thread::hardware_concurrency());
+  return std::max(1, std::min(n, 32));
+}
+
+#if ATHENA_HAVE_ZLIB
+// one complete zlib stream (level 1) of bytes, streamed in pieces of at most 1 GiB (the zlib
+// counters are 32-bit); false on a zlib error
+bool Deflate(const unsigned char *in, const std::uint64_t bytes,
+             std::vector<unsigned char> &out) {
+  z_stream z;
+  std::memset(&z, 0, sizeof(z));
+  if (deflateInit(&z, 1) != Z_OK) return false;
+  out.clear();
+  out.reserve(static_cast<std::size_t>(deflateBound(&z, static_cast<uLong>(bytes))));
+  std::vector<unsigned char> buf(std::size_t(1) << 18);
+  const std::uint64_t piece = std::uint64_t(1) << 30;
+  std::uint64_t done = 0;
+  int flush = Z_NO_FLUSH, ret = Z_OK;
+  do {
+    const std::uint64_t nin = std::min(piece, bytes - done);
+    z.next_in = const_cast<Bytef *>(in + done);
+    z.avail_in = static_cast<uInt>(nin);
+    done += nin;
+    flush = (done == bytes) ? Z_FINISH : Z_NO_FLUSH;
+    do {
+      z.next_out = buf.data();
+      z.avail_out = static_cast<uInt>(buf.size());
+      ret = deflate(&z, flush);
+      if (ret == Z_STREAM_ERROR) {
+        deflateEnd(&z);
+        return false;
+      }
+      out.insert(out.end(), buf.data(), buf.data() + (buf.size() - z.avail_out));
+    } while (z.avail_out == 0);
+  } while (flush != Z_FINISH);
+  deflateEnd(&z);
+  return ret == Z_STREAM_END;
+}
+#endif
+
+// version 3: byte shuffle and deflate n rows of itemsize bytes in chunks of chunk_rows rows;
+// the stored chunks are concatenated in c.stored, their sizes in c.chunk_bytes
+void ShuffleDeflate(const unsigned char *src, const std::uint64_t n, const std::uint64_t size,
+                    const std::uint64_t chunk_rows, const int nthreads, Column &c) {
+  const std::uint64_t nchunk = NumChunks(n, chunk_rows);
+  c.stored.clear();
+  c.chunk_bytes.assign(nchunk, 0);
+  if (n == 0) return;
+#if ATHENA_HAVE_ZLIB
+  std::vector<std::vector<unsigned char>> part(nchunk);
+  std::atomic<std::uint64_t> next(0);
+  std::atomic<int> failed(0);
+  auto work = [&]() {
+    std::vector<unsigned char> sh;
+    for (std::uint64_t j = next++; j < nchunk; j = next++) {
+      const std::uint64_t r0 = j*chunk_rows, rows = std::min(chunk_rows, n - r0);
+      const unsigned char *in = src + r0*size;
+      if (size > 1) {
+        sh.resize(static_cast<std::size_t>(rows*size));
+        // in blocks of 4096 rows (cache-friendly: itemsize sequential output streams)
+        for (std::uint64_t i0 = 0; i0 < rows; i0 += 4096) {
+          const std::uint64_t i1 = std::min(rows, i0 + 4096);
+          for (std::uint64_t k = 0; k < size; ++k) {
+            unsigned char *dst = sh.data() + k*rows;
+            for (std::uint64_t i = i0; i < i1; ++i) dst[i] = in[i*size + k];
+          }
+        }
+        in = sh.data();
+      }
+      if (!Deflate(in, rows*size, part[j])) failed = 1;
+      c.chunk_bytes[j] = part[j].size();
+    }
+  };
+  std::vector<std::thread> pool;
+  const int nt = static_cast<int>(std::min<std::uint64_t>(nthreads, nchunk));
+  for (int t = 1; t < nt; ++t) {
+    try {
+      pool.emplace_back(work);
+    } catch (const std::system_error &) {
+      break;   // no more threads: the remaining chunks are done by the others
+    }
+  }
+  work();
+  for (auto &t : pool) t.join();
+  if (failed) PbinFail("zlib deflate failed (column " + c.name + ")");
+  std::uint64_t total = 0;
+  for (const auto &p : part) total = Add(total, p.size());
+  c.stored.resize(static_cast<std::size_t>(total));
+  std::uint64_t at = 0;
+  for (auto &p : part) {
+    if (!p.empty()) std::memcpy(c.stored.data() + at, p.data(), p.size());
+    at += p.size();
+    std::vector<unsigned char>().swap(p);
+  }
+#else
+  (void) src; (void) size; (void) nthreads;
+  PbinFail("test_pbin_compress needs zlib (built without it)");
+#endif
+}
 
 }  // namespace
 
@@ -176,7 +328,116 @@ ParticleBinaryOutput::ParticleBinaryOutput(ParameterInput *pin, Mesh *pm,
               << "3-D mesh" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  // hidden: format version 3 with compressed particle columns (read only when set, so that
+  // the parameter dump of the default files is unchanged)
+  if (pin->DoesParameterExist(op.block_name, "test_pbin_compress")) {
+    const std::string mode = pin->GetString(op.block_name, "test_pbin_compress");
+    if (mode != "none" && mode != "shuffle_deflate") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "Output block '" << op.block_name << "': test_pbin_compress must be none "
+                << "or shuffle_deflate" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    compress_ = (mode == "shuffle_deflate");
+#if !ATHENA_HAVE_ZLIB
+    if (compress_) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "Output block '" << op.block_name << "': test_pbin_compress = "
+                << "shuffle_deflate needs zlib, but this binary was built without it (CMake "
+                << "did not find ZLIB)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+#endif
+  }
+  chunk_rows_ = kChunkRowsDefault;
+  if (pin->DoesParameterExist(op.block_name, "test_pbin_chunk_rows")) {
+    const int rows = pin->GetInteger(op.block_name, "test_pbin_chunk_rows");
+    if (rows < 1) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "Output block '" << op.block_name << "': test_pbin_chunk_rows must be "
+                << "positive" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    chunk_rows_ = static_cast<std::uint64_t>(rows);
+  }
   mkdir("pbin", 0775);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn ParticleBinaryOutput::PackParticleColumns
+//! \brief This rank's active rows of every named particle column, packed on the device and
+//! copied to the host one column at a time; sink(i, data, bytes) gets column names[i].
+
+void ParticleBinaryOutput::PackParticleColumns(Mesh *pm,
+    const std::vector<std::string> &names, const std::vector<std::uint64_t> &itemsizes,
+    const std::function<void(std::size_t, const void *, std::uint64_t)> &sink) {
+  particles::Particles *pp = pm->pmb_pack->ppart;
+  const int nidx = nactive_;
+  auto idx = active_;
+  auto pr = pp->prtcl_rdata;
+  auto pi = pp->prtcl_idata;
+  for (std::size_t ic = 0; ic < names.size(); ++ic) {
+    const std::string &name = names[ic];
+    const std::uint64_t nbytes = Mul(static_cast<std::uint64_t>(nidx), itemsizes[ic]);
+    if (nidx == 0) continue;
+    if (name == "id") {
+      DvceArray1D<std::uint64_t> d("pbin_id", nidx);
+      Kokkos::parallel_for("pbin_pack_id", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
+      KOKKOS_LAMBDA(const int q) {
+        d(q) = GetTag(pi, idx(q));
+      });
+      auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
+      sink(ic, h.data(), nbytes);
+    } else if (name == "species") {
+      DvceArray1D<std::uint32_t> d("pbin_species", nidx);
+      Kokkos::parallel_for("pbin_pack_species", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
+      KOKKOS_LAMBDA(const int q) {
+        d(q) = static_cast<std::uint32_t>(pi(PSP, idx(q)));
+      });
+      auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
+      sink(ic, h.data(), nbytes);
+    } else if (name == "shape") {
+      using T = SMRCompositeTransfer;
+      DvceArray1D<std::uint16_t> d("pbin_shape", nidx);
+      Kokkos::parallel_for("pbin_pack_shape", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
+      KOKKOS_LAMBDA(const int q) {
+        const int code = pi(PLEV, idx(q));
+        d(q) = static_cast<std::uint16_t>(T::CloudLevel(code) | (T::CloudLobe1(code) << 4) |
+                                          (T::CloudLobe2(code) << 6) |
+                                          (T::CloudLobe3(code) << 8));
+      });
+      auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
+      sink(ic, h.data(), nbytes);
+    } else {
+      int rc = -1;
+      if (name == "x1") rc = IPX;
+      if (name == "x2") rc = IPY;
+      if (name == "x3") rc = IPZ;
+      if (name == "v1") rc = IPVX;
+      if (name == "v2") rc = IPVY;
+      if (name == "v3") rc = IPVZ;
+      if (name == "mass") rc = IPM;
+      if (name == "stopping_time") rc = IPTS;
+      if (rc < 0 || rc >= pp->nrdata) PbinFail("internal: column " + name);
+      if (itemsizes[ic] == 4) {
+        DvceArray1D<float> d("pbin_real4", nidx);
+        Kokkos::parallel_for("pbin_pack_real4", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
+        KOKKOS_LAMBDA(const int q) {
+          d(q) = static_cast<float>(pr(rc, idx(q)));
+        });
+        auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
+        sink(ic, h.data(), nbytes);
+      } else {
+        DvceArray1D<double> d("pbin_real", nidx);
+        Kokkos::parallel_for("pbin_pack_real", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
+        KOKKOS_LAMBDA(const int q) {
+          d(q) = static_cast<double>(pr(rc, idx(q)));
+        });
+        auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
+        sink(ic, h.data(), nbytes);
+      }
+    }
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -343,10 +604,85 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   col("blocks", "x2max", "f8", 8, "block box x2max");
   col("blocks", "x3min", "f8", 8, "block box x3min");
   col("blocks", "x3max", "f8", 8, "block box x3max");
+  std::vector<std::size_t> pcol;   // the particle columns (indices into cols)
+  std::vector<std::string> pnames;
+  std::vector<std::uint64_t> psizes;
+  for (std::size_t i = 0; i < cols.size(); ++i) {
+    if (cols[i].table != "particles") continue;
+    pcol.push_back(i);
+    pnames.push_back(cols[i].name);
+    psizes.push_back(cols[i].itemsize);
+  }
+  const std::size_t npc = pcol.size();
+
+  // ---- version 3: compress this rank's particle columns first (the stored sizes set the
+  // layout); rank_stored[r*npc + i]: stored bytes of rank r in particle column i; on rank 0
+  // all_chunks[chunk_start[r] + i*nchunk(r) + j]: stored bytes of chunk j of rank r, column i
+  const std::uint32_t version = compress_ ? kVersionCompressed : kVersion;
+  std::vector<std::uint64_t> rank_stored, all_chunks, chunk_start;
+  double compress_seconds = 0.0;
+  std::uint64_t raw_particle_bytes = 0, stored_particle_bytes = 0;
+  if (compress_) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const int nthreads = CompressThreads();
+    for (auto i : pcol) {
+      cols[i].encoded = true;
+      cols[i].chunk_bytes.assign(NumChunks(static_cast<std::uint64_t>(nidx), chunk_rows_), 0);
+    }
+    PackParticleColumns(pm, pnames, psizes,
+        [&](std::size_t ic, const void *data, std::uint64_t) {
+      Column &c = cols[pcol[ic]];
+      ShuffleDeflate(static_cast<const unsigned char *>(data),
+                     static_cast<std::uint64_t>(nidx), c.itemsize, chunk_rows_, nthreads, c);
+    });
+    compress_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                     t0).count();
+    std::vector<std::uint64_t> mine(npc), mychunks;
+    for (std::size_t i = 0; i < npc; ++i) {
+      const Column &c = cols[pcol[i]];
+      mine[i] = c.stored.size();
+      mychunks.insert(mychunks.end(), c.chunk_bytes.begin(), c.chunk_bytes.end());
+    }
+    chunk_start.assign(nranks + 1, 0);
+    for (int r=0; r<nranks; ++r) {
+      chunk_start[r+1] = Add(chunk_start[r], Mul(npc, NumChunks(counts[r], chunk_rows_)));
+    }
+    if (chunk_start[nranks] > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+      PbinFail("too many compressed chunks; raise test_pbin_chunk_rows");
+    }
+#if MPI_PARALLEL_ENABLED
+    rank_stored.assign(static_cast<std::size_t>(nranks)*npc, 0);
+    MPI_Allgather(mine.data(), static_cast<int>(npc), MPI_UINT64_T, rank_stored.data(),
+                  static_cast<int>(npc), MPI_UINT64_T, MPI_COMM_WORLD);
+    std::vector<int> rcount(nranks), rdispl(nranks);
+    for (int r=0; r<nranks; ++r) {
+      rcount[r] = static_cast<int>(chunk_start[r+1] - chunk_start[r]);
+      rdispl[r] = static_cast<int>(chunk_start[r]);
+    }
+    if (me == 0) all_chunks.assign(chunk_start[nranks], 0);
+    MPI_Gatherv(mychunks.data(), static_cast<int>(mychunks.size()), MPI_UINT64_T,
+                all_chunks.data(), rcount.data(), rdispl.data(), MPI_UINT64_T, 0,
+                MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &compress_seconds, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+#else
+    rank_stored = mine;
+    all_chunks = mychunks;
+#endif
+  }
+
   std::uint64_t at = 0;
   for (auto &c : cols) {
     c.offset = at;
-    c.bytes = Mul(c.count, c.itemsize);
+    if (c.encoded) {
+      c.bytes = 0;
+      const std::size_t i = static_cast<std::size_t>(&c - cols.data());
+      const std::size_t ip = std::find(pcol.begin(), pcol.end(), i) - pcol.begin();
+      for (int r=0; r<nranks; ++r) c.bytes = Add(c.bytes, rank_stored[r*npc + ip]);
+      raw_particle_bytes = Add(raw_particle_bytes, Mul(c.count, c.itemsize));
+      stored_particle_bytes = Add(stored_particle_bytes, c.bytes);
+    } else {
+      c.bytes = Mul(c.count, c.itemsize);
+    }
     at = Align(Add(at, c.bytes));
   }
   const std::uint64_t data_bytes = at;
@@ -357,9 +693,12 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   if (me == 0) {
     std::ostringstream h;
     h << std::setprecision(17);
-    h << "AthenaK particle science file (pbin) format_version = " << kVersion << "\n";
+    h << "AthenaK particle science file (pbin) format_version = " << version << "\n";
     h << "[file]\n";
-    h << "format = AKPBIN\nformat_version = " << kVersion << "\n";
+    h << "format = AKPBIN\nformat_version = " << version << "\n";
+    if (compress_) {
+      h << "encoding = shuffle_deflate  # particle columns compressed, see [encoding]\n";
+    }
     h << "byte_order = " << (little ? "little" : "big") << "\n";
     h << "n_particles = " << ntotal << "\nn_blocks = " << nblocks << "\n";
     h << "written_by_ranks = " << nranks << "\n";
@@ -481,11 +820,57 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     } else {
       h << "velocity_frame = lab\n";
     }
+    if (compress_) {
+      h << "[encoding]\n";
+      h << "particle_columns = shuffle_deflate  # every particles column; the blocks columns "
+        << "are raw\n";
+      h << "chunk_rows = " << chunk_rows_ << "  # rows per chunk at most; a chunk holds rows of "
+        << "one writing rank\n";
+      h << "shuffle = byte shuffle per chunk: stored[k*rows + i] = raw[i*itemsize + k] for "
+        << "byte k = 0 .. itemsize-1 of row i (raw bytes in the file byte order)\n";
+      h << "deflate = one complete zlib stream per chunk (RFC 1950: deflate + adler32), "
+        << "level 1\n";
+      h << "chunk_layout = the chunks of a column follow one another without padding, by "
+        << "rank, then by row; a rank without rows has one chunk with rows 0 and "
+        << "stored_bytes 0\n";
+      h << "chunk_table = [chunks]  # chunk = column rank first_row rows offset stored_bytes; "
+        << "raw bytes = rows * itemsize\n";
+      h << "particle_raw_bytes = " << raw_particle_bytes << "\n";
+      h << "particle_stored_bytes = " << stored_particle_bytes << "\n";
+    }
     h << "[columns]\n";
-    h << "# column = table name dtype count offset bytes (offset from data_start)\n";
+    if (compress_) {
+      h << "# column = table name dtype count offset bytes encoding (offset from data_start; "
+        << "bytes stored: count * itemsize when raw)\n";
+    } else {
+      h << "# column = table name dtype count offset bytes (offset from data_start)\n";
+    }
     for (const auto &c : cols) {
       h << "column = " << c.table << " " << c.name << " " << c.dtype << " " << c.count << " "
-        << c.offset << " " << c.bytes << "\n";
+        << c.offset << " " << c.bytes;
+      if (compress_) h << (c.encoded ? " shuffle_deflate" : " raw");
+      h << "\n";
+    }
+    if (compress_) {
+      h << "[chunks]\n";
+      h << "# chunk = column rank first_row rows offset stored_bytes (offset from "
+        << "data_start)\n";
+      for (std::size_t i = 0; i < npc; ++i) {
+        const Column &c = cols[pcol[i]];
+        std::uint64_t off = c.offset, row = 0;
+        for (int r=0; r<nranks; ++r) {
+          const std::uint64_t nch = NumChunks(counts[r], chunk_rows_);
+          for (std::uint64_t j = 0; j < nch; ++j) {
+            const std::uint64_t rows = (counts[r] == 0) ? 0 :
+                std::min(chunk_rows_, counts[r] - j*chunk_rows_);
+            const std::uint64_t sb = all_chunks[chunk_start[r] + i*nch + j];
+            h << "chunk = " << c.name << " " << r << " " << row << " " << rows << " " << off
+              << " " << sb << "\n";
+            off += sb;
+            row += rows;
+          }
+        }
+      }
     }
     h << "[constants]\n";
     h << "# constant = table name dtype value (the same value in every row of the table)\n";
@@ -526,7 +911,7 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   if (me == 0) {
     std::vector<char> head(static_cast<std::size_t>(data_start), 0);
     std::memcpy(head.data(), kMagic, 8);
-    const std::uint32_t mark = 0x01020304u, version = kVersion;
+    const std::uint32_t mark = 0x01020304u;
     std::memcpy(head.data() + 8, &mark, 4);
     std::memcpy(head.data() + 12, &version, 4);
     const std::uint64_t pre[6] = {static_cast<std::uint64_t>(text.size()), data_start,
@@ -536,69 +921,22 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     WriteAt(file, head.data(), head.size(), 0);
   }
 
-  // ---- particle columns: this rank's active rows, packed on the device
-  for (const auto &c : cols) {
-    if (c.table != "particles") continue;
-    const std::uint64_t off = Add(Add(data_start, c.offset), Mul(prefix, c.itemsize));
-    const std::uint64_t nbytes = Mul(static_cast<std::uint64_t>(nidx), c.itemsize);
-    if (nidx == 0) continue;
-    if (c.name == "id") {
-      DvceArray1D<std::uint64_t> d("pbin_id", nidx);
-      Kokkos::parallel_for("pbin_pack_id", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
-      KOKKOS_LAMBDA(const int q) {
-        d(q) = GetTag(pi, idx(q));
-      });
-      auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
-      WriteAt(file, h.data(), nbytes, off);
-    } else if (c.name == "species") {
-      DvceArray1D<std::uint32_t> d("pbin_species", nidx);
-      Kokkos::parallel_for("pbin_pack_species", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
-      KOKKOS_LAMBDA(const int q) {
-        d(q) = static_cast<std::uint32_t>(pi(PSP, idx(q)));
-      });
-      auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
-      WriteAt(file, h.data(), nbytes, off);
-    } else if (c.name == "shape") {
-      using T = SMRCompositeTransfer;
-      DvceArray1D<std::uint16_t> d("pbin_shape", nidx);
-      Kokkos::parallel_for("pbin_pack_shape", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
-      KOKKOS_LAMBDA(const int q) {
-        const int code = pi(PLEV, idx(q));
-        d(q) = static_cast<std::uint16_t>(T::CloudLevel(code) | (T::CloudLobe1(code) << 4) |
-                                          (T::CloudLobe2(code) << 6) |
-                                          (T::CloudLobe3(code) << 8));
-      });
-      auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
-      WriteAt(file, h.data(), nbytes, off);
-    } else {
-      int rc = -1;
-      if (c.name == "x1") rc = IPX;
-      if (c.name == "x2") rc = IPY;
-      if (c.name == "x3") rc = IPZ;
-      if (c.name == "v1") rc = IPVX;
-      if (c.name == "v2") rc = IPVY;
-      if (c.name == "v3") rc = IPVZ;
-      if (c.name == "mass") rc = IPM;
-      if (c.name == "stopping_time") rc = IPTS;
-      if (rc < 0 || rc >= pp->nrdata) PbinFail("internal: column " + c.name);
-      if (c.itemsize == 4) {
-        DvceArray1D<float> d("pbin_real4", nidx);
-        Kokkos::parallel_for("pbin_pack_real4", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
-        KOKKOS_LAMBDA(const int q) {
-          d(q) = static_cast<float>(pr(rc, idx(q)));
-        });
-        auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
-        WriteAt(file, h.data(), nbytes, off);
-      } else {
-        DvceArray1D<double> d("pbin_real", nidx);
-        Kokkos::parallel_for("pbin_pack_real", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
-        KOKKOS_LAMBDA(const int q) {
-          d(q) = static_cast<double>(pr(rc, idx(q)));
-        });
-        auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
-        WriteAt(file, h.data(), nbytes, off);
-      }
+  // ---- particle columns: this rank's active rows, packed on the device (version 3: the
+  // chunks compressed above, after the stored bytes of the lower ranks)
+  if (compress_) {
+    for (std::size_t i = 0; i < npc; ++i) {
+      Column &c = cols[pcol[i]];
+      std::uint64_t off = Add(data_start, c.offset);
+      for (int r=0; r<me; ++r) off = Add(off, rank_stored[r*npc + i]);
+      if (!c.stored.empty()) WriteAt(file, c.stored.data(), c.stored.size(), off);
+      std::vector<unsigned char>().swap(c.stored);
     }
+  } else {
+    PackParticleColumns(pm, pnames, psizes,
+        [&](std::size_t ic, const void *data, std::uint64_t nbytes) {
+      const Column &c = cols[pcol[ic]];
+      WriteAt(file, data, nbytes, Add(Add(data_start, c.offset), Mul(prefix, c.itemsize)));
+    });
   }
 
   // ---- block columns: this rank's blocks at their gids
@@ -651,6 +989,16 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     if (std::rename(tmpname.c_str(), fname.c_str()) != 0) {
       std::cout << "### WARNING (pbin): could not rename " << tmpname << " to " << fname
                 << std::endl;
+    }
+    if (compress_) {   // (own stream: the format of std::cout is left as it is)
+      std::ostringstream msg;
+      msg << std::setprecision(4) << "pbin " << fname << ": particle columns "
+          << raw_particle_bytes << " -> " << stored_particle_bytes
+          << " bytes (shuffle_deflate, ratio "
+          << (stored_particle_bytes > 0 ? static_cast<double>(raw_particle_bytes) /
+              static_cast<double>(stored_particle_bytes) : 0.0)
+          << "), compression " << compress_seconds << " s (slowest rank)\n";
+      std::cout << msg.str() << std::flush;
     }
     if (anomalies[1] > 0 || anomalies[2] > 0 || anomalies[3] > 0) {
       std::cout << "### WARNING (pbin " << fname << "): " << anomalies[1]

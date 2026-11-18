@@ -52,7 +52,7 @@ Real HashUniform01(std::uint64_t key) {
 //----------------------------------------------------------------------------------------
 //! \struct RootPlacement
 //! \brief the position of root parent q (cloud_root_random): mode 0 the
-//! independent random draw (the original hash), 1 a square lattice (ppc = n^2, cell-centred
+//! independent random draw (the original hash), 1 a square lattice (ppc = n^2, cell-centered
 //! offsets), 2 a generic arrangement for problems along x1: x1 offsets (k + 1/2)/ppc in the root
 //! cell, x2 offsets frac((k + 1/2) phi) (phi the golden ratio), the same in every root cell, so
 //! that for any integer ppc each x1 sub-lattice is a full shift family of the mesh (a uniform

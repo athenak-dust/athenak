@@ -71,7 +71,7 @@ class ShearingBox {
   ShearingBoxBoundaryBuffer sendbuf[2], recvbuf[2];
   // With mesh refinement the same exchange also shifts the x1 ghost
   // zones of the coarse arrays: a fine x1-face block whose partner across the boundary (or a
-  // diagonal neighbour there) is coarser gets those ghost cells by prolongation from its coarse
+  // diagonal neighbor there) is coarser gets those ghost cells by prolongation from its coarse
   // array, after the shear exchange; its coarse array must be sheared first
   bool coarse_on = false;
   ShearingBoxBoundaryBuffer csendbuf[2], crecvbuf[2];
@@ -92,6 +92,25 @@ class ShearingBox {
   double t_plan_pull = 0.0, t_plan_flux = 0.0;
   long n_plan_pull = 0, n_plan_flux = 0;
   bool pull_ghost_valid = false;   // x1 ghosts hold collected values (not after a regrid)
+  // Rounds of the collection.  A coarser sender converts its cells with an x slope that
+  // reads its own x1 ghosts at the face column, so those are collected first: round 0 sends
+  // every piece that needs no slope (same level or finer sender) and fills the x1 ghosts of
+  // the coarsest face blocks; round k sends the pieces for the face blocks k levels above the
+  // coarsest (their senders' x1 ghosts are of this stage by then) and fills theirs.  One
+  // round when all face blocks are on one level.  pull_pbeg_: first piece of each round.
+  // <shearing_box>/test_pull_lagged_xslope (default false) = true: one round, the x slope from
+  // the x1 ghosts of the previous stage and none right after a start or a regrid (the
+  // former behavior, which made the ghost zones depend on the run's history).
+  bool pull_lagged_xslope = false;
+  int pull_nround_ = 1, pull_round_ = 0;
+  bool pull_done_ = false;
+  // Counts for the timing report: plans with several rounds, and plans in which a piece
+  // packed by this rank would take the one-sided y / z slope of PullPack (an edge row of a
+  // coarser sender with a still coarser neighbor beyond it).  The second stays zero while the
+  // level rule of the shear faces holds: that neighbor would itself read the receiver, two
+  // levels finer, and is refined by the rule (MeshRefinement::ShearFaceLevelLimit).
+  long n_pull_multi = 0, n_pull_edge = 0;
+  std::vector<int> pull_pbeg_;
   int nvar_pull = 0;
   // non-negative variables of the pulled array (bit v of pull_pos_mask for v < 31, and every
   // v >= pull_pos_from): the one-sided edge slopes of PullSend keep them non-negative.  The gas
@@ -99,10 +118,10 @@ class ShearingBox {
   int pull_pos_mask = 0, pull_pos_from = (1 << 30);
   ReconstructionMethod rcon_pull = ReconstructionMethod::plm;
   enum PullField {kPRGid, kPRType, kPRFace, kPRIdx, kPSGid, kPSLoc, kPSFace, kPD,
-                  kPY0, kPNy, kPYS, kPZ0, kPNz, kPZS, kPOff, kPSeq, kPNField};
+                  kPY0, kPNy, kPYS, kPZ0, kPNz, kPZS, kPOff, kPSeq, kPRnd, kPNField};
   DualArray2D<int> ppiece;      // pieces with a local sender or receiver
   int nppiece = 0, npymax = 1, npzmax = 1;
-  DualArray2D<int> precv;       // local receivers: (m, type 0 fine / 1 coarse, face)
+  DualArray2D<int> precv;       // local receivers: (m, type 0 fine / 1 coarse, face, round)
   DualArray1D<Real> precv_eps;  // fraction of the shift of each receiver
   int nprecv = 0;
   DvceArray5D<Real> pbuf;       // (receiver, v, z rows, depth, y rows)
@@ -247,6 +266,8 @@ class ShearingBoxCC : public ShearingBox {
   TaskStatus RecvFluxPair(DvceFaceFld5D<Real> &flx);
   // the collected x1 ghost zones (face_levels)
   TaskStatus PullSend(DvceArray5D<Real> &a);
+  void PullPack(DvceArray5D<Real> &a, const int rnd);
+  void PullRemap(DvceArray5D<Real> &a, const bool coarse, const int rnd);
   TaskStatus PullRecv(DvceArray5D<Real> &a, const bool coarse);
 
  private:

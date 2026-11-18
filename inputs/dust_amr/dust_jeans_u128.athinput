@@ -1,6 +1,6 @@
 # Linear gravitational (Jeans-type) instability of a dusty gas: one Fourier mode along x1 of the
 # coupled gas + dust system (tau_s = 0.1, eps = 1, 4 pi G = 50) with the gas and the dust both
-# as gravity sources (experimental_gas_source: the gas as a source is still experimental).
+# as gravity sources.
 # Box 1 x 0.25 x 0.25, uniform 128 x 32 x 32 with 16^3 blocks, 8 refinable clouds per cell.
 # Test: the mode's growth rate (jeans_sigma = 9.0356) and the amplitudes of the gas and dust
 # density and velocity (user history) against the linear solution.
@@ -76,7 +76,6 @@ refinable_mode = split_only
 enabled = true
 source = both
 kick = both
-experimental_gas_source = true
 setup = distributed
 solver = multigrid
 four_pi_G = 50.0

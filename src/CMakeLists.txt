@@ -43,6 +43,7 @@ add_executable(
         gravity/sparse_mg.cpp
         gravity/composite.cpp
         gravity/mesh_geometry.cpp
+        gravity/gpu_irregular.cpp
         gravity/geometric_mg.cpp
         gravity/vacuum_mesh.cpp
         gravity/vacuum_boundary.cpp
@@ -65,6 +66,7 @@ add_executable(
 
         dust/dust.cpp
         dust/dust_newdt.cpp
+        dust/dust_dtdiag.cpp
         dust/dust_pm.cpp
         dust/dust_push.cpp
         dust/dust_solver.cpp
@@ -242,6 +244,15 @@ add_executable(
         z4c/z4c_amr.cpp
         z4c/cce/cce.cpp
 )
+
+# (hidden key <gravity>/test_gpu_assembly) the irregular self-gravity rows on the device: compiled
+# without floating-point contraction; the code calls fma where the host compiler contracts
+set(gravity_irregular_options -ffp-contract=off)
+if (Kokkos_ENABLE_CUDA)
+  list(APPEND gravity_irregular_options --fmad=false)
+endif()
+set_source_files_properties(gravity/gpu_irregular.cpp PROPERTIES
+                            COMPILE_OPTIONS "${gravity_irregular_options}")
 
 # custom problem generator to be included in compile
 # specify on command line using '-D PROBLEM=file' where 'file' is name of file in

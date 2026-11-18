@@ -49,8 +49,8 @@ namespace {
 //! \struct ShearFaceGeom
 //! \brief Geometry of the rule on the levels across the shear-periodic x1 faces (AMR with a
 //! shearing box: at most one level, for every refinement criterion).  The
-//! tree's 2:1 balance treats these faces as plain periodic ones (the neighbour at the same x2),
-//! but the neighbours slide along x2 with the shear.  A face block at level l receives its x1
+//! tree's 2:1 balance treats these faces as plain periodic ones (the neighbor at the same x2),
+//! but the neighbors slide along x2 with the shear.  A face block at level l receives its x1
 //! ghosts at level l and, above the root level, those of its coarse array at l - 1, from every
 //! opposite block that overlaps the rows it reads (shearing_box_pull.cpp): its own x2 rows and
 //! nghost + 3 remap rows on each side at the receiver's level, shifted by the shear offset, and
@@ -568,7 +568,7 @@ void MeshRefinement::CheckCriteria(MeshBlockPack* pmbp) {
 //! \brief The flags of this rank's blocks after all refinement criteria, for the rule of
 //! ShearFaceGeom (it acted only in the 3-D dust-cloud trigger before, for clouds only).  Targets are level + max(flag, 0).  A face block whose target is below what the
 //! opposite face needs is refined (or kept from derefining); if one level up is not enough, the
-//! refinement of the opposite blocks above omax of its target is cancelled instead.  Repeated
+//! refinement of the opposite blocks above omax of its target is canceled instead.  Repeated
 //! until nothing changes.  The tree's 2:1 balance may still refine further face blocks; those
 //! cases are handled on the tree (ShearFaceTreeRefine, ShearFaceDerefineOK).
 
@@ -688,7 +688,7 @@ void MeshRefinement::ShearFaceLevelLimit(MeshBlockPack* pmbp) {
     }
     again = any(grow) != 0;
   }
-  int cnt[3] = {0, 0, 0};   // raised, kept from derefining, refinements cancelled
+  int cnt[3] = {0, 0, 0};   // raised, kept from derefining, refinements canceled
   for (int m=0; m<nmb; ++m) {
     const int f0 = orig[m], f1 = refine_flag.h_view(m + mbs);
     if (f0 == f1) continue;
@@ -704,7 +704,7 @@ void MeshRefinement::ShearFaceLevelLimit(MeshBlockPack* pmbp) {
   if (cnt[0] + cnt[1] + cnt[2] > 0 && global_variable::my_rank == 0) {
     std::cout << "# AMR shear-periodic x1 faces (dmax " << g.dmax << ", 2:1): " << cnt[0]
               << " blocks refined, " << cnt[1] << " kept from derefining, " << cnt[2]
-              << " refinements cancelled (" << rounds
+              << " refinements canceled (" << rounds
               << (rounds >= 64 ? " rounds, limit reached" : " rounds") << ")" << std::endl;
   }
   // the mesh after this regrid satisfies the rule until time + twin (CheckShearFaceLevels stops

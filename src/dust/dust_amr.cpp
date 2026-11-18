@@ -33,12 +33,18 @@
 //! integrals (the transfer of the coupling and of the field outputs).  Like the AthenaK
 //! refinement criteria, a block is judged on the maximum of
 //! rho_d / mean over its own leaf cells, widened by amr_rho_buffer cells of its own level
-//! (periodic; the cells of neighbouring blocks, from the halo on several ranks).  A block whose value
+//! (periodic; the cells of neighboring blocks, from the halo on several ranks).  A block whose value
 //! reaches amr_rho_refine is flagged for
 //! refinement, one that stays below amr_rho_derefine (< amr_rho_refine, hysteresis) for
 //! derefinement.
 //! The sibling, 2:1 and refinement_interval rules of MeshRefinement apply as usual.  Each
-//! check decides the refinement flags.
+//! check decides the refinement flags.  The derefinement test of a block of level l >= 1 widens by
+//! 2 amr_rho_buffer cells of its level (= amr_rho_buffer cells of the parent's level), so a group
+//! of siblings derefines only when the region of the parent's refinement test fell below the
+//! threshold (the default; with the reach of the refinement test, amr_rho_buffer
+//! cells of the block's level, groups derefined at the first allowed check and refined again at
+//! the next).  Hidden <dust>/test_derefine_parent_buffer = false restores that old reach; diag
+//! keeps the old flags and counts what the default test would keep (ParentBufferDiag).
 //!
 //! The old instant_switch transfer (kept for comparison) also runs on the dynamic mesh, one
 //! rank.  Point particles, TSC on the block that
@@ -55,6 +61,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -79,7 +86,7 @@ namespace {
 // schedule is kept here (set once from the input by SetupScheduledRefinement)
 struct SchedPatch {
   Real t0, t1;                          // wanted for t0 <= t < t1
-  Real x1min, x1max, x2min, x2max;      // blocks whose centre lies inside
+  Real x1min, x1max, x2min, x2max;      // blocks whose center lies inside
   Real x3min = -1.0e300, x3max = 1.0e300;   // 3-D: also in x3 (default: all)
   int level;                            // levels above the root
 };
@@ -177,7 +184,7 @@ int SetupScheduledRefinement(ParameterInput *pin) {
 //----------------------------------------------------------------------------------------
 //! \fn dust::ScheduledRefinement
 //! \brief Refinement request (<amr_criterionN>/method = user): a block is flagged for
-//! refinement when a patch that is active at the current time and contains its centre
+//! refinement when a patch that is active at the current time and contains its center
 //! wants a finer level, for derefinement when every such patch (or none) wants a coarser
 //! one.  The request is a function of time and place only, so it is repeated every check
 //! until the mesh has it; MeshRefinement applies its own 2:1 and sibling rules.
@@ -276,7 +283,7 @@ void SetupDensityTrigger(ParameterInput *pin) {
   trig_.device = pin->GetOrAddBoolean("dust", "amr_rho_device", true);
   {
     // default on (the shear-periodic x1 faces follow the 2:1 rule of all other
-    // neighbours, within what the face exchange can fill); auto = only the exchange's limit
+    // neighbors, within what the face exchange can fill); auto = only the exchange's limit
     // the rule is the mesh refinement's for every AMR shearing box
     // (MeshRefinement::ShearFaceLevelLimit), always on; the key is still read (restart files hold it)
     const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
@@ -309,6 +316,132 @@ void SetupDensityTrigger(ParameterInput *pin) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn dust::ParentBufferDiag
+//! \brief test_derefine_parent_buffer = diag, at every check of the density trigger: code[m]
+//! of a block of this rank is 0 unless the old test flags it for derefinement, then 1 if the
+//! test over 2 amr_rho_buffer cells keeps it, else 2; q2[m] is its value over 2 amr_rho_buffer
+//! cells.  Rank 0 prints one line: the flagged blocks, those past refinement_interval, those kept;
+//! the groups of siblings (8 in 3-D, 4 in 2-D) all flagged and past refinement_interval (what the
+//! default derefines, unless the 2:1 or shear-face rules keep them), those the test over 2
+//! amr_rho_buffer cells keeps (one sibling kept), and of these the ones whose parent would refine
+//! again at its next check (the largest q2 of the siblings, on their current leaves, >= the
+//! parent's refinement threshold): the flip-flops; per level of the siblings.  Then the follow-up
+//! (totals / of these kept by the test over 2 amr_rho_buffer cells): derefined_now = groups of the
+//! previous check whose parent is a leaf now (derefined by that regrid), derefined = their sum since
+//! the start, refined_again = derefined parents found refined again at a later check (within 1000
+//! cycles), mean_lag = cycles from the derefining regrid to that check (not kept / kept).
+
+namespace {
+void ParentBufferDiag(Mesh *pm, const int pmode, const std::vector<int> &code,
+                      const std::vector<Real> &q2) {
+  const int nmb = static_cast<int>(code.size());
+  const int mbs = pm->gids_eachrank[global_variable::my_rank];
+  const int ntot = pm->nmb_total;
+  std::vector<int> gc(ntot, 0);
+  std::vector<Real> gq(ntot, 0.0);
+  for (int m=0; m<nmb; ++m) {gc[m + mbs] = code[m]; gq[m + mbs] = q2[m];}
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Allreduce(MPI_IN_PLACE, gc.data(), ntot, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, gq.data(), ntot, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
+  }
+#endif
+  if (global_variable::my_rank != 0) return;
+  const int nleaf = pm->three_d ? 8 : (pm->two_d ? 4 : 2);
+  const MeshRefinement *pmr = pm->pmr;
+  struct Sib {int lev; std::int32_t x, y, z; int g;};
+  std::vector<Sib> v;
+  int nflag = 0, nelig = 0, nkeep = 0;
+  for (int g=0; g<ntot; ++g) {
+    if (gc[g] == 0) continue;
+    ++nflag;
+    const LogicalLocation &ll = pm->lloc_eachmb[g];
+    if (pmr->ncyc_since_ref(g) < pmr->refinement_interval) continue;
+    ++nelig;
+    if (gc[g] == 1) ++nkeep;
+    v.push_back({ll.level, ll.lx1 >> 1, ll.lx2 >> 1, ll.lx3 >> 1, g});
+  }
+  std::sort(v.begin(), v.end(), [](const Sib &a, const Sib &b) {
+    if (a.lev != b.lev) return a.lev < b.lev;
+    if (a.z != b.z) return a.z < b.z;
+    if (a.y != b.y) return a.y < b.y;
+    return a.x < b.x;
+  });
+  const int nl = pm->max_level - pm->root_level + 1;
+  std::vector<std::array<int, 3>> bylev(nl, {0, 0, 0});   // groups, kept, kept and refined again
+  std::array<int, 3> tot = {0, 0, 0};
+  // the follow-up of the groups of the previous check (rank 0, kept across calls): a group whose
+  // parent is a leaf now was derefined by the regrid of that check; a derefined parent that is
+  // an inner node of the tree at a later check was refined again (within 'watch' cycles).  Counted
+  // separately for the groups the test over 2 amr_rho_buffer cells keeps and the others.
+  using Key = std::array<long long, 4>;   // level, lx1, lx2, lx3 of a parent
+  struct Rec {Key k; bool kept; long long cyc;};
+  static std::vector<Rec> prev, watch;
+  static long long ndr[2] = {0, 0}, nag[2] = {0, 0}, lagsum[2] = {0, 0};   // [not kept, kept]
+  std::set<Key> leaf, inner;
+  for (int g=0; g<ntot; ++g) {
+    const LogicalLocation &ll = pm->lloc_eachmb[g];
+    leaf.insert({ll.level, ll.lx1, ll.lx2, ll.lx3});
+    for (int lv=ll.level - 1, sh=1; lv >= pm->root_level; --lv, ++sh) {
+      inner.insert({lv, ll.lx1 >> sh, ll.lx2 >> sh, ll.lx3 >> sh});
+    }
+  }
+  int ndr_now[2] = {0, 0};
+  {
+    // (cyc: the cycle of the check whose regrid derefined the group; lag = cycles from that regrid
+    // to the check that finds the parent refined again)
+    std::vector<Rec> keep;
+    for (const Rec &r : watch) {
+      if (inner.count(r.k)) {++nag[r.kept]; lagsum[r.kept] += pm->ncycle - r.cyc; continue;}
+      if (leaf.count(r.k) && pm->ncycle - r.cyc <= 1000) keep.push_back(r);
+    }
+    for (const Rec &r : prev) {
+      if (leaf.count(r.k)) {++ndr[r.kept]; ++ndr_now[r.kept]; keep.push_back(r);}
+    }
+    watch.swap(keep);
+  }
+  prev.clear();
+  for (std::size_t a=0; a<v.size(); ) {
+    std::size_t b = a;
+    while (b < v.size() && v[b].lev == v[a].lev && v[b].x == v[a].x && v[b].y == v[a].y &&
+           v[b].z == v[a].z) ++b;
+    if (static_cast<int>(b - a) == nleaf) {
+      const int l = v[a].lev - pm->root_level;
+      bool kept = false;
+      Real qm = 0.0;
+      for (std::size_t c=a; c<b; ++c) {
+        kept = kept || (gc[v[c].g] == 1);
+        qm = std::max(qm, gq[v[c].g]);
+      }
+      const bool again = kept && qm >= trig_.RefineAt(l - 1);
+      prev.push_back({{v[a].lev - 1, v[a].x, v[a].y, v[a].z}, kept, pm->ncycle});
+      ++bylev[l][0]; ++tot[0];
+      if (kept) {++bylev[l][1]; ++tot[1];}
+      if (again) {++bylev[l][2]; ++tot[2];}
+    }
+    a = b;
+  }
+  std::ostringstream tt;
+  tt << std::setprecision(10) << pm->time;
+  std::cout << "# dust trigger diag cycle=" << pm->ncycle << " time=" << tt.str() << " mode="
+            << (pmode == 1 ? "on" : "diag") << " flagged=" << nflag << " eligible=" << nelig
+            << " kept_blocks=" << nkeep << " groups=" << tot[0] << " kept_groups=" << tot[1]
+            << " rerefine_groups=" << tot[2] << " levels=";
+  bool any = false;
+  for (int l=1; l<nl; ++l) {
+    if (bylev[l][0] == 0) continue;
+    std::cout << (any ? "," : "") << "L" << l << ":" << bylev[l][0] << "/" << bylev[l][1] << "/"
+              << bylev[l][2];
+    any = true;
+  }
+  std::cout << (any ? "" : "-") << " derefined_now=" << ndr_now[0] + ndr_now[1] << "/" << ndr_now[1]
+            << " derefined=" << ndr[0] + ndr[1] << "/" << ndr[1] << " refined_again=" << nag[0] + nag[1]
+            << "/" << nag[1] << " mean_lag=" << (nag[0] ? lagsum[0]/nag[0] : 0) << "/"
+            << (nag[1] ? lagsum[1]/nag[1] : 0) << std::endl;
+}
+}  // namespace
+
+//----------------------------------------------------------------------------------------
 //! \fn dust::DensityRefinement3D
 //! \brief The density trigger with 3-D refinable clouds.  The dust density on
 //! the leaves (DepositCloudDensity3D); per block the largest rho_d/mean over the leaf cells that
@@ -324,10 +457,13 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
   // halo is checked first; the deposit adds the halo parts to their owners, and with a buffer the
   // owners' sums go back to the halo slots
   pd->CheckHaloReach("density trigger");
-  if (pd->cloud_split_max_level < 0) {
-    pd->DepositCloudDensity3D(pd->trig_f3, -1, true);   // (the trigger reads the density alone)
+  if (pd->cloud_split_max_level < 0 || pd->trigger_leaf_kernel) {
+    // (the trigger reads the density alone; with cloud_split_max_level, by default, every cloud
+    // with its own kernel too)
+    pd->DepositCloudDensity3D(pd->trig_f3, -1, true);
   } else {
-    // cloud_split_max_level = L: the clouds above L with the kernel of their mass level L
+    // cloud_split_max_level = L and amr_rho_kernel_above_split_max_level = split_max_level: the
+    // clouds above L with the kernel of their mass level L
     pd->DepositTriggerDensityCapped3D(pd->trig_f3);
   }
   if (trig_.buffer > 0) pd->HaloForward5D(pd->trig_f3, 0, 1);
@@ -376,15 +512,31 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     }
     Kokkos::deep_copy(srect, rh);
   }
+  // a second pass with 2 bb cells (default and diag; not with test_derefine_parent_buffer = false),
+  // the region of the derefinement test (bb cells of the parent's level: the siblings together see
+  // the parent's region)
+  const int pmode = pd->trigger_parent_buffer;
+  const int npass = (pmode > 0 && bb > 0) ? 2 : 1;
+  DvceArray1D<Real> q2d, a2d;
+  DvceArray1D<int> b2d;
+  if (npass > 1) {
+    q2d = DvceArray1D<Real>("amr_rho3d_q2", std::max(1, nmb));
+    a2d = DvceArray1D<Real>("amr_rho3d_vol2", std::max(1, nmb));
+    b2d = DvceArray1D<int>("amr_rho3d_bad2", std::max(1, nmb));
+  }
+  for (int pass=0; pass<npass; ++pass) {
+  const int bw = (pass == 0) ? bb : 2*bb;
+  auto qo = (pass == 0) ? qd : q2d, ao = (pass == 0) ? ad : a2d;
+  auto bo = (pass == 0) ? bd : b2d;
   Kokkos::parallel_for("amr_rho3d_blocks",
   Kokkos::MDRangePolicy<DevExeSpace, Kokkos::Rank<2>>({0, 0}, {nmb, nslot}),
   KOKKOS_LAMBDA(const int m, const int s) {
     const auto &bm = mbsz.d_view(m);
-    const Real ex0 = bm.x1min - bb*bm.dx1, ex1 = bm.x1max + bb*bm.dx1;
-    const Real ey0 = bm.x2min - bb*bm.dx2, ey1 = bm.x2max + bb*bm.dx2;
+    const Real ex0 = bm.x1min - bw*bm.dx1, ex1 = bm.x1max + bw*bm.dx1;
+    const Real ey0 = bm.x2min - bw*bm.dx2, ey1 = bm.x2max + bw*bm.dx2;
     // (physical x3 faces: the buffer stops at the face)
-    const Real ez0 = lt3.x3per ? bm.x3min - bb*bm.dx3 : Kokkos::fmax(bm.x3min - bb*bm.dx3, lt3.x3min);
-    const Real ez1 = lt3.x3per ? bm.x3max + bb*bm.dx3 : Kokkos::fmin(bm.x3max + bb*bm.dx3, lt3.x3max);
+    const Real ez0 = lt3.x3per ? bm.x3min - bw*bm.dx3 : Kokkos::fmax(bm.x3min - bw*bm.dx3, lt3.x3min);
+    const Real ez1 = lt3.x3per ? bm.x3max + bw*bm.dx3 : Kokkos::fmin(bm.x3max + bw*bm.dx3, lt3.x3max);
     const Real tol = 1.0e-9*Kokkos::fmin(bm.dx1, Kokkos::fmin(bm.dx2, bm.dx3));
     // the received box of slot s
     const Real sdx1 = lt3.box(s,3), sdx2 = lt3.box(s,4), sdx3 = lt3.box(s,5);
@@ -435,13 +587,25 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
         }
       }
     }
-    if (vol > 0.0) Kokkos::atomic_add(&ad(m), vol);
-    if (q > 0.0) Kokkos::atomic_max(&qd(m), q);
-    if (nbad > 0) Kokkos::atomic_add(&bd(m), nbad);
+    if (vol > 0.0) Kokkos::atomic_add(&ao(m), vol);
+    if (q > 0.0) Kokkos::atomic_max(&qo(m), q);
+    if (nbad > 0) Kokkos::atomic_add(&bo(m), nbad);
   });
+  }
   auto qh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), qd);
   auto ah = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ad);
   auto bh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bd);
+  decltype(Kokkos::create_mirror_view(DvceArray1D<Real>())) q2h, a2h;
+  decltype(Kokkos::create_mirror_view(DvceArray1D<int>())) b2h;
+  std::vector<int> dcode;    // 1: kept by the test over 2 bb cells, 2 derefined (ParentBufferDiag)
+  std::vector<Real> dq2;
+  if (npass > 1) {
+    q2h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), q2d);
+    a2h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), a2d);
+    b2h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), b2d);
+    dcode.assign(nmb, 0);
+    dq2.assign(nmb, 0.0);
+  }
   // the largest value and the share of the dust mass and volume on finer blocks
   Real qmax = 0.0, mfine = 0.0, vfine = 0.0;
   {
@@ -495,10 +659,34 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     int flag = 0;
     if (qh(m) >= trig_.RefineAt(l) && lev < pm->max_level) flag = 1;
     else if (lev > pm->root_level && qh(m) < trig_.DerefineAt(l)) flag = -1;
+    // the derefinement test over 2 bb cells (not for root blocks: they never derefine, and on
+    // several ranks their halo holds only bb cells)
+    if (npass > 1 && lev > pm->root_level) {
+      Real wz2 = (nx3 + 4*bb)*sz.dx3;
+      if (!pd->leaf_traversal3d.x3per) {
+        const Real lo = std::max(sz.x3min - 2*bb*sz.dx3, pm->mesh_size.x3min);
+        const Real hi = std::min(sz.x3max + 2*bb*sz.dx3, pm->mesh_size.x3max);
+        wz2 = hi - lo;
+      }
+      const Real want2 = (nx1 + 4*bb)*sz.dx1*(nx2 + 4*bb)*sz.dx2*wz2;
+      if (std::fabs(a2h(m) - want2) > 1.0e-9*want2 || b2h(m) > 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "3-D density trigger: the derefinement region (2 amr_rho_buffer cells) of "
+                  << "block " << m + mbs << " is not covered (volume " << a2h(m) << " of " << want2
+                  << ", " << b2h(m) << " non-finite cells)" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      dq2[m] = q2h(m);
+      if (flag < 0) {
+        dcode[m] = (q2h(m) < trig_.DerefineAt(l)) ? 2 : 1;
+        if (dcode[m] == 1 && pmode == 1) flag = 0;   // default: kept
+      }
+    }
     refine_flag.h_view(m + mbs) = flag;
     if (flag > 0) ++nref;
     if (flag < 0) ++nder;
   }
+  if (npass > 1 && pmode == 2) ParentBufferDiag(pm, pmode, dcode, dq2);
   // (the levels across the shear-periodic x1 faces: MeshRefinement::ShearFaceLevelLimit after all
   // criteria)
   (void) nref; (void) nder;
@@ -660,7 +848,8 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       f(0,k) = rho(m,0,ks,r/ncells1,r % ncells1);
     });
   } else {
-  if (pdust->cloud_split_max_level < 0) {
+  // (with cloud_split_max_level, by default, every cloud with its own kernel too)
+  if (pdust->cloud_split_max_level < 0 || pdust->trigger_leaf_kernel) {
   par_for("amr_rho_deposit", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
     const Real mass = pr(IPM,p);
     ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
@@ -671,9 +860,11 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     });
   });
   } else {
-  // <dust>/cloud_split_max_level = L: a plain cloud above L is deposited with the kernel of its
-  // mass level L (TriggerCloudCode), so the refinement does not follow the sampling noise of the
-  // switched kernels (the dynamics keep the switched kernel)
+  // <dust>/cloud_split_max_level = L and amr_rho_kernel_above_split_max_level = split_max_level
+  // (the former default): a plain cloud above L is deposited with the kernel of its
+  // mass level L
+  // (TriggerCloudCode), so the refinement does not follow the sampling noise of the switched
+  // kernels (the dynamics keep the switched kernel)
   const int lcap = pdust->cloud_split_max_level;
   par_for("amr_rho_deposit_cap", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
     const Real mass = pr(IPM,p);
@@ -818,13 +1009,17 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     }
     stamp.assign(nslot, -1);
   }
+  // (bw: the buffer in cells, trig_.buffer, or 2 trig_.buffer for the derefinement test; scall
+  // numbers the calls, so a block may be measured twice)
+  int scall = -1;
   auto BlockValue = [&](const int m, const Real bx0, const Real bx1, const Real by0, const Real by1,
-                        const Real bdx, const Real bdy) {
-    const Real ex0 = bx0 - trig_.buffer*bdx, ex1 = bx1 + trig_.buffer*bdx;
-    const Real ey0 = by0 - trig_.buffer*bdy, ey1 = by1 + trig_.buffer*bdy;
+                        const Real bdx, const Real bdy, const int bw) {
+    const Real ex0 = bx0 - bw*bdx, ex1 = bx1 + bw*bdx;
+    const Real ey0 = by0 - bw*bdy, ey1 = by1 + bw*bdy;
     const Real tol = 1.0e-9*std::min(bdx, bdy);
     Real q = 0.0, area = 0.0;
     int nbad = 0;
+    ++scall;
     // the candidate slots: those binned in the root cells the widened box touches, each once
     cand.clear();
     {
@@ -836,7 +1031,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
           const int c = ((j % nr2 + nr2) % nr2)*nr1 + (i % nr1 + nr1) % nr1;
           for (int e=bptr[c]; e<bptr[c + 1]; ++e) {
             const int s = bslot[e];
-            if (stamp[s] != m) {stamp[s] = m; cand.push_back(s);}
+            if (stamp[s] != scall) {stamp[s] = scall; cand.push_back(s);}
           }
         }
       }
@@ -869,7 +1064,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     const Real want = (ex1 - ex0)*(ey1 - ey0);
     if (std::fabs(area - want) > 1.0e-9*want || nbad > 0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "density trigger: the buffer of block " << m + mbs << " (" << trig_.buffer
+                << "density trigger: the buffer of block " << m + mbs << " (" << bw
                 << " cells) is not covered by the local and halo blocks (covered area "
                 << area << " of " << want << ", " << nbad << " non-finite cells)" << std::endl;
       std::exit(EXIT_FAILURE);
@@ -881,6 +1076,12 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   // the non-finite cells, then only these three numbers per block go to the host
   decltype(Kokkos::create_mirror_view(DvceArray1D<Real>())) qd_h, ad_h;
   decltype(Kokkos::create_mirror_view(DvceArray1D<int>())) bd_h;
+  // a second pass with 2 trig_.buffer cells (default and diag; not with test_derefine_parent_buffer
+  // = false), the region of the derefinement test (trig_.buffer cells of the parent's level)
+  const int pmode = pdust->trigger_parent_buffer;
+  const int npass = (pmode > 0 && trig_.buffer > 0) ? 2 : 1;
+  decltype(Kokkos::create_mirror_view(DvceArray1D<Real>())) q2d_h, a2d_h;
+  decltype(Kokkos::create_mirror_view(DvceArray1D<int>())) b2d_h;
   if (dev_blocks) {
     const int nh = nslot - nmb;
     if (pdust->trig_rect.extent_int(0) != std::max(1, nh)) {
@@ -901,11 +1102,19 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       Kokkos::deep_copy(pdust->trig_area, 0.0);
       Kokkos::deep_copy(pdust->trig_bad, 0);
     }
-    auto qd = pdust->trig_q, ad = pdust->trig_area;
-    auto bd = pdust->trig_bad;
+    DvceArray1D<Real> q2v, a2v;
+    DvceArray1D<int> b2v;
+    if (npass > 1) {
+      q2v = DvceArray1D<Real>("amr_rho_q2", std::max(1, nmb));
+      a2v = DvceArray1D<Real>("amr_rho_area2", std::max(1, nmb));
+      b2v = DvceArray1D<int>("amr_rho_bad2", std::max(1, nmb));
+    }
+    for (int pass=0; pass<npass; ++pass) {
+    auto qd = (pass == 0) ? pdust->trig_q : q2v, ad = (pass == 0) ? pdust->trig_area : a2v;
+    auto bd = (pass == 0) ? pdust->trig_bad : b2v;
     auto box = lt.box;
     auto mbsz = mbsize;
-    const int bb = trig_.buffer;
+    const int bb = (pass == 0) ? trig_.buffer : 2*trig_.buffer;
     // (block, slot) as a 2-D range: nmb*nslot overflows an int on large meshes
     Kokkos::parallel_for("amr_rho_blocks",
     Kokkos::MDRangePolicy<DevExeSpace, Kokkos::Rank<2>>({0, 0}, {nmb, nslot}),
@@ -944,14 +1153,44 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       if (q > 0.0) Kokkos::atomic_max(&qd(m), q);
       if (nbad > 0) Kokkos::atomic_add(&bd(m), nbad);
     });
-    qd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), qd);
-    ad_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ad);
-    bd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bd);
+    if (pass == 0) {
+      qd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), qd);
+      ad_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ad);
+      bd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bd);
+    } else {
+      q2d_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), qd);
+      a2d_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ad);
+      b2d_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bd);
+    }
+    }
   }
+  std::vector<int> dcode(npass > 1 ? nmb : 0, 0);   // (as in 3-D, ParentBufferDiag)
+  std::vector<Real> dq2(npass > 1 ? nmb : 0, 0.0);
   int nref = 0, nder = 0;
   for (int m=0; m<nmb; ++m) {
     const auto &sz = mbsize.h_view(m);
-    Real q = 0.0;
+    Real q = 0.0, q2 = 0.0;
+    // the value over 2 trig_.buffer cells (not for root blocks: they never derefine, and on several
+    // ranks their halo holds only trig_.buffer cells)
+    if (npass > 1 && pm->lloc_eachmb[m + mbs].level > pm->root_level) {
+      if (dev_blocks) {
+        const int b2 = 2*trig_.buffer;
+        const Real ex0 = sz.x1min - b2*sz.dx1, ex1 = sz.x1max + b2*sz.dx1;
+        const Real ey0 = sz.x2min - b2*sz.dx2, ey1 = sz.x2max + b2*sz.dx2;
+        const Real want = (ex1 - ex0)*(ey1 - ey0);
+        if (std::fabs(a2d_h(m) - want) > 1.0e-9*want || b2d_h(m) > 0) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << "density trigger: the derefinement region (2 amr_rho_buffer cells) of "
+                    << "block " << m + mbs << " (" << b2 << " cells) is not covered by the local "
+                    << "and halo blocks (covered area " << a2d_h(m) << " of " << want << ", "
+                    << b2d_h(m) << " non-finite cells)" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        q2 = q2d_h(m);
+      } else {
+        q2 = BlockValue(m, sz.x1min, sz.x1max, sz.x2min, sz.x2max, sz.dx1, sz.dx2, 2*trig_.buffer);
+      }
+    }
     if (dev_blocks) {
       const Real ex0 = sz.x1min - trig_.buffer*sz.dx1, ex1 = sz.x1max + trig_.buffer*sz.dx1;
       const Real ey0 = sz.x2min - trig_.buffer*sz.dx2, ey1 = sz.x2max + trig_.buffer*sz.dx2;
@@ -965,7 +1204,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
       }
       q = qd_h(m);
     } else {
-      q = BlockValue(m, sz.x1min, sz.x1max, sz.x2min, sz.x2max, sz.dx1, sz.dx2);
+      q = BlockValue(m, sz.x1min, sz.x1max, sz.x2min, sz.x2max, sz.dx1, sz.dx2, trig_.buffer);
     }
     const int lev = pm->lloc_eachmb[m + mbs].level;
     int flag = 0;
@@ -975,10 +1214,18 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     const Real thr_d = (l > 0) ? trig_.DerefineAt(l) : 0.0;
     if (q >= thr_r && lev < pm->max_level) flag = 1;
     else if (lev > pm->root_level && q < thr_d) flag = -1;
+    if (npass > 1) {   // the derefinement test over 2 trig_.buffer cells
+      dq2[m] = q2;
+      if (flag < 0) {
+        dcode[m] = (q2 < thr_d) ? 2 : 1;
+        if (dcode[m] == 1 && pmode == 1) flag = 0;   // default: kept
+      }
+    }
     refine_flag.h_view(m + mbs) = flag;
     if (flag > 0) ++nref;
     if (flag < 0) ++nder;
   }
+  if (npass > 1 && pmode == 2) ParentBufferDiag(pm, pmode, dcode, dq2);
   lap(DustGasDrag::kProfTrigBlocks);
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
@@ -990,7 +1237,7 @@ void DensityRefinement(MeshBlockPack *pmbp) {
 //! \brief Called by Driver::Initialize of a restarted run before the
 //! first time step.  Restores the cooldown age of every block and, when the file was written
 //! among the outputs of a cycle, carries out the mesh check that followed those outputs in
-//! the run that wrote it.  A file without the record (older code) keeps the old behaviour:
+//! the run that wrote it.  A file without the record (older code) keeps the old behavior:
 //! ages start at zero and no check is repeated.  First, on any mesh, the MeshBlock id of
 //! every refinable cloud is set from its position (files written by older versions can name
 //! a wrong block; the composite weights never read it).

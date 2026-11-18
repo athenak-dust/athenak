@@ -48,7 +48,7 @@ namespace dust {
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::PackGatherField
 //! \brief Gas velocity and its central differences in x1 and x2 of every cell with both
-//! neighbours, nine numbers side by side.  The linear cloud gather then reads one
+//! neighbors, nine numbers side by side.  The linear cloud gather then reads one
 //! short run of memory per leaf instead of fifteen values spread over nine rows of three
 //! arrays; the values and the order of the operations are those of the unpacked gather.
 
@@ -913,9 +913,9 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
   if (!clouds3d && !UsesCompositeTransfer() && imex_consistent_gas) {
     // Point particles (canonical TSC): as for the clouds, the gas takes the lumped
     // solve's change G_c = rho (u*_c - u_c) plus its mass share rho/(rho + Q_c) of the residual
-    // D_c - G_c; the dust share r_c Q_c V of a cell goes to the particles whose TSC centre cell it
-    // is, in proportion to m_p c_p (the centre cell is an active cell of the particle's own block:
-    // no ghost values are needed).  A cell that is no particle's centre gives the whole residual
+    // D_c - G_c; the dust share r_c Q_c V of a cell goes to the particles whose TSC center cell it
+    // is, in proportion to m_p c_p (the center cell is an active cell of the particle's own block:
+    // no ghost values are needed).  A cell that is no particle's center gives the whole residual
     // to the gas (as before).  Total momentum is exact.
     particles::Particles *ppar = pmy_pack->ppart;
     auto &pr = ppar->prtcl_rdata;
@@ -934,8 +934,8 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
                       ustar.extent(4));
     }
     Kokkos::deep_copy(DevExeSpace(), imex_resid, 0.0);
-    auto res = imex_resid;   // 0-2: the dust correction per unit coupled mass, 3: centre-cell m c/V
-    auto centre = KOKKOS_LAMBDA(const int p, int &m, int &ip, int &jp, int &kp) {
+    auto res = imex_resid;   // 0-2: the dust correction per unit coupled mass, 3: center-cell m c/V
+    auto center = KOKKOS_LAMBDA(const int p, int &m, int &ip, int &jp, int &kp) {
       m = pi(PGID,p) - gids;
       Real w[3];
       PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is, scheme, ip, w);
@@ -946,10 +946,10 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
         kp = ks;
       }
     };
-    par_for("dust_imex_point_centre_mass", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
+    par_for("dust_imex_point_center_mass", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
       if (pr(IPM,p) <= 0.0) return;
       int m, ip, jp, kp;
-      centre(p, m, ip, jp, kp);
+      center(p, m, ip, jp, kp);
       Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
       if (three_d) vol *= mbsize.d_view(m).dx3;
       Kokkos::atomic_add(&res(m,3,kp,jp,ip), pr(IPM,p)*(a_dt/(pr(IPTS,p) + a_dt))/vol);
@@ -975,7 +975,7 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
     par_for("dust_imex_point_consistent_dust", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
       if (pr(IPM,p) <= 0.0) return;
       int m, ip, jp, kp;
-      centre(p, m, ip, jp, kp);
+      center(p, m, ip, jp, kp);
       const Real cj = a_dt/(pr(IPTS,p) + a_dt);
       for (int c=0; c<3; ++c) {
         const Real dv = cj*res(m,c,kp,jp,ip);

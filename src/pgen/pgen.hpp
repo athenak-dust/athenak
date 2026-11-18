@@ -63,6 +63,9 @@ class ProblemGenerator {
   // true if user_work_in_loop_func never changes particle positions, masses, levels
   // or anchors (then <gravity>/kdk_reuse may keep the dust field across it)
   bool user_work_keeps_particles=false;
+  // with self-gravity: call user_work_in_loop_func after the integrator, before the closing
+  // gravity solve, instead of at the start of the next cycle (default false)
+  bool user_work_before_close_solve=false;
 
   // predefined problem generator functions (default test suite)
   void CallProblemGenerator(ParameterInput *pin, bool is_restart);

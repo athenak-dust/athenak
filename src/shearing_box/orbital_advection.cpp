@@ -40,7 +40,7 @@ OrbitalAdvection::OrbitalAdvection(MeshBlockPack *ppack, ParameterInput *pin) :
   Real xmax = fabs(ppack->pmesh->mesh_size.x1max);
   maxjshift = static_cast<int>((ppack->pmesh->cfl_no)*std::max(xmin,xmax)) + 1;
 
-  // x2 neighbours on another level are allowed (BuildMixedLists,
+  // x2 neighbors on another level are allowed (BuildMixedLists,
   // called by the derived classes, which know the number of variables)
   any_mixed = false;
   nvar_oa = 0;
@@ -85,9 +85,9 @@ OrbitalAdvection::~OrbitalAdvection() {
 //----------------------------------------------------------------------------------------
 //! \fn void OrbitalAdvection::BuildMixedLists()
 //! \brief which x2 faces of the blocks of this rank have a
-//! neighbour on another level (xlev), the slot of a coarser neighbour, and the buffers and MPI
+//! neighbor on another level (xlev), the slot of a coarser neighbor, and the buffers and MPI
 //! requests of the mixed-level exchange.  Called by the derived constructors and after every
-//! regrid (the neighbour lists must be current).
+//! regrid (the neighbor lists must be current).
 
 void OrbitalAdvection::BuildMixedLists() {
   Mesh *pm = pmy_pack->pmesh;
@@ -130,19 +130,19 @@ void OrbitalAdvection::BuildMixedLists() {
   xslot.template sync<DevExeSpace>();
   if (bad) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Orbital advection: an x2 face with finer neighbours must have all four"
+              << "Orbital advection: an x2 face with finer neighbors must have all four"
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (any_mixed && nvar_oa <= 0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Orbital advection of face-centred fields with x2 neighbours on another "
+              << "Orbital advection of face-centered fields with x2 neighbors on another "
               << "level is not implemented" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   if (any_mixed && 2*nrow > indcs.nx2) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Orbital advection with x2 neighbours on another level: meshblock/nx2 = "
+              << "Orbital advection with x2 neighbors on another level: meshblock/nx2 = "
               << indcs.nx2 << " must be at least 2*(nghost + maxjshift) = " << 2*nrow << std::endl;
     std::exit(EXIT_FAILURE);
   }

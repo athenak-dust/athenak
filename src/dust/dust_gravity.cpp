@@ -238,7 +238,7 @@ DvceArray2D<Real> DustGasDrag::GravityAccelerationStorage(int npart) {
         "gravity_particle_acceleration_store"),need + need/8);
   }
   DvceArray2D<Real> v(store.data(),3,npart);
-  Kokkos::deep_copy(DevExeSpace(),v,0.0);   // as the zero-initialised allocation it replaces
+  Kokkos::deep_copy(DevExeSpace(),v,0.0);   // as the zero-initialized allocation it replaces
   return v;
 }
 

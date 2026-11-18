@@ -34,7 +34,7 @@ namespace dust {
 //! blocks of this rank, then the halo blocks of other ranks next to them, then all other
 //! blocks), computed from the logical locations as AthenaK computes mb_size; and the distinct
 //! adjacent blocks (with the periodic shift that places each next to the block) of every
-//! MeshBlock of the pack, from the AthenaK neighbour table.  Then the halo exchange lists.
+//! MeshBlock of the pack, from the AthenaK neighbor table.  Then the halo exchange lists.
 
 void DustGasDrag::BuildLeafTraversal() {
   Mesh *pm = pmy_pack->pmesh;
@@ -46,15 +46,15 @@ void DustGasDrag::BuildLeafTraversal() {
   const int nslot = pmy_pack->pmb->nnghbr;
   if (!pm->two_d || nslot != 24) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "leaf traversal: 2-D meshes only (24 neighbour slots)" << std::endl;
+              << "leaf traversal: 2-D meshes only (24 neighbor slots)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   // block slots.  Local blocks first (slot = gid - gids), then the blocks of other
   // ranks that a cloud of this rank can reach (halo, ascending gid), then every other block.
-  // The reach of block m (HaloReach) follows from the coarsest cloud its centre
+  // The reach of block m (HaloReach) follows from the coarsest cloud its center
   // can hold, widened where CheckHaloReach found a cloud reaching further; the halo holds every
   // block of another rank within that reach of a block of this rank (the
-  // neighbours alone do not cover a root-level cloud over a deep mesh), found through the root
+  // neighbors alone do not cover a root-level cloud over a deep mesh), found through the root
   // block that holds each block.
   const int ntot = pm->nmb_total;
   std::vector<int> slot_of(ntot, -1), slot_gid;
@@ -252,13 +252,13 @@ void DustGasDrag::BuildLeafTraversal() {
       const int b = slot_of[gid];
       if (b >= nfld) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "leaf traversal: neighbour " << gid << " of block " << gids + m
+                  << "leaf traversal: neighbor " << gid << " of block " << gids + m
                   << " has no halo slot" << std::endl;
         std::exit(EXIT_FAILURE);
       }
       // the side of m this slot looks to (2-D slots of nghbr_index.hpp: x1 faces 0-3 and 4-7,
       // x2 faces 8-11 and 12-15, x1x2 edges 16-23), and the periodic shift that puts the
-      // neighbour there; the centre distance alone cannot tell the two sides apart when a
+      // neighbor there; the center distance alone cannot tell the two sides apart when a
       // direction has one or two blocks
       int ix = 0, iy = 0;
       if (n < 4) {ix = -1;} else if (n < 8) {ix = 1;} else if (n < 12) {iy = -1;}
@@ -275,7 +275,7 @@ void DustGasDrag::BuildLeafTraversal() {
       if (c >= LeafTraversal::kMaxNb) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                   << "leaf traversal: more than " << LeafTraversal::kMaxNb
-                  << " distinct neighbours of block " << m << std::endl;
+                  << " distinct neighbors of block " << m << std::endl;
         std::exit(EXIT_FAILURE);
       }
       nb(m, c) = b; nbs(m, c, 0) = sx; nbs(m, c, 1) = sy;
@@ -322,7 +322,7 @@ void DustGasDrag::BuildLeafTraversal() {
     }
     Kokkos::deep_copy(lt.blev, blev);
     Kokkos::deep_copy(lt.fbox, fbox);
-    // the finest level among each local block and its neighbours
+    // the finest level among each local block and its neighbors
     lt.nbmax = DvceArray1D<int>("dust_leaf_nbmax", std::max(1, nmb));
     auto nbmax = Kokkos::create_mirror_view(lt.nbmax);
     for (int m=0; m<nmb; ++m) {
@@ -331,9 +331,9 @@ void DustGasDrag::BuildLeafTraversal() {
       nbmax(m) = mx;
     }
     Kokkos::deep_copy(lt.nbmax, nbmax);
-    // the ring around each block that its neighbours certainly hold.  With s the
-    // smallest neighbour extent, every s-cell of the ring (aligned with the block) touches the
-    // block, so the leaf next to the block inside it is a neighbour, at least s wide and aligned:
+    // the ring around each block that its neighbors certainly hold.  With s the
+    // smallest neighbor extent, every s-cell of the ring (aligned with the block) touches the
+    // block, so the leaf next to the block inside it is a neighbor, at least s wide and aligned:
     // it holds the whole s-cell.  Checked cell by cell here; a block that fails gets 0 (its
     // queries then take the coverage test).
     lt.safe = DvceArray2D<int>("dust_leaf_safe", nmb, 2);
@@ -386,7 +386,7 @@ void DustGasDrag::BuildLeafTraversal() {
     }
     if (nunsafe > 0 && global_variable::my_rank == 0) {
       std::cout << "# NOTE (dust): leaf traversal: " << nunsafe << " of " << nmb << " blocks have "
-                << "no certain neighbour ring (their queries take the coverage test)" << std::endl;
+                << "no certain neighbor ring (their queries take the coverage test)" << std::endl;
     }
   }
   Kokkos::deep_copy(lt.box, box);
@@ -419,7 +419,7 @@ void DustGasDrag::BuildLeafTraversal() {
 //! the block's level (the drift of half a step before the gather), the furthest a cloud's
 //! support may extend beyond the block (CheckHaloReach).  The split runs every cycle before
 //! any gather or deposit; with the overlap rule a cloud is never coarser than the block that
-//! holds its centre, with the older rule at most one level, and right after a regrid both are
+//! holds its center, with the older rule at most one level, and right after a regrid both are
 //! one level coarser until the next split (the only traversal then is the post-regrid check):
 //! Lmin = lev - 1 (overlap) or lev - 2, never below 0 or above cloud_max_level, and 0 when the
 //! split is switched off.  <dust>/cloud_halo_coarser sets the levels instead (test).  need: a
@@ -438,6 +438,11 @@ void DustGasDrag::HaloReach(const int lev, const std::int64_t need, std::int64_t
   reach = std::max(rule, need);
   // the trigger's buffer (cells of this level) lies within the reach
   reach = std::max(reach, static_cast<std::int64_t>(halo_trigger_cells) << (nl - std::min(lev, nl)));
+  // the derefinement test of a refined block looks twice as far (2 amr_rho_buffer cells; root blocks
+  // never derefine; 0 with test_derefine_parent_buffer = false)
+  if (lev > 0 && halo_trigger_deref_cells > 0) {
+    reach = std::max(reach, static_cast<std::int64_t>(halo_trigger_deref_cells) << (nl - std::min(lev, nl)));
+  }
   allow = reach - margin;
 }
 

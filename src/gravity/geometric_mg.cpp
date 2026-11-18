@@ -10,7 +10,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <string>
 #include <exception>
 #include <limits>
 #include <map>
@@ -462,9 +465,19 @@ Real MinCellWidth(const std::vector<GravityPatch> &patches, int d) {
   return width;
 }
 
+namespace {
+// (split) the device statistics of a finished level
+void RecordSplit(HierarchyBuildTimes &times, const MeshGeometry &geometry, int level) {
+  const auto stats = geometry.LastDeviceStats();
+  times.split_device_rows += stats[0]; times.split_rows += stats[1];
+  times.split_join += stats[5];
+  if (level == 0) times.fine_device = stats;
+}
+}  // namespace
+
 GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     const CompositeDomain &domain, int rank, int nranks, bool neumann_z,
-    bool fine_forces, int threads, Real coarse_quantum) {
+    bool fine_forces, int threads, Real coarse_quantum, GpuSplit *split) {
   auto &times = BuildTimes();
   auto now = []() {
     return std::chrono::duration<double>(
@@ -473,6 +486,13 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
   double clock = now();
   auto lap = [&](double &bucket) { const double t = now(); bucket += t-clock; clock = t; };
   GeometricSystem out;
+  // (split) on a failure, no device pass may use the published geometries of `out` any more
+  // (destroyed before `out`)
+  struct AbandonOnFailure {
+    GpuSplit *split;
+    int exceptions = std::uncaught_exceptions();
+    ~AbandonOnFailure() { if (split && std::uncaught_exceptions() > exceptions) split->Abandon(); }
+  } abandon{split};
   out.fine_geometry.reset(new MeshGeometry(std::move(patches),domain,rank,nranks,neumann_z));
   // The geometry (patch metadata) of every level first. Then the systems of all levels and
   // the transfers between them are independent: a transfer only reads the two geometries
@@ -497,27 +517,122 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
   for (auto *g : geometry) g->SetSetupThreads(threads);
   const int workers = geometry[0]->SetupThreads();
   lap(times.geometry);
+  if (split) {
+    // (<gravity>/test_gpu_assembly) host tables and classification of every level, published to the
+    // device thread (a failure abandons the hand-over, see AbandonOnFailure)
+    // (the device classifies the rows itself: published before the host classification)
+    for (int l = 0; l < levels; ++l) {
+      geometry[l]->PrepareSplit(l == 0 ? fine_forces : false,split->options);
+      split->Publish(geometry[l],l+1 == levels);
+    }
+    for (int l = 0; l < levels; ++l) geometry[l]->ClassifySplit();
+    lap(times.split_prepare);
+  }
   std::vector<LocalCompositeSystem> systems(levels);
+  bool finished = false;   // (split) the systems are complete (finish_early)
   std::vector<LocalCsr> p(levels-1), r(levels-1);
   std::vector<TransferDiagnostics> checks(levels-1);
   std::vector<std::vector<int>> phase_rows(levels-1);
   std::vector<ProlongationCacheStats> caches(levels-1);
   // the transfers and coarse systems, level by level, on `chain` workers
   double chain_transfers = 0, chain_coarse = 0;
+  times.level_transfers.assign(levels-1,0.); times.level_coarse.assign(levels-1,0.);
+  times.level_rows.assign(levels,0);
+  for (int l = 0; l < levels; ++l) times.level_rows[l] = geometry[l]->GlobalRows();
   auto coarse_chain = [&](int chain) {
     double t = now();
     for (int l = 0; l+1 < levels; ++l) {
       Transfers(*geometry[l],*geometry[l+1],domain,rank,p[l],r[l],checks[l],neumann_z,
                 phase_rows[l],caches[l],chain);
-      double u = now(); chain_transfers += u-t; t = u;
+      double u = now(); chain_transfers += u-t; times.level_transfers[l] = u-t; t = u;
+      if (split) continue;   // the coarse host rows on the system workers (below)
       systems[l+1] = geometry[l+1]->BuildSystem(false);
-      u = now(); chain_coarse += u-t; t = u;
+      u = now(); chain_coarse += u-t; times.level_coarse[l] = u-t; t = u;
     }
   };
-  if (workers >= 2 && levels > 1) {
+  if (split && levels > 1 && workers >= 2) {
+    // the host rows of every level on the system workers, the transfers on the chain workers;
+    // the device rows meanwhile on the device thread (GpuSplit)
+    // a third of the workers for the transfers; 5/8 when the device takes >= 3/4 of the fine rows
+    // (the host rows are then the smaller part)
+    const auto fine_rows = geometry[0]->SplitRows();
+    int chain = workers-std::min(workers-1,(2*workers+2)/3);
+    if (4*fine_rows[0] >= 3*fine_rows[1]) chain = std::min(workers-1,(5*workers+4)/8);
+    if (split->chain_workers > 0) chain = std::min(workers-1,split->chain_workers);
+    const int system_workers = workers-chain;
+    for (int l = 0; l < levels; ++l) geometry[l]->SetSetupThreads(system_workers);
+    // the host rows of the small levels (>= 2: few chunks, nearly serial) on their own threads
+    // with two workers each, meanwhile those of levels 0 and 1 on the system workers here
+    // (allocated before any thread starts: nothing between a start and the try may throw)
+    std::vector<std::thread> small;
+    small.reserve(std::max(0,levels-2));
+    std::vector<std::exception_ptr> small_error(levels);
+    std::vector<double> small_s(levels,0.);
+    auto join_small = [&]() { for (auto &t : small) t.join(); small.clear(); };
+    std::exception_ptr chain_error;
+    std::thread worker([&]() {
+      try { coarse_chain(chain); } catch (...) { chain_error = std::current_exception(); }
+    });
+    try {
+      for (int l = 2; l < levels; ++l) {
+        geometry[l]->SetSetupThreads(2);
+        small.emplace_back([&,l]() {
+          const double t0 = now();
+          try { geometry[l]->BuildHostRows(); }
+          catch (...) { small_error[l] = std::current_exception(); }
+          small_s[l] = now()-t0;
+        });
+      }
+      for (int l = 0; l < std::min(levels,2); ++l) {
+        geometry[l]->BuildHostRows();
+        if (l == 0) {
+          const double t = now(); times.fine_alone += t-clock;
+          lap(times.fine_system);
+        } else {
+          const double t = now(); chain_coarse += t-clock; times.level_coarse[l-1] = t-clock;
+          clock = t;
+        }
+      }
+      join_small();
+      for (int l = 2; l < levels; ++l) {
+        if (small_error[l]) std::rethrow_exception(small_error[l]);
+        times.level_coarse[l-1] = small_s[l];
+      }
+      lap(chain_coarse);   // (the wait for the small levels)
+      // the device rows into every level here as each level's device pass ends, while the
+      // transfers go on (a canceled pass: the assembly is discarded)
+      if (split->finish_early) {
+        finished = true;
+        for (int l = 0; finished && l < levels; ++l) {
+          finished = split->WaitCounted(l);
+          lap(times.split_device_wait);
+          if (!finished) break;
+          geometry[l]->FinishSplitPrepare();   // (sizes the output while the device fills)
+          lap(times.split_finish);
+          finished = split->WaitDevice(l);
+          lap(times.split_device_wait);
+          if (!finished) break;
+          systems[l] = geometry[l]->FinishSplitCopy();
+          RecordSplit(times,*geometry[l],l);
+          lap(times.split_finish);
+        }
+      }
+    } catch (...) { join_small(); worker.join(); throw; }
+    worker.join();
+    {
+      const double t = now(); times.chain_wait += t-clock;
+    }
+    lap(times.fine_system);   // (the wait for the transfers)
+    if (chain_error) std::rethrow_exception(chain_error);
+    for (auto *g : geometry) g->SetSetupThreads(threads);
+  } else if (split) {
+    for (int l = 0; l < levels; ++l) geometry[l]->BuildHostRows();
+    lap(times.fine_system);
+    coarse_chain(workers);
+    clock = now();
+  } else if (workers >= 2 && levels > 1) {
     // the fine system on two thirds of the workers, the coarse chain on the rest (both scale
-    // poorly to all cores; the fine system is the larger part: 4-level 3-D GPU run with
-    // 35 workers, fine 0.42 s and chain 0.28 s at a 1:1 split); the coefficients do not
+    // poorly to all cores; the fine system is the larger part); the coefficients do not
     // depend on the split
     // (at most workers in all: the fine system keeps at least one for the chain)
     const int fine_workers = std::min(workers-1, (2*workers+2)/3), chain = workers-fine_workers;
@@ -530,19 +645,33 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     try {
       systems[0] = geometry[0]->BuildSystem(fine_forces);
     } catch (...) { worker.join(); throw; }
+    {
+      const double t = now(); times.fine_alone += t-clock;
+    }
     lap(times.fine_system);
     worker.join();
+    {
+      const double t = now(); times.chain_wait += t-clock;
+    }
     lap(times.fine_system);   // (the wait for the coarse chain)
     if (chain_error) std::rethrow_exception(chain_error);
     for (auto *g : geometry) g->SetSetupThreads(threads);
   } else {
     systems[0] = geometry[0]->BuildSystem(fine_forces);
+    times.fine_alone += now()-clock;
     lap(times.fine_system);
     coarse_chain(workers);
     clock = now();
   }
   times.transfers += chain_transfers;
   times.coarse_system += chain_coarse;
+  {
+    const auto b = geometry[0]->LastBuildSeconds();
+    times.fine_rows = b[0]; times.fine_join = b[1];
+    times.fine_class = {{b[2],b[3],b[4],b[5]}};
+  }
+  out.split_pending = split != nullptr && !finished;
+  out.split_fine_forces = fine_forces;
   out.fine = std::move(systems[0]);
   out.quadratic_interface_fallbacks.push_back(out.fine.quadratic_interface_fallbacks);
   out.hierarchy.constant_nullspace = !domain.isolated_z || neumann_z;
@@ -560,6 +689,104 @@ GeometricSystem BuildGeometricHierarchy(std::vector<GravityPatch> patches,
     out.patches.push_back(geometry[l+1]->Patches()); out.transfer_checks.push_back(checks[l]);
   }
   return out;
+}
+
+void GpuSplit::Publish(MeshGeometry *prepared, bool last) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    levels_.push_back(prepared);
+    complete_ = last;
+  }
+  cv_.notify_all();
+}
+
+void GpuSplit::Abandon() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  abandoned_ = true;
+  cv_.notify_all();
+  cv_.wait(lock,[this]() { return !running_; });
+}
+
+double GpuSplit::RunDevice() {
+  const auto t0 = std::chrono::steady_clock::now();
+  std::exception_ptr error;
+  for (size_t l = 0;; ++l) {
+    MeshGeometry *level = nullptr;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock,[&]() { return levels_.size() > l || complete_ || abandoned_; });
+      if (abandoned_) return 0;   // the hierarchy thread failed; its join reports the error
+      if (levels_.size() <= l) break;
+      level = levels_[l];
+      running_ = true;
+    }
+    if (l == 0) wait_s = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+    try {
+      level->RunDevice(static_cast<int>(l),[this,l]() {
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          counted_ = static_cast<int>(l)+1;
+        }
+        cv_.notify_all();
+      });
+    } catch (...) { error = std::current_exception(); }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      running_ = false;
+      if (error) canceled_ = true; else done_ = static_cast<int>(l)+1;
+    }
+    cv_.notify_all();
+    if (error) std::rethrow_exception(error);
+  }
+  return std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+}
+
+void GpuSplit::Cancel() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    canceled_ = true;
+  }
+  cv_.notify_all();
+}
+
+bool GpuSplit::WaitCounted(int level) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  cv_.wait(lock,[&]() { return counted_ > level || canceled_; });
+  return counted_ > level;
+}
+
+bool GpuSplit::WaitDevice(int level) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  cv_.wait(lock,[&]() { return done_ > level || canceled_; });
+  return done_ > level;
+}
+
+void FinishSplitHierarchy(GeometricSystem &out, int check, int rank) {
+  if (!out.split_pending) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<MeshGeometry *> geometry{out.fine_geometry.get()};
+  for (auto &g : out.coarse_geometry) geometry.push_back(g.get());
+  auto &times = BuildTimes();
+  times.split_differ = 0;
+  for (size_t l = 0; l < geometry.size(); ++l) {
+    const bool forces = l == 0 ? out.split_fine_forces : false;
+    auto system = geometry[l]->FinishSplit();
+    RecordSplit(times,*geometry[l],static_cast<int>(l));
+    const auto stats = geometry[l]->LastDeviceStats();
+    if (check) {
+      std::string first;
+      const long long differ = geometry[l]->CheckSplit(system,forces,&first);
+      times.split_differ += differ;
+      std::cout << "# SG_GPU_ASSEMBLY_CHECK rank=" << rank << " level=" << l
+                << " forces=" << forces << " rows=" << stats[1] << " device_rows=" << stats[0]
+                << " differ=" << differ << (differ ? " first: "+first : std::string()) << std::endl;
+    }
+    out.quadratic_interface_fallbacks[l] = system.quadratic_interface_fallbacks;
+    out.hierarchy.matrices[l] = std::move(system.matrix);
+    if (l == 0) out.fine = std::move(system);
+  }
+  out.split_pending = false;
+  times.split_finish = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
 }
 
 CsrRowUpdate BuildProlongationPhaseUpdate(const MeshGeometry &fine,

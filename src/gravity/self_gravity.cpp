@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -17,6 +18,7 @@
 #include <string>
 #include <sys/resource.h>
 #include <thread>
+#include <unordered_map>
 
 #include "mesh/mesh.hpp"
 #include "coordinates/coordinates.hpp"
@@ -48,6 +50,176 @@ Real Sum(Real value) {
   MPI_Allreduce(MPI_IN_PLACE, &value, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
 #endif
   return value;
+}
+// Memory options (a bit mask, SelfGravity::lean_; 1, 4 and 8 act in the distributed setup, 2 in
+// every FGMRES solve). Every option gives the same results as the former path (option 1 up to
+// the sign of an exact zero):
+//   1: the force operators keep only the rows of the physical source cells (the only rows the
+//      field is read from; vacuum rows become empty), and the boundary force operators,
+//      whose nonzeros then all vanish with the vacuum isolation, are not built. The physical
+//      accelerations are bitwise unchanged (the same row sums in the same order), up to the
+//      sign of an exact zero (the former path added a boundary force of +0).
+//   2: FGMRES allocates its Arnoldi / flexible-basis vectors when an iteration first needs
+//      them instead of all gmres_restart of them up front (sparse_mg.cpp; same arithmetic).
+//   4: a rebuild releases the previous multigrid, force and boundary operators before it
+//      builds the new ones, and a preconditioner refresh its previous hierarchy (no transient
+//      second copy; same operators).
+//   8: the force operators store their repeated rows (outside the phase rows, owned inputs
+//      only) as templates: one 16-bit id per row instead of the row's CSR entries
+//      (sparse_mg.cpp BuildTemplates; the same multiply-adds in the same order, bitwise).
+// Chosen automatically (no input key): 2 and 4 always (they cost nothing); 1 and 8 only on a
+// static mesh (uniform or SMR, <mesh_refinement>/refinement != adaptive). Their setup work
+// (row filtering, template hashing) is paid at every rebuild, and only adaptive meshes rebuild
+// during a run (the topology changes only in MeshRefinement::AdaptiveMeshRefinement); a static
+// mesh builds the operators once per run segment (start or restart) and updates only the shear
+// phase rows afterwards. Hidden override for comparisons: the environment variable
+// ATHENA_SG_LEAN = the bit mask (0 = the former path), on every rank alike.
+int SgLeanBits(const bool adaptive) {
+  const int forced = SgLeanOverride();
+  return forced >= 0 ? forced : (2 | 4 | (adaptive ? 0 : 1 | 8));
+}
+// The memory options and ATHENA_SG_TEMPLATE_CHECK choose collectives: option 1 adds an
+// MPI_Allreduce before the multigrid construction (its MPI_Comm_dup), options 4 and 8 change
+// which operators are released and built when, the template check adds an MPI_Allreduce at
+// every force build. A rank with other values (e.g. ATHENA_SG_LEAN set on some ranks only)
+// would pair different collectives (a hang). Collective: called by every rank in the
+// SelfGravity constructor, before any of them is used.
+void CheckSgEnvSwitches(const int lean) {
+#if MPI_PARALLEL_ENABLED
+  const int check = SgTemplateCheck() ? 1 : 0;
+  int v[4] = {lean, check, -lean, -check};   // max and -min
+  MPI_Allreduce(MPI_IN_PLACE,v,4,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
+  if (v[0] != -v[2] || v[1] != -v[3]) {
+    Fail("the memory options (values " + std::to_string(-v[2]) + " to " + std::to_string(v[0])
+         + "; ATHENA_SG_LEAN overrides them) and ATHENA_SG_TEMPLATE_CHECK ("
+         + std::to_string(-v[3]) + " to " + std::to_string(v[1])
+         + ") must be alike on every rank (mpirun -x)");
+  }
+#endif
+}
+// empty every row i of a local CSR with keep[i] == 0
+void KeepRows(LocalCsr &a, const std::vector<char> &keep) {
+  const int rows = a.LocalRows();
+  std::size_t out = 0;
+  for (int i = 0; i < rows; ++i) {
+    const int b = a.rowptr[i], e = a.rowptr[i+1];
+    a.rowptr[i] = static_cast<int>(out);
+    if (keep[i]) for (int k = b; k < e; ++k) {
+      a.colidx[out] = a.colidx[k]; a.values[out] = a.values[k]; ++out;
+    }
+  }
+  a.rowptr[rows] = static_cast<int>(out);
+  a.colidx.resize(out); a.colidx.shrink_to_fit();
+  a.values.resize(out); a.values.shrink_to_fit();
+}
+// the same for a compact row update (rows: its local rows)
+void KeepRows(CsrRowUpdate &a, const std::vector<char> &keep) {
+  const int rows = static_cast<int>(a.rows.size());
+  std::size_t out = 0;
+  for (int j = 0; j < rows; ++j) {
+    const int b = a.rowptr[j], e = a.rowptr[j+1];
+    a.rowptr[j] = static_cast<int>(out);
+    if (keep[a.rows[j]]) for (int k = b; k < e; ++k) {
+      a.colidx[out] = a.colidx[k]; a.values[out] = a.values[k]; ++out;
+    }
+  }
+  a.rowptr[rows] = static_cast<int>(out);
+  a.colidx.resize(out);
+  a.values.resize(out);
+}
+// ATHENA_SG_MEMSTATS=1 (diagnostics only): at every hierarchy rebuild each rank prints, per
+// local CSR operator, its rows, nonzeros, the nonzeros of its first `physical` rows (the
+// physical source cells; the rest are vacuum cells) and row-length histograms
+bool SgMemStats() {
+  static const bool on = []() {
+    const char *e = std::getenv("ATHENA_SG_MEMSTATS");
+    return e != nullptr && std::atoi(e) != 0;
+  }();
+  return on;
+}
+void PrintCsrStats(int rank, const char *name, int level, const LocalCsr &a, int physical) {
+  const int rows = a.LocalRows();
+  std::uint64_t phys_nnz = 0;
+  int max_len = 0;
+  // row lengths 0 | 1-7 | 8-15 | 16-31 | 32-63 | 64-127 | >=128: row counts and nonzeros
+  std::array<std::uint64_t,7> hist_rows{}, hist_nnz{}, hist_phys{};
+  for (int i = 0; i < rows; ++i) {
+    const int len = a.rowptr[i+1]-a.rowptr[i];
+    if (i < physical) phys_nnz += len;
+    max_len = std::max(max_len,len);
+    const int b = len == 0 ? 0 : len < 8 ? 1 : len < 16 ? 2 : len < 32 ? 3 : len < 64 ? 4
+                : len < 128 ? 5 : 6;
+    ++hist_rows[b]; hist_nnz[b] += len;
+    if (i < physical) ++hist_phys[b];
+  }
+  std::ostringstream s;
+  s << "# SG_MEMSTATS rank=" << rank << " op=" << name << " level=" << level
+    << " rows=" << rows << " cols=" << a.global_cols << " nnz=" << a.values.size()
+    << " physical_rows=" << std::min(rows,physical) << " physical_nnz=" << phys_nnz
+    << " max_row=" << max_len << " hist_rows=";
+  for (int b = 0; b < 7; ++b) s << (b ? "," : "") << hist_rows[b];
+  s << " hist_physical_rows=";
+  for (int b = 0; b < 7; ++b) s << (b ? "," : "") << hist_phys[b];
+  s << " hist_nnz=";
+  for (int b = 0; b < 7; ++b) s << (b ? "," : "") << hist_nnz[b];
+  s << '\n';
+  std::cout << s.str() << std::flush;
+}
+// ATHENA_SG_MEMSTATS=1: how much of a square operator a "template row" storage could take:
+// rows (not in phase_rows) whose columns are all owned and whose (column - row, value bits)
+// sequence equals that of other rows; a template row needs no CSR entries of its own (one
+// template id per row). Reports distinct patterns and the rows / nonzeros covered by the
+// most frequent 1, 16, 256 patterns, over all rows and over the first `physical` rows.
+void PrintTemplateStats(int rank, const char *name, int level, const LocalCsr &a,
+                        int physical, const std::vector<int> *phase_rows) {
+  const int rows = a.LocalRows();
+  std::vector<char> phase(rows,0);
+  if (phase_rows) for (int r : *phase_rows) if (r >= 0 && r < rows) phase[r] = 1;
+  struct Count { std::uint64_t rows = 0, nnz = 0, phys_rows = 0, phys_nnz = 0; };
+  std::unordered_map<std::uint64_t,Count> patterns;
+  std::uint64_t eligible = 0, eligible_nnz = 0;
+  for (int i = 0; i < rows; ++i) {
+    if (phase[i]) continue;
+    const int b = a.rowptr[i], e = a.rowptr[i+1];
+    if (e == b) continue;
+    bool local = true;
+    std::uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](std::uint64_t v) { h ^= v; h *= 1099511628211ull; h ^= h >> 29; };
+    mix(e-b);
+    for (int k = b; k < e && local; ++k) {
+      const GlobalIndex c = a.colidx[k]-a.row_begin;
+      local = c >= 0 && c < rows;
+      std::uint64_t bits;
+      const double v = a.values[k];
+      std::memcpy(&bits,&v,sizeof(bits));
+      mix(static_cast<std::uint64_t>(c-i)); mix(bits);
+    }
+    if (!local) continue;
+    ++eligible; eligible_nnz += e-b;
+    auto &c = patterns[h];
+    ++c.rows; c.nnz += e-b;
+    if (i < physical) { ++c.phys_rows; c.phys_nnz += e-b; }
+  }
+  std::vector<Count> sorted;
+  sorted.reserve(patterns.size());
+  for (const auto &p : patterns) sorted.push_back(p.second);
+  std::sort(sorted.begin(),sorted.end(),[](const Count &x, const Count &y) {
+    return x.nnz > y.nnz; });
+  std::ostringstream s;
+  s << "# SG_TEMPLATES rank=" << rank << " op=" << name << " level=" << level
+    << " rows=" << rows << " nnz=" << a.values.size() << " eligible_rows=" << eligible
+    << " eligible_nnz=" << eligible_nnz << " patterns=" << sorted.size();
+  for (size_t top : {size_t(1),size_t(16),size_t(256)}) {
+    Count c;
+    for (size_t t = 0; t < std::min(top,sorted.size()); ++t) {
+      c.rows += sorted[t].rows; c.nnz += sorted[t].nnz;
+      c.phys_rows += sorted[t].phys_rows; c.phys_nnz += sorted[t].phys_nnz;
+    }
+    s << " top" << top << "_rows/nnz/phys_rows/phys_nnz=" << c.rows << "/" << c.nnz << "/"
+      << c.phys_rows << "/" << c.phys_nnz;
+  }
+  s << '\n';
+  std::cout << s.str() << std::flush;
 }
 double ProfileTime(bool enabled) {
   if (!enabled) return 0;
@@ -101,6 +273,9 @@ struct SelfGravity::HierarchyAssembly {
   int rank = 0, nranks = 1, threads = 1;
   Real coarse_quantum = 0;                 // <gravity>/coarse_phase_quantum (0: exact phase)
   bool vacuum = false;                     // isolated x3 by the vacuum mesh
+  // (<gravity>/test_gpu_assembly) the device rows of all levels on the device thread meanwhile
+  std::unique_ptr<GpuSplit> split;
+  double device_s = 0;                     // the device thread's RunDevice seconds
   std::vector<GravityPatch> patches;       // moved into the assembly
   CompositeDomain domain;
   std::unique_ptr<VacuumMesh> vacuum_mesh;
@@ -166,12 +341,29 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     };
     const std::string src = pin->GetOrAddString("gravity", "source", coupled_dust_ ? "dust" : "gas");
     parse("source", src, source_gas_, source_dust_);
-    // The gas as a gravity source needs further development (the gas
-    // energy of the kicks; the flux form exists only for one level and periodic boxes): source =
-    // gas or both stops unless <gravity>/experimental_gas_source = true (tests, development)
-    if (source_gas_ && !pin->GetOrAddBoolean("gravity", "experimental_gas_source", false))
-      Fail("<gravity>/source = " + src + ": the gas as a gravity source needs further development"
-           "; use source = dust, or experimental_gas_source = true for tests");
+    // <gravity>/experimental_gas_source (removed): source = gas | both no longer
+    // needs it; a NOTE if still given
+    if (pin->DoesParameterExist("gravity", "experimental_gas_source")
+        && global_variable::my_rank == 0) {
+      std::cout << "# NOTE (self-gravity): <gravity>/experimental_gas_source is no longer needed "
+                   "and is ignored (source = gas or both works without it)" << std::endl;
+    }
+    // An ideal gas as a source: the energy of the kicks (energy_source = kick, flux or
+    // diag) is tested only with the adiabatic Jeans mode, on one level in a box periodic in
+    // every direction (hydro and gravity) with rk1/rk2/rk3; the production path is isothermal
+    if (source_gas_ && pack->phydro->peos->eos_data.is_ideal && evolution == "dynamic") {
+      bool tested = !pm->multilevel && pack->phydro->psbox_u == nullptr;
+      for (int f = 0; f < (pm->three_d ? 6 : 4); ++f)
+        tested = tested && pm->mesh_bcs[f] == BoundaryFlag::periodic;
+      // the field's own x3 boundary (read below with the same default): isolated z is untested
+      tested = tested && pin->GetOrAddString("gravity", "vertical_bc", "periodic") == "periodic";
+      const auto integ = pin->GetOrAddString("time", "integrator", "rk2");
+      tested = tested && (integ == "rk1" || integ == "rk2" || integ == "rk3");
+      if (!tested)
+        Fail("<gravity>/source = " + src + " with an ideal gas: the gas energy of the kicks is "
+             "tested only on one level, periodic in every direction, rk1/rk2/rk3 (use an "
+             "isothermal gas, or source = dust)");
+    }
     parse("kick", pin->GetOrAddString("gravity", "kick", src), kick_gas_, kick_dust_);
     if (!coupled_dust_ && (source_dust_ || kick_dust_))
       Fail("<gravity>/source or kick includes dust, but the run has no dust module");
@@ -213,6 +405,39 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   restart_ = pin->GetOrAddInteger("gravity", "gmres_restart", 24);
   report_each_solve_ = pin->GetOrAddBoolean("gravity", "report_each_solve", false);
   profile_ = pin->GetOrAddBoolean("gravity", "profile", false);
+  // Hidden test keys (read only when given) of the device assembly of a distributed rebuild:
+  // test_gpu_assembly 0 off (default), 1 the device rows of every level during the host assembly
+  // (split build, see GpuSplit), 2 also every level on the host, compared bitwise; with 1 or 2:
+  // test_gpu_chain_workers (transfer workers; 0 = the default rule), test_gpu_irregular (0: the
+  // irregular rows stay on the host), test_gpu_irregular_margin (cell widths from the x boundary
+  // and isolated-z walls, default 12), test_gpu_min_rows (smaller levels stay on the host,
+  // default 200000)
+  if (pin->DoesParameterExist("gravity", "test_gpu_assembly")) {
+    gpu_assembly_ = pin->GetInteger("gravity", "test_gpu_assembly");
+    if (gpu_assembly_ < 0 || gpu_assembly_ > 2) Fail("test_gpu_assembly must be 0, 1 or 2");
+  }
+  if (pin->DoesParameterExist("gravity", "test_gpu_chain_workers")) {
+    gpu_chain_workers_ = pin->GetInteger("gravity", "test_gpu_chain_workers");
+    if (gpu_chain_workers_ < 0) Fail("test_gpu_chain_workers must be nonnegative");
+  }
+  if (pin->DoesParameterExist("gravity", "test_gpu_irregular"))
+    gpu_options_.irregular = pin->GetInteger("gravity", "test_gpu_irregular") != 0;
+  if (pin->DoesParameterExist("gravity", "test_gpu_irregular_margin")) {
+    gpu_options_.margin = pin->GetReal("gravity", "test_gpu_irregular_margin");
+    if (!(gpu_options_.margin >= 0)) Fail("test_gpu_irregular_margin must be nonnegative");
+  }
+  if (pin->DoesParameterExist("gravity", "test_gpu_min_rows")) {
+    gpu_options_.min_rows = pin->GetInteger("gravity", "test_gpu_min_rows");
+    if (gpu_options_.min_rows < 0) Fail("test_gpu_min_rows must be nonnegative");
+  }
+  if (gpu_assembly_ != 0 && global_variable::my_rank == 0) {
+    std::cout << "# TEST (gravity) test_gpu_assembly=" << gpu_assembly_
+              << ": the rows of every multigrid level assembled on the device during the host"
+              << " assembly" << (gpu_assembly_ == 2 ? ", compared bitwise with the host assembly" : "")
+              << " (chain_workers=" << gpu_chain_workers_ << " irregular=" << gpu_options_.irregular
+              << " margin=" << gpu_options_.margin << " min_rows=" << gpu_options_.min_rows << ")"
+              << std::endl;
+  }
   SetupTimesOn() = profile_;
   phase_threads_ = pin->GetOrAddInteger("gravity", "phase_threads", 0);
   if (phase_threads_ < 0) Fail("gravity/phase_threads must be nonnegative");
@@ -224,7 +449,7 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
   // phase in steps of coarse_phase_quantum times the level's smallest y cell width (the phase
   // rounded to that grid; default 1: at most half a cell behind), the finest level exactly at
   // every solve. FGMRES converges with the exact finest operator to the same rtol; only the
-  // preconditioner lags. 0: every level at the exact phase at every update (the former behaviour).
+  // preconditioner lags. 0: every level at the exact phase at every update (the former behavior).
   coarse_phase_quantum_ = pin->GetOrAddReal("gravity", "coarse_phase_quantum", 1.0);
   if (!(coarse_phase_quantum_ >= 0) || !std::isfinite(coarse_phase_quantum_))
     Fail("gravity/coarse_phase_quantum must be finite and nonnegative");
@@ -319,6 +544,8 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     if (!periodic && !shear) Fail("unsupported gravity boundary in direction " +
                                 std::to_string(d+1));
   }
+  lean_ = SgLeanBits(pm->adaptive);
+  CheckSgEnvSwitches(lean_);
   dtnew = std::numeric_limits<Real>::max();
 }
 
@@ -352,7 +579,8 @@ SelfGravity::~SelfGravity() {
               << " coarse_level_skips=" << coarse_level_skips_
               << " iterations=" << last_solve.iterations
               << " relative_residual=" << last_solve.relative_residual
-              << " source_mean=" << last_source_mean << " time=" << last_time << '\n';
+              << " source_mean=" << last_source_mean << " time=" << last_time
+              << " memory_options=" << lean_ << '\n';
   }
 }
 
@@ -361,6 +589,11 @@ void SelfGravity::Invalidate() {
   topology_ = -1;
   phase_valid_ = false;
   field_cache_valid_ = false;
+}
+
+bool SelfGravity::FieldCurrent() const {
+  return field_cache_valid_ && topology_ == pack_->pmesh->GetAMRLoadBalanceUpdateSeq()
+      && acceleration.extent_int(0) == pack_->nmb_thispack;
 }
 
 void SelfGravity::SetHydroBoundaryTime(Real time) {
@@ -576,6 +809,14 @@ void SelfGravity::HierarchyInputs(Real shear_offset, int threads,
   domain.isolated_z = vertical_bc_ == "isolated";
   domain.shear_phase_updates = pm->mesh_bcs[0] == BoundaryFlag::shear_periodic;
   job.vacuum = domain.isolated_z && isolated_method_ == "vacuum";
+  if (gpu_assembly_ != 0) {
+    job.split = std::make_unique<GpuSplit>();
+    job.split->finish_early = gpu_assembly_ == 1;
+    // transfer workers of the split schedule (0: a third, 5/8 when the device takes >= 3/4 of the
+    // fine rows, BuildGeometricHierarchy)
+    job.split->chain_workers = gpu_chain_workers_;
+    job.split->options = gpu_options_;
+  }
   auto &patches = job.patches;
   patches.assign(pm->nmb_total,GravityPatch{});
   const int counts[3] = {ind.nx1,ind.nx2,ind.nx3};
@@ -610,22 +851,27 @@ void SelfGravity::AssembleHierarchy(HierarchyAssembly &job) {
   const double t0 = now();
   BuildTimes() = HierarchyBuildTimes{};
   job.neumann_z = false;
-  if (job.vacuum) {
-    job.vacuum_mesh = std::make_unique<VacuumMesh>(
-        BuildVacuumMesh(job.patches,job.domain,job.nranks));
-    job.patches = job.vacuum_mesh->patches;
-    job.domain = job.vacuum_mesh->domain;
-    job.neumann_z = job.vacuum_mesh->neumann_z;
-  }
+  try {
+    if (job.vacuum) {
+      job.vacuum_mesh = std::make_unique<VacuumMesh>(
+          BuildVacuumMesh(job.patches,job.domain,job.nranks));
+      job.patches = job.vacuum_mesh->patches;
+      job.domain = job.vacuum_mesh->domain;
+      job.neumann_z = job.vacuum_mesh->neumann_z;
+    }
+  } catch (...) { if (job.split) job.split->Abandon(); throw; }
   const double t1 = now();
   job.setup = BuildGeometricHierarchy(std::move(job.patches),job.domain,job.rank,job.nranks,
-                                      job.neumann_z,true,job.threads,job.coarse_quantum);
+                                      job.neumann_z,true,job.threads,job.coarse_quantum,
+                                      job.split.get());
   job.times = BuildTimes();
   job.geometry_s = t1-t0;
   job.assembly_s = now()-t1;
 }
 
 void SelfGravity::JoinHierarchyPrefetch() {
+  // (<gravity>/test_gpu_assembly) a hierarchy thread waiting for a device pass that has not run
+  if (hierarchy_prefetch_ && hierarchy_prefetch_->split) hierarchy_prefetch_->split->Cancel();
   if (hierarchy_prefetch_ && hierarchy_prefetch_->worker.joinable())
     hierarchy_prefetch_->worker.join();
 }
@@ -667,10 +913,19 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
   double prefetch_wait_s = 0;
   if (hierarchy_prefetch_) {
     const auto t_wait = std::chrono::steady_clock::now();
+    // (<gravity>/test_gpu_assembly) the device rows here, while the prefetch thread assembles
+    // the rest
+    double device_s = 0;
+    if (hierarchy_prefetch_->split && hierarchy_prefetch_->topology == pm->GetAMRLoadBalanceUpdateSeq()
+        && hierarchy_prefetch_->shift == shear_offset) {
+      try { device_s = hierarchy_prefetch_->split->RunDevice(); }
+      catch (const std::exception &e) { JoinHierarchyPrefetch(); Fail(e.what()); }
+    }
     JoinHierarchyPrefetch();
     prefetch_wait_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now()-t_wait).count();
     job = std::move(hierarchy_prefetch_);
+    job->device_s = device_s;
     prefetched = job->topology == pm->GetAMRLoadBalanceUpdateSeq() && job->shift == shear_offset;
     if (prefetched) {
       ++hierarchy_prefetch_used_;
@@ -682,12 +937,28 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
   if (!job) {
     job = std::make_unique<HierarchyAssembly>();
     HierarchyInputs(shear_offset,phase_serial_only_ ? 1 : setup_threads_,*job);
-    try { AssembleHierarchy(*job); } catch (...) { job->error = std::current_exception(); }
+    if (job->split) {
+      // (<gravity>/test_gpu_assembly) the host assembly on a thread, the device rows here meanwhile
+      auto *p = job.get();
+      p->worker = std::thread([p]() {
+        try { AssembleHierarchy(*p); } catch (...) { p->error = std::current_exception(); }
+      });
+      try { job->device_s = job->split->RunDevice(); }
+      catch (const std::exception &e) { job->split->Cancel(); p->worker.join(); Fail(e.what()); }
+      job->split->Cancel();   // (after the device pass: no effect)
+      p->worker.join();
+    } else {
+      try { AssembleHierarchy(*job); } catch (...) { job->error = std::current_exception(); }
+    }
   }
   if (job->error) {
     try { std::rethrow_exception(job->error); } catch (const std::exception &e) { Fail(e.what()); }
   }
   BuildTimes() = job->times;
+  if (job->split) {
+    BuildTimes().split_wait = job->split->wait_s;
+    BuildTimes().split_device = job->device_s;
+  }
   const double job_geometry_s = job->geometry_s, job_assembly_s = job->assembly_s;
   CompositeDomain domain = job->domain;
   std::unique_ptr<VacuumMesh> vacuum_mesh = std::move(job->vacuum_mesh);
@@ -696,6 +967,8 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
   try {
     auto setup = std::move(job->setup);
     job.reset();
+    // (<gravity>/test_gpu_assembly) the device rows into the systems of every level
+    FinishSplitHierarchy(setup,gpu_assembly_ == 2,rank);
     const double t_assembly = ProfileTime(profile_);
     const auto old_partition = partition_;
     partition_ = setup.fine.row_partition;
@@ -726,11 +999,79 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
     const int op_threads = setup.fine_geometry->SetupThreads();
     OperatorThreads operator_threads(op_threads);
     SetupTimes() = OperatorSetupTimes{};
+    bool build_boundary_force = true;
+    lean_rows_.clear();
+    if (lean_ & 4) {
+      mg_.reset();
+      for (auto &f : force_) f.reset();
+      boundary_rhs_op_.reset();
+      for (auto &f : boundary_force_) f.reset();
+    }
+    if (lean_ & 1) {
+      lean_rows_.assign(local,0);
+      for (int r : physical_rows) lean_rows_[r] = 1;
+      for (int d = 0; d < 3; ++d) KeepRows(setup.fine.acceleration[d],lean_rows_);
+      if (domain.isolated_z) {
+        std::uint64_t kept = 0;
+        for (int d = 0; d < 3; ++d) {
+          KeepRows(setup.fine.boundary_acceleration[d],lean_rows_);
+          kept += setup.fine.boundary_acceleration[d].values.size();
+        }
+#if MPI_PARALLEL_ENABLED
+        MPI_Allreduce(MPI_IN_PLACE,&kept,1,MPI_UINT64_T,MPI_SUM,MPI_COMM_WORLD);
+#endif
+        build_boundary_force = kept > 0;
+      }
+    }
+    if (SgMemStats()) {
+      const auto &h = setup.hierarchy;
+      for (size_t l = 0; l < h.matrices.size(); ++l)
+        PrintCsrStats(rank,"A",l,h.matrices[l],l == 0 ? physical_n : 0);
+      for (size_t l = 0; l < h.prolongation.size(); ++l)
+        PrintCsrStats(rank,"P",l,h.prolongation[l],l == 0 ? physical_n : 0);
+      for (size_t l = 0; l < h.restriction.size(); ++l)
+        PrintCsrStats(rank,"R",l,h.restriction[l],0);
+      for (int d = 0; d < domain.ndim; ++d)
+        PrintCsrStats(rank,"force",d,setup.fine.acceleration[d],physical_n);
+      if (domain.isolated_z) {
+        PrintCsrStats(rank,"boundary_rhs",0,setup.fine.boundary_rhs,physical_n);
+        for (int d = 0; d < 3; ++d)
+          PrintCsrStats(rank,"boundary_force",d,setup.fine.boundary_acceleration[d],physical_n);
+      }
+      const auto &fine_phase = setup.fine_geometry->PhaseRows();
+      for (size_t l = 0; l < h.matrices.size(); ++l)
+        PrintTemplateStats(rank,"A",l,h.matrices[l],l == 0 ? physical_n : 0,
+            l == 0 ? &fine_phase : &setup.coarse_geometry[l-1]->PhaseRows());
+      for (int d = 0; d < domain.ndim; ++d)
+        PrintTemplateStats(rank,"force",d,setup.fine.acceleration[d],physical_n,&fine_phase);
+      std::cout << "# SG_MEMSTATS rank=" << rank << " local_rows=" << local
+                << " physical_n=" << physical_n << " levels=" << h.matrices.size()
+                << " samples=" << setup.fine.boundary_samples.size()
+                << " vacuum=" << (vacuum_mesh ? 1 : 0) << std::endl;
+    }
     mg_ = std::make_unique<SparseMultigrid>(setup.hierarchy);
     const double t_multigrid = ProfileTime(profile_);
-    for (int d = 0; d < domain.ndim; ++d) {
-      force_[d] = std::make_unique<DistributedOperator>(setup.fine.acceleration[d],
-                                                       partition_,partition_);
+    if (lean_ & 8) {
+      // template rows; the phase rows (shear seam) stay in the CSR
+      const std::vector<int> none;
+      const auto &exclude = pm->mesh_bcs[0] == BoundaryFlag::shear_periodic
+          ? setup.fine_geometry->PhaseRows() : none;
+      for (int d = 0; d < domain.ndim; ++d) {
+        force_[d].reset();
+        force_[d] = std::make_unique<DistributedOperator>(setup.fine.acceleration[d],
+                                                         partition_,partition_,exclude);
+        if (SgMemStats()) {
+          const auto t = force_[d]->TemplateCounts();
+          std::cout << "# SG_MEMSTATS rank=" << rank << " op=force_templates level=" << d
+                    << " template_rows=" << t[0] << " template_nnz=" << t[1]
+                    << " csr_nnz=" << force_[d]->Storage().a_nnz << std::endl;
+        }
+      }
+    } else {
+      for (int d = 0; d < domain.ndim; ++d) {
+        force_[d] = std::make_unique<DistributedOperator>(setup.fine.acceleration[d],
+                                                         partition_,partition_);
+      }
     }
     const double t_operators = ProfileTime(profile_);
     if (domain.isolated_z) {
@@ -751,9 +1092,14 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
       boundary_values_ = DvceArray1D<Real>("sg_slab_boundary",bp[rank+1]-bp[rank]);
       boundary_rhs_op_ = std::make_unique<DistributedOperator>(setup.fine.boundary_rhs,
                                                                partition_,bp);
-      for (int d = 0; d < 3; ++d) boundary_force_[d] =
-          std::make_unique<DistributedOperator>(setup.fine.boundary_acceleration[d],
-                                                partition_,bp);
+      for (int d = 0; d < 3; ++d) {
+        if (build_boundary_force) {
+          boundary_force_[d] = std::make_unique<DistributedOperator>(
+              setup.fine.boundary_acceleration[d],partition_,bp);
+        } else {
+          boundary_force_[d].reset();
+        }
+      }
     }
     const double t_slab = ProfileTime(profile_);
     AllocateFields(setup.fine.volume,physical_rows,keep_guess);
@@ -785,7 +1131,18 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
       for (int d = 0; d < domain.ndim; ++d) force_[d]->ConfigurePhaseRows(rows);
       if (slab_ || vacuum_) {
         boundary_rhs_op_->ConfigurePhaseRows(rows);
-        for (int d = 0; d < 3; ++d) boundary_force_[d]->ConfigurePhaseRows(rows);
+        for (int d = 0; d < 3; ++d)
+          if (boundary_force_[d]) boundary_force_[d]->ConfigurePhaseRows(rows);
+      }
+      if (SgMemStats()) {
+        std::ostringstream s;
+        s << "# SG_MEMSTATS rank=" << rank << " phase_rows_a=" << rows.size();
+        for (const auto &coarse : coarse_geometry_) s << "," << coarse->PhaseRows().size();
+        s << " phase_rows_p=";
+        for (size_t l = 0; l < prolongation_phase_rows_.size(); ++l)
+          s << (l ? "," : "") << prolongation_phase_rows_[l].size();
+        s << '\n';
+        std::cout << s.str() << std::flush;
       }
     }
     hierarchy_fresh_ = true;
@@ -808,6 +1165,7 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
         const auto s = boundary_rhs_op_->Storage();
         storage.csr_bytes += s.csr_bytes; storage.halo_bytes += s.halo_bytes;
         for (int d = 0; d < 3; ++d) {
+          if (!boundary_force_[d]) continue;
           const auto f = boundary_force_[d]->Storage();
           storage.csr_bytes += f.csr_bytes; storage.halo_bytes += f.halo_bytes;
         }
@@ -835,6 +1193,34 @@ void SelfGravity::RebuildDistributed(Real shear_offset) {
                 << " assembly_fine_s=" << BuildTimes().fine_system
                 << " assembly_transfers_s=" << BuildTimes().transfers
                 << " assembly_coarse_s=" << BuildTimes().coarse_system
+                << " assembly_fine_alone_s=" << BuildTimes().fine_alone
+                << " assembly_chain_wait_s=" << BuildTimes().chain_wait
+                << " fine_rows_s=" << BuildTimes().fine_rows
+                << " fine_join_s=" << BuildTimes().fine_join
+                << " gpu_assembly=" << gpu_assembly_
+                << " split_prepare_s=" << BuildTimes().split_prepare
+                << " split_wait_s=" << BuildTimes().split_wait
+                << " split_device_s=" << BuildTimes().split_device
+                << " split_device_wait_s=" << BuildTimes().split_device_wait
+                << " split_finish_s=" << BuildTimes().split_finish
+                << " split_join_s=" << BuildTimes().split_join
+                << " split_device_rows=" << BuildTimes().split_device_rows
+                << " split_rows=" << BuildTimes().split_rows
+                << " split_differ=" << BuildTimes().split_differ
+                << " fine_device_rows=" << BuildTimes().fine_device[0]
+                << " fine_rows=" << BuildTimes().fine_device[1]
+                << " fine_device_upload_kernels_s=" << BuildTimes().fine_device[3]
+                << " fine_device_download_s=" << BuildTimes().fine_device[4]
+                << " fine_inner_thread_s=" << BuildTimes().fine_class[0]
+                << " fine_outer_thread_s=" << BuildTimes().fine_class[1]
+                << " fine_inner_rows=" << BuildTimes().fine_class[2]
+                << " fine_outer_rows=" << BuildTimes().fine_class[3]
+                << " chain_levels=" << [&]() {
+                     std::ostringstream o; const auto &b = BuildTimes();
+                     for (size_t l = 0; l < b.level_transfers.size(); ++l)
+                       o << (l ? "," : "") << b.level_rows[l+1] << ':' << b.level_transfers[l]
+                         << '/' << b.level_coarse[l];
+                     return o.str(); }()
                 << " operators_s=" << t_operators-t_assembly
                 << " op_multigrid_s=" << t_multigrid-t_assembly
                 << " op_force_s=" << t_operators-t_multigrid
@@ -920,6 +1306,12 @@ void SelfGravity::AssemblePhase(Real shear_offset, PhaseAssembly &out) {
     }
     out.level_p_s[l] = seconds(t,Clock::now());
   }
+  if (!lean_rows_.empty()) {   // memory option 1: the kept force rows only
+    for (int d = 0; d < 3; ++d) {
+      KeepRows(out.fine.acceleration[d],lean_rows_);
+      KeepRows(out.fine.boundary_acceleration[d],lean_rows_);
+    }
+  }
   const auto assembled = Clock::now();
   // The host part of every operator update, read-only on the idle operators
   // (on the phase workers: each plan's loops in row chunks; the plans do not depend on the count)
@@ -934,6 +1326,7 @@ void SelfGravity::AssemblePhase(Real shear_offset, PhaseAssembly &out) {
     extra.push_back({boundary_rhs_op_.get(),&out.fine.boundary_rhs,nullptr});
     extra_plan.push_back(&out.boundary_rhs_plan);
     for (int d = 0; d < 3; ++d) {
+      if (!boundary_force_[d]) { out.boundary_force_plans[d] = PhaseRowPlan{}; continue; }
       extra.push_back({boundary_force_[d].get(),&out.fine.boundary_acceleration[d],nullptr});
       extra_plan.push_back(&out.boundary_force_plans[d]);
     }
@@ -1010,8 +1403,9 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
     if (slab_ || vacuum_) {
       extra.push_back({boundary_rhs_op_.get(),&update.boundary_rhs,&job.boundary_rhs_plan});
       for (int d = 0; d < 3; ++d) {
-        extra.push_back({boundary_force_[d].get(),&update.boundary_acceleration[d],
-                         &job.boundary_force_plans[d]});
+        if (boundary_force_[d])
+          extra.push_back({boundary_force_[d].get(),&update.boundary_acceleration[d],
+                           &job.boundary_force_plans[d]});
       }
     }
     // (profile) per level: rows, nnz and whether the pattern is unchanged, before the release
@@ -1141,6 +1535,7 @@ void SelfGravity::RefreshHierarchy() {
       || refreshed.hierarchy.matrices[0].LocalRows() != solution_.extent_int(0)) {
     Fail("hierarchy-only refresh changed fine ownership; full rebuild required");
   }
+  if (lean_ & 4) mg_.reset();   // no transient second hierarchy (and FGMRES basis)
   auto solver = std::make_unique<SparseMultigrid>(refreshed.hierarchy);
   if (pack_->pmesh->mesh_bcs[0] == BoundaryFlag::shear_periodic) {
     std::vector<std::vector<int>> a_rows{geometry_->PhaseRows()};
@@ -1675,7 +2070,7 @@ void SelfGravity::Solve(Real time) {
       const int k = t%ind.nx3+ind.ks; t /= ind.nx3;
       acc(t,d,k,j,i) = work(rows(q));
     });
-    if (slab_ || vacuum_) {
+    if ((slab_ || vacuum_) && boundary_force_[d]) {
       boundary_force_[d]->Apply(boundary_values_,work_);
       Kokkos::parallel_for("sg_add_slab_force",Kokkos::RangePolicy<DevExeSpace>(0,n),
       KOKKOS_LAMBDA(const int q) {

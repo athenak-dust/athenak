@@ -2,7 +2,7 @@
 Reader for the AthenaK dust particle history (file_type = phst, <basename>.phst).
 
 One row per output time.  Every run writes 16
-columns: time, dt, n_particles, mass, mom1..3, ekin, z_rms, rho_max and the centre
+columns: time, dt, n_particles, mass, mom1..3, ekin, z_rms, rho_max and the center
 (rho_max_x1..x3) and level (rho_max_level) of that cell, chi_max, dt_stiff_min.  Runs
 with G/R (refinable clouds with merging or resampling on a refined mesh) add g_groups
 and r_removed (18).  The set is fixed for a run, restarts included; the header names

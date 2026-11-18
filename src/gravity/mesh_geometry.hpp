@@ -6,6 +6,8 @@
 #define GRAVITY_MESH_GEOMETRY_HPP_
 
 #include <array>
+#include <functional>
+#include <string>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -23,6 +25,15 @@ struct GravityPatch {
   std::array<int, 3> cells{{1, 1, 1}};
   int owner = 0, gid = -1;
   GlobalIndex row_begin = 0;
+};
+
+// The split build's choices (SelfGravity: hidden <gravity>/test_gpu_* keys): the irregular rows
+// on the device, their distance in cell widths from the x boundary and isolated-z walls, the
+// smallest level (owned rows) on the device
+struct GpuSplitOptions {
+  bool irregular = true;
+  double margin = 12.;
+  long long min_rows = 200000;
 };
 
 struct LocalCompositeSystem {
@@ -95,6 +106,34 @@ class MeshGeometry {
   LocalCompositeUpdate BuildPhaseUpdate(Real phase, bool forces = true);
   // host seconds of the last BuildPhaseUpdate: {row assembly, join of the worker chunks}
   std::array<double,2> LastPhaseUpdateSeconds() const;
+  // host seconds of the last BuildSystem: {row assembly, join of the worker chunks} and (with
+  // SetupTimesOn) summed thread seconds and rows of cells >= 2 cells inside their patch / others
+  std::array<double,6> LastBuildSeconds() const;
+  // Test key <gravity>/test_gpu_assembly: BuildSystem(forces) in steps, the regular rows
+  // (gpu_assembly.hpp) on the device concurrently with the other rows on the host.
+  // PrepareSplit (any thread): host tables and the host classification of the owned rows; then
+  // BuildHostRows (any thread, the setup workers) and RunDevice (only on the thread that owns
+  // the device) in any order or concurrently; then FinishSplit: the BuildSystem(forces) system.
+  void PrepareSplit(bool forces, const GpuSplitOptions &options = GpuSplitOptions{});
+  void ClassifySplit();   // after PrepareSplit, before BuildHostRows (any thread)
+  void BuildHostRows();
+  // slot: page-locked download buffers (one per level); counted (optional): called once the
+  // offsets are on the host (FinishSplitPrepare may run from then on)
+  void RunDevice(int slot = 0, const std::function<void()> &counted = {});
+  LocalCompositeSystem FinishSplit();   // = FinishSplitPrepare + FinishSplitCopy
+  // FinishSplit in two steps: Prepare after BuildHostRows and the counted call of RunDevice
+  // (the irregular rows the device left to the host, the output sizes), Copy after RunDevice
+  void FinishSplitPrepare();
+  LocalCompositeSystem FinishSplitCopy();
+  // (check) BuildSystem(forces) on the host, compared bitwise with a FinishSplit result: the
+  // number of rows (and metadata) that differ, the first difference in *first_difference
+  long long CheckSplit(const LocalCompositeSystem &split, bool forces,
+                       std::string *first_difference = nullptr);
+  // after PrepareSplit: {rows the device will assemble, owned rows}
+  std::array<long long,2> SplitRows() const;
+  // the last FinishSplit: {device rows, owned rows, host tables + classification s, upload +
+  // kernels s, download s, join s}
+  std::array<double,6> LastDeviceStats() const;
   const std::vector<GravityPatch> &Patches() const;
   const std::vector<GlobalIndex> &RowPartition() const;
   const std::vector<GlobalIndex> &SamplePartition() const;
@@ -117,6 +156,7 @@ class MeshGeometry {
       bool *images = nullptr, bool *shear_images = nullptr) const;
 
  private:
+  LocalCompositeSystem BuildSystemRows(bool forces, bool split);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

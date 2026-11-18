@@ -381,8 +381,8 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
     if (use_fofc) { il = is-1, iu = ie+1, jl = js-1, ju = je+1, kl = ks-2, ku = ke+2; }
 
     // the walk over k in nch3 chunks of faces (WalkChunks): with one or two MeshBlocks per
-    // rank one team per (m,j) row left most of a GPU idle (x3 2.5 ms vs x1 0.9 ms per cycle
-    // on one 128x128x256 block); each chunk reconstructs the cell before its first face once
+    // rank one team per (m,j) row left most of a GPU idle (the x3 sweep took several times as long
+    // as the x1 sweep); each chunk reconstructs the cell before its first face once
     // more, the same arithmetic per face for any nch3
     const int nch3 = WalkChunks(nmb1 + 1, ju - jl + 1, ku - kl);
     const int nf3 = ku - kl;

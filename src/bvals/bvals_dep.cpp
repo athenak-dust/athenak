@@ -81,10 +81,10 @@ MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *
 //----------------------------------------------------------------------------------------
 //! \fn void MeshBoundaryValuesDep::BuildLocalSMRMap()
 //! \brief Precompute the active-leaf destinations of every local ghost cell.  This runs
-//! on the device, and only the block itself and its neighbours (each once) are
+//! on the device, and only the block itself and its neighbors (each once) are
 //! searched instead of every block, so that a dynamic mesh can rebuild the map after each
 //! regrid; per target block only the cells near the ghost cell are tested.  Blocks narrower
-//! than two ghost depths (the coarse ghost zone then reaches past the finer neighbours) search
+//! than two ghost depths (the coarse ghost zone then reaches past the finer neighbors) search
 //! every block of the pack, as before.  The overlaps, the
 //! tests and the weights are those of the former full search, so the map is the same (the
 //! order of the targets of a ghost cell may differ, which does not change any sum).
@@ -117,8 +117,8 @@ void MeshBoundaryValuesDep::BuildLocalSMRMap() {
   const Real lxmesh = x1max - x1min, lymesh = x2max - x2min;
   constexpr int ntmax = max_smr_targets_;
   // the ghost zone of a coarse block is 2 ng cells of its finer
-  // neighbours; with blocks narrower than that (e.g. 4^2 cells, ng = 4) it reaches past the
-  // neighbours, so every block of the pack is searched then
+  // neighbors; with blocks narrower than that (e.g. 4^2 cells, ng = 4) it reaches past the
+  // neighbors, so every block of the pack is searched then
   const bool full = (2*indcs.ng > nx1) || (2*indcs.ng > nx2);
   const int ncand = full ? nmb : nnghbr;
   int nmany = 0, nuncovered = 0, nremote = 0;
@@ -140,7 +140,7 @@ void MeshBoundaryValuesDep::BuildLocalSMRMap() {
     while (0.5*(ylo + yhi) >= x2max) {ylo -= lymesh; yhi -= lymesh;}
     int ntarget = 0;
     Real overlap_sum = 0.0;
-    for (int n=-1; n<ncand; ++n) {   // the block itself, then each neighbour (or block) once
+    for (int n=-1; n<ncand; ++n) {   // the block itself, then each neighbor (or block) once
       int tm = m;
       if (n >= 0 && full) {
         if (n == m) continue;
@@ -192,8 +192,8 @@ void MeshBoundaryValuesDep::BuildLocalSMRMap() {
   if (nmany > 0 || nuncovered > 0 || nremote > 0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "Static-SMR deposit map: " << nmany << " ghost cells overlap too many leaves, "
-              << nuncovered << " are not covered by the block and its neighbours, " << nremote
-              << " neighbours lie on another rank" << std::endl;
+              << nuncovered << " are not covered by the block and its neighbors, " << nremote
+              << " neighbors lie on another rank" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 }

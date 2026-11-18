@@ -327,7 +327,7 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
   }
   int lnx1 = indcs.nx1, lnx2 = indcs.nx2, lnx3 = indcs.nx3;
   // <problem>/lattice_sub: in 3-D the ppc particles of a cell on an n^3 sub-lattice
-  // (offsets (a + 1/2)/n) instead of all at the cell centre; ppc = n^3 times nspecies
+  // (offsets (a + 1/2)/n) instead of all at the cell center; ppc = n^3 times nspecies
   int nsub = 1;
   if (pin->GetOrAddBoolean("problem", "lattice_sub", false)) {
     if (sblocks) {   // every species on its own cubic sub-lattice
@@ -1121,7 +1121,7 @@ bool SpeciesHistory(HistoryData *pdata, Mesh *pm) {
 //! \brief The errors of the 3-D drag tests, computed in the code (leaf cells, volume
 //! weighted).  damping: rms(rho_g - rho0),
 //! rms(u_x - u(t)), rms(rho_d/(eps rho0) - 1), rms|u_perp|; wave: L1 errors over the amplitudes
-//! (gas and dust density as cell averages, u_x at the cell centre) and rms|u_perp|/|du|.  Both:
+//! (gas and dust density as cell averages, u_x at the cell center) and rms|u_perp|/|du|.  Both:
 //! the rms deviation of rho_g and rho_d from their x-column means (the part that is not one-
 //! dimensional; over the amplitudes for the wave, rho_d over eps rho0 for damping) and the dust
 //! mass on the leaves over the particle mass, minus one.  Dust entries are -1 without clouds.

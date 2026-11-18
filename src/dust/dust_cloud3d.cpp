@@ -98,37 +98,40 @@ bool P1Flag3(const LeafTraversal3D &t, const int m, const int code, const Real x
   return false;
 }
 
-// pieces of a flagged particle along the three directions (P1Event per direction)
+// the separation flags of a flagged particle: bit 2j (2j + 1) set when the lower (upper) side
+// along direction j lies inside the finer region (the CloudInsideFiner tests of P1Event per
+// direction); P1Build3 forms the pieces from them.  With the piece bound the count pass keeps
+// them (split_sep) and the range kernel and the fill use those, so all three decide alike.
 KOKKOS_INLINE_FUNCTION
-void P1Event3(const LeafTraversal3D &t, const int m, const int code, const Real x, const Real y,
-              const Real z, const Real slack, DPiece3 p1[3], DPiece3 p2[3], DPiece3 p3[3],
+int P1Sep3(const LeafTraversal3D &t, const int m, const int code, const Real x, const Real y,
+           const Real z, const Real slack) {
+  using T = SMRCompositeTransfer;
+  const int lev = T::CloudLevel(code);
+  const bool plain = T::CloudLobe1(code) == 0 && T::CloudLobe2(code) == 0 &&
+                     T::CloudLobe3(code) == 0;
+  const int l = plain ? lev : lev - 1;
+  const Real h1 = t.CloudHalfWidth1(l), h2 = t.CloudHalfWidth2(l), h3 = t.CloudHalfWidth3(l);
+  return (t.CloudInsideFiner(x - h1, y, z, l, slack, m) ? 1 : 0) |
+         (t.CloudInsideFiner(x + h1, y, z, l, slack, m) ? 2 : 0) |
+         (t.CloudInsideFiner(x, y - h2, z, l, slack, m) ? 4 : 0) |
+         (t.CloudInsideFiner(x, y + h2, z, l, slack, m) ? 8 : 0) |
+         (t.CloudInsideFiner(x, y, z - h3, l, slack, m) ? 16 : 0) |
+         (t.CloudInsideFiner(x, y, z + h3, l, slack, m) ? 32 : 0);
+}
+
+// pieces of a flagged particle along the three directions from its separation flags
+KOKKOS_INLINE_FUNCTION
+void P1Build3(const int code, const int sep, DPiece3 p1[3], DPiece3 p2[3], DPiece3 p3[3],
               int &n1, int &n2, int &n3, int &clev, bool &parent) {
   using T = SMRCompositeTransfer;
   const int lev = T::CloudLevel(code);
   const int l1 = T::CloudLobe1(code), l2 = T::CloudLobe2(code), l3 = T::CloudLobe3(code);
-  if (l1 == 0 && l2 == 0 && l3 == 0) {
-    const Real h1 = t.CloudHalfWidth1(lev), h2 = t.CloudHalfWidth2(lev);
-    const Real h3 = t.CloudHalfWidth3(lev);
-    n1 = P1Pieces3(3, t.CloudInsideFiner(x - h1, y, z, lev, slack, m),
-                   t.CloudInsideFiner(x + h1, y, z, lev, slack, m), p1);
-    n2 = P1Pieces3(3, t.CloudInsideFiner(x, y - h2, z, lev, slack, m),
-                   t.CloudInsideFiner(x, y + h2, z, lev, slack, m), p2);
-    n3 = P1Pieces3(3, t.CloudInsideFiner(x, y, z - h3, lev, slack, m),
-                   t.CloudInsideFiner(x, y, z + h3, lev, slack, m), p3);
-    clev = lev + 1;
-    parent = true;
-  } else {
-    const Real h1 = t.CloudHalfWidth1(lev - 1), h2 = t.CloudHalfWidth2(lev - 1);
-    const Real h3 = t.CloudHalfWidth3(lev - 1);
-    n1 = P1Pieces3(l1, t.CloudInsideFiner(x - h1, y, z, lev - 1, slack, m),
-                   t.CloudInsideFiner(x + h1, y, z, lev - 1, slack, m), p1);
-    n2 = P1Pieces3(l2, t.CloudInsideFiner(x, y - h2, z, lev - 1, slack, m),
-                   t.CloudInsideFiner(x, y + h2, z, lev - 1, slack, m), p2);
-    n3 = P1Pieces3(l3, t.CloudInsideFiner(x, y, z - h3, lev - 1, slack, m),
-                   t.CloudInsideFiner(x, y, z + h3, lev - 1, slack, m), p3);
-    clev = lev;
-    parent = false;
-  }
+  const bool plain = (l1 == 0 && l2 == 0 && l3 == 0);
+  n1 = P1Pieces3(plain ? 3 : l1, (sep & 1) != 0, (sep & 2) != 0, p1);
+  n2 = P1Pieces3(plain ? 3 : l2, (sep & 4) != 0, (sep & 8) != 0, p2);
+  n3 = P1Pieces3(plain ? 3 : l3, (sep & 16) != 0, (sep & 32) != 0, p3);
+  clev = plain ? lev + 1 : lev;
+  parent = plain;
 }
 
 std::uint64_t Mix64(std::uint64_t x) {
@@ -199,7 +202,7 @@ void DustGasDrag::CheckClouds3D() {
 //! \brief The block geometry of LeafTraversal3D: box, cell size, level and finest-cell box of
 //! every block (from the logical locations, as AthenaK computes mb_size), the distinct adjacent
 //! blocks of every block with the periodic shift that places each next to it (from the 56
-//! neighbour slots), the ring its neighbours certainly hold, and the index of logical
+//! neighbor slots), the ring its neighbors certainly hold, and the index of logical
 //! locations; several ranks: the halo slots and the exchange lists (BuildHalo).
 
 void DustGasDrag::BuildLeafTraversal3D() {
@@ -212,7 +215,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
   const int nslot = pmy_pack->pmb->nnghbr;
   if (!pm->three_d || nslot != 56) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "3-D leaf traversal: 3-D meshes only (56 neighbour slots)" << std::endl;
+              << "3-D leaf traversal: 3-D meshes only (56 neighbor slots)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   const auto &t = smr_transfer;
@@ -220,7 +223,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
   const bool zper = pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic;
   // block slots: the blocks of this rank (slot = gid - gids), then
   // the blocks of other ranks that a cloud of this rank can reach (halo, ascending gid: the
-  // neighbours, and every block within the reach of a block of this rank, HaloReach), then all
+  // neighbors, and every block within the reach of a block of this rank, HaloReach), then all
   // other blocks; with the box of cells of each halo block that the clouds can reach (strips)
   const int ntot = pm->nmb_total;
   std::vector<int> slot_of(ntot, -1), slot_gid;
@@ -504,7 +507,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
       std::exit(EXIT_FAILURE);
     }
   }
-  // the direction of every neighbour slot
+  // the direction of every neighbor slot
   int dir[56][3];
   for (int n=0; n<56; ++n) dir[n][0] = dir[n][1] = dir[n][2] = 0;
   for (int iz=-1; iz<=1; ++iz) {
@@ -532,7 +535,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
       const int b = slot_of[g];
       if (b >= nfld) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "3-D leaf traversal: neighbour " << g << " of block " << gids + m
+                  << "3-D leaf traversal: neighbor " << g << " of block " << gids + m
                   << " has no halo slot" << std::endl;
         std::exit(EXIT_FAILURE);
       }
@@ -543,8 +546,8 @@ void DustGasDrag::BuildLeafTraversal3D() {
       const Real bmax_m[3] = {bmax1[m], bmax2[m], bmax3[m]};
       for (int d=0; d<3; ++d) {
         // across a face, edge or corner: the gap between the facing sides (0 or a domain length);
-        // along it (id = 0) the neighbour overlaps the block: the image whose centre is nearest.
-        // (The minimum-side difference rounds the wrong way when a coarser neighbour spans the
+        // along it (id = 0) the neighbor overlaps the block: the image whose center is nearest.
+        // (The minimum-side difference rounds the wrong way when a coarser neighbor spans the
         // whole domain in that direction: half a domain length.)
         const int id = dir[n][d];
         const Real gap = (id > 0) ? bmin_b[d] - bmax_m[d]
@@ -561,7 +564,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
       if (c >= LeafTraversal3D::kMaxNb) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                   << "3-D leaf traversal: more than " << LeafTraversal3D::kMaxNb
-                  << " distinct neighbours of block " << m << std::endl;
+                  << " distinct neighbors of block " << m << std::endl;
         std::exit(EXIT_FAILURE);
       }
       nb(m, c) = b; nbs(m, c, 0) = s[0]; nbs(m, c, 1) = s[1]; nbs(m, c, 2) = s[2];
@@ -569,7 +572,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
     }
     nnb(m) = c;
   }
-  // the finest level among each block and its neighbours
+  // the finest level among each block and its neighbors
   lt.nbmax = DvceArray1D<int>("dust_leaf3d_nbmax", std::max(1, nmb));
   auto nbmax = Kokkos::create_mirror_view(lt.nbmax);
   for (int m=0; m<nmb; ++m) {
@@ -577,7 +580,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
     for (int k=0; k<nnb(m); ++k) mx = std::max(mx, blev(nb(m, k)));
     nbmax(m) = mx;
   }
-  // the ring that the neighbours certainly hold, checked cell by cell
+  // the ring that the neighbors certainly hold, checked cell by cell
   lt.safe = DvceArray2D<int>("dust_leaf3d_safe", std::max(1, nmb), 3);
   auto safe = Kokkos::create_mirror_view(lt.safe);
   int nunsafe = 0;
@@ -656,7 +659,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
     Kokkos::deep_copy(dmom, 0.0);
   }
   BuildHalo(slot_gid);
-  // shear-periodic x1, the data of the shear neighbours (UpdateShear3D): the finest
+  // shear-periodic x1, the data of the shear neighbors (UpdateShear3D): the finest
   // boxes of all slots, the slots near each x1 face, the reach of each local block (the halo's
   // on several ranks, the level rule on one)
   lt.shear = shear3d;
@@ -703,7 +706,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
       std::cout << " on rank 0 (" << nfld - nmb << " halo, " << ntot << " in all)";
     }
     std::cout << ", levels " << lt.nlev << ", finest grid " << lt.nfine1 << "x" << lt.nfine2
-              << "x" << lt.nfine3 << ", at most " << mxnb << " neighbours"
+              << "x" << lt.nfine3 << ", at most " << mxnb << " neighbors"
               << (nunsafe > 0 ? ", " + std::to_string(nunsafe) + " blocks without a certain ring"
                               : "") << std::endl;
   }
@@ -721,7 +724,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
 //! \fn DustGasDrag::UpdateShear3D
 //! \brief Shear-periodic x1.  The shear offset ysh = fmod(q Omega Lx t, Ly) of the
 //! time t of the positions to be traversed (bvals_part.cpp) and, when it changed, the shear
-//! neighbours of every local block: for each side, the blocks that meet the block translated
+//! neighbors of every local block: for each side, the blocks that meet the block translated
 //! across that x1 face ((+Lx, -ysh) across the inner face, (-Lx, +ysh) across the outer one)
 //! and widened by its reach, with their periodic shifts in y and z (none in x).  Host lists from
 //! the finest-cell boxes of the slots near the opposite face; a few per block.
@@ -767,7 +770,7 @@ void DustGasDrag::UpdateShear3D(const Real time) {
             if (!(bz0 < z1 && z0 < bz1)) continue;
             if (b >= lt.nfld) {
               std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                        << std::endl << "3-D clouds, shear-periodic x1: shear neighbour slot " << b
+                        << std::endl << "3-D clouds, shear-periodic x1: shear neighbor slot " << b
                         << " of block " << lt.gids + m << " is beyond the halo" << std::endl;
               std::exit(EXIT_FAILURE);
             }
@@ -1068,7 +1071,7 @@ int DustGasDrag::RouteToOwnerBlocks3D(const char *when, const int first) {
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::SplitCloudsP1Device3D
 //! \brief The device P1 split in 3-D (SplitCloudsP1Device with a third direction): pieces per
-//! particle, exclusive scan for the slots and tags, one fill kernel; the centre piece keeps its
+//! particle, exclusive scan for the slots and tags, one fill kernel; the center piece keeps its
 //! parent's slot and tag.  Returns the number of split / released particles.
 //! cloud_split_budget > 0: the events are taken in particle index order while fewer than the
 //! budget clouds have been created (the scan offset of an event is the number created before
@@ -1110,6 +1113,13 @@ int DustGasDrag::SplitCloudsP1Device3D() {
   }
   auto np = split_np;
   auto tagoff = split_off;
+  // (the piece bound) the separation flags of every event kept for the range kernel and the fill
+  const bool gbsep = split_gb_fill;
+  if (gbsep && split_sep.extent_int(0) < npart) {
+    split_sep = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "dust_split_sep"),
+                                 npart + npart/4);
+  }
+  auto sepv = split_sep;
   int nflag = 0, nparent = 0;
   Kokkos::parallel_reduce("dust_split3d_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, int &sf, int &sp) {
@@ -1118,8 +1128,10 @@ int DustGasDrag::SplitCloudsP1Device3D() {
     const int m = lt.Anchor(pi(PGID,p));
     if (!P1Flag3(lt, m, code, x, y, z, slack)) {np(p) = 0; return;}
     DPiece3 p1[3], p2[3], p3[3]; int n1, n2, n3, clev; bool parent;
-    P1Event3(lt, m, code, x, y, z, slack, p1, p2, p3, n1, n2, n3, clev, parent);
+    const int sep = P1Sep3(lt, m, code, x, y, z, slack);
+    P1Build3(code, sep, p1, p2, p3, n1, n2, n3, clev, parent);
     np(p) = n1*n2*n3;
+    if (gbsep) sepv(p) = sep;
     sf += 1;
     if (parent) sp += 1;
   }, Kokkos::Sum<int>(nflag), Kokkos::Sum<int>(nparent));
@@ -1177,6 +1189,46 @@ int DustGasDrag::SplitCloudsP1Device3D() {
   const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
   const bool mark = split_blk_mark;
   auto sblk = split_blk;
+  if (ai && split_gb_fill) {
+    // (the piece bound) a separate kernel before the fill: the pieces' offsets of every event from
+    // the count pass's separation flags (the fill uses the same flags), the range factor (range:
+    // G of the row scaled), with the diagnostic the pieces' statistics
+    const int gbmode = split_gb_mode;
+    const Real gbmargin = split_gb_margin, gbrsmp = split_gb_rsmp;
+    const int gbkind = split_gb_kind, gbucol = split_gb_ucol;
+    const bool gbfull = split_gb_full;
+    auto gbc = split_gb_cnt;
+    auto gbm = split_gb_max;
+    auto gbs = split_gb_smp;
+    Kokkos::parallel_for("dust_split3d_gbound", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      if (np(p) < 2) return;
+      using T = SMRCompositeTransfer;
+      const int code = piv(PLEV,p);
+      const Real x = prv(IPX,p), y = prv(IPY,p), z = prv(IPZ,p);
+      DPiece3 p1[3], p2[3], p3[3]; int n1, n2, n3, clev; bool parent;
+      P1Build3(code, sepv(p), p1, p2, p3, n1, n2, n3, clev, parent);   // the count pass's flags
+      if (n1*n2*n3 < 2) return;
+      const Real e1 = lt.CloudHalfWidth1(clev), e2 = lt.CloudHalfWidth2(clev);
+      const Real e3 = lt.CloudHalfWidth3(clev);
+      Real dk[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+      const int nk[3] = {n1, n2, n3};
+      for (int a=0; a<n1; ++a) {
+        dk[0][a] = p1[a].off*e1 + SplitLobeShift(p1[a].lobe, e1) -
+                   (parent ? 0.0 : SplitLobeShift(T::CloudLobe1(code), e1));
+      }
+      for (int b=0; b<n2; ++b) {
+        dk[1][b] = p2[b].off*e2 + SplitLobeShift(p2[b].lobe, e2) -
+                   (parent ? 0.0 : SplitLobeShift(T::CloudLobe2(code), e2));
+      }
+      for (int c=0; c<n3; ++c) {
+        dk[2][c] = p3[c].off*e3 + SplitLobeShift(p3[c].lobe, e3) -
+                   (parent ? 0.0 : SplitLobeShift(T::CloudLobe3(code), e3));
+      }
+      SplitGradientBound(vg, tagoff(p), gbmode, gbmargin, gbkind, gbfull, gbucol, gbrsmp, dk, nk, x, y,
+                         z, gbc, gbm, gbs);
+    });
+  }
   Kokkos::parallel_for("dust_split3d_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     if (np(p) == 0) return;
@@ -1184,8 +1236,9 @@ int DustGasDrag::SplitCloudsP1Device3D() {
     const int code = piv(PLEV,p);
     const Real x = prv(IPX,p), y = prv(IPY,p), z = prv(IPZ,p), mass = prv(IPM,p);
     DPiece3 p1[3], p2[3], p3[3]; int n1, n2, n3, clev; bool parent;
-    P1Event3(lt, lt.Anchor(piv(PGID,p)), code, x, y, z, slack, p1, p2, p3, n1, n2, n3, clev,
-             parent);
+    // (with the piece bound the count pass's separation flags, as the range kernel)
+    P1Build3(code, gbsep ? sepv(p) : P1Sep3(lt, lt.Anchor(piv(PGID,p)), code, x, y, z, slack),
+             p1, p2, p3, n1, n2, n3, clev, parent);
     const Real e1 = lt.CloudHalfWidth1(clev), e2 = lt.CloudHalfWidth2(clev);
     const Real e3 = lt.CloudHalfWidth3(clev);
     const int n12 = n1*n2;
@@ -1242,8 +1295,8 @@ int DustGasDrag::SplitCloudsP1Device3D() {
   }
   if (mark && nnew > npart) {
     // (the log of the R after the split) pieces that landed in a block that is neither their
-    // parent's block nor one of its MeshBlock neighbours (across a shear-periodic x1 face the
-    // neighbours are the unshifted blocks; after a hold by the budget pieces lie further away)
+    // parent's block nor one of its MeshBlock neighbors (across a shear-periodic x1 face the
+    // neighbors are the unshifted blocks; after a hold by the budget pieces lie further away)
     auto nbr = pmy_pack->pmb->nghbr.d_view;
     const int nnb = pmy_pack->pmb->nnghbr, nmb = pmy_pack->nmb_thispack;
     auto sgid = leaf_slot_gid_d;
@@ -1277,6 +1330,7 @@ int DustGasDrag::SplitCloudsP1Device3D() {
     split_last_offrank = noff;
   }
   if (ai) SplitVelocityCheck(npart, nnew);
+  if (ai && split_gb_diag) SplitGradientBoundReport();
   cloud_split_count += nparent;
   cloud_lobe_split_count += nflag - nparent;
   ppar->nprtcl_thispack = nnew;
@@ -1289,7 +1343,7 @@ int DustGasDrag::SplitCloudsP1Device3D() {
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::PackGatherField3D, PackGasGather3D
 //! \brief The 3-D gather field: gas velocity and its central differences in x1, x2, x3 of every
-//! cell with both neighbours in each direction, twelve numbers side by side (PackGatherField in
+//! cell with both neighbors in each direction, twelve numbers side by side (PackGatherField in
 //! 3-D); from a conserved state: the velocity of every cell first (PackGasGather in 3-D).
 
 void DustGasDrag::PackGatherField3D(const DvceArray5D<Real> &vel) {

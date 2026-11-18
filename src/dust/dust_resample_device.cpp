@@ -63,7 +63,7 @@ namespace {
 
 //! Workspace budget in bytes: cloud_resample_device_mem_mb (at least 64 MB), but at most half of
 //! the device memory free right now, so that a workspace never asks for memory that the clouds
-//! and the pair tables already hold (L4: 31.7 GiB asked with 530M clouds resident, 2026-10-30).
+//! and the pair tables already hold.
 //! Host backends: the configured budget.
 double WorkspaceBudget(const int mem_mb, const char *what) {
   const double conf = static_cast<double>(std::max(mem_mb, 64))*1048576.0;
@@ -112,7 +112,7 @@ WsSize Sizes(const int nmax, const int emax, const int lmax, const int extra = 0
   z.lmax = std::max(lmax, 1);
   z.hmax = 4;
   while (z.hmax < 4*z.lmax) z.hmax *= 2;
-  z.rmax = 7*lmax + 8 + extra;   // (3-D: extra = 1, the x3 centre-of-mass row, + cross moments)
+  z.rmax = 7*lmax + 8 + extra;   // (3-D: extra = 1, the x3 center-of-mass row, + cross moments)
   const int rb = std::min(z.rmax, z.nmax);
   z.cmax = std::max(2*rb, rb + 32);
   const std::size_t r = z.rmax, n = z.nmax, c = z.cmax;
@@ -621,7 +621,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
   const int e0 = pb.sptr(a0), ne = pb.sptr(a1) - e0;
   const int nl = DistinctSorted(tm, ne, [&](const int e) {return pb.stgt(e0 + e);}, ws.tab,
                                 hmask, ws.ltmp, ws.leaves);
-  const int ncom = pb.three ? 3 : 2;   // centre-of-mass rows (x3 in 3-D)
+  const int ncom = pb.three ? 3 : 2;   // center-of-mass rows (x3 in 3-D)
   // cross-moment rows, + 3 inertial rows in a rotating frame (kXV != 0 only)
   const int nxv = (kXV != 0) ? XVRows(kXV) + (xp.rot ? 3 : 0) : 0;
   const int nrow = 7*nl + 6 + ncom + nxv;
@@ -637,7 +637,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
   });
   Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, nrow*n), [&](const int e) {ws.A[e] = 0.0;});
   tm.team_barrier();
-  // rows: leaf mass, leaf momentum about the patch mean, centre of mass, velocity second
+  // rows: leaf mass, leaf momentum about the patch mean, center of mass, velocity second
   // moments, leaf feedback; one thread per cloud (its column A[i*n + j])
   const double xc = pb.pgeo(q,0), yc = pb.pgeo(q,1), rdx = pb.pgeo(q,2), rdy = pb.pgeo(q,3);
   Kokkos::parallel_for(Kokkos::TeamThreadRange(tm, n), [&](const int j) {
@@ -666,7 +666,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
     col(g + 6) = c[1]*c[2]; col(g + 7) = c[2]*c[2];
     if constexpr (kXV != 0) {
       // the cross moments sum w (x - c)_a (v - u)_b, after the feedback rows; x unwrapped about
-      // the patch centre as in the centre-of-mass rows, u the patch mean (c[] above)
+      // the patch center as in the center-of-mass rows, u the patch mean (c[] above)
       double dz = 0.0;
       if (pb.three) {
         dz = spd(a, JZ) - pb.pgeo(q,4);
@@ -690,7 +690,7 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
       }
       if (xp.rot) {
         // rotating frame (shearing box, stored v2 shear-relative): the inertial J about the
-        // patch centre is the J of the stored velocities + omega ((q - 1) S_xz, -S_yz,
+        // patch center is the J of the stored velocities + omega ((q - 1) S_xz, -S_yz,
         // (1 - q) S_xx + S_yy), S = sum m x x^T; these three combinations as rows (over one
         // length, the largest half width), so that both J are kept
         const double h = pb.three ? Kokkos::fmax(Kokkos::fmax(rdx, rdy), pb.pgeo(q,5))
@@ -889,7 +889,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
   // them; the larger ones (a crowded cell of a dense core can hold millions of entries) use
   // slots of one table in device memory, as many slots as cloud_resample_device_mem_mb allows.
   // (Team scratch is allocated for every resident team, so sizing it for the largest patch
-  // asked for 152-304 GiB per GPU once cells of a dense core held that many clouds.)
+  // asked for far more than the device memory once cells of a dense core held that many clouds.)
   // The counts do not depend on the table size.
   const int ecut = 8192;
   int emax = 1, elarge = 0, nlarge = 0;

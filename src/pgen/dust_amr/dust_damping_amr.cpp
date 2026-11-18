@@ -6,7 +6,7 @@
 //! \file dust_damping_amr.cpp
 //! \brief Problem generator for the drag damping test on refined meshes: uniform dust
 //! moving at <problem>/dust_test_v0 (default 0.1) along x1 through uniform gas at rest, without
-//! rotation (no <shearing_box>).  The centre-of-mass velocity is conserved and the relative
+//! rotation (no <shearing_box>).  The center-of-mass velocity is conserved and the relative
 //! velocity decays as exp(-(1 + eps) t/t_s), so the gas velocity is
 //!     u(t) = eps v0/(1 + eps) (1 - exp(-(1 + eps) t/t_s))
 //! (one species).  As dust_damping, but with the particle set-up of dust_setup: point
@@ -61,7 +61,7 @@ void DampingHistory(HistoryData *pdata, Mesh *pm) {
 // Test fields of <dust>/cloud_split_velocity (no drag and no forces: the clouds move
 // ballistically).  <problem>/test_vgrad = "G00 G01 ... G22" (G_ij = dv_i/dx_j; in 2-D the
 // columns j = 0, 1): every cloud gets v_base + G (X - c) at its centroid X (c = test_vgrad_c,
-// default the domain centre).  The field stays linear under ballistic motion,
+// default the domain center).  The field stays linear under ballistic motion,
 // u(x, t) = v_base + G (I + G t)^-1 (x - c - v_base t).  <problem>/test_two_stream_v = V: every
 // cloud becomes two, v_base +- V along x1, masses m f and m (1 - f), f = 1/2 + a sin(2 pi x/L1)
 // (a = test_two_stream_amp).  At the end one line # SPLIT_VELOCITY_TEST: linear, the largest
@@ -159,7 +159,7 @@ void SVTestFinal(ParameterInput *, Mesh *pm) {
 void SVTestInit(ParameterInput *pin, Mesh *pm, const Real v0) {
   // every test key is read only when present (before the return below: nothing is added to the
   // parameters, so the parameter dump and the restart header of a run without them are those of
-  // the base; Codex review: GetOrAddReal added test_two_stream_v = 0 to every run)
+  // the base)
   svt_.lin = pin->DoesParameterExist("problem", "test_vgrad");
   svt_.V = pin->DoesParameterExist("problem", "test_two_stream_v")
            ? pin->GetReal("problem", "test_two_stream_v") : 0.0;

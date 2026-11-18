@@ -137,6 +137,10 @@ void DustGasDrag::PackRestartState(std::vector<char> &b) const {
   if (!cloud_merge_mroot.empty()) {
     PutRecord(b, "mroot", cloud_merge_mroot.data(), cloud_merge_mroot.size()*sizeof(Real));
   }
+  // the cloud residual rule's own root-mass estimate (made only while the G / R passes had none)
+  if (!imex_mown.empty()) {
+    PutRecord(b, "imex_mown", imex_mown.data(), imex_mown.size()*sizeof(Real));
+  }
   const std::uint64_t rs[2] = {cloud_resample_pass, cloud_resample_removed};
   PutRecord(b, "resample", rs, sizeof(rs));
   // the time-mode resampling schedule (by_time 0 in cycle mode; next -1 before
@@ -261,6 +265,11 @@ void DustGasDrag::UnpackRestartState(const char *p, std::size_t nbytes) {
       if (n % sizeof(Real) != 0) Broken("dust record mroot has an unexpected size");
       cloud_merge_mroot.resize(n/sizeof(Real));
       std::memcpy(cloud_merge_mroot.data(), d, n);
+    } else if (name == "imex_mown") {
+      if (n % sizeof(Real) != 0) Broken("dust record imex_mown has an unexpected size");
+      imex_mown.resize(n/sizeof(Real));
+      std::memcpy(imex_mown.data(), d, n);
+      imex_mown_restored = true;
     } else if (name == "resample") {
       std::uint64_t v[2]; want(sizeof(v)); std::memcpy(v, d, sizeof(v));
       cloud_resample_pass = v[0]; cloud_resample_removed = v[1];

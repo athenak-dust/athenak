@@ -21,7 +21,7 @@
 //! finest-grid table): for every target cell of this rank the contributing source cells, sorted
 //! by (source gid, source cell), so that the sums do not depend on how the blocks are spread over
 //! the ranks; and per peer rank the source cells sent there.  Both sides enumerate the pairs of
-//! blocks with the same function (the target's neighbours or the source's neighbours; the
+//! blocks with the same function (the target's neighbors or the source's neighbors; the
 //! adjacency is symmetric) and every message size is checked once per build (MPI_Alltoall).
 //! Every source ghost cell must be covered exactly once (checked).
 //!
@@ -231,7 +231,7 @@ void PairOverlap(const Geo &g, const BlkR &s, const BlkR &t, const int part, con
   }
 }
 
-// candidate partners of block b (local index m): itself and its neighbours (part 0), or the
+// candidate partners of block b (local index m): itself and its neighbors (part 0), or the
 // blocks of the opposite face(s) (part 1)
 std::vector<int> Candidates(MeshBlockPack *pp, const BlkR &b, const int m, const int part,
                             const std::vector<int> *face) {

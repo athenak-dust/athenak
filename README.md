@@ -184,5 +184,5 @@ All in `<dust>` unless noted. The defaults are the validated production values; 
 
 ## 5. Known limitations
 
-- MHD in a shearing box with shear-periodic x1 boundaries runs on a uniform mesh only; with SMR/AMR the run stops at start-up. The face-level ghost exchange used by refined shearing boxes exists for cell-centred (hydro, dust) variables only.
+- MHD in a shearing box with shear-periodic x1 boundaries runs on a uniform mesh only; with SMR/AMR the run stops at start-up. The face-level ghost exchange used by refined shearing boxes exists for cell-centered (hydro, dust) variables only.
 - `refinable_mode = default` is meant for nonlinear runs. It damps small linear modes (LinA-like tests); use `careful_merge` or `split_only` there.

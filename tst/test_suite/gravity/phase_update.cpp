@@ -11,7 +11,7 @@
 //     solver's ProjectionFusion() must match (run once without ATHENA_SG_PROJECT_FUSE, once with
 //     it, once with it and ATHENA_SG_PROJECT_FUSE_PROBE_TEST=1, which must refuse); the V-cycle
 //     result is printed as a checksum so that runs with and without fusion can be compared
-//  4. the completion of the queued uploads (Codex review round 3): every public update that
+//  4. the completion of the queued uploads: every public update that
 //     returns normally ends with the fence "gravity_phase_uploads", which may throw (Kokkos throws
 //     on a failed CUDA/HIP synchronization); an update that throws ends with the non-throwing
 //     fence "gravity_phase_uploads_unwind".  A Kokkos Tools fence callback counts both and, when

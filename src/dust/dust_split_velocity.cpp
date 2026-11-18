@@ -12,7 +12,7 @@
 //! On a cycle where some rank splits:
 //!  - DepositSplitMoments(3D): per species, on the actual leaves with the clouds' own weights,
 //!    rho, rho dX, rho dX dX^T, rho v, rho |v|^2 (dX = X - x_c, X the cloud's centroid, x_c the
-//!    cell centre, the cloud framed next to the cell's block; v relative to the species'
+//!    cell center, the cloud framed next to the cell's block; v relative to the species'
 //!    mass-weighted mean velocity, so that the second moment keeps small dispersions about a
 //!    drift common to the species; it does not remove the cancellation where the local velocity
 //!    differs strongly from that mean: the round-off of the excess below is then about
@@ -52,6 +52,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -202,6 +203,153 @@ int SVFit(const SVMoments &q, const int ndim, const Real vpx, const Real vpy, co
   return 2;
 }
 
+// (the piece bound, diagnostic) a copy of SVMoments for the statistics kernel: the base fit kernels
+// keep their own helpers and call graph, so the compiler treats them as in the base code (shared
+// helpers changed the 3-D default path at round-off on the CPU)
+
+struct SVMomentsGB {
+  Real s0 = 0.0, sx[3] = {0.0, 0.0, 0.0}, su[3] = {0.0, 0.0, 0.0};
+  Real sxx[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // 00 11 22 01 02 12
+  Real sux[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  Real svc[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // sum a V_c (00 11 22 01 02 12)
+  Real svv = 0.0;   // sum w rho |v|^2
+  KOKKOS_INLINE_FUNCTION
+  void Add(const Real a, const Real x0, const Real x1, const Real x2, const Real u0,
+           const Real u1, const Real u2, const Real wvv, const Real v[6]) {
+    s0 += a;
+    sx[0] += a*x0; sx[1] += a*x1; sx[2] += a*x2;
+    su[0] += a*u0; su[1] += a*u1; su[2] += a*u2;
+    sxx[0] += a*x0*x0; sxx[1] += a*x1*x1; sxx[2] += a*x2*x2;
+    sxx[3] += a*x0*x1; sxx[4] += a*x0*x2; sxx[5] += a*x1*x2;
+    sux[0] += a*u0*x0; sux[1] += a*u0*x1; sux[2] += a*u0*x2;
+    sux[3] += a*u1*x0; sux[4] += a*u1*x1; sux[5] += a*u1*x2;
+    sux[6] += a*u2*x0; sux[7] += a*u2*x1; sux[8] += a*u2*x2;
+    for (int n=0; n<6; ++n) svc[n] += a*v[n];
+    svv += wvv;
+  }
+};
+
+// (test_split_gradient_bound) the smallest eigenvalue of E^-1 A E^-1, A the weighted covariance
+// of the cells' mean centroids (as in SVFit), E = diag(e): about the squared spread of the
+// populated cells along their thinnest direction in units of the half-width (closed form for a
+// symmetric 3 x 3 / 2 x 2 matrix)
+KOKKOS_INLINE_FUNCTION
+Real SVLambdaMin(const SVMomentsGB &q, const int ndim, const Real e0, const Real e1, const Real e2) {
+  if (!(q.s0 > 0.0)) return 0.0;
+  const Real is0 = 1.0/q.s0;
+  const Real mx[3] = {q.sx[0]*is0, q.sx[1]*is0, q.sx[2]*is0};
+  const Real a00 = (q.sxx[0]*is0 - mx[0]*mx[0])/(e0*e0);
+  const Real a11 = (q.sxx[1]*is0 - mx[1]*mx[1])/(e1*e1);
+  const Real a01 = (q.sxx[3]*is0 - mx[0]*mx[1])/(e0*e1);
+  if (ndim == 2) {
+    const Real h = 0.5*(a00 + a11), d = 0.5*(a00 - a11);
+    return h - sqrt(d*d + a01*a01);
+  }
+  const Real a22 = (q.sxx[2]*is0 - mx[2]*mx[2])/(e2*e2);
+  const Real a02 = (q.sxx[4]*is0 - mx[0]*mx[2])/(e0*e2);
+  const Real a12 = (q.sxx[5]*is0 - mx[1]*mx[2])/(e1*e2);
+  const Real p1 = a01*a01 + a02*a02 + a12*a12;
+  const Real qq = (a00 + a11 + a22)/3.0;
+  const Real p2 = (a00 - qq)*(a00 - qq) + (a11 - qq)*(a11 - qq) + (a22 - qq)*(a22 - qq) + 2.0*p1;
+  if (!(p2 > 0.0)) return qq;
+  const Real pp = sqrt(p2/6.0), ip = 1.0/pp;
+  const Real b00 = (a00 - qq)*ip, b11 = (a11 - qq)*ip, b22 = (a22 - qq)*ip;
+  const Real b01 = a01*ip, b02 = a02*ip, b12 = a12*ip;
+  Real r = 0.5*(b00*(b11*b22 - b12*b12) - b01*(b01*b22 - b12*b02) + b02*(b01*b12 - b11*b02));
+  r = fmax(-1.0, fmin(1.0, r));
+  const Real phi = acos(r)/3.0;
+  return qq + 2.0*pp*cos(phi + 2.0*M_PI/3.0);
+}
+
+// (test_split_gradient_bound) the populated support cells of one fit: the range of their mean
+// velocities (relative to the parent's), the fewest clouds per cell, the weights
+// (sentinels: the largest finite Real, in single precision too)
+constexpr Real kSVHuge = std::numeric_limits<Real>::max();
+struct SVCellStats {
+  Real umn[3] = {kSVHuge, kSVHuge, kSVHuge}, umx[3] = {-kSVHuge, -kSVHuge, -kSVHuge};
+  Real nmn = kSVHuge, sa = 0.0, sa2 = 0.0, san = 0.0, amax = 0.0;
+  KOKKOS_INLINE_FUNCTION
+  void Add(const Real a, const Real u0, const Real u1, const Real u2, const Real n) {
+    umn[0] = fmin(umn[0], u0); umn[1] = fmin(umn[1], u1); umn[2] = fmin(umn[2], u2);
+    umx[0] = fmax(umx[0], u0); umx[1] = fmax(umx[1], u1); umx[2] = fmax(umx[2], u2);
+    nmn = fmin(nmn, n); sa += a; sa2 += a*a; san += a*n; amax = fmax(amax, a);
+  }
+};
+
+// (test_split_gradient_bound) after the fit kernel, in the separate statistics kernel: the
+// extra columns of the row (G and V_G as the fit kernel stored them: the applied fit has V_G > 0),
+// the count rule (mode 2: the row's G and V_G zeroed, the parent's velocity; split_vel_cnt's
+// "gradient" count decremented), the counters and maxima of the call.  cok: the per-cell cloud
+// counts exist (not with physical x3 faces: nmin, nmean -1 and no count verdict then).
+// Returns R = V_G / dv (dv the span of the cells' mean velocities) for an applied fit, else 0.
+template <class GV, class CV, class MV, class SV>
+KOKKOS_INLINE_FUNCTION
+Real SVBoundFit(const SVMomentsGB &q, const SVCellStats &cs, const int ndim, const Real e0,
+                const Real e1, const Real e2, const int ncell, const int mode, const int nmin,
+                const int cmean, const bool cok, const bool chk, const GV &g, const int row,
+                const CV &cnt, const MV &mx, const SV &svc) {
+  const Real vg = g(row,13);
+  const int st0 = (vg > 0.0) ? 1 : 0;   // the fit applied (as the base fit kernel stored it)
+  const bool any = ncell > 0;
+  Real dv2 = 0.0;
+  for (int c=0; c<3; ++c) {
+    const Real a = any ? cs.umn[c] : 0.0, b = any ? cs.umx[c] : 0.0;
+    g(row, kGBCol + kGBUmin + c) = a;
+    g(row, kGBCol + kGBUmax + c) = b;
+    dv2 += (b - a)*(b - a);
+  }
+  const Real nmean = !cok ? -1.0 : ((cs.sa > 0.0) ? cs.san/cs.sa : 0.0);
+  const Real nmn = !cok ? -1.0 : (any ? cs.nmn : 0.0);
+  g(row, kGBCol + kGBNmin) = nmn;
+  g(row, kGBCol + kGBNmean) = nmean;
+  g(row, kGBCol + kGBNeff) = (cs.sa2 > 0.0) ? cs.sa*cs.sa/cs.sa2 : 0.0;
+  g(row, kGBCol + kGBLmin) = SVLambdaMin(q, ndim, e0, e1, e2);
+  g(row, kGBCol + kGBWmax) = (cs.sa > 0.0) ? cs.amax/cs.sa : 0.0;
+  g(row, kGBCol + kGBSt0) = st0;
+  g(row, kGBCol + kGBVG) = (st0 == 1) ? vg : 0.0;
+  g(row, kGBCol + kGBS) = 1.0;
+  g(row, kGBCol + kGBNcell) = ncell;
+  Real gn2 = 0.0;
+  for (int n=0; n<9; ++n) {
+    const Real v = g(row,n);
+    g(row, kGBCol + kGBG + n) = v;
+    gn2 += v*v;
+  }
+  bool coff = false;
+  Kokkos::atomic_add(&cnt(kGCEvents), 1ULL);
+  Real r = 0.0;
+  if (st0 == 1) {
+    coff = cok && ((cmean != 0) ? nmean : nmn) < static_cast<Real>(nmin);
+    if (mode == 2 && coff) {
+      for (int n=0; n<9; ++n) g(row,n) = 0.0;
+      g(row,13) = 0.0;
+      if (chk) g(row,15) = 5;
+      Kokkos::atomic_sub(&svc(1), 1ULL);
+      Kokkos::atomic_add(&cnt(kGCCountA), 1ULL);
+    }
+    if (coff) Kokkos::atomic_add(&cnt(kGCCountV), 1ULL);
+    Kokkos::atomic_add(&cnt(kGCFit), 1ULL);
+    const Real dv = sqrt(dv2);
+    r = (dv > 0.0) ? vg/dv : 1.0e30;
+    const Real re[11] = {0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0, 100.0};
+    const Real ne[11] = {1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 64.0};
+    int br = 0, bn = 0, bm = 0;
+    while (br < 11 && r >= re[br]) ++br;
+    while (bn < 11 && nmn >= ne[bn]) ++bn;
+    while (bm < 11 && nmean >= ne[bm]) ++bm;
+    Kokkos::atomic_add(&cnt(kGCRHist + br), 1ULL);
+    if (cok) {
+      Kokkos::atomic_add(&cnt(kGCNHist + bn), 1ULL);
+      Kokkos::atomic_add(&cnt(kGCMHist + bm), 1ULL);
+    }
+    Kokkos::atomic_max(&mx(kGMR), static_cast<double>(fmin(r, 1.0e30)));
+    Kokkos::atomic_max(&mx(kGMVG), static_cast<double>(vg));
+    Kokkos::atomic_max(&mx(kGMG), static_cast<double>(sqrt(gn2)));
+  }
+  g(row, kGBCol + kGBCntOff) = coff ? 1.0 : 0.0;
+  return r;
+}
+
 }  // namespace
 
 //----------------------------------------------------------------------------------------
@@ -238,6 +386,117 @@ void DustGasDrag::ReadSplitVelocityKeys(ParameterInput *pin) {
     std::cout << "# dust: cloud_split_velocity = mesh_gradient, cloud_split_dispersion_max = "
               << cloud_split_dispersion_max << std::endl;
   }
+  // the bound on the pieces' velocities (SplitGradientBound, dust_split_velocity.hpp): with
+  // mesh_gradient the range bound, box form, margin 0.5; the hidden
+  // test keys below (read only when given, mesh_gradient only) change it or add the diagnostic
+  if (cloud_split_velocity == 1) {
+    split_gb_mode = 1;
+    split_gb_kind = 0;
+    split_gb_margin = 0.5;
+  }
+  static const char *gbkeys[] = {"test_split_gradient_bound", "test_split_gradient_nmin",
+                                 "test_split_gradient_count", "test_split_gradient_range_kind",
+                                 "test_split_gradient_range_margin", "test_split_gradient_diag",
+                                 "test_split_gradient_sample_r", "test_split_gradient_dump_r"};
+  bool gbkey = false;
+  for (const char *k : gbkeys) gbkey = gbkey || pin->DoesParameterExist("dust", k);
+  if (gbkey && cloud_split_velocity != 1) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<dust>/test_split_gradient_* need cloud_split_velocity = mesh_gradient"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (pin->DoesParameterExist("dust", "test_split_gradient_bound")) {
+    const std::string v = pin->GetString("dust", "test_split_gradient_bound");
+    if (v == "none") {
+      split_gb_mode = 0;
+    } else if (v == "range") {
+      split_gb_mode = 1;
+    } else if (v == "count") {
+      split_gb_mode = 2;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<dust>/test_split_gradient_bound must be none, range or count" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+  if (pin->DoesParameterExist("dust", "test_split_gradient_nmin")) {
+    split_gb_nmin = pin->GetInteger("dust", "test_split_gradient_nmin");
+  }
+  if (pin->DoesParameterExist("dust", "test_split_gradient_count")) {
+    const std::string c = pin->GetString("dust", "test_split_gradient_count");
+    if (c == "cell") {
+      split_gb_count_mean = 0;
+    } else if (c == "mean") {
+      split_gb_count_mean = 1;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<dust>/test_split_gradient_count must be cell or mean" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+  if (pin->DoesParameterExist("dust", "test_split_gradient_range_kind")) {
+    const std::string c = pin->GetString("dust", "test_split_gradient_range_kind");
+    if (c == "box") {
+      split_gb_kind = 0;
+    } else if (c == "span") {
+      split_gb_kind = 1;
+    } else {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "<dust>/test_split_gradient_range_kind must be box or span" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+  if (pin->DoesParameterExist("dust", "test_split_gradient_range_margin")) {
+    split_gb_margin = pin->GetReal("dust", "test_split_gradient_range_margin");
+  }
+  if (pin->DoesParameterExist("dust", "test_split_gradient_diag")) {
+    split_gb_diag = pin->GetBoolean("dust", "test_split_gradient_diag");
+  }
+  if (pin->DoesParameterExist("dust", "test_split_gradient_sample_r")) {
+    split_gb_rsmp = pin->GetReal("dust", "test_split_gradient_sample_r");
+  }
+  if (pin->DoesParameterExist("dust", "test_split_gradient_dump_r")) {
+    split_gb_rdump = pin->GetReal("dust", "test_split_gradient_dump_r");
+  }
+  // what runs (every rank decides from the same input; no collective depends on it):
+  //  full: the per-cell cloud counts in the moments' deposit, every extra column of a row, the
+  //        verdicts of both rules (the count rule, or the diagnostic)
+  //  stats: the statistics kernel after the fit (the range of the cells' mean velocities; full)
+  //  fill: the range kernel before the fill (the range bound, or the diagnostic)
+  //  ucol: the columns of that range (the check-only columns 14.. of a row when the check is off)
+  //  counts: the per-cell cloud counts in the deposit; with physical x3 faces the 3-D traversal
+  //        mirrors a support back into the domain, so one cloud can reach a cell twice: the count
+  //        rule is refused there and the diagnostic leaves the counts out
+  //  acol: the column with the support the fit used (its code; written by the fit kernel)
+  const bool x3phys = pmy_pack->pmesh->three_d &&
+      (pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic ||
+       pmy_pack->pmesh->mesh_bcs[BoundaryFace::outer_x3] != BoundaryFlag::periodic);
+  if (split_gb_mode == 2 && x3phys) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<dust>/test_split_gradient_bound = count needs periodic x3 faces (with physical "
+              << "faces a mirrored support part would count a cloud twice)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  split_gb_full = (split_gb_mode == 2) || split_gb_diag;
+  split_gb_counts = split_gb_full && !x3phys;
+  split_gb_stats = (split_gb_mode != 0) || split_gb_diag;
+  split_gb_fill = (split_gb_mode == 1) || split_gb_diag;
+  split_gb_ucol = (split_gb_full || cloud_split_velocity_check) ? kGBCol : 14;
+  split_gb_acol = split_gb_full ? kGBCol + kGBNum : split_gb_ucol + 6;
+  if (cloud_split_velocity == 1 && global_variable::my_rank == 0) {
+    std::cout << "# dust: mesh_gradient piece bound: "
+              << ((split_gb_mode == 0) ? "none" : ((split_gb_mode == 2) ? "count" :
+                  (split_gb_kind ? "range (span)" : "range (box)")))
+              << ((split_gb_mode == 1) ? ", margin " + std::to_string(split_gb_margin) : "")
+              << ((split_gb_mode == 2) ? ", nmin " + std::to_string(split_gb_nmin) +
+                  (split_gb_count_mean ? " (fit-weighted mean)" : " (every populated cell)") : "")
+              << (gbkey ? " (hidden test keys given)" : "")
+              << (split_gb_diag ? ", diagnostic on (sample R > " + std::to_string(split_gb_rsmp) +
+                  ", dump R > " + std::to_string(split_gb_rdump) + ")" : "")
+              << ((split_gb_full && !split_gb_counts) ? ", no cloud counts (physical x3 faces)" : "")
+              << std::endl;
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -267,9 +526,19 @@ bool DustGasDrag::SplitVelocityPrepare(const int nrows) {
   }
   ++split_vel_deposits;
   if (nrows == 0) return false;
-  if (split_vgrad.extent_int(0) < nrows || split_vgrad.extent_int(1) != kRow) {
+  // (the piece bound) the extra columns: every one from kGBCol (full), else the range of the
+  // cells' mean velocities at split_gb_ucol (inside the base row when the check is off),
+  // and the column with the support the fit used (split_gb_acol)
+  const int krow = split_gb_stats ? std::max(kRow, split_gb_acol + 1) : kRow;
+  if (split_vgrad.extent_int(0) < nrows || split_vgrad.extent_int(1) != krow) {
     split_vgrad = DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing,
-                                                       "dust_split_vgrad"), nrows + nrows/4, kRow);
+                                                       "dust_split_vgrad"), nrows + nrows/4, krow);
+  }
+  if (split_gb_stats && split_gb_cnt.extent_int(0) != kGCNum) {
+    split_gb_cnt = Kokkos::View<unsigned long long*, DevMemSpace>("dust_split_gb_cnt", kGCNum);
+    split_gb_max = Kokkos::View<double*, DevMemSpace>("dust_split_gb_max", kGMNum);
+    split_gb_dump = Kokkos::View<int*, DevMemSpace>("dust_split_gb_dump", 1);
+    split_gb_smp = DvceArray2D<Real>("dust_split_gb_smp", kGSmpRows, kGSmpCols);
   }
   const int npart = pmy_pack->ppart->nprtcl_thispack;
   if (clouds3d) {
@@ -294,7 +563,7 @@ bool DustGasDrag::SplitVelocityPrepare(const int nrows) {
 //! further, and then the halo is widened and the leaf traversal rebuilt as in CheckHaloReach.
 //! Called from SplitCloudsP1 in place of CheckHaloReach("split velocity"), before the device
 //! split copies the traversal, so the moments' deposit, its halo exchange and the fit all see
-//! the widened halo (Codex review: the retry support could run past the halo, or read halo cells
+//! the widened halo (otherwise the retry support could run past the halo, or read halo cells
 //! whose moments had not been exchanged).  Returns whether the halo was rebuilt.
 
 bool DustGasDrag::CheckSplitVelocityReach() {
@@ -439,7 +708,9 @@ DvceArray1D<Real> DustGasDrag::SplitReferenceVelocity() {
 //! \brief The moments of every cloud on the actual leaves (see the file comment).
 
 void DustGasDrag::DepositSplitMoments3D() {
-  const int nc = kNC3*nspecies;
+  // (test_split_gradient_bound) one more component per species after the moments: the number of
+  // clouds that deposit into the cell (a separate kernel below)
+  const int nc = kNC3*nspecies + (split_gb_counts ? nspecies : 0);
   // the slots the leaf traversal can reach (local + halo), not qdep's preallocated
   // max_nmb_per_rank: the array is zeroed at every deposit
   const int nslot = std::max(std::max(1, pmy_pack->nmb_thispack), leaf_traversal3d.nfld);
@@ -497,13 +768,28 @@ void DustGasDrag::DepositSplitMoments3D() {
   } else {
     CloudParFor("dust_split_moments3d", npart, body);
   }
+  if (split_gb_counts) {
+    const int cbase = kNC3*nsp;
+    auto cbody = KOKKOS_LAMBDA(const int p) {
+      const int sp = pi(PSP,p);
+      lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
+      [&](const int target, const Real w) {
+        if (w == 0.0) return;
+        int tb, tk, tj, ti;
+        lt.Decode(target, tb, tk, tj, ti);
+        Real one[1] = {1.0};
+        DepositAddWarp<1>(&f(tb,cbase+sp,tk,tj,ti), cstride, target*nsp + sp, one);
+      });
+    };
+    CloudParFor("dust_split_counts3d", npart, cbody);
+  }
   // several ranks: the owners' sums, then the owners' values on the halo slots
   HaloReverseAdd(split_mom, 0, nc);
   HaloForward5D(split_mom, 0, nc);
 }
 
 void DustGasDrag::DepositSplitMoments() {
-  const int nc = kNC2*nspecies;
+  const int nc = kNC2*nspecies + (split_gb_counts ? nspecies : 0);   // (+ counts, as 3-D)
   const int nslot = std::max(std::max(1, pmy_pack->nmb_thispack), leaf_traversal.nfld);
   if (split_mom.extent_int(0) != nslot || split_mom.extent_int(1) != nc ||
       split_mom.extent_int(2) != qdep.extent_int(2) || split_mom.extent_int(3) != qdep.extent_int(3) ||
@@ -553,6 +839,20 @@ void DustGasDrag::DepositSplitMoments() {
   } else {
     CloudParFor("dust_split_moments2d", npart, body);
   }
+  if (split_gb_counts) {
+    const int cbase = kNC2*nsp;
+    auto cbody = KOKKOS_LAMBDA(const int p) {
+      const int sp = pi(PSP,p);
+      lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
+      [&](const int target, const Real w) {
+        if (w == 0.0) return;
+        const int ti = target % nc1, r = target/nc1, tj = r % nc2, tm = r/nc2;
+        Real one[1] = {1.0};
+        DepositAddWarp<1>(&f(tm,cbase+sp,ks,tj,ti), cstride, target*nsp + sp, one);
+      });
+    };
+    CloudParFor("dust_split_counts2d", npart, cbody);
+  }
   HaloReverseAdd(split_mom, 0, nc);
   HaloForward5D(split_mom, 0, nc);
 }
@@ -578,6 +878,9 @@ void DustGasDrag::SplitVelocityGradient3D(const int npart) {
   // (check) the retry supports against the halo allowance of the anchor block (several ranks)
   const bool multi = global_variable::nranks > 1;
   auto allow = halo_allow_d_;
+  // (the piece bound) the support the fit used (its code), for the statistics kernel
+  const bool rec = split_gb_stats;
+  const int acol = split_gb_acol;
   Kokkos::parallel_for("dust_split_vgrad3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     if (np(p) < 2) return;
@@ -651,6 +954,7 @@ void DustGasDrag::SplitVelocityGradient3D(const int npart) {
             f(tb,c0+12,tk,tj,ti)*ir - vz, w*f(tb,c0+13,tk,tj,ti), vc);
     });
     st = SVFit(q, 3, vx, vy, vz, e1, e2, e3, c2, gg, vg, dg);
+    if (rec) g(row, acol) = tcode;
     }
     for (int n=0; n<9; ++n) g(row,n) = gg[n];
     g(row,9) = pr(IPVX,p); g(row,10) = pr(IPVY,p); g(row,11) = pr(IPVZ,p); g(row,12) = pr(IPM,p);
@@ -665,6 +969,7 @@ void DustGasDrag::SplitVelocityGradient3D(const int npart) {
     Kokkos::atomic_add(&cnt(0), 1ULL);
     Kokkos::atomic_add(&cnt(st), 1ULL);
   });
+  if (split_gb_stats) SplitGradientBoundFit3D(npart);   // the range of the cells' means; (test) counts
 }
 
 void DustGasDrag::SplitVelocityGradient(const int npart) {
@@ -685,6 +990,9 @@ void DustGasDrag::SplitVelocityGradient(const int npart) {
   // (check) the retry supports against the halo allowance of the anchor block (several ranks)
   const bool multi = global_variable::nranks > 1;
   auto allow = halo_allow_d_;
+  // (the piece bound) the support the fit used (its code), for the statistics kernel
+  const bool rec = split_gb_stats;
+  const int acol = split_gb_acol;
   Kokkos::parallel_for("dust_split_vgrad2d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     if (np(p) < 2) return;
@@ -739,6 +1047,7 @@ void DustGasDrag::SplitVelocityGradient(const int npart) {
             f(tm,c0+8,ks,tj,ti)*ir - vz, w*f(tm,c0+9,ks,tj,ti), vc);
     });
     st = SVFit(q, 2, vx, vy, vz, e1, e2, 0.0, c2, gg, vg, dg);
+    if (rec) g(row, acol) = tcode;
     }
     for (int n=0; n<9; ++n) g(row,n) = gg[n];
     g(row,9) = pr(IPVX,p); g(row,10) = pr(IPVY,p); g(row,11) = pr(IPVZ,p); g(row,12) = pr(IPM,p);
@@ -752,6 +1061,207 @@ void DustGasDrag::SplitVelocityGradient(const int npart) {
     // counters: [0] events, [st] by status (1 applied, 2 dispersion, 3 conditioning, 4 uniform)
     Kokkos::atomic_add(&cnt(0), 1ULL);
     Kokkos::atomic_add(&cnt(st), 1ULL);
+  });
+  if (split_gb_stats) SplitGradientBoundFit(npart);   // the range of the cells' means; (test) counts
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::SplitGradientBoundFit3D / SplitGradientBoundFit
+//! \brief (the piece bound) a separate kernel after the fit: one traversal of the support the fit
+//! used (its code, stored by the fit kernel at split_gb_acol), the range of the populated cells'
+//! mean velocities for the events whose fit applied (the default range bound); with full (the
+//! count rule or the diagnostic) also the clouds per cell, the weights, the thinnest spread of the
+//! centroids, the count rule on the row, and (3-D, test_split_gradient_dump_r) the support of the
+//! first four events with R above the threshold.
+
+void DustGasDrag::SplitGradientBoundFit3D(const int npart) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  const auto lt = leaf_traversal3d;
+  auto f = split_mom;
+  auto g = split_vgrad;
+  auto np = split_np;
+  auto off = split_off;
+  const int is = lt.is, js = lt.js, ks = lt.ks;
+  const bool chk = cloud_split_velocity_check;
+  auto vr = split_vref;
+  auto svc = split_vel_cnt;
+  const int gbmode = split_gb_mode, gbnmin = split_gb_nmin, gbcm = split_gb_count_mean;
+  const int cbase = kNC3*nspecies;
+  const Real rdump = split_gb_rdump;
+  const bool diag = split_gb_diag;
+  auto gbc = split_gb_cnt;
+  auto gbm = split_gb_max;
+  // full: the count rule or the diagnostic; otherwise (the default range bound) only the range of
+  // the cells' mean velocities of the events whose fit applied (V_G > 0 in the row)
+  const bool full = split_gb_full, cok = split_gb_counts;
+  const int ucol = split_gb_ucol, acol = split_gb_acol;
+  auto gbd = split_gb_dump;
+  Kokkos::parallel_for("dust_split_gbfit3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    if (np(p) < 2) return;
+    using T = SMRCompositeTransfer;
+    const int row = off(p);
+    if (!full && !(g(row,13) > 0.0)) return;
+    const int code = pi(PLEV,p), lev = T::CloudLevel(code), c0 = kNC3*pi(PSP,p);
+    const Real e1 = lt.CloudHalfWidth1(lev), e2 = lt.CloudHalfWidth2(lev);
+    const Real e3 = lt.CloudHalfWidth3(lev);
+    const Real x = pr(IPX,p), y = pr(IPY,p), z = pr(IPZ,p);
+    const Real xc = x + SplitLobeShift(T::CloudLobe1(code), e1);
+    const Real yc = y + SplitLobeShift(T::CloudLobe2(code), e2);
+    const Real zc = z + SplitLobeShift(T::CloudLobe3(code), e3);
+    const int sp = pi(PSP,p);
+    const Real vx = pr(IPVX,p) - vr(3*sp), vy = pr(IPVY,p) - vr(3*sp+1);
+    const Real vz = pr(IPVZ,p) - vr(3*sp+2);
+    // one traversal of the support the fit used (its code, stored by the fit kernel): the range of
+    // the cells' mean velocities; with full also the moments of the centroids and the counts
+    const int tfin = static_cast<int>(g(row, acol));
+    int ncell = 0;
+    SVMomentsGB q;
+    SVCellStats cs;
+    lt.ForEachCloudWeight(x, y, z, tfin, lt.Anchor(pi(PGID,p)),
+    [&](const int target, const Real w) {
+      if (w == 0.0) return;
+      int tb, tk, tj, ti;
+      lt.Decode(target, tb, tk, tj, ti);
+      const Real rho = f(tb,c0,tk,tj,ti);
+      if (!(rho > 0.0)) return;
+      const Real ir = 1.0/rho;
+      const Real u0 = f(tb,c0+10,tk,tj,ti)*ir - vx, u1 = f(tb,c0+11,tk,tj,ti)*ir - vy;
+      const Real u2 = f(tb,c0+12,tk,tj,ti)*ir - vz;
+      ++ncell;
+      cs.Add(w*rho, u0, u1, u2, cok ? f(tb,cbase+sp,tk,tj,ti) : 0.0);
+      if (!full) return;
+      Real xq = xc, yq = yc, zq = zc;
+      lt.Frame(tb, xq, yq, zq);
+      const Real m0 = f(tb,c0+1,tk,tj,ti)*ir, m1 = f(tb,c0+2,tk,tj,ti)*ir;
+      const Real m2 = f(tb,c0+3,tk,tj,ti)*ir;
+      const Real X0 = lt.box(tb,0) + (ti - is + 0.5)*lt.box(tb,3) - xq + m0;
+      const Real X1 = lt.box(tb,1) + (tj - js + 0.5)*lt.box(tb,4) - yq + m1;
+      const Real X2 = lt.box(tb,2) + (tk - ks + 0.5)*lt.box(tb,5) - zq + m2;
+      const Real vc[6] = {f(tb,c0+4,tk,tj,ti)*ir - m0*m0, f(tb,c0+5,tk,tj,ti)*ir - m1*m1,
+                          f(tb,c0+6,tk,tj,ti)*ir - m2*m2, f(tb,c0+7,tk,tj,ti)*ir - m0*m1,
+                          f(tb,c0+8,tk,tj,ti)*ir - m0*m2, f(tb,c0+9,tk,tj,ti)*ir - m1*m2};
+      q.Add(w*rho, X0, X1, X2, u0, u1, u2, w*f(tb,c0+13,tk,tj,ti), vc);
+    });
+    if (!full) {
+      for (int c=0; c<3; ++c) {
+        g(row, ucol + kGBUmin + c) = (ncell > 0) ? cs.umn[c] : 0.0;
+        g(row, ucol + kGBUmax + c) = (ncell > 0) ? cs.umx[c] : 0.0;
+      }
+      return;
+    }
+    const Real r = SVBoundFit(q, cs, 3, e1, e2, e3, ncell, gbmode, gbnmin, gbcm, cok, chk, g, row,
+                              gbc, gbm, svc);
+    // (test_split_gradient_dump_r) the support of the first four events with R above it
+    if (diag && rdump > 0.0 && r > rdump && Kokkos::atomic_fetch_add(&gbd(0), 1) < 4) {
+      const int id = row;
+      Kokkos::printf("# SVDUMP ev=%d x=%.7f %.7f %.7f code=%d tcode=%d e=%.5g ncell=%d R=%.4g "
+                     "VG=%.4g nmin=%.0f nmean=%.2f neff=%.2f lmin=%.4g wmax=%.4g vp=%.5f %.5f "
+                     "%.5f\n", id, x, y, z, code, tfin, e1, ncell, r,
+                     g(row, kGBCol + kGBVG), g(row, kGBCol + kGBNmin), g(row, kGBCol + kGBNmean),
+                     g(row, kGBCol + kGBNeff), g(row, kGBCol + kGBLmin), g(row, kGBCol + kGBWmax),
+                     pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p));
+      Kokkos::printf("# SVDUMP ev=%d G=%.4g %.4g %.4g / %.4g %.4g %.4g / %.4g %.4g %.4g\n", id,
+                     g(row, kGBCol + kGBG), g(row, kGBCol + kGBG + 1), g(row, kGBCol + kGBG + 2),
+                     g(row, kGBCol + kGBG + 3), g(row, kGBCol + kGBG + 4),
+                     g(row, kGBCol + kGBG + 5), g(row, kGBCol + kGBG + 6),
+                     g(row, kGBCol + kGBG + 7), g(row, kGBCol + kGBG + 8));
+      const Real sa = cs.sa;
+      lt.ForEachCloudWeight(x, y, z, tfin, lt.Anchor(pi(PGID,p)),
+      [&](const int target, const Real w) {
+        if (w == 0.0) return;
+        int tb, tk, tj, ti;
+        lt.Decode(target, tb, tk, tj, ti);
+        const Real rho = f(tb,c0,tk,tj,ti);
+        if (!(rho > 0.0)) return;
+        const Real ir = 1.0/rho;
+        Real xq = xc, yq = yc, zq = zc;
+        lt.Frame(tb, xq, yq, zq);
+        const Real X0 = lt.box(tb,0) + (ti - is + 0.5)*lt.box(tb,3) - xq + f(tb,c0+1,tk,tj,ti)*ir;
+        const Real X1 = lt.box(tb,1) + (tj - js + 0.5)*lt.box(tb,4) - yq + f(tb,c0+2,tk,tj,ti)*ir;
+        const Real X2 = lt.box(tb,2) + (tk - ks + 0.5)*lt.box(tb,5) - zq + f(tb,c0+3,tk,tj,ti)*ir;
+        // (the clouds in the cell: -1 without the count channel, physical x3 faces)
+        Kokkos::printf("# SVDUMP ev=%d cell X/e=%+.4f %+.4f %+.4f U-vp=%+.5f %+.5f %+.5f "
+                       "a/sum=%.4g n=%.0f rho=%.5g w=%.4g dx=%.4g\n", id, X0/e1, X1/e2, X2/e3,
+                       f(tb,c0+10,tk,tj,ti)*ir - vx, f(tb,c0+11,tk,tj,ti)*ir - vy,
+                       f(tb,c0+12,tk,tj,ti)*ir - vz, w*rho/sa,
+                       cok ? f(tb,cbase+sp,tk,tj,ti) : -1.0, rho, w, lt.box(tb,3));
+      });
+    }
+  });
+}
+
+void DustGasDrag::SplitGradientBoundFit(const int npart) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  const auto lt = leaf_traversal;
+  auto f = split_mom;
+  auto g = split_vgrad;
+  auto np = split_np;
+  auto off = split_off;
+  const int is = lt.is, js = lt.js, ks = pmy_pack->pmesh->mb_indcs.ks;
+  const int nc1 = lt.ncells1, nc2 = lt.ncells2;
+  const bool chk = cloud_split_velocity_check;
+  auto vr = split_vref;
+  auto svc = split_vel_cnt;
+  const int gbmode = split_gb_mode, gbnmin = split_gb_nmin, gbcm = split_gb_count_mean;
+  const int cbase = kNC2*nspecies;
+  auto gbc = split_gb_cnt;
+  auto gbm = split_gb_max;
+  // full: the count rule or the diagnostic; otherwise (the default range bound) only the range of
+  // the cells' mean velocities of the events whose fit applied (V_G > 0 in the row)
+  const bool full = split_gb_full, cok = split_gb_counts;
+  const int ucol = split_gb_ucol, acol = split_gb_acol;
+  Kokkos::parallel_for("dust_split_gbfit2d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    if (np(p) < 2) return;
+    using T = SMRCompositeTransfer;
+    const int row = off(p);
+    if (!full && !(g(row,13) > 0.0)) return;
+    const int code = pi(PLEV,p), lev = T::CloudLevel(code), c0 = kNC2*pi(PSP,p);
+    const Real e1 = lt.CloudHalfWidth1(lev), e2 = lt.CloudHalfWidth2(lev);
+    const Real x = pr(IPX,p), y = pr(IPY,p);
+    const Real xc = x + SplitLobeShift(T::CloudLobe1(code), e1);
+    const Real yc = y + SplitLobeShift(T::CloudLobe2(code), e2);
+    const int sp = pi(PSP,p);
+    const Real vx = pr(IPVX,p) - vr(3*sp), vy = pr(IPVY,p) - vr(3*sp+1);
+    const Real vz = pr(IPVZ,p) - vr(3*sp+2);
+    // one traversal of the support the fit used (as 3-D)
+    const int tfin = static_cast<int>(g(row, acol));
+    int ncell = 0;
+    SVMomentsGB q;
+    SVCellStats cs;
+    lt.ForEachCloudWeight(x, y, tfin, lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
+      if (w == 0.0) return;
+      const int ti = target % nc1, rr = target/nc1, tj = rr % nc2, tm = rr/nc2;
+      const Real rho = f(tm,c0,ks,tj,ti);
+      if (!(rho > 0.0)) return;
+      const Real ir = 1.0/rho;
+      const Real u0 = f(tm,c0+6,ks,tj,ti)*ir - vx, u1 = f(tm,c0+7,ks,tj,ti)*ir - vy;
+      const Real u2 = f(tm,c0+8,ks,tj,ti)*ir - vz;
+      ++ncell;
+      cs.Add(w*rho, u0, u1, u2, cok ? f(tm,cbase+sp,ks,tj,ti) : 0.0);
+      if (!full) return;
+      Real xq = xc, yq = yc;
+      lt.Frame(tm, xq, yq);
+      const Real m0 = f(tm,c0+1,ks,tj,ti)*ir, m1 = f(tm,c0+2,ks,tj,ti)*ir;
+      const Real X0 = lt.box(tm,0) + (ti - is + 0.5)*lt.box(tm,2) - xq + m0;
+      const Real X1 = lt.box(tm,1) + (tj - js + 0.5)*lt.box(tm,3) - yq + m1;
+      const Real vc[6] = {f(tm,c0+3,ks,tj,ti)*ir - m0*m0, f(tm,c0+4,ks,tj,ti)*ir - m1*m1, 0.0,
+                          f(tm,c0+5,ks,tj,ti)*ir - m0*m1, 0.0, 0.0};
+      q.Add(w*rho, X0, X1, 0.0, u0, u1, u2, w*f(tm,c0+9,ks,tj,ti), vc);
+    });
+    if (!full) {
+      for (int c=0; c<3; ++c) {
+        g(row, ucol + kGBUmin + c) = (ncell > 0) ? cs.umn[c] : 0.0;
+        g(row, ucol + kGBUmax + c) = (ncell > 0) ? cs.umx[c] : 0.0;
+      }
+      return;
+    }
+    SVBoundFit(q, cs, 2, e1, e2, 1.0, ncell, gbmode, gbnmin, gbcm, cok, chk, g, row, gbc, gbm, svc);
   });
 }
 
@@ -793,7 +1303,7 @@ void DustGasDrag::SplitVelocityCheck(const int npart, const int nnew) {
   auto offh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), off);
   static const double edge[11] = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0, 2.0, 5.0, 10.0};
   // (the scope of a restricted deposit) the blocks of this rank that hold an event parent, and
-  // those blocks with their MeshBlock neighbours
+  // those blocks with their MeshBlock neighbors
   {
     const int nmb = pmy_pack->nmb_thispack;
     std::vector<char> ev(nmb, 0), dil(nmb, 0);
@@ -840,6 +1350,48 @@ void DustGasDrag::SplitVelocityCheck(const int npart, const int nnew) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::SplitGradientBoundReport
+//! \brief (test_split_gradient_bound) after the fill of a split call: the call's counters and
+//! maxima to the run totals, one line per rank and call with events, the samples (events with
+//! R = V_G / dv above test_split_gradient_sample_r; at most 400 lines per rank and run), and the
+//! device counters reset.
+
+void DustGasDrag::SplitGradientBoundReport() {
+  if (!split_gb_diag || split_gb_cnt.extent_int(0) != kGCNum) return;
+  auto hc = Kokkos::create_mirror_view_and_copy(HostMemSpace(), split_gb_cnt);
+  auto hm = Kokkos::create_mirror_view_and_copy(HostMemSpace(), split_gb_max);
+  for (int n=0; n<kGCNum; ++n) split_gb_tot[n] += hc(n);
+  for (int n=0; n<kGMNum; ++n) split_gb_totmax[n] = std::max(split_gb_totmax[n], hm(n));
+  if (hc(kGCEvents) == 0) return;
+  const int cyc = pmy_pack->pmesh->ncycle;
+  const double tim = pmy_pack->pmesh->time;
+  std::printf("# SPLIT_GB rank=%d cycle=%d time=%.7g events=%llu fit=%llu count_off=%llu/%llu "
+              "range_bound=%llu/%llu s0=%llu s_lt_half=%llu both=%llu maxR=%.4g maxVG=%.4g "
+              "maxG=%.4g maxdv_fit=%.4g maxdv_applied=%.4g samples=%llu\n",
+              global_variable::my_rank, cyc, tim, hc(kGCEvents), hc(kGCFit), hc(kGCCountV),
+              hc(kGCCountA), hc(kGCRangeV), hc(kGCRangeA), hc(kGCRange0), hc(kGCRangeHalf),
+              hc(kGCBoth), hm(kGMR), hm(kGMVG), hm(kGMG), hm(kGMDvRaw), hm(kGMDvApp), hc(kGCSmp));
+  const int ns = static_cast<int>(std::min<unsigned long long>(hc(kGCSmp), kGSmpRows));
+  if (ns > 0 && split_gb_printed < 400) {
+    auto hs = Kokkos::create_mirror_view_and_copy(HostMemSpace(), split_gb_smp);
+    for (int q=0; q<ns && split_gb_printed < 400; ++q, ++split_gb_printed) {
+      std::printf("# SPLIT_GB_SAMPLE rank=%d cycle=%d x=%.7f %.7f %.7f R=%.4g VG=%.4g dv=%.4g "
+                  "dvmax_fit=%.4g s=%.4g ncell=%.0f nmin=%.0f nmean=%.2f neff=%.2f lmin=%.4g "
+                  "wmax=%.4g count_off=%.0f mass=%.4g umin=%.4g %.4g %.4g umax=%.4g %.4g %.4g "
+                  "vp=%.4g %.4g %.4g G=%.4g %.4g %.4g %.4g %.4g %.4g %.4g %.4g %.4g pieces=%.0f\n",
+                  global_variable::my_rank, cyc, hs(q,0), hs(q,1), hs(q,2), hs(q,3), hs(q,4),
+                  hs(q,5), hs(q,6), hs(q,7), hs(q,8), hs(q,9), hs(q,10), hs(q,11), hs(q,12),
+                  hs(q,13), hs(q,14), hs(q,15), hs(q,16), hs(q,17), hs(q,18), hs(q,19), hs(q,20),
+                  hs(q,21), hs(q,22), hs(q,23), hs(q,24), hs(q,25), hs(q,26), hs(q,27), hs(q,28),
+                  hs(q,29), hs(q,30), hs(q,31), hs(q,32), hs(q,33), hs(q,34));
+    }
+  }
+  std::fflush(stdout);
+  Kokkos::deep_copy(split_gb_cnt, 0ULL);
+  Kokkos::deep_copy(split_gb_max, 0.0);
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::SplitVelocitySummary
 //! \brief One line per rank at the end (mesh_gradient only).
 
@@ -862,10 +1414,52 @@ void DustGasDrag::SplitVelocitySummary() {
     for (int b=0; b<12; ++b) os << (b ? "," : "") << split_vel_hist[b];
     if (split_vel_blk[2] > 0.0) {
       os << " mean_block_fraction_with_events=" << split_vel_blk[0]/split_vel_blk[2]
-         << " with_neighbours=" << split_vel_blk[1]/split_vel_blk[2];
+         << " with_neighbors=" << split_vel_blk[1]/split_vel_blk[2];
     }
   }
   os << "\n";
+  if (split_gb_stats && !split_gb_diag && split_gb_cnt.extent_int(0) == kGCNum &&
+      Kokkos::is_initialized()) {
+    // without the diagnostic the device counters were never reset: they are the run's totals
+    auto hc = Kokkos::create_mirror_view_and_copy(HostMemSpace(), split_gb_cnt);
+    auto hm = Kokkos::create_mirror_view_and_copy(HostMemSpace(), split_gb_max);
+    for (int n=0; n<kGCNum; ++n) split_gb_tot[n] = hc(n);
+    for (int n=0; n<kGMNum; ++n) split_gb_totmax[n] = hm(n);
+  }
+  if (split_gb_stats) {
+    const unsigned long long *t = split_gb_tot;
+    os << "# DUST_SPLIT_BOUND rank=" << global_variable::my_rank << " bound="
+       << ((split_gb_mode == 0) ? "none" : ((split_gb_mode == 1) ? (split_gb_kind ? "span" : "box")
+                                                                 : "count"))
+       << " margin=" << split_gb_margin << " gradient=" << split_vel_applied
+       << " bounded=" << t[kGCRangeA] << " bounded_to_parent=" << t[kGCRange0A]
+       << " count_off=" << t[kGCCountA] << "\n";
+  }
+  if (split_gb_diag) {
+    const unsigned long long *t = split_gb_tot;
+    os << "# DUST_SPLIT_GB rank=" << global_variable::my_rank << " mode="
+       << ((split_gb_mode == 0) ? "none" : ((split_gb_mode == 1) ? "range" : "count"))
+       << " nmin=" << split_gb_nmin << " count=" << (split_gb_count_mean ? "mean" : "cell")
+       << " kind=" << (split_gb_kind ? "span" : "box") << " margin=" << split_gb_margin
+       << " events=" << t[kGCEvents] << " fit=" << t[kGCFit]
+       << " count_off_verdict=" << t[kGCCountV] << " count_off_applied=" << t[kGCCountA]
+       << " range_bound_verdict=" << t[kGCRangeV] << " range_bound_applied=" << t[kGCRangeA]
+       << " range_s0_verdict=" << t[kGCRange0] << " range_s0_applied=" << t[kGCRange0A]
+       << " range_s_lt_half=" << t[kGCRangeHalf]
+       << " both=" << t[kGCBoth] << " max_R=" << split_gb_totmax[kGMR]
+       << " max_VG=" << split_gb_totmax[kGMVG] << " max_G=" << split_gb_totmax[kGMG]
+       << " max_dv_fit=" << split_gb_totmax[kGMDvRaw]
+       << " max_dv_applied=" << split_gb_totmax[kGMDvApp]
+       << " R_hist(<0.25,0.5,0.75,1,1.5,2,3,5,10,30,100,>=100)=";
+    for (int b=0; b<12; ++b) os << (b ? "," : "") << t[kGCRHist + b];
+    os << " nmin_hist(<1,2,3,4,6,8,12,16,24,32,64,>=64)=";
+    for (int b=0; b<12; ++b) os << (b ? "," : "") << t[kGCNHist + b];
+    os << " nmean_hist(same bins)=";
+    for (int b=0; b<12; ++b) os << (b ? "," : "") << t[kGCMHist + b];
+    os << " s_hist(0,<0.25,<0.5,<0.75,<1,1)=";
+    for (int b=0; b<6; ++b) os << (b ? "," : "") << t[kGCSHist + b];
+    os << "\n";
+  }
   std::cout << os.str() << std::flush;
 }
 

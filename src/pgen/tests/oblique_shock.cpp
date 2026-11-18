@@ -4,7 +4,7 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file oblique_shock.cpp
-//! \brief Isothermal planar shock travelling at an angle to the grid (a
+//! \brief Isothermal planar shock traveling at an angle to the grid (a
 //! robustness test).  Upstream rho1 at rest on the side n.x > x0 + vs t,
 //! with n = (cos theta, sin theta); shock speed vs = mach*cs; downstream rho2 = mach^2 rho1
 //! moving with u2 = vs (1 - 1/mach^2) along n.  Cell averages of rho and M by 4x4
@@ -33,7 +33,7 @@ namespace {
 Real os_mach, os_th, os_x0, os_rho1, os_cs;
 void ObliqueShockBCs(Mesh *pm);
 
-// sub-sampled conserved state of the exact moving shock in a cell (centre xc, yc)
+// sub-sampled conserved state of the exact moving shock in a cell (center xc, yc)
 KOKKOS_INLINE_FUNCTION
 void ShockCellState(Real xc, Real yc, Real dx, Real dy, Real front, Real nx, Real ny,
                     Real rho1, Real rho2, Real u2, Real &d, Real &m1, Real &m2) {

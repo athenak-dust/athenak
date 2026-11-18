@@ -298,7 +298,7 @@ TaskStatus MeshBoundaryValuesFC::RecvAndUnpackFC(DvceFaceFld4D<Real> &b,
   //----- STEP 2: buffers have all completed, so unpack 3-components of field
   // Off-rank payloads are read directly from the rank-packed aggregate recv
   // buffer (fuses the former RankUnpackScatter kernel); on-rank payloads sit in
-  // their per-neighbour recv buffers, written there directly by the sender.
+  // their per-neighbor recv buffers, written there directly by the sender.
 
   auto &mblev = pmy_pack->pmb->mb_lev;
 #if MPI_PARALLEL_ENABLED

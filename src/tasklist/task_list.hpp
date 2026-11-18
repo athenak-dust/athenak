@@ -119,7 +119,7 @@ class TaskList {
  public:
   TaskList() = default;
   ~TaskList() = default;
-  std::string prof_prefix = "tl";          // xnode profiling: the region prefix of the tasks
+  std::string prof_prefix = "tl";          // profiling: the region prefix of the tasks
   std::vector<std::string> prof_names_;
 
   // functions (all implemented here)
@@ -148,7 +148,7 @@ class TaskList {
 
   // cycle through task list once, do any tasks whose dependencies are clear
   TaskListStatus DoAvailable(Driver *d, int s) {
-    // xnode profiling: with a Kokkos tool loaded every task call is a profile region
+    // profiling: with a Kokkos tool loaded every task call is a profile region
     // "<list>#<index>" (index = position in the list, from 0); no-op otherwise
     const bool prof = Kokkos::Tools::profileLibraryLoaded();
     if (prof && prof_names_.size() != task_list_.size()) {

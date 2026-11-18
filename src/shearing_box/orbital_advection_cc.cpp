@@ -180,7 +180,7 @@ TaskStatus OrbitalAdvectionCC::PackAndSendCC(DvceArray5D<Real> &a) {
     std::exit(EXIT_FAILURE);
   }
 #endif
-  // rows for x2 neighbours on another level
+  // rows for x2 neighbors on another level
   if (any_mixed) PackMixedCC(a);
   return TaskStatus::complete;
 }
@@ -245,7 +245,7 @@ TaskStatus OrbitalAdvectionCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
   //----- STEP 2: buffers have all completed, so unpack and apply shift
 
   int nvar = a.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
-  // rows from finer neighbours on other ranks into their quarter of the buffer
+  // rows from finer neighbors on other ranks into their quarter of the buffer
   if (any_mixed) UnpackMixedCC();
 
   auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -343,12 +343,12 @@ TaskStatus OrbitalAdvectionCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
 
 //----------------------------------------------------------------------------------------
 //! \fn void OrbitalAdvectionCC::PackMixedCC()
-//! \brief the rows for x2 neighbours on another level, at the
+//! \brief the rows for x2 neighbors on another level, at the
 //! receiver's resolution and in the layout of its receive buffer (row r of the lower buffer
 //! [0] is adjacent to the face at r = nrow-1, of the upper buffer [1] at r = 0).
 //!  * A finer block restricts 2x2x2 cells into its quarter (x1 half fx, x3 half fz) of the
-//!    coarser neighbour's buffer.
-//!  * A coarser block prolongates into the whole buffer of each of its four finer neighbours,
+//!    coarser neighbor's buffer.
+//!  * A coarser block prolongates into the whole buffer of each of its four finer neighbors,
 //!    limited linear in all three directions as ProlongCC (slopes from the block's own cells,
 //!    ghost cells included: those of the last boundary exchange).
 //! Same rank: written into the receive buffer directly; else into msend and sent.
@@ -370,7 +370,7 @@ void OrbitalAdvectionCC::PackMixedCC(DvceArray5D<Real> &a) {
     const int dn = (n + 1) % 2;
     const int base = (n == 0) ? 8 : 12;
     auto sbm = msend[n];
-    // finer block: restriction into its quarter of the coarser neighbour's buffer
+    // finer block: restriction into its quarter of the coarser neighbor's buffer
     par_for("oa-mix-r", DevExeSpace(), 0, nmb-1, 0, nvar-1, 0, nk2-1, 0, R-1, 0, ni2-1,
     KOKKOS_LAMBDA(const int m, const int v, const int kc, const int r, const int ic) {
       if (xlev_.d_view(m,n) != 1) return;
@@ -389,7 +389,7 @@ void OrbitalAdvectionCC::PackMixedCC(DvceArray5D<Real> &a) {
         sbm(m, 0, ((v*nk2 + kc)*R + r)*ni2 + ic) = val;
       }
     });
-    // coarser block: prolongation into the buffers of its four finer neighbours
+    // coarser block: prolongation into the buffers of its four finer neighbors
     par_for("oa-mix-p", DevExeSpace(), 0, nmb-1, 0, 4*nvar-1, 0, nk-1, 0, R-1, 0, ni-1,
     KOKKOS_LAMBDA(const int m, const int vs, const int kf, const int rf, const int ifn) {
       if (xlev_.d_view(m,n) != 2) return;
@@ -458,7 +458,7 @@ void OrbitalAdvectionCC::PackMixedCC(DvceArray5D<Real> &a) {
 
 //----------------------------------------------------------------------------------------
 //! \fn void OrbitalAdvectionCC::UnpackMixedCC()
-//! \brief the restricted rows that finer neighbours on other ranks sent: into their
+//! \brief the restricted rows that finer neighbors on other ranks sent: into their
 //! quarter of the receive buffer
 
 void OrbitalAdvectionCC::UnpackMixedCC() {
@@ -490,7 +490,7 @@ void OrbitalAdvectionCC::UnpackMixedCC() {
 
 //----------------------------------------------------------------------------------------
 //! \fn TaskStatus OrbitalAdvectionCC::SendFluxCC()
-//! \brief a block with a coarser x2 neighbour sends its remap fluxes through that
+//! \brief a block with a coarser x2 neighbor sends its remap fluxes through that
 //! face, summed over 2x2 cells and divided by 8 (the coarse cell's content units: a coarse
 //! column has 4 fine columns of half the width in x2), to the coarser block
 
@@ -558,7 +558,7 @@ TaskStatus OrbitalAdvectionCC::SendFluxCC() {
 
 //----------------------------------------------------------------------------------------
 //! \fn TaskStatus OrbitalAdvectionCC::RecvFluxCC()
-//! \brief a block with finer x2 neighbours replaces its remap flux through that
+//! \brief a block with finer x2 neighbors replaces its remap flux through that
 //! face by theirs: the cell next to the face changes by the difference
 
 TaskStatus OrbitalAdvectionCC::RecvFluxCC(DvceArray5D<Real> &a) {

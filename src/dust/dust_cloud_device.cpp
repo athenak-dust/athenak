@@ -44,7 +44,7 @@ struct DPiece {Real off; Real frac; int lobe;};
 
 // pieces of a cloud along one direction (port of the host 'pieces' lambda): offset in
 // child half-widths, fraction of the cloud's mass, lobe code; lobe_old = 3 for a plain
-// parent (centre child with both edge children attached)
+// parent (center child with both edge children attached)
 KOKKOS_INLINE_FUNCTION
 int P1Pieces(const int lobe_old, const bool sep_lo, const bool sep_hi, DPiece out[3]) {
   int n = 0;
@@ -88,31 +88,37 @@ bool P1Flag(const LeafTraversal &t, const int m, const int code, const Real x, c
   return false;
 }
 
-// pieces of a flagged particle along both directions (port of the host event code)
+// the separation flags of a flagged particle: bit 2j (2j + 1) set when the lower (upper) side
+// along direction j lies inside the finer region (the CloudInsideFiner tests of the host event
+// code); P1Build forms the pieces from them.  With the piece bound the count pass keeps them
+// (split_sep) and the range kernel and the fill use those (as in 3-D).
 KOKKOS_INLINE_FUNCTION
-void P1Event(const LeafTraversal &t, const int m, const int code, const Real x, const Real y,
-             const Real slack, DPiece p1[3],
-             DPiece p2[3], int &n1, int &n2, int &clev, bool &parent) {
+int P1Sep(const LeafTraversal &t, const int m, const int code, const Real x, const Real y,
+          const Real slack) {
+  const int lev = SMRCompositeTransfer::CloudLevel(code);
+  const bool plain = SMRCompositeTransfer::CloudLobe1(code) == 0 &&
+                     SMRCompositeTransfer::CloudLobe2(code) == 0;
+  const int l = plain ? lev : lev - 1;
+  const Real h1 = t.CloudHalfWidth1(l), h2 = t.CloudHalfWidth2(l);
+  return (t.CloudInsideFiner(x - h1, y, l, slack, m) ? 1 : 0) |
+         (t.CloudInsideFiner(x + h1, y, l, slack, m) ? 2 : 0) |
+         (t.CloudInsideFiner(x, y - h2, l, slack, m) ? 4 : 0) |
+         (t.CloudInsideFiner(x, y + h2, l, slack, m) ? 8 : 0);
+}
+
+// pieces of a flagged particle along both directions from its separation flags (port of the
+// host event code)
+KOKKOS_INLINE_FUNCTION
+void P1Build(const int code, const int sep, DPiece p1[3], DPiece p2[3], int &n1, int &n2,
+             int &clev, bool &parent) {
   const int lev = SMRCompositeTransfer::CloudLevel(code);
   const int l1 = SMRCompositeTransfer::CloudLobe1(code);
   const int l2 = SMRCompositeTransfer::CloudLobe2(code);
-  if (l1 == 0 && l2 == 0) {
-    const Real h1 = t.CloudHalfWidth1(lev), h2 = t.CloudHalfWidth2(lev);
-    n1 = P1Pieces(3, t.CloudInsideFiner(x - h1, y, lev, slack, m),
-                  t.CloudInsideFiner(x + h1, y, lev, slack, m), p1);
-    n2 = P1Pieces(3, t.CloudInsideFiner(x, y - h2, lev, slack, m),
-                  t.CloudInsideFiner(x, y + h2, lev, slack, m), p2);
-    clev = lev + 1;
-    parent = true;
-  } else {
-    const Real h1 = t.CloudHalfWidth1(lev - 1), h2 = t.CloudHalfWidth2(lev - 1);
-    n1 = P1Pieces(l1, t.CloudInsideFiner(x - h1, y, lev - 1, slack, m),
-                  t.CloudInsideFiner(x + h1, y, lev - 1, slack, m), p1);
-    n2 = P1Pieces(l2, t.CloudInsideFiner(x, y - h2, lev - 1, slack, m),
-                  t.CloudInsideFiner(x, y + h2, lev - 1, slack, m), p2);
-    clev = lev;
-    parent = false;
-  }
+  const bool plain = (l1 == 0 && l2 == 0);
+  n1 = P1Pieces(plain ? 3 : l1, (sep & 1) != 0, (sep & 2) != 0, p1);
+  n2 = P1Pieces(plain ? 3 : l2, (sep & 4) != 0, (sep & 8) != 0, p2);
+  clev = plain ? lev + 1 : lev;
+  parent = plain;
 }
 
 }  // namespace
@@ -127,8 +133,8 @@ int DustGasDrag::SplitCloudsP1Device() {
   const int npart = ppar->nprtcl_thispack;
   // (cloud_split_velocity = mesh_gradient, several ranks) SplitVelocityPrepare is collective
   // (AnyRank, then the moments' deposit and halo exchange): every exit calls it, with 0 rows on
-  // the early ones, as the 3-D split does (Codex review: a rank without clouds or without events
-  // skipped the MPI_Allreduce that a splitting rank entered)
+  // the early ones, as the 3-D split does (otherwise a rank without clouds or without events
+  // would skip the MPI_Allreduce that a splitting rank enters)
   if (npart == 0) {SplitVelocityPrepare(0); return 0;}
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
@@ -152,6 +158,13 @@ int DustGasDrag::SplitCloudsP1Device() {
   }
   auto np = split_np;
   auto tagoff = split_off;
+  // (the piece bound) the separation flags of every event kept for the range kernel and the fill
+  const bool gbsep = split_gb_fill;
+  if (gbsep && split_sep.extent_int(0) < npart) {
+    split_sep = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "dust_split_sep"),
+                                 npart + npart/4);
+  }
+  auto sepv = split_sep;
   int nflag = 0, nparent = 0;
   Kokkos::parallel_reduce("dust_split_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, int &sf, int &sp) {
@@ -160,15 +173,17 @@ int DustGasDrag::SplitCloudsP1Device() {
     const int m = lt.Anchor(pi(PGID,p));   // anchor block
     if (!P1Flag(lt, m, code, x, y, slack)) {np(p) = 0; return;}
     DPiece p1[3], p2[3]; int n1, n2, clev; bool parent;
-    P1Event(lt, m, code, x, y, slack, p1, p2, n1, n2, clev, parent);
+    const int sep = P1Sep(lt, m, code, x, y, slack);
+    P1Build(code, sep, p1, p2, n1, n2, clev, parent);
     np(p) = n1*n2;
+    if (gbsep) sepv(p) = sep;
     sf += 1;
     if (parent) sp += 1;
   }, Kokkos::Sum<int>(nflag), Kokkos::Sum<int>(nparent));
   if (nflag == 0) {SplitVelocityPrepare(0); return 0;}   // (collective with mesh_gradient)
   EnsureNextTag();
 
-  // In place: the centre piece (k = 0, which keeps the tag) overwrites its parent's slot,
+  // In place: the center piece (k = 0, which keeps the tag) overwrites its parent's slot,
   // and the other pieces are appended after the npart particles, at the offsets (and with
   // the tags) of the exclusive scan of the extra pieces.  The particle arrays keep 25%
   // headroom so that the append rarely reallocates.
@@ -192,14 +207,47 @@ int DustGasDrag::SplitCloudsP1Device() {
   // moved on, with a check, before the fill)
   const std::uint64_t tag0 = IssueTags(static_cast<std::uint64_t>(ntags));
   const std::uint64_t tstride = static_cast<std::uint64_t>(global_variable::nranks);
+  if (ai && split_gb_fill) {
+    // (the piece bound) a separate kernel before the fill, as in 3-D
+    const int gbmode = split_gb_mode;
+    const Real gbmargin = split_gb_margin, gbrsmp = split_gb_rsmp;
+    const int gbkind = split_gb_kind, gbucol = split_gb_ucol;
+    const bool gbfull = split_gb_full;
+    auto gbc = split_gb_cnt;
+    auto gbm = split_gb_max;
+    auto gbs = split_gb_smp;
+    Kokkos::parallel_for("dust_split_gbound", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      if (np(p) < 2) return;
+      const int code = piv(PLEV,p);
+      const Real x = prv(IPX,p), y = prv(IPY,p);
+      DPiece p1[3], p2[3]; int n1, n2, clev; bool parent;
+      P1Build(code, sepv(p), p1, p2, n1, n2, clev, parent);   // the count pass's flags
+      if (n1*n2 < 2) return;
+      const Real e1 = transfer.CloudHalfWidth1(clev), e2 = transfer.CloudHalfWidth2(clev);
+      Real dk[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+      const int nk[3] = {n1, n2, 1};
+      for (int a=0; a<n1; ++a) {
+        dk[0][a] = p1[a].off*e1 + SplitLobeShift(p1[a].lobe, e1) -
+            (parent ? 0.0 : SplitLobeShift(SMRCompositeTransfer::CloudLobe1(code), e1));
+      }
+      for (int b=0; b<n2; ++b) {
+        dk[1][b] = p2[b].off*e2 + SplitLobeShift(p2[b].lobe, e2) -
+            (parent ? 0.0 : SplitLobeShift(SMRCompositeTransfer::CloudLobe2(code), e2));
+      }
+      SplitGradientBound(vg, tagoff(p), gbmode, gbmargin, gbkind, gbfull, gbucol, gbrsmp, dk, nk, x,
+                         y, 0.0, gbc, gbm, gbs);
+    });
+  }
   Kokkos::parallel_for("dust_split_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     if (np(p) == 0) return;
     const int code = piv(PLEV,p);
     const Real x = prv(IPX,p), y = prv(IPY,p), mass = prv(IPM,p);
     DPiece p1[3], p2[3]; int n1, n2, clev; bool parent;
-    P1Event(lt, lt.Anchor(piv(PGID,p)), code, x, y, slack, p1, p2, n1, n2,
-            clev, parent);
+    // (with the piece bound the count pass's separation flags, as the range kernel)
+    P1Build(code, gbsep ? sepv(p) : P1Sep(lt, lt.Anchor(piv(PGID,p)), code, x, y, slack), p1, p2,
+            n1, n2, clev, parent);
     const Real e1 = transfer.CloudHalfWidth1(clev), e2 = transfer.CloudHalfWidth2(clev);
     // the parent's slot is written last, after the appended pieces have copied it
     for (int k=n1*n2-1; k>=0; --k) {
@@ -212,7 +260,7 @@ int DustGasDrag::SplitCloudsP1Device() {
       if (k > 0) {
         for (int c=0; c<nrdata; ++c) prv(c,s) = prv(c,p);
         for (int c=0; c<nidata; ++c) piv(c,s) = piv(c,p);
-        // the centre keeps the tag
+        // the center keeps the tag
         SetTag(piv, s, tag0 + static_cast<std::uint64_t>(tagoff(p) + k - 1)*tstride);
       }
       prv(IPX,s) = cx; prv(IPX1,s) = cx;
@@ -230,6 +278,7 @@ int DustGasDrag::SplitCloudsP1Device() {
     }
   });
   if (ai) SplitVelocityCheck(npart, nnew);
+  if (ai && split_gb_diag) SplitGradientBoundReport();
   cloud_split_count += nparent;
   cloud_lobe_split_count += nflag - nparent;
   ppar->nprtcl_thispack = nnew;
@@ -242,8 +291,8 @@ int DustGasDrag::SplitCloudsP1Device() {
 
 namespace {
 
-constexpr int kNbMax = 96;     // pieces in a centre's tent support
-constexpr int kNodeMax = 64;   // nodes of a centre (regular offsets and irregular pieces)
+constexpr int kNbMax = 96;     // pieces in a center's tent support
+constexpr int kNodeMax = 64;   // nodes of a center (regular offsets and irregular pieces)
 
 KOKKOS_INLINE_FUNCTION
 Real Snap(const Real d, const Real ell) {
@@ -313,8 +362,8 @@ struct KeyCSR {
 
 // the device buffers of the sparse key tables, grown when needed
 // and kept across passes.  Allocating and freeing them in every pass (cudaMalloc and cudaFree
-// synchronise the device; thrust's sort allocated its own storage in every call) made the first
-// sparse version 1-3% slower than the dense tables at BA 128/256.  Released at Kokkos::finalize.
+// synchronize the device; thrust's sort allocated its own storage in every call) made the first
+// sparse version slower than the dense tables.  Released at Kokkos::finalize.
 // Slots: KeyCSR 0 pieces, 1 level-L clouds, 2 lobed clouds, 3 q-stage walk; CellLists 1 tent
 // commits (slot 0 held the commits of the removed quantum absorption).  A slot is
 // rebuilt only after the tables built in it are out of use (kernels on the one stream run in
@@ -493,12 +542,12 @@ struct CellLists {
 //! \fn DustGasDrag::MergeCloudsDevice
 //! \brief Device version of MergeClouds: far-field lobe release and the P1
 //! tent merge with the node rule and the merge-side node convention, as the host prototype.
-//! Differences, by construction of the parallel algorithm: centres are the local maxima
+//! Differences, by construction of the parallel algorithm: centers are the local maxima
 //! (mass, then x, then y) among unblocked zone pieces within the blocking radius, in two
-//! rounds (the host designates greedily, heaviest first); commits run in 16 colour rounds of
-//! the centres' level-L cells (I mod 4, J mod 4), so that the supports, the nodes' implicit
-//! masses and the new clouds of concurrent centres never overlap.  On a quiet lattice the
-//! centres and the commits are the host's; for irregular particles the order differs.
+//! rounds (the host designates greedily, heaviest first); commits run in 16 color rounds of
+//! the centers' level-L cells (I mod 4, J mod 4), so that the supports, the nodes' implicit
+//! masses and the new clouds of concurrent centers never overlap.  On a quiet lattice the
+//! centers and the commits are the host's; for irregular particles the order differs.
 
 namespace {
 
@@ -795,8 +844,8 @@ int DustGasDrag::MergeCloudsDevice() {
   Real mroot_floor = 0.0;
   for (const Real m : cloud_merge_mroot) mroot_floor = std::max(mroot_floor, m);
   // cloud_merge_budget_kappa > 0: the budget of leaf t is
-  // max(min(beta, kappa s_t), 1e-12), s_t = max over its four neighbour leaves (the leaves at one
-  // cell width beside its centre, of any level) of |rho_n - rho_t| / max(rho_t, floor), with the
+  // max(min(beta, kappa s_t), 1e-12), s_t = max over its four neighbor leaves (the leaves at one
+  // cell width beside its center, of any level) of |rho_n - rho_t| / max(rho_t, floor), with the
   // dust densities at the entry of the pass.  A lossy merge may change a leaf by at most the
   // structure it resolves: none on a quiet state (LinA, a dusty wave), as before where the dust
   // has structure of order one (BA's clumps and outflows); exact merges (round-off) still pass.
@@ -1139,7 +1188,7 @@ int DustGasDrag::MergeCloudsDevice() {
         }
       }
       // ---- protect stage X's waiting candidates.  A read-only pass over the
-      // pieces that survived stage X: a centre whose 9-point stencil is complete by stage X's own
+      // pieces that survived stage X: a center whose 9-point stencil is complete by stage X's own
       // rule (nearest candidates for the velocity range, claims ignored) marks itself and every
       // candidate of every slot as waiting.  Waiting pieces are skipped by the G walk, so they
       // cannot become G residuals before stage X retries them.
@@ -1443,7 +1492,7 @@ int DustGasDrag::MergeCloudsDevice() {
         // touch a violating leaf is rejected; repeat.  The decision depends on the proposals and
         // the leaf fields only, not on any order of commits.
         // several ranks: proposals on any rank are evaluated on all of them (their
-        // leaves may be touched by a neighbour's proposals)
+        // leaves may be touched by a neighbor's proposals)
         if (pbud && AnyRank(k1 > k0)) {
           Kokkos::Timer btimer;
           const Real beta = cloud_merge_budget;
@@ -1616,8 +1665,8 @@ int DustGasDrag::MergeCloudsDevice() {
       return Kokkos::fmax(0.0, 1.0 - Kokkos::fabs(Snap(dx, ell1))/H1)*
              Kokkos::fmax(0.0, 1.0 - Kokkos::fabs(Snap(dy, ell2))/H2);
     };
-    // centres: two rounds of local maxima among unblocked zone pieces
-    DvceArray1D<int> state(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_state"), npart);   // 0 none, 1 candidate, 2 centre, 3 blocked
+    // centers: two rounds of local maxima among unblocked zone pieces
+    DvceArray1D<int> state(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_state"), npart);   // 0 none, 1 candidate, 2 center, 3 blocked
     const Real b1 = H1 - 0.5*ell1, b2 = H2 - 0.5*ell2;
     Kokkos::parallel_for("merge_cand", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
@@ -1656,7 +1705,7 @@ int DustGasDrag::MergeCloudsDevice() {
               if (q == p || (state(q) != 1 && state(q) != 2)) continue;
               if (Kokkos::fabs(transfer.MinImage1(xp - pr(IPX,q))) >= b1 ||
                   Kokkos::fabs(transfer.MinImage2(yp - pr(IPY,q))) >= b2) continue;
-              if (state(q) == 2) return;   // within the radius of an earlier centre
+              if (state(q) == 2) return;   // within the radius of an earlier center
               const Real mq = pr(IPM,q), xq = pr(IPX,q), yq = pr(IPY,q);
               const bool before = (mq > mp) || (mq == mp && (xq < xp || (xq == xp && yq < yp)));
               if (before) return;
@@ -1668,11 +1717,11 @@ int DustGasDrag::MergeCloudsDevice() {
       Kokkos::parallel_for("merge_mis_set", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
       KOKKOS_LAMBDA(const int p) {if (win(p)) state(p) = 2;});
     }
-    int ncentre = 0;
-    Kokkos::parallel_reduce("merge_ncentre", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p, int &sum) {if (state(p) == 2) sum += 1;}, Kokkos::Sum<int>(ncentre));
-    if (ncentre == 0) continue;
-    // rank of a centre among the centres of its own cell (two centres may share a cell when
+    int ncenter = 0;
+    Kokkos::parallel_reduce("merge_ncenter", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &sum) {if (state(p) == 2) sum += 1;}, Kokkos::Sum<int>(ncenter));
+    if (ncenter == 0) continue;
+    // rank of a center among the centers of its own cell (two centers may share a cell when
     // they are more than the blocking radius apart in one direction): sub-rounds by rank
     DvceArray1D<int> rank(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_rank"), npart);
     int maxrank = 0;
@@ -1692,11 +1741,11 @@ int DustGasDrag::MergeCloudsDevice() {
       if (r > mx) mx = r;
     }, Kokkos::Max<int>(maxrank));
     // new level-L clouds of this pass, and their per-cell linked lists
-    DvceArray2D<Real> nr(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_nr"), nrdata, ncentre);
-    DvceArray2D<int> ni(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_ni"), nidata, ncentre);
+    DvceArray2D<Real> nr(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_nr"), nrdata, ncenter);
+    DvceArray2D<int> ni(Kokkos::view_alloc(Kokkos::WithoutInitializing, "merge_ni"), nidata, ncenter);
     CellLists nhead;   // hash of the cells, no level-L table
-    nhead.Allocate(ncentre, 1);
-    DvceArray1D<int> nnext("merge_nnext", ncentre);
+    nhead.Allocate(ncenter, 1);
+    DvceArray1D<int> nnext("merge_nnext", ncenter);
     DvceArray1D<int> nnew("merge_nnew", 1);
     for (int round=0; round<16*(maxrank + 1); ++round) {
       const int col = round % 16, sub = round/16;
@@ -1709,7 +1758,7 @@ int DustGasDrag::MergeCloudsDevice() {
         if (pr(IPM,c) <= 0.0) return;
         const Real mref = mrootsp(sp)/static_cast<Real>(1 << (2*L)), mnode = 0.25*mref;
         const Real xc0 = pr(IPX,c), yc0 = pr(IPY,c);
-        // neighbours with a positive tent weight
+        // neighbors with a positive tent weight
         int nb[kNbMax]; int nnb = 0; bool ready = true, over = false; int why = 6;
         for (int dj=-1; dj<=1 && ready; ++dj) {
           for (int di=-1; di<=1 && ready; ++di) {
@@ -1718,7 +1767,7 @@ int DustGasDrag::MergeCloudsDevice() {
             for (int k=spc.First(key), ke=spc.Last(key); k<ke; ++k) {
               const int t = spc.list(k);
               if (t == c || pr(IPM,t) <= 0.0) continue;
-              // with exact_ts the new cloud takes the centre's ts: only pieces with that same ts
+              // with exact_ts the new cloud takes the center's ts: only pieces with that same ts
               // (bitwise) join (G and X compare ts the same way)
               if (exact_ts && pr(IPTS,t) != pr(IPTS,c)) continue;
               const Real dx = transfer.MinImage1(pr(IPX,t) - xc0);
@@ -1732,7 +1781,7 @@ int DustGasDrag::MergeCloudsDevice() {
           }
         }
         // lobe wait: an unreleased lobed cloud whose released pieces could fall in this
-        // centre's tent makes the centre wait: reach H + ell in both directions
+        // center's tent makes the center wait: reach H + ell in both directions
         // (cloud_merge_lobe_wait = 1), or H plus ell only along the cloud's lobes (= 2)
         if (ready && lobe_wait) {
           // the reach (up to H + ell) can span two level-L cells: search +-2 cells
@@ -2266,7 +2315,7 @@ struct MergeMask3D {
 //! pieces of the deep merge zone in each level-L cell (4 x 4 x 4 sub-cells, Morton order rotated
 //! by the pass number) into level-L clouds of the quantum m_root / 8^L, position and velocity
 //! bounding boxes, K open groups; the pass budget (with the structure-relative beta over the
-//! six neighbour leaves) accepts or rejects whole groups; the compaction.
+//! six neighbor leaves) accepts or rejects whole groups; the compaction.
 //! No stage-X budget, no X protection.  Returns the merges.
 
 int DustGasDrag::MergeCloudsDevice3D() {
@@ -2404,7 +2453,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
   Real mroot_floor = 0.0;
   for (const Real m : cloud_merge_mroot) mroot_floor = std::max(mroot_floor, m);
   const Real rvol = lt.root_dx1*lt.root_dx2*lt.root_dx3;
-  // the structure-relative budget: s_t = max over the six neighbour leaves
+  // the structure-relative budget: s_t = max over the six neighbor leaves
   const Real bkappa = cloud_merge_budget_kappa;
   DvceArray1D<Real> lbeta("budget3d_lbeta", (pbud && bkappa > 0.0) ? nbt : 1);
   if (pbud && bkappa > 0.0) {
@@ -2800,7 +2849,7 @@ int DustGasDrag::MergeCloudsDevice3D() {
       }
       // ---- accept or reject the proposed groups by the pass budget
       // several ranks: proposals on any rank are evaluated on all of them (their leaves may be
-      // touched by a neighbour's proposals)
+      // touched by a neighbor's proposals)
       if (pbud && AnyRank(k1 > k0)) {
         const Real beta = cloud_merge_budget;
         const int maxev = cloud_merge_budget_evals;

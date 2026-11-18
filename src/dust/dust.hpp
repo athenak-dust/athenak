@@ -186,7 +186,7 @@ struct SMRCompositeTransfer {
     return (s <= 0.0) ? 0.5*SQR(1.0 + s) : 1.0 - 0.5*SQR(1.0 - s);
   }
 
-  // Exact 1-D integrals of a hat cloud of half-width ell centred at x over the
+  // Exact 1-D integrals of a hat cloud of half-width ell centered at x over the
   // consecutive virtual cells [i0, i0+count) of spacing dx.  Consecutive CDF
   // differences telescope, so the weights sum to one for any cell partition.
   // A nonzero lobe (1 lower, 2 upper) gives the transition shape
@@ -425,7 +425,8 @@ struct SMRCompositeTransfer {
 
 //----------------------------------------------------------------------------------------
 //! TriggerCloudCode: the cloud code the density trigger uses with <dust>/cloud_split_max_level =
-//! lcap: a plain cloud above lcap (switched to a finer leaf by the cloud instant switch, the
+//! lcap and amr_rho_kernel_above_split_max_level = split_max_level (the default is leaf): a plain
+//! cloud above lcap (switched to a finer leaf by the cloud instant switch, the
 //! mass of level lcap) as a plain level-lcap cloud; every other code as it is.
 KOKKOS_INLINE_FUNCTION
 int TriggerCloudCode(const int code, const int lcap) {
@@ -456,24 +457,24 @@ struct ResampleCapTable {
 //! refinable cloud, without the global virtual finest grid of SMRCompositeTransfer.
 //!
 //! Each MeshBlock knows its box, its level and its adjacent MeshBlocks (from the AthenaK
-//! neighbour table, every distinct neighbour once, with the periodic shift that puts it next
+//! neighbor table, every distinct neighbor once, with the periodic shift that puts it next
 //! to the block).  A cloud owned by block m is integrated exactly over every leaf cell of m
-//! and of its neighbours that its support overlaps: per direction the integral of the cloud
+//! and of its neighbors that its support overlaps: per direction the integral of the cloud
 //! shape over the leaf interval is a difference of the hat CDF (and of its first moment),
 //! the formulas of SMRCompositeTransfer::CloudWeightsMoments1D evaluated at the leaf faces
 //! instead of the faces of the virtual finest cells.  The integral over a leaf is the sum of
 //! the integrals over its finest sub-cells, so the weights and first moments equal those of
 //! the table up to round-off; lobes, gather codes and the point rule are handled as there.
-//! The sum of the weights is returned so that a support reaching beyond the neighbours
+//! The sum of the weights is returned so that a support reaching beyond the neighbors
 //! (possible only for clouds much coarser than the leaves) is detected, not truncated.
 //!
 //! Block slots: [0, nmb) the blocks of this rank (slot = gid - gids), [nmb, nfld)
 //! the blocks of other ranks next to them (halo blocks: their leaf fields are exchanged, see
 //! DustHalo), [nfld, nall) every other block of the mesh (geometry only, for the eligibility
-//! queries that leave the neighbourhood and for Locate).  One rank: nfld = nall = nmb.
+//! queries that leave the neighborhood and for Locate).  One rank: nfld = nall = nmb.
 
 struct LeafTraversal {
-  static constexpr int kMaxNb = 16;    // distinct neighbours of a 2-D block (12 at most)
+  static constexpr int kMaxNb = 16;    // distinct neighbors of a 2-D block (12 at most)
   int nmb = 0, gids = 0;
   int nfld = 0, nall = 0;              // slots with leaf fields (local + halo), all slots
   int nx1 = 0, nx2 = 0, is = 0, js = 0, ncells1 = 0, ncells2 = 0;
@@ -482,8 +483,8 @@ struct LeafTraversal {
   Real root_dx1 = 0.0, root_dx2 = 0.0;
   Real iroot_dx1 = 0.0, iroot_dx2 = 0.0;   // 1/root_dx1, 1/root_dx2
   DvceArray2D<Real> box;               // (b, 0..5): x1min, x2min, dx1, dx2, 1/dx1, 1/dx2 of slot b
-  DvceArray1D<int> nnb;                // number of neighbours of local block m
-  DvceArray2D<int> nb;                 // (m, k): slot of neighbour k (local or halo)
+  DvceArray1D<int> nnb;                // number of neighbors of local block m
+  DvceArray2D<int> nb;                 // (m, k): slot of neighbor k (local or halo)
   DvceArray3D<int> nbs;                // (m, k, 0..1): periodic shift (in domain lengths)
   // Split / merge eligibility on integer coordinates of the finest level (no
   // stored grid).  Block m covers the finest cells [fbox(m,0), fbox(m,1)) x [fbox(m,2),
@@ -499,11 +500,11 @@ struct LeafTraversal {
   bool split_everywhere = false, split_overlap = false;
   DvceArray1D<int> blev;
   DvceArray2D<int> fbox;
-  // (m): the finest level among local block m and its neighbours, i.e. among the
+  // (m): the finest level among local block m and its neighbors, i.e. among the
   // candidates of a query that needs no global search
   DvceArray1D<int> nbmax;
   // (m, 0..1): width of the ring around block m (finest cells, per direction) that its
-  // neighbours certainly hold: the smallest neighbour extent, checked when built (0 if the
+  // neighbors certainly hold: the smallest neighbor extent, checked when built (0 if the
   // check fails); a query inside it needs no coverage test
   DvceArray2D<int> safe;
   // sorted logical-location keys of the blocks and their blocks (Locate)
@@ -579,12 +580,12 @@ struct LeafTraversal {
 
   // ---- candidate blocks ----------------------------------------------------------------
   // Every query is answered in the frame of the anchor block m (the periodic image of the
-  // position next to m).  Local: m and its distinct neighbours, each with the periodic shift
-  // (domain lengths, from the direction of its neighbour slot) that puts it on that side of
-  // m, so the two images of a block that is the neighbour on both sides (one or two blocks
+  // position next to m).  Local: m and its distinct neighbors, each with the periodic shift
+  // (domain lengths, from the direction of its neighbor slot) that puts it on that side of
+  // m, so the two images of a block that is the neighbor on both sides (one or two blocks
   // across the domain) both appear.  Global: every block of the pack in every periodic image
   // that meets the query box [ia, ib] x [ja, jb] (finest cells, inclusive) widened by r, so a
-  // query of any width is answered; used when the anchor's neighbourhood does not hold the
+  // query of any width is answered; used when the anchor's neighborhood does not hold the
   // whole query.  f(b, sx, sy): block b shifted by -(sx, sy) domain lengths.
   KOKKOS_INLINE_FUNCTION
   static int FloorDiv(const int a, const int n) {
@@ -673,7 +674,7 @@ struct LeafTraversal {
     }
     return true;
   }
-  // true when the box widened by r is not held by the anchor's neighbourhood: blocks further
+  // true when the box widened by r is not held by the anchor's neighborhood: blocks further
   // away may matter, so the global candidates are used (a missing block is never read as
   // "no finer leaf there")
   KOKKOS_INLINE_FUNCTION
@@ -681,7 +682,7 @@ struct LeafTraversal {
                   const int r) const {
     int x0, x1, y0, y1;
     ImageRect(m, 0, 0, 0, x0, x1, y0, y1);
-    // fast path: inside the ring around m that its neighbours certainly hold (safe)
+    // fast path: inside the ring around m that its neighbors certainly hold (safe)
     const int s1 = safe(m, 0), s2 = safe(m, 1);
     if (x0 - s1 <= ia - r && x1 + s1 > ib + r && y0 - s2 <= ja - r && y1 + s2 > jb + r) {
       return false;
@@ -690,8 +691,8 @@ struct LeafTraversal {
   }
 
   // the candidate blocks (block, image) of a support [lo1, hi1] x [lo2, hi2] (anchor frame) that
-  // does not lie inside the anchor block m: those of the anchor's neighbourhood (or of all
-  // blocks, when the neighbourhood does not hold the support) whose image box meets it.  In
+  // does not lie inside the anchor block m: those of the anchor's neighborhood (or of all
+  // blocks, when the neighborhood does not hold the support) whose image box meets it.  In
   // batches of at most kBatch from cursor (0 at the start); returns the count and sets cursor to
   // the next batch, or -1.  Not inlined: the coverage test and the global
   // enumeration stay out of the hot kernels, which only loop over the batch.
@@ -849,7 +850,7 @@ struct LeafTraversal {
   }
 
   // encoded leaf cell that holds (x1, x2), searched from the anchor block m (its own box, its
-  // neighbours, then every block); -1 if no block holds it.  *bout: the block.  A position on a
+  // neighbors, then every block); -1 if no block holds it.  *bout: the block.  A position on a
   // block face can round outside both blocks (y = -1.7e-17 against a face at 0: (y - y0)/dy is
   // exactly nx2 below and negative above), so a last pass accepts 1e-9 cells around the blocks
   // and clamps the cell.
@@ -883,7 +884,7 @@ struct LeafTraversal {
     }
     return -1;
   }
-  // The search beyond the neighbours uses the index of logical locations
+  // The search beyond the neighbors uses the index of logical locations
   // (Locate, O(levels log blocks)); the scan of all blocks remains for a structure without it.
   KOKKOS_INLINE_FUNCTION
   int Owner(const Real px1, const Real px2, const int m, int *bout = nullptr) const {
@@ -917,7 +918,7 @@ struct LeafTraversal {
 
   // ---- split / merge eligibility -------------------------------------------------------
   // the region of the table's level map above lev (see the members), on the anchor's
-  // neighbourhood or, when that does not hold the box widened by the dilation, on all blocks
+  // neighborhood or, when that does not hold the box widened by the dilation, on all blocks
   KOKKOS_INLINE_FUNCTION
   bool AnyAbove(const int m, const int ia, const int ib, const int ja, const int jb,
                 const int lev, bool *reach = nullptr) const {
@@ -1048,7 +1049,7 @@ inline std::string RankFile(const std::string &name) {
 }
 
 // an append-mode log file opened once per process and kept open, instead of an open and
-// close per line (an open/close can take about 1 ms on a parallel file system); callers
+// close per line (an open/close can be slow on a parallel file system); callers
 // write and fflush
 inline std::FILE *AppendLog(const std::string &name) {
   static std::map<std::string, std::FILE*> open;
@@ -1060,8 +1061,8 @@ inline std::FILE *AppendLog(const std::string &name) {
 }
 
 // whether a log kept open by AppendLog is empty (its header still to write), asked once per
-// file: on a Lustre file system the position query at the end of the file can take about
-// 1 ms per call, far longer than writing a line
+// file: on a parallel file system the position query at the end of the file can take far
+// longer than writing a line
 inline bool LogEmpty(std::FILE *fp) {
   static std::map<std::FILE*, bool> asked;
   if (asked.count(fp) != 0) return false;
@@ -1220,7 +1221,7 @@ void DepositAdd(Real *destination, const Real value) {
 // N components of one leaf cell, dst[c*stride] += v[c].  On a CUDA device the lanes of a warp
 // that add to the same cell (key) in the same step first sum their values in registers, a
 // tree over the peers (__match_any_sync, __shfl_sync); the lowest of them adds the sums.  In
-// the cell order of the cloud kernels (cloud_ord) neighbouring lanes often share a cell, and
+// the cell order of the cloud kernels (cloud_ord) neighboring lanes often share a cell, and
 // atomic adds to one address serialize.  Only the order of the sums changes, as between any
 // two runs with atomics; elsewhere (host backends, CUDA devices before compute capability 7.0)
 // the plain DepositAdd in the old order.
@@ -1255,12 +1256,12 @@ void DepositAddWarp(Real *dst, const std::size_t stride, const int key, Real (&v
 
 // Tried and not adopted: splitting each of the two production cloud kernels into a gather
 // kernel and a deposit kernel that forms the leaf weights again (fewer registers per kernel)
-// was about 10% slower on a GB200 GPU; keeping the 25-entry leaf-weight cache in team scratch
+// was slower on GPUs; keeping the 25-entry leaf-weight cache in team scratch
 // (shared memory) instead of per-thread local arrays changed nothing measurable.  Both gave
-// results identical to this kernel on the CPU.  Profile on that GPU: 128 registers, 25%
-// occupancy, waiting on L1 data.
+// results identical to this kernel on the CPU.  The kernels are bound by L1 data access at
+// low occupancy.
 // The cloud kernels over particles 0..n-1 with a launch bound: 0 none, 1 <256, 2> (at most
-// 128 registers, default: fastest on GB200), 2 <128, 3> (at most 168), 3 <256, 3> (at most
+// 128 registers, default), 2 <128, 3> (at most 168), 3 <256, 3> (at most
 // 85); occupancy against spills.  A compile-time choice, -DDUST_CLOUD_LAUNCH_BOUNDS=n (a
 // run-time choice would compile all four variants of every cloud kernel); the key
 // <dust>/cloud_launch_bounds is accepted only with the compiled value (dust.cpp)
@@ -1406,7 +1407,7 @@ class DustGasDrag {
   std::uint64_t LiveTagBound() const; // collective: 1 + the largest live tag (0: no particle)
   std::uint64_t IssuedTagBound() const;   // collective: above every tag issued so far
   // moving-particle P1 split: edge children
-                                      // separate only where the neighbour parent splits,
+                                      // separate only where the neighbor parent splits,
                                       // no merging (requires cloud_transition > 0); the
                                       // only split scheme
   bool cloud_merge = false;           // coarsening: far from finer
@@ -1451,7 +1452,7 @@ class DustGasDrag {
   int amr_regrid_nnew = 0, amr_regrid_ndel = 0;  // of the regrid in progress (BeforeRegrid)
   void HandleRegridEvent(const bool merge_due, const bool split_r = false);
   bool cloud_merge_nc = true;         // merge-side node convention
-  int cloud_merge_lobe_wait = 0;      // a centre waits while an unreleased lobed cloud is near
+  int cloud_merge_lobe_wait = 0;      // a center waits while an unreleased lobed cloud is near
                                       // 1: reach H + ell, 2: reach per lobe direction
   std::vector<Real> cloud_merge_mroot; // per species: root-level cloud mass (set on first pass)
   // quantum mode: stage X exact P1-stencil re-merge, stage G mass-quantum grouping
@@ -1466,7 +1467,7 @@ class DustGasDrag {
                                        // walked by G in the same pass
   Real cloud_merge_budget = -1.0;      // > 0, one budget of leaf mass / momentum
   // > 0, the budget of a leaf is min(beta, kappa s), s the largest dust
-  // density difference to its four neighbour leaves relative to its own (structure-relative); 0 = off
+  // density difference to its four neighbor leaves relative to its own (structure-relative); 0 = off
   Real cloud_merge_budget_kappa = 0.0;
   // <dust>/refinable_mode (see RefinableMode); refinable_given: the preset keys given in the
   // input or the restart file ("key=value ..."), printed with the resolved preset
@@ -1540,7 +1541,7 @@ class DustGasDrag {
   Real cloud_resample_t0_file = 0.0, cloud_resample_dt_file = 0.0;  // its origin, interval
   long long cloud_resample_next_file = -1;  // ... and next event
   int cloud_merge_g_lag = 2;          // stage G only in level-L cells whose (2 lag + 1)^2
-                                      // neighbourhood is in the merge zone: the outer band is
+                                      // neighborhood is in the merge zone: the outer band is
                                       // left to stage X
   int cloud_merge_pass = 0;           // pass counter (walk rotation)
   unsigned long long cloud_coarsen_events = 0, cloud_coarsen_in = 0;
@@ -1553,26 +1554,37 @@ class DustGasDrag {
   // <dust>/cloud_split_max_level = L (unset or negative: no limit, -1 here): the clouds split up
   // to level L; above it they keep their mass (that of level L) and their kernel follows the
   // mesh: every plain cloud of level >= L takes the level max(L, level of the leaf that holds its
-  // centre) at the start of every cycle (CloudInstantSwitch: the instant switch of the cloud
+  // center) at the start of every cycle (CloudInstantSwitch: the instant switch of the cloud
   // framework, the former cloud_instant_switch; not the point particles of amr_pic =
   // instant_switch); R gives them the cap of level L, G never takes them (its levels stop at L)
   int cloud_split_max_level = -1;
+  // with cloud_split_max_level the density trigger deposits the switched clouds with their own
+  // (leaf) kernel, as the dynamics (the default); false: the kernel of level L
+  // (TriggerCloudCode), with <dust>/amr_rho_kernel_above_split_max_level = split_max_level
+  // (BuildRefinableCloudTransfer)
+  bool trigger_leaf_kernel = true;
   unsigned long long cloud_instant_switch_count = 0;   // level changes made by CloudInstantSwitch
   bool cloud_split_device = false;    // P1 split on the device; false: the host split
-  // The split budget and the resampling right after a split (3-D refinable clouds; off by
-  // default).  cloud_split_budget > 0: one rank's split pass takes its events (parent splits
-  // and lobe releases) in particle index order while it has created fewer than this many
+  // The split budget (off by default) and the resampling right after a split (on by default
+  // with R); 3-D refinable clouds only.  cloud_split_budget > 0: one rank's
+  // split pass takes its events (parent splits and lobe releases) in particle index order while
+  // it has created fewer than this many
   // clouds; the rest wait for a later cycle and stay a level coarser than their leaf until then.
   // Several ranks: a held event's pieces can lie several blocks from their parent's block
-  // (a root cloud held until the mesh under it is four levels finer), beyond the neighbour step
+  // (a root cloud held until the mesh under it is four levels finer), beyond the neighbor step
   // of the particle exchange; with the budget on, the pieces that belong to blocks of other
   // ranks go there by position right after the split (RouteToOwnerBlocks3D from the first
   // new piece, as SplitToLeaves).
-  // cloud_split_resample: a local R in the same cycle, right after a split pass that created at
-  // least cloud_split_resample_frac of the clouds (all ranks together) or held events back, on
-  // the blocks of the split events: the blocks of the parents and the blocks the pieces landed
-  // in (also across a shear-periodic x1 face, and several blocks away after a hold) (not when
-  // the scheduled global R falls on that cycle).
+  // cloud_split_resample: a local R in the same cycle, right after a split pass that held events
+  // back or in which some rank with at least the mean clouds per rank (after the split) created
+  // at least cloud_split_resample_frac of its own clouds (per rank: the R's memory transient is
+  // per GPU; a rank with few clouds never triggers it), on the blocks of the split events of all
+  // ranks:
+  // the blocks of the parents and the blocks the pieces landed in (also across a
+  // shear-periodic x1 face, and several blocks away after a hold) (not when the scheduled global
+  // R falls on that cycle).  Default clouds3d && cloud_resample (written to the parameters; off
+  // whenever R is off).  It fires on large splits only: a new level opening, a restart of a
+  // file with capped cloud levels.
   int cloud_split_budget = 0;
   bool cloud_split_resample = false;
   Real cloud_split_resample_frac = 0.05;
@@ -1582,7 +1594,7 @@ class DustGasDrag {
   int split_last_before = 0, split_last_new = 0, split_last_held = 0;   // this rank, this cycle
   int split_last_offrank = 0;         // budget, several ranks: new pieces of other ranks' blocks
   int split_last_far = 0;             // (split_blk_mark) pieces outside their parent block's
-                                      // MeshBlock neighbours (the R log)
+                                      // MeshBlock neighbors (the R log)
   bool split_route_due = false;       // (SplitResampleWanted) route the new pieces now
   std::vector<int> split_gid_mark;    // (gid, bits) pairs of this rank's split_blk, this cycle
   std::vector<int> split_gid_flag;    // blocks (global ids) of this cycle's split events: bits
@@ -1729,7 +1741,7 @@ class DustGasDrag {
   void LogRankClouds();
   // 3-D instant_switch on a dynamic mesh: the new block of every old block (8 entries:
   // the child by octant of the position; one value repeated if not refined) and the old block
-  // centres, from RegridCosts (the old mesh), for RouteOO3D after the regrid
+  // centers, from RegridCosts (the old mesh), for RouteOO3D after the regrid
   DvceArray2D<int> oo_newgid;
   DvceArray2D<Real> oo_oldctr;
   void RegridCosts(const int *newtoold, const LogicalLocation *new_lloc, const int new_nmb, float *cost);
@@ -1788,7 +1800,7 @@ class DustGasDrag {
   int MergeCloudsDevice();    // device version of MergeClouds
   int ResampleClouds(const bool local = false);   // returns the number of clouds removed;
                               // local: only clouds anchored in blocks new since the
-                              // regrid and their neighbours
+                              // regrid and their neighbors
   bool cloud_resample_event_local = true;    // default: the resampling
                                              // after a regrid is local (the scheduled one global)
   bool cloud_resample_after_derefine = false;   // R after a pure derefinement event
@@ -1805,7 +1817,7 @@ class DustGasDrag {
   bool clouds3d = false;               // refinable clouds on a 3-D mesh (set by the constructor)
   bool Clouds3D() const {return clouds3d;}
   // 3-D clouds in a shearing box with shear-periodic x1; the shear
-  // neighbours of LeafTraversal3D for the shear
+  // neighbors of LeafTraversal3D for the shear
   // offset at a time (UpdateShear3D: rebuilt when the offset changes), from the finest-cell boxes
   // of the slots, the slots near the inner / outer x1 face and the reach of every local block
   bool shear3d = false;
@@ -1819,7 +1831,7 @@ class DustGasDrag {
   Real ShearRouteTime(Driver *pdrive, int stage) const;
   void ShiftShearCrossings(const Real tau);
   bool shear3d_lists_ok_ = false;
-  // <dust>/cloud_shear_list_cache keeps the shear neighbour
+  // <dust>/cloud_shear_list_cache keeps the shear neighbor
   // lists while ysh / fine_dx2 stays in one unit interval [k, k + 1) (lists built for the whole
   // interval: a superset, the traversal filters by the current ysh); shear3d_key_ = k
   bool shear3d_list_cache = false;
@@ -1847,7 +1859,7 @@ class DustGasDrag {
   double split_vel_dpmax = 0.0;
   long long split_vel_hist[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};   // (check) ratio bins
   int split_vel_samples = 0, split_vel_samples_app = 0;
-  double split_vel_blk[3] = {0.0, 0.0, 0.0};   // (check) block fractions with events, + neighbours, calls
+  double split_vel_blk[3] = {0.0, 0.0, 0.0};   // (check) block fractions with events, + neighbors, calls
   unsigned long long split_vel_halo_rebuilds = 0;   // halo widenings by CheckSplitVelocityReach
   // (check) the fit's retries on the coarser support, and those beyond the halo allowance
   unsigned long long split_vel_retry = 0, split_vel_retry_out = 0;
@@ -1862,6 +1874,35 @@ class DustGasDrag {
   void SplitVelocityCheck(const int npart, const int nnew);
   void SplitVelocitySummary();
   Kokkos::View<unsigned long long*, DevMemSpace> split_vel_cnt;   // device counters of the fit
+  // the bound on the mesh_gradient pieces (dust_split_velocity.cpp / .hpp): 1 range (default with
+  // mesh_gradient: no piece leaves the range of its support cells' mean velocities, widened by
+  // split_gb_margin = 0.5 times its span and extended to the parent's; G scaled uniformly), 0 none
+  // (hidden test_split_gradient_bound = none: as before the bound), 2 count (test: the parent's
+  // velocity unless test_split_gradient_nmin clouds per support cell or on the fit-weighted mean,
+  // test_split_gradient_count = cell | mean; refused with physical x3 faces);
+  // test_split_gradient_diag: per-call statistics
+  int split_gb_mode = 0;
+  int split_gb_nmin = 8;
+  int split_gb_count_mean = 0;
+  Real split_gb_margin = 0.5;    // test_split_gradient_range_margin (fraction of the range)
+  int split_gb_kind = 0;         // test_split_gradient_range_kind = box (0) | span (1)
+  bool split_gb_diag = false;    // test_split_gradient_diag
+  bool split_gb_full = false, split_gb_stats = false, split_gb_fill = false;   // (see the keys)
+  bool split_gb_counts = false;  // the per-cell cloud counts (count rule, diag; periodic x3 only)
+  int split_gb_ucol = 14, split_gb_acol = 20;   // row columns: the range, the fit's support
+  DvceArray1D<int> split_sep;    // (the bound) the count pass's separation flags per particle
+  Real split_gb_rsmp = 3.0;      // test_split_gradient_sample_r: samples of events with R above
+  Real split_gb_rdump = 0.0;     // test_split_gradient_dump_r: support dumps (first 4) above
+  int split_gb_printed = 0;
+  Kokkos::View<unsigned long long*, DevMemSpace> split_gb_cnt;   // per split call
+  Kokkos::View<double*, DevMemSpace> split_gb_max;               // per split call
+  Kokkos::View<int*, DevMemSpace> split_gb_dump;                 // dumps so far (whole run)
+  DvceArray2D<Real> split_gb_smp;
+  unsigned long long split_gb_tot[64] = {};   // the counters summed over the calls (kGCNum)
+  double split_gb_totmax[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+  void SplitGradientBoundReport();
+  void SplitGradientBoundFit3D(const int npart);   // the statistics kernels after the fit
+  void SplitGradientBoundFit(const int npart);
   void PackGatherField3D(const DvceArray5D<Real> &vel);
   void PackGasGather3D(const DvceArray5D<Real> &u);
   void CloudPredictor3D(const bool rate_dep);
@@ -1871,6 +1912,45 @@ class DustGasDrag {
   void CloudImplicitConsistency3D(Driver *pdrive, int stage);
   bool imex_consistent_gas = true;
   DvceArray5D<Real> imex_resid;
+  // hidden key <dust>/test_imex_residual_to_center_upto_nominal (default true): for 3-D
+  // refinable clouds with coupling = imex, back-reaction, imex_consistent_gas and
+  // cloud_transition = 2 the three parts below, always together (false, or any other set-up: none
+  // of them).
+  bool imex_res_want = false;    // the key is on and the set-up fits (but for cloud_transition)
+  // (1) center rule: the dust share of a leaf cell's residual goes to the clouds whose center lies
+  // in that cell, in proportion to m_p c_p (the rule of the point path), instead of to every cloud
+  // that overlaps the cell with its weight
+  bool imex_resid_center = false;
+  DvceArray5D<Real> imex_qcen;   // (slot, 0, k, j, i): coupled mass density of the clouds centered there
+  // (3) floor on the centered mass: a cell whose centered clouds weigh less than one nominal cloud
+  // of its level gives them only that share of its dust residual (the kick of one nominal cloud at
+  // most) and the rest to every overlapping cloud by its weight (the default rule), also in a cell
+  // that is no cloud's center; any number of species and stopping-time modes (CloudCenterMass3D)
+  bool imex_resid_center_floor = false;
+  void CloudCenterMass3D(Driver *pdrive, int stage);   // imex_qcen (and imex_leaf, imex_bsingle)
+  DvceArray1D<Real> imex_bnom;   // per species: nominal centered mass density m_root/V_root (< 0: none)
+  std::vector<Real> imex_mref;   // ... the root cloud masses it was built from (G / R value or own)
+  std::vector<Real> imex_mown;   // ... own estimate, made once when the G / R passes have none yet
+                                 // (restart record imex_mown)
+  bool imex_mown_restored = false;
+  std::vector<Real> ImexRootMassEstimate(const int nsp);
+  Real imex_rho_nom = -1.0;      // ... of species 0 (set at first use)
+  Real imex_bsingle = 0.0;       // c_p rho_nom of the stage (one species, one stopping time)
+  bool imex_floor_multi = false; // several species or stopping times: imex_qcen component 1 holds
+                                 // the largest c_p rho_nom of the centered clouds
+  DvceArray1D<int> imex_leaf;    // per cloud: its center leaf (the center pass of the stage)
+  DvceArray1D<int> imex_need;    // per cloud: 1 = it covers a cell with an overlap share (set by
+                                 // the blend gather kernel; the others skip the overlap gather)
+  // (2) gather blend: the linear (slope) part of the
+  // clouds' u* gather fades with the dust share f = Q/(rho + Q) of the cells under the cloud,
+  // ubar = sum w u* + (1 - sum w f) (slope terms): the linear-moment gather where the gas dominates,
+  // the adjoint of the deposit (weights w only) where the dust dominates the lumped solve
+  bool imex_gather_blend = false;
+  DvceArray5D<Real> imex_fq;     // (slot, 0, k, j, i): f of the leaf cell (halo slots: owners' values)
+  // hidden diagnostic key <dust>/test_dt_diag = dt threshold (default 0 = off): Mesh::NewTimeStep
+  // calls DtDiag when the new global dt falls below it (dust_dtdiag.cpp; read-only)
+  Real dt_diag_thr = 0.0;
+  void DtDiag(const Real dt, const Real dt_hydro, const Real dt_grav, const Real dt_part);
   // IMEX stages see the gas in its t^n orbital-advection frame (the remap runs at the end
   // of the last stage): a particle at the lab stage position (x, y) meets the gas stored at
   // y + ImplicitShearShift*x (0 outside the 3-D shearing box and for the hybrid paths)
@@ -2006,6 +2086,14 @@ class DustGasDrag {
   // the buffer of the density trigger (amr_rho_map = block), cells of a block's level: part of the
   // reach of the halo, so that the strips hold the buffer cells
   int halo_trigger_cells = 0;
+  // the derefinement test of a block of level l >= 1 looks 2 amr_rho_buffer cells of its own
+  // level out (= amr_rho_buffer cells of the parent's level), so the siblings together see the
+  // region of the parent's refinement test (the default).  Hidden switch <dust>/
+  // test_derefine_parent_buffer = false / diag: false the old reach (amr_rho_buffer cells of the block's level), diag the old flags
+  // and a count of the derefinements the default test would keep.  0 old, 1 default, 2 diag.  The
+  // halo of a refined block holds 2 amr_rho_buffer cells (halo_trigger_deref_cells, HaloReach)
+  int trigger_parent_buffer = 1;
+  int halo_trigger_deref_cells = 0;
   // profile: fenced wall-clock seconds and calls of the AMR and cloud-management
   // phases, summed over the run (rank 0's), printed as one DUST_AMR_PROFILE line at the end
   enum ProfPhase {kProfTrigger, kProfAmr, kProfRegridMesh, kProfRebuild, kProfRefineClouds, kProfSplit,
@@ -2050,8 +2138,9 @@ class DustGasDrag {
   // own split (DustHalo::tsec)
   double mpi_time[4] = {0.0, 0.0, 0.0, 0.0};
   unsigned long long mpi_count[4] = {0, 0, 0, 0};
-  void HaloForwardPack(DvceArray5D<Real> &gp);
+  void HaloForwardPack(DvceArray5D<Real> &gp, const int nc = 0);   // nc > 0: the first nc components
   void HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int nc);
+  void HaloReverseMax(DvceArray5D<Real> &f, const int c0, const int nc);   // 3-D clouds: maximum
   void HaloForward5D(DvceArray5D<Real> &f, const int c0, const int nc);   // 3-D clouds
   void HaloForwardFlat(DvceArray2D<Real> &f, const int nc);
   void HaloReverseAddFlat(DvceArray2D<Real> &f, const int nc);

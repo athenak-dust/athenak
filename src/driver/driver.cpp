@@ -448,7 +448,10 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
 
       // Problem work may change density (e.g. Li2018 mass normalization).
       // Apply it before gravity samples the source or performs either kick.
-      if (pmesh->pgen->user_work_in_loop_func != nullptr) {
+      // (user_work_before_close_solve: called before the closing solve instead, below)
+      const bool work_at_close = pmesh->pmb_pack->pgrav != nullptr &&
+                                 pmesh->pgen->user_work_before_close_solve;
+      if (pmesh->pgen->user_work_in_loop_func != nullptr && !work_at_close) {
         (pmesh->pgen->user_work_in_loop_func)(pmesh);
       }
 
@@ -526,6 +529,11 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
           const auto &ind = pmesh->mb_indcs;
           hydro->peos->ConsToPrim(hydro->u0, hydro->w0, false,
               ind.is, ind.ie, ind.js, ind.je, ind.ks, ind.ke);
+        }
+        // the problem work of the next cycle done now, so that the closing field
+        // already sees it and the next opening solve may keep that field (kdk_reuse)
+        if (work_at_close && pmesh->pgen->user_work_in_loop_func != nullptr) {
+          (pmesh->pgen->user_work_in_loop_func)(pmesh);
         }
         Kokkos::Profiling::pushRegion("DRV:SG_Solve_close");
         pgrav->Solve(pmesh->time+pmesh->dt);

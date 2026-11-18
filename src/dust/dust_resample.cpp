@@ -9,7 +9,7 @@
 //! clouds change, a cloud whose mass reaches zero is removed.  Per patch (kc x kc cells of one
 //! MeshBlock, so that a patch holds about the same number of leaves on every level)
 //! the new masses keep, to round-off, every leaf's deposited mass and momentum, the three
-//! components of the frozen-gas drag feedback of every leaf (AuditFeedback), the centre of
+//! components of the frozen-gas drag feedback of every leaf (AuditFeedback), the center of
 //! mass and the six velocity second moments of the patch (3-D: by default also the angular
 //! momentum, <dust>/cloud_resample_xv_rows, in the patches where the rows above do not already fix
 //! it, dust_resample.hpp); a mass never exceeds its cap
@@ -285,7 +285,7 @@ PatchInfo ResamplePatch(const int a0, const int a1, const double *pd, const int 
     for (int k=0; k<3; ++k) vb[k] += P(JM, a)*P(JVX + k, a);
   }
   for (int k=0; k<3; ++k) vb[k] /= mt;
-  // rows: leaf mass, leaf momentum about the patch mean, centre of
+  // rows: leaf mass, leaf momentum about the patch mean, center of
   // mass, velocity second moments, leaf feedback (the leaf volume is a row factor: left out)
   ws.a.assign(static_cast<std::size_t>(nrow)*n, 0.0);
   for (int a=a0; a<a1; ++a) {
@@ -395,8 +395,8 @@ namespace resample {
 //! \brief <dust>/cloud_resample_xv_audit (3-D): the changes one batch of patch solves makes,
 //! from the sorted pool (pb), the new masses mn and the pair tables, before the masses are
 //! written.  Extra kernels only; the solve is not touched.  Per patch (one thread, pool order):
-//! with d = new - old mass, x the position about the patch centre (unwrapped as in the
-//! centre-of-mass rows) and c = v - u (u the old mass-weighted mean velocity of the patch):
+//! with d = new - old mass, x the position about the patch center (unwrapped as in the
+//! center-of-mass rows) and c = v - u (u the old mass-weighted mean velocity of the patch):
 //! |sum d| / sum m, |sum d v| / sum m |v|, |sum d x| / sum m |x|, |sum d c c^T| / sum m |c|^2,
 //! |sum d x c^T| / sum m |x||c| (Frobenius), |sum d x x c| / sum m |x||c|; J_q = sum m x x c and
 //! dJ_q = sum d x x c.  Per leaf (atomics over the (cloud, leaf) pairs): |sum_e w d| / sum_e w m
@@ -618,7 +618,7 @@ void AuditXVPatches(const DevicePatchProblem &pb, const DvceArray1D<double> &mn,
 //----------------------------------------------------------------------------------------
 //! \fn resample::AuditXVTotals
 //! \brief cloud_resample_xv_audit: totals over every cloud of this rank (m > 0), positions about
-//! the domain centre (not wrapped: a clump must not straddle a periodic face): [0] mass,
+//! the domain center (not wrapped: a clump must not straddle a periodic face): [0] mass,
 //! [1..3] sum m x, [4..6] sum m v, [7..9] sum m x x v, [10] clouds, [11..16] sum m x_a x_b
 //! (xx, yy, zz, xy, xz, yz).
 void AuditXVTotals(particles::Particles *ppar, const RegionSize &ms, double g[17]) {
@@ -850,7 +850,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
     MPI_Allreduce(MPI_IN_PLACE, mx, NM, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 #endif
     if (global_variable::my_rank == 0) {
-      // J about the centre of mass of the stored velocities (jcom) and the inertial J (jin: +
+      // J about the center of mass of the stored velocities (jcom) and the inertial J (jin: +
       // omega ((q - 1) S_xz, -S_yz, (1 - q) S_xx + S_yy) of the second moments about the COM;
       // = jcom without a shearing box), before (a) and after (b)
       const double om = omega0, qs = qshear;
@@ -1355,7 +1355,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
   t0 = Clock::now();
   const int npatch = nslot;   // (geometric patch x cell slot) x species
   const double lx = transfer.x1max - transfer.x1min, ly = transfer.x2max - transfer.x2min;
-  // per patch: centre and length scale of the centre-of-mass rows (half the patch width)
+  // per patch: center and length scale of the center-of-mass rows (half the patch width)
   DvceArray2D<Real> pgeo(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pgeo"), npatch, 4);
   Kokkos::parallel_for("rs_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
   KOKKOS_LAMBDA(const int qs) {
@@ -1599,7 +1599,7 @@ int DustGasDrag::ResampleClouds(const bool local) {
 //! mask), patches of k x k x k cells inside one MeshBlock with k = min(s 2^level, kc), split
 //! into octants down to single cells while a patch holds more than cloud_resample_patch_split
 //! clouds, and the rows of every patch: leaf mass, momentum and feedback, the three
-//! centre-of-mass rows and the six velocity second moments.  Returns the number of clouds
+//! center-of-mass rows and the six velocity second moments.  Returns the number of clouds
 //! removed.
 
 int DustGasDrag::ResampleClouds3D(const bool local) {
@@ -1716,7 +1716,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       }
       // the blocks of this cycle's split events (cloud_split_resample): the blocks of the
       // parents and the blocks the pieces landed in (PrepareSplitBlocks; not the static
-      // neighbours: across a shear-periodic x1 face the pieces land in blocks shifted along x2,
+      // neighbors: across a shear-periodic x1 face the pieces land in blocks shifted along x2,
       // and after a hold by the split budget several blocks away)
       if (!on && r_split_blocks && static_cast<int>(split_gid_flag.size()) == ntot) {
         on = (split_gid_flag[pmy_pack->gids + m] != 0) ? 1 : 0;
@@ -2051,7 +2051,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       });
     }
     const int npatch = nslot;
-    // per patch: centre and half widths of the centre-of-mass rows (x, y, half x, half y, z, half z)
+    // per patch: center and half widths of the center-of-mass rows (x, y, half x, half y, z, half z)
     DvceArray2D<Real> pgeo(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pgeo"), npatch, 6);
     Kokkos::parallel_for("rs3_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
     KOKKOS_LAMBDA(const int qs) {
@@ -2083,7 +2083,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
     // sub-patches of the crowded patches (cloud_resample_patch_max): a patch of n > pmax pool
     // clouds becomes ns = ceil(n / pmax) sub-patches of consecutive clouds in the sorted order
     // (balanced sizes).  Every sub-patch keeps its own contributions to every row (leaf mass,
-    // momentum and feedback, centre of mass, second moments) and takes the geometry of its patch,
+    // momentum and feedback, center of mass, second moments) and takes the geometry of its patch,
     // so the sum keeps all of them; the solves stay small and run in parallel.  (A single cell of
     // a dense core held 5e5 clouds at L3: one team solved it for 40 min.)
     const int pmax = cloud_resample_patch_max;
@@ -2169,7 +2169,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
     });
     // the patches for the cross-moment rows (cloud_resample_xv_rows, and for the audit's counts).
     // Unflagged only when all pool clouds of the patch have one level L and every footprint leaf
-    // is at level >= L.  Then, per direction, leaf values a_l = the centre of the level-L cell
+    // is at level >= L.  Then, per direction, leaf values a_l = the center of the level-L cell
     // holding leaf l give sum_l a_l W_il = x_i (the hat is box * box of the L cell width), and
     // b_l = the level-L quadratic B-spline coefficients give sum_l b_l W_il = x_i^2 + const (the
     // cell-integrated hat is box * box * box, a B-spline of degree 2 that reproduces quadratics,
@@ -2178,12 +2178,12 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
     // are redundant and such patches are solved without them (bitwise as with none).  Every
     // other patch is flagged: a cloud finer than a leaf, or several cloud widths in one patch
     // (no general redundancy: moving mass between a width-2h cloud and its three width-h
-    // P1 pieces keeps every leaf deposit, the mass and the centre of mass but changes S_xx).
+    // P1 pieces keeps every leaf deposit, the mass and the center of mass but changes S_xx).
     // The proof also needs the unbounded hat and one consistent unwrapping: flagged as well are
     // the patches with a cloud whose support crosses a physical x3 face (the part beyond the face
     // is folded back into the domain, so the weights no longer reproduce z) and the patches whose
     // footprint spans a whole period of a periodic direction (x1, x2, periodic x3), where the
-    // unwrapping about the patch centre is ambiguous.
+    // unwrapping about the patch center is ambiguous.
     DvceArray1D<int> xfl;
     if (cloud_resample_xv_rows != 0 || cloud_resample_xv_audit) {
       DvceArray1D<int> klev(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_xvlev"), npool);
@@ -2212,7 +2212,7 @@ int DustGasDrag::ResampleClouds3D(const bool local) {
       Kokkos::parallel_for("rs3_xvflag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch2),
       KOKKOS_LAMBDA(const int q) {
         int cmin = 255, cmax = -1, lmin = 255, own = 0, fold = 0;
-        // the footprint about the patch centre, unwrapped as in the rows: [lo, hi] per direction
+        // the footprint about the patch center, unwrapped as in the rows: [lo, hi] per direction
         Real lo[3] = {1.0e300, 1.0e300, 1.0e300}, hi[3] = {-1.0e300, -1.0e300, -1.0e300};
         const Real per[3] = {plx, ply, plz}, cen[3] = {pg(q,0), pg(q,1), pg(q,4)};
         const Real rd[3] = {rdx1, rdx2, rdz};

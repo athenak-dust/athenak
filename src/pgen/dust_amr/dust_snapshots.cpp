@@ -118,12 +118,12 @@ constexpr int kBAFields = 11;
 // Diagnostic only: the distribution of the dust density measured at
 // the particle positions, weighted by the mass each particle represents, appended to
 // <basename>.ppdf with every field snapshot.  The leaf densities are the run's own deposit
-// (WriteBAFields).  Two estimates per particle, both a normalised point-TSC interpolation
-// of a uniform periodic grid at the particle centre (self contribution included):
+// (WriteBAFields).  Two estimates per particle, both a normalized point-TSC interpolation
+// of a uniform periodic grid at the particle center (self contribution included):
 //   native   the grid of the level of the leaf that holds the particle; finer leaves are
 //            restricted to it conservatively, coarser leaves prolonged piecewise constant
 //   common   the reference grid of ba_ppdf_nref cells per x1 extent (leaves restricted)
-// Regions by particle centre: all; x1 below / above the middle of the box; the same two
+// Regions by particle center: all; x1 below / above the middle of the box; the same two
 // without the bands of two reference cells around the middle and the box edge.
 // Record: kPPScal doubles (time, cycle, particles, mass, mean density, largest native and
 // common estimate; for native then common the mass fraction above 1, 3, 10, 30, 100, 300;

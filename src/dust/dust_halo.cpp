@@ -63,6 +63,19 @@ struct Acc5D3 {
   KOKKOS_INLINE_FUNCTION void set(const int c, const int t, const Real v) const {at(c, t) = v;}
   KOKKOS_INLINE_FUNCTION void add(const int c, const int t, const Real v) const {at(c, t) += v;}
 };
+struct Acc5D3Max {   // Acc5D3 whose reverse step keeps the maximum (HaloReverseMax)
+  DvceArray5D<Real> f;
+  int c0 = 0, nc1 = 1, n12 = 1, n123 = 1;
+  KOKKOS_INLINE_FUNCTION Real &at(const int c, const int t) const {
+    const int m = t/n123, r = t - m*n123, k = r/n12, q = r - k*n12;
+    return f(m, c0 + c, k, q/nc1, q % nc1);
+  }
+  KOKKOS_INLINE_FUNCTION Real get(const int c, const int t) const {return at(c, t);}
+  KOKKOS_INLINE_FUNCTION void set(const int c, const int t, const Real v) const {at(c, t) = v;}
+  KOKKOS_INLINE_FUNCTION void add(const int c, const int t, const Real v) const {
+    if (v > at(c, t)) at(c, t) = v;
+  }
+};
 struct AccPack {
   DvceArray5D<Real> f;
   int ks = 0, nc1 = 1, n12 = 1;
@@ -201,7 +214,7 @@ void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
 //! one all-to-all of the counts and one of the requests, so that both sides of every pair hold
 //! the same lists: per peer rank (ascending), the cells of this rank's blocks asked for by it
 //! and the cells of the halo slots it fills, block by block, row by row.  (The halo may hold
-//! blocks beyond the neighbours, so it is not symmetric in general.)
+//! blocks beyond the neighbors, so it is not symmetric in general.)
 
 void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
   Mesh *pm = pmy_pack->pmesh;
@@ -309,12 +322,12 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
 //! forward), the deposits qdep / dmom (components c0 .. c0 + nc - 1, reverse), the merge
 //! budget fields (c, leaf) and the per-leaf flags (forward and reverse).
 
-void DustGasDrag::HaloForwardPack(DvceArray5D<Real> &gp) {
+void DustGasDrag::HaloForwardPack(DvceArray5D<Real> &gp, const int nc) {
   if (halo_.npeer == 0) return;
   const int nc1 = halo_.ncells1, n12 = halo_.ncells1*halo_.ncells2;
-  if (halo_.three) {   // 3-D clouds: gpack3 (12 components)
+  if (halo_.three) {   // 3-D clouds: gpack3 (12 components, or only the first nc)
     AccPack3 a; a.f = gp; a.nc1 = nc1; a.n12 = n12; a.n123 = n12*halo_.ncells3;
-    Exchange(halo_, gp.extent_int(4), false, a);
+    Exchange(halo_, (nc > 0) ? nc : gp.extent_int(4), false, a);
     return;
   }
   AccPack a; a.f = gp; a.ks = pmy_pack->pmesh->mb_indcs.ks; a.nc1 = nc1; a.n12 = n12;
@@ -330,6 +343,14 @@ void DustGasDrag::HaloReverseAdd(DvceArray5D<Real> &f, const int c0, const int n
     return;
   }
   Acc5D a; a.f = f; a.c0 = c0; a.ks = pmy_pack->pmesh->mb_indcs.ks; a.nc1 = nc1; a.n12 = n12;
+  Exchange(halo_, nc, true, a);
+}
+
+// the owners' cells take the maximum of their own value and the halo slots' (3-D clouds)
+void DustGasDrag::HaloReverseMax(DvceArray5D<Real> &f, const int c0, const int nc) {
+  if (halo_.npeer == 0) return;
+  const int nc1 = halo_.ncells1, n12 = halo_.ncells1*halo_.ncells2;
+  Acc5D3Max a; a.f = f; a.c0 = c0; a.nc1 = nc1; a.n12 = n12; a.n123 = n12*halo_.ncells3;
   Exchange(halo_, nc, true, a);
 }
 

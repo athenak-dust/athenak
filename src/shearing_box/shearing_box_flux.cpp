@@ -620,7 +620,7 @@ void ShearingBoxCC::PlanFluxPair() {
 //! \brief The authoritative blocks integrate their x1 face fluxes (piecewise linear in x2,
 //! limited, none at the block's own first and last rows) over each receiving cell; the sums,
 //! the covered fraction and its first moment in the receiving cell (x2, in units
-//! of its width, about its centre) go to the receiver's accumulators or to the flat buffer.
+//! of its width, about its center) go to the receiver's accumulators or to the flat buffer.
 
 TaskStatus ShearingBoxCC::SendFluxPair(DvceFaceFld5D<Real> &flx) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -746,7 +746,7 @@ TaskStatus ShearingBoxCC::RecvFluxPair(DvceFaceFld5D<Real> &flx) {
   // flux on the rest, where it is itself authoritative and sends the integral of its piecewise
   // linear flux (SendFluxPair): keep the same integral, F_own (1 - covered) - slope m1 (m1 = first
   // moment of the covered part), so both sides of every piece agree.  Fully covered cells as before.
-  // Into qnew first: the slope reads the neighbours' unreplaced fluxes.
+  // Into qnew first: the slope reads the neighbors' unreplaced fluxes.
   par_for("shr-qflx-apply", DevExeSpace(), 0, nmb-1, 0, 1, 0, nv-1, 0, nx3-1, 0, nx2-1,
   KOKKOS_LAMBDA(const int m, const int f, const int v, const int k, const int j) {
     const auto face = (f == 0) ? BoundaryFace::inner_x1 : BoundaryFace::outer_x1;

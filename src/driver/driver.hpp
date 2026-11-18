@@ -55,7 +55,7 @@ class Driver {
   // identity (beta = 0, gam0 = 1, gam1 = 0: the final stage of imex2+), when its
   // beta-weighted hydro work (fluxes, their corrections and messages, RK update, source
   // terms) is skipped; everything else of the stage (boundary tail, orbital advection,
-  // C2P, dt) still runs.  Stages <= 0 (initialisation, ghost refresh) are never skipped.
+  // C2P, dt) still runs.  Stages <= 0 (initialization, ghost refresh) are never skipped.
   bool SkipIdentityStage(int stage) const {
     return skip_identity_stages && stage >= 1 && stage <= nexp_stages &&
            beta[stage-1] == 0.0 && gam0[stage-1] == 1.0 && gam1[stage-1] == 0.0;

@@ -1,5 +1,5 @@
 """
-Reader for AthenaK particle science files (file_type = pbin, format versions 1 and 2).
+Reader for AthenaK particle science files (file_type = pbin, format versions 1, 2 and 3).
 
 A pbin file holds the active dust particles of one output time as typed columns
 (float64 positions, velocities, masses and stopping times, uint64 ids, uint32
@@ -16,6 +16,12 @@ them as arrays of length N (read-only broadcast views of the constant), so analy
 code is the same for both layouts; ``snap.constant_columns`` names them.  With
 <outputN>/precision = single the particle real columns are float32 (their dtype is
 in the column directory; the constants stay float64).
+
+Format version 3 (hidden <outputN>/test_pbin_compress = shuffle_deflate) stores the
+particle columns compressed: chunks of at most chunk_rows rows of one writing rank, each
+byte-shuffled (byte k of every value together) and deflated as one zlib stream; the
+[chunks] section of the header lists them.  The reader inflates and unshuffles them
+(Python's zlib, in threads) and returns the same arrays as for version 2.
 
 Example::
 
@@ -42,6 +48,8 @@ Only some columns can be read: ``pbin.read(path, columns=["x1", "x2", "mass"])``
 
 import os
 import warnings
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -49,7 +57,8 @@ MAGIC = b"AKPBIN01"
 END = b"AKPBEND1"
 PREAMBLE = 64
 FOOTER = 16
-SUPPORTED_VERSIONS = (1, 2)
+SUPPORTED_VERSIONS = (1, 2, 3)
+ENCODINGS = ("raw", "shuffle_deflate")
 SHAPE_VERSION = 1
 
 
@@ -60,10 +69,13 @@ class PbinError(Exception):
 def _parse_text(text):
     """Split the text header into {section: {key: value}}, the column directory and the
     raw input-parameter dump.  The constants of version 2 are in sections["constants"] as
-    {"table.name": dict(table, name, dtype, value)}."""
+    {"table.name": dict(table, name, dtype, value)}.  Version 3: every column has an
+    "encoding" ("raw" before version 3) and the compressed ones the list "chunks" of
+    dict(rank, first_row, rows, offset, stored_bytes) from the [chunks] section."""
     sections = {}
     columns = []
     constants = {}
+    chunks = []
     current = None
     head, sep, dump = text.partition("\n[input]\n")
     if not sep:
@@ -82,7 +94,13 @@ def _parse_text(text):
         if current == "columns" and key == "column":
             t = value.split()
             columns.append(dict(table=t[0], name=t[1], dtype=t[2], count=int(t[3]),
-                                offset=int(t[4]), nbytes=int(t[5])))
+                                offset=int(t[4]), nbytes=int(t[5]),
+                                encoding=t[6] if len(t) > 6 else "raw"))
+            continue
+        if current == "chunks" and key == "chunk":
+            t = value.split()
+            chunks.append(dict(name=t[0], rank=int(t[1]), first_row=int(t[2]),
+                               rows=int(t[3]), offset=int(t[4]), stored_bytes=int(t[5])))
             continue
         if current == "constants" and key == "constant":
             t = value.split()
@@ -93,6 +111,10 @@ def _parse_text(text):
         value = value.split("  #")[0].strip()
         sections[current][key] = value
     sections["constants"] = constants
+    sections.pop("chunks", None)
+    for c in columns:
+        if c["encoding"] != "raw":
+            c["chunks"] = [ch for ch in chunks if ch["name"] == c["name"]]
     return sections, columns, dump
 
 
@@ -155,8 +177,25 @@ def read_header(path):
     for c in columns:
         if c["offset"] + c["nbytes"] > data_bytes:
             raise PbinError(f"{path}: column {c['name']} runs past the data section")
-        if c["nbytes"] != c["count"] * np.dtype(c["dtype"]).itemsize:
-            raise PbinError(f"{path}: column {c['name']} has an inconsistent size")
+        if c["encoding"] not in ENCODINGS:
+            raise PbinError(f"{path}: column {c['name']} has the unknown encoding "
+                            f"{c['encoding']}")
+        if c["encoding"] == "raw":
+            if c["nbytes"] != c["count"] * np.dtype(c["dtype"]).itemsize:
+                raise PbinError(f"{path}: column {c['name']} has an inconsistent size")
+            continue
+        # compressed: the chunks tile the rows in order and the column's stored bytes
+        row, at = 0, c["offset"]
+        for ch in c["chunks"]:
+            if ch["rows"] < 0 or ch["stored_bytes"] < 0:
+                raise PbinError(f"{path}: column {c['name']}: negative chunk size")
+            if ch["first_row"] != row or ch["offset"] != at:
+                raise PbinError(f"{path}: column {c['name']}: chunk table out of order")
+            row += ch["rows"]
+            at += ch["stored_bytes"]
+        if row != c["count"] or at != c["offset"] + c["nbytes"]:
+            raise PbinError(f"{path}: column {c['name']}: chunk table does not cover the "
+                            "column")
     return pre, sections, columns, dump
 
 
@@ -425,10 +464,59 @@ def topology_hash(level, lx1, lx2, lx3):
     return h
 
 
-def read(path, columns=None):
+def _decode_shuffle_deflate(path, c, region, threads):
+    """Version 3: inflate and unshuffle the chunks of one column (region = its stored
+    bytes) into an array of count values."""
+    dt = np.dtype(c["dtype"])
+    size = dt.itemsize
+    out = np.empty(c["count"], dtype=dt)
+    ob = out.view(np.uint8)
+    view = memoryview(region)
+
+    def one(ch):
+        rows = ch["rows"]
+        if rows == 0:
+            if ch["stored_bytes"] != 0:
+                raise PbinError(f"{path}: column {c['name']}: empty chunk with data")
+            return
+        a = ch["offset"] - c["offset"]
+        want = rows * size
+        where = f"{path}: column {c['name']}: chunk at row {ch['first_row']}"
+        # one complete zlib stream that fills the chunk's stored bytes exactly and inflates to
+        # exactly rows * itemsize bytes (output capped at want + 1 to detect an overlong one)
+        d = zlib.decompressobj()
+        try:
+            raw = d.decompress(view[a:a + ch["stored_bytes"]], want + 1)
+        except zlib.error as e:
+            raise PbinError(f"{where}: corrupt deflate stream ({e})") from None
+        if len(raw) > want or d.unconsumed_tail:
+            raise PbinError(f"{where}: inflates to more than {want} bytes")
+        if not d.eof:
+            raise PbinError(f"{where}: truncated deflate stream")
+        if d.unused_data:
+            raise PbinError(f"{where}: data after the end of the deflate stream")
+        if len(raw) != want:
+            raise PbinError(f"{where}: inflates to {len(raw)} bytes, not {want}")
+        r0 = ch["first_row"] * size
+        ob[r0:r0 + rows * size].reshape(rows, size)[...] = \
+            np.frombuffer(raw, np.uint8).reshape(size, rows).T
+
+    if threads > 1 and len(c["chunks"]) > 1:
+        with ThreadPoolExecutor(min(threads, len(c["chunks"]))) as ex:
+            list(ex.map(one, c["chunks"]))
+    else:
+        for ch in c["chunks"]:
+            one(ch)
+    return out
+
+
+def read(path, columns=None, threads=None):
     """Read a pbin file.  columns: names of particle columns to read (default all); the
-    block table is always read."""
+    block table is always read.  threads: inflate threads for compressed columns (format
+    version 3; default min(8, CPUs))."""
     pre, sections, coldir, dump = read_header(path)
+    if threads is None:
+        threads = min(8, os.cpu_count() or 1)
     cols, blocks = {}, {}
     with open(path, "rb") as f:
         for c in coldir:
@@ -436,6 +524,13 @@ def read(path, columns=None):
                     and c["name"] not in columns):
                 continue
             f.seek(pre["data_start"] + c["offset"])
+            if c["encoding"] == "shuffle_deflate":
+                region = f.read(c["nbytes"])
+                if len(region) != c["nbytes"]:
+                    raise PbinError(f"{path}: column {c['name']} is truncated")
+                arr = _decode_shuffle_deflate(path, c, region, threads)
+                (cols if c["table"] == "particles" else blocks)[c["name"]] = arr
+                continue
             arr = np.fromfile(f, dtype=np.dtype(c["dtype"]), count=c["count"])
             if arr.size != c["count"]:
                 raise PbinError(f"{path}: column {c['name']} is truncated")

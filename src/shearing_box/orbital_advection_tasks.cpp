@@ -57,8 +57,8 @@ TaskStatus OrbitalAdvection::InitRecv() {
       }
     }
   }
-  // x2 faces with a level change: the rows from a coarser neighbour (into the
-  // receive buffer itself), from four finer neighbours (one message each) and their fluxes
+  // x2 faces with a level change: the rows from a coarser neighbor (into the
+  // receive buffer itself), from four finer neighbors (one message each) and their fluxes
   if (any_mixed) {
     const int my_rank = global_variable::my_rank;
     const int nk = pmy_pack->pmesh->mb_indcs.nx3, ni = pmy_pack->pmesh->mb_indcs.nx1;

@@ -20,9 +20,9 @@
 #include "bvals.hpp"
 
 namespace {
-// The (k,j) rows of one (MeshBlock, neighbour, variable) buffer are split over RowSplit teams
-// when a pack has few MeshBlocks: one team per buffer left most of a GPU idle (a 4x128x256 face
-// of a single block took ~0.2 ms per exchange, the same as eight blocks).  Pure copies: the
+// The (k,j) rows of one (MeshBlock, neighbor, variable) buffer are split over RowSplit teams
+// when a pack has few MeshBlocks: one team per buffer left most of a GPU idle (a single block
+// took as long per exchange as eight blocks).  Pure copies: the
 // result does not depend on the split.
 int RowSplit(const int nteams) {
   constexpr int kTarget = 4096, kMax = 32;
@@ -329,7 +329,7 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
   //----- STEP 2: buffers have all completed, so unpack
   // Off-rank payloads are read directly out of the rank-packed aggregate recv
   // buffer (fuses the former RankUnpackScatter kernel); on-rank payloads remain
-  // in their per-neighbour recv buffers, written there directly by the sender.
+  // in their per-neighbor recv buffers, written there directly by the sender.
 
   int nvar = a.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
   auto &mblev = pmy_pack->pmb->mb_lev;

@@ -47,6 +47,20 @@ int &OperatorSetupThreads() {
   static int threads = 1;
   return threads;
 }
+bool SgTemplateCheck() {
+  static const bool on = [] {
+    const char *e = std::getenv("ATHENA_SG_TEMPLATE_CHECK");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+int SgLeanOverride() {
+  static const int bits = [] {
+    const char *e = std::getenv("ATHENA_SG_LEAN");
+    return e != nullptr && e[0] != '\0' ? std::max(0,std::atoi(e)) : -1;
+  }();
+  return bits;
+}
 namespace {
 double HostSeconds() {
   return std::chrono::duration<double>(
@@ -72,9 +86,9 @@ void SetupChunks(std::size_t items, int &workers, int &chunks) {
 using Vector = DvceArray1D<Real>;
 using Indices = DvceArray1D<int>;
 
-// the host copies into the pinned stages of a phase update (values of every operator, ~10^6
-// to 10^7 entries per update at L3/L4) on up to 8 host threads of this rank's CPU set, in chunks
-// of at least 2^16 entries; memcpy of the same bytes
+// the host copies into the pinned stages of a phase update (values of every operator, millions
+// of entries per update on deep hierarchies) on up to 8 host threads of this rank's CPU
+// set, in chunks of at least 2^16 entries; memcpy of the same bytes
 int StageCopyWorkers() {
   static const int n = [] {
     int cpus = 1;
@@ -217,9 +231,9 @@ bool DeviceMpi() {
 // product, blocking deep copies with global fences), kept for A/B timing.  Default: point-to-
 // point messages with the ranks that share halo entries only, copies queued on the device
 // stream.  The same values arrive in the same places: results are bitwise identical.
-// Operators with at least n nonzeros per row on average (the coarse multigrid levels: 42-69,
-// rows up to 300 entries) use the row-team product kernel, which gives bitwise the same
-// results; in our tests n = 40 was faster than 16, and n = 1 (the fine level too) slower.
+// Operators with at least n nonzeros per row on average (the coarse multigrid levels) use the
+// row-team product kernel, which gives bitwise the same results; in our tests n = 40 was faster
+// than 16, and n = 1 (the fine level too) slower.
 // Default n = 40 on GPU backends, 0 (the
 // one-thread-per-row kernel everywhere) on host backends; ATHENA_SG_SPMV_ROWS=<n> overrides
 // (0: off).
@@ -242,6 +256,13 @@ int SpmvRowTeams() {
 // their capacity (grown by an eighth when too small), new device vectors are zeroed as the fresh
 // ones were, and the value uploads are queued on the device stream with one fence per update.
 // The same values reach the same places: results are bitwise identical.
+// memory option 2 (see self_gravity.cpp): FGMRES allocates each Arnoldi / flexible-basis
+// vector when an iteration first needs it (same arithmetic). Always on, unless the hidden
+// override ATHENA_SG_LEAN is set without bit 2.
+bool KrylovLazy() {
+  const int forced = SgLeanOverride();
+  return forced < 0 || (forced & 2) != 0;
+}
 bool PhaseAllocOld() {
   static const bool on = [] {
     const char *e = std::getenv("ATHENA_SG_PHASE_ALLOC_OLD");
@@ -289,7 +310,7 @@ bool GhostMapOld() {
 // numbers ONLY IF MPI_Allreduce returns bitwise the same sum on every rank.  The MPI standard asks
 // for that, but not every implementation delivers it: UCC 1.3.0 (TL/UCP knomial, radix 4) adds in
 // a rank-dependent order, and local sums {1, -1, 2^-54, 0} can come back as 0 on some ranks and
-// 2^-54 on others; then a receiver's ghost value differs from the owner's (Codex review;
+// 2^-54 on others; then a receiver's ghost value differs from the owner's (
 // OpenMPI 5 tuned/HAN and UCC >= 1.5 add in the same order everywhere).  Hence: off by default
 // (every projection completes before the next product packs its halo, as before), and when it is
 // requested a probe at every solver construction (ProbeAllreduceIdentical) sums such values and
@@ -313,9 +334,9 @@ bool ProjectFuseProbeTest() {
 }
 // completion of the queued phase uploads (StagedCopy, the value copies) at every exit of a
 // public phase update, also by an exception: the pinned stages may be written again as soon as
-// the call has returned (Codex review: two consecutive fine updates, or a batch that throws after
-// the fine upload, could otherwise rewrite a stage under a copy still in flight).
-// Two exits (Codex review, round 3): a normal return calls Complete() as its last statement, a
+// the call has returned (two consecutive fine updates, or a batch that throws after the fine
+// upload, could otherwise rewrite a stage under a copy still in flight).
+// Two exits: a normal return calls Complete() as its last statement, a
 // plain fence that throws what Kokkos throws on a failed device synchronization (CUDA/HIP errors
 // of the queued copies or kernels), so the update does not report success for failed device
 // work.  The destructor fences only when Complete() was not reached, i.e. while an exception
@@ -385,6 +406,15 @@ struct SparseMultigrid::Impl {
     bool phase_base_sorted = false;
     std::uint64_t phase_masked_base_nnz = 0;
     FineOperatorStats phase_updates;
+    // template rows (memory option 8; DistributedOperator only): row i with
+    // tmpl_id(i) = t >= 0 has an empty CSR row; its product is the sum over k in
+    // [tmpl_ptr(t), tmpl_ptr(t+1)) of tmpl_val(k)*x(i+tmpl_off(k)), exactly the entries of its
+    // former CSR row in their order (owned inputs only). Never a phase row.
+    bool templates = false;
+    DvceArray1D<std::int16_t> tmpl_id;
+    Indices tmpl_ptr, tmpl_off;
+    Vector tmpl_val;
+    std::uint64_t template_rows = 0, template_nnz = 0;
     // the stores behind the views above that BuildHalo and the phase updates replace
     // (ATHENA_SG_PHASE_ALLOC_OLD=1: fresh views instead)
     struct Stores {
@@ -486,6 +516,8 @@ struct SparseMultigrid::Impl {
   }
   static void AddAllocations(const Operator &op, Ranges &csr, Ranges &halo) {
     AddRange(csr,op.rowptr); AddRange(csr,op.colidx); AddRange(csr,op.values);
+    AddRange(csr,op.tmpl_id); AddRange(csr,op.tmpl_ptr); AddRange(csr,op.tmpl_off);
+    AddRange(csr,op.tmpl_val);
     AddRange(csr,op.phase_rowptr); AddRange(csr,op.phase_colidx); AddRange(csr,op.phase_values);
     AddRange(csr,op.phase_values_pinned);
     const auto &st = op.store;
@@ -630,7 +662,7 @@ struct SparseMultigrid::Impl {
   // Collective.  Sums of probe values with one MPI_Allreduce each, as the projection
   // does (one MPI_ATHENA_REAL, MPI_SUM), then one exact integer reduction of the result bits:
   // true if every rank received bitwise the same sums.  The values are the UCC 1.3 counterexample
-  // ({1, -1, 2^-54, 0} by rank modulo 4) in four rotations and a set of near-cancelling numbers.
+  // ({1, -1, 2^-54, 0} by rank modulo 4) in four rotations and a set of near-canceling numbers.
   bool ProbeAllreduceIdentical() const {
     const Real tiny = std::ldexp(Real(1), -54);
     const Real base[4] = {Real(1), Real(-1), tiny, Real(0)};
@@ -879,7 +911,8 @@ struct SparseMultigrid::Impl {
   }
 
   Operator Build(const LocalCsr &a, const std::vector<GlobalIndex> &outpart,
-                 const std::vector<GlobalIndex> &inpart) {
+                 const std::vector<GlobalIndex> &inpart,
+                 const std::vector<int> *template_exclude = nullptr) {
     Operator op;
     op.rows = a.LocalRows(); op.inputs = static_cast<int>(inpart[rank+1]-inpart[rank]);
     op.global_rows = a.global_rows; op.global_cols = a.global_cols; op.row_begin = a.row_begin;
@@ -911,11 +944,178 @@ struct SparseMultigrid::Impl {
         }
       });
     }
+    if (template_exclude != nullptr) {
+      BuildTemplates(op,a,columns,*template_exclude);
+      return op;
+    }
     SetupLap lap(SetupTimes().upload);
     op.rowptr = DeviceCopy(a.rowptr,"gravity_csr_rows");
     op.colidx = DeviceCopy(columns,"gravity_csr_columns");
     op.values = DeviceCopy(a.values,"gravity_csr_values");
     return op;
+  }
+
+  // (memory option 8) the device CSR of op with repeated rows stored as templates.
+  // A row is a candidate when it is not excluded (the phase rows), not empty and reads owned
+  // inputs only; its pattern is its length, column offsets (column - row) and value bits.
+  // The most frequent patterns (by nonzeros, at most kMaxTemplates, each used by >= 2 rows)
+  // become templates; a candidate row joins a template only after an exact comparison of
+  // its offsets and value bits, so a hash collision leaves the row in the CSR. A template
+  // row's product is then the same multiply-adds in the same order as its CSR row: bitwise
+  // the same result. ATHENA_SG_TEMPLATE_CHECK=1 compares the two products on the device.
+  void BuildTemplates(Operator &op, const LocalCsr &a, const std::vector<int> &columns,
+                      const std::vector<int> &exclude) {
+    constexpr int kMaxTemplates = 1024;
+    const int rows = op.rows, inputs = op.inputs;
+    std::vector<char> excluded(rows,0);
+    for (int r : exclude) if (r >= 0 && r < rows) excluded[r] = 1;
+    std::vector<std::uint64_t> hash(rows,0);
+    int workers = 1, chunks = 1;
+    SetupChunks(a.colidx.size(),workers,chunks);
+    // the bits of a value (single precision: the 4 bytes of the float, upper bits zero)
+    static_assert(sizeof(Real) <= sizeof(std::uint64_t),"Real wider than 64 bits");
+    auto bits = [](Real v) { std::uint64_t b = 0; std::memcpy(&b,&v,sizeof(v)); return b; };
+    auto mix = [](std::uint64_t h, std::uint64_t v) {
+      h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+      h *= 0xff51afd7ed558ccdull; h ^= h >> 33;
+      return h;
+    };
+    ParallelChunks(workers,chunks,[&](int c) {
+      for (int i = static_cast<int>(std::int64_t(rows)*c/chunks);
+           i < static_cast<int>(std::int64_t(rows)*(c+1)/chunks); ++i) {
+        const int b = a.rowptr[i], e = a.rowptr[i+1];
+        if (excluded[i] || e == b) continue;
+        std::uint64_t h = static_cast<std::uint64_t>(e-b);
+        bool owned = true;
+        for (int k = b; k < e && owned; ++k) {
+          owned = columns[k] < inputs;
+          h = mix(h,static_cast<std::uint64_t>(static_cast<std::int64_t>(columns[k])-i));
+          h = mix(h,bits(a.values[k]));
+        }
+        hash[i] = owned ? (h | 1) : 0;
+      }
+    });
+    // pattern frequencies (consecutive rows mostly share a pattern: one lookup per run)
+    struct Candidate { int row; int length; std::uint64_t count; };
+    std::unordered_map<std::uint64_t,Candidate> candidates;
+    {
+      Candidate *last = nullptr;
+      std::uint64_t last_hash = 0;
+      for (int i = 0; i < rows; ++i) {
+        if (hash[i] == 0) continue;
+        if (last == nullptr || hash[i] != last_hash) {
+          auto it = candidates.find(hash[i]);
+          if (it == candidates.end())
+            it = candidates.emplace(hash[i],Candidate{i,a.rowptr[i+1]-a.rowptr[i],0}).first;
+          last = &it->second; last_hash = hash[i];
+        }
+        ++last->count;
+      }
+    }
+    std::vector<std::pair<std::uint64_t,std::uint64_t>> order;   // (saved nonzeros, hash)
+    for (const auto &c : candidates)
+      if (c.second.count >= 2) order.emplace_back(c.second.count*c.second.length,c.first);
+    std::sort(order.begin(),order.end(),[](const auto &x, const auto &y) {
+      return x.first != y.first ? x.first > y.first : x.second < y.second; });
+    if (order.size() > static_cast<std::size_t>(kMaxTemplates)) order.resize(kMaxTemplates);
+    std::unordered_map<std::uint64_t,int> chosen;
+    std::vector<int> tptr{0}, toff;
+    std::vector<Real> tval;
+    std::vector<int> representative;
+    for (const auto &o : order) {
+      const int r = candidates[o.second].row;
+      chosen.emplace(o.second,static_cast<int>(representative.size()));
+      representative.push_back(r);
+      for (int k = a.rowptr[r]; k < a.rowptr[r+1]; ++k) {
+        toff.push_back(columns[k]-r); tval.push_back(a.values[k]);
+      }
+      tptr.push_back(static_cast<int>(toff.size()));
+    }
+    // exact membership: offsets and value bits equal to the template's
+    std::vector<std::int16_t> id(rows,-1);
+    ParallelChunks(workers,chunks,[&](int c) {
+      for (int i = static_cast<int>(std::int64_t(rows)*c/chunks);
+           i < static_cast<int>(std::int64_t(rows)*(c+1)/chunks); ++i) {
+        if (hash[i] == 0) continue;
+        const auto it = chosen.find(hash[i]);
+        if (it == chosen.end()) continue;
+        const int t = it->second, b = a.rowptr[i], e = a.rowptr[i+1];
+        bool same = e-b == tptr[t+1]-tptr[t];
+        for (int k = 0; same && k < e-b; ++k) {
+          same = columns[b+k]-i == toff[tptr[t]+k]
+              && bits(a.values[b+k]) == bits(tval[tptr[t]+k]);
+        }
+        if (same) id[i] = static_cast<std::int16_t>(t);
+      }
+    });
+    std::vector<std::uint64_t>().swap(hash);
+    // the remaining CSR (template rows empty)
+    std::vector<int> rowptr(rows+1,0);
+    for (int i = 0; i < rows; ++i)
+      rowptr[i+1] = rowptr[i]+(id[i] >= 0 ? 0 : a.rowptr[i+1]-a.rowptr[i]);
+    const std::size_t kept = rowptr[rows];
+    std::vector<int> kept_columns(kept);
+    std::vector<Real> kept_values(kept);
+    ParallelChunks(workers,chunks,[&](int c) {
+      for (int i = static_cast<int>(std::int64_t(rows)*c/chunks);
+           i < static_cast<int>(std::int64_t(rows)*(c+1)/chunks); ++i) {
+        if (id[i] >= 0) continue;
+        std::copy(columns.begin()+a.rowptr[i],columns.begin()+a.rowptr[i+1],
+                  kept_columns.begin()+rowptr[i]);
+        std::copy(a.values.begin()+a.rowptr[i],a.values.begin()+a.rowptr[i+1],
+                  kept_values.begin()+rowptr[i]);
+      }
+    });
+    op.template_nnz = a.values.size()-kept;
+    op.template_rows = 0;
+    for (int i = 0; i < rows; ++i) op.template_rows += id[i] >= 0;
+    SetupLap lap(SetupTimes().upload);
+    op.templates = true;
+    op.rowptr = DeviceCopy(rowptr,"gravity_csr_rows");
+    op.colidx = DeviceCopy(kept_columns,"gravity_csr_columns");
+    op.values = DeviceCopy(kept_values,"gravity_csr_values");
+    op.tmpl_id = DeviceCopy(id,"gravity_template_ids");
+    op.tmpl_ptr = DeviceCopy(tptr,"gravity_template_rows");
+    op.tmpl_off = DeviceCopy(toff,"gravity_template_offsets");
+    op.tmpl_val = DeviceCopy(tval,"gravity_template_values");
+    if (SgTemplateCheck()) CheckTemplates(op,a,columns);
+  }
+
+  // ATHENA_SG_TEMPLATE_CHECK=1 (collective): the product of op and of its full CSR (uploaded
+  // for the check only) for a pseudo-random input; counts the rows whose results differ in any bit
+  void CheckTemplates(Operator &op, const LocalCsr &a, const std::vector<int> &columns) {
+    Operator full = op;
+    full.templates = false;
+    full.rowptr = DeviceCopy(a.rowptr,"gravity_check_rows");
+    full.colidx = DeviceCopy(columns,"gravity_check_columns");
+    full.values = DeviceCopy(a.values,"gravity_check_values");
+    Vector x("gravity_check_x",op.inputs), y0("gravity_check_y0",op.rows),
+        y1("gravity_check_y1",op.rows);
+    const GlobalIndex offset = op.input_partition[rank];
+    Kokkos::parallel_for("gravity_check_input",Kokkos::RangePolicy<DevExeSpace>(0,op.inputs),
+                         KOKKOS_LAMBDA(int j) {
+      std::uint64_t z = static_cast<std::uint64_t>(offset+j)*0x9e3779b97f4a7c15ull+12345;
+      z = (z ^ (z >> 30))*0xbf58476d1ce4e5b9ull; z = (z ^ (z >> 27))*0x94d049bb133111ebull;
+      z ^= z >> 31;
+      x(j) = (static_cast<Real>(z >> 11)*0x1.0p-53-0.5)*(1+static_cast<Real>(j%7));
+    });
+    Multiply(full,x,y0);
+    Multiply(op,x,y1);
+    std::uint64_t differ = 0;
+    Kokkos::parallel_reduce("gravity_check_compare",Kokkos::RangePolicy<DevExeSpace>(0,op.rows),
+                            KOKKOS_LAMBDA(int i, std::uint64_t &n) {
+      const Real u = y0(i), v = y1(i);
+      if (u != v || Kokkos::signbit(u) != Kokkos::signbit(v)) ++n;
+    },differ);
+    std::uint64_t counts[3] = {differ,op.template_rows,static_cast<std::uint64_t>(op.rows)};
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE,counts,3,MPI_UINT64_T,MPI_SUM,comm);
+#endif
+    if (rank == 0) {
+      std::cout << "# SG_TEMPLATE_CHECK rows=" << counts[2] << " template_rows=" << counts[1]
+                << " differing_rows=" << counts[0] << std::endl;
+    }
+    Require(counts[0] == 0,"template rows do not reproduce their CSR rows bitwise");
   }
 
   void ConfigurePhase(Operator &op, const std::vector<int> &rows) {
@@ -1185,7 +1385,7 @@ struct SparseMultigrid::Impl {
     }
     return given;
   }
-  // known (xnode): {any rank invalid, any rank's ghost list changed} of this operator, already
+  // known: {any rank invalid, any rank's ghost list changed} of this operator, already
   // reduced over all ranks by the caller (one collective for many operators); nullptr: the two
   // collectives here
   bool UpdatePhase(Operator &op, const CsrRowUpdate &a, bool smoothing_diagonal = false,
@@ -1238,7 +1438,7 @@ struct SparseMultigrid::Impl {
     lap(times.ghosts);
     // No MPI occurs below this point: CSR/value uploads are local decisions.
     if (same) {
-      // a kept pinned buffer instead of a fresh zero-initialised mirror per update (22
+      // a kept pinned buffer instead of a fresh zero-initialized mirror per update (22
       // operators per phase update: allocation, memset and a pageable copy each)
       const size_t nv = op.phase_values.extent(0);
       Kokkos::View<Real*, Kokkos::SharedHostPinnedSpace> host;
@@ -1258,7 +1458,7 @@ struct SparseMultigrid::Impl {
       } else {
         StageCopy(host.data(),values.data(),nc);   // the same bytes, several threads
       }
-      for (size_t k = nc; k < nv; ++k) host(k) = 0;   // (as the zero-initialised mirror did)
+      for (size_t k = nc; k < nv; ++k) host(k) = 0;   // (as the zero-initialized mirror did)
       // queued on the device stream; the caller fences once per update before the host
       // writes the pinned buffer again (UpdateHierarchyPhaseRows, DistributedOperator)
       if (PhaseAllocOld()) Kokkos::deep_copy(op.phase_values,host);
@@ -1475,7 +1675,7 @@ struct SparseMultigrid::Impl {
         level.r = Build(h.restriction[l],levels[l+1].partition,part);
       }
     }
-    // ATHENA_SG_LEVEL_STATS=1 (xnode diagnostics): rows, nonzeros, longest row and halo of
+    // ATHENA_SG_LEVEL_STATS=1 (diagnostics): rows, nonzeros, longest row and halo of
     // every local operator of the hierarchy, one line per rank and level
     if (const char *e = std::getenv("ATHENA_SG_LEVEL_STATS"); e != nullptr && e[0] == '1') {
       auto stat = [](const LocalCsr &m, const Operator &op) {
@@ -1844,10 +2044,40 @@ struct SparseMultigrid::Impl {
     auto pav = op.phase_values;
     const bool phase_active = op.phase_active;
     const int ni = op.inputs;
+    if (op.templates) {
+      // (memory option 8) the loop below plus the template rows: a template row is the
+      // same multiply-adds in the same order as its former CSR row (owned inputs only)
+      auto tid = op.tmpl_id;
+      auto tptr = op.tmpl_ptr;
+      auto toff = op.tmpl_off;
+      auto tval = op.tmpl_val;
+      Kokkos::parallel_for("gravity_sparse_matvec_templates",
+                           Kokkos::RangePolicy<DevExeSpace>(0, op.rows), KOKKOS_LAMBDA(int i) {
+        Real sum = 0;
+        const int selected = phase_active ? phase_map(i) : -1;
+        const int t = selected >= 0 ? -1 : static_cast<int>(tid(i));
+        if (selected >= 0) {
+          for (int k = prp(selected); k < prp(selected+1); ++k) {
+            const int j = pci(k);
+            sum += pav(k)*(j < ni ? x(j) : ghosts(j-ni));
+          }
+        } else if (t >= 0) {
+          for (int k = tptr(t); k < tptr(t+1); ++k) sum += tval(k)*x(i+toff(k));
+        } else {
+          for (int k = rp(i); k < rp(i+1); ++k) {
+            const int j = ci(k);
+            sum += av(k)*(j < ni ? x(j) : ghosts(j-ni));
+          }
+        }
+        y(i) = sum;
+      });
+      ++matrix_applications;
+      return;
+    }
     const int row_teams = SpmvRowTeams();
     if (row_teams > 0 && op.rows > 0
         && static_cast<std::int64_t>(op.colidx.extent(0)) >= static_cast<std::int64_t>(row_teams)*op.rows) {
-      // one team per row (xnode; see SpmvRowTeams): the vector lanes load
+      // one team per row (see SpmvRowTeams): the vector lanes load
       // a chunk of the row's values and inputs into team scratch at once, then one lane adds
       // them up in the row order -- the same multiply-adds in the same order as the loop
       // below, so a long row costs a few memory latencies instead of one per entry
@@ -2023,7 +2253,7 @@ struct SparseMultigrid::Impl {
   }
 
   void Cycle(int index) {
-    // xnode profiling: a region per level (nested; no-op without a Kokkos tool)
+    // profiling: a region per level (nested; no-op without a Kokkos tool)
     Kokkos::Profiling::pushRegion("MG:L" + std::to_string(index));
     auto &l = levels[index];
     Project(l.b, l.partition.back());
@@ -2133,8 +2363,10 @@ struct SparseMultigrid::Impl {
       krylov_x = Vector("gravity_krylov_solution", n);
       krylov_v.clear();
       krylov_z.clear();
-      for (int j = 0; j <= m; ++j) krylov_v.emplace_back("gravity_arnoldi", n);
-      for (int j = 0; j < m; ++j) krylov_z.emplace_back("gravity_flexible_basis", n);
+      if (!KrylovLazy()) {
+        for (int j = 0; j <= m; ++j) krylov_v.emplace_back("gravity_arnoldi", n);
+        for (int j = 0; j < m; ++j) krylov_z.emplace_back("gravity_flexible_basis", n);
+      }
       krylov_h.resize((m+1)*m);
       krylov_cosine.resize(m);
       krylov_sine.resize(m);
@@ -2145,6 +2377,13 @@ struct SparseMultigrid::Impl {
     auto b = krylov_b, r = krylov_r, w = krylov_w, x = krylov_x;
     auto &v = krylov_v;
     auto &z = krylov_z;
+    // (KrylovLazy) the basis vectors up to index j, allocated as fresh (zeroed) vectors
+    auto need_v = [&](int j) {
+      while (static_cast<int>(v.size()) <= j) v.emplace_back("gravity_arnoldi", n);
+    };
+    auto need_z = [&](int j) {
+      while (static_cast<int>(z.size()) <= j) z.emplace_back("gravity_flexible_basis", n);
+    };
     auto &h = krylov_h;
     auto &cosine = krylov_cosine;
     auto &sine = krylov_sine;
@@ -2171,7 +2410,7 @@ struct SparseMultigrid::Impl {
     Project(x, global_n);
     const Real norm_b = Norm(b);
     // Zero is an exact gauge-fixed solution of the homogeneous system. Taking
-    // it directly avoids spending iterations cancelling an enormous warm guess
+    // it directly avoids spending iterations canceling an enormous warm guess
     // down to the absolute tolerance used for a zero projected RHS.
     if (norm_b == 0) Kokkos::deep_copy(x,Real(0));
     // Compare dimensionless ratios rather than tolerance*||b||, which could
@@ -2187,11 +2426,13 @@ struct SparseMultigrid::Impl {
       std::fill(h.begin(), h.end(), Real(0));
       std::fill(g.begin(), g.end(), Real(0));
       g[0] = beta;
+      need_v(0);
       if (MgSyncCopies()) Kokkos::deep_copy(v[0], r);
       else Kokkos::deep_copy(DevExeSpace(), v[0], r);
       Scale(1/beta, v[0]);
       int used = 0;
       for (int j = 0; j < m && stats.iterations < max_iterations; ++j) {
+        need_z(j);
         Precondition(v[j], z[j]);
         Kokkos::Profiling::pushRegion("MG:krylov");
         Multiply(current_a,z[j],w);
@@ -2208,6 +2449,7 @@ struct SparseMultigrid::Impl {
         Kokkos::Profiling::popRegion();
         h[(j+1)*m+j] = next;
         if (next > 0) {
+          need_v(j+1);
           if (MgSyncCopies()) Kokkos::deep_copy(v[j+1], w);
           else Kokkos::deep_copy(DevExeSpace(), v[j+1], w);
           Scale(1/next, v[j+1]);
@@ -2246,7 +2488,7 @@ struct SparseMultigrid::Impl {
       CurrentResidual(b,x,r);
       beta = Norm(r);
       // A huge true/Arnoldi gap signals an unusable flexible basis, e.g. a
-      // near-singular coarse solve producing 1e15-size cancelling updates.
+      // near-singular coarse solve producing 1e15-size canceling updates.
       // Include the requested target in the comparison so normal residual
       // replacement near the roundoff floor is not mistaken for breakdown.
       if (relative(beta)/1000 > std::max(relative(std::abs(g[used])),tolerance)) {
@@ -2462,11 +2704,13 @@ struct DistributedOperator::Impl {
   }
 #if MPI_PARALLEL_ENABLED
   Impl(const LocalCsr &a, const std::vector<GlobalIndex> &rows,
-       const std::vector<GlobalIndex> &cols, MPI_Comm comm)
+       const std::vector<GlobalIndex> &cols, MPI_Comm comm,
+       const std::vector<int> *template_exclude = nullptr)
       : backend(new SparseMultigrid::Impl(comm)) {
 #else
   Impl(const LocalCsr &a, const std::vector<GlobalIndex> &rows,
-       const std::vector<GlobalIndex> &cols) : backend(new SparseMultigrid::Impl()) {
+       const std::vector<GlobalIndex> &cols, const std::vector<int> *template_exclude = nullptr)
+      : backend(new SparseMultigrid::Impl()) {
 #endif
     const std::vector<std::vector<GlobalIndex>> supplied{rows,cols};
     std::vector<GlobalIndex> row_partition, col_partition;
@@ -2476,7 +2720,7 @@ struct DistributedOperator::Impl {
       col_partition = backend->Partition(supplied,1,a.global_cols);
     }
     backend->CheckLocal(a,row_partition,col_partition);
-    op = backend->Build(a,row_partition,col_partition);
+    op = backend->Build(a,row_partition,col_partition,template_exclude);
   }
 };
 // (after DistributedOperator::Impl: it plans the extra operators too)
@@ -2520,7 +2764,7 @@ void SparseMultigrid::UpdateHierarchyPhaseRows(const std::vector<CsrRowUpdate> &
   if (a_plans && a_plans->size() != a.size()) a_plans = nullptr;
   if (p_plans && p_plans->size() != p.size()) p_plans = nullptr;
   const bool terminal_full_update = a.size() == 1 && impl_->fine_diagonal_dirty;
-  // ATHENA_SG_LEVEL_STATS=1 (xnode diagnostics): the phase rows of the first update
+  // ATHENA_SG_LEVEL_STATS=1 (diagnostics): the phase rows of the first update
   static bool stats_done = false;
   if (const char *e = std::getenv("ATHENA_SG_LEVEL_STATS"); !stats_done && e != nullptr && e[0] == '1') {
     stats_done = true;
@@ -2536,7 +2780,7 @@ void SparseMultigrid::UpdateHierarchyPhaseRows(const std::vector<CsrRowUpdate> &
       std::cout << '\n';
     }
   }
-  // xnode: the plans of all operators first (host only), then ONE collective for the validity
+  // the plans of all operators first (host only), then ONE collective for the validity
   // and ghost-change flags of all of them instead of two per operator; the updates below
   // run in the former order with the same plans (results identical).
   // ATHENA_SG_PHASE_COLLECTIVES=1: the former two collectives per operator (A/B timing).
@@ -2647,6 +2891,10 @@ DistributedOperator::DistributedOperator(const HostCsr &a, const std::vector<int
 DistributedOperator::DistributedOperator(const LocalCsr &a,
     const std::vector<GlobalIndex> &rows, const std::vector<GlobalIndex> &cols, MPI_Comm comm)
     : impl_(new Impl(a,rows,cols,comm)) {}
+DistributedOperator::DistributedOperator(const LocalCsr &a,
+    const std::vector<GlobalIndex> &rows, const std::vector<GlobalIndex> &cols,
+    const std::vector<int> &template_exclude, MPI_Comm comm)
+    : impl_(new Impl(a,rows,cols,comm,&template_exclude)) {}
 #else
 DistributedOperator::DistributedOperator(const HostCsr &a, const std::vector<int> &rows,
                                          const std::vector<int> &cols)
@@ -2654,7 +2902,14 @@ DistributedOperator::DistributedOperator(const HostCsr &a, const std::vector<int
 DistributedOperator::DistributedOperator(const LocalCsr &a,
     const std::vector<GlobalIndex> &rows, const std::vector<GlobalIndex> &cols)
     : impl_(new Impl(a,rows,cols)) {}
+DistributedOperator::DistributedOperator(const LocalCsr &a,
+    const std::vector<GlobalIndex> &rows, const std::vector<GlobalIndex> &cols,
+    const std::vector<int> &template_exclude)
+    : impl_(new Impl(a,rows,cols,&template_exclude)) {}
 #endif
+std::array<std::uint64_t,2> DistributedOperator::TemplateCounts() const {
+  return {impl_->op.template_rows,impl_->op.template_nnz};
+}
 DistributedOperator::~DistributedOperator() = default;
 StorageStats DistributedOperator::Storage() const {
   StorageStats s;

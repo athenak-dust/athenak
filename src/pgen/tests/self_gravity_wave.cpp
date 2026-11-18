@@ -37,6 +37,9 @@ struct WaveData {
   Real refine_start, refine_end, band_lo, band_hi;
   Real band2_lo, band2_hi, band3_lo, band3_hi;
   bool jeans, shear, topology, slab, slab_evolve, scheduled_amr;
+  bool spitzer;
+  Real zs, zc, cs2;   // spitzer: z0 = cs/sqrt(2 pi G rho0), the slab center, cs^2
+  bool reflect;       // spitzer: <problem>/test_spitzer_reflect (ghost vz mirrored, no mass flux)
 };
 WaveData wave;
 
@@ -201,6 +204,207 @@ void ShearDiagnostics(Mesh *pm) {
   std::cout << "}\n";
 }
 
+// mode = spitzer: the isothermal self-gravitating slab rho0 sech^2((z - zc)/z0),
+// z0 = cs/sqrt(2 pi G rho0), at rest, isolated in z (Spitzer 1942); its cell averages
+KOKKOS_INLINE_FUNCTION
+Real SpitzerAverage(const WaveData &sv, const Real zlo, const Real zhi) {
+  return sv.rho0*sv.zs*(tanh((zhi - sv.zc)/sv.zs) - tanh((zlo - sv.zc)/sv.zs))/(zhi - zlo);
+}
+
+void SpitzerInitialize(Mesh *pm) {
+  auto *pack = pm->pmb_pack;
+  const auto ind = pm->mb_indcs;
+  const auto sv = wave;
+  auto u = pack->phydro->u0;
+  auto size = pack->pmb->mb_size.d_view;
+  par_for("sg_spitzer_initial", DevExeSpace(), 0, pack->nmb_thispack-1,
+          ind.ks,ind.ke,ind.js,ind.je,ind.is,ind.ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const auto s = size(m);
+    const Real zlo = s.x3min+(k-ind.ks)*s.dx3;
+    u(m,IDN,k,j,i) = SpitzerAverage(sv,zlo,zlo+s.dx3);
+    u(m,IM1,k,j,i) = 0; u(m,IM2,k,j,i) = 0; u(m,IM3,k,j,i) = 0;
+  });
+}
+
+// ix3_bc / ox3_bc = user: the ghost density hydrostatic in the self-gravity field of the
+// boundary cell, cs^2 dln(rho)/dz = g_b - 4 pi G rho_b (z - z_b) (dust_si_strat's li2018 rule
+// velocity copied unless it flows into the box (then 0; test_spitzer_reflect: mirrored); before a
+// field of the current mesh exists,
+// the analytic profile.  Coarse arrays: g_b the mean of the 2x2x2 fine boundary cells.
+void SpitzerBCsApply(Mesh *pm, const bool coarse) {
+  auto *pack = pm->pmb_pack;
+  const auto ind = pm->mb_indcs;
+  const auto sv = wave;
+  const int ng = ind.ng;
+  const int nx1 = coarse ? ind.cnx1 : ind.nx1, nx2 = coarse ? ind.cnx2 : ind.nx2;
+  const int nx3 = coarse ? ind.cnx3 : ind.nx3;
+  const int n1 = nx1+2*ng, n2 = nx2+2*ng;
+  const int ks = coarse ? ind.cks : ind.ks, ke = coarse ? ind.cke : ind.ke;
+  const int ais = coarse ? ind.cis : ind.is, aie = coarse ? ind.cie : ind.ie;
+  const int ajs = coarse ? ind.cjs : ind.js, aje = coarse ? ind.cje : ind.je;
+  const int fis = ind.is, fjs = ind.js, fks = ind.ks, fke = ind.ke;
+  auto &mb_bcs = pack->pmb->mb_bcs;
+  auto &size = pack->pmb->mb_size;
+  auto u = coarse ? pack->phydro->coarse_u0 : pack->phydro->u0;
+  auto *pg = pack->pgrav;
+  const bool sg = pg != nullptr && pg->FieldCurrent();
+  DvceArray5D<Real> acc;
+  if (sg) acc = pg->acceleration;
+  const Real tpg = sg ? 0.5*pg->four_pi_G : 0.0;
+  par_for("sg_spitzer_bc", DevExeSpace(), 0, pack->nmb_thispack-1, 0, n2-1, 0, n1-1,
+  KOKKOS_LAMBDA(int m, int j, int i) {
+    const Real zmin = size.d_view(m).x3min, dz = (size.d_view(m).x3max-zmin)/nx3;
+    Real gl = 0, gu = 0;
+    if (sg) {
+      const int ic = (i < ais) ? ais : ((i > aie) ? aie : i);
+      const int jc = (j < ajs) ? ajs : ((j > aje) ? aje : j);
+      if (coarse) {
+        const int fi = fis+2*(ic-ais), fj = fjs+2*(jc-ajs);
+        for (int dk=0; dk<2; ++dk) for (int dj=0; dj<2; ++dj) for (int di=0; di<2; ++di) {
+          gl += acc(m,2,fks+dk,fj+dj,fi+di);
+          gu += acc(m,2,fke-dk,fj+dj,fi+di);
+        }
+        gl *= Real(.125); gu *= Real(.125);
+      } else {
+        gl = acc(m,2,fks,jc,ic); gu = acc(m,2,fke,jc,ic);
+      }
+    }
+    for (int side=0; side<2; ++side) {
+      const auto face = side == 0 ? BoundaryFace::inner_x3 : BoundaryFace::outer_x3;
+      if (mb_bcs.d_view(m,face) != BoundaryFlag::user) continue;
+      const int kb = side == 0 ? ks : ke;
+      const Real zb = zmin+(kb-ks+Real(.5))*dz;
+      const Real d = u(m,IDN,kb,j,i);
+      const Real v1 = u(m,IM1,kb,j,i)/d, v2 = u(m,IM2,kb,j,i)/d, v3 = u(m,IM3,kb,j,i)/d;
+      const bool in = side == 0 ? v3 >= 0 : v3 <= 0;
+      const Real gb = side == 0 ? gl : gu;
+      for (int g=0; g<ng; ++g) {
+        const int kg = side == 0 ? ks-1-g : ke+1+g;
+        const Real z = zmin+(kg-ks+Real(.5))*dz, dzb = z-zb;
+        Real rho;
+        if (sg) {
+          rho = d*exp((gb*dzb-tpg*d*dzb*dzb)/sv.cs2);
+        } else {
+          const Real cb = cosh((zb-sv.zc)/sv.zs), cg = cosh((z-sv.zc)/sv.zs);
+          rho = d*SQR(cb/cg);
+        }
+        u(m,IDN,kg,j,i) = rho;
+        u(m,IM1,kg,j,i) = rho*v1;
+        u(m,IM2,kg,j,i) = rho*v2;
+        if (sv.reflect) {   // the mirror cell, vz reversed
+          const int km = side == 0 ? ks+g : ke-g;
+          u(m,IM3,kg,j,i) = -rho*u(m,IM3,km,j,i)/u(m,IDN,km,j,i);
+        } else {
+          u(m,IM3,kg,j,i) = in ? Real(0) : rho*v3;
+        }
+      }
+    }
+  });
+}
+void SpitzerBCs(Mesh *pm) {SpitzerBCsApply(pm,false);}
+void SpitzerBCsCoarse(Mesh *pm) {SpitzerBCsApply(pm,true);}
+
+KOKKOS_INLINE_FUNCTION bool ExteriorX3(const BoundaryFlag f) {
+  return f == BoundaryFlag::user || f == BoundaryFlag::outflow || f == BoundaryFlag::diode;
+}
+
+// the history of mode = spitzer (sums of this rank; the history sums the ranks): mass,
+// sum V (rho - rho_ex)^2, sum V rho_ex^2, sum V |rho - rho_ex|, sum 1/2 rho vz^2 V, sum 1/2 rho v^2 V,
+// sum mz V, the outward mass flux rho vz A at the boundary cells of the x3 faces (top, bottom), volume,
+// and sum V rho of g_h^2, g_z^2, (g_z - g_ex)^2 of the self-gravity field
+void SpitzerHistory(HistoryData *data, Mesh *pm) {
+  auto *pack = pm->pmb_pack;
+  const auto ind = pm->mb_indcs;
+  const auto sv = wave;
+  auto u = pack->phydro->u0;
+  auto size = pack->pmb->mb_size.d_view;
+  auto &mb_bcs = pack->pmb->mb_bcs;
+  const int nc = ind.nx1*ind.nx2*ind.nx3, n = pack->nmb_thispack*nc;
+  const int is = ind.is, js = ind.js, ks = ind.ks, ke = ind.ke;
+  // the self-gravity field of the last solve (when it belongs to this mesh): mass-weighted
+  // horizontal g^2, g_z^2 and (g_z - g_ex)^2, g_ex = -(2 cs^2/z0) tanh((z - zc)/z0)
+  const bool field = pack->pgrav != nullptr && pack->pgrav->FieldCurrent();
+  DvceArray5D<Real> acc;
+  if (field) acc = pack->pgrav->acceleration;
+  array_sum::GlobalSum r;
+  Kokkos::parallel_reduce("sg_spitzer_hist",Kokkos::RangePolicy<DevExeSpace>(0,n),
+  KOKKOS_LAMBDA(int q, array_sum::GlobalSum &sum) {
+    const int m = q/nc;
+    int t = q%nc;
+    const int i = t%ind.nx1+is; t /= ind.nx1;
+    const int j = t%ind.nx2+js; t /= ind.nx2;
+    const int k = t+ks;
+    const auto s = size(m);
+    const Real vol = s.dx1*s.dx2*s.dx3;
+    const Real zlo = s.x3min+(k-ks)*s.dx3;
+    const Real ex = SpitzerAverage(sv,zlo,zlo+s.dx3);
+    const Real d = u(m,IDN,k,j,i);
+    const Real m1 = u(m,IM1,k,j,i), m2 = u(m,IM2,k,j,i), m3 = u(m,IM3,k,j,i);
+    sum.the_array[0] += vol*d;
+    sum.the_array[1] += vol*SQR(d-ex);
+    sum.the_array[2] += vol*ex*ex;
+    sum.the_array[3] += vol*fabs(d-ex);
+    sum.the_array[4] += vol*Real(.5)*m3*m3/d;
+    sum.the_array[5] += vol*Real(.5)*(m1*m1+m2*m2+m3*m3)/d;
+    sum.the_array[6] += vol*m3;
+    if (k == ke && ExteriorX3(mb_bcs.d_view(m,BoundaryFace::outer_x3)))
+      sum.the_array[7] += s.dx1*s.dx2*m3;
+    if (k == ks && ExteriorX3(mb_bcs.d_view(m,BoundaryFace::inner_x3)))
+      sum.the_array[8] -= s.dx1*s.dx2*m3;
+    sum.the_array[9] += vol;
+    if (field) {
+      const Real z = zlo+Real(.5)*s.dx3;
+      const Real gex = -2*sv.cs2/sv.zs*tanh((z-sv.zc)/sv.zs);
+      sum.the_array[10] += vol*d*(SQR(acc(m,0,k,j,i))+SQR(acc(m,1,k,j,i)));
+      sum.the_array[11] += vol*d*SQR(acc(m,2,k,j,i));
+      sum.the_array[12] += vol*d*SQR(acc(m,2,k,j,i)-gex);
+    }
+  }, Kokkos::Sum<array_sum::GlobalSum>(r));
+  const char *labels[] = {"mass","drho2","rhoex2","drho1","ekz","ek","mom3",
+                          "fz_top","fz_bot","volume","rho_gh2","rho_gz2","rho_dgz2"};
+  data->nhist = 13;
+  for (int q=0; q<13; ++q) {data->label[q] = labels[q]; data->hdata[q] = r.the_array[q];}
+}
+
+// final diagnostics of mode = spitzer: max |rho/rho_ex - 1|, max |vz|/cs, rms
+void SpitzerDiagnostics(Mesh *pm) {
+  auto *pack = pm->pmb_pack;
+  auto u = Kokkos::create_mirror_view_and_copy(HostMemSpace(),pack->phydro->u0);
+  const auto ind = pm->mb_indcs;
+  Real dmax = 0, vmax = 0, sums[3] = {};
+  for (int m=0; m<pack->nmb_thispack; ++m) {
+    const auto s = pack->pmb->mb_size.h_view(m);
+    const Real vol = s.dx1*s.dx2*s.dx3;
+    for (int k=ind.ks; k<=ind.ke; ++k) for (int j=ind.js; j<=ind.je; ++j)
+      for (int i=ind.is; i<=ind.ie; ++i) {
+        const Real zlo = s.x3min+(k-ind.ks)*s.dx3;
+        const Real ex = SpitzerAverage(wave,zlo,zlo+s.dx3), d = u(m,IDN,k,j,i);
+        dmax = std::max(dmax,std::abs(d/ex-1));
+        vmax = std::max(vmax,std::abs(u(m,IM3,k,j,i)/d));
+        sums[0] += vol*SQR(d-ex); sums[1] += vol*ex*ex; sums[2] += vol*d;
+      }
+  }
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE,&dmax,1,MPI_ATHENA_REAL,MPI_MAX,MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE,&vmax,1,MPI_ATHENA_REAL,MPI_MAX,MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE,sums,3,MPI_ATHENA_REAL,MPI_SUM,MPI_COMM_WORLD);
+#endif
+  if (global_variable::my_rank != 0) return;
+  std::cout << std::setprecision(16) << "# SELF_GRAVITY_WAVE {\"mode\":\"spitzer\",\"time\":"
+            << pm->time << ",\"cycle\":" << pm->ncycle << ",\"blocks\":" << pm->nmb_total
+            << ",\"z0\":" << wave.zs << ",\"rel_density_linf\":" << dmax
+            << ",\"rel_density_l2\":" << std::sqrt(sums[0]/sums[1])
+            << ",\"vz_linf_over_cs\":" << vmax/std::sqrt(wave.cs2) << ",\"mass\":" << sums[2];
+  if (const auto *gravity = pack->pgrav) {
+    std::cout << ",\"iterations\":" << gravity->last_solve.iterations
+              << ",\"residual\":" << gravity->last_solve.relative_residual
+              << ",\"solves\":" << gravity->solve_count << ",\"rebuilds\":" << gravity->rebuild_count
+              << ",\"kdk_reuse_hits\":" << gravity->cache_hit_count;
+  }
+  std::cout << "}\n";
+}
+
 // A physical, non-resetting slab control. Mean/momentum/positivity are meaningful
 // after hydro/AMR evolution; the initial sinusoid is not an evolved exact solution.
 void SlabEvolutionDiagnostics(Mesh *pm) {
@@ -260,6 +464,7 @@ void SlabEvolutionDiagnostics(Mesh *pm) {
 void WaveErrors(ParameterInput *, Mesh *pm) {
   auto *pack=pm->pmb_pack;
   if (wave.shear) {ShearDiagnostics(pm); return;}
+  if (wave.spitzer) {SpitzerDiagnostics(pm); return;}
   if (wave.slab_evolve) {SlabEvolutionDiagnostics(pm); return;}
   if (wave.topology) InitializeKnownWave(pm,pm->time);
   pack->pgrav->Solve(pm->time);
@@ -423,6 +628,52 @@ void ProblemGenerator::SelfGravityWave(ParameterInput *pin, const bool restart) 
   wave.jeans=mode=="jeans"; wave.topology=mode=="topology";
   wave.slab_evolve=mode=="slab_evolve";
   wave.slab=mode=="slab" || wave.slab_evolve; wave.shear=mode=="shear";
+  wave.spitzer=mode=="spitzer";
+  if (wave.spitzer) {
+    // the isothermal self-gravitating slab in equilibrium (no rotation), isolated z gravity;
+    // hydro x3 faces user (hydrostatic ghosts, SpitzerBCs) or outflow; optional scheduled AMR band
+    if (pack->pgrav==nullptr || !pm->three_d || pack->phydro->peos->eos_data.is_ideal ||
+        pack->phydro->psbox_u!=nullptr ||
+        pin->GetOrAddString("gravity","vertical_bc","periodic")!="isolated" ||
+        pin->GetString("time","evolution")!="dynamic") {
+      WaveFail("spitzer mode requires 3D isothermal hydro without rotation, dynamic evolution, "
+               "and gravity with vertical_bc=isolated");
+    }
+    wave.rho0=pin->GetOrAddReal("problem","rho0",1);
+    wave.fourpig=pack->pgrav->four_pi_G;
+    wave.cs2=SQR(pack->phydro->peos->eos_data.iso_cs);
+    // hidden test key (only looked up): reflecting ghost vz instead of the li2018 outflow rule
+    wave.reflect=pin->DoesParameterExist("problem","test_spitzer_reflect") &&
+                 pin->GetBoolean("problem","test_spitzer_reflect");
+    wave.zs=std::sqrt(2*wave.cs2/(wave.fourpig*wave.rho0));   // cs/sqrt(2 pi G rho0)
+    wave.zc=Real(.5)*(pm->mesh_size.x3min+pm->mesh_size.x3max);
+    wave.x0=pm->mesh_size.x1min; wave.y0=pm->mesh_size.x2min; wave.z0=pm->mesh_size.x3min;
+    wave.kx=wave.ky=wave.kz=wave.qomega=wave.frequency=wave.growth=wave.amp=0;
+    wave.scheduled_amr=pin->GetOrAddBoolean("problem","scheduled_amr",false);
+    wave.refine_start=pin->GetOrAddReal("problem","refine_start",Real(.02));
+    wave.refine_end=pin->GetOrAddReal("problem","refine_end",Real(.06));
+    wave.band_lo=pin->GetOrAddReal("problem","refine_x1min",pm->mesh_size.x1min);
+    wave.band_hi=pin->GetOrAddReal("problem","refine_x1max",pm->mesh_size.x1max);
+    wave.band2_lo=pin->GetOrAddReal("problem","refine_x2min",pm->mesh_size.x2min);
+    wave.band2_hi=pin->GetOrAddReal("problem","refine_x2max",pm->mesh_size.x2max);
+    wave.band3_lo=pin->GetOrAddReal("problem","refine_x3min",wave.zc-wave.zs);
+    wave.band3_hi=pin->GetOrAddReal("problem","refine_x3max",wave.zc+wave.zs);
+    pgen_final_func=WaveErrors;
+    user_hist_func=SpitzerHistory;
+    if (user_bcs) {user_bcs_func=SpitzerBCs; user_bcs_coarse_func=SpitzerBCsCoarse;}
+    if (wave.scheduled_amr) {
+      if (!pm->adaptive) WaveFail("refinement schedule requires adaptive mesh");
+      user_ref_func=WaveRefinement;
+    }
+    if (global_variable::my_rank==0) {
+      std::cout << std::setprecision(10) << "# spitzer slab: rho0 = " << wave.rho0 << ", z0 = "
+                << wave.zs << ", center " << wave.zc << ", box half height "
+                << Real(.5)*(pm->mesh_size.x3max-pm->mesh_size.x3min) << " = "
+                << Real(.5)*(pm->mesh_size.x3max-pm->mesh_size.x3min)/wave.zs << " z0\n";
+    }
+    if (!restart) SpitzerInitialize(pm);
+    return;
+  }
   if (pack->pgrav==nullptr && !wave.shear && !wave.slab_evolve) {
     WaveFail("analytic/static gravity controls require gravity/enabled=true");
   }

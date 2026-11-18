@@ -14,10 +14,11 @@
 //! K0-ng .. K0+nz+ng-1 (periodic), with joff + eps the shear shift in Lr cells.  Every opposite
 //! block that overlaps this rectangle sends its part converted to Lr: copied (same level),
 //! averaged over 2^d cells per direction (finer by d), or prolongated with limited slopes
-//! (coarser; slopes from its own cells and ghosts: in x at the face column from the x1 ghosts
-//! of the last exchange, none right after a regrid; in y / z one-sided at an edge row whose
-//! ghosts come from a coarser neighbour, prolongated only after this exchange, and capped at
-//! the cell value for non-negative variables).  The
+//! (coarser; slopes from its own cells and ghosts: in x at the face column from its x1 ghosts,
+//! which are collected in an earlier round of the same exchange (the rounds go from the
+//! coarsest face blocks to the finest, see shearing_box.hpp); in y / z one-sided at an edge
+//! row whose ghosts come from a coarser neighbor, prolongated only after this exchange, and
+//! capped at the cell value for non-negative variables).  The
 //! receiver remaps the rows by eps as the two-step exchange
 //! does (DC/PLM/PPMX_RemapFlx) and writes all its x1 ghost cells.  The pieces are planned
 //! every stage from the global block list (all ranks derive the same list); one MPI message
@@ -48,7 +49,7 @@ namespace {
 long long FloorDiv(long long a, long long d) {
   return (a >= 0) ? (a/d) : -((-a + d - 1)/d);
 }
-// a neighbour of block m on the face whose four slots start at s0 (NeighborIndex layout) is
+// a neighbor of block m on the face whose four slots start at s0 (NeighborIndex layout) is
 // coarser than m
 KOKKOS_INLINE_FUNCTION
 bool CoarserFace(const DualArray2D<NeighborBlock> &nb, const DualArray1D<int> &lev,
@@ -82,6 +83,25 @@ void ShearingBox::PlanPull() {
   const Real ly = pm->mesh_size.x2max - pm->mesh_size.x2min;
   auto nxl = [pm, root](int l) {return pm->nmb_rootx1 << (l - root);};
   const bool zper = (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic);
+  // rounds: the levels of the blocks on the x1 faces (global list: the same on every rank)
+  int lmin = 1 << 30, lmax = -1;
+  for (int g=0; g<pm->nmb_total; ++g) {
+    const auto &ll = pm->lloc_eachmb[g];
+    if (ll.lx1 == 0 || ll.lx1 == nxl(ll.level) - 1) {
+      lmin = std::min(lmin, ll.level); lmax = std::max(lmax, ll.level);
+    }
+  }
+  const bool rounds = !pull_lagged_xslope && lmax > lmin;
+  pull_nround_ = rounds ? (lmax - lmin + 1) : 1;
+  pull_round_ = 0;
+  pull_done_ = false;
+  if (rounds) ++n_pull_multi;
+  bool edge = false;
+  if (pull_nround_ > 64) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "shearing box (x1-face levels): more than 64 levels on the faces" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   // a receiver: the x1 ghosts of a face block (type 0) or of its coarse array
   // (type 1); the same function on the receiving and on the sending rank
   struct Recv {int gid, type, f, lr, ny, nz; long long j0, k0, joff; Real eps;};
@@ -151,6 +171,31 @@ void ShearingBox::PlanPull() {
         p[kPZ0] = static_cast<int>(b0 - z0); p[kPNz] = static_cast<int>(b1 - b0);
         p[kPZS] = static_cast<int>(b0 - (sz0 + kz*nz_l));
         p[kPOff] = -1; p[kPSeq] = seq++;
+        // a piece from a coarser sender waits for the round that follows the one in which
+        // the sender's own x1 ghosts are filled (the round of the sender's level)
+        p[kPRnd] = (rounds && d < 0) ? std::min(std::max(lr - lmin, 1), pull_nround_ - 1) : 0;
+        // count (n_pull_edge): a piece this rank packs from a coarser sender whose first or
+        // last row in x2 / x3 has a still coarser neighbor beyond it, the rows at which
+        // PullPack takes the one-sided slope.  Not expected (see shearing_box.hpp).
+        if (d < 0 && s.rank == my_rank && !edge) {
+          const int fs = 1 << (-d);
+          const int ms = s.gid - gids;
+          const auto &nb = pmy_pack->pmb->nghbr.h_view;
+          const int lv = pmy_pack->pmb->mb_lev.h_view(ms);
+          auto coarser = [&nb, ms, lv](int s0) {
+            for (int q=s0; q<s0+4; ++q) {
+              if (nb(ms,q).gid >= 0 && nb(ms,q).lev < lv) return true;
+            }
+            return false;
+          };
+          if ((p[kPYS]/fs == 0 && coarser(8)) ||
+              ((p[kPYS] + p[kPNy] - 1)/fs == nx2 - 1 && coarser(12)) ||
+              (pm->three_d && p[kPZS]/fs == 0 && coarser(24)) ||
+              (pm->three_d && (p[kPZS] + p[kPNz] - 1)/fs == nx3 - 1 && coarser(28))) {
+            edge = true;
+            ++n_pull_edge;
+          }
+        }
         pcs.push_back(p);
       }
     }
@@ -158,6 +203,7 @@ void ShearingBox::PlanPull() {
   // receivers of this rank (every candidate: local or remote sender)
   std::vector<std::tuple<int, int, int>> rl;   // local receivers (m, type, face)
   std::vector<Real> reps;
+  std::vector<int> rrnd;                       // the round that fills a fine receiver
   for (int m=0; m<nmb; ++m) {
     const auto &ll = pm->lloc_eachmb[gids + m];
     for (int f=0; f<2; ++f) {
@@ -168,6 +214,7 @@ void ShearingBox::PlanPull() {
         const int ridx = static_cast<int>(rl.size());
         rl.emplace_back(m, type, f);
         reps.push_back(r.eps);
+        rrnd.push_back((rounds && type == 0) ? (ll.level - lmin) : 0);
         for (const ShearCand &s : cand_[f][m]) pieces(r, s, ridx);
       }
     }
@@ -194,7 +241,14 @@ void ShearingBox::PlanPull() {
               << "by 2^d)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // one message per peer rank and direction
+  // the pieces in the order of their rounds
+  std::stable_sort(pcs.begin(), pcs.end(),
+                   [](const std::array<int, kPNField> &x, const std::array<int, kPNField> &y) {
+                     return x[kPRnd] < y[kPRnd];});
+  pull_pbeg_.assign(pull_nround_ + 1, static_cast<int>(pcs.size()));
+  for (int n=static_cast<int>(pcs.size())-1; n>=0; --n) pull_pbeg_[pcs[n][kPRnd]] = n;
+  for (int k=pull_nround_-1; k>=0; --k) pull_pbeg_[k] = std::min(pull_pbeg_[k], pull_pbeg_[k+1]);
+  // one message per peer rank, direction and round
   std::vector<std::array<long long, 8>> key;
   std::vector<int> rem;
   for (int n=0; n<static_cast<int>(pcs.size()); ++n) {
@@ -202,7 +256,14 @@ void ShearingBox::PlanPull() {
     const bool rloc = (p[kPRIdx] >= 0), sloc = (p[kPSLoc] == 1);
     if (rloc == sloc) continue;
     const int peer = rloc ? pm->rank_eachmb[p[kPSGid]] : pm->rank_eachmb[p[kPRGid]];
-    key.push_back({rloc ? 0LL : 1LL, peer, p[kPRGid], p[kPRType], p[kPRFace], p[kPSGid],
+    if (peer > (1 << 24)) {   // LayoutPeerMessages keeps 64*peer + round in an int
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "shearing box (x1-face levels): rank number too large for the message key"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    key.push_back({rloc ? 0LL : 1LL, 64LL*peer + p[kPRnd], p[kPRGid], p[kPRType], p[kPRFace],
+                   p[kPSGid],
                    p[kPSeq], static_cast<long long>(nvar_pull)*ng*p[kPNz]*p[kPNy]});
     rem.push_back(n);
   }
@@ -210,6 +271,11 @@ void ShearingBox::PlanPull() {
   int soff = 0, roff = 0;
 #if MPI_PARALLEL_ENABLED
   LayoutPeerMessages(key, offset, pmsg_rank, pmsg_off, pmsg_size, pmsg_send, soff, roff);
+  pmsg_tag.assign(pmsg_rank.size(), 0);   // the round of a message, also its MPI tag
+  for (size_t n=0; n<pmsg_rank.size(); ++n) {
+    pmsg_tag[n] = pmsg_rank[n] % 64;
+    pmsg_rank[n] /= 64;
+  }
 #else
   std::vector<int> mr, mo, ms, md;
   LayoutPeerMessages(key, offset, mr, mo, ms, md, soff, roff);
@@ -226,14 +292,16 @@ void ShearingBox::PlanPull() {
   }
   ppiece.template modify<HostMemSpace>();
   ppiece.template sync<DevExeSpace>();
-  if (static_cast<int>(precv.extent(0)) < std::max(1, nprecv)) {
-    Kokkos::realloc(precv, std::max(1, nprecv), 3);
+  if (static_cast<int>(precv.extent(0)) < std::max(1, nprecv) ||
+      static_cast<int>(precv.extent(1)) != 4) {
+    Kokkos::realloc(precv, std::max(1, nprecv), 4);
     Kokkos::realloc(precv_eps, std::max(1, nprecv));
   }
   for (int r=0; r<nprecv; ++r) {
     precv.h_view(r,0) = std::get<0>(rl[r]);
     precv.h_view(r,1) = std::get<1>(rl[r]);
     precv.h_view(r,2) = std::get<2>(rl[r]);
+    precv.h_view(r,3) = rrnd[r];
     precv_eps.h_view(r) = reps[r];
   }
   precv.template modify<HostMemSpace>();
@@ -260,7 +328,6 @@ void ShearingBox::PlanPull() {
     prreq_ = new MPI_Request[npreq_];
   }
   for (int n=0; n<npreq_; ++n) {psreq_[n] = MPI_REQUEST_NULL; prreq_[n] = MPI_REQUEST_NULL;}
-  pmsg_tag.assign(nmsg, 0);   // one message per (peer, direction): the order identifies it
   bool no_errors = true;
   for (int n=0; n<nmsg; ++n) {
     if (pmsg_send[n] == 1) continue;
@@ -283,7 +350,12 @@ void ShearingBox::PlanPull() {
 bool ShearingBox::WaitPull() {
   bool no_errors = true;
 #if MPI_PARALLEL_ENABLED
+  // Only the messages of the rounds started so far: those of a later round are sent by
+  // PullRecv once the round before it is complete (Driver::InitBoundaryValuesAndPrimitives
+  // clears before it receives).
+  const int nmsg = static_cast<int>(pmsg_rank.size());
   for (int n=0; n<npreq_; ++n) {
+    if (!pull_done_ && n < nmsg && pmsg_tag[n] > pull_round_) continue;
     if (MPI_Wait(&(psreq_[n]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
     if (MPI_Wait(&(prreq_[n]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
   }
@@ -296,7 +368,20 @@ bool ShearingBox::WaitPull() {
 //! \brief The local senders convert their cells next to the face to each receiver's level
 
 TaskStatus ShearingBoxCC::PullSend(DvceArray5D<Real> &a) {
-  if (nppiece == 0) return TaskStatus::complete;
+  pull_round_ = 0;
+  pull_done_ = false;
+  PullPack(a, 0);   // the pieces that need no slope; the later rounds follow in PullRecv
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void ShearingBoxCC::PullPack()
+//! \brief Packs the pieces of round rnd (local receivers: into their buffer) and sends this
+//! rank's messages of that round
+
+void ShearingBoxCC::PullPack(DvceArray5D<Real> &a, const int rnd) {
+  if (nppiece == 0) return;
+  const int p0 = pull_pbeg_[rnd], p1 = pull_pbeg_[rnd+1];
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   const int is = indcs.is, ie = indcs.ie, js = indcs.js, ks = indcs.ks, ng = indcs.ng;
   const int gids = pmy_pack->gids;
@@ -305,22 +390,28 @@ TaskStatus ShearingBoxCC::PullSend(DvceArray5D<Real> &a) {
   auto pb = pbuf;
   auto sf = psendflat;
   const int nymax = npymax, nzmax = npzmax;
-  const bool xslope = pull_ghost_valid;   // x slope at the face column only once the x1
-                                          // ghosts hold collected values
+  // x slope at the face column: its x1 ghosts were filled in an earlier round of this
+  // exchange.  test_pull_lagged_xslope: they hold the values of the previous stage, and the
+  // slope is left out until they have been collected once (pull_ghost_valid).
+  const bool xslope = !pull_lagged_xslope || pull_ghost_valid;
   // A coarser sender's y / z slopes read its transverse ghost rows.  Those of a same-level or
-  // finer neighbour (RecvU) and of a physical x3 boundary (set before the pack) are of this
-  // stage; those of a COARSER neighbour are prolongated only after this exchange (Prolongate,
-  // FinishUstarGhosts) and still hold the previous stage.  At such an edge row the slope is
+  // finer neighbor (RecvU) and of a physical x3 boundary (set before the pack) are of this
+  // stage; those of a COARSER neighbor are prolongated only after this exchange (Prolongate,
+  // FinishUstarGhosts) and still hold the previous stage.  The level rule of the shear faces
+  // keeps such a row out of every receiver's reach (the coarser neighbor would read the
+  // receiver, two levels finer, and is refined); PlanPull counts the plans in which it happens
+  // all the same (n_pull_edge, timing report).  As a guard, at such an edge row the slope is
   // one-sided from the two interior differences (block size >= 4), its magnitude capped at the
   // cell value for the non-negative variables (pull_pos_mask / pull_pos_from: density, total
   // energy, passive scalars of the gas; none of u*) so that no child turns negative.  The
-  // neighbour table is read only for the edge rows.
+  // neighbor table is read only for the edge rows.
   const int je = indcs.je, ke = indcs.ke;
   const int posmask = pull_pos_mask, posfrom = pull_pos_from;
   const bool zface = pmy_pack->pmesh->three_d;
   auto nghbr = pmy_pack->pmb->nghbr;
   auto mblev = pmy_pack->pmb->mb_lev;
-  par_for("shr-pull-pack", DevExeSpace(), 0, nppiece-1, 0, nv*ng-1, 0, nzmax-1, 0, nymax-1,
+  if (p1 > p0) {
+  par_for("shr-pull-pack", DevExeSpace(), p0, p1-1, 0, nv*ng-1, 0, nzmax-1, 0, nymax-1,
   KOKKOS_LAMBDA(const int n, const int vd, const int zz, const int yy) {
     if (pp.d_view(n,kPSLoc) == 0) return;
     const int ny = pp.d_view(n,kPNy), nz = pp.d_view(n,kPNz);
@@ -374,8 +465,7 @@ TaskStatus ShearingBoxCC::PullSend(DvceArray5D<Real> &a) {
         one = false;
       }
       const Real mz = one ? PullOneSidedSlope(dl, dr, u0, pos) : 4.0*PROLONG_CC_SLOPE(dl, dr);
-      // the face column: its x1 ghosts hold the last collected values (one stage old), except
-      // right after a regrid (no slope then)
+      // the face column (cd == 0) reads the x1 ghost beyond the face (see xslope above)
       Real mx = 0.0;
       if (cd > 0 || xslope) {
         dl = u0 - a(m, v, kp, jp, ip-1); dr = a(m, v, kp, jp, ip+1) - u0;
@@ -390,11 +480,12 @@ TaskStatus ShearingBoxCC::PullSend(DvceArray5D<Real> &a) {
       sf(pp.d_view(n,kPOff) + ((v*ng + dep)*nz + zz)*ny + yy) = val;
     }
   });
+  }
 #if MPI_PARALLEL_ENABLED
   Kokkos::fence();
   bool no_errors = true;
   for (size_t n=0; n<pmsg_rank.size(); ++n) {
-    if (pmsg_send[n] == 0) continue;
+    if (pmsg_send[n] == 0 || pmsg_tag[n] != rnd) continue;
     if (MPI_Isend(psendflat.data() + pmsg_off[n], pmsg_size[n], MPI_ATHENA_REAL,
                   pmsg_rank[n], pmsg_tag[n], comm_pull, &(psreq_[n])) != MPI_SUCCESS) {
       no_errors = false;
@@ -406,13 +497,14 @@ TaskStatus ShearingBoxCC::PullSend(DvceArray5D<Real> &a) {
     std::exit(EXIT_FAILURE);
   }
 #endif
-  return TaskStatus::complete;
 }
 
 //----------------------------------------------------------------------------------------
 //! \fn TaskStatus ShearingBoxCC::PullRecv()
-//! \brief (coarse = false) the pieces from other ranks, then the remap of the fine receivers
-//! into a; (coarse = true) the remap of the coarse receivers into the coarse array a
+//! \brief (coarse = false) round by round: the pieces from other ranks, the remap of the fine
+//! receivers of the round into a, then the pack and send of the next round (whose senders
+//! read the x1 ghosts just written); incomplete while a round's messages are on their way.
+//! (coarse = true, after that) the remap of the coarse receivers into the coarse array a
 
 TaskStatus ShearingBoxCC::PullRecv(DvceArray5D<Real> &a, const bool coarse) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -420,10 +512,24 @@ TaskStatus ShearingBoxCC::PullRecv(DvceArray5D<Real> &a, const bool coarse) {
   const int nv = nvar_;
   auto pp = ppiece;
   auto pb = pbuf;
-  if (!coarse) {
+  if (coarse) {
+    PullRemap(a, true, 0);
+    return TaskStatus::complete;
+  }
+  if (pull_done_) return TaskStatus::complete;
+  while (true) {
+    const int rnd = pull_round_;
 #if MPI_PARALLEL_ENABLED
     bool done = true, no_errors = true;
     for (size_t n=0; n<pmsg_rank.size(); ++n) {
+      if (pmsg_send[n] == 1 || pmsg_tag[n] != rnd) continue;
+      // Round 0 is polled (its messages were sent by PullSend, which another rank may not
+      // have reached yet).  A later round waits: every rank sends its messages of a round
+      // before it waits for that round, and the caller may not poll (initialization).
+      if (rnd > 0) {
+        if (MPI_Wait(&(prreq_[n]), MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
+        continue;
+      }
       int test;
       if (MPI_Test(&(prreq_[n]), &test, MPI_STATUS_IGNORE) != MPI_SUCCESS) no_errors = false;
       if (!(static_cast<bool>(test))) done = false;
@@ -434,11 +540,11 @@ TaskStatus ShearingBoxCC::PullRecv(DvceArray5D<Real> &a, const bool coarse) {
       std::exit(EXIT_FAILURE);
     }
     if (!done) return TaskStatus::incomplete;
-    if (nppiece > 0) {
+    if (nppiece > 0 && pull_pbeg_[rnd+1] > pull_pbeg_[rnd]) {
       auto rf = precvflat;
       const int nymax = npymax, nzmax = npzmax;
-      par_for("shr-pull-unpk", DevExeSpace(), 0, nppiece-1, 0, nv*ng-1, 0, nzmax-1, 0,
-              nymax-1,
+      par_for("shr-pull-unpk", DevExeSpace(), pull_pbeg_[rnd], pull_pbeg_[rnd+1]-1, 0,
+              nv*ng-1, 0, nzmax-1, 0, nymax-1,
       KOKKOS_LAMBDA(const int n, const int vd, const int zz, const int yy) {
         if (pp.d_view(n,kPSLoc) == 1 || pp.d_view(n,kPRIdx) < 0) return;
         const int ny = pp.d_view(n,kPNy), nz = pp.d_view(n,kPNz);
@@ -449,9 +555,39 @@ TaskStatus ShearingBoxCC::PullRecv(DvceArray5D<Real> &a, const bool coarse) {
       });
     }
 #endif
+    PullRemap(a, false, rnd);
+    if (rnd + 1 >= pull_nround_) break;
+    pull_round_ = rnd + 1;
+    PullPack(a, pull_round_);
   }
-  if (!coarse) pull_ghost_valid = true;   // after this the x1 ghosts hold collected values
-  if (nprecv == 0) return TaskStatus::complete;
+#if MPI_PARALLEL_ENABLED
+  // the sends of the later rounds: complete before the send buffer is used again (their
+  // receives were posted with the plan; the initialization has no clearing step after this)
+  for (size_t n=0; n<pmsg_rank.size(); ++n) {
+    if (pmsg_send[n] == 0 || pmsg_tag[n] == 0) continue;
+    if (MPI_Wait(&(psreq_[n]), MPI_STATUS_IGNORE) != MPI_SUCCESS) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "MPI error in waiting for sends (shearing box, face levels)" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+#endif
+  pull_done_ = true;
+  pull_ghost_valid = true;   // after this the x1 ghosts hold collected values
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void ShearingBoxCC::PullRemap()
+//! \brief The remap of the fine receivers of round rnd into a, or (coarse) of the coarse
+//! receivers into the coarse array a
+
+void ShearingBoxCC::PullRemap(DvceArray5D<Real> &a, const bool coarse, const int rnd) {
+  if (nprecv == 0) return;
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int ng = indcs.ng;
+  const int nv = nvar_;
+  auto pb = pbuf;
   const int type = coarse ? 1 : 0;
   const int nyr = coarse ? indcs.cnx2 : indcs.nx2;
   const int nzr = coarse ? indcs.cnx3 : indcs.nx3;
@@ -468,7 +604,7 @@ TaskStatus ShearingBoxCC::PullRecv(DvceArray5D<Real> &a, const bool coarse) {
   par_for_outer("shr-pull-remap", DevExeSpace(), scr_size, scr_lvl, 0, nprecv-1, 0, nv-1,
                 0, nzb-1, 0, ng-1,
   KOKKOS_LAMBDA(TeamMember_t member, const int r, const int v, const int zz, const int dep) {
-    if (rlist.d_view(r,1) != type) return;
+    if (rlist.d_view(r,1) != type || rlist.d_view(r,3) != rnd) return;
     ScrArray1D<Real> a_(member.team_scratch(scr_lvl), nb);
     ScrArray1D<Real> ust(member.team_scratch(scr_lvl), nb);
     par_for_inner(member, 0, nb-1, [&](const int b) {
@@ -499,5 +635,4 @@ TaskStatus ShearingBoxCC::PullRecv(DvceArray5D<Real> &a, const bool coarse) {
       a(m, v, kb + zz, jb + jl, icol) = a_(jl+3) - (ust(jl+4) - ust(jl+3));
     });
   });
-  return TaskStatus::complete;
 }

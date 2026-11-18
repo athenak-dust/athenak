@@ -69,7 +69,7 @@ ShwaveTestVariables shw_var;
 void ProblemGenerator::Shwave(ParameterInput *pin, const bool restart) {
   // <problem>/band_n bands of refinement for tests of the adaptive
   // shearing box: bandK_t0, _t1, _x1min, _x1max, _x3min, _x3max, _level; a
-  // block whose centre is inside an active band is wanted at its level (whole x2).
+  // block whose center is inside an active band is wanted at its level (whole x2).
   // Also on a restart: the refinement function is enrolled again
   shw_bands.clear();
   const int nband = pin->GetOrAddInteger("problem", "band_n", 0);
@@ -471,7 +471,7 @@ void ShwaveHistory(HistoryData *pdata, Mesh *pm) {
 
 //----------------------------------------------------------------------------------------
 //! \fn void ShwaveBands()
-//! \brief refinement request of the bands: refine a block whose centre
+//! \brief refinement request of the bands: refine a block whose center
 //! lies in an active band below its level, derefine one outside every active band (or above the
 //! level they want).  (Boxes may be limited in x2; the blocks on the shear-periodic x1
 //! faces are merged into columns along x2 by the mesh refinement.)

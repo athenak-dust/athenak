@@ -5,7 +5,7 @@
 //========================================================================================
 //! \file dusty_wave_amr.cpp
 //! \brief Problem generator for the damped dusty sound wave on refined meshes, without
-//! rotation (no <shearing_box>): the right-travelling eigenmode of gas and N dust species
+//! rotation (no <shearing_box>): the right-traveling eigenmode of gas and N dust species
 //! (at most 4) with <problem>/wave_n wavelengths along x1 and the gas velocity amplitude
 //! <problem>/amp (in units of cs).  The dust starts at its eigenmode displacement and velocity.
 //! As dusty_wave, but with the particle set-up of dust_setup: point particles on a lattice
@@ -54,7 +54,7 @@ void WaveHistory(HistoryData *pdata, Mesh *pm) {
 
 //----------------------------------------------------------------------------------------
 //! \fn DustTestOmega
-//! \brief dust_test = wave: the right-travelling damped root of the dusty-wave dispersion
+//! \brief dust_test = wave: the right-traveling damped root of the dusty-wave dispersion
 //! relation omega^2 (1 + sum_s eps_s/(1 - i omega t_s)) = k^2 cs^2 (as dusty_wave.cpp).
 
 std::complex<Real> DustTestOmega(const Real kwv, const Real cs, const std::vector<Real> &eps,
@@ -120,7 +120,7 @@ void ProblemGenerator::DustyWaveAMR(ParameterInput *pin, const bool restart) {
   const Real rho0 = pin->GetOrAddReal("problem","rho0",1.0);
   const bool three_d = pmy_mesh_->three_d;
 
-  // the eigenmode (velocity normalisation as dusty_wave.cpp)
+  // the eigenmode (velocity normalization as dusty_wave.cpp)
   dust_setup::DustInit d;
   const Real amp = pin->GetOrAddReal("problem", "amp", 1.0e-6);
   const int nwave = pin->GetOrAddInteger("problem", "wave_n", 1);
@@ -150,7 +150,7 @@ void ProblemGenerator::DustyWaveAMR(ParameterInput *pin, const bool restart) {
               << omega.real() << " " << omega.imag() << " i, |drho| = " << std::abs(drho)
               << std::endl;
   }
-  // the gas part of the eigenmode (cell-centre values)
+  // the gas part of the eigenmode (cell-center values)
   {
     auto &indcs = pmy_mesh_->mb_indcs;
     const int ng = indcs.ng, nmb = pmbp->nmb_thispack;

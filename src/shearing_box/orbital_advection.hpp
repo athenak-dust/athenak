@@ -36,14 +36,14 @@ class OrbitalAdvection {
   MPI_Comm comm_orb_advect;
 #endif
 
-  // x2-face neighbours on another level.  xlev(m,n) for the lower
-  // (n=0) and upper (n=1) x2 face: 0 a neighbour on the same level, 1 a coarser neighbour,
-  // 2 four finer neighbours.  A coarser sender prolongates (limited linear, as ProlongCC) and
+  // x2-face neighbors on another level.  xlev(m,n) for the lower
+  // (n=0) and upper (n=1) x2 face: 0 a neighbor on the same level, 1 a coarser neighbor,
+  // 2 four finer neighbors.  A coarser sender prolongates (limited linear, as ProlongCC) and
   // a finer sender restricts the rows into the receiver's buffer, so the remap itself is the
   // same-level one.  The coarse side then takes the finer side's remap fluxes through the face
   // (sum of the 2x2 fine fluxes / 8): conservative to round-off.
   DualArray2D<int> xlev;
-  DualArray2D<int> xslot;   // (m,n): the slot (nghbr index) of the coarser neighbour
+  DualArray2D<int> xslot;   // (m,n): the slot (nghbr index) of the coarser neighbor
   bool any_mixed;           // on this rank
   int nvar_oa;              // variables (set by the CC class)
   int nrow;                 // ng + maxjshift: rows exchanged at the receiver's resolution
@@ -77,7 +77,7 @@ class OrbitalAdvectionCC : public OrbitalAdvection {
   // functions to communicate CC data with orbital advection
   TaskStatus PackAndSendCC(DvceArray5D<Real> &a);
   TaskStatus RecvAndUnpackCC(DvceArray5D<Real> &a, ReconstructionMethod rcon);
-  // the fine side sends its remap fluxes through faces with a coarser neighbour;
+  // the fine side sends its remap fluxes through faces with a coarser neighbor;
   // the coarse side replaces its own by them
   TaskStatus SendFluxCC();
   TaskStatus RecvFluxCC(DvceArray5D<Real> &a);

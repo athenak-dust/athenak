@@ -139,7 +139,7 @@ void SlabBoundary::SetShearOffset(Real shear_offset) {
       const Real a = nx-offset;
       const Real ky = twopi*ny/ly_, kx = twopi*a/lx_;
       kh(m,0) = kx; kh(m,1) = ky; kh(m,2) = std::sqrt(kx*kx+ky*ky);
-      // A window in physical kx is invariant under shear-period relabelling.
+      // A window in physical kx is invariant under shear-period relabeling.
       // The flat core preserves the unsheared cutoff; exchanged labels have
       // zero value AND derivative at |a|=Mx+1, including at integer ny*phase.
       const Real edge = std::abs(a)-modes_x_;

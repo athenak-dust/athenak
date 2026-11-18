@@ -64,7 +64,7 @@ class SelfGravity {
   // Both species receive the field sampled by the immediately preceding Solve.
   void KickMatter(Real dt);
   // <gravity>/energy_source = kick (default) | flux | diag.  The half-kicks change
-  // the gas energy by the kinetic-energy change of the cell-centred momentum kick, sum rho v.g dt;
+  // the gas energy by the kinetic-energy change of the cell-centered momentum kick, sum rho v.g dt;
   // the potential energy W = 1/2 sum rho phi V changes with the face mass fluxes, so total
   // K + U + W drifts (12.3% / 5.4% at 32^3 / 64^3 in a test, all from this).  flux
   // replaces, at the end of each step, the gas energy of the two kicks by the face work
@@ -89,6 +89,14 @@ class SelfGravity {
   Real HydroBoundaryTime(Real stage_time) const {
     return hydro_boundary_time_valid_ ? hydro_boundary_time_ : stage_time;
   }
+  // the matter of the field (<gravity>/source) and the matter it acts on (kick)
+  bool SourceGas() const { return source_gas_; }
+  bool SourceDust() const { return source_dust_; }
+  bool KicksGas() const { return kick_gas_; }
+  bool IsolatedZ() const { return vertical_bc_ == "isolated"; }   // <gravity>/vertical_bc
+  // phi and acceleration belong to the current mesh (a solve or kept field since the last
+  // regrid); false before the first solve and inside a regrid until its solve
+  bool FieldCurrent() const;
   // Topology/load balance rebuilds automatically; shear updates only surface rows.
   void Invalidate();
   void LoadRestartState(GravityRestartState state) { restart_state_ = std::move(state); }
@@ -177,9 +185,19 @@ class SelfGravity {
   DvceArray2D<Real> particle_acceleration_;
   ExtraDensitySource extra_source_;
   std::vector<GlobalIndex> partition_;
+  // memory options (bit mask, see SgLeanBits in self_gravity.cpp), set in the constructor
+  int lean_ = 0;
+  // memory option 1: the local solver rows whose force rows are
+  // kept (the physical source cells); empty: every row (option 1 off)
+  std::vector<char> lean_rows_;
   int topology_ = -1, max_iterations_, restart_;
   int slab_modes_x_ = 0, slab_modes_y_ = 0;
   int phase_threads_ = 0, setup_threads_ = 0;
+  // hidden key <gravity>/test_gpu_assembly (0 off, 1 on, 2 check): the regular rows of
+  // every level of a distributed rebuild on the device, during the host assembly (GpuSplit)
+  int gpu_assembly_ = 0;
+  int gpu_chain_workers_ = 0;        // <gravity>/test_gpu_chain_workers
+  GpuSplitOptions gpu_options_;      // <gravity>/test_gpu_irregular, _irregular_margin, _min_rows
   // <gravity>/coarse_phase_quantum (see the constructor): the phase of coarse level l is
   // CoarsePhase(shift, level_width_[l-1]); level_phase_[l-1] is the phase of its current A_l
   // and P_{l-1}

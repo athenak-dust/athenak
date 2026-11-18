@@ -19,7 +19,7 @@
 //!    (mass, momentum and the passive scalars rho s conserved exactly).  Slopes are periodic in
 //!    x2, zero in the first and last cells along x1 (shear-periodic faces) and x3.
 //!  - Particles (<problem>/refine_split = 8, 2 or 1; default 8): with 8, every particle becomes
-//!    eight, mass m/8, at the centres of the eight fine cells of a coarse cell centred on it
+//!    eight, mass m/8, at the centers of the eight fine cells of a coarse cell centered on it
 //!    (offsets +-dx/2 of the fine cell along each direction); with 2, two of them, mass m/2, at
 //!    opposite corners (the diagonal chosen by the parent's tag modulo 4); with 1, the particle
 //!    as it is.  Particles outside a shorter box are dropped (their count and mass are printed),
@@ -30,7 +30,7 @@
 //!    copies, drag rates zero).  Child tags: refine_split parent_tag + k, checked against the
 //!    largest tag the run holds (refine_tags.hpp) before they are formed.
 //! What the coarse run kept outside the particles and the hydro variables (dust state records,
-//! the li2018 renormalisation totals) is not read: the input carries vbc_mean0 / vbc_dm (for a
+//! the li2018 renormalization totals) is not read: the input carries vbc_mean0 / vbc_dm (for a
 //! shorter box dust_si_strat.cpp takes the mean density of the prolongated gas without them).
 
 #include <algorithm>

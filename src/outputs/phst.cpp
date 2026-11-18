@@ -125,8 +125,8 @@ void ParticleHistoryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
                    pm->three_d ? "x3" : "x2 (the vertical of the 2-D r-z box)");
       std::fprintf(fp, "# [10] rho_max: the largest dust density (%s) on the active cells, "
                    "deposited at this time with the run's representation (the mesh field "
-                   "dust_total_rho); [11-13] the centre of that cell, [14] its level above "
-                   "the root (rho_max = 0: centre 0, level -1)\n",
+                   "dust_total_rho); [11-13] the center of that cell, [14] its level above "
+                   "the root (rho_max = 0: center 0, level -1)\n",
                    pm->three_d ? "mass per volume" : "mass per unit area of the x1-x2 plane");
       std::fprintf(fp, "# [15] chi_max: largest PC2 feedback stiffness chi = dt max(sum w m/(t_s "
                    "V rho_g)) of the cycles since the previous row (dust_stiffness_log.txt); "

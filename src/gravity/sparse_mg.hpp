@@ -126,7 +126,7 @@ struct PhaseRowPlan {
   std::vector<Real> values;
 };
 
-// <gravity>/phase_pattern_padding (default 2; 0: exact patterns, the former behaviour). A compact
+// <gravity>/phase_pattern_padding (default 2; 0: exact patterns, the former behavior). A compact
 // phase row whose new pattern lacks columns of the current one, or adds columns, keeps the union
 // with explicit zeros as long as the union exceeds the new row by at most this many entries.
 // Roundoff-size coefficients (|a| ~ 1e-47 of the row) of the shear-seam rows next to a C1 joint
@@ -161,6 +161,14 @@ bool &SetupTimesOn();
 // not depend on it (integer maps and per-row sums in row order). 1 unless a caller sets it
 // (SelfGravity: its setup threads, during a hierarchy rebuild).
 int &OperatorSetupThreads();
+
+// ATHENA_SG_TEMPLATE_CHECK=1 (diagnostic; memory option 8): every build of an operator
+// with template rows compares its product with the full CSR product (collective). Read once;
+// SelfGravity checks at construction that every rank has the same value.
+bool SgTemplateCheck();
+// ATHENA_SG_LEAN (hidden override of the automatic memory options, for comparisons; see
+// self_gravity.cpp): the bit mask it gives, or -1 when it is unset or empty. Read once.
+int SgLeanOverride();
 
 // Restarted flexible GMRES preconditioned by the supplied multigrid V-cycle. The
 // production path accepts independent A/P/R; the legacy adapter uses Galerkin R=P^T.
@@ -209,7 +217,7 @@ class SparseMultigrid {
   // when it throws (the pinned stages may be written again at once).
   void UpdateFinePhaseRows(const CsrRowUpdate &matrix);
   void UpdateFinePhaseRowsPlanned(const CsrRowUpdate &matrix, const PhaseRowPlan *plan);
-  // (xnode) as UpdateFinePhaseRowsPlanned with the operator's validity / ghost-change flags
+  // as UpdateFinePhaseRowsPlanned with the operator's validity / ghost-change flags
   // already reduced over the ranks by the caller (nullptr: reduced here)
   void UpdateFinePhaseRowsKnown(const CsrRowUpdate &matrix, const PhaseRowPlan *plan,
                                 const int *known);
@@ -289,12 +297,24 @@ class DistributedOperator {
                       const std::vector<GlobalIndex> &row_partition,
                       const std::vector<GlobalIndex> &col_partition,
                       MPI_Comm comm = MPI_COMM_WORLD);
+  // (memory option 8, see self_gravity.cpp) the same operator with its repeated rows that
+  // read owned inputs only, except the local rows template_exclude (the phase rows), stored
+  // as templates (sparse_mg.cpp, BuildTemplates): the same products, bitwise
+  DistributedOperator(const LocalCsr &matrix,
+                      const std::vector<GlobalIndex> &row_partition,
+                      const std::vector<GlobalIndex> &col_partition,
+                      const std::vector<int> &template_exclude,
+                      MPI_Comm comm = MPI_COMM_WORLD);
 #else
   DistributedOperator(const HostCsr &matrix, const std::vector<int> &row_partition,
                       const std::vector<int> &col_partition);
   DistributedOperator(const LocalCsr &matrix,
                       const std::vector<GlobalIndex> &row_partition,
                       const std::vector<GlobalIndex> &col_partition);
+  DistributedOperator(const LocalCsr &matrix,
+                      const std::vector<GlobalIndex> &row_partition,
+                      const std::vector<GlobalIndex> &col_partition,
+                      const std::vector<int> &template_exclude);
 #endif
   ~DistributedOperator();
   DistributedOperator(const DistributedOperator &) = delete;
@@ -305,6 +325,8 @@ class DistributedOperator {
   void UpdatePhaseRows(const CsrRowUpdate &matrix, const PhaseRowPlan *plan = nullptr);
   PhaseRowPlan PreparePhaseRows(const CsrRowUpdate &matrix) const;  // host only
   FineOperatorStats PhaseUpdates() const;
+  // template rows and the nonzeros they took out of the CSR (0, 0 without templates)
+  std::array<std::uint64_t,2> TemplateCounts() const;
 
  private:
   friend class SparseMultigrid;   // (its flags in the hierarchy's phase collective)

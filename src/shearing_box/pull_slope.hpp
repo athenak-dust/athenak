@@ -7,7 +7,7 @@
 //========================================================================================
 //! \file pull_slope.hpp
 //! \brief One-sided slope of the collected shear ghost zones (ShearingBoxCC::PullSend) at a
-//! coarser sender's y / z edge row whose ghost row comes from a still coarser neighbour.
+//! coarser sender's y / z edge row whose ghost row comes from a still coarser neighbor.
 
 #include "athena.hpp"
 #include "mesh/prolongation.hpp"
@@ -18,7 +18,7 @@
 //! two-sided slope (+x2 / +x3 differences); u0: the edge cell; positive: a non-negative
 //! variable.  Returns the slope in the units of the pull (4 PROLONG_CC_SLOPE: the change
 //! across one sender cell).  For a non-negative variable the magnitude is capped at
-//! max(u0, 0), the bound a centred minmod slope with any non-negative ghost satisfies: with
+//! max(u0, 0), the bound a centered minmod slope with any non-negative ghost satisfies: with
 //! |offset| <= 1/4 per direction (one level) every child keeps at least u0/4.  Only the
 //! slope is limited, so the mean of the children stays u0; below the cap the slope is
 //! unchanged.

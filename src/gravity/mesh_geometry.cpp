@@ -3,6 +3,8 @@
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
 #include "gravity/mesh_geometry.hpp"
+#include "gravity/gpu_assembly.hpp"
+#include "gravity/gpu_irregular.hpp"
 #include "gravity/host_workers.hpp"
 #include "gravity/row_index.hpp"
 
@@ -12,16 +14,24 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <exception>
+#include <iostream>
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #if defined(__linux__)
 #include <sched.h>
+#endif
+#if defined(KOKKOS_ENABLE_CUDA)
+#include <cuda_runtime.h>
 #endif
 
 namespace gravity {
@@ -117,6 +127,39 @@ struct RowWorkspace {
   }
 };
 
+#if defined(KOKKOS_ENABLE_CUDA)
+using PinnedSpace = Kokkos::CudaHostPinnedSpace;
+#else
+using PinnedSpace = Kokkos::HostSpace;
+#endif
+// (<gravity>/test_gpu_assembly) the page-locked download buffers of the split builds per level slot
+// and component, kept for the next rebuild (page-locked allocations are slow); only the thread
+// that owns the device takes them, a rebuild's systems are complete before the next one
+struct PinnedPool {
+  std::vector<std::array<Kokkos::View<GlobalIndex*, PinnedSpace>,4>> offset, col;
+  std::vector<std::array<Kokkos::View<double*, PinnedSpace>,4>> val;
+};
+PinnedPool &Pinned() {
+  static PinnedPool pool;
+  // released before Kokkos::finalize
+  static const bool hooked = []() {
+    Kokkos::push_finalize_hook([]() { Pinned() = PinnedPool{}; });
+    return true;
+  }();
+  (void)hooked;
+  return pool;
+}
+template <class T>
+Kokkos::View<T*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged> Take(
+    Kokkos::View<T*, PinnedSpace> &buffer, std::size_t n, const char *name) {
+  if (buffer.extent(0) < n) {
+    buffer = Kokkos::View<T*, PinnedSpace>();
+    buffer = Kokkos::View<T*, PinnedSpace>(
+        Kokkos::view_alloc(Kokkos::WithoutInitializing,std::string(name)),n+n/8+1024);
+  }
+  return Kokkos::View<T*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(buffer.data(),n);
+}
+
 int AvailablePhaseCpus() {
 #if defined(__linux__)
   cpu_set_t affinity;
@@ -152,8 +195,73 @@ struct MeshGeometry::Impl {
   std::vector<PhaseContext> phase_contexts;
   int phase_threads = 1, setup_threads = 1;
   double phase_rows_s = 0, phase_join_s = 0;   // last BuildPhaseUpdate: row assembly, join
+  double build_rows_s = 0, build_join_s = 0;   // last BuildSystem: row assembly, join
+  std::array<double,4> build_class{};   // (profile) thread seconds and rows: inner / outer cells
+  std::array<double,gpu::kReasons> reason_seconds{};   // (profile) host row thread seconds by reason
   std::vector<int> phase_rows;
   bool phase_rows_ready = false;
+  std::array<double,6> device_stats{};   // see LastDeviceStats
+  // One worker chunk of a BuildSystem: consecutive owned rows.
+  struct Part {
+    LocalCsr matrix, boundary_rhs;
+    std::array<LocalCsr,3> acceleration, boundary_acceleration;
+    std::vector<Real> volume;
+    std::vector<CompositeCell> cells;
+    std::vector<unsigned char> interface;
+    std::vector<int> phase_rows;
+    // (profile) host seconds and rows: cells >= 2 cells inside their patch / all others
+    double t_inner = 0, t_outer = 0;
+    std::array<double,gpu::kReasons> t_reason{};   // (profile, split build) host rows by reason
+    long long n_inner = 0, n_outer = 0;
+  };
+  // <gravity>/test_gpu_assembly split build (PrepareSplit, BuildHostRows, RunDevice, FinishSplit)
+  struct Split {
+    bool prepared = false, forces = false, host_done = false, device_done = false;
+    bool no_device = false;   // no device rows: RunDevice does nothing
+    // the classification parameters (PrepareSplit), the host classification done (ClassifySplit),
+    // the device's own classification (downloaded, compared in FinishSplitPrepare)
+    bool device_level = false, irregular_on = false, classified = false;
+    double margin = 12.;
+    std::vector<int> device_kind;
+    int components = 0;
+    // host tables (gpu::HostGeometry points into these) and per owned row: 1 = a device row,
+    // else -(the reason it stays on the host)
+    // (1: the regular-row kernels of gpu_assembly.hpp, 2: the irregular-row kernels of
+    // gpu_irregular.hpp, whose status 1/2 = assembled (2: an interface row), <= 0 = left to the
+    // host in FinishSplit)
+    gpu::HostGeometry g;
+    std::vector<double> width, center, plo, phi;
+    std::vector<int> cells, coff, nb, wrap, owned, owned_first, regular, status;
+    std::vector<int> cand_off, cand, rorder, irregular_rows;
+    std::vector<GlobalIndex> row_begin;
+    std::array<long long,gpu::kReasons> why{};   // rows by the first non-regular reason
+    long long irregular = 0, fallback = 0;
+    std::array<long long,8> failures{};          // irregular rows left to the host, by status
+    // the host pass's fits with an interface / x-image fallback (sorted unique ids)
+    std::vector<GlobalIndex> interface_ids, x_image_ids;
+    // the device rows (host copies): per component (0: A, 1+d: acceleration d) offsets per
+    // owned row (+1), columns and values
+    std::array<Kokkos::View<GlobalIndex*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>,4> offset, colidx;
+    std::array<Kokkos::View<double*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>,4> values;
+    // the host pass: its chunks (device rows are empty placeholders) and the output so far
+    std::vector<Part> parts;
+    LocalCompositeSystem out;
+    // FinishSplit in two steps: Prepare (needs the device offsets and statuses: the irregular
+    // rows left to the host, the output sizes) and Copy (needs the device entries)
+    struct Fallback {
+      std::array<LocalCsr,8> c;
+      unsigned char interface = 0;
+      bool phase = false;
+    };
+    bool counted = false, join_prepared = false;
+    std::vector<int> failed;
+    std::vector<Fallback> fallback_rows;
+    std::vector<size_t> row_offset;
+    std::vector<std::vector<size_t>> entry_offset;
+    double join_t0 = 0;
+    double prepare_s = 0, upload_s = 0, kernels_s = 0, download_s = 0, join_s = 0;
+    std::string memory;   // (diagnostic) free device memory at the device steps
+  } split;
 
   static GlobalIndex Count(const GravityPatch &p) {
     GlobalIndex n = 1;
@@ -421,7 +529,7 @@ struct MeshGeometry::Impl {
     std::vector<Sample> samples;
     PositionIndex sample_index;   // (cleared with every samples.clear())
     bool one_sided = !domain.c1_z_interfaces.empty();
-    // A cell spanning the entire x period has no same-side x neighbours.
+    // A cell spanning the entire x period has no same-side x neighbors.
     // On the deepest vacuum levels it must use periodic images from the
     // outset, rather than inferring periodic curvature from one-sided samples.
     // Keep the real source/vacuum z filter independent of this choice.
@@ -1142,8 +1250,674 @@ std::vector<std::pair<GlobalIndex,Real>> MeshGeometry::VirtualAverage(
   return result;
 }
 
-LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
+// <gravity>/test_gpu_assembly split build, step 1 (any thread): the host patch tables (cell
+// centers and widths from Cell(), aligned same-shape face neighbors from the patch tree, the
+// candidate lists of the irregular kernels) and the classification parameters.
+void MeshGeometry::PrepareSplit(bool forces, const GpuSplitOptions &options) {
   auto &m = *impl_;
+  const auto t0 = std::chrono::steady_clock::now();
+  auto &x = m.split;
+  x = Impl::Split{};
+  x.forces = forces;
+  x.components = forces ? 1+m.nd : 1;
+  const GlobalIndex begin = m.partition[m.rank], end = m.partition[m.rank+1];
+  const int rows = static_cast<int>(end-begin);
+  auto &g = x.g;
+  g.nd = m.nd; g.shear = m.domain.shear_phase_updates ? 1 : 0; g.n = m.partition.back();
+  for (int d = 0; d < 3; ++d) {
+    g.dlo[d] = m.domain.lo[d]; g.dhi[d] = m.domain.hi[d];
+    g.length[d] = m.length[d]; g.minwidth[d] = m.minwidth[d];
+  }
+  // more C1 planes than the tables hold: every row stays on the host
+  const bool supported = m.domain.c1_z_interfaces.size() <= static_cast<size_t>(gpu::kMaxPlanes);
+  g.nplanes = supported ? static_cast<int>(m.domain.c1_z_interfaces.size()) : 0;
+  for (int k = 0; k < g.nplanes; ++k) g.planes[k] = m.domain.c1_z_interfaces[k];
+  const int np = static_cast<int>(m.patches.size());
+  for (int p : m.row_order) if (m.patches[p].owner == m.rank) {
+    x.owned.push_back(p); x.owned_first.push_back(static_cast<int>(m.patches[p].row_begin-begin));
+  }
+  GlobalIndex centers = 0;
+  for (const auto &p : m.patches) centers += p.cells[0]+p.cells[1]+p.cells[2];
+  if (centers > std::numeric_limits<int>::max()) throw std::overflow_error("Gravity device center table");
+  x.width.assign(3*np,0.); x.cells.assign(3*np,0); x.coff.assign(3*np,0);
+  x.center.assign(centers,0.); x.row_begin.assign(np,0);
+  x.nb.assign(6*np,-1); x.wrap.assign(6*np,0);
+  g.width = {x.width.data(),static_cast<size_t>(np)};
+  g.cells = {x.cells.data(),static_cast<size_t>(np)};
+  g.coff = {x.coff.data(),static_cast<size_t>(np)};
+  g.center = {x.center.data(),x.center.size()};
+  g.row_begin = {x.row_begin.data(),x.row_begin.size()};
+  g.nb = {x.nb.data(),static_cast<size_t>(np)};
+  g.wrap = {x.wrap.data(),static_cast<size_t>(np)};
+  g.owned = {x.owned.data(),x.owned.size()};
+  g.owned_first = {x.owned_first.data(),x.owned_first.size()};
+  GlobalIndex offset = 0;
+  for (int p = 0; p < np; ++p) {
+    for (int d = 0; d < 3; ++d) {
+      g.cells(p,d) = m.patches[p].cells[d]; g.coff(p,d) = static_cast<int>(offset);
+      for (int i = 0; i < m.patches[p].cells[d]; ++i) {
+        const auto c = m.Cell(p,{{i,i,i}});
+        g.center(offset+i) = c.center[d];
+        if (i == 0) g.width(p,d) = c.width[d];
+      }
+      offset += m.patches[p].cells[d];
+    }
+    g.row_begin(p) = m.patches[p].row_begin;
+  }
+  auto locate = [&](const Vec &point) {
+    Box query; query.lo = point; query.hi = point;
+    std::vector<int> candidates; m.Query(0,query,candidates);
+    for (int q : candidates) {
+      bool inside = true;
+      for (int t = 0; t < m.nd; ++t)
+        inside = inside && point[t] > m.patches[q].lo[t] && point[t] < m.patches[q].hi[t];
+      if (inside) return q;
+    }
+    return -1;
+  };
+  for (int p = 0; p < np; ++p) for (int k = 0; k < 6; ++k) {
+    const int d = k/2, s = k%2 ? 1 : -1;
+    if (d >= m.nd) continue;
+    const auto &P = m.patches[p];
+    const double edge = s > 0 ? P.hi[d] : P.lo[d];
+    const double wall = s > 0 ? m.domain.hi[d] : m.domain.lo[d];
+    const bool boundary = std::abs(edge-wall) < m.minwidth[d]*1.e-5;
+    if (boundary && (d == 0 || (d == 2 && m.domain.isolated_z))) { g.nb(p,k) = -2; continue; }
+    Vec point{};
+    for (int t = 0; t < m.nd; ++t) point[t] = .5*(P.lo[t]+P.hi[t]);
+    point[d] = edge+s*.5*g.width(p,d);
+    if (boundary) point[d] -= s*m.length[d];
+    const int q = locate(point);
+    if (q < 0) continue;
+    const auto &Q = m.patches[q];
+    bool same = true;
+    for (int t = 0; t < m.nd; ++t) {
+      const double tol = g.width(p,t)*1.e-9;
+      same = same && Q.cells[t] == P.cells[t] &&
+             std::abs(g.width(q,t)-g.width(p,t)) <= g.width(p,t)*1.e-12;
+      if (t != d) same = same && std::abs(Q.lo[t]-P.lo[t]) <= tol;
+      else if (s > 0) same = same && std::abs(Q.lo[t]-(boundary ? m.domain.lo[t] : P.hi[t])) <= tol;
+      else same = same && std::abs(Q.hi[t]-(boundary ? m.domain.hi[t] : P.lo[t])) <= tol;
+    }
+    if (same) { g.nb(p,k) = q; g.wrap(p,k) = boundary ? 1 : 0; }
+  }
+  // The classification (ClassifySplit on the host, the same predicates on the device in
+  // RunDevice).  Irregular rows (options.irregular) go to the irregular kernels unless they touch
+  // the x boundary (phase rows) or lie within options.margin cell widths of it or of an
+  // isolated-z wall (x images and wall samples stay on the host; the kernels would refuse them,
+  // see gpu_irregular.hpp; margin 0 sends those rows to the kernels too, which then leave them to
+  // the host fallback).  A level with fewer than options.min_rows owned rows stays on the host
+  // (below that the kernels' latency exceeds the host's time for the level).
+  const bool irregular = options.irregular;
+  const double margin = std::max(0.,options.margin);
+  const long long min_rows = options.min_rows;
+  x.device_level = rows > 0 && rows >= min_rows && supported && !x.owned.empty();
+  x.irregular_on = x.device_level && irregular;
+  x.margin = margin;
+  if (x.irregular_on) {
+    // patch boxes, row order, and per patch face the candidate patches of the Faces() query of
+    // any of its cells (an enlarged query of the whole face, in tree order)
+    x.plo.assign(3*np,0.); x.phi.assign(3*np,0.);
+    for (int p = 0; p < np; ++p) for (int d = 0; d < 3; ++d) {
+      x.plo[3*p+d] = m.patches[p].lo[d]; x.phi[3*p+d] = m.patches[p].hi[d];
+    }
+    x.rorder = m.row_order;
+    x.cand_off.assign(6*np+1,0);
+    for (int p = 0; p < np; ++p) for (int k = 0; k < 6; ++k) {
+      x.cand_off[6*p+k] = static_cast<int>(x.cand.size());
+      const int d = k/2, side = k%2 ? 1 : -1;
+      if (d >= m.nd) continue;
+      const auto &P = m.patches[p];
+      const double edge = side > 0 ? P.hi[d] : P.lo[d];
+      const bool periodic = std::abs(edge-(side < 0 ? m.domain.lo[d] : m.domain.hi[d])) <
+                            m.minwidth[d]*1.e-5;
+      if (periodic && (d == 0 || (d == 2 && m.domain.isolated_z))) continue;
+      const double image = periodic ? side*m.length[d] : 0.;
+      Box box{};
+      for (int t = 0; t < m.nd; ++t) {
+        box.lo[t] = P.lo[t]-1.e-6*m.minwidth[t]; box.hi[t] = P.hi[t]+1.e-6*m.minwidth[t];
+      }
+      const double probe = edge-image+side*m.minwidth[d]*1.e-6;
+      box.lo[d] = probe-1.e-7*m.minwidth[d]; box.hi[d] = probe+1.e-7*m.minwidth[d];
+      std::vector<int> candidates; m.Query(0,box,candidates);
+      x.cand.insert(x.cand.end(),candidates.begin(),candidates.end());
+    }
+    x.cand_off[6*np] = static_cast<int>(x.cand.size());
+  }
+  x.prepared = true;
+  x.prepare_s = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+}
+
+// Split build, step 1b (any thread, after PrepareSplit, concurrently with RunDevice): the host
+// classification of the owned rows (the device classifies them itself with the same predicates)
+void MeshGeometry::ClassifySplit() {
+  auto &m = *impl_;
+  auto &x = m.split;
+  if (!x.prepared) throw std::logic_error("Gravity ClassifySplit before PrepareSplit");
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto &g = x.g;
+  const bool forces = x.forces, irregular = x.irregular_on;
+  const double margin = x.margin;
+  const int rows = static_cast<int>(m.partition[m.rank+1]-m.partition[m.rank]);
+  x.regular.assign(rows,-gpu::kOverflow);
+  const int chunks = std::max(1,std::min(64*std::max(1,m.setup_threads),rows/4096+1));
+  std::vector<std::array<long long,gpu::kReasons+1>> histogram(chunks);
+  if (x.device_level) {
+    ParallelChunks(m.setup_threads,chunks,[&](int c) {
+      const int first = static_cast<int>(static_cast<long long>(rows)*c/chunks);
+      const int last = static_cast<int>(static_cast<long long>(rows)*(c+1)/chunks);
+      auto &h = histogram[c];
+      h.fill(0);
+      for (int row = first; row < last; ++row) {
+        const auto ref = gpu::LocalRef(g,row);
+        const int why = gpu::Regular(g,ref,forces);
+        ++h[why >= 0 && why < gpu::kReasons ? why : gpu::kOverflow];
+        if (why == gpu::kRegular) { x.regular[row] = 1; continue; }
+        x.regular[row] = -why;
+        if (!irregular || why == gpu::kRowTouchesX) continue;
+        if (gpu::Far(g,gpu::GetCell(g,ref),margin,m.domain.isolated_z)) {
+          x.regular[row] = 2; ++h[gpu::kReasons];
+        }
+      }
+    });
+  } else {
+    histogram.assign(1,{}); histogram[0][gpu::kOverflow] = rows;
+  }
+  for (const auto &h : histogram) {
+    for (int r = 0; r < gpu::kReasons; ++r) x.why[r] += h[r];
+    x.irregular += h[gpu::kReasons];
+  }
+  if (x.irregular > 0)
+    for (int row = 0; row < rows; ++row) if (x.regular[row] == 2) x.irregular_rows.push_back(row);
+  x.classified = true;
+  x.prepare_s += std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+}
+
+// Split build, device step (the thread that owns the device, after PrepareSplit, concurrently with
+// BuildHostRows): upload, the gpu_assembly.hpp kernels (counts, offsets, entries), download.
+void MeshGeometry::RunDevice(int slot, const std::function<void()> &counted) {
+  auto &m = *impl_;
+  auto &x = m.split;
+  if (!x.prepared) throw std::logic_error("Gravity RunDevice before PrepareSplit");
+  if (!x.device_level) {
+    x.no_device = true; x.counted = true;
+    if (counted) counted();
+    x.device_done = true;
+    return;
+  }
+  using Clock = std::chrono::steady_clock;
+  auto seconds = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double>(b-a).count();
+  };
+  const auto t0 = Clock::now();
+  std::ostringstream memory;
+  auto mark = [&memory,&t0,&seconds](const char *step) {
+    Kokkos::fence();
+    memory << ' ' << step << '=' << seconds(t0,Clock::now()) << "s";
+#if defined(KOKKOS_ENABLE_CUDA)
+    std::size_t free = 0, total = 0;
+    cudaMemGetInfo(&free,&total);
+    memory << '/' << free/1073741824. << "GiB";
+#endif
+  };
+  // (x.regular: the host classification may still be running)
+  const int rows = static_cast<int>(m.partition[m.rank+1]-m.partition[m.rank]);
+  const auto &h = x.g;
+  gpu::Geometry g;
+  g.nd = h.nd; g.shear = h.shear; g.nplanes = h.nplanes; g.n = h.n;
+  for (int d = 0; d < 3; ++d) {
+    g.dlo[d] = h.dlo[d]; g.dhi[d] = h.dhi[d]; g.length[d] = h.length[d]; g.minwidth[d] = h.minwidth[d];
+  }
+  for (int k = 0; k < gpu::kMaxPlanes; ++k) g.planes[k] = h.planes[k];
+  const size_t np = h.width.n;
+  auto upload = [](auto &view, const char *name, const auto *data, size_t n) {
+    using V = std::remove_reference_t<decltype(view)>;
+    view = V(std::string(name),n);
+    typename V::HostMirror::const_type src(data,n);
+    Kokkos::deep_copy(view,src);
+  };
+  upload(g.width,"sg_gpu_width",x.width.data(),np);
+  upload(g.cells,"sg_gpu_cells",x.cells.data(),np);
+  upload(g.coff,"sg_gpu_center_offset",x.coff.data(),np);
+  upload(g.center,"sg_gpu_center",x.center.data(),x.center.size());
+  upload(g.row_begin,"sg_gpu_row_begin",x.row_begin.data(),x.row_begin.size());
+  upload(g.nb,"sg_gpu_neighbor",x.nb.data(),np);
+  upload(g.wrap,"sg_gpu_wrap",x.wrap.data(),np);
+  upload(g.owned,"sg_gpu_owned",x.owned.data(),x.owned.size());
+  upload(g.owned_first,"sg_gpu_owned_first",x.owned_first.data(),x.owned_first.size());
+  gpu::Irregular t;
+  t.isolated_z = m.domain.isolated_z ? 1 : 0;
+  gpu::DeviceFlags status("sg_gpu_status",x.irregular_on ? rows : 0);
+  if (x.irregular_on) {
+    upload(t.plo,"sg_gpu_patch_lo",x.plo.data(),np);
+    upload(t.phi,"sg_gpu_patch_hi",x.phi.data(),np);
+    upload(t.cand_off,"sg_gpu_candidate_offsets",x.cand_off.data(),x.cand_off.size());
+    upload(t.cand,"sg_gpu_candidates",x.cand.data(),x.cand.size());
+    upload(t.rorder,"sg_gpu_row_order",x.rorder.data(),x.rorder.size());
+  }
+  // the classification on the device (as ClassifySplit; compared in FinishSplitPrepare) and the
+  // list of the irregular rows
+  gpu::DeviceFlags regular(Kokkos::view_alloc(Kokkos::WithoutInitializing,"sg_gpu_regular"),rows);
+  {
+    const bool forces = x.forces, irregular = x.irregular_on, isolated_z = m.domain.isolated_z;
+    const double margin = x.margin;
+    Kokkos::parallel_for("sg_gpu_classify",Kokkos::RangePolicy<DevExeSpace>(0,rows),
+        KOKKOS_LAMBDA(const int row) {
+      const auto ref = gpu::LocalRef(g,row);
+      const int why = gpu::Regular(g,ref,forces);
+      int kind = why == gpu::kRegular ? 1 : -why;
+      if (kind < 0 && irregular && why != gpu::kRowTouchesX &&
+          gpu::Far(g,gpu::GetCell(g,ref),margin,isolated_z)) kind = 2;
+      regular(row) = kind;
+    });
+    int listed = 0;
+    if (irregular) {
+      Kokkos::parallel_reduce("sg_gpu_count_listed",Kokkos::RangePolicy<DevExeSpace>(0,rows),
+          KOKKOS_LAMBDA(const int row, int &n) { n += regular(row) == 2; },listed);
+      t.rows = Kokkos::View<int*, DevMemSpace>(
+          Kokkos::view_alloc(Kokkos::WithoutInitializing,"sg_gpu_irregular_rows"),listed);
+      auto list = t.rows;
+      Kokkos::parallel_scan("sg_gpu_list_irregular",Kokkos::RangePolicy<DevExeSpace>(0,rows),
+          KOKKOS_LAMBDA(const int row, int &update, const bool final) {
+        if (regular(row) != 2) return;
+        if (final) list(update) = row;
+        ++update;
+      });
+    }
+    x.device_kind.resize(rows);
+    Kokkos::View<int*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged> h_kind(x.device_kind.data(),rows);
+    Kokkos::deep_copy(h_kind,regular);
+  }
+  const bool listed_rows = t.rows.extent(0) > 0;
+  mark("classify");
+  const auto t1 = Clock::now();
+  std::array<gpu::DeviceIndex,4> count, col;
+  std::array<Kokkos::View<double*, DevMemSpace>,4> val;
+  for (int c = 0; c < 4; ++c) count[c] = gpu::DeviceIndex("sg_gpu_offsets",c < x.components ? rows+1 : 1);
+  if (rows > 0 && !x.owned.empty()) {
+    Kokkos::parallel_for("sg_gpu_count_rows",Kokkos::RangePolicy<DevExeSpace>(0,rows),
+        gpu::CountRows{g,regular,x.components,count[0],count[1],count[2],count[3]});
+  }
+  mark("count");
+  gpu::Quads fits;
+  std::array<double,4> irregular_s{};
+  if (listed_rows) {
+    fits = gpu::IrregularCount(g,t,x.forces,x.components,count[0],count[1],count[2],count[3],
+                               status,&irregular_s);
+    mark("count_irregular");
+    memory << "(marks=" << irregular_s[0] << "s fit_counts=" << irregular_s[1] << "s fit_fill="
+           << irregular_s[2] << "s row_counts=" << irregular_s[3] << "s fits=" << fits.count
+           << " samples=" << fits.samples << ")";
+  }
+  std::array<GlobalIndex,4> total{};
+  for (int c = 0; c < x.components; ++c) {
+    Kokkos::parallel_scan("sg_gpu_offsets",Kokkos::RangePolicy<DevExeSpace>(0,rows+1),
+                          gpu::ScanCounts{count[c]},total[c]);
+  }
+  // a row the host left to the device that overflowed the fixed row buffers (impossible for
+  // the regular stencils: A has 2 nd+1 entries, an acceleration row at most 17 in 3-D)
+  int lost = 0;
+  Kokkos::parallel_reduce("sg_gpu_lost_rows",Kokkos::RangePolicy<DevExeSpace>(0,rows),
+      KOKKOS_LAMBDA(const int i, int &n) { n += regular(i) == -gpu::kOverflow; },lost);
+  if (lost > 0) throw std::logic_error("Gravity device rows overflowed the row buffers");
+  // the offsets and statuses now (page-locked buffers of this slot): the joining thread sizes the
+  // output while the entries are filled
+  auto &pool = Pinned();
+  if (static_cast<int>(pool.offset.size()) <= slot) {
+    pool.offset.resize(slot+1); pool.col.resize(slot+1); pool.val.resize(slot+1);
+  }
+  for (int c = 0; c < 4; ++c) {
+    x.offset[c] = Take(pool.offset[slot][c],count[c].extent(0),"sg_gpu_pinned_offsets");
+    Kokkos::deep_copy(x.offset[c],count[c]);
+  }
+  if (x.irregular_on) {
+    x.status.resize(rows);
+    Kokkos::View<int*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged> h_status(x.status.data(),rows);
+    Kokkos::deep_copy(h_status,status);
+  }
+  mark("offsets");
+  x.counted = true;
+  if (counted) counted();
+  for (int c = 0; c < 4; ++c) {
+    const GlobalIndex n = c < x.components ? total[c] : 0;
+    col[c] = gpu::DeviceIndex(Kokkos::view_alloc(Kokkos::WithoutInitializing,"sg_gpu_columns"),n);
+    val[c] = Kokkos::View<double*, DevMemSpace>(
+        Kokkos::view_alloc(Kokkos::WithoutInitializing,"sg_gpu_values"),n);
+  }
+  if (rows > 0 && !x.owned.empty()) {
+    Kokkos::parallel_for("sg_gpu_fill_rows",Kokkos::RangePolicy<DevExeSpace>(0,rows),
+        gpu::FillRows{g,regular,x.components,count[0],count[1],count[2],count[3],
+                      col[0],col[1],col[2],col[3],val[0],val[1],val[2],val[3]});
+  }
+  mark("fill");
+  if (listed_rows) {
+    gpu::IrregularFill(g,t,fits,x.forces,x.components,count,col,val,status);
+    mark("fill_irregular");
+  }
+  const auto t2 = Clock::now();
+  for (int c = 0; c < 4; ++c) {
+    x.colidx[c] = Take(pool.col[slot][c],col[c].extent(0),"sg_gpu_pinned_columns");
+    x.values[c] = Take(pool.val[slot][c],val[c].extent(0),"sg_gpu_pinned_values");
+    Kokkos::deep_copy(x.colidx[c],col[c]);
+    Kokkos::deep_copy(x.values[c],val[c]);
+  }
+  mark("download");
+  const auto t3 = Clock::now();
+  x.upload_s = seconds(t0,t1); x.kernels_s = seconds(t1,t2); x.download_s = seconds(t2,t3);
+  x.memory = memory.str();
+  x.device_done = true;
+}
+
+LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
+  return BuildSystemRows(forces,false);
+}
+
+// Split build, host step (after PrepareSplit, any thread, concurrently with RunDevice): the rows
+// the device does not assemble; the device rows are empty placeholders until FinishSplit.
+void MeshGeometry::BuildHostRows() {
+  auto &x = impl_->split;
+  if (!x.prepared) throw std::logic_error("Gravity BuildHostRows before PrepareSplit");
+  BuildSystemRows(x.forces,true);
+  x.host_done = true;
+}
+
+// Split build, last step (after BuildHostRows and RunDevice): the device rows into their
+// placeholders, as a serial join (no floating-point arithmetic).
+LocalCompositeSystem MeshGeometry::FinishSplit() {
+  FinishSplitPrepare();
+  return FinishSplitCopy();
+}
+
+void MeshGeometry::FinishSplitPrepare() {
+  auto &m = *impl_;
+  auto &x = m.split;
+  if (!x.host_done || !x.counted) throw std::logic_error("Gravity FinishSplit before both passes");
+  if (!x.no_device && x.device_kind != x.regular)
+    throw std::logic_error("Gravity device and host row classifications differ");
+  const auto t0 = std::chrono::steady_clock::now();
+  x.join_t0 = std::chrono::duration<double>(t0.time_since_epoch()).count();
+  auto &out = x.out;
+  const GlobalIndex begin = m.partition[m.rank];
+  const bool forces = x.forces;
+  auto component = [](auto &system, int k) -> LocalCsr & {
+    if (k == 0) return system.matrix;
+    if (k == 1) return system.boundary_rhs;
+    if (k < 5) return system.acceleration[k-2];
+    return system.boundary_acceleration[k-5];
+  };
+  // the device component of system component k (-1: none)
+  auto device_component = [&](int k) {
+    if (k == 0) return 0;
+    if (k >= 2 && k < 5 && k-2 < m.nd && forces) return k-1;
+    return -1;
+  };
+  const int components = forces ? 8 : 1;
+  const int chunks = static_cast<int>(x.parts.size());
+  const int setup_workers = std::max(1,m.setup_threads);
+  // irregular rows the device left to the host (status <= 0): assembled here, as in the host pass
+  // (fresh caches per chunk; the coefficients do not depend on them)
+  const GlobalIndex n = m.partition.back();
+  auto &failed = x.failed;
+  failed.clear();
+  for (int i : x.irregular_rows) if (x.status[i] <= 0) failed.push_back(i);
+  x.fallback = static_cast<long long>(failed.size());
+  for (int i : failed) ++x.failures[std::min(7,-x.status[i])];
+  using Fallback = Impl::Split::Fallback;
+  auto &fallback = x.fallback_rows;
+  fallback.assign(failed.size(),Fallback{});
+  if (!failed.empty()) {
+    const int fchunks = std::min(static_cast<int>(failed.size()),8*setup_workers);
+    std::vector<std::vector<GlobalIndex>> interface_ids(fchunks), x_image_ids(fchunks);
+    ParallelChunks(setup_workers,fchunks,[&](int c) {
+      QuadraticCache quadratics; ReconstructionFaces faces; RowWorkspace work;
+      const size_t first = failed.size()*c/fchunks, last = failed.size()*(c+1)/fchunks;
+      for (size_t i = first; i < last; ++i) {
+        const GlobalIndex row = begin+failed[i];
+        const auto ci = m.Cell(row); double volume = 1.;
+        for (int d = 0; d < m.nd; ++d) volume *= ci.width[d];
+        bool is_interface = false, phase_dependent = false;
+        m.AssembleRow(row,ci,volume,forces,work,quadratics,faces,
+                      forces ? &is_interface : nullptr,&phase_dependent);
+        auto &f = fallback[i];
+        f.interface = is_interface; f.phase = phase_dependent;
+        Append(f.c[0],work.a,n,false);
+        if (forces) Append(f.c[1],work.a,n,true,-1.);
+        for (int d = 0; forces && d < 3; ++d) {
+          Append(f.c[2+d],work.g[d],n,false);
+          Append(f.c[5+d],work.g[d],n,true);
+        }
+      }
+      for (const auto &q : quadratics) {
+        if (q.second.interface_fallback) interface_ids[c].push_back(q.first);
+        if (q.second.x_image_fallback) x_image_ids[c].push_back(q.first);
+      }
+    });
+    auto merge = [](std::vector<GlobalIndex> &all, std::vector<std::vector<GlobalIndex>> &lists) {
+      for (auto &list : lists) all.insert(all.end(),list.begin(),list.end());
+      std::sort(all.begin(),all.end());
+      all.erase(std::unique(all.begin(),all.end()),all.end());
+      return all.size();
+    };
+    out.quadratic_interface_fallbacks = merge(x.interface_ids,interface_ids);
+    out.quadratic_x_image_fallbacks = merge(x.x_image_ids,x_image_ids);
+    bool phase = false;
+    for (size_t i = 0; i < failed.size(); ++i) if (fallback[i].phase) {
+      m.phase_rows.push_back(failed[i]); phase = true;
+    }
+    if (phase) std::sort(m.phase_rows.begin(),m.phase_rows.end());
+  }
+  auto &row_offset = x.row_offset;
+  auto &entry_offset = x.entry_offset;
+  row_offset.assign(chunks+1,0);
+  entry_offset.assign(components,std::vector<size_t>(chunks+1,0));
+  for (int c = 0; c < chunks; ++c) {
+    auto &part = x.parts[c];
+    const size_t rows = part.matrix.LocalRows();
+    row_offset[c+1] = row_offset[c]+rows;
+    const auto f0 = std::lower_bound(failed.begin(),failed.end(),static_cast<int>(row_offset[c]));
+    const auto f1 = std::lower_bound(failed.begin(),failed.end(),static_cast<int>(row_offset[c+1]));
+    for (int k = 0; k < components; ++k) {
+      if (component(part,k).LocalRows() != rows)
+        throw std::logic_error("Gravity setup part components disagree on rows");
+      const int dc = device_component(k);
+      size_t device = dc < 0 || x.no_device ? 0 : static_cast<size_t>(
+          x.offset[dc](row_offset[c+1])-x.offset[dc](row_offset[c]));
+      for (auto f = f0; f != f1; ++f) device += fallback[f-failed.begin()].c[k].values.size();
+      entry_offset[k][c+1] = entry_offset[k][c]+component(part,k).values.size()+device;
+    }
+  }
+  for (int k = 0; k < components; ++k)
+    if (entry_offset[k][chunks] > static_cast<size_t>(std::numeric_limits<int>::max()))
+      throw std::overflow_error("Gravity local CSR exceeds 32-bit offsets");
+  const size_t total = row_offset[chunks];
+  if (total != x.regular.size()) throw std::logic_error("Gravity split build lost rows");
+  const int workers = std::max(1,std::min(setup_workers,chunks));
+  ParallelChunks(workers,3*components+(forces ? 3 : 0),[&](int t) {
+    if (t < 3*components) {
+      auto &a = component(out,t/3);
+      if (t%3 == 0) { a.rowptr.resize(total+1); a.rowptr[0] = 0; }
+      else if (t%3 == 1) a.colidx.resize(entry_offset[t/3][chunks]);
+      else a.values.resize(entry_offset[t/3][chunks]);
+    } else if (t == 3*components) {
+      out.volume.resize(total);
+    } else if (t == 3*components+1) {
+      out.cells.resize(total);
+    } else {
+      out.interface.resize(total);
+    }
+  });
+  x.join_prepared = true;
+}
+
+LocalCompositeSystem MeshGeometry::FinishSplitCopy() {
+  auto &m = *impl_;
+  auto &x = m.split;
+  if (!x.join_prepared || !x.device_done) throw std::logic_error("Gravity FinishSplit before both passes");
+  auto out = std::move(x.out);
+  const bool forces = x.forces;
+  auto component = [](auto &system, int k) -> LocalCsr & {
+    if (k == 0) return system.matrix;
+    if (k == 1) return system.boundary_rhs;
+    if (k < 5) return system.acceleration[k-2];
+    return system.boundary_acceleration[k-5];
+  };
+  auto device_component = [&](int k) {
+    if (k == 0) return 0;
+    if (k >= 2 && k < 5 && k-2 < m.nd && forces) return k-1;
+    return -1;
+  };
+  const int components = forces ? 8 : 1;
+  const int chunks = static_cast<int>(x.parts.size());
+  const int workers = std::max(1,std::min(std::max(1,m.setup_threads),chunks));
+  const auto &failed = x.failed;
+  const auto &fallback = x.fallback_rows;
+  const auto &row_offset = x.row_offset;
+  const auto &entry_offset = x.entry_offset;
+  using Fallback = Impl::Split::Fallback;
+  auto fallback_of = [&](size_t local) -> const Fallback & {
+    const auto it = std::lower_bound(failed.begin(),failed.end(),static_cast<int>(local));
+    return fallback[it-failed.begin()];
+  };
+  ParallelChunks(workers,chunks,[&](int c) {
+    auto &part = x.parts[c];
+    for (int k = 0; k < components; ++k) {
+      auto &source = component(part,k);
+      auto &destination = component(out,k);
+      const int dc = device_component(k);
+      size_t at = entry_offset[k][c];
+      for (size_t i = 0; i+1 < source.rowptr.size(); ++i) {
+        const size_t local = row_offset[c]+i;
+        const int kind = x.regular[local];
+        if (kind == 2 && x.status[local] <= 0) {
+          const auto &f = fallback_of(local).c[k];
+          std::copy(f.colidx.begin(),f.colidx.end(),destination.colidx.begin()+at);
+          std::copy(f.values.begin(),f.values.end(),destination.values.begin()+at);
+          at += f.values.size();
+        } else if (kind > 0) {
+          if (dc >= 0) {
+            const GlobalIndex k0 = x.offset[dc](local), k1 = x.offset[dc](local+1);
+            std::copy(x.colidx[dc].data()+k0,x.colidx[dc].data()+k1,destination.colidx.begin()+at);
+            std::copy(x.values[dc].data()+k0,x.values[dc].data()+k1,destination.values.begin()+at);
+            at += static_cast<size_t>(k1-k0);
+          }
+        } else {
+          const int s0 = source.rowptr[i], s1 = source.rowptr[i+1];
+          std::copy(source.colidx.begin()+s0,source.colidx.begin()+s1,destination.colidx.begin()+at);
+          std::copy(source.values.begin()+s0,source.values.begin()+s1,destination.values.begin()+at);
+          at += static_cast<size_t>(s1-s0);
+        }
+        destination.rowptr[local+1] = static_cast<int>(at);
+      }
+    }
+    if (forces) {
+      std::copy(part.volume.begin(),part.volume.end(),out.volume.begin()+row_offset[c]);
+      std::copy(part.cells.begin(),part.cells.end(),out.cells.begin()+row_offset[c]);
+      std::copy(part.interface.begin(),part.interface.end(),out.interface.begin()+row_offset[c]);
+      for (size_t local = row_offset[c]; local < row_offset[c+1]; ++local)
+        if (x.regular[local] == 2)
+          out.interface[local] = x.status[local] > 0 ? x.status[local] == 2
+                                                     : fallback_of(local).interface;
+    }
+    part = Impl::Part{};
+  });
+  x.parts.clear(); x.failed.clear(); x.fallback_rows.clear();
+  for (int c = 0; c < 4; ++c) {
+    x.offset[c] = {}; x.colidx[c] = {}; x.values[c] = {};
+  }
+  x.join_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count()-x.join_t0;
+  long long device_rows = x.why[0]+x.irregular-x.fallback;
+  m.device_stats = {{static_cast<double>(device_rows),static_cast<double>(x.regular.size()),
+                     x.prepare_s,x.upload_s+x.kernels_s,x.download_s,x.join_s}};
+  if (SetupTimesOn()) {
+    const auto &w = x.why;
+    std::cout << "# SG_GPU_ASSEMBLY_ROWS rank=" << m.rank << " forces=" << forces
+              << " rows=" << x.regular.size() << " device=" << w[0]
+              << " irregular_device=" << x.irregular-x.fallback << " irregular_to_host=" << x.fallback
+              << " (x/wall/geometry/samples/rank/duplicate/buffer=" << x.failures[1] << '/'
+              << x.failures[2] << '/' << x.failures[3] << '/' << x.failures[4] << '/'
+              << x.failures[5] << '/' << x.failures[6] << '/' << x.failures[7] << ")"
+              << " first non-regular reason (all non-regular rows):"
+              << " touches_x=" << w[1] << " near_c1_plane=" << w[2]
+              << " neighbor_touches_x=" << w[3] << " level_jump=" << w[4]
+              << " domain_wall=" << w[5] << " face_geometry=" << w[6] << " offset=" << w[7]
+              << " c1_face=" << w[8] << " width=" << w[9] << " self_face=" << w[10]
+              << " unsupported=" << w[11] << " | prepare_s=" << x.prepare_s
+              << " upload_s=" << x.upload_s << " kernels_s=" << x.kernels_s
+              << " download_s=" << x.download_s << " join_s=" << x.join_s
+              << " host_thread_s by reason:";
+    for (int k = 1; k < gpu::kReasons; ++k) std::cout << ' ' << k << '=' << m.reason_seconds[k];
+    std::cout << " device:" << x.memory << std::endl;
+  }
+  x.prepared = x.host_done = x.device_done = x.counted = x.join_prepared = false;
+  return out;
+}
+
+// (test_gpu_assembly = 2) the host system of the same geometry, compared bitwise with a split
+// build's result (every component, volume/cells/interface/phase rows/boundary/fallbacks).
+long long MeshGeometry::CheckSplit(const LocalCompositeSystem &split, bool forces, std::string *first_difference) {
+  auto &m = *impl_;
+  const auto split_phase_rows = m.phase_rows;
+  m.phase_rows_ready = false;
+  const auto reference = BuildSystemRows(forces,false);
+  long long differ = 0;
+  std::string first;
+  auto compare = [&](const LocalCsr &a, const LocalCsr &b, const char *name) {
+    if (a.global_rows != b.global_rows || a.global_cols != b.global_cols ||
+        a.row_begin != b.row_begin || a.rowptr.size() != b.rowptr.size()) {
+      ++differ; if (first.empty()) first = std::string(name)+" shape"; return;
+    }
+    for (size_t i = 0; i+1 < a.rowptr.size(); ++i) {
+      const int a0 = a.rowptr[i], a1 = a.rowptr[i+1], b0 = b.rowptr[i], b1 = b.rowptr[i+1];
+      bool same = a1-a0 == b1-b0;
+      if (same && a1 > a0) {
+        same = std::memcmp(a.colidx.data()+a0,b.colidx.data()+b0,(a1-a0)*sizeof(GlobalIndex)) == 0
+            && std::memcmp(a.values.data()+a0,b.values.data()+b0,(a1-a0)*sizeof(Real)) == 0;
+      }
+      if (same) continue;
+      ++differ;
+      if (first.empty()) {
+        std::ostringstream o;
+        o << name << " local row " << i << " (global " << a.row_begin+GlobalIndex(i) << ") host";
+        o.precision(17);
+        for (int k = a0; k < a1; ++k) o << ' ' << a.colidx[k] << ':' << a.values[k];
+        o << " device";
+        for (int k = b0; k < b1; ++k) o << ' ' << b.colidx[k] << ':' << b.values[k];
+        first = o.str();
+      }
+    }
+  };
+  compare(reference.matrix,split.matrix,"A");
+  compare(reference.boundary_rhs,split.boundary_rhs,"boundary_rhs");
+  for (int d = 0; d < 3; ++d) {
+    compare(reference.acceleration[d],split.acceleration[d],"acceleration");
+    compare(reference.boundary_acceleration[d],split.boundary_acceleration[d],"boundary_acceleration");
+  }
+  auto same_bytes = [](const auto &a, const auto &b) {
+    return a.size() == b.size() && (a.empty() ||
+        std::memcmp(a.data(),b.data(),a.size()*sizeof(a[0])) == 0);
+  };
+  const bool others = same_bytes(reference.volume,split.volume) && same_bytes(reference.cells,split.cells)
+      && same_bytes(reference.interface,split.interface) && same_bytes(split_phase_rows,m.phase_rows)
+      && same_bytes(reference.boundary_cells,split.boundary_cells)
+      && same_bytes(reference.boundary_area,split.boundary_area)
+      && same_bytes(reference.boundary_width,split.boundary_width)
+      && reference.boundary_samples.size() == split.boundary_samples.size()
+      && reference.row_partition == split.row_partition
+      && reference.sample_partition == split.sample_partition
+      && reference.neumann_z == split.neumann_z
+      && reference.quadratic_interface_fallbacks == split.quadratic_interface_fallbacks
+      && reference.quadratic_x_image_fallbacks == split.quadratic_x_image_fallbacks;
+  if (!others) { ++differ; if (first.empty()) first = "volume/cells/interface/phase rows/boundary/fallbacks"; }
+  if (first_difference) *first_difference = first;
+  return differ;
+}
+
+LocalCompositeSystem MeshGeometry::BuildSystemRows(bool forces, bool split) {
+  auto &m = *impl_;
+  using BuildClock = std::chrono::steady_clock;
+  const auto build_t0 = BuildClock::now();
+  m.build_join_s = 0;
   // Full setup owns its scratch independently of retained phase-worker caches.
   // In particular, a reused object must never inherit gradients from an earlier
   // full build or an interrupted assembly at a different phase.
@@ -1181,22 +1955,29 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   if (discover_phase_rows) m.phase_rows.clear();
   // One worker's consecutive rows. Every row is the same pure function of the geometry;
   // the caches only memoize it, so private caches give the serial coefficients.
-  struct Part {
-    LocalCsr matrix, boundary_rhs;
-    std::array<LocalCsr,3> acceleration, boundary_acceleration;
-    std::vector<Real> volume;
-    std::vector<CompositeCell> cells;
-    std::vector<unsigned char> interface;
-    std::vector<int> phase_rows;
-  };
+  using Part = Impl::Part;
+  const bool row_profile = SetupTimesOn();
+  // (split build, <gravity>/test_gpu_assembly) rows left to the device: empty placeholders here
+  const int *skip = split ? m.split.regular.data() : nullptr;
   auto assemble = [&](GlobalIndex first, GlobalIndex last, Part &part,
                       QuadraticCache &quadratics, ReconstructionFaces &faces) {
     RowWorkspace work;
     for (GlobalIndex row = first; row < last; ++row) {
+      const auto row_t0 = row_profile ? BuildClock::now() : BuildClock::time_point{};
       const auto ci = m.Cell(row); double volume = 1.;
       for (int d = 0; d < m.nd; ++d) volume *= ci.width[d];
       if (forces) {
         part.volume.push_back(volume); part.cells.push_back(ci); part.interface.push_back(0);
+      }
+      if (skip && skip[row-begin] > 0) {
+        // a device row: not an interface, not a phase row, no exterior columns
+        auto empty = [](LocalCsr &a) { a.rowptr.push_back(static_cast<int>(a.values.size())); };
+        empty(part.matrix);
+        if (forces) {
+          empty(part.boundary_rhs);
+          for (int d = 0; d < 3; ++d) { empty(part.acceleration[d]); empty(part.boundary_acceleration[d]); }
+        }
+        continue;
       }
       bool is_interface = false, phase_dependent = false;
       m.AssembleRow(row,ci,volume,forces,work,quadratics,faces,
@@ -1211,6 +1992,18 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
         Append(part.acceleration[d],work.g[d],n,false);
         Append(part.boundary_acceleration[d],work.g[d],n,true);
       }
+      if (row_profile) {
+        const double dt = std::chrono::duration<double>(BuildClock::now()-row_t0).count();
+        const int p = m.Patch(row); const auto ijk = m.Indices(p,row);
+        bool inner = true;
+        for (int d = 0; d < m.nd; ++d)
+          inner = inner && ijk[d] >= 2 && ijk[d]+2 < m.patches[p].cells[d];
+        if (inner) { part.t_inner += dt; ++part.n_inner; } else { part.t_outer += dt; ++part.n_outer; }
+        if (skip) {
+          const int why = -skip[row-begin];
+          if (why > 0 && why < gpu::kReasons) part.t_reason[why] += dt;
+        }
+      }
     }
   };
   // The full setup runs on SetupThreads() workers; the rows are cut into
@@ -1219,7 +2012,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   const int workers = static_cast<int>(std::max<GlobalIndex>(1,std::min<GlobalIndex>(
       SetupThreads(),(end-begin)/4096)));
   std::size_t interface_fallbacks = 0, x_image_fallbacks = 0;  // parallel path only
-  if (workers == 1) {
+  if (workers == 1 && !split) {
     // Serial: write straight into the output (identical to the original loop).
     Part part;
     part.matrix = std::move(out.matrix); part.boundary_rhs = std::move(out.boundary_rhs);
@@ -1238,6 +2031,9 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
     out.volume = std::move(part.volume); out.cells = std::move(part.cells);
     out.interface = std::move(part.interface);
     if (discover_phase_rows) m.phase_rows = std::move(part.phase_rows);
+    m.build_rows_s = std::chrono::duration<double>(BuildClock::now()-build_t0).count();
+    m.build_class = {{part.t_inner,part.t_outer,double(part.n_inner),double(part.n_outer)}};
+    m.reason_seconds = part.t_reason;
   } else {
     const GlobalIndex rows = end-begin;
     const int chunks = static_cast<int>(std::max<GlobalIndex>(workers,
@@ -1281,10 +2077,12 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
     };
     ThreadWorkers().Run(workers,run);
     for (const auto &error : errors) if (error) std::rethrow_exception(error);
+    const auto build_t1 = BuildClock::now();
+    m.build_rows_s = std::chrono::duration<double>(build_t1-build_t0).count();
     // Concatenation in row order without floating-point arithmetic, as a serial join:
     // exact-size outputs (each vector resized by one task), then every part is copied
     // into its slot and released by a worker. The serial join of all parts and the merge
-    // of the fit caches took ~0.8 s of a ~1 s fine setup with 2M rows on GH200.
+    // of the fit caches took most of the fine setup.
     auto component = [](auto &system, int k) -> LocalCsr & {
       if (k == 0) return system.matrix;
       if (k == 1) return system.boundary_rhs;
@@ -1294,8 +2092,18 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
     const int components = forces ? 8 : 1;
     std::vector<size_t> row_offset(chunks+1,0);
     std::vector<std::vector<size_t>> entry_offset(components,std::vector<size_t>(chunks+1,0));
+    m.build_class = {{0.,0.,0.,0.}};
+    m.reason_seconds = {};
     for (int c = 0; c < chunks; ++c) {
       auto &part = parts[c];
+      m.build_class[0] += part.t_inner; m.build_class[1] += part.t_outer;
+      for (int k = 0; k < gpu::kReasons; ++k) m.reason_seconds[k] += part.t_reason[k];
+      m.build_class[2] += part.n_inner; m.build_class[3] += part.n_outer;
+      if (split) {   // the join waits for the device rows (FinishSplit)
+        if (discover_phase_rows)
+          m.phase_rows.insert(m.phase_rows.end(),part.phase_rows.begin(),part.phase_rows.end());
+        continue;
+      }
       row_offset[c+1] = row_offset[c]+part.matrix.LocalRows();
       for (int k = 0; k < components; ++k) {
         if (component(part,k).LocalRows() != part.matrix.LocalRows())
@@ -1308,7 +2116,8 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
     for (int k = 0; k < components; ++k)
       if (entry_offset[k][chunks] > static_cast<size_t>(std::numeric_limits<int>::max()))
         throw std::overflow_error("Gravity local CSR exceeds 32-bit offsets");
-    const size_t total = row_offset[chunks];
+    if (split) m.split.parts = std::move(parts);
+    const size_t total = split ? 0 : row_offset[chunks];
     auto parallel = [&](int tasks, const std::function<void(int)> &task) {
       const int count = std::max(1,std::min(workers,tasks));
       std::vector<std::exception_ptr> failures(count);
@@ -1320,7 +2129,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
       ThreadWorkers().Run(count,work);
       for (const auto &failure : failures) if (failure) std::rethrow_exception(failure);
     };
-    parallel(3*components+(forces ? 3 : 0),[&](int t) {
+    if (!split) parallel(3*components+(forces ? 3 : 0),[&](int t) {
       if (t < 3*components) {
         auto &a = component(out,t/3);
         if (t%3 == 0) a.rowptr.resize(total+1);
@@ -1334,7 +2143,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
         out.interface.resize(total);
       }
     });
-    parallel(chunks,[&](int c) {
+    if (!split) parallel(chunks,[&](int c) {
       auto &part = parts[c];
       for (int k = 0; k < components; ++k) {
         auto &source = component(part,k);
@@ -1363,6 +2172,17 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
       return static_cast<std::size_t>(std::unique(all.begin(),all.end())-all.begin());
     };
     interface_fallbacks = unique(interface_ids); x_image_fallbacks = unique(x_image_ids);
+    if (split) {   // FinishSplit adds the fits of the irregular rows the device left to the host
+      auto ids = [](std::vector<std::vector<GlobalIndex>> &lists) {
+        std::vector<GlobalIndex> all;
+        for (auto &list : lists) all.insert(all.end(),list.begin(),list.end());
+        std::sort(all.begin(),all.end());
+        all.erase(std::unique(all.begin(),all.end()),all.end());
+        return all;
+      };
+      m.split.interface_ids = ids(interface_ids); m.split.x_image_ids = ids(x_image_ids);
+    }
+    m.build_join_s = std::chrono::duration<double>(BuildClock::now()-build_t1).count();
   }
   m.phase_rows_ready = true;
   for (int p : m.row_order) if (forces && m.patches[p].owner == m.rank) {
@@ -1388,6 +2208,7 @@ LocalCompositeSystem MeshGeometry::BuildSystem(bool forces) {
   }
   m.quadratics.clear(); m.quadratics.rehash(0);
   m.reconstruction_faces = ReconstructionFaces{};
+  if (split) { m.split.out = std::move(out); return LocalCompositeSystem{}; }
   return out;
 }
 
@@ -1482,7 +2303,7 @@ LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase, bool forces) {
   // Chunks contain consecutive sorted rows. Concatenation performs no floating
   // arithmetic, preserving serial coefficients and sparse entry order bitwise:
   // every (component, chunk) copies into its own slot of the exact-size outputs, on the
-  // phase workers (the serial join of ~40M entries took a third of the fine update).
+  // phase workers (the serial join took a large part of the fine update).
   auto component = [](LocalCompositeUpdate &u, int k) -> CsrRowUpdate & {
     if (k == 0) return u.matrix;
     if (k == 1) return u.boundary_rhs;
@@ -1524,6 +2345,18 @@ LocalCompositeUpdate MeshGeometry::BuildPhaseUpdate(Real phase, bool forces) {
   m.phase_rows_s = std::chrono::duration<double>(t1-t0).count();
   m.phase_join_s = std::chrono::duration<double>(Clock::now()-t1).count();
   return out;
+}
+
+std::array<long long,2> MeshGeometry::SplitRows() const {
+  const auto &x = impl_->split;
+  return {{x.why[0]+x.irregular,static_cast<long long>(x.regular.size())}};
+}
+
+std::array<double,6> MeshGeometry::LastDeviceStats() const { return impl_->device_stats; }
+
+std::array<double,6> MeshGeometry::LastBuildSeconds() const {
+  const auto &c = impl_->build_class;
+  return {{impl_->build_rows_s,impl_->build_join_s,c[0],c[1],c[2],c[3]}};
 }
 
 std::array<double,2> MeshGeometry::LastPhaseUpdateSeconds() const {

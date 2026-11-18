@@ -15,9 +15,8 @@
 
 // The stage clock (DUST_R_STAGES) and the basic-solution check (DUST_R_BASIS) of the
 // device patch solves are compiled only with -DDUST_R_DIAG=1.  Compiled in but switched off they
-// still changed the solve kernels (local CUDA build, sm_89: the small-patch kernel 168 -> 178
-// registers, the 512- and 1024-thread kernels 24 / 32 more stack bytes per thread, 64 more bytes
-// of shared memory each).  With DUST_R_DIAG = 0, amr_profile still times the phases on the host.
+// still changed the solve kernels (more registers, stack and shared memory per thread).
+// With DUST_R_DIAG = 0, amr_profile still times the phases on the host.
 #ifndef DUST_R_DIAG
 #define DUST_R_DIAG 0
 #endif
@@ -51,7 +50,7 @@ enum PatchCount {PN=0, PKEPT=1, PNCAP=2, PFALLBACK=3, PZERO=4, PCAPSTEP=5, PSCAN
 // The pool sorted by patch (k = 0..npool-1, patch q holds k in [pptr(q), pptr(q+1))): rows
 // spd (npool x NPD), CSR weights sptr / stgt / swgt in the same order.  New masses in mnew
 // (sorted order), counters in outi (npatch x NPC) and the accepted residual in outr (npatch).
-// Patch q is centred at (pgeo(q,0), pgeo(q,1)); its centre-of-mass rows are measured in units of
+// Patch q is centered at (pgeo(q,0), pgeo(q,1)); its center-of-mass rows are measured in units of
 // (pgeo(q,2), pgeo(q,3)).
 // Workspaces are allocated per team slot, with at most mem_mb megabytes in all.
 struct DevicePatchProblem {
@@ -61,8 +60,8 @@ struct DevicePatchProblem {
   DvceArray2D<Real> pgeo;
   int npool = 0, npatch = 0;
   double lx = 0.0, ly = 0.0;
-  // 3-D refinable clouds: pools with JZ, pgeo (x, y, z centre, three half widths) and a
-  // third centre-of-mass row; the 2-D rows and their order are unchanged
+  // 3-D refinable clouds: pools with JZ, pgeo (x, y, z center, three half widths) and a
+  // third center-of-mass row; the 2-D rows and their order are unchanged
   bool three = false;
   double lz = 0.0;
   // amr_profile only: device clock cycles of the patch solves by stage, summed over
@@ -70,7 +69,7 @@ struct DevicePatchProblem {
   DvceArray1D<unsigned long long> stage;
   bool qr_rows = false;   // the QR update shares the rows as well (cloud_resample_qr_rows)
   // 3-D, <dust>/cloud_resample_rank_screen: patches whose clouds do not outnumber their nominal
-  // rows (7 leaves + 6 + centre-of-mass rows, + the cross-moment rows in a flagged patch) are
+  // rows (7 leaves + 6 + center-of-mass rows, + the cross-moment rows in a flagged patch) are
   // left as they are, before any bucket
   bool rank_screen = false;
 };
@@ -96,8 +95,8 @@ inline unsigned long long *StageTotals() {
 //   angmom: sum w (x - c) x (v - u) / h, the three components, h the largest half width of
 //           the patch (one length, so the rows are the physical angular momentum),
 //   full:   sum w ((x - c)_a / h_a) (v - u)_b, a, b = 1..3 (h_a the half widths, as the
-//           centre-of-mass rows),
-// c the patch centre (pgeo), x the position unwrapped about it as for the centre-of-mass rows,
+//           center-of-mass rows),
+// c the patch center (pgeo), x the position unwrapped about it as for the center-of-mass rows,
 // u the patch's mass-weighted mean velocity before R (the reference of the momentum rows).  The
 // solver scales every row by its largest entry, so the absolute scale above is cosmetic.  Each
 // mode is its own instantiation of the solve kernels, so xv = 0 compiles the kernels as before.
@@ -105,7 +104,7 @@ inline unsigned long long *StageTotals() {
 // pool clouds have one level L, every footprint leaf is at level >= L, no cloud support crosses a
 // physical x3 face and the footprint spans less than a period in every periodic direction; there
 // the existing rows already fix all nine cross moments and the six spatial second moments (the
-// hat of a cloud is box * box of the level-L cell width: leaf values a_l = the centre of the
+// hat of a cloud is box * box of the level-L cell width: leaf values a_l = the center of the
 // level-L cell holding leaf l give sum_l a_l W_il = x_i; the cell-integrated hat is a quadratic
 // B-spline on the level-L grid, which reproduces x^2 up to one constant per width), so those
 // patches are solved by the xv = 0 kernels, with the result of none.  Rows per flagged patch:

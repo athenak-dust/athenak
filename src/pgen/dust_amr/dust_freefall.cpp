@@ -17,25 +17,25 @@
 //! t_ff = pi sqrt(3/(8 rho_s 4piG)).
 //!
 //! Initial state: one root-level cloud at each point of an ff_n^3 sub-lattice of every root cell
-//! whose point lies inside ff_radius of the centre, mass rho_s dx^3/ff_n^3, at rest; then the
+//! whose point lies inside ff_radius of the center, mass rho_s dx^3/ff_n^3, at rest; then the
 //! usual initial split to the leaves.  Diagnostics every ff_dt (and at the end), rank 0, one line
 //! "# FREEFALL {json}" and freefall_history.jsonl: the Lagrangian radii r_q (radius about the
-//! centre of mass that holds the mass fraction q) over f(t) r_q(0), of the particle centres and of
+//! center of mass that holds the mass fraction q) over f(t) r_q(0), of the particle centers and of
 //! the clouds expanded by repeated P1 splits to ff_repr_level (no jump at a refinement); kinetic and
 //! potential energy
 //! W = 1/2 sum rho_d (phi - <phi>) V over the leaf cells, the energy drift (K + W - E0)/|W0|; the
-//! centre of mass; the peak deposited density; the leaf blocks per level.
+//! center of mass; the peak deposited density; the leaf blocks per level.
 //!
 //! Spinning clump (tests of the resampling R, all keys optional; without them the set-up and the
 //! outputs are as before): ff_spin = Omega_s adds the solid-body rotation Omega_s z x (x - c)
-//! about the z axis through the centre, ff_sigma an isotropic Gaussian velocity dispersion (per
+//! about the z axis through the center, ff_sigma an isotropic Gaussian velocity dispersion (per
 //! component, from a hash of ff_seed and the cloud tag).  ff_cloud_level = L >= 0 replaces the
 //! root lattice and the split: about ff_ppc clouds per level-L cell of the sphere's volume, at
 //! uniform random positions inside the sphere (hash of ff_seed and the cloud number, the same on
 //! every rank), all of level L (no lobes), each of mass rho V_sphere / N; the root cloud mass of
 //! the resampling cap (cloud_resample_m0, cloud_merge_mroot) is set so that a cloud holds
 //! ff_mfrac of its level's nominal mass m0 / 8^L.  With any of these keys the diagnostics add
-//! "J", the angular momentum of all clouds about their centre of mass.
+//! "J", the angular momentum of all clouds about their center of mass.
 
 #include <algorithm>
 #include <array>
@@ -216,8 +216,8 @@ void Observe(Mesh *pm) {
 #endif
   const Real mass = a[0], cm[3] = {a[1]/mass, a[2]/mass, a[3]/mass};
   const Real kin = a[4];
-  // (spinning clump) J about the centre of mass: sum m (x - c) x v - M (X - c) x V, c the
-  // sphere centre
+  // (spinning clump) J about the center of mass: sum m (x - c) x v - M (X - c) x V, c the
+  // sphere center
   Real jc[3] = {0.0, 0.0, 0.0};
   if (ff.jrep) {
     Real b[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -237,7 +237,7 @@ void Observe(Mesh *pm) {
     jc[2] = b[2] - (xm[0]*b[7] - xm[1]*b[6]);
   }
   const Real pot = 0.5*(s[2] - s[0]*s[1]/s[3]);   // 1/2 sum rho (phi - <phi>) V
-  // Lagrangian radii about the centre of mass: of the particle centres (rq), and of every cloud
+  // Lagrangian radii about the center of mass: of the particle centers (rq), and of every cloud
   // expanded into the points of repeated P1 splits down to the level ff_repr_level (per direction
   // offsets -h/2, 0, +h/2 with weights 1/4, 1/2, 1/4, h the half-width; the children of an actual
   // split sit exactly on these points, so these radii (rqm) do not jump at a refinement; lobes of
@@ -477,7 +477,7 @@ void ProblemGenerator::DustFreeFall(ParameterInput *pin, const bool restart) {
   pack->pdust->EnsureNextTag();
   if (ff.level < 0) pack->pdust->SplitToLeaves();
   if (ff.spin != 0.0 || ff.sigma != 0.0) {
-    // solid-body rotation about z through the centre plus the dispersion, per cloud tag
+    // solid-body rotation about z through the center plus the dispersion, per cloud tag
     auto rh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), part->prtcl_rdata);
     auto ih = Kokkos::create_mirror_view_and_copy(HostMemSpace(), part->prtcl_idata);
     const std::uint64_t vstream = 0x5bd1e995ULL;

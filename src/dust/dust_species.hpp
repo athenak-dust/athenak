@@ -17,7 +17,7 @@
 //!   abundance and    new: epsilon_N | Z_N (with column_normalization = full_profile | domain)
 //!   sampling         and ppc_N, or (powerlaw) epsilon | Z and ppc_per_species;
 //!                    legacy: <problem>/eps_N or <dust>/dust_to_gas and <particles>/ppc
-//! Legacy inputs keep their exact behaviour (to be deprecated).  The input index N is
+//! Legacy inputs keep their exact behavior (to be deprecated).  The input index N is
 //! 1-based; species_id = N - 1.
 
 #include <string>

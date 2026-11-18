@@ -19,7 +19,7 @@
 //! blocks, [nfld, nall) every other block.  One rank: nfld = nall = nmb.
 
 struct LeafTraversal3D {
-  static constexpr int kMaxNb = 64;    // distinct neighbours of a 3-D block (56 at most)
+  static constexpr int kMaxNb = 64;    // distinct neighbors of a 3-D block (56 at most)
   int nmb = 0, gids = 0;
   int nfld = 0, nall = 0;
   int nx1 = 0, nx2 = 0, nx3 = 0, is = 0, js = 0, ks = 0;
@@ -31,8 +31,8 @@ struct LeafTraversal3D {
   Real iroot_dx1 = 0.0, iroot_dx2 = 0.0, iroot_dx3 = 0.0;
   // (b, 0..8): x1min, x2min, x3min, dx1, dx2, dx3, 1/dx1, 1/dx2, 1/dx3 of slot b
   DvceArray2D<Real> box;
-  DvceArray1D<int> nnb;                // number of neighbours of local block m
-  DvceArray2D<int> nb;                 // (m, k): slot of neighbour k
+  DvceArray1D<int> nnb;                // number of neighbors of local block m
+  DvceArray2D<int> nb;                 // (m, k): slot of neighbor k
   DvceArray3D<int> nbs;                // (m, k, 0..2): periodic shift (in domain lengths)
   static constexpr int kMaxLev = 16;
   int nlev = 0, nfine1 = 0, nfine2 = 0, nfine3 = 0;
@@ -42,8 +42,8 @@ struct LeafTraversal3D {
   bool split_everywhere = false, split_overlap = false;
   DvceArray1D<int> blev;
   DvceArray2D<int> fbox;               // (b, 0..5): finest-cell box [x0,x1) x [y0,y1) x [z0,z1)
-  DvceArray1D<int> nbmax;              // finest level among local block m and its neighbours
-  DvceArray2D<int> safe;               // (m, 0..2): the ring its neighbours certainly hold
+  DvceArray1D<int> nbmax;              // finest level among local block m and its neighbors
+  DvceArray2D<int> safe;               // (m, 0..2): the ring its neighbors certainly hold
   DvceArray1D<std::int64_t> lockey;    // sorted logical-location keys (Locate)
   DvceArray1D<int> locblk;
   int nloc = 0;
@@ -53,7 +53,7 @@ struct LeafTraversal3D {
   // A support across an x1 face is traversed in two parts (ForEach): the part in the domain
   // (candidates without an x shift, mode 1) and the cloud translated to the other side (mode 2:
   // across the inner face, translated by (+lx, -ysh); mode 3: across the outer face, (-lx, +ysh)),
-  // whose candidates are the shear neighbours of the anchor: (m, side, k) packed candidates
+  // whose candidates are the shear neighbors of the anchor: (m, side, k) packed candidates
   // without an x shift, side 0 / 1 = mode 2 / 3, nsnb(m, side) of them, every block that meets
   // the translated box of m widened by sreach(m) finest cells
   bool shear = false;
@@ -140,7 +140,7 @@ struct LeafTraversal3D {
 
   // candidates as in LeafTraversal::ForCandidates, with the third direction:
   // f(b, sx, sy, sz): block b shifted by -(sx, sy, sz) domain lengths.  mode: 0 all,
-  // 1 none shifted in x1, 2 / 3 the shear neighbours of m across the inner / outer x1 face
+  // 1 none shifted in x1, 2 / 3 the shear neighbors of m across the inner / outer x1 face
   template <typename Function>
   KOKKOS_INLINE_FUNCTION
   void ForCandidates(const int m, const bool global, const int ia, const int ib, const int ja,
@@ -243,7 +243,7 @@ struct LeafTraversal3D {
     }
     return true;
   }
-  // mode 2 / 3: inside the translated box of m that the shear neighbours were found for (one
+  // mode 2 / 3: inside the translated box of m that the shear neighbors were found for (one
   // finest cell less, against round-off)
   KOKKOS_INLINE_FUNCTION
   bool InShearBox(const int m, const int mode, const int ia, const int ib, const int ja,
@@ -318,7 +318,7 @@ struct LeafTraversal3D {
           if (!meets(b, sx, sy, sz) || n > kBatch) return;
           cand[n++] = Pack(b, sx, sy, sz);   // at most 1 + kMaxNb <= kBatch + 1: checked below
         }, mode);
-        if (n > kBatch) Kokkos::abort("LeafTraversal3D::Candidates: too many shear neighbours");
+        if (n > kBatch) Kokkos::abort("LeafTraversal3D::Candidates: too many shear neighbors");
         cursor = -1;
         return n;
       }
@@ -556,7 +556,7 @@ struct LeafTraversal3D {
       if (x3 >= x3max) x3 = fmin(2.0*x3max - x3, x3max - 1.0e-12*lz);
     }
     // shear-periodic x1: a point beyond an x1 face into the domain, then the
-    // shear neighbours of m
+    // shear neighbors of m
     int mode = 0;
     if (shear && (x1 < x1min || x1 >= x1max)) {
       const int side = (x1 >= x1max) ? 1 : 0;
