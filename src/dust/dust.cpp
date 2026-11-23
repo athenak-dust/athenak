@@ -450,7 +450,18 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
 
   {
-    std::string mode = pin->GetOrAddString("dust","stopping_time_mode","species_fixed");
+    // species_distribution = continuous: every particle has its own stopping time
+    // (particle_static by default; species_fixed is refused)
+    const bool cont = Species(pin).continuous;
+    std::string mode = pin->GetOrAddString("dust","stopping_time_mode",
+                                           cont ? "particle_static" : "species_fixed");
+    if (cont && mode.compare("species_fixed") == 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<dust>/species_distribution = continuous draws a stopping time "
+                << "for every particle: stopping_time_mode = particle_static (the default) or "
+                << "dynamic, not species_fixed" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
     if (mode.compare("species_fixed") == 0) {
       stopping_time_mode = DustStoppingTimeMode::species_fixed;
     } else if (mode.compare("particle_static") == 0) {
@@ -487,8 +498,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     for (int s=0; s<nspecies; ++s) {
       const Real ts = static_cast<Real>(st.tau_s[s]);
       taus.h_view(s) = ts;
-      taus_max = std::max(taus_max, ts);
-      taus_min = std::min(taus_min, ts);
+      // continuous: the range of the distribution (the bin edges), before the particles refresh it
+      taus_max = std::max(taus_max, st.continuous ? static_cast<Real>(st.tau_hi[s]) : ts);
+      taus_min = std::min(taus_min, st.continuous ? static_cast<Real>(st.tau_lo[s]) : ts);
     }
   }
   taus.template modify<HostMemSpace>();

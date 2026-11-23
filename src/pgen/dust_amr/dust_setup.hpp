@@ -50,6 +50,20 @@ Real HashUniform01(std::uint64_t key) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn NSHDustDrift
+//! \brief the NSH drift (v_x, v_phi) of a particle with stopping time ts in gas moving at
+//! (ux, uphi): the steady state of dv_x/dt = 2 Omega v_phi - (v_x - u_x)/ts and
+//! dv_phi/dt = -(2 - q) Omega v_x - (v_phi - u_phi)/ts, i.e. with T = Omega ts, b = 2 - q:
+//! v_x = (u_x + 2 T u_phi)/(1 + 2 b T^2), v_phi = u_phi - b T v_x (host and device)
+KOKKOS_INLINE_FUNCTION
+void NSHDustDrift(const Real omega0, const Real qshear, const Real ts, const Real ux,
+                  const Real uphi, Real &vx, Real &vphi) {
+  const Real t = omega0*ts, b = 2.0 - qshear;
+  vx = (ux + 2.0*t*uphi)/(1.0 + 2.0*b*t*t);
+  vphi = uphi - b*t*vx;
+}
+
+//----------------------------------------------------------------------------------------
 //! \struct RootPlacement
 //! \brief the position of root parent q (cloud_root_random): mode 0 the
 //! independent random draw (the original hash), 1 a square lattice (ppc = n^2, cell-centered
@@ -274,6 +288,10 @@ struct DustInit {
   // dust_damping_amr: a uniform vz on the 3-D root parents; with vz_mirror its sign follows z
   Real vz_add = 0.0;
   bool vz_mirror = false;
+  // species_distribution = continuous: the gas velocity of the equilibrium (the midplane one;
+  // with the NSH(z) table the gas columns of the table) and the shearing box, from which every
+  // particle gets the drift of its own stopping time (NSHDustDrift)
+  Real ugx = 0.0, ugp = 0.0, omega0 = 1.0, qshear = 1.5;
   StratDust strat;
 };
 
@@ -286,6 +304,19 @@ void ReadSpecies(ParameterInput *pin, MeshBlockPack *pmbp, const bool allow_z,
 void SolveNSH(const Real omega0, const Real qshear, const Real ax,
               const std::vector<Real> &eps, const std::vector<Real> &taus,
               Real &ugx, Real &ugp, std::vector<Real> &vx, std::vector<Real> &vp);
+// the gas velocity of the multi-species NSH equilibrium from the 2x2 system left after the
+// dust velocities (NSHDustDrift) are eliminated; the same solution as SolveNSH in O(N)
+void SolveNSHGas(const Real omega0, const Real qshear, const Real ax,
+                 const std::vector<Real> &eps, const std::vector<Real> &taus,
+                 Real &ugx, Real &ugp);
+// species_distribution = continuous: the NSH equilibrium of the continuous distribution, the
+// dust-to-gas ratio eps_s of every bin spread over the bin as tau^mass_slope (midpoint rule,
+// nsub points per bin in ln tau); vx, vp: the drift at the bin centres (the table entries, logs);
+// vdx, vdp (if not null): the drift at every quadrature point and bin edge (the particle dt)
+void SolveNSHContinuous(ParameterInput *pin, const Real omega0, const Real qshear,
+                        const Real ax, const std::vector<Real> &eps, Real &ugx, Real &ugp,
+                        std::vector<Real> &vx, std::vector<Real> &vp,
+                        std::vector<Real> *vdx = nullptr, std::vector<Real> *vdp = nullptr);
 // the radial forcing 2 Omega etavk on the gas through <hydro_srcterms>/const_accel
 void CheckRadialForcing(ParameterInput *pin, const Real ax);
 // uniform gas rho0 with the velocity (ugx, ugp); azimuthal is IM2 in 3-D, IM3 in 2-D

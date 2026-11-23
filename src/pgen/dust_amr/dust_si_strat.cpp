@@ -490,7 +490,15 @@ void ProblemGenerator::DustSIStrat(ParameterInput *pin, const bool restart) {
   std::vector<Real> vx(nspec, 0.0), vp(nspec, 0.0);
   std::vector<Real> eps_mid = eps;   // the midplane ratios of the gas set below
   if (sgp_.on) for (auto &e : eps_mid) e /= static_cast<Real>(sgp_.f[0]);
-  dust_setup::SolveNSH(omega0, qshear, ax, eps_mid, taus, ugx, ugp, vx, vp);
+  // species_distribution = continuous: the equilibrium of the distribution, the particles' own
+  // drifts in PlaceParticles; vdx, vdp the drifts over the whole range (the particle dt)
+  const bool cont = (spt != nullptr) && spt->continuous;
+  std::vector<Real> vdx, vdp;
+  if (cont) {
+    dust_setup::SolveNSHContinuous(pin, omega0, qshear, ax, eps_mid, ugx, ugp, vx, vp, &vdx, &vdp);
+  } else {
+    dust_setup::SolveNSH(omega0, qshear, ax, eps_mid, taus, ugx, ugp, vx, vp);
+  }
   // <problem>/nsh_vertical: the NSH drift with the local dust-to-gas ratio
   // eps_s(z) = eps_s exp(-z^2 (1/Hp^2 - 1/H^2)/2) for the gas (the mean of the two cell faces) and
   // the particles (their height), on a table of at least 64 points per root cell in z
@@ -532,7 +540,11 @@ void ProblemGenerator::DustSIStrat(ParameterInput *pin, const bool restart) {
         for (int s=0; s<nspec; ++s) ez[s] = in ? eps[s]*fcs[s]*std::exp(-0.5*z*z*as[s]) : 0.0;
       }
       Real gx = 0.0, gp = 0.0;
-      dust_setup::SolveNSH(omega0, qshear, ax, ez, taus, gx, gp, vxz, vpz);
+      if (cont) {
+        dust_setup::SolveNSHContinuous(pin, omega0, qshear, ax, ez, gx, gp, vxz, vpz);
+      } else {
+        dust_setup::SolveNSH(omega0, qshear, ax, ez, taus, gx, gp, vxz, vpz);
+      }
       th(n,0) = gx; th(n,1) = gp;
       for (int s=0; s<nspec; ++s) {th(n,2 + 2*s) = vxz[s]; th(n,3 + 2*s) = vpz[s];}
     }
@@ -549,7 +561,7 @@ void ProblemGenerator::DustSIStrat(ParameterInput *pin, const bool restart) {
       std::cout << "# NSH equilibrium (midplane): u_gx=" << ugx << " u_gphi=" << ugp << std::endl;
       for (int s=0; s<nspec; ++s) {
         std::cout << "#   species " << s+1 << ": v_x=" << vx[s]
-                  << " v_phi=" << vp[s] << std::endl;
+                  << " v_phi=" << vp[s] << (cont ? " (bin centre)" : "") << std::endl;
       }
     } else {
       std::cout << "# Dust-free NSH equilibrium: u_gx=" << ugx
@@ -612,8 +624,9 @@ void ProblemGenerator::DustSIStrat(ParameterInput *pin, const bool restart) {
   d.vp = vp;
   d.placement = "lattice";
   d.strat = sd;
+  d.ugx = ugx; d.ugp = ugp; d.omega0 = omega0; d.qshear = qshear;
   dust_setup::PlaceParticles(pin, pmy_mesh_, d);
-  dust_setup::SetParticleDt(pmy_mesh_, vx, vp, 0.0);
+  dust_setup::SetParticleDt(pmy_mesh_, cont ? vdx : vx, cont ? vdp : vp, 0.0);
 }
 
 namespace {

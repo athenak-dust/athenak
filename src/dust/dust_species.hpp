@@ -13,12 +13,28 @@
 //! Two independent groups of keys, each either new or legacy (never mixed):
 //!   stopping times   new: tau_s_N | stokes_N (Omega: <shearing_box>/omega0 or
 //!                    <dust>/stokes_omega_ref) | species_distribution = powerlaw with
-//!                    tau_s_min/max (or stokes_min/max);  legacy: taus_N
+//!                    tau_s_min/max (or stokes_min/max) | species_distribution = continuous
+//!                    (the same keys; see below);  legacy: taus_N
 //!   abundance and    new: epsilon_N | Z_N (with column_normalization = full_profile | domain)
 //!   sampling         and ppc_N, or (powerlaw) epsilon | Z and ppc_per_species;
 //!                    legacy: <problem>/eps_N or <dust>/dust_to_gas and <particles>/ppc
 //! Legacy inputs keep their exact behavior (to be deprecated).  The input index N is
 //! 1-based; species_id = N - 1.
+//!
+//! species_distribution = continuous: a continuous size distribution sampled by Monte Carlo,
+//! dM/dln(tau_s) proportional to tau_s^mass_slope on [tau_min, tau_max] (mass_slope = 4 - p for
+//! dN/ds ~ s^-p and tau_s ~ s, Epstein).  The range is cut into nspecies bins of equal width in
+//! ln(tau_s) (the strata): bin N holds the mass of the distribution between its edges and
+//! ppc_per_species particles per root cell, every particle with its own stopping time drawn
+//! uniformly in ln(tau_s) inside the bin and the mass weight tau_s^mass_slope/<tau^mass_slope>_bin
+//! (equal numbers of particles per ln(tau_s); the bin masses made exact after placement).  The
+//! species id is the bin, so the per-species outputs are per bin; tau_s_N is the geometric bin
+//! centre (the table entry only: the drag uses the particle's own value, <dust>/
+//! stopping_time_mode = particle_static).
+//! <dust>/continuous_sampling = equal_mass instead: the bins at the mass quantiles (every bin the
+//! same mass), tau_s drawn from dM/dln(tau_s) ~ tau_s^mass_slope inside the bin (inverse CDF:
+//! tau^a uniform), no weights, so every particle of the run has the same mass (equal H_p and
+//! ppc); the number of particles per ln(tau_s) then follows tau_s^mass_slope.
 
 #include <string>
 #include <vector>
@@ -42,12 +58,17 @@ struct SpeciesTable {
   std::vector<int> ppc;              // root ppc per species (new_init)
   int ppc_total = 0;                 // sum of ppc (new_init)
   bool powerlaw = false;
-  double mass_slope = 0.0, total = 0.0;   // power law: exponent p and the total epsilon / Z
+  bool continuous = false;           // species_distribution = continuous: the bins are strata
+  bool equal_mass = false;           // continuous_sampling = equal_mass (else log_uniform)
+  std::vector<double> tau_lo, tau_hi;   // continuous: the bin edges (code time)
+  std::vector<double> wmean;         // continuous: <tau^mass_slope> over ln(tau) in each bin
+  double mass_slope = 0.0, total = 0.0;   // power law / continuous: the slope and the total
   bool equal_ppc = false;            // every ppc_N the same (the legacy interleaved layout)
   std::vector<double> hp;            // initial H_p per species (<problem>/H_p_N | H_p |
                                      // H_p_min+H_p_max); empty: none given (legacy dust_hp)
 
   bool NewAPI() const {return new_tau || new_init;}
+  bool Generated() const {return powerlaw || continuous;}
   // slot k (0 <= k < ppc_total) of a root cell: species and the index within the species.
   // Equal ppc: interleaved as the legacy layout (k % nspecies); otherwise consecutive blocks.
   void SlotSpecies(const int k, int &s, int &kk) const;
