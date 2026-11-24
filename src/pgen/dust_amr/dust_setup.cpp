@@ -174,6 +174,83 @@ void SolveNSH(const Real omega0, const Real qshear, const Real ax,
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn SolveNSHGas
+//! \brief the gas velocity of the multi-species NSH equilibrium.  With the dust velocities of
+//! NSHDustDrift (D_s = 1 + 2 b T_s^2, T_s = Omega ts_s, b = 2 - q) the gas equations
+//! 2 Omega (u_phi + sum eps_s v_phi,s) = -a_x and u_x + sum eps_s v_x,s = 0 become, with
+//! A = sum eps_s/D_s and B = sum eps_s T_s/D_s,
+//!   (1 + A) u_x + 2 B u_phi = 0,   (1 + A) u_phi - b B u_x = -a_x/(2 Omega),
+//! so u_x = (a_x/Omega) B/((1 + A)^2 + 2 b B^2), u_phi = -(a_x/2 Omega)(1 + A)/((1 + A)^2 + 2 b B^2)
+//! (b = 1/2: the familiar NSH form with eta v_K = a_x/2 Omega).  The same solution as SolveNSH.
+
+void SolveNSHGas(const Real omega0, const Real qshear, const Real ax,
+                 const std::vector<Real> &eps, const std::vector<Real> &taus,
+                 Real &ugx, Real &ugp) {
+  const double b = 2.0 - qshear;
+  double sa = 0.0, sb = 0.0;
+  for (std::size_t s=0; s<eps.size(); ++s) {
+    const double t = static_cast<double>(omega0)*taus[s];
+    const double dd = 1.0 + 2.0*b*t*t;
+    sa += eps[s]/dd;
+    sb += eps[s]*t/dd;
+  }
+  const double den = (1.0 + sa)*(1.0 + sa) + 2.0*b*sb*sb;
+  ugx = static_cast<Real>((ax/omega0)*sb/den);
+  ugp = static_cast<Real>(-(ax/(2.0*omega0))*(1.0 + sa)/den);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn SolveNSHContinuous
+//! \brief species_distribution = continuous: the NSH equilibrium of the distribution.  The
+//! dust-to-gas ratio eps_s of bin s is spread over the bin as tau^a (a = mass_slope), which is
+//! the distribution the particles sample, and the sums A, B of SolveNSHGas are integrated by the
+//! midpoint rule in ln tau (<dust>/nsh_quadrature points per bin, default 256).
+
+void SolveNSHContinuous(ParameterInput *pin, const Real omega0, const Real qshear,
+                        const Real ax, const std::vector<Real> &eps, Real &ugx, Real &ugp,
+                        std::vector<Real> &vx, std::vector<Real> &vp,
+                        std::vector<Real> *vdx, std::vector<Real> *vdp) {
+  const dust::SpeciesTable &t = dust::Species(pin);
+  if (!t.continuous) Fatal("SolveNSHContinuous needs species_distribution = continuous");
+  const int ns = t.nspecies;
+  if (static_cast<int>(eps.size()) != ns) Fatal("SolveNSHContinuous: one ratio per bin");
+  const int nsub = pin->GetOrAddInteger("dust", "nsh_quadrature", 256);
+  if (nsub < 1) Fatal("<dust>/nsh_quadrature must be at least 1");
+  std::vector<Real> eq, tq;
+  eq.reserve(ns*nsub); tq.reserve(ns*nsub);
+  for (int s=0; s<ns; ++s) {
+    const double l = std::log(t.tau_hi[s]/t.tau_lo[s]);
+    std::vector<double> w(nsub);
+    double wsum = 0.0;
+    for (int k=0; k<nsub; ++k) {
+      const double tk = t.tau_lo[s]*std::exp((k + 0.5)*l/nsub);
+      w[k] = std::pow(tk, t.mass_slope);
+      wsum += w[k];
+      tq.push_back(static_cast<Real>(tk));
+    }
+    for (int k=0; k<nsub; ++k) eq.push_back(static_cast<Real>(eps[s]*w[k]/wsum));
+  }
+  SolveNSHGas(omega0, qshear, ax, eq, tq, ugx, ugp);
+  vx.assign(ns, 0.0); vp.assign(ns, 0.0);
+  for (int s=0; s<ns; ++s) {
+    NSHDustDrift(omega0, qshear, static_cast<Real>(t.tau_s[s]), ugx, ugp, vx[s], vp[s]);
+  }
+  if (vdx != nullptr && vdp != nullptr) {
+    vdx->clear(); vdp->clear();
+    std::vector<Real> tall = tq;
+    for (int s=0; s<ns; ++s) {
+      tall.push_back(static_cast<Real>(t.tau_lo[s]));
+      tall.push_back(static_cast<Real>(t.tau_hi[s]));
+    }
+    for (Real tk : tall) {
+      Real a, b;
+      NSHDustDrift(omega0, qshear, tk, ugx, ugp, a, b);
+      vdx->push_back(a); vdp->push_back(b);
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn CheckRadialForcing
 //! \brief the radial forcing must be applied to the gas by the standard const_accel source
 //! term (so that dust particles do not feel it); verify the input file sets it up
@@ -266,6 +343,15 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
   }
   const dust::SpeciesTable *spt = &dust::Species(pin);
   const bool new_init = spt->new_init;
+  // species_distribution = continuous: implemented for 3-D point particles drawn as root
+  // parents on a uniform mesh (the per-particle stopping times must not meet cloud splitting,
+  // merging or resampling, which group particles by species)
+  const bool cont = spt->continuous;
+  if (cont && !(cloud_root_random && three_d && !pm->multilevel &&
+                pmbp->pdust->smr_transfer_mode == DustSMRTransfer::none)) {
+    Fatal("species_distribution = continuous: 3-D point particles on a uniform mesh, drawn with "
+          "<problem>/cloud_root_random = true (no refinable clouds, no mesh refinement)");
+  }
   // the stratified set-up of the new species keys (per-species H_p, Z_N)
   const bool strat_setup = new_init && sd.on;
   const std::vector<Real> &hps = sd.hp, &finside = sd.finside, &wnorm = sd.wnorm;
@@ -395,7 +481,8 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
     for (int sp=0; sp<nspec; ++sp) {
       if (act[sp] > 0.0 && std::fabs(act[sp]/tgt[sp] - 1.0) > 1.0e-11) rescale = true;
     }
-    if (domain && allow_rescale && rescale) {
+    // continuous: the bin masses carry the sampling noise of the particle weights, put right here
+    if ((domain || cont) && allow_rescale && rescale) {
       DualArray1D<Real> fac("nsh_species_rescale", nspec);
       for (int sp=0; sp<nspec; ++sp) fac.h_view(sp) = (act[sp] > 0.0) ? tgt[sp]/act[sp] : 1.0;
       fac.template modify<HostMemSpace>();
@@ -421,7 +508,8 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
         o << ", target mass " << tgt[sp] << ", particle mass " << act[sp] << ", rel_error "
           << std::setprecision(3) << ((tgt[sp] > 0.0) ? act[sp]/tgt[sp] - 1.0 : 0.0)
           << std::setprecision(17)
-          << ((domain && allow_rescale && rescale) ? " (before the scaling to the target)" : "")
+          << (((domain || cont) && allow_rescale && rescale) ? " (before the scaling to the target)"
+                                                             : "")
           << "\n";
       }
       std::cout << o.str() << std::flush;
@@ -587,6 +675,30 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
     const int rootlev0 = pm->root_level;
     const bool nshz = sd.ztab_on;
     const NSHTableZ ntab = sd.ztab;
+    // continuous: per bin, log_uniform: ln(tau_lo), ln(tau_hi/tau_lo) and <tau^a> of the weights;
+    // equal_mass (a != 0): tau_lo^a, tau_hi^a - tau_lo^a and 1/a (tau^a uniform: the inverse CDF of
+    // dM/dln tau ~ tau^a), no weights.  equal_mass with a = 0 is log_uniform with unit weights.
+    const bool cemass = cont && spt->equal_mass && spt->mass_slope != 0.0;
+    DualArray2D<Real> cbin("nsh_cont_bins", std::max(1, nspec), 3);
+    if (cont) {
+      for (int sp=0; sp<nspec; ++sp) {
+        const double a = spt->mass_slope;
+        if (cemass) {
+          cbin.h_view(sp,0) = std::pow(spt->tau_lo[sp], a);
+          cbin.h_view(sp,1) = std::pow(spt->tau_hi[sp], a) - std::pow(spt->tau_lo[sp], a);
+          cbin.h_view(sp,2) = 1.0/a;
+        } else {
+          cbin.h_view(sp,0) = std::log(spt->tau_lo[sp]);
+          cbin.h_view(sp,1) = std::log(spt->tau_hi[sp]/spt->tau_lo[sp]);
+          cbin.h_view(sp,2) = spt->wmean[sp];
+        }
+      }
+    }
+    cbin.template modify<HostMemSpace>(); cbin.template sync<DevExeSpace>();
+    auto cbd = cbin.d_view;
+    const Real cslope = cont ? static_cast<Real>(spt->mass_slope) : 0.0;
+    const Real cugx = d.ugx, cugp = d.ugp, com = d.omega0, cqs = d.qshear;
+    const std::uint64_t tseed = random_seed;
     par_for("nsh_cloud_root3d", DevExeSpace(), 0, nparent-1, KOKKOS_LAMBDA(const int q) {
       const int p = pnew(q);
       if (p < 0) return;
@@ -620,11 +732,37 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
         pr0(IPVX1,p) = pr0(IPVX,p);
         pr0(IPVY1,p) = pr0(IPVY,p);
       }
+      if (cont) {
+        // the stopping time uniform in ln(tau) within the bin of the parent (its own hash
+        // stream, independent of the rank count), the mass weight tau^a/<tau^a>_bin, and the
+        // NSH drift of this stopping time in the gas of the equilibrium at the parent's height
+        const std::uint64_t key = static_cast<std::uint64_t>(q) + tseed*UINT64_C(0x9e3779b97f4a7c15);
+        const Real u = HashUniform01(key + UINT64_C(0xd6e8feb86659fd93));
+        const Real ts = cemass ? Kokkos::pow(cbd(sp,0) + u*cbd(sp,1), cbd(sp,2))
+                               : Kokkos::exp(cbd(sp,0) + u*cbd(sp,1));
+        pr0(IPTS,p) = ts;
+        if (!cemass && cslope != 0.0) pr0(IPM,p) *= Kokkos::pow(ts, cslope)/cbd(sp,2);
+        const Real ux = nshz ? ntab.At(z, 0) : cugx, up = nshz ? ntab.At(z, 1) : cugp;
+        Real vxd, vpd;
+        NSHDustDrift(com, cqs, ts, ux, up, vxd, vpd);
+        pr0(IPVX,p) = vxd + vw; pr0(IPVX1,p) = pr0(IPVX,p);
+        pr0(IPVY,p) = vpd; pr0(IPVY1,p) = vpd;
+      }
       if (tvz0 != 0.0) {
         pr0(IPVZ,p) += (tvzm && z < 0.0) ? -tvz0 : tvz0;
         pr0(IPVZ1,p) = pr0(IPVZ,p);
       }
     });
+    if (cont && global_variable::my_rank == 0) {
+      std::cout << "# continuous size distribution: " << nspec << " bins (strata) over tau_s ["
+                << spt->tau_lo[0] << ", " << spt->tau_hi[nspec - 1] << "], mass_slope "
+                << spt->mass_slope << (spt->equal_mass ?
+                   ", equal_mass: every particle tau_s from dM/dln(tau_s) ~ tau_s^mass_slope in "
+                   "its bin (equal masses)" :
+                   ", log_uniform: every particle tau_s uniform in ln(tau_s) in its bin, mass weight "
+                   "tau_s^mass_slope/<.>_bin") << ", its own NSH drift"
+                << (nshz ? " at its height" : "") << std::endl;
+    }
     if (strat && global_variable::my_rank == 0) {
       std::cout << "# stratified dust (3-D root " << (canonical_root ? "particles" : "clouds")
                 << "): Hp = ";

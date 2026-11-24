@@ -3,7 +3,7 @@
 This branch (`amrSG_dev`) extends the dust module of the uniform-mesh dust branch [`dust`](https://github.com/athenak-dust/athenak/tree/dust) with
 
 - dust on statically and adaptively refined meshes (refinable dust clouds, or point particles with owner-overlap deposition),
-- a multi-species input API (stopping times, abundances and sampling per species, power-law size distributions),
+- a multi-species input API (stopping times, abundances and sampling per species, power-law size distributions, and continuous size distributions sampled by Monte Carlo),
 - science outputs for the particles (`pbin`, `phst`) and dust mesh fields in the standard binary output,
 - self-gravity of the dust (and, experimentally, of the gas) with a multigrid Poisson solver that works on refined meshes and in the (stratified) shearing box.
 
@@ -28,6 +28,32 @@ All in `<dust>` unless noted; species are numbered `N = 1 .. nspecies` (the part
 - `column_normalization` (with `Z_N`): `redraw` (default; the whole column mass is placed inside the box, draws outside are redrawn), `full_profile` (the Gaussian is cut at the box), or `domain` (the dust mass in the box is `Z` times the gas mass in the box).
 - With `ppc_N` the key `<particles>/ppc` must not be given. The resolved species table is printed at start-up and stored in the restart files; a restart with a different table stops.
 - `dust_nsh`, `dust_si_unstrat`, `dust_si_strat`, `dust_damping_amr`, `dusty_wave_amr`, `dusty_wave` and `dust_damping` take the new keys (`Z_N` only `dust_si_strat`). `streaming_linear`, `dust_freefall`, `dust_jeans` and `dust_snapshot_clump` take only the legacy abundance and sampling keys (the new stopping-time keys work everywhere except in `dust_jeans`).
+
+### Continuous size distribution
+
+`species_distribution = continuous` replaces the discrete species by a continuous distribution, dM/dln(t_s) ∝ t_s^`mass_slope` on [`tau_s_min`, `tau_s_max`] (or [`stokes_min`, `stokes_max`]), sampled by stratified Monte Carlo. Every particle carries its own stopping time. With dN/ds ∝ s^-p and t_s ∝ s (Epstein), `mass_slope = 4 - p` (0.5 for MRN).
+
+```ini
+<dust>
+species_distribution = continuous
+nspecies            = 7            # number of bins (strata)
+stokes_min          = 0.001        # or tau_s_min / tau_s_max
+stokes_max          = 1.0
+mass_slope          = 0.5
+Z                   = 0.01         # or epsilon (total over all bins)
+ppc_per_species     = 1            # particles per bin per root cell
+continuous_sampling = log_uniform  # default; or equal_mass
+nsh_quadrature      = 256          # optional: points per bin for the NSH integrals
+```
+
+- `continuous_sampling = log_uniform`: `nspecies` bins of equal width in ln(t_s), equal particle numbers per ln(t_s). Each particle draws t_s uniformly in ln(t_s) inside its bin and carries the mass weight t_s^`mass_slope`/<t_s^`mass_slope`>_bin.
+- `continuous_sampling = equal_mass`: the bin edges sit at the mass quantiles, so every bin holds the same mass. Each particle draws t_s from dM/dln(t_s) ∝ t_s^`mass_slope` inside its bin (t_s^`mass_slope` uniform), and every particle has the same mass. With `mass_slope = 0` this is the same as `log_uniform`.
+- Each bin holds the mass of the distribution between its edges, made exact after placement. The draws come from a hash of the particle index and `<problem>/random_seed`, so they do not depend on the number of ranks.
+- The species id of a particle is its bin. Per-species outputs (`phst`, `dust_species`, the history) are therefore per bin, and `tau_s_N` in the printed table is the geometric bin centre. The table also prints each bin's edges. `pbin` writes every particle's own stopping time.
+- The drag uses each particle's own stopping time: `stopping_time_mode` defaults to `particle_static` (`species_fixed` stops the run).
+- `dust_si_unstrat` and `dust_si_strat` (including `nsh_vertical`) start every particle in the NSH equilibrium of the continuous distribution, at its own stopping time (and, with `nsh_vertical`, at its own height).
+- 3-D point particles on a uniform mesh only (`cloud_root_random = true`; no refinable clouds, SMR or AMR).
+- Example: [`si3d_strat_continuous.athinput`](inputs/dust_amr/si3d_strat_continuous.athinput) (a (0.2 H)^3 stratified box at 32^3, 7 bins over St 0.001–1).
 
 ### Outputs
 
@@ -185,4 +211,5 @@ All in `<dust>` unless noted. The defaults are the validated production values; 
 ## 5. Known limitations
 
 - MHD in a shearing box with shear-periodic x1 boundaries runs on a uniform mesh only; with SMR/AMR the run stops at start-up. The face-level ghost exchange used by refined shearing boxes exists for cell-centered (hydro, dust) variables only.
+- `species_distribution = continuous` works with 3-D point particles on a uniform mesh only: refinable clouds and AMR split, merge and resample particles by species, and would mix the different stopping times within a bin.
 - `refinable_mode = default` is meant for nonlinear runs. It damps small linear modes (LinA-like tests); use `careful_merge` or `split_only` there.

@@ -1,0 +1,123 @@
+# Stratified streaming instability with a CONTINUOUS dust size distribution (<dust>/species_distribution = continuous):
+# dM/dln(St) ~ St^mass_slope on [stokes_min, stokes_max] (mass_slope = 4 - p for dN/ds ~ s^-p; 0.5 = MRN), sampled by
+# Monte Carlo with equal particle numbers per ln(St): nspecies bins (strata) of equal width in ln(St), ppc_per_species
+# particles per bin per cell, each with its own St (uniform in ln St inside its bin) and mass weight St^mass_slope.
+# Per-species outputs (phst, bin species columns, history) are per bin; pbin writes every particle's stopping_time.
+# The NSH drift of every particle is that of its own St (nsh_vertical: at its height).  Point particles on a
+# uniform mesh only (cloud_root_random = true, no AMR / refinable clouds).
+# <dust>/continuous_sampling = equal_mass instead: bins of equal mass (edges at the mass quantiles), St drawn from
+# dM/dln St ~ St^mass_slope inside the bin, every particle the same mass (fewer particles on the small grains).
+# Small test box: (0.2 H)^3 at 32^3, 7 bins over St 0.001..1, Z = 0.01, H_p = 0.025 H, li2018 vertical boundaries.
+<job>
+basename = cs
+
+<output1>
+file_type = hst
+dt = 0.06283185307179586        # 0.01 P
+data_format = %.17e
+
+<output2>
+file_type = phst
+dt = 0.06283185307179586        # 0.01 P
+
+<output3>
+file_type = bin
+variable = hydro_w              # + dust_total_rho, dust_total_mom1..3 (added automatically)
+dt = 0.6283185307179586         # 0.1 P
+
+<output4>
+file_type = bin
+variable = dust_total           # dust_total_rho, dust_total_mom1..3 alone
+dt = 0.6283185307179586         # 0.1 P
+
+<output5>
+file_type = pbin
+dt = 3.141592653589793          # 0.5 P
+
+<output6>
+file_type = rst
+dt = 3.141592653589793          # 0.5 P
+
+<mesh>
+nghost = 4
+
+nx1 = 32
+x1min = -0.1
+x1max = 0.1
+ix1_bc = shear_periodic
+ox1_bc = shear_periodic
+
+nx2 = 32
+x2min = -0.1
+x2max = 0.1
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3 = 32
+x3min = -0.1
+x3max = 0.1
+ix3_bc = user                   # <problem>/vertical_bc
+ox3_bc = user
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.225
+nlim = -1
+tlim = 6.283185307179586        # 1 P
+ndiag = 100
+
+<hydro>
+eos = isothermal
+iso_sound_speed = 1.0
+reconstruct = wenoz
+rsolver = hllc
+
+<hydro_srcterms>
+const_accel = true
+const_accel_val = 0.1           # 2 Omega eta v_K
+const_accel_dir = 1
+
+<shearing_box>
+qshear = 1.5
+omega0 = 1.0
+stratified = true
+
+<particles>
+particle_type = dust
+pusher = imex_dust
+
+<dust>
+nspecies = 7                    # bins (strata) of the continuous distribution
+species_distribution = continuous
+stokes_min = 0.001
+stokes_max = 1.0
+mass_slope = 0.5                # dM/dln St ~ St^0.5 (MRN, p = 3.5)
+Z = 0.01                        # column ratio (column_normalization = redraw, the default)
+ppc_per_species = 1
+continuous_sampling = log_uniform  # equal numbers per ln St, mass-weighted particles; or equal_mass
+back_reaction = true
+deposit = tsc
+dt_cfl = 0.5
+coupling = pc2
+particle_x3_bc = outflow
+
+<problem>
+pgen_name = dust_si_strat
+user_hist = true
+check_equilibrium = false
+rho0 = 1.0
+etavk = 0.05
+H_p = 0.025                     # every species
+stratified_dust_sampling = gaussian
+nsh_vertical = true
+vertical_bc = li2018
+cloud_root_random = true        # required by the gaussian sampling; point particles on a uniform mesh
+root_placement = random
+random_seed = 3
+dust_moments_hist = false          # true overflows the 20 hst columns (user_hist: 3 per species, species 1-6 only)

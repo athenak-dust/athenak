@@ -29,6 +29,7 @@
 #include "hydro/hydro.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "dust/dust_species.hpp"
 #include "outputs/outputs.hpp"
 #include "pgen/pgen.hpp"
 #include "pgen/dust_amr/dust_setup.hpp"
@@ -90,11 +91,20 @@ void ProblemGenerator::DustSIUnstrat(ParameterInput *pin, const bool restart) {
   dust_setup::CheckRadialForcing(pin, ax);
   Real ugx = 0.0, ugp = 0.0;
   std::vector<Real> vx(nspec, 0.0), vp(nspec, 0.0);
-  dust_setup::SolveNSH(omega0, qshear, ax, eps, taus, ugx, ugp, vx, vp);
+  // species_distribution = continuous: the equilibrium of the distribution, the particles' own
+  // drifts in PlaceParticles; vdx, vdp the drifts over the whole range (the particle dt)
+  const bool cont = (pmbp->pdust != nullptr) && dust::Species(pin).continuous;
+  std::vector<Real> vdx, vdp;
+  if (cont) {
+    dust_setup::SolveNSHContinuous(pin, omega0, qshear, ax, eps, ugx, ugp, vx, vp, &vdx, &vdp);
+  } else {
+    dust_setup::SolveNSH(omega0, qshear, ax, eps, taus, ugx, ugp, vx, vp);
+  }
   if (global_variable::my_rank == 0) {
     std::cout << "# NSH equilibrium: u_gx=" << ugx << " u_gphi=" << ugp << std::endl;
     for (int s=0; s<nspec; ++s) {
-      std::cout << "#   species " << s+1 << ": v_x=" << vx[s] << " v_phi=" << vp[s] << std::endl;
+      std::cout << "#   species " << s+1 << ": v_x=" << vx[s] << " v_phi=" << vp[s]
+                << (cont ? " (bin centre)" : "") << std::endl;
     }
   }
 
@@ -106,6 +116,7 @@ void ProblemGenerator::DustSIUnstrat(ParameterInput *pin, const bool restart) {
   d.vx = vx;
   d.vp = vp;
   d.placement = "random";
+  d.ugx = ugx; d.ugp = ugp; d.omega0 = omega0; d.qshear = qshear;
   dust_setup::PlaceParticles(pin, pmy_mesh_, d);
-  dust_setup::SetParticleDt(pmy_mesh_, vx, vp, 0.0);
+  dust_setup::SetParticleDt(pmy_mesh_, cont ? vdx : vx, cont ? vdp : vp, 0.0);
 }

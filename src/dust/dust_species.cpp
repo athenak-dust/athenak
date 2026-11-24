@@ -144,10 +144,12 @@ SpeciesTable Parse(ParameterInput *pin) {
   // ---- the form of the table
   std::string dist = "explicit";
   if (Has(pin, D, "species_distribution")) dist = pin->GetString(D, "species_distribution");
-  if (dist != "explicit" && dist != "powerlaw") {
-    Fail("<dust>/species_distribution must be explicit or powerlaw");
+  if (dist != "explicit" && dist != "powerlaw" && dist != "continuous") {
+    Fail("<dust>/species_distribution must be explicit, powerlaw or continuous");
   }
   t.powerlaw = (dist == "powerlaw");
+  t.continuous = (dist == "continuous");
+  const bool gen = t.Generated();
   const auto i_taus = Indexed(pin, D, "taus_"), i_tau = Indexed(pin, D, "tau_s_");
   const auto i_st = Indexed(pin, D, "stokes_"), i_eps = Indexed(pin, D, "epsilon_");
   const auto i_z = Indexed(pin, D, "Z_"), i_ppc = Indexed(pin, D, "ppc_");
@@ -159,13 +161,13 @@ SpeciesTable Parse(ParameterInput *pin) {
 
   // ---- stopping times
   t.tau_s.assign(n, 0.0);
-  if (t.powerlaw) {
+  if (gen) {
     if (!i_taus.empty() || !i_tau.empty() || !i_st.empty()) {
-      Fail("species_distribution = powerlaw generates the stopping times: leave out taus_N, "
+      Fail("species_distribution = " + dist + " generates the stopping times: leave out taus_N, "
            "tau_s_N and stokes_N");
     }
     if (range_tau == range_st) {
-      Fail("species_distribution = powerlaw needs tau_s_min and tau_s_max, or stokes_min and "
+      Fail("species_distribution = " + dist + " needs tau_s_min and tau_s_max, or stokes_min and "
            "stokes_max (one pair)");
     }
     const std::string a = range_tau ? "tau_s_" : "stokes_";
@@ -176,15 +178,54 @@ SpeciesTable Parse(ParameterInput *pin) {
       }
       lo /= t.omega_ref; hi /= t.omega_ref;
     }
-    if (n == 1 && lo != hi) Fail("species_distribution = powerlaw with one species needs min = max");
-    if (hi < lo) Fail("species_distribution = powerlaw: max below min");
-    for (int s=0; s<n; ++s) {
-      t.tau_s[s] = (n == 1) ? lo : lo*std::pow(hi/lo, static_cast<double>(s)/(n - 1));
+    if (t.continuous) {
+      // nspecies bins (strata) of equal width in ln(tau_s); the table entry is the geometric
+      // centre, the particles draw their own values inside the bin edges (PlaceParticles)
+      if (!(hi > lo)) Fail("species_distribution = continuous needs max > min");
+      // <dust>/continuous_sampling: log_uniform (default; equal numbers of particles per
+      // ln(tau), bins of equal width in ln(tau), mass weights) or equal_mass (bins of equal mass,
+      // tau drawn from dM/dln(tau) ~ tau^a inside the bin, all particles of a bin the same mass)
+      const std::string cs = Has(pin, D, "continuous_sampling") ?
+          pin->GetString(D, "continuous_sampling") : std::string("log_uniform");
+      if (cs != "log_uniform" && cs != "equal_mass") {
+        Fail("<dust>/continuous_sampling must be log_uniform or equal_mass");
+      }
+      t.equal_mass = (cs == "equal_mass");
+      const double a = pin->GetReal(D, "mass_slope");   // (checked again with the abundances)
+      if (!std::isfinite(a)) Fail("<dust>/mass_slope must be finite");
+      t.tau_lo.resize(n); t.tau_hi.resize(n);
+      for (int s=0; s<n; ++s) {
+        const double f0 = static_cast<double>(s)/n, f1 = static_cast<double>(s + 1)/n;
+        if (t.equal_mass && a != 0.0) {
+          // the mass quantiles of dM/dln(tau) ~ tau^a: tau^a uniform between lo^a and hi^a
+          const double la = std::pow(lo, a), ha = std::pow(hi, a);
+          t.tau_lo[s] = std::pow(la + f0*(ha - la), 1.0/a);
+          t.tau_hi[s] = (s == n - 1) ? hi : std::pow(la + f1*(ha - la), 1.0/a);
+        } else {   // equal width in ln(tau) (equal_mass with a = 0 is the same)
+          t.tau_lo[s] = lo*std::pow(hi/lo, f0);
+          t.tau_hi[s] = (s == n - 1) ? hi : lo*std::pow(hi/lo, f1);
+        }
+        if (s == 0) t.tau_lo[s] = lo;
+        t.tau_s[s] = std::sqrt(t.tau_lo[s]*t.tau_hi[s]);
+      }
+    } else {
+      if (Has(pin, D, "continuous_sampling")) {
+        Fail("continuous_sampling belongs to species_distribution = continuous");
+      }
+      if (n == 1 && lo != hi) Fail("species_distribution = powerlaw with one species needs min = max");
+      if (hi < lo) Fail("species_distribution = powerlaw: max below min");
+      for (int s=0; s<n; ++s) {
+        t.tau_s[s] = (n == 1) ? lo : lo*std::pow(hi/lo, static_cast<double>(s)/(n - 1));
+      }
     }
     t.new_tau = true;
-    t.tau_source = range_tau ? "powerlaw (tau_s_min, tau_s_max)" : "powerlaw (stokes_min, stokes_max)";
+    t.tau_source = dist + (range_tau ? " (tau_s_min, tau_s_max)" : " (stokes_min, stokes_max)");
   } else {
-    if (range_tau || range_st) Fail("tau_s_min/max and stokes_min/max belong to species_distribution = powerlaw");
+    if (range_tau || range_st) {
+      Fail("tau_s_min/max and stokes_min/max belong to species_distribution = powerlaw or "
+           "continuous");
+    }
+    if (Has(pin, D, "continuous_sampling")) Fail("continuous_sampling belongs to species_distribution = continuous");
     const int kinds = (!i_taus.empty()) + (!i_tau.empty()) + (!i_st.empty());
     if (kinds > 1) {
       Fail("stopping times given by more than one of taus_N (legacy), tau_s_N, stokes_N: use one");
@@ -215,7 +256,7 @@ SpeciesTable Parse(ParameterInput *pin) {
   }
 
   // ---- abundance and sampling
-  t.new_init = t.powerlaw || !i_eps.empty() || !i_z.empty() || !i_ppc.empty() || tot_eps ||
+  t.new_init = gen || !i_eps.empty() || !i_z.empty() || !i_ppc.empty() || tot_eps ||
                tot_z || tot_ppc || Has(pin, D, "column_normalization");
   if (!t.new_init) return t;   // legacy: <problem>/eps_N or dust_to_gas, <particles>/ppc
   if (!i_peps.empty()) {
@@ -227,13 +268,13 @@ SpeciesTable Parse(ParameterInput *pin) {
   }
   t.value.assign(n, 0.0);
   t.ppc.assign(n, 0);
-  if (t.powerlaw) {
+  if (gen) {
     if (!i_eps.empty() || !i_z.empty() || !i_ppc.empty()) {
-      Fail("species_distribution = powerlaw: give the total epsilon or Z and ppc_per_species, "
+      Fail("species_distribution = " + dist + ": give the total epsilon or Z and ppc_per_species, "
            "not epsilon_N / Z_N / ppc_N");
     }
-    if (tot_eps == tot_z) Fail("species_distribution = powerlaw needs epsilon or Z (one of them)");
-    if (!tot_ppc) Fail("species_distribution = powerlaw needs ppc_per_species");
+    if (tot_eps == tot_z) Fail("species_distribution = " + dist + " needs epsilon or Z (one of them)");
+    if (!tot_ppc) Fail("species_distribution = " + dist + " needs ppc_per_species");
     t.abundance = tot_eps ? "epsilon" : "Z";
     t.total = NonNegative(pin, D, tot_eps ? "epsilon" : "Z");
     t.mass_slope = pin->GetReal(D, "mass_slope");
@@ -241,11 +282,25 @@ SpeciesTable Parse(ParameterInput *pin) {
     const int pps = Count(pin, D, "ppc_per_species");
     double wsum = 0.0;
     std::vector<double> w(n);
-    for (int s=0; s<n; ++s) {w[s] = std::pow(t.tau_s[s], t.mass_slope); wsum += w[s];}
+    if (t.continuous) {
+      // the mass of the distribution dM/dln(tau) ~ tau^a between the bin edges, and the mean of
+      // tau^a over ln(tau) in the bin (the normalization of the particle weights)
+      const double a = t.mass_slope;
+      t.wmean.resize(n);
+      for (int s=0; s<n; ++s) {
+        const double l = std::log(t.tau_hi[s]/t.tau_lo[s]);
+        w[s] = (a == 0.0) ? l : (std::pow(t.tau_hi[s], a) - std::pow(t.tau_lo[s], a))/a;
+        t.wmean[s] = w[s]/l;
+        wsum += w[s];
+      }
+    } else {
+      for (int s=0; s<n; ++s) {w[s] = std::pow(t.tau_s[s], t.mass_slope); wsum += w[s];}
+    }
     for (int s=0; s<n; ++s) {t.value[s] = t.total*w[s]/wsum; t.ppc[s] = pps;}
   } else {
     if (tot_ppc || Has(pin, D, "mass_slope")) {
-      Fail("ppc_per_species and mass_slope belong to species_distribution = powerlaw");
+      Fail("ppc_per_species and mass_slope belong to species_distribution = powerlaw or "
+           "continuous");
     }
     if (!i_eps.empty() && !i_z.empty()) Fail("give epsilon_N or Z_N, not both");
     if (i_eps.empty() && i_z.empty()) Fail("ppc_N needs the abundances epsilon_N (or Z_N)");
@@ -303,7 +358,7 @@ SpeciesTable Parse(ParameterInput *pin) {
   // module takes the total from this table (RootPpc).
   if (Has(pin, "particles", "ppc")) {
     Fail("<particles>/ppc = " + pin->GetString("particles", "ppc") + " cannot be given with " +
-         (t.powerlaw ? std::string("ppc_per_species") : std::string("ppc_N")) + " (the new "
+         (gen ? std::string("ppc_per_species") : std::string("ppc_N")) + " (the new "
          "sampling keys; total " + std::to_string(t.ppc_total) + " per root cell): remove "
          "<particles>/ppc");
   }
@@ -342,8 +397,12 @@ std::string SpeciesTable::Describe(const std::string &pre) const {
     h << pre << "abundance = " << abundance;
     if (abundance == "Z") h << " (column ratio, column_normalization = " << column_normalization << ")";
     else h << " (initial reference ratio rho_d/rho_g; the midplane ratio if stratified)";
-    h << (powerlaw ? ", power law" : ", explicit") << "\n";
-    if (powerlaw) h << pre << "mass_slope = " << mass_slope << "\n";
+    h << (continuous ? (equal_mass ? ", continuous (Monte Carlo, equal_mass: bins of equal mass, "
+                                     "equal-mass particles)"
+                                   : ", continuous (Monte Carlo, log_uniform: bins of equal width "
+                                     "in ln tau, mass-weighted particles)") :
+          (powerlaw ? ", power law" : ", explicit")) << "\n";
+    if (Generated()) h << pre << "mass_slope = " << mass_slope << "\n";
     h << pre << abundance << "_total = " << total << "\n";
     h << pre << "sampling = ppc_N per root cell, total " << ppc_total << " ("
       << (equal_ppc ? "equal: species interleaved as the legacy layout" : "species in blocks")
@@ -358,6 +417,7 @@ std::string SpeciesTable::Describe(const std::string &pre) const {
     if (omega_ref > 0.0) h << ", stokes " << tau_s[s]*omega_ref;
     if (new_init) h << ", " << abundance << " " << value[s] << ", ppc " << ppc[s];
     if (!hp.empty()) h << ", H_p " << hp[s];
+    if (continuous) h << ", bin tau_s [" << tau_lo[s] << ", " << tau_hi[s] << "]";
     h << "\n";
   }
   return h.str();
