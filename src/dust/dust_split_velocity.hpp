@@ -39,7 +39,12 @@ void SplitAddGradient(const PR &pr, const int s, const GV &g, const int row, con
 }
 
 //----------------------------------------------------------------------------------------
-// (test) <dust>/test_split_gradient_bound = none | range | count (dust_split_velocity.cpp):
+// the margin of the range bound and the cloud count of the diagnostic's count verdict (constants:
+// test_split_gradient_range_margin, _range_kind, _nmin, _count and the count rule
+// retired)
+constexpr Real kSplitGBMargin = 0.5;
+constexpr int kSplitGBNmin = 8;
+// (test) <dust>/test_split_gradient_bound = none | range (dust_split_velocity.cpp):
 // the extra columns of a split_vgrad row (from kGBCol), written by the fit when the key is given
 constexpr int kGBCol = 25;
 enum : int {
@@ -80,12 +85,10 @@ constexpr int kGSmpCols = 40;
 // (separable: a sum over the directions of the extremes along each); the range factor s is the
 // largest value in [0, 1] that keeps v_parent + s (G d)_c within [lo_c, hi_c] for every piece and
 // component, lo/hi the range of the support cells' mean velocities widened by margin times its
-// span and extended to v_parent itself (s = 0, the parent's velocity, is always inside).  kind 1
-// (span): the magnitude only, s = min(1, (1 + margin) dv / V_G), dv the span (norm of the
-// componentwise ranges) of the cells' mean velocities: the pieces may extrapolate beyond the
-// cells' range in position (a surface parent) but not change by more than the span.  mode 1
+// span (margin kSplitGBMargin) and extended to v_parent itself (s = 0, the parent's velocity, is
+// always inside).  mode 1
 // (range): G and V_G of the row scaled by s (uniformly: the pieces keep the parent's momentum).
-// full (test_split_gradient_diag or the count rule: the statistics kernel wrote every extra
+// full (test_split_gradient_diag: the statistics kernel wrote every extra
 // column from kGBCol): the fit's own status and G from those columns, the verdict in every mode,
 // counters, maxima and samples for the diagnostic.  Otherwise (the default range bound): an
 // applied fit is one with V_G > 0 in the row, its G is the row's, the range of the cells' mean
@@ -93,11 +96,12 @@ constexpr int kGSmpCols = 40;
 // The pieces' offsets dk come from the count pass's separation flags (as the fill's).
 template <class GV, class CV, class MV, class SV>
 KOKKOS_INLINE_FUNCTION
-void SplitGradientBound(const GV &g, const int row, const int mode, const Real margin,
-                        const int kind, const bool full, const int ucol, const Real rsmp,
+void SplitGradientBound(const GV &g, const int row, const int mode,
+                        const bool full, const int ucol, const Real rsmp,
                         const Real dk[3][3], const int nk[3], const Real x, const Real y,
                         const Real z, const CV &cnt, const MV &mx, const SV &smp) {
   if (full ? (g(row, kGBCol + kGBSt0) != 1.0) : !(g(row,13) > 0.0)) return;
+  constexpr Real margin = kSplitGBMargin;
   Real gr[9];
   for (int n=0; n<9; ++n) gr[n] = full ? g(row, kGBCol + kGBG + n) : g(row,n);
   Real s = 1.0, dv2 = 0.0;
@@ -119,10 +123,6 @@ void SplitGradientBound(const GV &g, const int row, const int mode, const Real m
     if (ilo < 0.0) s = fmin(s, lo/ilo);
   }
   s = fmax(0.0, fmin(1.0, s));
-  if (kind == 1) {
-    const Real vg0 = full ? g(row, kGBCol + kGBVG) : g(row,13), dvs = (1.0 + margin)*sqrt(dv2);
-    s = (vg0 > dvs) ? dvs/vg0 : 1.0;
-  }
   // a factor at round-off (a range edge at v_parent, u = O(1e-18)) is 0: the parent's velocity
   // (otherwise the check's |sum m dv| / (M s V_G) divides round-off by round-off)
   if (s < 1.0e-12) s = 0.0;

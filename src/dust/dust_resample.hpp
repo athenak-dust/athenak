@@ -20,10 +20,10 @@
 #ifndef DUST_R_DIAG
 #define DUST_R_DIAG 0
 #endif
-// The column-by-column QR update of the device patch solves (<dust>/cloud_resample_qr_rows =
-// false, one thread per column in the host's order, bitwise comparable with the host solver) is
-// compiled only with -DDUST_R_QR_COLUMNS=1 (the reference build); the production build has the
-// row-parallel update only, and an input or restart asking for false stops there (dust.cpp).
+// The column-by-column QR update of the device patch solves (one thread per column in the host's
+// order, bitwise comparable with the host solver) is the reference build -DDUST_R_QR_COLUMNS=1,
+// which takes it for every device solve (DevicePatchProblem::qr_rows = false); the production
+// build has the row-parallel update only (cloud_resample_qr_rows retired).
 // The host R solver is not affected.
 #ifndef DUST_R_QR_COLUMNS
 #define DUST_R_QR_COLUMNS 0
@@ -67,7 +67,7 @@ struct DevicePatchProblem {
   // amr_profile only: device clock cycles of the patch solves by stage, summed over
   // the teams (kNStage entries; empty = off)
   DvceArray1D<unsigned long long> stage;
-  bool qr_rows = false;   // the QR update shares the rows as well (cloud_resample_qr_rows)
+  bool qr_rows = false;   // the QR update shares the rows as well (!DUST_R_QR_COLUMNS)
   // 3-D, <dust>/cloud_resample_rank_screen: patches whose clouds do not outnumber their nominal
   // rows (7 leaves + 6 + center-of-mass rows, + the cross-moment rows in a flagged patch) are
   // left as they are, before any bucket
@@ -111,12 +111,11 @@ inline unsigned long long *StageTotals() {
 // angmom 3 (+ 3 in a rotating frame, xv_rot), full 9 (+ 3).
 KOKKOS_INLINE_FUNCTION
 constexpr int XVRows(const int xv) {return (xv == 1) ? 3 : ((xv == 2) ? 9 : 0);}
-// mid > 64: patches of 65 .. mid clouds form a middle bucket solved with teams of mid_team threads;
-// mid <= 64: only the two buckets of at most 64 and of more than 64 clouds.  wide_team > 512: the
+// Two buckets, of at most 64 and of more than 64 clouds.  wide_team > 512: the
 // large bucket with teams of up to 1024 threads (a kernel bound to 1024 threads).
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
-                        const int mid, const int mid_team, const int wide_team,
+                        const int wide_team,
                         double timing[5], long long *screened = nullptr, const int xv = 0,
                         const DvceArray1D<int> &xflag = DvceArray1D<int>(),
                         const bool xv_rot = false, const double xv_q = 0.0);

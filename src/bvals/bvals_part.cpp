@@ -27,15 +27,6 @@
 
 namespace particles {
 namespace {
-// ATHENA_PART_SENDLIST_OLD=1: the send list is reallocated to exactly the particle count and
-// cleared (host and device) whenever that count passes its high-water mark (the former path)
-bool SendlistOld() {
-  static const bool on = [] {
-    const char *e = std::getenv("ATHENA_PART_SENDLIST_OLD");
-    return e != nullptr && e[0] == '1';
-  }();
-  return on;
-}
 #if MPI_PARALLEL_ENABLED
 // Post the count elements at buf (a message of the particle exchange) as consecutive MPI
 // messages of at most chunk elements each (MPI counts are int), all with the same tag: MPI's
@@ -85,20 +76,15 @@ void ReserveMessageBuffer(View &buf, const std::size_t required, const int nvals
 //! with the exact size, a rank whose particle count keeps growing (splits, inflow) reallocated
 //! and cleared the whole list, 12 bytes per particle on the host and on the device, at nearly
 //! every migration (on a deep adaptive run almost every cycle, a delay that the other ranks
-//! waited for).  ATHENA_PART_SENDLIST_OLD=1 restores the exact size with
-//! initialization.
+//! waited for).
 
 void ParticlesBoundaryValues::ReserveSendlist(int npart) {
   const int required_capacity = std::max(npart, 1);
   if (sendlist.extent_int(0) >= required_capacity) return;
-  if (SendlistOld()) {
-    Kokkos::realloc(sendlist, required_capacity);
-  } else {
-    const std::size_t cap = std::min<std::size_t>(
-        static_cast<std::size_t>(required_capacity) + required_capacity/8,
-        static_cast<std::size_t>(std::numeric_limits<int>::max()));
-    Kokkos::realloc(Kokkos::WithoutInitializing, sendlist, cap);
-  }
+  const std::size_t cap = std::min<std::size_t>(
+      static_cast<std::size_t>(required_capacity) + required_capacity/8,
+      static_cast<std::size_t>(std::numeric_limits<int>::max()));
+  Kokkos::realloc(Kokkos::WithoutInitializing, sendlist, cap);
 }
 
 //----------------------------------------------------------------------------------------
@@ -172,7 +158,7 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
   auto psendl = sendlist.d_view;
   // the physical x3 faces: reflect or outflow (see bvals.hpp)
   const int x3bc = x3bc_dust;
-  constexpr int kLobe3Shift = SMRCompositeTransfer::kCloudLobeShift3;   // dust.hpp
+  constexpr int kLobe3Shift = CloudGeometry::kCloudLobeShift3;   // dust.hpp
   auto x3rem = x3_removed.d_view;
   const Real z3a = meshsize.x3min, z3b = meshsize.x3max;
   par_for("part_update",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
@@ -190,7 +176,7 @@ TaskStatus ParticlesBoundaryValues::SetNewPrtclGID() {
         if (has_reg) {
           pr(IPZ1,p) = 2.0*zf - pr(IPZ1,p); pr(IPVZ1,p) = -pr(IPVZ1,p);
           // a refinable cloud's x3 lobe mirrors too: lobe 1 <-> 2 (bits
-          // 9-10 of PLEV, dust::SMRCompositeTransfer::kCloudLobeShift3; 0 and 3 are symmetric;
+          // 9-10 of PLEV, dust::CloudGeometry::kCloudLobeShift3; 0 and 3 are symmetric;
           // point particles have no lobe bits)
           const int l3 = (pi(PLEV,p) >> kLobe3Shift) & 3;
           if (l3 == 1 || l3 == 2) pi(PLEV,p) ^= (3 << kLobe3Shift);

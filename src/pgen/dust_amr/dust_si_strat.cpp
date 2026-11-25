@@ -343,7 +343,7 @@ void ProblemGenerator::DustSIStrat(ParameterInput *pin, const bool restart) {
   if (pin->GetOrAddReal("problem", "dust_zcut", 0.0) > 0.0 && !gs) {
     Fatal("<problem>/dust_zcut needs stratified_dust_sampling = gaussian");
   }
-  if (gs && dust_active && !pin->GetOrAddBoolean("problem", "cloud_root_random", false)) {
+  if (gs && dust_active && !dust::GetCloudRootRandom(pin, pmbp->pdust)) {
     Fatal("stratified_dust_sampling = gaussian draws root parents: cloud_root_random = true, "
           "root_placement = random");
   }

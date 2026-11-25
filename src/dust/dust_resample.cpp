@@ -708,6 +708,1341 @@ void PoolInTagOrder(const DvceArray2D<int> &pi, const DvceArray1D<int> &slot, co
   }
 }
 
+namespace {
+
+// the per-dimension steps of the resampling's shared kernels, each dimension's own
+// code: a plain (unlobed) cloud code, the leaf of a cloud's position (from its anchor block)
+template <class LTT> struct RDim;
+template <>
+struct RDim<LeafTraversal> {
+  KOKKOS_INLINE_FUNCTION static bool Lobed(const int code) {
+    return CloudGeometry::CloudLobe1(code) || CloudGeometry::CloudLobe2(code);
+  }
+  template <class PR>
+  KOKKOS_INLINE_FUNCTION
+  static int Leaf(const LeafTraversal &lt, const PR &pr, const int p, const int am) {
+    return lt.LeafOwner(pr(IPX,p), pr(IPY,p), am);
+  }
+};
+template <>
+struct RDim<LeafTraversal3D> {
+  KOKKOS_INLINE_FUNCTION static bool Lobed(const int code) {
+    using T = CloudGeometry;
+    return T::CloudLobe1(code) || T::CloudLobe2(code) || T::CloudLobe3(code);
+  }
+  template <class PR>
+  KOKKOS_INLINE_FUNCTION
+  static int Leaf(const LeafTraversal3D &lt, const PR &pr, const int p, const int am) {
+    return lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), am);
+  }
+};
+
+// the cold gate of R written once (cloud_resample_cold_alpha > 0): a block patch (one
+// species) is cold when every velocity component of its candidate clouds spans at most alpha H /
+// tau (H the cell size of its block, tau = min(ts, 1/omega), the velocity tolerance of stage X).
+// Resampling keeps the leaf masses at the moment of the pass but replaces a lattice (or intact P1
+// families) by unequal masses, whose deposit is no longer uniform once the clouds move (aliasing):
+// a quiet state is left alone.  patch(t, b, q): the block b and block patch q of leaf t, false
+// beyond this rank's blocks.  kGuard (2-D): an anchor outside this rank's blocks is no candidate
+// under the event mask.
+template <bool kGuard, class LTT, class PF>
+void ResampleColdGateT(const LTT &lt, const DvceArray2D<Real> &pr, const DvceArray2D<int> &pi,
+                       const int npart, const int nqs, const int nsp, const int ncell,
+                       const int nmbp, const bool use_mask, const DvceArray1D<int> &rmask,
+                       const ResampleCapTable &rcap, const DvceArray1D<Real> &m0sp,
+                       const Real calpha, const Real comega, const PF &patch,
+                       const DvceArray2D<Real> &crange, const DvceArray1D<int> &ccold,
+                       const DvceArray1D<int> &cq) {
+  using RD = RDim<LTT>;
+  using A = LeafApi<LTT>;
+  constexpr bool k3 = (A::kDim == 3);
+  Kokkos::parallel_for(k3 ? "rs3_cold_init" : "rs_cold_init", Kokkos::RangePolicy<>(DevExeSpace(), 0, nqs),
+  KOKKOS_LAMBDA(const int q) {
+    for (int c=0; c<3; ++c) {crange(q,c) = 1.0e300; crange(q,3+c) = -1.0e300;}
+    ccold(q) = 1;
+  });
+  // the candidates (the pool tests of the flag kernel) and their block patch
+  Kokkos::parallel_for(k3 ? "rs3_cold_q" : "rs_cold_q", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    cq(p) = -1;
+    if (pr(IPM,p) <= 0.0) return;
+    const int code = pi(PLEV,p);
+    if (RD::Lobed(code)) return;
+    const int am = lt.Anchor(pi(PGID,p));
+    if (use_mask && ((kGuard && (am < 0 || am >= nmbp)) || rmask(am) == 0)) return;
+    const int lev = CloudGeometry::CloudLevel(code);
+    const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
+    const Real cap = rcap.Cap(m0sp(sp), lev);
+    if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol)) || pr(IPM,p) >= cap*(1.0 - kCapTol)) return;
+    const int t = RD::Leaf(lt, pr, p, am);
+    if (t < 0) return;
+    int b, q;
+    if (!patch(t, b, q)) return;
+    const int qs = q*nsp + sp;
+    cq(p) = qs;
+    const Real v[3] = {pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p)};
+    for (int c=0; c<3; ++c) {
+      Kokkos::atomic_min(&crange(qs,c), v[c]);
+      Kokkos::atomic_max(&crange(qs,3+c), v[c]);
+    }
+  });
+  Kokkos::parallel_for(k3 ? "rs3_cold_flag" : "rs_cold_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    const int qs = cq(p);
+    if (qs < 0) return;
+    const Real ts = pr(IPTS,p);
+    const Real tau = (comega > 0.0) ? Kokkos::fmin(ts, 1.0/comega) : ts;
+    const int b = RD::Leaf(lt, pr, p, lt.Anchor(pi(PGID,p)))/ncell;
+    const Real tolv = calpha*A::Dx(lt, b, 0)/tau;
+    for (int c=0; c<3; ++c) {
+      if (crange(qs,3+c) - crange(qs,c) > tolv) {Kokkos::atomic_store(&ccold(qs), 0); return;}
+    }
+  });
+}
+
+// R's pool flags written once: cnt(p) the number of (leaf, weight) entries of a pool
+// cloud (plain, below its cap eta_L m0 / 2^(d L) and not at it, not in a cold patch, anchored in a
+// marked block under the event mask), -1 for the others; the totals before (mass, x momentum) and
+// the counts of lobed clouds, plain clouds above the cap, zero-mass slots and cold skips.  Several
+// ranks: a cloud whose leaf is on a block of another rank stays out (a position within round-off of
+// a periodic face can be routed to this rank's block while its leaf lookup takes the periodic image
+// on the other side, owned elsewhere).  kGuard (2-D): an anchor outside this rank's blocks is
+// no candidate under the event mask.
+template <bool kGuard, class LTT>
+void ResamplePoolFlagsT(const LTT &lt, const DvceArray2D<Real> &pr, const DvceArray2D<int> &pi,
+                        const int npart, const DvceArray1D<int> &cnt, const bool use_mask,
+                        const DvceArray1D<int> &rmask, const int nmbp, const int nsp,
+                        const ResampleCapTable &rcap, const DvceArray1D<Real> &m0sp,
+                        const Real calpha, const DvceArray1D<int> &cq,
+                        const DvceArray1D<int> &ccold, const int ncell, double tot_b[2],
+                        double cnt_b[3], double &cnt_cold) {
+  using RD = RDim<LTT>;
+  using A = LeafApi<LTT>;
+  constexpr bool k3 = (A::kDim == 3);
+  const bool multirank = (global_variable::nranks > 1);
+  Kokkos::parallel_reduce(k3 ? "rs3_flag" : "rs_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p, double &mt, double &px, double &nl, double &nf, double &nz,
+                double &ncold) {
+    cnt(p) = -1;
+    if (pr(IPM,p) <= 0.0) {nz += 1.0; return;}
+    mt += pr(IPM,p); px += pr(IPM,p)*pr(IPVX,p);
+    const int code = pi(PLEV,p);
+    const int lev = CloudGeometry::CloudLevel(code);
+    if (RD::Lobed(code)) {nl += 1.0; return;}
+    if (use_mask) {   // local resampling: only clouds anchored in the marked blocks
+      const int am = lt.Anchor(pi(PGID,p));
+      if ((kGuard && (am < 0 || am >= nmbp)) || rmask(am) == 0) return;
+    }
+    const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
+    const Real cap = rcap.Cap(m0sp(sp), lev);
+    if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
+    if (pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
+    if (calpha > 0.0 && cq(p) >= 0 && ccold(cq(p)) == 1) {ncold += 1.0; return;}   // cold patch
+    if (multirank) {
+      const int tl = RD::Leaf(lt, pr, p, lt.Anchor(pi(PGID,p)));
+      if (tl < 0 || tl/ncell >= nmbp) return;
+    }
+    int c = 0;
+    Real x[3];
+    A::Load(pr, p, x);
+    A::ForEachWeight(lt, x, code, lt.Anchor(pi(PGID,p)), [&](const int, const Real) {++c;});
+    cnt(p) = c;
+  }, tot_b[0], tot_b[1], cnt_b[0], cnt_b[1], cnt_b[2], cnt_cold);
+}
+
+// R's compaction, both traversals: the clouds with mass kept in order, with 25%
+// headroom as the in-place split keeps it; the mesh's particle counts updated.  Returns the count.
+template <bool k3>
+int CompactResampledT(particles::Particles *ppar, Mesh *pmesh, const int npart) {
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  const int nrd = ppar->nrdata, nid = ppar->nidata;
+  DvceArray1D<int> koff(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                          std::string(k3 ? "rs3_koff" : "rs_koff")), npart);
+  int nkeep = 0;
+  Kokkos::parallel_scan(k3 ? "rs3_kscan" : "rs_kscan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+    if (final) koff(p) = upd;
+    upd += (pr(IPM,p) > 0.0) ? 1 : 0;
+  }, nkeep);
+  DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrd,
+                        nkeep + nkeep/4);
+  DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nid,
+                       nkeep + nkeep/4);
+  Kokkos::parallel_for(k3 ? "rs3_keep" : "rs_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    if (pr(IPM,p) <= 0.0) return;
+    const int k = koff(p);
+    for (int c=0; c<nrd; ++c) prn(c,k) = pr(c,p);
+    for (int c=0; c<nid; ++c) pin(c,k) = pi(c,p);
+  });
+  ppar->prtcl_rdata = prn;
+  ppar->prtcl_idata = pin;
+  ppar->nprtcl_thispack = nkeep;
+  pmesh->nprtcl_thisrank = nkeep;
+  pmesh->nprtcl_eachrank[global_variable::my_rank] = nkeep;
+  pmesh->nprtcl_total = nkeep;
+  return nkeep;
+}
+
+
+// the per-dimension kernels of the resampling pass written once
+// (DustGasDrag::ResampleCloudsT), each dimension's own straight-line code: the block patch of a
+// leaf, the cold gate's patch, the fill of the pool table (position, mass, velocity, stopping
+// time, the gas velocity gathered with the linear moments, the cap; the patch and cell slot of a
+// pool cloud), the split of a crowded patch (quadrants in 2-D, octants in 3-D) and the patch
+// geometry of the center-of-mass rows.  2-D: the anchor guard of the event mask, a cloud without
+// a leaf goes to its anchor's (0, 0) cell; 3-D: a pool cloud without a leaf aborts.
+template <class LTT> struct RKern;
+
+template <>
+struct RKern<LeafTraversal> {
+  using LT = LeafTraversal;
+  static constexpr int kNpd = 11;      // pool table columns (resample::NPD)
+  static constexpr int kNgeo = 4;      // patch geometry columns (x, y, half x, half y)
+  static constexpr bool kGuard = true;
+  static int Ncell(const DustGasDrag *dg, const LT &) {
+    return dg->qdep.extent_int(4)*dg->qdep.extent_int(3);
+  }
+  static void ColdGate(const DustGasDrag *pd, const Mesh *pmesh, const LT &lt,
+                       const DvceArray2D<Real> &pr, const DvceArray2D<int> &pi, const int npart,
+                       const int nqs, const int nsp, const int nmbp, const bool use_mask,
+                       const DvceArray1D<int> &rmask, const ResampleCapTable &rcap,
+                       const DvceArray1D<Real> &m0sp, const Real calpha, const Real comega,
+                       const DvceArray1D<int> &kblk, const DvceArray1D<int> &poff, const int bnx1,
+                       const int, const DvceArray2D<Real> &crange, const DvceArray1D<int> &ccold,
+                       const DvceArray1D<int> &cq) {
+    const int js_ = pmesh->mb_indcs.js, is_ = pmesh->mb_indcs.is;
+    const int nc1 = pd->qdep.extent_int(4), nc2 = pd->qdep.extent_int(3);
+    auto patch2 = [=] KOKKOS_FUNCTION (const int t, int &b, int &q) -> bool {
+      b = t/(nc1*nc2);
+      if (b >= nmbp) return false;
+      const int r = t % (nc1*nc2);
+      const int tj = r/nc1 - js_, ti = r % nc1 - is_;
+      const int k = kblk(b);
+      q = poff(b) + (tj/k)*(bnx1/k) + ti/k;
+      return true;
+    };
+    ResampleColdGateT<true>(lt, pr, pi, npart, nqs, nsp, nc1*nc2, nmbp, use_mask, rmask, rcap,
+                            m0sp, calpha, comega, patch2, crange, ccold, cq);
+  }
+  // the pool table, ids and CSR weights of the pool clouds (slot >= 0)
+  static void Fill(const DustGasDrag *dg, const Mesh *pmesh, const LT &lt,
+                   const DvceArray2D<Real> &pr, const DvceArray2D<int> &pi, const int npart,
+                   const int npool, const int nnz, const int nsp, const int nmbp_,
+                   const DvceArray1D<int> &slot, const DvceArray1D<int> &coff,
+                   const DvceArray1D<int> &kblk, const DvceArray1D<int> &poff, const int psub,
+                   const int bnx1, const int, const ResampleCapTable &rcap,
+                   const DvceArray1D<Real> &m0sp, DvceArray2D<Real> &pd_, DvceArray2D<int> &pid_,
+                   DvceArray1D<int> &cptr_, DvceArray1D<int> &ctgt_, DvceArray1D<Real> &cwgt_) {
+    const int npd = kNpd;
+    DvceArray2D<Real> pd(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pd"), npool, npd);
+    DvceArray2D<int> pid(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pid"), npool, 2);
+    DvceArray1D<int> cptr(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_cptr"), npool + 1);
+    DvceArray1D<int> ctgt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_ctgt"), nnz);
+    DvceArray1D<Real> cwgt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_cwgt"), nnz);
+    const auto transfer = dg->cloud_geometry;
+    auto &indcs = pmesh->mb_indcs;
+    const int is = indcs.is, js = indcs.js, ks = indcs.ks;
+    auto gp = dg->gpack;   // PackGasGather (at the start of the pass)
+    const int ncells1 = dg->qdep.extent_int(4), ncells2 = dg->qdep.extent_int(3);
+    const int nnz_ = nnz;
+    Kokkos::parallel_for("rs_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      const int a = slot(p);
+      if (p == npart - 1) cptr(npool) = nnz_;
+      if (a < 0) return;
+      const Real xp = pr(IPX,p), yp = pr(IPY,p);
+      const int code = pi(PLEV,p);
+      const int lev = CloudGeometry::CloudLevel(code);
+      Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
+      lt.ForEachCloudMoment(xp, yp, CloudGeometry::GatherCode(code),
+                            lt.Anchor(pi(PGID,p)),
+      [&](const int target, const Real w, const Real m1x, const Real m1y) {
+        const int ti = target % ncells1;
+        const int remainder = target/ncells1;
+        const int tj = remainder % ncells2;
+        const int tm = remainder/ncells2;
+        // the leaf's block slot may be a halo block: its box from lt, the gas from
+        // the packed field (the predictor's gather)
+        const Real dx1 = lt.box(tm,2), dx2 = lt.box(tm,3);
+        const Real xc = lt.box(tm,0) + (ti - is + 0.5)*dx1;
+        const Real yc = lt.box(tm,1) + (tj - js + 0.5)*dx2;
+        const Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
+        const Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
+        ugx += w*gp(tm,ks,tj,ti,0) + cx*gp(tm,ks,tj,ti,3) + cy*gp(tm,ks,tj,ti,6);
+        ugy += w*gp(tm,ks,tj,ti,1) + cx*gp(tm,ks,tj,ti,4) + cy*gp(tm,ks,tj,ti,7);
+        ugz += w*gp(tm,ks,tj,ti,2) + cx*gp(tm,ks,tj,ti,5) + cy*gp(tm,ks,tj,ti,8);
+      });
+      pd(a,0) = xp; pd(a,1) = yp; pd(a,2) = pr(IPM,p);
+      pd(a,3) = pr(IPVX,p); pd(a,4) = pr(IPVY,p); pd(a,5) = pr(IPVZ,p); pd(a,6) = pr(IPTS,p);
+      pd(a,7) = ugx; pd(a,8) = ugy; pd(a,9) = ugz;
+      const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
+      pd(a,10) = rcap.Cap(m0sp(sp), lev);
+      {
+        // the leaf that holds the particle: its block and cell
+        const int am = lt.Anchor(pi(PGID,p));
+        const int t = lt.LeafOwner(xp, yp, am);
+        int b = am, ti = 0, tj = 0;
+        if (t >= 0) {
+          b = t/(ncells1*ncells2);
+          const int r = t % (ncells1*ncells2);
+          tj = r/ncells1 - js; ti = r % ncells1 - is;
+        }
+        // the clouds were moved to the rank of their block before (MigrateClouds)
+        if (b >= nmbp_) {
+          Kokkos::printf("resampling: cloud p=%d tag=%llu x=%.17g y=%.17g PGID=%d anchor=%d leaf=%d "
+                         "block=%d of %d (code %d, m=%.6e)\n", p,
+                         static_cast<unsigned long long>(GetTag(pi,p)), xp, yp, pi(PGID,p), am,
+                         t, b, nmbp_, code, pr(IPM,p));
+          Kokkos::abort("resampling: a cloud in a block of another rank");
+        }
+        const int k = kblk(b);
+        int q = poff(b) + (tj/k)*(bnx1/k) + ti/k;
+        if (psub > 1) q = q*psub + (tj % k)*k + (ti % k);   // its cell in the patch
+        pid(a,0) = q;
+      }
+      pid(a,0) = pid(a,0)*nsp + sp;   // one species per patch
+      pid(a,1) = p;
+      cptr(a) = coff(p);
+      int e = coff(p);
+      lt.ForEachCloudWeight(xp, yp, code, lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
+        ctgt(e) = target; cwgt(e) = w; ++e;
+      });
+    });
+    pd_ = pd; pid_ = pid; cptr_ = cptr; ctgt_ = ctgt; cwgt_ = cwgt;
+  }
+  // count the pool of every cell slot; per block patch and species one thread splits the
+  // squares holding more than psplit clouds into quadrants (down to single cells) and maps every
+  // slot to the lower-left slot of its final square (own) with the square's width there (nsz)
+  static DvceArray1D<int> SplitTree(const DvceArray2D<int> &pid, const int npool, const int nbase,
+                                    const int psub, const int nsp, const int nmbp,
+                                    const DvceArray1D<int> &poff, const DvceArray1D<int> &kblk,
+                                    const int psplit) {
+    const int nslot = nbase*psub;
+    DvceArray1D<int> nsz("rs_split_size", (psub > 1) ? nslot : 1);
+    int nsplit = 0;
+    if (psub > 1) {
+      DvceArray1D<int> pc("rs_split_count", nslot), own("rs_split_owner", nslot);
+      Kokkos::deep_copy(own, -1);   // every slot that holds a cloud must be given a patch below
+      Kokkos::parallel_for("rs_split_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int a) {Kokkos::atomic_increment(&pc(pid(a,0)));});
+      const int ps = psub;
+      Kokkos::parallel_reduce("rs_split_tree", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbase),
+      KOKKOS_LAMBDA(const int i, int &ns) {
+        const int q = i/nsp, sp = i % nsp;
+        int lo = 0, hi = nmbp;   // the block of patch q
+        while (hi - lo > 1) {
+          const int mid = (lo + hi)/2;
+          if (poff(mid) <= q) lo = mid; else hi = mid;
+        }
+        const int k = kblk(lo);
+        auto idx = [&](const int x, const int y) {return (q*ps + y*k + x)*nsp + sp;};
+        int st[64][3], top = 0;   // squares to look at: lower-left cell and width
+        st[top][0] = 0; st[top][1] = 0; st[top][2] = k; ++top;
+        while (top > 0) {
+          --top;
+          const int x0 = st[top][0], y0 = st[top][1], w = st[top][2];
+          int tot = 0;
+          for (int y=y0; y<y0+w; ++y) for (int x=x0; x<x0+w; ++x) tot += pc(idx(x, y));
+          if (tot > psplit && w >= 2 && top + 4 <= 64) {
+            const int h = w/2;
+            if (w == k) ns += 1;
+            for (int c=0; c<4; ++c) {
+              st[top][0] = x0 + (c & 1)*h; st[top][1] = y0 + (c >> 1)*h; st[top][2] = h; ++top;
+            }
+          } else {
+            for (int y=y0; y<y0+w; ++y) for (int x=x0; x<x0+w; ++x) own(idx(x, y)) = idx(x0, y0);
+            nsz(idx(x0, y0)) = w;
+          }
+        }
+      }, nsplit);
+      Kokkos::parallel_for("rs_split_ids", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int a) {
+        const int o = own(pid(a,0));
+        if (o < 0) Kokkos::abort("resampling: a cell slot without a patch");
+        pid(a,0) = o;
+      });
+    }
+    return nsz;
+  }
+  // per patch: center and length scale of the center-of-mass rows (half the patch width)
+  static DvceArray2D<Real> Pgeo(const LT &lt, const int npatch, const int nsp, const int psub,
+                                const int nmbp, const DvceArray1D<int> &poff,
+                                const DvceArray1D<int> &kblk, const DvceArray1D<int> &nsz,
+                                const int bnx1, const int) {
+    DvceArray2D<Real> pgeo(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pgeo"), npatch, 4);
+    Kokkos::parallel_for("rs_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+    KOKKOS_LAMBDA(const int qs) {
+      const int g = qs/nsp, q = g/psub, c = g % psub;   // the geometric patch, cell slot
+      int lo = 0, hi = nmbp;   // the block of patch q: poff(b) <= q < poff(b + 1)
+      while (hi - lo > 1) {
+        const int mid = (lo + hi)/2;
+        if (poff(mid) <= q) lo = mid; else hi = mid;
+      }
+      const int b = lo, k = kblk(b), r = q - poff(b), nbx = bnx1/k, ip = r % nbx, jp = r/nbx;
+      const Real d1 = lt.box(b,2), d2 = lt.box(b,3);   // = mb_size of local block b
+      pgeo(qs,0) = lt.box(b,0) + (ip + 0.5)*k*d1;
+      pgeo(qs,1) = lt.box(b,1) + (jp + 0.5)*k*d2;
+      pgeo(qs,2) = 0.5*k*d1; pgeo(qs,3) = 0.5*k*d2;
+      if (psub > 1 && nsz(qs) > 0) {   // a final square of w cells
+        const int w = nsz(qs), x0 = c % k, y0 = c/k;
+        pgeo(qs,0) = lt.box(b,0) + (ip*k + x0 + 0.5*w)*d1;
+        pgeo(qs,1) = lt.box(b,1) + (jp*k + y0 + 0.5*w)*d2;
+        pgeo(qs,2) = 0.5*w*d1; pgeo(qs,3) = 0.5*w*d2;
+      }
+    });
+    return pgeo;
+  }
+};
+
+template <>
+struct RKern<LeafTraversal3D> {
+  using LT = LeafTraversal3D;
+  using T = CloudGeometry;
+  static constexpr int kNpd = resample::NPD3;
+  static constexpr int kNgeo = 6;      // (x, y, half x, half y, z, half z)
+  static constexpr bool kGuard = false;
+  static int Ncell(const DustGasDrag *, const LT &lt) {return lt.ncells1*lt.ncells2*lt.ncells3;}
+  static void ColdGate(const DustGasDrag *, const Mesh *, const LT &lt,
+                       const DvceArray2D<Real> &pr, const DvceArray2D<int> &pi, const int npart,
+                       const int nqs, const int nsp, const int nmbp, const bool use_mask,
+                       const DvceArray1D<int> &rmask, const ResampleCapTable &rcap,
+                       const DvceArray1D<Real> &m0sp, const Real calpha, const Real comega,
+                       const DvceArray1D<int> &kblk, const DvceArray1D<int> &poff, const int bnx1,
+                       const int bnx2, const DvceArray2D<Real> &crange,
+                       const DvceArray1D<int> &ccold, const DvceArray1D<int> &cq) {
+    const int is = lt.is, js = lt.js, ks = lt.ks;
+    const int ncell123 = lt.ncells1*lt.ncells2*lt.ncells3;
+    // the block patch (geometric) of a leaf
+    auto patch_of = [=] KOKKOS_FUNCTION (const int t, int &b, int &q, int &cell) -> bool {
+      int kk, jj, ii;
+      lt.Decode(t, b, kk, jj, ii);
+      if (b >= nmbp) return false;   // a halo leaf (kblk / poff hold this rank's blocks only)
+      const int ti = ii - is, tj = jj - js, tk = kk - ks;
+      const int k = kblk(b), nbx = bnx1/k, nby = bnx2/k;
+      q = poff(b) + ((tk/k)*nby + tj/k)*nbx + ti/k;
+      cell = ((tk % k)*k + (tj % k))*k + (ti % k);
+      return true;
+    };
+    auto patch3 = [=] KOKKOS_FUNCTION (const int t, int &b, int &q) -> bool {
+      int cell;
+      return patch_of(t, b, q, cell);   // false: a center on another rank's block (skipped)
+    };
+    ResampleColdGateT<false>(lt, pr, pi, npart, nqs, nsp, ncell123, nmbp, use_mask, rmask, rcap,
+                             m0sp, calpha, comega, patch3, crange, ccold, cq);
+  }
+  // the base patch of every pool cloud (cnt >= 0) and the (cloud, leaf cell) pairs per base patch
+  // (the batches of cloud_resample_batch_pairs); returns the pool size
+  static int Ppat(const LT &lt, const DvceArray2D<Real> &pr, const DvceArray2D<int> &pi,
+                  const int npart, const int nsp, const int nmbp, const DvceArray1D<int> &cnt,
+                  const DvceArray1D<int> &kblk, const DvceArray1D<int> &poff, const int bnx1,
+                  const int bnx2, const DvceArray1D<int> &ppat, const DvceArray1D<long long> &pent) {
+    const int is = lt.is, js = lt.js, ks = lt.ks;
+    auto patch_of = [=] KOKKOS_FUNCTION (const int t, int &b, int &q, int &cell) -> bool {
+      int kk, jj, ii;
+      lt.Decode(t, b, kk, jj, ii);
+      if (b >= nmbp) return false;   // a halo leaf (kblk / poff hold this rank's blocks only)
+      const int ti = ii - is, tj = jj - js, tk = kk - ks;
+      const int k = kblk(b), nbx = bnx1/k, nby = bnx2/k;
+      q = poff(b) + ((tk/k)*nby + tj/k)*nbx + ti/k;
+      cell = ((tk % k)*k + (tj % k))*k + (ti % k);
+      return true;
+    };
+    int npool_all = 0;
+    Kokkos::parallel_reduce("rs3_ppat", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &np_) {
+      ppat(p) = -1;
+      if (cnt(p) < 0) return;
+      ++np_;
+      // (a pool cloud without a leaf or on another rank's block: batch 0, where rs3_fill aborts)
+      int qs = 0;
+      const int t = lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), lt.Anchor(pi(PGID,p)));
+      if (t >= 0) {
+        int b, q, cell;
+        if (patch_of(t, b, q, cell)) {
+          const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
+          qs = q*nsp + sp;
+        }
+      }
+      ppat(p) = qs;
+      Kokkos::atomic_add(&pent(qs), static_cast<long long>(cnt(p) > 0 ? cnt(p) : 0));
+    }, npool_all);
+    return npool_all;
+  }
+  static void Fill(const DustGasDrag *dg, const Mesh *, const LT &lt,
+                   const DvceArray2D<Real> &pr, const DvceArray2D<int> &pi, const int npart,
+                   const int npool, const int nnz, const int nsp, const int nmbp,
+                   const DvceArray1D<int> &slot, const DvceArray1D<int> &coff,
+                   const DvceArray1D<int> &kblk, const DvceArray1D<int> &poff, const int psub,
+                   const int bnx1, const int bnx2, const ResampleCapTable &rcap,
+                   const DvceArray1D<Real> &m0sp, DvceArray2D<Real> &pd_, DvceArray2D<int> &pid_,
+                   DvceArray1D<int> &cptr_, DvceArray1D<int> &ctgt_, DvceArray1D<Real> &cwgt_) {
+    const int is = lt.is, js = lt.js, ks = lt.ks;
+    auto patch_of = [=] KOKKOS_FUNCTION (const int t, int &b, int &q, int &cell) -> bool {
+      int kk, jj, ii;
+      lt.Decode(t, b, kk, jj, ii);
+      if (b >= nmbp) return false;   // a halo leaf (kblk / poff hold this rank's blocks only)
+      const int ti = ii - is, tj = jj - js, tk = kk - ks;
+      const int k = kblk(b), nbx = bnx1/k, nby = bnx2/k;
+      q = poff(b) + ((tk/k)*nby + tj/k)*nbx + ti/k;
+      cell = ((tk % k)*k + (tj % k))*k + (ti % k);
+      return true;
+    };
+    const int npd = kNpd;
+    DvceArray2D<Real> pd(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pd"), npool, npd);
+    DvceArray2D<int> pid(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pid"), npool, 2);
+    DvceArray1D<int> cptr(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_cptr"), npool + 1);
+    DvceArray1D<int> ctgt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_ctgt"), nnz);
+    DvceArray1D<Real> cwgt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_cwgt"), nnz);
+    auto gp = dg->gpack3;   // PackGasGather3D (once the pool is known)
+    const int nnz_ = nnz;
+    Kokkos::parallel_for("rs3_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      const int a = slot(p);
+      if (p == npart - 1) cptr(npool) = nnz_;
+      if (a < 0) return;
+      const Real xp = pr(IPX,p), yp = pr(IPY,p), zp = pr(IPZ,p);
+      const int code = pi(PLEV,p);
+      const int lev = T::CloudLevel(code);
+      const int am = lt.Anchor(pi(PGID,p));
+      Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
+      lt.ForEachCloudMoment(xp, yp, zp, T::GatherCode(code), am,
+      [&](const int target, const Real w, const Real m1x, const Real m1y, const Real m1z) {
+        int tb, tk, tj, ti;
+        lt.Decode(target, tb, tk, tj, ti);
+        const Real dx1 = lt.box(tb,3), dx2 = lt.box(tb,4), dx3 = lt.box(tb,5);
+        const Real xc = lt.box(tb,0) + (ti - is + 0.5)*dx1;
+        const Real yc = lt.box(tb,1) + (tj - js + 0.5)*dx2;
+        const Real zc = lt.box(tb,2) + (tk - ks + 0.5)*dx3;
+        const Real cx = 0.5*(m1x + T::MinImage(xp - xc, lt.lx)*w)/dx1;
+        const Real cy = 0.5*(m1y + T::MinImage(yp - yc, lt.ly)*w)/dx2;
+        const Real cz = 0.5*(m1z + T::MinImage(zp - zc, lt.lz)*w)/dx3;
+        ugx += w*gp(tb,tk,tj,ti,0) + cx*gp(tb,tk,tj,ti,3) + cy*gp(tb,tk,tj,ti,6) + cz*gp(tb,tk,tj,ti,9);
+        ugy += w*gp(tb,tk,tj,ti,1) + cx*gp(tb,tk,tj,ti,4) + cy*gp(tb,tk,tj,ti,7) + cz*gp(tb,tk,tj,ti,10);
+        ugz += w*gp(tb,tk,tj,ti,2) + cx*gp(tb,tk,tj,ti,5) + cy*gp(tb,tk,tj,ti,8) + cz*gp(tb,tk,tj,ti,11);
+      });
+      pd(a,resample::JX) = xp; pd(a,resample::JY) = yp; pd(a,resample::JZ) = zp;
+      pd(a,resample::JM) = pr(IPM,p);
+      pd(a,resample::JVX) = pr(IPVX,p); pd(a,resample::JVY) = pr(IPVY,p);
+      pd(a,resample::JVZ) = pr(IPVZ,p); pd(a,resample::JTS) = pr(IPTS,p);
+      pd(a,resample::JUX) = ugx; pd(a,resample::JUY) = ugy; pd(a,resample::JUZ) = ugz;
+      const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
+      pd(a,resample::JCAP) = rcap.Cap(m0sp(sp), lev);
+      const int t = lt.LeafOwner(xp, yp, zp, am);
+      if (t < 0) Kokkos::abort("3-D resampling: a pool cloud without a leaf");
+      int b, q, cell;
+      if (!patch_of(t, b, q, cell)) {
+        Kokkos::abort("3-D resampling: a cloud in a block of another rank");
+      }
+      if (psub > 1) q = q*psub + cell;   // its cell in the patch
+      pid(a,0) = q*nsp + sp;
+      pid(a,1) = p;
+      cptr(a) = coff(p);
+      int e = coff(p);
+      lt.ForEachCloudWeight(xp, yp, zp, code, am, [&](const int target, const Real w) {
+        ctgt(e) = target; cwgt(e) = w; ++e;
+      });
+    });
+    pd_ = pd; pid_ = pid; cptr_ = cptr; ctgt_ = ctgt; cwgt_ = cwgt;
+  }
+  // octant split of the crowded patches: every slot to the lowest-corner slot of its final cube
+  // (own), with the cube's width there (nsz)
+  static DvceArray1D<int> SplitTree(const DvceArray2D<int> &pid, const int npool, const int nbase,
+                                    const int psub, const int nsp, const int nmbp,
+                                    const DvceArray1D<int> &poff, const DvceArray1D<int> &kblk,
+                                    const int psplit) {
+    const int nslot = nbase*psub;
+    DvceArray1D<int> nsz("rs3_split_size", (psub > 1) ? nslot : 1);
+    int nsplit = 0;
+    if (psub > 1) {
+      DvceArray1D<int> pc("rs3_split_count", nslot), own("rs3_split_owner", nslot);
+      Kokkos::deep_copy(own, -1);
+      Kokkos::parallel_for("rs3_split_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int a) {Kokkos::atomic_increment(&pc(pid(a,0)));});
+      const int ps = psub;
+      Kokkos::parallel_reduce("rs3_split_tree", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbase),
+      KOKKOS_LAMBDA(const int i, int &ns) {
+        const int q = i/nsp, sp = i % nsp;
+        int lo = 0, hi = nmbp;
+        while (hi - lo > 1) {
+          const int mid = (lo + hi)/2;
+          if (poff(mid) <= q) lo = mid; else hi = mid;
+        }
+        const int k = kblk(lo);
+        auto idx = [&](const int x, const int y, const int z) {
+          return (q*ps + (z*k + y)*k + x)*nsp + sp;
+        };
+        int st[64][4], top = 0;
+        st[top][0] = 0; st[top][1] = 0; st[top][2] = 0; st[top][3] = k; ++top;
+        while (top > 0) {
+          --top;
+          const int x0 = st[top][0], y0 = st[top][1], z0 = st[top][2], w = st[top][3];
+          int tot = 0;
+          for (int z=z0; z<z0+w; ++z) {
+            for (int y=y0; y<y0+w; ++y) for (int x=x0; x<x0+w; ++x) tot += pc(idx(x, y, z));
+          }
+          if (tot > psplit && w >= 2 && top + 8 <= 64) {
+            const int h = w/2;
+            if (w == k) ns += 1;
+            for (int c=0; c<8; ++c) {
+              st[top][0] = x0 + (c & 1)*h; st[top][1] = y0 + ((c >> 1) & 1)*h;
+              st[top][2] = z0 + (c >> 2)*h; st[top][3] = h; ++top;
+            }
+          } else {
+            for (int z=z0; z<z0+w; ++z) {
+              for (int y=y0; y<y0+w; ++y) {
+                for (int x=x0; x<x0+w; ++x) own(idx(x, y, z)) = idx(x0, y0, z0);
+              }
+            }
+            nsz(idx(x0, y0, z0)) = w;
+          }
+        }
+      }, nsplit);
+      Kokkos::parallel_for("rs3_split_ids", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int a) {
+        const int o = own(pid(a,0));
+        if (o < 0) Kokkos::abort("3-D resampling: a cell slot without a patch");
+        pid(a,0) = o;
+      });
+    }
+    return nsz;
+  }
+  // per patch: center and half widths of the center-of-mass rows (x, y, half x, half y, z, half z)
+  static DvceArray2D<Real> Pgeo(const LT &lt, const int npatch, const int nsp, const int psub,
+                                const int nmbp, const DvceArray1D<int> &poff,
+                                const DvceArray1D<int> &kblk, const DvceArray1D<int> &nsz,
+                                const int bnx1, const int bnx2) {
+    DvceArray2D<Real> pgeo(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pgeo"), npatch, 6);
+    Kokkos::parallel_for("rs3_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+    KOKKOS_LAMBDA(const int qs) {
+      const int g = qs/nsp, q = g/psub, c = g % psub;
+      int lo = 0, hi = nmbp;
+      while (hi - lo > 1) {
+        const int mid = (lo + hi)/2;
+        if (poff(mid) <= q) lo = mid; else hi = mid;
+      }
+      const int b = lo, k = kblk(b), r = q - poff(b), nbx = bnx1/k, nby = bnx2/k;
+      const int ip = r % nbx, jp = (r/nbx) % nby, kp = r/(nbx*nby);
+      const Real d1 = lt.box(b,3), d2 = lt.box(b,4), d3 = lt.box(b,5);
+      Real x0 = 0.0, y0 = 0.0, z0 = 0.0, w = k;
+      if (psub > 1 && nsz(qs) > 0) {
+        w = nsz(qs); x0 = c % k; y0 = (c/k) % k; z0 = c/(k*k);
+      }
+      pgeo(qs,0) = lt.box(b,0) + (ip*k + x0 + 0.5*w)*d1;
+      pgeo(qs,1) = lt.box(b,1) + (jp*k + y0 + 0.5*w)*d2;
+      pgeo(qs,2) = 0.5*w*d1; pgeo(qs,3) = 0.5*w*d2;
+      pgeo(qs,4) = lt.box(b,2) + (kp*k + z0 + 0.5*w)*d3;
+      pgeo(qs,5) = 0.5*w*d3;
+    });
+    return pgeo;
+  }
+};
+
+}  // namespace
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::ResampleCloudsT
+//! \brief One resampling of the plain clouds, both traversals (the former
+//! ResampleClouds 2-D body and ResampleClouds3D).  The pool (plain clouds below their cap
+//! eta_L m0 / 2^(d level), the cold gate, the local event mask), patches of k^d cells inside one
+//! MeshBlock with k = min(s 2^level, kc), split into 2^d sub-squares down to single cells while a
+//! patch holds more than cloud_resample_patch_split clouds, and the rows of every patch: leaf
+//! mass, momentum and feedback, the d center-of-mass rows and the six velocity second moments.
+//! Per dimension (RKern; traits of each instance): 2-D packs the gas gather field at the start
+//! (collective) and keeps the host solve (cloud_resample_device = false, the CPU default); 3-D packs it once the pool is
+//! known (collective decision), resamples in batches of block patches
+//! (cloud_resample_batch_pairs), splits a crowded patch into sub-patches (cloud_resample_patch_max),
+//! screens the rank (cloud_resample_rank_screen) and adds the cross-moment rows
+//! (cloud_resample_xv_rows).  Old 2-D restart files carry patch_max, rank_screen and batch_pairs,
+//! which 2-D never applied: not applied.  Returns the number of clouds removed.
+
+template <class LTT>
+int DustGasDrag::ResampleCloudsT(const LTT &lt_in, const bool local) {
+  using RK = RKern<LTT>;
+  using T = CloudGeometry;
+  constexpr bool k3 = (LeafApi<LTT>::kDim == 3);
+  using Clock = std::chrono::steady_clock;
+  particles::Particles *ppar = pmy_pack->ppart;
+  Mesh *pmesh = pmy_pack->pmesh;
+  const int npart = ppar->nprtcl_thispack;
+  const auto lt = lt_in;
+  // 3-D: the gas gather field is packed below, once the pool is known; the decision is
+  // collective and the pack has a forward halo exchange, so every rank takes part, also one
+  // without particles (a rank that returned early made the others fail in the MPI_Allreduce)
+  auto gas_if_needed = [&](const int npool_mine) {
+    int npool_max = npool_mine;
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &npool_max, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+#endif
+    if (npool_max >= 2) PackGasGather3D(pmy_pack->phydro->u0);
+  };
+  // 2-D: the gas velocity and its differences of every leaf of the current state, the owners'
+  // values on the halo blocks, for the gather of the pool (the predictor's packed field).  Before
+  // any return: the halo exchange is collective.
+  if constexpr (!k3) PackGasGather(pmy_pack->phydro->u0);
+  // the root cloud mass (reduced over the ranks): also before any return
+  if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
+  if (npart == 0) {
+    if constexpr (k3) gas_if_needed(0);
+    return 0;
+  }
+  // the root cloud mass of every species (cap eta_L m0 / 2^(d level)): cloud_resample_m0 for all
+  // of them, else the merge pass's per-species value.  The patches are also split by species, so
+  // every species keeps its own leaf masses.  A species without such a value (no plain
+  // level-0/1 cloud) has a cap of zero: its clouds stay out of the pool.
+  const int nsp = std::max(1, nspecies);
+  DvceArray1D<Real> m0sp(std::string(k3 ? "rs3_m0" : "rs_m0"), nsp);
+  {
+    auto mh = Kokkos::create_mirror_view(m0sp);
+    bool any = false;
+    for (int sp=0; sp<nsp; ++sp) {
+      mh(sp) = (cloud_resample_m0 > 0.0) ? cloud_resample_m0
+             : ((static_cast<int>(cloud_merge_mroot.size()) > sp) ? cloud_merge_mroot[sp] : 0.0);
+      if (mh(sp) > 0.0) any = true;
+    }
+    if (!any) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl;
+      if constexpr (k3) {
+        std::cout << "cloud_resample needs the root cloud mass: set <dust>/cloud_resample_m0"
+                  << std::endl;
+      } else {
+        std::cout << "cloud_resample needs the root cloud mass: no species has a plain level-0 or "
+                  << "level-1 cloud; set <dust>/cloud_resample_m0" << std::endl;
+      }
+      std::exit(EXIT_FAILURE);
+    }
+    if constexpr (!k3) {
+      static bool told = false;
+      if (!told && global_variable::my_rank == 0) {
+        for (int sp=0; sp<nsp; ++sp) {
+          if (!(mh(sp) > 0.0)) {
+            std::cout << "# NOTE (dust): species " << sp << " has no root cloud mass (no plain "
+                      << "level-0 or level-1 cloud of positive mass): its clouds stay out of the "
+                      << "resampling" << std::endl;
+          }
+        }
+        told = true;
+      }
+    }
+    Kokkos::deep_copy(m0sp, mh);
+  }
+  // the patches: inside one MeshBlock, k^d of its cells with k = min(s 2^l, kc) (s^d root cells on
+  // the root level, up to the level where they reach kc^d cells, never more)
+  const int s = cloud_resample_patch, kc = cloud_resample_patch_cells;
+  const int nmbp = pmy_pack->nmb_thispack;
+  const int bnx1 = k3 ? lt.nx1 : pmesh->mb_indcs.nx1, bnx2 = k3 ? lt.nx2 : pmesh->mb_indcs.nx2;
+  const int bnx3 = k3 ? LeafApi<LTT>::Nx(lt, 2) : 1;
+  std::vector<int> kblk_h(nmbp), poff_h(nmbp + 1, 0);   // block patches: k per block, offsets
+  bool bad = (kc < 1);
+  for (int b=0; b<nmbp && !bad; ++b) {
+    const int lev = pmy_pack->pmb->mb_lev.h_view(b) - pmesh->root_level;
+    int k = s;
+    for (int l=0; l<lev && k < kc; ++l) k *= 2;
+    k = std::min(k, kc);
+    if (bnx1 % k != 0 || bnx2 % k != 0 || (k3 && bnx3 % k != 0)) bad = true;
+    // the split halves the width down to one cell, so k must be a power of two
+    if (cloud_resample_patch_split > 0 && (k & (k - 1)) != 0) bad = true;
+    kblk_h[b] = k;
+    poff_h[b + 1] = poff_h[b] + (k3 ? (bnx1/k)*(bnx2/k)*(bnx3/k) : (bnx1/k)*(bnx2/k));
+  }
+  if (bad) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << (k3 ? "3-D " : "") << "block patches of min(2 * 2^level, 4) cells must divide the "
+                 "MeshBlock (and be "
+                 "powers of two with test_cloud_resample_patch_split > 0)" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  DvceArray1D<int> kblk(std::string(k3 ? "rs3_kblk" : "rs_kblk"), nmbp), poff(std::string(k3 ? "rs3_poff" : "rs_poff"), nmbp + 1);
+  {
+    auto kb = Kokkos::create_mirror_view(kblk);
+    auto po = Kokkos::create_mirror_view(poff);
+    for (int b=0; b<nmbp; ++b) kb(b) = kblk_h[b];
+    for (int b=0; b<=nmbp; ++b) po(b) = poff_h[b];
+    Kokkos::deep_copy(kblk, kb);
+    Kokkos::deep_copy(poff, po);
+  }
+  // local resampling: the blocks of this rank made by the last regrid (no cycle since their
+  // refinement) and every block of this rank whose box touches one of them (any rank, corners
+  // and periodic images included); clouds anchored elsewhere stay out of the pool.  3-D also:
+  // the blocks of this cycle's split events (cloud_split_resample)
+  DvceArray1D<int> rmask(std::string(k3 ? "rs3_mask" : "rs_mask"), std::max(1, nmbp));
+  if (local) {
+    auto pmr = pmesh->pmr;
+    const int ntot = pmesh->nmb_total;
+    const auto &ms = pmesh->mesh_size;
+    const Real lx = ms.x1max - ms.x1min, ly = ms.x2max - ms.x2min;
+    const Real lz = k3 ? ms.x3max - ms.x3min : 0.0;
+    auto box = [&](const int g, Real b[6]) {
+      const auto &ll = pmesh->lloc_eachmb[g];
+      const int lev = ll.level - pmesh->root_level;
+      const Real w1 = lx/(pmesh->nmb_rootx1 << lev), w2 = ly/(pmesh->nmb_rootx2 << lev);
+      b[0] = ms.x1min + ll.lx1*w1; b[1] = b[0] + w1;
+      b[2] = ms.x2min + ll.lx2*w2; b[3] = b[2] + w2;
+      if (k3) {
+        const Real w3 = lz/(pmesh->nmb_rootx3 << lev);
+        b[4] = ms.x3min + ll.lx3*w3; b[5] = b[4] + w3;
+      } else {
+        b[4] = b[5] = 0.0;
+      }
+    };
+    const bool fresh_on = k3 ? r_fresh_blocks : true;
+    std::vector<std::array<Real, 6>> fresh;
+    for (int g=0; g<ntot && fresh_on; ++g) {
+      // (every regrid of the event, cloud_event_dt; 0 for one regrid)
+      if (pmr->ncyc_since_ref(g) <= amr_event_max_age) {
+        Real b[6]; box(g, b); fresh.push_back({b[0], b[1], b[2], b[3], b[4], b[5]});
+      }
+    }
+    const int oz0 = k3 ? -1 : 0, oz1 = k3 ? 1 : 0;
+    auto mh = Kokkos::create_mirror_view(rmask);
+    for (int m=0; m<nmbp; ++m) {
+      Real b[6]; box(pmy_pack->gids + m, b);
+      const Real e1 = 1.0e-9*(b[1] - b[0]), e2 = 1.0e-9*(b[3] - b[2]), e3 = 1.0e-9*(b[5] - b[4]);
+      int on = 0;
+      for (const auto &f : fresh) {
+        for (int oz=oz0; oz<=oz1 && !on; ++oz) {
+          for (int oy=-1; oy<=1 && !on; ++oy) {
+            for (int ox=-1; ox<=1 && !on; ++ox) {
+              const Real a0 = f[0] + ox*lx, a1 = f[1] + ox*lx, c0 = f[2] + oy*ly, c1 = f[3] + oy*ly;
+              const Real d0 = f[4] + oz*lz, d1 = f[5] + oz*lz;
+              if (a0 <= b[1] + e1 && b[0] <= a1 + e1 && c0 <= b[3] + e2 && b[2] <= c1 + e2 &&
+                  (!k3 || (d0 <= b[5] + e3 && b[4] <= d1 + e3))) on = 1;   // touch
+            }
+          }
+        }
+        if (on) break;
+      }
+      // (3-D) the blocks of this cycle's split events (cloud_split_resample): the blocks of the
+      // parents and the blocks the pieces landed in (PrepareSplitBlocks; not the static
+      // neighbors: across a shear-periodic x1 face the pieces land in blocks shifted along x2,
+      // and after a hold by the split budget several blocks away)
+      if (k3 && !on && r_split_blocks && static_cast<int>(split_gid_flag.size()) == ntot) {
+        on = (split_gid_flag[pmy_pack->gids + m] != 0) ? 1 : 0;
+      }
+      mh(m) = on;
+    }
+    Kokkos::deep_copy(rmask, mh);
+  }
+  const bool use_mask = local;
+  // with cloud_resample_patch_split = N > 0 every block patch of k^d cells has one slot per cell
+  // (kc^d slots); a patch, or a part of it, whose pool (one species) holds more than N clouds is
+  // solved as its 2^d parts, recursively down to single cells; each final square (cube) is one
+  // patch in the slot of its lowest cell
+  const int psplit = cloud_resample_patch_split;
+  const int psub = (psplit > 0) ? (k3 ? kc*kc*kc : kc*kc) : 1;
+  const ResampleCapTable rcap = cloud_resample_cap;   // eta_L m0 / 2^(d L) per level
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  const int ncellb = RK::Ncell(this, lt);   // leaf cells of a block slot
+  DvceArray1D<int> cnt(Kokkos::view_alloc(Kokkos::WithoutInitializing, std::string(std::string(k3 ? "rs3_cnt" : "rs_cnt"))), npart);
+  DvceArray1D<int> slot(Kokkos::view_alloc(Kokkos::WithoutInitializing, std::string(std::string(k3 ? "rs3_slot" : "rs_slot"))), npart);
+  DvceArray1D<int> coff(Kokkos::view_alloc(Kokkos::WithoutInitializing, std::string(std::string(k3 ? "rs3_coff" : "rs_coff"))), npart);
+  int npool = 0, nnz = 0;
+  long long nnz64 = 0;
+  double tot_b[2] = {0.0, 0.0}, cnt_b[3] = {0.0, 0.0, 0.0};
+  // cold gate (cloud_resample_cold_alpha > 0): a block patch (one species) is cold when every
+  // velocity component of its candidate clouds spans at most alpha H / tau (H the cell size of
+  // its block, tau = min(ts, 1/omega), the velocity tolerance of stage X); a quiet state is left
+  // alone (ResampleColdGateT)
+  const Real calpha = cloud_resample_cold_alpha, comega = cloud_resample_omega;
+  const int nqs = (calpha > 0.0) ? std::max(1, poff_h[nmbp]*nsp) : 1;
+  DvceArray2D<Real> crange(std::string(k3 ? "rs3_cold_range" : "rs_cold_range"), nqs, 6);
+  DvceArray1D<int> ccold(std::string(k3 ? "rs3_cold" : "rs_cold"), nqs);
+  DvceArray1D<int> cq(std::string(k3 ? "rs3_cold_q" : "rs_cold_q"), (calpha > 0.0) ? std::max(1, npart) : 1);
+  double cnt_cold = 0.0;
+  if (calpha > 0.0) {
+    RK::ColdGate(this, pmesh, lt, pr, pi, npart, nqs, nsp, nmbp, use_mask, rmask, rcap, m0sp,
+                 calpha, comega, kblk, poff, bnx1, bnx2, crange, ccold, cq);
+  }
+  // cnt: number of (leaf, weight) entries of a pool cloud, -1 for the others; totals before;
+  // lobed clouds, plain clouds above the cap, zero-mass slots (ResamplePoolFlagsT)
+  ResamplePoolFlagsT<RK::kGuard>(lt, pr, pi, npart, cnt, use_mask, rmask, nmbp, nsp, rcap, m0sp,
+                                 calpha, cq, ccold, ncellb, tot_b, cnt_b, cnt_cold);
+  cloud_resample_cold_skips += static_cast<unsigned long long>(cnt_cold);
+  // 3-D: batches of block patches (cloud_resample_batch_pairs): the (cloud, leaf cell) pairs of
+  // the pool are held in tables with 32-bit offsets; a rank with more pairs resamples
+  // consecutive ranges of its block patches (and species) one after the other.  Patches are
+  // independent and the pool order within a patch is the same, so the result is that of one
+  // pass (2.2-2.5e9 pairs per rank at L3 when clouds capped at L2 split at once).  ppat: the base
+  // patch of a pool cloud.  2-D: one batch.
+  const int nbase0 = std::max(1, poff_h[nmbp]*nsp);
+  std::vector<std::array<int, 2>> batches;
+  DvceArray1D<int> cntb = cnt;
+  DvceArray1D<int> ppat;
+  if constexpr (k3) {
+    ppat = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_ppat"), npart);
+    DvceArray1D<long long> pent("rs3_pent", nbase0);
+    const int npool_all = RK::Ppat(lt, pr, pi, npart, nsp, nmbp, cnt, kblk, poff, bnx1, bnx2,
+                                   ppat, pent);
+    // the gas gather field (u0 velocities, with a forward halo exchange on several ranks) is only
+    // needed when some rank resamples; the decision is collective because the halo exchange is
+    gas_if_needed(npool_all);
+    if (npool_all < 2) {
+      ++cloud_resample_pass;
+      return 0;
+    }
+    {
+      auto ph = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), pent);
+      const long long cap = cloud_resample_batch_pairs;
+      long long acc = 0, largest = 0;
+      int q0 = 0;
+      for (int q=0; q<nbase0; ++q) {
+        if (ph(q) > static_cast<long long>(std::numeric_limits<int>::max())) {
+          // where and how many, for the message: the pool clouds of the patch and their mean
+          // position, the block and the level of the patch
+          long long nq = 0;
+          double sx = 0.0, sy = 0.0, sz = 0.0;
+          Kokkos::parallel_reduce("rs3_bigpatch", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+          KOKKOS_LAMBDA(const int p, long long &n_, double &x_, double &y_, double &z_) {
+            if (ppat(p) != q) return;
+            ++n_;
+            x_ += pr(IPX,p); y_ += pr(IPY,p); z_ += pr(IPZ,p);
+          }, nq, sx, sy, sz);
+          int mb = 0;
+          while (mb + 1 < nmbp && poff_h[mb + 1] <= q/nsp) ++mb;
+          const double rn = 1.0/static_cast<double>(std::max(nq, 1LL));
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << "resampling: one patch holds " << nq << " clouds of the resampling pool "
+                    << "(below their mass cap and past the other gates) with " << ph(q)
+                    << " (cloud, leaf cell) pairs: more than the 32-bit range of the weight tables ("
+                    << std::numeric_limits<int>::max() << ")" << std::endl
+                    << "  where: rank " << global_variable::my_rank << ", MeshBlock "
+                    << pmy_pack->gids + mb << " (level "
+                    << pmy_pack->pmb->mb_lev.h_view(mb) - pmesh->root_level << " above the root), "
+                    << "species " << q % nsp << " (counted from 0), mean position of these clouds ("
+                    << sx*rn << ", " << sy*rn << ", " << sz*rn << ")" << std::endl
+                    << "  A patch is " << kblk_h[mb] << " x " << kblk_h[mb] << " x " << kblk_h[mb]
+                    << " cells here and is not divided among the batches: a smaller "
+                    << "<dust>/cloud_resample_batch_pairs does not help." << std::endl
+                    << "  The pairs grow with the number of pool clouds in the patch and with their "
+                    << "footprint on finer leaves.  One possible cause: a region that is already "
+                    << "dense is refined abruptly (a restart that adds a refinement level or lowers "
+                    << "a threshold of <dust>/amr_rho_refine_levels), so that its clouds split all "
+                    << "at once." << std::endl
+                    << "  Possible changes of the setup (none is certain to help): a restart from "
+                    << "an earlier time, before the region is this dense; a higher threshold for the "
+                    << "new level (the split may then only come later, at a higher density); "
+                    << "<dust>/cloud_split_max_level, which stops the splitting at a coarser level "
+                    << "(above it the clouds keep their mass and take the kernel of their leaf)."
+                    << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        if (acc > 0 && acc + ph(q) > cap) {
+          batches.push_back({q0, q});
+          largest = std::max(largest, acc);
+          q0 = q;
+          acc = 0;
+        }
+        acc += ph(q);
+      }
+      batches.push_back({q0, nbase0});
+      largest = std::max(largest, acc);
+      // (cap is a target: a patch with more pairs than cap is a batch of its own; the hard limit is
+      // the 32-bit range per batch, checked below)
+      if (batches.size() > 1 || largest > cap) {
+        std::cout << "# resampling (rank " << global_variable::my_rank << "): " << batches.size()
+                  << " batches of block patches (target " << cap << " (cloud, leaf) pairs each, "
+                  << "largest " << largest << ((largest > cap) ? ": one patch alone" : "") << ")"
+                  << std::endl;
+      }
+    }
+    cntb = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_cntb"), npart);
+  } else {
+    batches.push_back({0, nbase0});
+  }
+  int nremoved = 0;
+  for (const auto &bt : batches) {
+    if constexpr (k3) {
+      const int bq0 = bt[0], bq1 = bt[1];
+      Kokkos::parallel_for("rs3_cntb", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p) {
+        cntb(p) = (cnt(p) >= 0 && ppat(p) >= bq0 && ppat(p) < bq1) ? cnt(p) : -1;
+      });
+    }
+    Kokkos::parallel_scan(k3 ? "rs3_slot" : "rs_slot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
+      if (final) slot(p) = (cntb(p) >= 0) ? upd : -1;
+      upd += (cntb(p) >= 0) ? 1 : 0;
+    }, npool);
+    if (cloud_resample_tag_order && npool > 1) {
+      // cloud_resample_order = tag: the pool in PTAG order, so that the streaming order inside a
+      // patch does not depend on where the particles sit in the arrays (storage sorting, several
+      // ranks); the CSR offsets follow the slots
+      DvceArray1D<int> pofs(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                               std::string(k3 ? "rs3_pofs" : "rs_pofs")), npool);
+      PoolInTagOrder(pi, slot, npart, npool, pofs);   // 64-bit tags
+      Kokkos::parallel_scan(k3 ? "rs3_coff" : "rs_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int a, long long &upd, const bool final) {
+        const int p = pofs(a);
+        if (final) coff(p) = static_cast<int>(upd);
+        upd += (cntb(p) > 0) ? cntb(p) : 0;
+      }, nnz64);
+    } else {
+      Kokkos::parallel_scan(k3 ? "rs3_coff" : "rs_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+      KOKKOS_LAMBDA(const int p, long long &upd, const bool final) {
+        if (final) coff(p) = static_cast<int>(upd);
+        upd += (cntb(p) > 0) ? cntb(p) : 0;
+      }, nnz64);
+    }
+    // the (cloud, leaf cell) pairs of the pool in 64 bits: above the 32-bit range the CSR offsets
+    // would wrap (clouds capped at L2 on L5 leaves once asked for 1.7e7 TiB)
+    if (nnz64 > static_cast<long long>(std::numeric_limits<int>::max())) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "resampling: " << nnz64 << " (cloud, leaf cell) pairs on this rank exceed the "
+                << "32-bit range of the weight tables" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    nnz = static_cast<int>(nnz64);
+    if (npool < 2) continue;   // (this batch; nothing to resample)
+    // the pool table (x, y, m, v, ts, gathered gas velocity, cap (, z)), ids, CSR weights
+    DvceArray2D<Real> pd;
+    DvceArray2D<int> pid;
+    DvceArray1D<int> cptr, ctgt;
+    DvceArray1D<Real> cwgt;
+    RK::Fill(this, pmesh, lt, pr, pi, npart, npool, nnz, nsp, nmbp, slot, coff, kblk, poff, psub,
+             bnx1, bnx2, rcap, m0sp, pd, pid, cptr, ctgt, cwgt);
+    const int nbase = poff_h[nmbp]*nsp;   // geometric patch x species
+    const DvceArray1D<int> nsz = RK::SplitTree(pid, npool, nbase, psub, nsp, nmbp, poff, kblk,
+                                               psplit);
+    const int npatch = nbase*psub;   // (geometric patch x cell slot) x species
+    const DvceArray2D<Real> pgeo = RK::Pgeo(lt, npatch, nsp, psub, nmbp, poff, kblk, nsz, bnx1,
+                                            bnx2);
+    if constexpr (k3) {
+      const int ncell123 = ncellb;
+      // the device solve, the pool in patch order
+      DvceArray1D<std::int64_t> key(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_key"), npool);
+      const std::int64_t npl = npool;
+      Kokkos::parallel_for("rs3_key", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int a) {key(a) = static_cast<std::int64_t>(pid(a,0))*npl + a;});
+      Kokkos::sort(key);
+      // sub-patches of the crowded patches (cloud_resample_patch_max): a patch of n > pmax pool
+      // clouds becomes ns = ceil(n / pmax) sub-patches of consecutive clouds in the sorted order
+      // (balanced sizes).  Every sub-patch keeps its own contributions to every row (leaf mass,
+      // momentum and feedback, center of mass, second moments) and takes the geometry of its
+      // patch, so the sum keeps all of them; the solves stay small and run in parallel.  (A single
+      // cell of a dense core held 5e5 clouds at L3: one team solved it for 40 min.)
+      const int pmax = cloud_resample_patch_max;
+      DvceArray1D<int> pcnt("rs3_pcnt", npatch), pstart("rs3_pstart", npatch);
+      DvceArray1D<int> qbase("rs3_qbase", npatch);
+      Kokkos::parallel_for("rs3_pcnt", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int k) {Kokkos::atomic_inc(&pcnt(static_cast<int>(key(k)/npl)));});
+      auto nsub_of = [=] KOKKOS_FUNCTION (const int n) {
+        return (pmax > 0 && n > pmax) ? (n + pmax - 1)/pmax : 1;
+      };
+      int npatch2 = 0;
+      Kokkos::parallel_scan("rs3_qbase", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+      KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
+        if (final) qbase(q) = upd;
+        upd += nsub_of(pcnt(q));
+      }, npatch2);
+      Kokkos::parallel_scan("rs3_pstart", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+      KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
+        if (final) pstart(q) = upd;
+        upd += pcnt(q);
+      });
+      if (npatch2 != npatch) {
+        int ncrowd = 0;
+        Kokkos::parallel_reduce("rs3_ncrowd", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+        KOKKOS_LAMBDA(const int q, int &c) {if (nsub_of(pcnt(q)) > 1) ++c;}, ncrowd);
+        std::cout << "# resampling (rank " << global_variable::my_rank << "): " << ncrowd
+                  << " patches of more than " << pmax << " pool clouds solved as "
+                  << ncrowd + npatch2 - npatch << " sub-patches" << std::endl;
+      }
+      DvceArray2D<Real> pgeo2 = pgeo;
+      if (npatch2 != npatch) {
+        pgeo2 = DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pgeo2"),
+                                  npatch2, 6);
+        Kokkos::parallel_for("rs3_pgeo2", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
+        KOKKOS_LAMBDA(const int q) {
+          const int ns = nsub_of(pcnt(q));
+          for (int j=0; j<ns; ++j) {
+            for (int c=0; c<6; ++c) pgeo2(qbase(q) + j, c) = pgeo(q, c);
+          }
+        });
+      }
+      resample::DevicePatchProblem pb;
+      pb.npool = npool; pb.npatch = npatch2;
+      pb.qr_rows = (DUST_R_QR_COLUMNS == 0);
+      pb.lx = lt.lx; pb.ly = lt.ly; pb.lz = lt.lz; pb.three = true; pb.pgeo = pgeo2;
+      pb.rank_screen = cloud_resample_rank_screen;
+      pb.pptr = DvceArray1D<int>("rs3_pptr", npatch2 + 1);
+      DvceArray1D<int> sorder(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_sorder"), npool);
+      DvceArray1D<int> scnt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_scnt"), npool);
+      auto pptr_d = pb.pptr;
+      Kokkos::parallel_for("rs3_order", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int k) {
+        const int a = static_cast<int>(key(k) % npl), q = static_cast<int>(key(k)/npl);
+        sorder(k) = a;
+        scnt(k) = cptr(a + 1) - cptr(a);
+        const int n = pcnt(q), ns = nsub_of(n);
+        const int sub = (ns > 1) ? static_cast<int>(static_cast<std::int64_t>(k - pstart(q))*ns/n) : 0;
+        Kokkos::atomic_inc(&pptr_d(qbase(q) + sub + 1));
+      });
+      Kokkos::parallel_scan("rs3_pptr", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch2 + 1),
+      KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
+        upd += pptr_d(q);
+        if (final) pptr_d(q) = upd;
+      });
+      pb.sptr = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_sptr"), npool + 1);
+      auto sptr_d = pb.sptr;
+      Kokkos::parallel_scan("rs3_sptr", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int k, int &upd, const bool final) {
+        if (final) sptr_d(k) = upd;
+        upd += scnt(k);
+        if (final && k == npl - 1) sptr_d(k + 1) = upd;
+      });
+      const int npd = RK::kNpd;
+      pb.spd = DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_spd"), npool, npd);
+      pb.stgt = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_stgt"), nnz);
+      pb.swgt = DvceArray1D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_swgt"), nnz);
+      auto spd_d = pb.spd; auto stgt_d = pb.stgt; auto swgt_d = pb.swgt;
+      Kokkos::parallel_for("rs3_sfill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+      KOKKOS_LAMBDA(const int k) {
+        const int a = sorder(k);
+        for (int c=0; c<npd; ++c) spd_d(k,c) = pd(a,c);
+        int e = sptr_d(k);
+        for (int j=cptr(a); j<cptr(a + 1); ++j) {stgt_d(e) = ctgt(j); swgt_d(e) = cwgt(j); ++e;}
+      });
+      // the patches for the cross-moment rows (cloud_resample_xv_rows, and for the audit's counts)
+      DvceArray1D<int> xfl;
+      if (cloud_resample_xv_rows != 0 || cloud_resample_xv_audit) {
+        DvceArray1D<int> klev(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_xvlev"), npool);
+        auto blev = lt.blev;
+        const bool z3per = lt.x3per;
+        const Real rdz = lt.root_dx3, z3min = lt.x3min, z3max = lt.x3max, ztol = 1.0e-12*lt.lz;
+        Kokkos::parallel_for("rs3_xvlev", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+        KOKKOS_LAMBDA(const int k) {
+          int lmin = 255;
+          for (int e=sptr_d(k); e<sptr_d(k + 1); ++e) lmin = Kokkos::min(lmin, blev(stgt_d(e)/ncell123));
+          const int cl = T::CloudLevel(pi(PLEV, pid(sorder(k), 1)));
+          // bit 17: the support [z - ell, z + ell] crosses a physical x3 face (folded deposit)
+          int fold = 0;
+          if (!z3per) {
+            const Real z = spd_d(k, resample::JZ), ell = rdz/static_cast<Real>(1 << cl);
+            fold = (z - ell < z3min + ztol || z + ell > z3max - ztol) ? 1 : 0;
+          }
+          // bit 16: finer than one of its leaves
+          klev(k) = (fold << 17) | ((cl > lmin) ? (1 << 16) : 0) | (cl << 8) | lmin;
+        });
+        xfl = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_xvflag"),
+                               npatch2);
+        auto pg = pb.pgeo;
+        const Real plx = lt.lx, ply = lt.ly, plz = lt.lz;
+        const Real rdx1 = lt.root_dx1, rdx2 = lt.root_dx2;
+        Kokkos::parallel_for("rs3_xvflag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch2),
+        KOKKOS_LAMBDA(const int q) {
+          int cmin = 255, cmax = -1, lmin = 255, own = 0, fold = 0;
+          // the footprint about the patch center, unwrapped as in the rows: [lo, hi] per direction
+          Real lo[3] = {1.0e300, 1.0e300, 1.0e300}, hi[3] = {-1.0e300, -1.0e300, -1.0e300};
+          const Real per[3] = {plx, ply, plz}, cen[3] = {pg(q,0), pg(q,1), pg(q,4)};
+          const Real rd[3] = {rdx1, rdx2, rdz};
+          for (int k=pptr_d(q); k<pptr_d(q + 1); ++k) {
+            const int cl = (klev(k) >> 8) & 255;
+            cmin = Kokkos::min(cmin, cl);
+            cmax = Kokkos::max(cmax, cl);
+            lmin = Kokkos::min(lmin, klev(k) & 255);
+            own |= (klev(k) >> 16) & 1;
+            fold |= (klev(k) >> 17) & 1;
+            for (int a=0; a<3; ++a) {
+              Real d = spd_d(k, (a == 0) ? resample::JX : ((a == 1) ? resample::JY : resample::JZ)) - cen[a];
+              if (a < 2 || z3per) d -= per[a]*Kokkos::floor(d/per[a] + 0.5);
+              const Real ell = rd[a]/static_cast<Real>(1 << cl);
+              lo[a] = Kokkos::fmin(lo[a], d - ell);
+              hi[a] = Kokkos::fmax(hi[a], d + ell);
+            }
+          }
+          // a footprint spanning a whole period (x1, x2; x3 when periodic): ambiguous unwrapping
+          const bool amb = (hi[0] - lo[0] >= per[0]*(1.0 - 1.0e-12)) ||
+                           (hi[1] - lo[1] >= per[1]*(1.0 - 1.0e-12)) ||
+                           (z3per && hi[2] - lo[2] >= per[2]*(1.0 - 1.0e-12));
+          const bool widths = (cmin == cmax && cmax <= lmin);
+          // 0 unflagged (one cloud level L, every footprint leaf at level >= L, no x3 fold, an
+          // unambiguous unwrapping); 3 a cloud finer than one of its own leaves; 2 several cloud
+          // levels (otherwise); 4 only the boundary (an x3 fold or an ambiguous unwrapping).  The
+          // solve uses != 0, the audit counts 2 ("mixed") and 4 ("boundary") separately
+          xfl(q) = (widths && !fold && !amb) ? 0 : (own ? 3 : (!widths ? 2 : 4));
+        });
+      }
+      DvceArray1D<double> mn("rs3_dev_mnew", npool);
+      DvceArray2D<int> outi("rs3_dev_outi", npatch2, resample::NPC);
+      DvceArray1D<double> outr("rs3_dev_outr", npatch2);
+      double tim[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+      long long scr[2] = {0, 0};
+      resample::SolvePatchesDevice(pb, mn, outi, outr, cloud_resample_device_mem_mb,
+                                   cloud_resample_device_wide_team, tim, scr,
+                                   cloud_resample_xv_rows, xfl, omega0 != 0.0, qshear);
+      resample::PatchSummary dsum;
+      resample::SummarizePatchesDevice(outi, outr, dsum);
+      if (cloud_resample_xv_audit) {
+        resample::AuditXVPatches(pb, mn, lt, omega0, qshear, xfl, rxv_acc);
+        rxv_acc[20] = std::max(rxv_acc[20], dsum.resmax);
+        rxv_acc[21] += static_cast<double>(dsum.nfall);
+        rxv_acc[22] += static_cast<double>(dsum.npat);
+        rxv_acc[23] += static_cast<double>(dsum.nred);
+      }
+      const int nremoved_b = static_cast<int>(dsum.pool - dsum.kept);
+      nremoved += nremoved_b;
+      if (nremoved_b > 0 || dsum.csteps > 0) {
+        Kokkos::parallel_for("rs3_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+        KOKKOS_LAMBDA(const int k) {pr(IPM, pid(sorder(k),1)) = mn(k);});
+      }
+    } else {
+      // 2-D: the patch solves on the host (cloud_resample_device = false, the CPU default) or on
+      // the device
+      const int npd = RK::kNpd;
+      const double lx = cloud_geometry.x1max - cloud_geometry.x1min;
+      const double ly = cloud_geometry.x2max - cloud_geometry.x2min;
+      std::vector<PatchInfo> infos;
+      std::vector<int> order;
+      std::vector<double> mnew;
+      long long pool = 0, kept = 0, csteps = 0;
+      DvceArray1D<Real> mdev;
+      if (!cloud_resample_device) {
+        infos.resize(npatch);
+        auto pd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pd);
+        auto pgeo_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pgeo);
+        auto pid_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pid);
+        auto cptr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cptr);
+        auto ctgt_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ctgt);
+        auto cwgt_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cwgt);
+        // host: clouds in patch order (counting sort), CSR in the same order
+        std::vector<int> pptr(npatch + 1, 0);
+        order.assign(npool, 0);
+        for (int a=0; a<npool; ++a) ++pptr[pid_h(a,0) + 1];
+        for (int q=0; q<npatch; ++q) pptr[q+1] += pptr[q];
+        {
+          std::vector<int> fill(pptr.begin(), pptr.end() - 1);
+          for (int a=0; a<npool; ++a) order[fill[pid_h(a,0)]++] = a;
+        }
+        std::vector<double> spd(static_cast<std::size_t>(npool)*npd), swgt(nnz);
+        mnew.assign(npool, 0.0);
+        std::vector<int> sptr(npool + 1), stgt(nnz);
+        sptr[0] = 0;
+        for (int k=0; k<npool; ++k) {
+          const int a = order[k];
+          for (int c=0; c<npd; ++c) spd[static_cast<std::size_t>(k)*npd + c] = pd_h(a,c);
+          int e = sptr[k];
+          for (int j=cptr_h(a); j<cptr_h(a+1); ++j) {stgt[e] = ctgt_h(j); swgt[e] = cwgt_h(j); ++e;}
+          sptr[k+1] = e;
+        }
+        std::atomic<int> next(0);
+        const int nthread = std::max(1, std::min(cloud_resample_threads, npatch));
+        auto worker = [&](const int) {
+          Work ws;
+          while (true) {
+            const int q = next.fetch_add(1);
+            if (q >= npatch) break;
+            if (pptr[q+1] - pptr[q] < 1) continue;
+            infos[q] = ResamplePatch(pptr[q], pptr[q+1], spd.data(), npd, sptr.data(), stgt.data(),
+                                     swgt.data(), pgeo_h(q,0), pgeo_h(q,1), lx, ly, pgeo_h(q,2),
+                                     pgeo_h(q,3), mnew.data(), ws);
+          }
+        };
+        if (nthread == 1) {
+          worker(0);
+        } else {
+          std::vector<std::thread> th;
+          for (int t=0; t<nthread; ++t) th.emplace_back(worker, t);
+          for (auto &t : th) t.join();
+        }
+        for (const auto &f : infos) {
+          if (f.n == 0) continue;
+          pool += f.n; kept += f.kept; csteps += f.steps_cap;
+        }
+      } else {
+        // the pool in patch order on the device: the unique keys patch * npool + a, sorted (the
+        // host's counting sort keeps the pool order inside a patch, so does this)
+        DvceArray1D<std::int64_t> key(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_key"), npool);
+        const std::int64_t npl = npool;
+        Kokkos::parallel_for("rs_key", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+        KOKKOS_LAMBDA(const int a) {key(a) = static_cast<std::int64_t>(pid(a,0))*npl + a;});
+        Kokkos::sort(key);
+        resample::DevicePatchProblem pb;
+        pb.npool = npool; pb.npatch = npatch;
+        if (DUST_R_DIAG && ProfOn()) pb.stage = DvceArray1D<unsigned long long>("rs_stage", resample::kNStage);
+        pb.qr_rows = (DUST_R_QR_COLUMNS == 0);
+        pb.lx = lx; pb.ly = ly; pb.pgeo = pgeo;
+        pb.pptr = DvceArray1D<int>("rs_pptr", npatch + 1);
+        DvceArray1D<int> sorder(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_sorder"), npool);
+        DvceArray1D<int> scnt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_scnt"), npool);
+        auto pptr_d = pb.pptr;
+        Kokkos::parallel_for("rs_order", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+        KOKKOS_LAMBDA(const int k) {
+          const int a = static_cast<int>(key(k) % npl), q = static_cast<int>(key(k)/npl);
+          sorder(k) = a;
+          scnt(k) = cptr(a + 1) - cptr(a);
+          Kokkos::atomic_inc(&pptr_d(q + 1));
+        });
+        Kokkos::parallel_scan("rs_pptr", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch + 1),
+        KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
+          upd += pptr_d(q);
+          if (final) pptr_d(q) = upd;
+        });
+        pb.sptr = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_sptr"), npool + 1);
+        auto sptr_d = pb.sptr;
+        Kokkos::parallel_scan("rs_sptr", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+        KOKKOS_LAMBDA(const int k, int &upd, const bool final) {
+          if (final) sptr_d(k) = upd;
+          upd += scnt(k);
+          if (final && k == npl - 1) sptr_d(k + 1) = upd;
+        });
+        pb.spd = DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_spd"), npool, npd);
+        pb.stgt = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_stgt"), nnz);
+        pb.swgt = DvceArray1D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_swgt"), nnz);
+        auto spd_d = pb.spd; auto stgt_d = pb.stgt; auto swgt_d = pb.swgt;
+        Kokkos::parallel_for("rs_sfill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+        KOKKOS_LAMBDA(const int k) {
+          const int a = sorder(k);
+          for (int c=0; c<npd; ++c) spd_d(k,c) = pd(a,c);
+          int e = sptr_d(k);
+          for (int j=cptr(a); j<cptr(a + 1); ++j) {stgt_d(e) = ctgt(j); swgt_d(e) = cwgt(j); ++e;}
+        });
+        DvceArray1D<double> mn("rs_dev_mnew", npool);
+        DvceArray2D<int> outi("rs_dev_outi", npatch, resample::NPC);
+        DvceArray1D<double> outr("rs_dev_outr", npatch);
+        double tim[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+        resample::SolvePatchesDevice(pb, mn, outi, outr, cloud_resample_device_mem_mb,
+                                     cloud_resample_device_wide_team, tim);
+        if (pb.stage.extent(0) > 0) {   // stage clock (amr_profile)
+          auto sh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pb.stage);
+          for (int c=0; c<resample::kNStage; ++c) resample::StageTotals()[c] += sh(c);
+        }
+        mdev = DvceArray1D<Real>("rs_mnew_dev", npool);
+        auto mdv = mdev;
+        Kokkos::parallel_for("rs_unsort", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+        KOKKOS_LAMBDA(const int k) {mdv(sorder(k)) = mn(k);});
+        // the totals reduced on the device
+        resample::PatchSummary dsum;
+        resample::SummarizePatchesDevice(outi, outr, dsum);
+        pool = dsum.pool; kept = dsum.kept; csteps = dsum.csteps;
+      }
+      const int nremoved_b = static_cast<int>(pool - kept);
+      nremoved += nremoved_b;
+      // device: new masses
+      if (nremoved_b > 0 || csteps > 0) {
+        if (cloud_resample_device) {
+          auto mdv = mdev;
+          Kokkos::parallel_for("rs_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+          KOKKOS_LAMBDA(const int a) {pr(IPM, pid(a,1)) = mdv(a);});
+        } else {
+          Kokkos::View<double*, HostMemSpace> mh("rs_mnew_h", npool);
+          for (int k=0; k<npool; ++k) mh(order[k]) = mnew[k];
+          DvceArray1D<Real> md("rs_mnew", npool);
+          Kokkos::deep_copy(md, mh);
+          Kokkos::parallel_for("rs_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
+          KOKKOS_LAMBDA(const int a) {pr(IPM, pid(a,1)) = md(a);});
+        }
+      }
+    }
+  }
+  if (nremoved > 0) CompactResampledT<k3>(ppar, pmesh, npart);
+  ++cloud_resample_pass;
+  cloud_resample_removed += static_cast<unsigned long long>(nremoved);
+  if (phst_track) phst_r_removed += static_cast<unsigned long long>(nremoved);
+  return nremoved;
+}
+
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ResampleDue
 //! \brief Is a resampling due at the start of this cycle?  Cycle mode:
@@ -821,8 +2156,8 @@ bool DustGasDrag::MergeDue() {
 
 int DustGasDrag::ResampleClouds(const bool local) {
   ++gravity_mass_epoch;   // R changes the deposited mass (gravity field reuse)
-  if (clouds3d && !cloud_resample_xv_audit) return ResampleClouds3D(local);
-  if (clouds3d) {
+  if (cloud_dim == 3 && !cloud_resample_xv_audit) return ResampleClouds3D(local);
+  if (cloud_dim == 3) {
     // cloud_resample_xv_audit: the totals before and after, the patch and leaf changes of the
     // solves (resample::AuditXVPatches), one line per pass (rank 0, reduced over the ranks)
     Mesh *pm = pmy_pack->pmesh;
@@ -904,1404 +2239,13 @@ int DustGasDrag::ResampleClouds(const bool local) {
     }
     return removed;
   }
-  using Clock = std::chrono::steady_clock;
-  auto seconds = [](const Clock::time_point &a) {
-    return std::chrono::duration<double>(Clock::now() - a).count();
-  };
-  particles::Particles *ppar = pmy_pack->ppart;
-  Mesh *pmesh = pmy_pack->pmesh;
-  const int npart = ppar->nprtcl_thispack;
-  const auto transfer = smr_transfer;
-  const auto lt = leaf_traversal;   // cloud weights on the actual leaves
-  // the gas velocity and its differences of every leaf of the current state, the
-  // owners' values on the halo blocks, for the gather of the pool (the predictor's packed
-  // field).  Before any return: the halo exchange is collective.
-  PackGasGather(pmy_pack->phydro->u0);
-  // the root cloud mass (reduced over the ranks): also before any return
-  if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
-  if (npart == 0) return 0;
-  // the root cloud mass of every species (cap eta_L m0 / 4^level): cloud_resample_m0 for all of
-  // them, else the merge pass's per-species value.  The patches are also split by
-  // species, so every species keeps its own leaf masses (one species: no change)
-  // A species without such a value (no plain level-0/1 cloud) has a cap of zero: its clouds
-  // stay out of the pool.
-  const int nsp = std::max(1, nspecies);
-  DvceArray1D<Real> m0sp("rs_m0", nsp);
-  {
-    // a missing value only takes its own species out of the pool (e.g. eps_1 = 0 with a second
-    // species); fatal only when no species has one
-    auto mh = Kokkos::create_mirror_view(m0sp);
-    bool any = false;
-    for (int sp=0; sp<nsp; ++sp) {
-      mh(sp) = (cloud_resample_m0 > 0.0) ? cloud_resample_m0
-             : ((static_cast<int>(cloud_merge_mroot.size()) > sp) ? cloud_merge_mroot[sp] : 0.0);
-      if (mh(sp) > 0.0) any = true;
-    }
-    if (!any) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "cloud_resample needs the root cloud mass: no species has a plain level-0 or "
-                << "level-1 cloud; set <dust>/cloud_resample_m0" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    static bool told = false;
-    if (!told && global_variable::my_rank == 0) {
-      for (int sp=0; sp<nsp; ++sp) {
-        if (!(mh(sp) > 0.0)) {
-          std::cout << "# NOTE (dust): species " << sp << " has no root cloud mass (no plain level-0 "
-                    << "or level-1 cloud of positive mass): its clouds stay out of the resampling"
-                    << std::endl;
-        }
-      }
-      told = true;
-    }
-    Kokkos::deep_copy(m0sp, mh);
-  }
-  // the patches: inside one MeshBlock, k x k of its cells with k = min(s 2^l, kc) (s x s root
-  // cells on the root level, up to the level where they reach kc x kc cells, never more), so a
-  // patch holds at most about (kc + 2)^2 leaves on any level.
-  const int s = cloud_resample_patch, kc = cloud_resample_patch_cells;
-  const int nmbp = pmy_pack->nmb_thispack, bnx1 = pmesh->mb_indcs.nx1, bnx2 = pmesh->mb_indcs.nx2;
-  std::vector<int> kblk_h, poff_h(nmbp + 1, 0);   // block patches: k per block, patch offsets
-  bool bad = (kc < 1);
-  if (!bad) {
-    kblk_h.resize(nmbp);
-    for (int b=0; b<nmbp; ++b) {
-      const int lev = pmy_pack->pmb->mb_lev.h_view(b) - pmesh->root_level;
-      int k = s;
-      for (int l=0; l<lev && k < kc; ++l) k *= 2;
-      k = std::min(k, kc);
-      if (bnx1 % k != 0 || bnx2 % k != 0) bad = true;
-      // the quadrant split halves the width down to one cell, so k must be a power of two
-      if (cloud_resample_patch_split > 0 && (k & (k - 1)) != 0) bad = true;
-      kblk_h[b] = k;
-      poff_h[b + 1] = poff_h[b] + (bnx1/k)*(bnx2/k);
-    }
-  }
-  if (bad) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "block patches of min(cloud_resample_patch 2^level, "
-                 "cloud_resample_patch_cells) cells must divide the MeshBlock (and be "
-                 "powers of two with cloud_resample_patch_split > 0)" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  DvceArray1D<int> kblk("rs_kblk", nmbp), poff("rs_poff", nmbp + 1);
-  {
-    auto kb = Kokkos::create_mirror_view(kblk);
-    auto po = Kokkos::create_mirror_view(poff);
-    for (int b=0; b<nmbp; ++b) kb(b) = kblk_h[b];
-    for (int b=0; b<=nmbp; ++b) po(b) = poff_h[b];
-    Kokkos::deep_copy(kblk, kb);
-    Kokkos::deep_copy(poff, po);
-  }
-  // local resampling: the blocks of this rank made by the last regrid (no cycle since their
-  // refinement) and every block of this rank whose box touches one of them (any rank, corners and
-  // periodic images included); clouds anchored elsewhere stay out of the pool
-  DvceArray1D<int> rmask("rs_mask", std::max(1, nmbp));
-  int nmask = nmbp;
-  if (local) {
-    auto pmr = pmesh->pmr;
-    const int gids0 = pmy_pack->gids, ntot = pmesh->nmb_total;
-    const Real lx = pmesh->mesh_size.x1max - pmesh->mesh_size.x1min;
-    const Real ly = pmesh->mesh_size.x2max - pmesh->mesh_size.x2min;
-    auto box = [&](const int g, Real b[4]) {
-      const auto &ll = pmesh->lloc_eachmb[g];
-      const int lev = ll.level - pmesh->root_level;
-      const Real w1 = lx/(pmesh->nmb_rootx1 << lev), w2 = ly/(pmesh->nmb_rootx2 << lev);
-      b[0] = pmesh->mesh_size.x1min + ll.lx1*w1; b[1] = b[0] + w1;
-      b[2] = pmesh->mesh_size.x2min + ll.lx2*w2; b[3] = b[2] + w2;
-    };
-    std::vector<std::array<Real, 4>> fresh;
-    for (int g=0; g<ntot; ++g) {
-      // (every regrid of the event, cloud_event_dt; 0 for one regrid)
-      if (pmr->ncyc_since_ref(g) <= amr_event_max_age) {
-        Real b[4]; box(g, b); fresh.push_back({b[0], b[1], b[2], b[3]});
-      }
-    }
-    auto mh = Kokkos::create_mirror_view(rmask);
-    nmask = 0;
-    for (int m=0; m<nmbp; ++m) {
-      Real b[4]; box(gids0 + m, b);
-      const Real e1 = 1.0e-9*(b[1] - b[0]), e2 = 1.0e-9*(b[3] - b[2]);
-      int on = 0;
-      for (const auto &f : fresh) {
-        for (int oy=-1; oy<=1 && !on; ++oy) {
-          for (int ox=-1; ox<=1 && !on; ++ox) {
-            const Real a0 = f[0] + ox*lx, a1 = f[1] + ox*lx, c0 = f[2] + oy*ly, c1 = f[3] + oy*ly;
-            if (a0 <= b[1] + e1 && b[0] <= a1 + e1 && c0 <= b[3] + e2 && b[2] <= c1 + e2) on = 1;   // touch
-          }
-        }
-        if (on) break;
-      }
-      mh(m) = on; nmask += on;
-    }
-    Kokkos::deep_copy(rmask, mh);
-  }
-  const bool use_mask = local;
-  // with cloud_resample_patch_split = N > 0 every block patch of k x k cells has one
-  // slot per cell (kc^2 slots); a patch, or a quadrant of it, whose pool (one species) holds more
-  // than N clouds is solved as its four quadrants, recursively down to single cells; each final
-  // square is one patch in the slot of its lower-left cell
-  const int psplit = cloud_resample_patch_split;
-  const int psub = (psplit > 0) ? kc*kc : 1;
-  const ResampleCapTable rcap = cloud_resample_cap;   // eta_L m0 / 2^(d L) per level
-  auto t_all = Clock::now();
-  Kokkos::fence();
-  auto t0 = Clock::now();
-
-  // device: pool flags, slots and CSR offsets
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  const int nrdata = ppar->nrdata, nidata = ppar->nidata;
-  DvceArray1D<int> cnt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_cnt"), npart);
-  DvceArray1D<int> slot(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_slot"), npart);
-  DvceArray1D<int> coff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_coff"), npart);
-  int npool = 0, nnz = 0;
-  long long nnz64 = 0;
-  double tot_b[2] = {0.0, 0.0}, cnt_b[3] = {0.0, 0.0, 0.0};
-  // cold gate (cloud_resample_cold_alpha > 0): a block patch (one species) is cold when
-  // every velocity component of its candidate clouds spans at most alpha H / tau (H the cell size of
-  // its block, tau = min(ts, 1/omega), the velocity tolerance of stage X).  Resampling keeps the
-  // leaf masses at the moment of the pass but replaces a lattice (or intact P1 families) by unequal
-  // masses, whose deposit is no longer uniform once the clouds move (aliasing): a quiet state is
-  // left alone; stage X restores its families exactly where they leave the finer leaves.
-  const Real calpha = cloud_resample_cold_alpha, comega = cloud_resample_omega;
-  const int nqs = (calpha > 0.0) ? std::max(1, poff_h[nmbp]*nsp) : 1;
-  DvceArray2D<Real> crange("rs_cold_range", nqs, 6);
-  DvceArray1D<int> ccold("rs_cold", nqs);
-  DvceArray1D<int> cq("rs_cold_q", (calpha > 0.0) ? std::max(1, npart) : 1);
-  double cnt_cold = 0.0;
-  if (calpha > 0.0) {
-    Kokkos::parallel_for("rs_cold_init", Kokkos::RangePolicy<>(DevExeSpace(), 0, nqs),
-    KOKKOS_LAMBDA(const int q) {
-      for (int c=0; c<3; ++c) {crange(q,c) = 1.0e300; crange(q,3+c) = -1.0e300;}
-      ccold(q) = 1;
-    });
-    const int js_ = pmesh->mb_indcs.js, is_ = pmesh->mb_indcs.is;
-    const int nc1 = qdep.extent_int(4), nc2 = qdep.extent_int(3);
-    auto prc = ppar->prtcl_rdata;
-    auto pic = ppar->prtcl_idata;
-    // the candidates (the pool tests of rs_flag below) and their block patch
-    Kokkos::parallel_for("rs_cold_q", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      cq(p) = -1;
-      if (prc(IPM,p) <= 0.0) return;
-      const int code = pic(PLEV,p);
-      if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) return;
-      const int am = lt.Anchor(pic(PGID,p));
-      if (use_mask && (am < 0 || am >= nmbp || rmask(am) == 0)) return;
-      const int lev = SMRCompositeTransfer::CloudLevel(code);
-      const int sp = (pic(PSP,p) >= 0 && pic(PSP,p) < nsp) ? pic(PSP,p) : 0;
-      const Real cap = rcap.Cap(m0sp(sp), lev);
-      if (!(prc(IPM,p) <= cap*(1.0 + kPoolTol)) || prc(IPM,p) >= cap*(1.0 - kCapTol)) return;
-      const int t = lt.LeafOwner(prc(IPX,p), prc(IPY,p), am);
-      if (t < 0) return;
-      const int b = t/(nc1*nc2);
-      if (b >= nmbp) return;
-      const int r = t % (nc1*nc2);
-      const int tj = r/nc1 - js_, ti = r % nc1 - is_;
-      const int k = kblk(b);
-      const int qs = (poff(b) + (tj/k)*(bnx1/k) + ti/k)*nsp + sp;
-      cq(p) = qs;
-      const Real v[3] = {prc(IPVX,p), prc(IPVY,p), prc(IPVZ,p)};
-      for (int c=0; c<3; ++c) {
-        Kokkos::atomic_min(&crange(qs,c), v[c]);
-        Kokkos::atomic_max(&crange(qs,3+c), v[c]);
-      }
-    });
-    Kokkos::parallel_for("rs_cold_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      const int qs = cq(p);
-      if (qs < 0) return;
-      const Real ts = prc(IPTS,p);
-      const Real tau = (comega > 0.0) ? Kokkos::fmin(ts, 1.0/comega) : ts;
-      const int b = lt.LeafOwner(prc(IPX,p), prc(IPY,p), lt.Anchor(pic(PGID,p)))/(nc1*nc2);
-      const Real tolv = calpha*lt.box(b,2)/tau;
-      for (int c=0; c<3; ++c) {
-        if (crange(qs,3+c) - crange(qs,c) > tolv) {Kokkos::atomic_store(&ccold(qs), 0); return;}
-      }
-    });
-  }
-  // cnt: number of (leaf, weight) entries of a pool cloud, -1 for the others; totals before;
-  // lobed clouds, plain clouds above the cap, zero-mass slots
-  const int qdep_n1 = qdep.extent_int(4), qdep_n2 = qdep.extent_int(3);
-  const bool multirank = (global_variable::nranks > 1);
-  Kokkos::parallel_reduce("rs_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, double &mt, double &px, double &nl, double &nf, double &nz,
-                double &ncold) {
-    cnt(p) = -1;
-    if (pr(IPM,p) <= 0.0) {nz += 1.0; return;}
-    mt += pr(IPM,p); px += pr(IPM,p)*pr(IPVX,p);
-    const int code = pi(PLEV,p);
-    const int lev = SMRCompositeTransfer::CloudLevel(code);
-    if (SMRCompositeTransfer::CloudLobe1(code) || SMRCompositeTransfer::CloudLobe2(code)) {nl += 1.0; return;}
-    if (use_mask) {   // local resampling: only clouds anchored in the marked blocks
-      const int am = lt.Anchor(pi(PGID,p));
-      if (am < 0 || am >= nmbp || rmask(am) == 0) return;
-    }
-    const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-    const Real cap = rcap.Cap(m0sp(sp), lev);
-    if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
-    if (pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}   // at the cap: left alone
-    if (calpha > 0.0 && cq(p) >= 0 && ccold(cq(p)) == 1) {ncold += 1.0; return;}   // cold patch
-    // a cloud whose leaf is on a block of another rank stays out (several
-    // ranks; a position within round-off of a periodic face can be routed to this rank's block while
-    // its leaf lookup takes the periodic image on the other side, owned elsewhere)
-    if (multirank) {
-      const int tl = lt.LeafOwner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)));
-      if (tl < 0 || tl/(qdep_n1*qdep_n2) >= nmbp) return;
-    }
-    int c = 0;
-    lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), code, lt.Anchor(pi(PGID,p)),
-                          [&](const int, const Real) {++c;});
-    cnt(p) = c;
-  }, tot_b[0], tot_b[1], cnt_b[0], cnt_b[1], cnt_b[2], cnt_cold);
-  cloud_resample_cold_skips += static_cast<unsigned long long>(cnt_cold);
-  Kokkos::parallel_scan("rs_slot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
-    if (final) slot(p) = (cnt(p) >= 0) ? upd : -1;
-    upd += (cnt(p) >= 0) ? 1 : 0;
-  }, npool);
-  if (cloud_resample_tag_order && npool > 1) {
-    // cloud_resample_order = tag: the pool in PTAG order, so that the streaming
-    // order inside a patch does not depend on where the particles sit in the arrays (storage
-    // sorting, several ranks); the CSR offsets follow the slots
-    DvceArray1D<int> pofs(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pofs"), npool);
-    // position: rows of y, then x, 2^20 per side of the domain (cloud_resample_order = position)
-    const bool bypos = cloud_resample_pos_order;
-    if (bypos) {
-      DvceArray1D<std::int64_t> tk(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_poskey"), npool);
-      const std::int64_t np64 = npart, side = std::int64_t(1) << 20;
-      if (static_cast<double>(side)*side*np64 >= 9.0e18) {
-        std::cout << "### FATAL ERROR: cloud_resample_order = position: too many particles" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-      const Real px0 = transfer.x1min, py0 = transfer.x2min;
-      const Real plx = transfer.x1max - transfer.x1min, ply = transfer.x2max - transfer.x2min;
-      Kokkos::parallel_for("rs_poskey", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-      KOKKOS_LAMBDA(const int p) {
-        if (slot(p) < 0) return;
-        const Real x = SMRCompositeTransfer::WrapPosition(pr(IPX,p), transfer.x1min, transfer.x1max);
-        const Real y = SMRCompositeTransfer::WrapPosition(pr(IPY,p), transfer.x2min, transfer.x2max);
-        std::int64_t ix = static_cast<std::int64_t>((x - px0)/plx*side);
-        std::int64_t iy = static_cast<std::int64_t>((y - py0)/ply*side);
-        ix = (ix < 0) ? 0 : ((ix >= side) ? side - 1 : ix);
-        iy = (iy < 0) ? 0 : ((iy >= side) ? side - 1 : iy);
-        tk(slot(p)) = (iy*side + ix)*np64 + p;
-      });
-      Kokkos::sort(tk);
-      Kokkos::parallel_for("rs_posslot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-      KOKKOS_LAMBDA(const int k) {
-        const int p = static_cast<int>(tk(k) % np64);
-        slot(p) = k; pofs(k) = p;
-      });
-    } else {
-      PoolInTagOrder(pi, slot, npart, npool, pofs);   // 64-bit tags
-    }
-    Kokkos::parallel_scan("rs_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int a, long long &upd, const bool final) {
-      const int p = pofs(a);
-      if (final) coff(p) = static_cast<int>(upd);
-      upd += (cnt(p) > 0) ? cnt(p) : 0;
-    }, nnz64);
-  } else {
-    Kokkos::parallel_scan("rs_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p, long long &upd, const bool final) {
-      if (final) coff(p) = static_cast<int>(upd);
-      upd += (cnt(p) > 0) ? cnt(p) : 0;
-    }, nnz64);
-  }
-  // the (cloud, leaf cell) pairs of the pool in 64 bits: above the 32-bit range the CSR offsets
-  // would wrap (clouds capped at L2 on L5 leaves once asked for 1.7e7 TiB)
-  if (nnz64 > static_cast<long long>(std::numeric_limits<int>::max())) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "resampling: " << nnz64 << " (cloud, leaf cell) pairs on this rank exceed the "
-              << "32-bit range of the weight tables" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  nnz = static_cast<int>(nnz64);
-  if (npool < 2) {   // nothing to resample
-    ++cloud_resample_pass;
-    return 0;
-  }
-
-  // device: pool table (x, y, m, v, ts, gathered gas velocity, cap), ids, CSR weights
-  const int npd = 11;
-  DvceArray2D<Real> pd(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pd"), npool, npd);
-  DvceArray2D<int> pid(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pid"), npool, 2);
-  DvceArray1D<int> cptr(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_cptr"), npool + 1);
-  DvceArray1D<int> ctgt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_ctgt"), nnz);
-  DvceArray1D<Real> cwgt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_cwgt"), nnz);
-  auto &indcs = pmesh->mb_indcs;
-  const int is = indcs.is, js = indcs.js, ks = indcs.ks;
-  auto gp = gpack;   // PackGasGather above
-  const int ncells1 = qdep.extent_int(4), ncells2 = qdep.extent_int(3);
-  const int tmode = cloud_transition;
-  const int nnz_ = nnz;
-  const int nmbp_ = pmy_pack->nmb_thispack;
-  Kokkos::parallel_for("rs_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p) {
-    const int a = slot(p);
-    if (p == npart - 1) cptr(npool) = nnz_;
-    if (a < 0) return;
-    const Real xp = pr(IPX,p), yp = pr(IPY,p);
-    const int code = pi(PLEV,p);
-    const int lev = SMRCompositeTransfer::CloudLevel(code);
-    Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-    lt.ForEachCloudMoment(xp, yp, SMRCompositeTransfer::GatherCode(code, tmode),
-                          lt.Anchor(pi(PGID,p)),
-    [&](const int target, const Real w, const Real m1x, const Real m1y) {
-      const int ti = target % ncells1;
-      const int remainder = target/ncells1;
-      const int tj = remainder % ncells2;
-      const int tm = remainder/ncells2;
-      // the leaf's block slot may be a halo block: its box from lt, the gas from
-      // the packed field (the predictor's gather)
-      const Real dx1 = lt.box(tm,2), dx2 = lt.box(tm,3);
-      const Real xc = lt.box(tm,0) + (ti - is + 0.5)*dx1;
-      const Real yc = lt.box(tm,1) + (tj - js + 0.5)*dx2;
-      const Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
-      const Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
-      ugx += w*gp(tm,ks,tj,ti,0) + cx*gp(tm,ks,tj,ti,3) + cy*gp(tm,ks,tj,ti,6);
-      ugy += w*gp(tm,ks,tj,ti,1) + cx*gp(tm,ks,tj,ti,4) + cy*gp(tm,ks,tj,ti,7);
-      ugz += w*gp(tm,ks,tj,ti,2) + cx*gp(tm,ks,tj,ti,5) + cy*gp(tm,ks,tj,ti,8);
-    });
-    pd(a,0) = xp; pd(a,1) = yp; pd(a,2) = pr(IPM,p);
-    pd(a,3) = pr(IPVX,p); pd(a,4) = pr(IPVY,p); pd(a,5) = pr(IPVZ,p); pd(a,6) = pr(IPTS,p);
-    pd(a,7) = ugx; pd(a,8) = ugy; pd(a,9) = ugz;
-    const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-    pd(a,10) = rcap.Cap(m0sp(sp), lev);
-    {
-      // the leaf that holds the particle: its block and cell
-      const int am = lt.Anchor(pi(PGID,p));
-      const int t = lt.LeafOwner(xp, yp, am);
-      int b = am, ti = 0, tj = 0;
-      if (t >= 0) {
-        b = t/(ncells1*ncells2);
-        const int r = t % (ncells1*ncells2);
-        tj = r/ncells1 - js; ti = r % ncells1 - is;
-      }
-      // the clouds were moved to the rank of their block before (MigrateClouds)
-      if (b >= nmbp_) {
-        Kokkos::printf("resampling: cloud p=%d tag=%llu x=%.17g y=%.17g PGID=%d anchor=%d leaf=%d "
-                       "block=%d of %d (code %d, m=%.6e)\n", p,
-                       static_cast<unsigned long long>(GetTag(pi,p)), xp, yp, pi(PGID,p), am,
-                       t, b, nmbp_, code, pr(IPM,p));
-        Kokkos::abort("resampling: a cloud in a block of another rank");
-      }
-      const int k = kblk(b);
-      int q = poff(b) + (tj/k)*(bnx1/k) + ti/k;
-      if (psub > 1) q = q*psub + (tj % k)*k + (ti % k);   // its cell in the patch
-      pid(a,0) = q;
-    }
-    pid(a,0) = pid(a,0)*nsp + sp;   // one species per patch
-    pid(a,1) = p;
-    cptr(a) = coff(p);
-    int e = coff(p);
-    lt.ForEachCloudWeight(xp, yp, code, lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
-      ctgt(e) = target; cwgt(e) = w; ++e;
-    });
-  });
-  // count the pool of every cell slot; per block patch and species one thread
-  // splits the squares holding more than N clouds into quadrants (down to single cells) and maps
-  // every slot to the lower-left slot of its final square (own) with the square's width there (nsz)
-  const int nbase = poff_h[nmbp]*nsp;   // geometric patch x species
-  const int nslot = nbase*psub;
-  DvceArray1D<int> nsz("rs_split_size", (psub > 1) ? nslot : 1);
-  int nsplit = 0;
-  if (psub > 1) {
-    DvceArray1D<int> pc("rs_split_count", nslot), own("rs_split_owner", nslot);
-    Kokkos::deep_copy(own, -1);   // every slot that holds a cloud must be given a patch below
-    Kokkos::parallel_for("rs_split_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int a) {Kokkos::atomic_increment(&pc(pid(a,0)));});
-    const int ps = psub;
-    Kokkos::parallel_reduce("rs_split_tree", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbase),
-    KOKKOS_LAMBDA(const int i, int &ns) {
-      const int q = i/nsp, sp = i % nsp;
-      int lo = 0, hi = nmbp;   // the block of patch q
-      while (hi - lo > 1) {
-        const int mid = (lo + hi)/2;
-        if (poff(mid) <= q) lo = mid; else hi = mid;
-      }
-      const int k = kblk(lo);
-      auto idx = [&](const int x, const int y) {return (q*ps + y*k + x)*nsp + sp;};
-      int st[64][3], top = 0;   // squares to look at: lower-left cell and width
-      st[top][0] = 0; st[top][1] = 0; st[top][2] = k; ++top;
-      while (top > 0) {
-        --top;
-        const int x0 = st[top][0], y0 = st[top][1], w = st[top][2];
-        int tot = 0;
-        for (int y=y0; y<y0+w; ++y) for (int x=x0; x<x0+w; ++x) tot += pc(idx(x, y));
-        if (tot > psplit && w >= 2 && top + 4 <= 64) {
-          const int h = w/2;
-          if (w == k) ns += 1;
-          for (int c=0; c<4; ++c) {
-            st[top][0] = x0 + (c & 1)*h; st[top][1] = y0 + (c >> 1)*h; st[top][2] = h; ++top;
-          }
-        } else {
-          for (int y=y0; y<y0+w; ++y) for (int x=x0; x<x0+w; ++x) own(idx(x, y)) = idx(x0, y0);
-          nsz(idx(x0, y0)) = w;
-        }
-      }
-    }, nsplit);
-    Kokkos::parallel_for("rs_split_ids", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int a) {
-      const int o = own(pid(a,0));
-      if (o < 0) Kokkos::abort("resampling: a cell slot without a patch");
-      pid(a,0) = o;
-    });
-  }
-  Kokkos::fence();
-  const double t_dev = seconds(t0);
-  t0 = Clock::now();
-  const int npatch = nslot;   // (geometric patch x cell slot) x species
-  const double lx = transfer.x1max - transfer.x1min, ly = transfer.x2max - transfer.x2min;
-  // per patch: center and length scale of the center-of-mass rows (half the patch width)
-  DvceArray2D<Real> pgeo(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_pgeo"), npatch, 4);
-  Kokkos::parallel_for("rs_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-  KOKKOS_LAMBDA(const int qs) {
-    const int g = qs/nsp, q = g/psub, c = g % psub;   // the geometric patch, cell slot
-    int lo = 0, hi = nmbp;   // the block of patch q: poff(b) <= q < poff(b + 1)
-    while (hi - lo > 1) {
-      const int mid = (lo + hi)/2;
-      if (poff(mid) <= q) lo = mid; else hi = mid;
-    }
-    const int b = lo, k = kblk(b), r = q - poff(b), nbx = bnx1/k, ip = r % nbx, jp = r/nbx;
-    const Real d1 = lt.box(b,2), d2 = lt.box(b,3);   // = mb_size of local block b
-    pgeo(qs,0) = lt.box(b,0) + (ip + 0.5)*k*d1;
-    pgeo(qs,1) = lt.box(b,1) + (jp + 0.5)*k*d2;
-    pgeo(qs,2) = 0.5*k*d1; pgeo(qs,3) = 0.5*k*d2;
-    if (psub > 1 && nsz(qs) > 0) {   // a final square of w cells
-      const int w = nsz(qs), x0 = c % k, y0 = c/k;
-      pgeo(qs,0) = lt.box(b,0) + (ip*k + x0 + 0.5*w)*d1;
-      pgeo(qs,1) = lt.box(b,1) + (jp*k + y0 + 0.5*w)*d2;
-      pgeo(qs,2) = 0.5*w*d1; pgeo(qs,3) = 0.5*w*d2;
-    }
-  });
-  // the patch solves on the host or on the device (cloud_resample_device)
-  const bool on_dev = cloud_resample_device;
-  const bool on_host = !cloud_resample_device;
-  double t_copy = 0.0, t_sort = 0.0, t_host = 0.0, cpu = 0.0;
-  int nthread = 0;
-  std::vector<PatchInfo> infos(npatch);
-  std::vector<int> order;
-  std::vector<double> mnew;
-  if (on_host) {
-    auto pd_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pd);
-    auto pgeo_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pgeo);
-    auto pid_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pid);
-    auto cptr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cptr);
-    auto ctgt_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ctgt);
-    auto cwgt_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cwgt);
-    t_copy = seconds(t0);
-    t0 = Clock::now();
-
-    // host: clouds in patch order (counting sort), CSR in the same order
-    std::vector<int> pptr(npatch + 1, 0);
-    order.assign(npool, 0);
-    for (int a=0; a<npool; ++a) ++pptr[pid_h(a,0) + 1];
-    for (int q=0; q<npatch; ++q) pptr[q+1] += pptr[q];
-    {
-      std::vector<int> fill(pptr.begin(), pptr.end() - 1);
-      for (int a=0; a<npool; ++a) order[fill[pid_h(a,0)]++] = a;
-    }
-    std::vector<double> spd(static_cast<std::size_t>(npool)*npd), swgt(nnz);
-    mnew.assign(npool, 0.0);
-    std::vector<int> sptr(npool + 1), stgt(nnz);
-    sptr[0] = 0;
-    for (int k=0; k<npool; ++k) {
-      const int a = order[k];
-      for (int c=0; c<npd; ++c) spd[static_cast<std::size_t>(k)*npd + c] = pd_h(a,c);
-      int e = sptr[k];
-      for (int j=cptr_h(a); j<cptr_h(a+1); ++j) {stgt[e] = ctgt_h(j); swgt[e] = cwgt_h(j); ++e;}
-      sptr[k+1] = e;
-    }
-    t_sort = seconds(t0);
-    t0 = Clock::now();
-    std::atomic<int> next(0);
-    nthread = std::max(1, std::min(cloud_resample_threads, npatch));
-    std::vector<double> busy(nthread, 0.0);
-    auto worker = [&](const int tid) {
-      Work ws;
-      auto tw = Clock::now();
-      while (true) {
-        const int q = next.fetch_add(1);
-        if (q >= npatch) break;
-        if (pptr[q+1] - pptr[q] < 1) continue;
-        infos[q] = ResamplePatch(pptr[q], pptr[q+1], spd.data(), npd, sptr.data(), stgt.data(),
-                                 swgt.data(), pgeo_h(q,0), pgeo_h(q,1), lx, ly, pgeo_h(q,2),
-                                 pgeo_h(q,3), mnew.data(), ws);
-      }
-      busy[tid] = seconds(tw);
-    };
-    if (nthread == 1) {
-      worker(0);
-    } else {
-      std::vector<std::thread> th;
-      for (int t=0; t<nthread; ++t) th.emplace_back(worker, t);
-      for (auto &t : th) t.join();
-    }
-    t_host = seconds(t0);
-    for (double b : busy) cpu += b;
-  }
-  resample::PatchSummary dsum;       // device totals
-  DvceArray1D<Real> mdev;
-  double dtim[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // device: order, sizes, small, large, solve, middle
-  if (on_dev) {
-    auto td = Clock::now();
-    // the pool in patch order on the device: the unique keys patch * npool + a, sorted (the
-    // host's counting sort keeps the pool order inside a patch, so does this)
-    DvceArray1D<std::int64_t> key(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_key"), npool);
-    const std::int64_t npl = npool;
-    Kokkos::parallel_for("rs_key", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int a) {key(a) = static_cast<std::int64_t>(pid(a,0))*npl + a;});
-    Kokkos::sort(key);
-    resample::DevicePatchProblem pb;
-    pb.npool = npool; pb.npatch = npatch;
-    if (DUST_R_DIAG && ProfOn()) pb.stage = DvceArray1D<unsigned long long>("rs_stage", resample::kNStage);
-    pb.qr_rows = cloud_resample_qr_rows;
-    pb.lx = lx; pb.ly = ly; pb.pgeo = pgeo;
-    pb.pptr = DvceArray1D<int>("rs_pptr", npatch + 1);
-    DvceArray1D<int> sorder(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_sorder"), npool);
-    DvceArray1D<int> scnt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_scnt"), npool);
-    auto pptr_d = pb.pptr;
-    Kokkos::parallel_for("rs_order", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int k) {
-      const int a = static_cast<int>(key(k) % npl), q = static_cast<int>(key(k)/npl);
-      sorder(k) = a;
-      scnt(k) = cptr(a + 1) - cptr(a);
-      Kokkos::atomic_inc(&pptr_d(q + 1));
-    });
-    Kokkos::parallel_scan("rs_pptr", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch + 1),
-    KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
-      upd += pptr_d(q);
-      if (final) pptr_d(q) = upd;
-    });
-    pb.sptr = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_sptr"), npool + 1);
-    auto sptr_d = pb.sptr;
-    Kokkos::parallel_scan("rs_sptr", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int k, int &upd, const bool final) {
-      if (final) sptr_d(k) = upd;
-      upd += scnt(k);
-      if (final && k == npl - 1) sptr_d(k + 1) = upd;
-    });
-    pb.spd = DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_spd"), npool, npd);
-    pb.stgt = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_stgt"), nnz);
-    pb.swgt = DvceArray1D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_swgt"), nnz);
-    auto spd_d = pb.spd; auto stgt_d = pb.stgt; auto swgt_d = pb.swgt;
-    Kokkos::parallel_for("rs_sfill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int k) {
-      const int a = sorder(k);
-      for (int c=0; c<npd; ++c) spd_d(k,c) = pd(a,c);
-      int e = sptr_d(k);
-      for (int j=cptr(a); j<cptr(a + 1); ++j) {stgt_d(e) = ctgt(j); swgt_d(e) = cwgt(j); ++e;}
-    });
-    Kokkos::fence();
-    dtim[0] = seconds(td);
-    DvceArray1D<double> mn("rs_dev_mnew", npool);
-    DvceArray2D<int> outi("rs_dev_outi", npatch, resample::NPC);
-    DvceArray1D<double> outr("rs_dev_outr", npatch);
-    double tim[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
-    resample::SolvePatchesDevice(pb, mn, outi, outr, cloud_resample_device_mem_mb,
-                                 cloud_resample_device_mid, cloud_resample_device_mid_team,
-                                 cloud_resample_device_wide_team, tim);
-    dtim[1] = tim[0]; dtim[2] = tim[1]; dtim[3] = tim[2]; dtim[4] = tim[3]; dtim[5] = tim[4];
-    if (pb.stage.extent(0) > 0) {   // stage clock (amr_profile)
-      auto sh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pb.stage);
-      for (int c=0; c<resample::kNStage; ++c) resample::StageTotals()[c] += sh(c);
-    }
-    mdev = DvceArray1D<Real>("rs_mnew_dev", npool);
-    auto mdv = mdev;
-    Kokkos::parallel_for("rs_unsort", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int k) {mdv(sorder(k)) = mn(k);});
-    // the totals reduced on the device
-    resample::SummarizePatchesDevice(outi, outr, dsum);
-  }
-  if (cloud_resample_device) {t_sort = dtim[0]; t_host = dtim[4];}
-  t0 = Clock::now();
-  long long pool = 0, kept = 0, atcap = 0, nfall = 0, nred = 0, npat = 0, zsteps = 0, csteps = 0, scans = 0;
-  double resmax = 0.0;
-  double st[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // stage seconds, all threads
-  int nmax = 0, nbmax = 0, n64 = 0, n256 = 0;      // largest patch, its rows; patches with >= 64 / 256 clouds
-  if (cloud_resample_device) {   // stage seconds are host-only (zero)
-    npat = dsum.npat; pool = dsum.pool; kept = dsum.kept; atcap = dsum.atcap; nfall = dsum.nfall;
-    nred = dsum.nred; zsteps = dsum.zsteps; csteps = dsum.csteps; scans = dsum.scans;
-    resmax = dsum.resmax; nmax = dsum.nmax; nbmax = dsum.nbmax; n64 = dsum.n64; n256 = dsum.n256;
-  }
-  for (const auto &f : infos) {
-    if (cloud_resample_device) break;
-    if (f.n == 0) continue;
-    st[0] += f.t_rows; st[1] += f.t_scale; st[2] += f.t_qr; st[3] += f.t_null; st[4] += f.t_red;
-    st[5] += f.t_check;
-    nmax = std::max(nmax, f.n); nbmax = std::max(nbmax, f.nb);
-    if (f.n >= 64) ++n64;
-    if (f.n >= 256) ++n256;
-    ++npat; pool += f.n; kept += f.kept; atcap += f.ncap; zsteps += f.steps_zero; csteps += f.steps_cap;
-    scans += f.scans;
-    if (f.fallback) ++nfall; else resmax = std::max(resmax, f.res);
-    if (f.kept < f.n) ++nred;
-  }
-  const int nremoved = static_cast<int>(pool - kept);
-
-  // device: new masses, compaction
-  if (nremoved > 0 || csteps > 0) {
-    if (cloud_resample_device) {
-      auto mdv = mdev;
-      Kokkos::parallel_for("rs_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-      KOKKOS_LAMBDA(const int a) {pr(IPM, pid(a,1)) = mdv(a);});
-    } else {
-      Kokkos::View<double*, HostMemSpace> mh("rs_mnew_h", npool);
-      for (int k=0; k<npool; ++k) mh(order[k]) = mnew[k];
-      DvceArray1D<Real> md("rs_mnew", npool);
-      Kokkos::deep_copy(md, mh);
-      Kokkos::parallel_for("rs_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-      KOKKOS_LAMBDA(const int a) {pr(IPM, pid(a,1)) = md(a);});
-    }
-  }
-  int nfinal = npart;
-  if (nremoved > 0) {
-    DvceArray1D<int> koff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs_koff"), npart);
-    int nkeep = 0;
-    Kokkos::parallel_scan("rs_kscan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
-      if (final) koff(p) = upd;
-      upd += (pr(IPM,p) > 0.0) ? 1 : 0;
-    }, nkeep);
-    // 25% headroom, as the in-place split keeps it
-    DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrdata,
-                          nkeep + nkeep/4);
-    DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nidata,
-                         nkeep + nkeep/4);
-    Kokkos::parallel_for("rs_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      if (pr(IPM,p) <= 0.0) return;
-      const int k = koff(p);
-      for (int c=0; c<nrdata; ++c) prn(c,k) = pr(c,p);
-      for (int c=0; c<nidata; ++c) pin(c,k) = pi(c,p);
-    });
-    ppar->prtcl_rdata = prn;
-    ppar->prtcl_idata = pin;
-    ppar->nprtcl_thispack = nkeep;
-    nfinal = nkeep;
-    pmesh->nprtcl_thisrank = nfinal;
-    pmesh->nprtcl_eachrank[global_variable::my_rank] = nfinal;
-    pmesh->nprtcl_total = nfinal;
-  }
-  ++cloud_resample_pass;
-  cloud_resample_removed += static_cast<unsigned long long>(nremoved);
-  if (phst_track) phst_r_removed += static_cast<unsigned long long>(nremoved);
-  return nremoved;
+  return ResampleCloudsT(leaf_traversal, local);
 }
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ResampleClouds3D
-//! \brief ResampleClouds for 3-D refinable clouds, the device solve only.
-//! The same pool (plain clouds below their cap eta_L m0 / 8^level, the cold gate, the local event
-//! mask), patches of k x k x k cells inside one MeshBlock with k = min(s 2^level, kc), split
-//! into octants down to single cells while a patch holds more than cloud_resample_patch_split
-//! clouds, and the rows of every patch: leaf mass, momentum and feedback, the three
-//! center-of-mass rows and the six velocity second moments.  Returns the number of clouds
-//! removed.
+//! \brief ResampleClouds for 3-D refinable clouds: ResampleCloudsT on the 3-D traversal.
 
-int DustGasDrag::ResampleClouds3D(const bool local) {
-  using Clock = std::chrono::steady_clock;
-  auto seconds = [](const Clock::time_point &a) {
-    return std::chrono::duration<double>(Clock::now() - a).count();
-  };
-  using T = SMRCompositeTransfer;
-  particles::Particles *ppar = pmy_pack->ppart;
-  Mesh *pmesh = pmy_pack->pmesh;
-  const int npart = ppar->nprtcl_thispack;
-  const auto lt = leaf_traversal3d;
-  // (the gas gather field is packed below, once the pool is known)
-  // the decision is collective and the pack has a forward halo exchange, so every rank takes
-  // part, also one without particles (a rank that returned early made the others fail in the
-  // MPI_Allreduce)
-  auto gas_if_needed = [&](const int npool_mine) {
-    int npool_max = npool_mine;
-#if MPI_PARALLEL_ENABLED
-    MPI_Allreduce(MPI_IN_PLACE, &npool_max, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-#endif
-    if (npool_max >= 2) PackGasGather3D(pmy_pack->phydro->u0);
-  };
-  if (cloud_resample_m0 <= 0.0) EnsureRootCloudMass();
-  if (npart == 0) {gas_if_needed(0); return 0;}
-  const int nsp = std::max(1, nspecies);
-  DvceArray1D<Real> m0sp("rs3_m0", nsp);
-  {
-    auto mh = Kokkos::create_mirror_view(m0sp);
-    bool any = false;
-    for (int sp=0; sp<nsp; ++sp) {
-      mh(sp) = (cloud_resample_m0 > 0.0) ? cloud_resample_m0
-             : ((static_cast<int>(cloud_merge_mroot.size()) > sp) ? cloud_merge_mroot[sp] : 0.0);
-      if (mh(sp) > 0.0) any = true;
-    }
-    if (!any) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "cloud_resample needs the root cloud mass: set <dust>/cloud_resample_m0"
-                << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    Kokkos::deep_copy(m0sp, mh);
-  }
-  // block patches of k x k x k cells
-  const int s = cloud_resample_patch, kc = cloud_resample_patch_cells;
-  const int nmbp = pmy_pack->nmb_thispack;
-  const int bnx1 = lt.nx1, bnx2 = lt.nx2, bnx3 = lt.nx3;
-  std::vector<int> kblk_h(nmbp), poff_h(nmbp + 1, 0);
-  bool bad = (kc < 1);
-  for (int b=0; b<nmbp && !bad; ++b) {
-    const int lev = pmy_pack->pmb->mb_lev.h_view(b) - pmesh->root_level;
-    int k = s;
-    for (int l=0; l<lev && k < kc; ++l) k *= 2;
-    k = std::min(k, kc);
-    if (bnx1 % k != 0 || bnx2 % k != 0 || bnx3 % k != 0) bad = true;
-    if (cloud_resample_patch_split > 0 && (k & (k - 1)) != 0) bad = true;
-    kblk_h[b] = k;
-    poff_h[b + 1] = poff_h[b] + (bnx1/k)*(bnx2/k)*(bnx3/k);
-  }
-  if (bad) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "3-D block patches of min(cloud_resample_patch 2^level, cloud_resample_patch_cells) "
-              << "cells must divide the MeshBlock (powers of two with the patch split)" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  DvceArray1D<int> kblk("rs3_kblk", nmbp), poff("rs3_poff", nmbp + 1);
-  {
-    auto kb = Kokkos::create_mirror_view(kblk);
-    auto po = Kokkos::create_mirror_view(poff);
-    for (int b=0; b<nmbp; ++b) kb(b) = kblk_h[b];
-    for (int b=0; b<=nmbp; ++b) po(b) = poff_h[b];
-    Kokkos::deep_copy(kblk, kb);
-    Kokkos::deep_copy(poff, po);
-  }
-  // local resampling: the blocks of the last regrid and the blocks touching them
-  DvceArray1D<int> rmask("rs3_mask", std::max(1, nmbp));
-  if (local) {
-    auto pmr = pmesh->pmr;
-    const int ntot = pmesh->nmb_total;
-    const auto &ms = pmesh->mesh_size;
-    const Real lx = ms.x1max - ms.x1min, ly = ms.x2max - ms.x2min, lz = ms.x3max - ms.x3min;
-    auto box = [&](const int g, Real b[6]) {
-      const auto &ll = pmesh->lloc_eachmb[g];
-      const int lev = ll.level - pmesh->root_level;
-      const Real w1 = lx/(pmesh->nmb_rootx1 << lev), w2 = ly/(pmesh->nmb_rootx2 << lev);
-      const Real w3 = lz/(pmesh->nmb_rootx3 << lev);
-      b[0] = ms.x1min + ll.lx1*w1; b[1] = b[0] + w1;
-      b[2] = ms.x2min + ll.lx2*w2; b[3] = b[2] + w2;
-      b[4] = ms.x3min + ll.lx3*w3; b[5] = b[4] + w3;
-    };
-    std::vector<std::array<Real, 6>> fresh;
-    for (int g=0; g<ntot && r_fresh_blocks; ++g) {
-      if (pmr->ncyc_since_ref(g) <= amr_event_max_age) {
-        Real b[6]; box(g, b); fresh.push_back({b[0], b[1], b[2], b[3], b[4], b[5]});
-      }
-    }
-    auto mh = Kokkos::create_mirror_view(rmask);
-    for (int m=0; m<nmbp; ++m) {
-      Real b[6]; box(pmy_pack->gids + m, b);
-      const Real e1 = 1.0e-9*(b[1] - b[0]), e2 = 1.0e-9*(b[3] - b[2]), e3 = 1.0e-9*(b[5] - b[4]);
-      int on = 0;
-      for (const auto &f : fresh) {
-        for (int oz=-1; oz<=1 && !on; ++oz) {
-          for (int oy=-1; oy<=1 && !on; ++oy) {
-            for (int ox=-1; ox<=1 && !on; ++ox) {
-              const Real a0 = f[0] + ox*lx, a1 = f[1] + ox*lx, c0 = f[2] + oy*ly, c1 = f[3] + oy*ly;
-              const Real d0 = f[4] + oz*lz, d1 = f[5] + oz*lz;
-              if (a0 <= b[1] + e1 && b[0] <= a1 + e1 && c0 <= b[3] + e2 && b[2] <= c1 + e2 &&
-                  d0 <= b[5] + e3 && b[4] <= d1 + e3) on = 1;
-            }
-          }
-        }
-        if (on) break;
-      }
-      // the blocks of this cycle's split events (cloud_split_resample): the blocks of the
-      // parents and the blocks the pieces landed in (PrepareSplitBlocks; not the static
-      // neighbors: across a shear-periodic x1 face the pieces land in blocks shifted along x2,
-      // and after a hold by the split budget several blocks away)
-      if (!on && r_split_blocks && static_cast<int>(split_gid_flag.size()) == ntot) {
-        on = (split_gid_flag[pmy_pack->gids + m] != 0) ? 1 : 0;
-      }
-      mh(m) = on;
-    }
-    Kokkos::deep_copy(rmask, mh);
-  }
-  const bool use_mask = local;
-  const int psplit = cloud_resample_patch_split;
-  const int psub = (psplit > 0) ? kc*kc*kc : 1;
-  const ResampleCapTable rcap = cloud_resample_cap;   // eta_L m0 / 2^(d L) per level
-  auto t_all = Clock::now();
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  const int nrdata = ppar->nrdata;
-  (void) nrdata;
-  const int is = lt.is, js = lt.js, ks = lt.ks;
-  const int ncell123 = lt.ncells1*lt.ncells2*lt.ncells3;
-  // the block patch (geometric) of a leaf
-  auto patch_of = [=] KOKKOS_FUNCTION (const int t, int &b, int &q, int &cell) {
-    int kk, jj, ii;
-    lt.Decode(t, b, kk, jj, ii);
-    const int ti = ii - is, tj = jj - js, tk = kk - ks;
-    const int k = kblk(b), nbx = bnx1/k, nby = bnx2/k;
-    q = poff(b) + ((tk/k)*nby + tj/k)*nbx + ti/k;
-    cell = ((tk % k)*k + (tj % k))*k + (ti % k);
-  };
-  DvceArray1D<int> cnt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_cnt"), npart);
-  DvceArray1D<int> slot(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_slot"), npart);
-  DvceArray1D<int> coff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_coff"), npart);
-  int npool = 0, nnz = 0;
-  long long nnz64 = 0;
-  double tot_b[2] = {0.0, 0.0}, cnt_b[3] = {0.0, 0.0, 0.0};
-  // the cold gate: a block patch whose candidates span at most alpha H / tau in every
-  // velocity component is left alone
-  const Real calpha = cloud_resample_cold_alpha, comega = cloud_resample_omega;
-  const int nqs = (calpha > 0.0) ? std::max(1, poff_h[nmbp]*nsp) : 1;
-  DvceArray2D<Real> crange("rs3_cold_range", nqs, 6);
-  DvceArray1D<int> ccold("rs3_cold", nqs);
-  DvceArray1D<int> cq("rs3_cold_q", (calpha > 0.0) ? std::max(1, npart) : 1);
-  double cnt_cold = 0.0;
-  if (calpha > 0.0) {
-    Kokkos::parallel_for("rs3_cold_init", Kokkos::RangePolicy<>(DevExeSpace(), 0, nqs),
-    KOKKOS_LAMBDA(const int q) {
-      for (int c=0; c<3; ++c) {crange(q,c) = 1.0e300; crange(q,3+c) = -1.0e300;}
-      ccold(q) = 1;
-    });
-    Kokkos::parallel_for("rs3_cold_q", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      cq(p) = -1;
-      if (pr(IPM,p) <= 0.0) return;
-      const int code = pi(PLEV,p);
-      if (T::CloudLobe1(code) || T::CloudLobe2(code) || T::CloudLobe3(code)) return;
-      const int am = lt.Anchor(pi(PGID,p));
-      if (use_mask && rmask(am) == 0) return;
-      const int lev = T::CloudLevel(code);
-      const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-      const Real cap = rcap.Cap(m0sp(sp), lev);
-      if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol)) || pr(IPM,p) >= cap*(1.0 - kCapTol)) return;
-      const int t = lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), am);
-      if (t < 0) return;
-      int b, q, cell;
-      patch_of(t, b, q, cell);
-      if (b >= nmbp) return;
-      const int qs = q*nsp + sp;
-      cq(p) = qs;
-      const Real v[3] = {pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p)};
-      for (int c=0; c<3; ++c) {
-        Kokkos::atomic_min(&crange(qs,c), v[c]);
-        Kokkos::atomic_max(&crange(qs,3+c), v[c]);
-      }
-    });
-    Kokkos::parallel_for("rs3_cold_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      const int qs = cq(p);
-      if (qs < 0) return;
-      const Real ts = pr(IPTS,p);
-      const Real tau = (comega > 0.0) ? Kokkos::fmin(ts, 1.0/comega) : ts;
-      const int b = lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), lt.Anchor(pi(PGID,p)))/ncell123;
-      const Real tolv = calpha*lt.box(b,3)/tau;
-      for (int c=0; c<3; ++c) {
-        if (crange(qs,3+c) - crange(qs,c) > tolv) {Kokkos::atomic_store(&ccold(qs), 0); return;}
-      }
-    });
-  }
-  const bool multirank = (global_variable::nranks > 1);
-  Kokkos::parallel_reduce("rs3_flag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, double &mt, double &px, double &nl, double &nf, double &nz,
-                double &ncold) {
-    cnt(p) = -1;
-    if (pr(IPM,p) <= 0.0) {nz += 1.0; return;}
-    mt += pr(IPM,p); px += pr(IPM,p)*pr(IPVX,p);
-    const int code = pi(PLEV,p);
-    const int lev = T::CloudLevel(code);
-    if (T::CloudLobe1(code) || T::CloudLobe2(code) || T::CloudLobe3(code)) {nl += 1.0; return;}
-    if (use_mask && rmask(lt.Anchor(pi(PGID,p))) == 0) return;
-    const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-    const Real cap = rcap.Cap(m0sp(sp), lev);
-    if (!(pr(IPM,p) <= cap*(1.0 + kPoolTol))) {nf += 1.0; return;}
-    if (pr(IPM,p) >= cap*(1.0 - kCapTol)) {nf += 1.0; return;}
-    if (calpha > 0.0 && cq(p) >= 0 && ccold(cq(p)) == 1) {ncold += 1.0; return;}
-    // several ranks (as in 2-D): a cloud whose leaf is on a block of another rank stays
-    // out (a position within round-off of a periodic face routed to this rank's block while its
-    // leaf lookup takes the image on the other side)
-    if (multirank) {
-      const int tl = lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), lt.Anchor(pi(PGID,p)));
-      if (tl < 0 || tl/ncell123 >= nmbp) return;
-    }
-    int c = 0;
-    lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), code, lt.Anchor(pi(PGID,p)),
-                          [&](const int, const Real) {++c;});
-    cnt(p) = c;
-  }, tot_b[0], tot_b[1], cnt_b[0], cnt_b[1], cnt_b[2], cnt_cold);
-  cloud_resample_cold_skips += static_cast<unsigned long long>(cnt_cold);
-  // batches of block patches (cloud_resample_batch_pairs): the (cloud, leaf cell) pairs of the pool
-  // are held in tables with 32-bit offsets; a rank with more pairs resamples consecutive ranges of
-  // its block patches (and species) one after the other.  Patches are independent and the pool
-  // order within a patch is the same, so the result is that of one pass (2.2-2.5e9 pairs per rank
-  // at L3 when clouds capped at L2 split at once).  ppat: the base patch of a pool cloud.
-  const int nbase0 = std::max(1, poff_h[nmbp]*nsp);
-  DvceArray1D<int> ppat(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_ppat"), npart);
-  DvceArray1D<long long> pent("rs3_pent", nbase0);
-  int npool_all = 0;
-  Kokkos::parallel_reduce("rs3_ppat", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &np_) {
-    ppat(p) = -1;
-    if (cnt(p) < 0) return;
-    ++np_;
-    // (a pool cloud without a leaf or on another rank's block: batch 0, where rs3_fill aborts)
-    int qs = 0;
-    const int t = lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), lt.Anchor(pi(PGID,p)));
-    if (t >= 0) {
-      int b, q, cell;
-      patch_of(t, b, q, cell);
-      const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-      if (b < nmbp) qs = q*nsp + sp;
-    }
-    ppat(p) = qs;
-    Kokkos::atomic_add(&pent(qs), static_cast<long long>(cnt(p) > 0 ? cnt(p) : 0));
-  }, npool_all);
-  // the gas gather field (u0 velocities, with a forward halo
-  // exchange on several ranks) is only needed when some rank resamples; the decision is
-  // collective because the halo exchange is.  u0 is unchanged since the call above used to be.
-  gas_if_needed(npool_all);
-  if (npool_all < 2) {
-    ++cloud_resample_pass;
-    return 0;
-  }
-  std::vector<std::array<int, 2>> batches;
-  {
-    auto ph = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), pent);
-    const long long cap = cloud_resample_batch_pairs;
-    long long acc = 0, largest = 0;
-    int q0 = 0;
-    for (int q=0; q<nbase0; ++q) {
-      if (ph(q) > static_cast<long long>(std::numeric_limits<int>::max())) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "resampling: one patch holds " << ph(q) << " (cloud, leaf cell) pairs, more "
-                  << "than the 32-bit range of the weight tables" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-      if (acc > 0 && acc + ph(q) > cap) {
-        batches.push_back({q0, q});
-        largest = std::max(largest, acc);
-        q0 = q;
-        acc = 0;
-      }
-      acc += ph(q);
-    }
-    batches.push_back({q0, nbase0});
-    largest = std::max(largest, acc);
-    // (cap is a target: a patch with more pairs than cap is a batch of its own; the hard limit is
-    // the 32-bit range per batch, checked below)
-    if (batches.size() > 1 || largest > cap) {
-      std::cout << "# resampling (rank " << global_variable::my_rank << "): " << batches.size()
-                << " batches of block patches (target " << cap << " (cloud, leaf) pairs each, "
-                << "largest " << largest << ((largest > cap) ? ": one patch alone" : "") << ")"
-                << std::endl;
-    }
-  }
-  int nremoved = 0;
-  DvceArray1D<int> cntb(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_cntb"), npart);
-  for (const auto &bt : batches) {
-    const int bq0 = bt[0], bq1 = bt[1];
-    Kokkos::parallel_for("rs3_cntb", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      cntb(p) = (cnt(p) >= 0 && ppat(p) >= bq0 && ppat(p) < bq1) ? cnt(p) : -1;
-    });
-    Kokkos::parallel_scan("rs3_slot", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
-      if (final) slot(p) = (cntb(p) >= 0) ? upd : -1;
-      upd += (cntb(p) >= 0) ? 1 : 0;
-    }, npool);
-    if (cloud_resample_tag_order && npool > 1) {   // the pool in PTAG order
-      DvceArray1D<int> pofs(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pofs"), npool);
-      PoolInTagOrder(pi, slot, npart, npool, pofs);   // 64-bit tags
-      Kokkos::parallel_scan("rs3_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-      KOKKOS_LAMBDA(const int a, long long &upd, const bool final) {
-        const int p = pofs(a);
-        if (final) coff(p) = static_cast<int>(upd);
-        upd += (cntb(p) > 0) ? cntb(p) : 0;
-      }, nnz64);
-    } else {
-      Kokkos::parallel_scan("rs3_coff", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-      KOKKOS_LAMBDA(const int p, long long &upd, const bool final) {
-        if (final) coff(p) = static_cast<int>(upd);
-        upd += (cntb(p) > 0) ? cntb(p) : 0;
-      }, nnz64);
-    }
-    // the (cloud, leaf cell) pairs of the pool in 64 bits: above the 32-bit range the CSR offsets
-    // would wrap (clouds capped at L2 on L5 leaves once asked for 1.7e7 TiB)
-    if (nnz64 > static_cast<long long>(std::numeric_limits<int>::max())) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "resampling: " << nnz64 << " (cloud, leaf cell) pairs on this rank exceed the "
-                << "32-bit range of the weight tables" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    nnz = static_cast<int>(nnz64);
-    if (npool < 2) continue;   // (this batch; the gas field above is collective, once per call)
-    // the pool table (x, y, m, v, ts, gathered gas velocity, cap, z), ids, CSR weights
-    const int npd = resample::NPD3;
-    DvceArray2D<Real> pd(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pd"), npool, npd);
-    DvceArray2D<int> pid(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pid"), npool, 2);
-    DvceArray1D<int> cptr(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_cptr"), npool + 1);
-    DvceArray1D<int> ctgt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_ctgt"), nnz);
-    DvceArray1D<Real> cwgt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_cwgt"), nnz);
-    auto gp = gpack3;   // PackGasGather3D above
-    const int tmode = cloud_transition;
-    const int nnz_ = nnz;
-    Kokkos::parallel_for("rs3_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      const int a = slot(p);
-      if (p == npart - 1) cptr(npool) = nnz_;
-      if (a < 0) return;
-      const Real xp = pr(IPX,p), yp = pr(IPY,p), zp = pr(IPZ,p);
-      const int code = pi(PLEV,p);
-      const int lev = T::CloudLevel(code);
-      const int am = lt.Anchor(pi(PGID,p));
-      Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-      lt.ForEachCloudMoment(xp, yp, zp, T::GatherCode(code, tmode), am,
-      [&](const int target, const Real w, const Real m1x, const Real m1y, const Real m1z) {
-        int tb, tk, tj, ti;
-        lt.Decode(target, tb, tk, tj, ti);
-        const Real dx1 = lt.box(tb,3), dx2 = lt.box(tb,4), dx3 = lt.box(tb,5);
-        const Real xc = lt.box(tb,0) + (ti - is + 0.5)*dx1;
-        const Real yc = lt.box(tb,1) + (tj - js + 0.5)*dx2;
-        const Real zc = lt.box(tb,2) + (tk - ks + 0.5)*dx3;
-        const Real cx = 0.5*(m1x + T::MinImage(xp - xc, lt.lx)*w)/dx1;
-        const Real cy = 0.5*(m1y + T::MinImage(yp - yc, lt.ly)*w)/dx2;
-        const Real cz = 0.5*(m1z + T::MinImage(zp - zc, lt.lz)*w)/dx3;
-        ugx += w*gp(tb,tk,tj,ti,0) + cx*gp(tb,tk,tj,ti,3) + cy*gp(tb,tk,tj,ti,6) + cz*gp(tb,tk,tj,ti,9);
-        ugy += w*gp(tb,tk,tj,ti,1) + cx*gp(tb,tk,tj,ti,4) + cy*gp(tb,tk,tj,ti,7) + cz*gp(tb,tk,tj,ti,10);
-        ugz += w*gp(tb,tk,tj,ti,2) + cx*gp(tb,tk,tj,ti,5) + cy*gp(tb,tk,tj,ti,8) + cz*gp(tb,tk,tj,ti,11);
-      });
-      pd(a,resample::JX) = xp; pd(a,resample::JY) = yp; pd(a,resample::JZ) = zp;
-      pd(a,resample::JM) = pr(IPM,p);
-      pd(a,resample::JVX) = pr(IPVX,p); pd(a,resample::JVY) = pr(IPVY,p);
-      pd(a,resample::JVZ) = pr(IPVZ,p); pd(a,resample::JTS) = pr(IPTS,p);
-      pd(a,resample::JUX) = ugx; pd(a,resample::JUY) = ugy; pd(a,resample::JUZ) = ugz;
-      const int sp = (pi(PSP,p) >= 0 && pi(PSP,p) < nsp) ? pi(PSP,p) : 0;
-      pd(a,resample::JCAP) = rcap.Cap(m0sp(sp), lev);
-      const int t = lt.LeafOwner(xp, yp, zp, am);
-      if (t < 0) Kokkos::abort("3-D resampling: a pool cloud without a leaf");
-      int b, q, cell;
-      patch_of(t, b, q, cell);
-      if (b >= nmbp) Kokkos::abort("3-D resampling: a cloud in a block of another rank");
-      if (psub > 1) q = q*psub + cell;   // its cell in the patch
-      pid(a,0) = q*nsp + sp;
-      pid(a,1) = p;
-      cptr(a) = coff(p);
-      int e = coff(p);
-      lt.ForEachCloudWeight(xp, yp, zp, code, am, [&](const int target, const Real w) {
-        ctgt(e) = target; cwgt(e) = w; ++e;
-      });
-    });
-    // octant split of the crowded patches: every slot to the lowest-corner slot
-    // of its final cube (own), with the cube's width there (nsz)
-    const int nbase = poff_h[nmbp]*nsp;
-    const int nslot = nbase*psub;
-    DvceArray1D<int> nsz("rs3_split_size", (psub > 1) ? nslot : 1);
-    int nsplit = 0;
-    if (psub > 1) {
-      DvceArray1D<int> pc("rs3_split_count", nslot), own("rs3_split_owner", nslot);
-      Kokkos::deep_copy(own, -1);
-      Kokkos::parallel_for("rs3_split_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-      KOKKOS_LAMBDA(const int a) {Kokkos::atomic_increment(&pc(pid(a,0)));});
-      const int ps = psub;
-      Kokkos::parallel_reduce("rs3_split_tree", Kokkos::RangePolicy<>(DevExeSpace(), 0, nbase),
-      KOKKOS_LAMBDA(const int i, int &ns) {
-        const int q = i/nsp, sp = i % nsp;
-        int lo = 0, hi = nmbp;
-        while (hi - lo > 1) {
-          const int mid = (lo + hi)/2;
-          if (poff(mid) <= q) lo = mid; else hi = mid;
-        }
-        const int k = kblk(lo);
-        auto idx = [&](const int x, const int y, const int z) {
-          return (q*ps + (z*k + y)*k + x)*nsp + sp;
-        };
-        int st[64][4], top = 0;
-        st[top][0] = 0; st[top][1] = 0; st[top][2] = 0; st[top][3] = k; ++top;
-        while (top > 0) {
-          --top;
-          const int x0 = st[top][0], y0 = st[top][1], z0 = st[top][2], w = st[top][3];
-          int tot = 0;
-          for (int z=z0; z<z0+w; ++z) {
-            for (int y=y0; y<y0+w; ++y) for (int x=x0; x<x0+w; ++x) tot += pc(idx(x, y, z));
-          }
-          if (tot > psplit && w >= 2 && top + 8 <= 64) {
-            const int h = w/2;
-            if (w == k) ns += 1;
-            for (int c=0; c<8; ++c) {
-              st[top][0] = x0 + (c & 1)*h; st[top][1] = y0 + ((c >> 1) & 1)*h;
-              st[top][2] = z0 + (c >> 2)*h; st[top][3] = h; ++top;
-            }
-          } else {
-            for (int z=z0; z<z0+w; ++z) {
-              for (int y=y0; y<y0+w; ++y) {
-                for (int x=x0; x<x0+w; ++x) own(idx(x, y, z)) = idx(x0, y0, z0);
-              }
-            }
-            nsz(idx(x0, y0, z0)) = w;
-          }
-        }
-      }, nsplit);
-      Kokkos::parallel_for("rs3_split_ids", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-      KOKKOS_LAMBDA(const int a) {
-        const int o = own(pid(a,0));
-        if (o < 0) Kokkos::abort("3-D resampling: a cell slot without a patch");
-        pid(a,0) = o;
-      });
-    }
-    const int npatch = nslot;
-    // per patch: center and half widths of the center-of-mass rows (x, y, half x, half y, z, half z)
-    DvceArray2D<Real> pgeo(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pgeo"), npatch, 6);
-    Kokkos::parallel_for("rs3_pgeo", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-    KOKKOS_LAMBDA(const int qs) {
-      const int g = qs/nsp, q = g/psub, c = g % psub;
-      int lo = 0, hi = nmbp;
-      while (hi - lo > 1) {
-        const int mid = (lo + hi)/2;
-        if (poff(mid) <= q) lo = mid; else hi = mid;
-      }
-      const int b = lo, k = kblk(b), r = q - poff(b), nbx = bnx1/k, nby = bnx2/k;
-      const int ip = r % nbx, jp = (r/nbx) % nby, kp = r/(nbx*nby);
-      const Real d1 = lt.box(b,3), d2 = lt.box(b,4), d3 = lt.box(b,5);
-      Real x0 = 0.0, y0 = 0.0, z0 = 0.0, w = k;
-      if (psub > 1 && nsz(qs) > 0) {
-        w = nsz(qs); x0 = c % k; y0 = (c/k) % k; z0 = c/(k*k);
-      }
-      pgeo(qs,0) = lt.box(b,0) + (ip*k + x0 + 0.5*w)*d1;
-      pgeo(qs,1) = lt.box(b,1) + (jp*k + y0 + 0.5*w)*d2;
-      pgeo(qs,2) = 0.5*w*d1; pgeo(qs,3) = 0.5*w*d2;
-      pgeo(qs,4) = lt.box(b,2) + (kp*k + z0 + 0.5*w)*d3;
-      pgeo(qs,5) = 0.5*w*d3;
-    });
-    // the device solve, the pool in patch order
-    DvceArray1D<std::int64_t> key(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_key"), npool);
-    const std::int64_t npl = npool;
-    Kokkos::parallel_for("rs3_key", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int a) {key(a) = static_cast<std::int64_t>(pid(a,0))*npl + a;});
-    Kokkos::sort(key);
-    // sub-patches of the crowded patches (cloud_resample_patch_max): a patch of n > pmax pool
-    // clouds becomes ns = ceil(n / pmax) sub-patches of consecutive clouds in the sorted order
-    // (balanced sizes).  Every sub-patch keeps its own contributions to every row (leaf mass,
-    // momentum and feedback, center of mass, second moments) and takes the geometry of its patch,
-    // so the sum keeps all of them; the solves stay small and run in parallel.  (A single cell of
-    // a dense core held 5e5 clouds at L3: one team solved it for 40 min.)
-    const int pmax = cloud_resample_patch_max;
-    DvceArray1D<int> pcnt("rs3_pcnt", npatch), pstart("rs3_pstart", npatch);
-    DvceArray1D<int> qbase("rs3_qbase", npatch);
-    Kokkos::parallel_for("rs3_pcnt", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int k) {Kokkos::atomic_inc(&pcnt(static_cast<int>(key(k)/npl)));});
-    auto nsub_of = [=] KOKKOS_FUNCTION (const int n) {
-      return (pmax > 0 && n > pmax) ? (n + pmax - 1)/pmax : 1;
-    };
-    int npatch2 = 0;
-    Kokkos::parallel_scan("rs3_qbase", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-    KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
-      if (final) qbase(q) = upd;
-      upd += nsub_of(pcnt(q));
-    }, npatch2);
-    Kokkos::parallel_scan("rs3_pstart", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-    KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
-      if (final) pstart(q) = upd;
-      upd += pcnt(q);
-    });
-    if (npatch2 != npatch) {
-      int ncrowd = 0;
-      Kokkos::parallel_reduce("rs3_ncrowd", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-      KOKKOS_LAMBDA(const int q, int &c) {if (nsub_of(pcnt(q)) > 1) ++c;}, ncrowd);
-      std::cout << "# resampling (rank " << global_variable::my_rank << "): " << ncrowd
-                << " patches of more than " << pmax << " pool clouds solved as "
-                << ncrowd + npatch2 - npatch << " sub-patches" << std::endl;
-    }
-    DvceArray2D<Real> pgeo2 = pgeo;
-    if (npatch2 != npatch) {
-      pgeo2 = DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_pgeo2"),
-                                npatch2, 6);
-      Kokkos::parallel_for("rs3_pgeo2", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
-      KOKKOS_LAMBDA(const int q) {
-        const int ns = nsub_of(pcnt(q));
-        for (int j=0; j<ns; ++j) {
-          for (int c=0; c<6; ++c) pgeo2(qbase(q) + j, c) = pgeo(q, c);
-        }
-      });
-    }
-    resample::DevicePatchProblem pb;
-    pb.npool = npool; pb.npatch = npatch2;
-    pb.qr_rows = cloud_resample_qr_rows;
-    pb.lx = lt.lx; pb.ly = lt.ly; pb.lz = lt.lz; pb.three = true; pb.pgeo = pgeo2;
-    pb.rank_screen = cloud_resample_rank_screen;
-    pb.pptr = DvceArray1D<int>("rs3_pptr", npatch2 + 1);
-    DvceArray1D<int> sorder(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_sorder"), npool);
-    DvceArray1D<int> scnt(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_scnt"), npool);
-    auto pptr_d = pb.pptr;
-    Kokkos::parallel_for("rs3_order", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int k) {
-      const int a = static_cast<int>(key(k) % npl), q = static_cast<int>(key(k)/npl);
-      sorder(k) = a;
-      scnt(k) = cptr(a + 1) - cptr(a);
-      const int n = pcnt(q), ns = nsub_of(n);
-      const int sub = (ns > 1) ? static_cast<int>(static_cast<std::int64_t>(k - pstart(q))*ns/n) : 0;
-      Kokkos::atomic_inc(&pptr_d(qbase(q) + sub + 1));
-    });
-    Kokkos::parallel_scan("rs3_pptr", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch2 + 1),
-    KOKKOS_LAMBDA(const int q, int &upd, const bool final) {
-      upd += pptr_d(q);
-      if (final) pptr_d(q) = upd;
-    });
-    pb.sptr = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_sptr"), npool + 1);
-    auto sptr_d = pb.sptr;
-    Kokkos::parallel_scan("rs3_sptr", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int k, int &upd, const bool final) {
-      if (final) sptr_d(k) = upd;
-      upd += scnt(k);
-      if (final && k == npl - 1) sptr_d(k + 1) = upd;
-    });
-    pb.spd = DvceArray2D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_spd"), npool, npd);
-    pb.stgt = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_stgt"), nnz);
-    pb.swgt = DvceArray1D<Real>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_swgt"), nnz);
-    auto spd_d = pb.spd; auto stgt_d = pb.stgt; auto swgt_d = pb.swgt;
-    Kokkos::parallel_for("rs3_sfill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-    KOKKOS_LAMBDA(const int k) {
-      const int a = sorder(k);
-      for (int c=0; c<npd; ++c) spd_d(k,c) = pd(a,c);
-      int e = sptr_d(k);
-      for (int j=cptr(a); j<cptr(a + 1); ++j) {stgt_d(e) = ctgt(j); swgt_d(e) = cwgt(j); ++e;}
-    });
-    // the patches for the cross-moment rows (cloud_resample_xv_rows, and for the audit's counts).
-    // Unflagged only when all pool clouds of the patch have one level L and every footprint leaf
-    // is at level >= L.  Then, per direction, leaf values a_l = the center of the level-L cell
-    // holding leaf l give sum_l a_l W_il = x_i (the hat is box * box of the L cell width), and
-    // b_l = the level-L quadratic B-spline coefficients give sum_l b_l W_il = x_i^2 + const (the
-    // cell-integrated hat is box * box * box, a B-spline of degree 2 that reproduces quadratics,
-    // the same constant for every cloud of width L): the leaf-momentum rows fix
-    // sum m (x - c)(v - u)^T and the leaf-mass rows the spatial second moments, so the extra rows
-    // are redundant and such patches are solved without them (bitwise as with none).  Every
-    // other patch is flagged: a cloud finer than a leaf, or several cloud widths in one patch
-    // (no general redundancy: moving mass between a width-2h cloud and its three width-h
-    // P1 pieces keeps every leaf deposit, the mass and the center of mass but changes S_xx).
-    // The proof also needs the unbounded hat and one consistent unwrapping: flagged as well are
-    // the patches with a cloud whose support crosses a physical x3 face (the part beyond the face
-    // is folded back into the domain, so the weights no longer reproduce z) and the patches whose
-    // footprint spans a whole period of a periodic direction (x1, x2, periodic x3), where the
-    // unwrapping about the patch center is ambiguous.
-    DvceArray1D<int> xfl;
-    if (cloud_resample_xv_rows != 0 || cloud_resample_xv_audit) {
-      DvceArray1D<int> klev(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_xvlev"), npool);
-      auto blev = lt.blev;
-      const bool z3per = lt.x3per;
-      const Real rdz = lt.root_dx3, z3min = lt.x3min, z3max = lt.x3max, ztol = 1.0e-12*lt.lz;
-      Kokkos::parallel_for("rs3_xvlev", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-      KOKKOS_LAMBDA(const int k) {
-        int lmin = 255;
-        for (int e=sptr_d(k); e<sptr_d(k + 1); ++e) lmin = Kokkos::min(lmin, blev(stgt_d(e)/ncell123));
-        const int cl = T::CloudLevel(pi(PLEV, pid(sorder(k), 1)));
-        // bit 17: the support [z - ell, z + ell] crosses a physical x3 face (folded deposit)
-        int fold = 0;
-        if (!z3per) {
-          const Real z = spd_d(k, resample::JZ), ell = rdz/static_cast<Real>(1 << cl);
-          fold = (z - ell < z3min + ztol || z + ell > z3max - ztol) ? 1 : 0;
-        }
-        // bit 16: finer than one of its leaves
-        klev(k) = (fold << 17) | ((cl > lmin) ? (1 << 16) : 0) | (cl << 8) | lmin;
-      });
-      xfl = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_xvflag"),
-                             npatch2);
-      auto pg = pb.pgeo;
-      const Real plx = lt.lx, ply = lt.ly, plz = lt.lz;
-      const Real rdx1 = lt.root_dx1, rdx2 = lt.root_dx2;
-      Kokkos::parallel_for("rs3_xvflag", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch2),
-      KOKKOS_LAMBDA(const int q) {
-        int cmin = 255, cmax = -1, lmin = 255, own = 0, fold = 0;
-        // the footprint about the patch center, unwrapped as in the rows: [lo, hi] per direction
-        Real lo[3] = {1.0e300, 1.0e300, 1.0e300}, hi[3] = {-1.0e300, -1.0e300, -1.0e300};
-        const Real per[3] = {plx, ply, plz}, cen[3] = {pg(q,0), pg(q,1), pg(q,4)};
-        const Real rd[3] = {rdx1, rdx2, rdz};
-        for (int k=pptr_d(q); k<pptr_d(q + 1); ++k) {
-          const int cl = (klev(k) >> 8) & 255;
-          cmin = Kokkos::min(cmin, cl);
-          cmax = Kokkos::max(cmax, cl);
-          lmin = Kokkos::min(lmin, klev(k) & 255);
-          own |= (klev(k) >> 16) & 1;
-          fold |= (klev(k) >> 17) & 1;
-          for (int a=0; a<3; ++a) {
-            Real d = spd_d(k, (a == 0) ? resample::JX : ((a == 1) ? resample::JY : resample::JZ)) - cen[a];
-            if (a < 2 || z3per) d -= per[a]*Kokkos::floor(d/per[a] + 0.5);
-            const Real ell = rd[a]/static_cast<Real>(1 << cl);
-            lo[a] = Kokkos::fmin(lo[a], d - ell);
-            hi[a] = Kokkos::fmax(hi[a], d + ell);
-          }
-        }
-        // a footprint spanning a whole period (x1, x2; x3 when periodic): ambiguous unwrapping
-        const bool amb = (hi[0] - lo[0] >= per[0]*(1.0 - 1.0e-12)) ||
-                         (hi[1] - lo[1] >= per[1]*(1.0 - 1.0e-12)) ||
-                         (z3per && hi[2] - lo[2] >= per[2]*(1.0 - 1.0e-12));
-        const bool widths = (cmin == cmax && cmax <= lmin);
-        // 0 unflagged (one cloud level L, every footprint leaf at level >= L, no x3 fold, an
-        // unambiguous unwrapping); 3 a cloud finer than one of its own leaves; 2 several cloud
-        // levels (otherwise); 4 only the boundary (an x3 fold or an ambiguous unwrapping).  The
-        // solve uses != 0, the audit counts 2 ("mixed") and 4 ("boundary") separately
-        xfl(q) = (widths && !fold && !amb) ? 0 : (own ? 3 : (!widths ? 2 : 4));
-      });
-    }
-    DvceArray1D<double> mn("rs3_dev_mnew", npool);
-    DvceArray2D<int> outi("rs3_dev_outi", npatch2, resample::NPC);
-    DvceArray1D<double> outr("rs3_dev_outr", npatch2);
-    double tim[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
-    long long scr[2] = {0, 0};
-    resample::SolvePatchesDevice(pb, mn, outi, outr, cloud_resample_device_mem_mb,
-                                 cloud_resample_device_mid, cloud_resample_device_mid_team,
-                                 cloud_resample_device_wide_team, tim, scr,
-                                 cloud_resample_xv_rows, xfl, omega0 != 0.0, qshear);
-    resample::PatchSummary dsum;
-    resample::SummarizePatchesDevice(outi, outr, dsum);
-    if (cloud_resample_xv_audit) {
-      resample::AuditXVPatches(pb, mn, lt, omega0, qshear, xfl, rxv_acc);
-      rxv_acc[20] = std::max(rxv_acc[20], dsum.resmax);
-      rxv_acc[21] += static_cast<double>(dsum.nfall);
-      rxv_acc[22] += static_cast<double>(dsum.npat);
-      rxv_acc[23] += static_cast<double>(dsum.nred);
-    }
-    const int nremoved_b = static_cast<int>(dsum.pool - dsum.kept);
-    nremoved += nremoved_b;
-    if (nremoved_b > 0 || dsum.csteps > 0) {
-      Kokkos::parallel_for("rs3_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npool),
-      KOKKOS_LAMBDA(const int k) {pr(IPM, pid(sorder(k),1)) = mn(k);});
-    }
-    (void) nsplit;
-  }
-  int nfinal = npart;
-  if (nremoved > 0) {
-    const int nrd = ppar->nrdata, nid = ppar->nidata;
-    DvceArray1D<int> koff(Kokkos::view_alloc(Kokkos::WithoutInitializing, "rs3_koff"), npart);
-    int nkeep = 0;
-    Kokkos::parallel_scan("rs3_kscan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
-      if (final) koff(p) = upd;
-      upd += (pr(IPM,p) > 0.0) ? 1 : 0;
-    }, nkeep);
-    DvceArray2D<Real> prn(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_rdata"), nrd,
-                          nkeep + nkeep/4);
-    DvceArray2D<int> pin(Kokkos::view_alloc(Kokkos::WithoutInitializing, "prtcl_idata"), nid,
-                         nkeep + nkeep/4);
-    Kokkos::parallel_for("rs3_keep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      if (pr(IPM,p) <= 0.0) return;
-      const int k = koff(p);
-      for (int c=0; c<nrd; ++c) prn(c,k) = pr(c,p);
-      for (int c=0; c<nid; ++c) pin(c,k) = pi(c,p);
-    });
-    ppar->prtcl_rdata = prn;
-    ppar->prtcl_idata = pin;
-    ppar->nprtcl_thispack = nkeep;
-    nfinal = nkeep;
-    pmesh->nprtcl_thisrank = nfinal;
-    pmesh->nprtcl_eachrank[global_variable::my_rank] = nfinal;
-    pmesh->nprtcl_total = nfinal;
-  }
-  ++cloud_resample_pass;
-  cloud_resample_removed += static_cast<unsigned long long>(nremoved);
-  if (phst_track) phst_r_removed += static_cast<unsigned long long>(nremoved);
-  return nremoved;
-}
+int DustGasDrag::ResampleClouds3D(const bool local) {return ResampleCloudsT(leaf_traversal3d, local);}
 
 }  // namespace dust

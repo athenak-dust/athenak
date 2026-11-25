@@ -15,6 +15,7 @@
 #include "mesh/mesh.hpp"
 #include "particles/particles.hpp"
 #include "dust/dust.hpp"
+#include "gravity/sg_test_keys.hpp"
 
 namespace dust {
 namespace {
@@ -38,8 +39,8 @@ void ResizeField(DvceArray5D<Real> &field, const char *name, int blocks,
     field=DvceArray5D<Real>(std::string(name),blocks,components,nk,nj,ni);
 }
 
-// The atomic adds of the gravity mass deposit on a GPU (environment ATHENA_SG_DEPOSIT_ATOMIC,
-// read once).  In the cell order of the cloud kernels (cloud_ord) the lanes of a warp often
+// The atomic adds of the gravity mass deposit on a GPU (hidden test key
+// <gravity>/test_deposit_atomic, read by SelfGravity; gravity/sg_test_keys.hpp).  In the cell order of the cloud kernels (cloud_ord) the lanes of a warp often
 // deposit into the same leaf cells in the same step, and atomic adds to one address serialize:
 // in clumps the plain deposit took several times as long on one
 // rank as on another, and every rank waits for the slowest in the check that follows.
@@ -58,22 +59,11 @@ void ResizeField(DvceArray5D<Real> &field, const char *name, int blocks,
 // plain order (DepositAddWarp falls back to DepositAdd), so CPU results do not depend on the mode.
 enum DepositAtomicMode {kDepositPlain = 0, kDepositWarp = 1, kDepositCycle = 2,
                         kDepositCompare = 3};
+// (the same on every rank: compare adds an MPI_Allreduce)
 int DepositAtomicMode() {
-  static const int mode = [] {
-    const char *e = std::getenv("ATHENA_SG_DEPOSIT_ATOMIC");
-    const std::string s = (e == nullptr) ? "" : e;
-    if (s.empty() || s == "warp") return static_cast<int>(kDepositWarp);
-    if (s == "plain") return static_cast<int>(kDepositPlain);
-    if (s == "cycle") return static_cast<int>(kDepositCycle);
-    if (s == "compare") return static_cast<int>(kDepositCompare);
-    std::cerr << "### FATAL ERROR: ATHENA_SG_DEPOSIT_ATOMIC=" << s
-              << " (warp, plain, cycle or compare)" << std::endl;
-#if MPI_PARALLEL_ENABLED
-    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-#endif
-    std::exit(EXIT_FAILURE);
-  }();
-  return mode;
+  static_assert(kDepositPlain == 0 && kDepositWarp == 1 && kDepositCycle == 2 &&
+                kDepositCompare == 3, "the codes of gravity::SgTestKeys::deposit_atomic");
+  return gravity::SgTest().deposit_atomic;
 }
 }  // namespace
 
@@ -88,7 +78,7 @@ int GravityDepositKernel(const char *label, const LeafTraversal3D &lt,
   const int nq=(nord>npart) ? nord : npart;
   Kokkos::parallel_reduce(label,CloudPolicy(0,nq),KOKKOS_LAMBDA(int q,int &invalid) {
     const int p=(q<nord) ? ord(q) : q;
-    if (p>=npart) return;   // (cloud_order_keep) an index slot past the end
+    if (p>=npart) return;   // an index slot past the end (the index is kept after migrations)
     const Real mass=pr(IPM,p);
     if (!(mass>=0) || !Kokkos::isfinite(mass)) {++invalid;return;}
     if (mass==0) return;  // existing outflow tombstones carry no gravity mass
@@ -118,7 +108,7 @@ int GravityDepositKernel(const char *label, const LeafTraversal3D &lt,
 }
 
 bool DustGasDrag::GravityTransferSupported() const {
-  return PointGravityTransferSupported() || (clouds3d && pmy_pack->pmesh->three_d &&
+  return PointGravityTransferSupported() || (cloud_dim == 3 && pmy_pack->pmesh->three_d &&
       smr_transfer_mode==DustSMRTransfer::refinable_cloud &&
       (pmy_pack->pmesh->mesh_bcs[0]!=BoundaryFlag::shear_periodic || shear3d));
 }
@@ -143,29 +133,12 @@ void DustGasDrag::DepositGravityDensity(Real time, DvceArray5D<Real> &owned) {
   const int npart=particles->nprtcl_thispack, gids=pmy_pack->gids;
   // the launch bound and the cell order of the drag kernels (CloudPolicy, cloud_ord): the same
   // clouds, each once; only the order of the atomic sums changes (also between the atomic modes,
-  // ATHENA_SG_DEPOSIT_ATOMIC above)
+  // test_deposit_atomic above)
   const int nord=CloudOrderLength(npart);
   auto ord=cloud_ord;
   const int config=DepositAtomicMode();
   int mode=(config==kDepositCompare) ? static_cast<int>(kDepositWarp) : config;
   static int calls=0;   // (cycle) the calls so far
-  // compare adds an MPI_Allreduce: the choice must agree on every rank, checked at the first
-  // call (collective: every rank calls this deposit, see CheckParticles below)
-  static bool compare_checked=false;
-  if (!compare_checked) {
-#if MPI_PARALLEL_ENABLED
-    const int a=(config==kDepositCompare) ? 1 : 0;
-    int v[2]={a,-a};
-    MPI_Allreduce(MPI_IN_PLACE,v,2,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
-    if (v[0]!=-v[1]) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "ATHENA_SG_DEPOSIT_ATOMIC=compare must be set on every rank or on none"
-                << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-#endif
-    compare_checked=true;
-  }
   if (config==kDepositCycle) mode=(calls++)%2;
   auto deposit=[&](const int m, const DvceArray5D<Real> &f) {
     if (m==kDepositPlain) {
@@ -217,16 +190,6 @@ void DustGasDrag::DepositGravityDensity(Real time, DvceArray5D<Real> &owned) {
       ind.ks,ind.ke,ind.js,ind.je,ind.is,ind.ie,
       KOKKOS_LAMBDA(int b,int k,int j,int i) {destination(b,0,k,j,i)=field(b,0,k,j,i);});
 }
-
-namespace {
-bool GatherAllocOld() {
-  static const bool on = [] {
-    const char *e = std::getenv("ATHENA_DUST_GATHER_ALLOC");
-    return e != nullptr && e[0] == '1';
-  }();
-  return on;
-}
-}  // namespace
 
 DvceArray2D<Real> DustGasDrag::GravityAccelerationStorage(int npart) {
   gravity_acc_turn_ ^= 1;
@@ -284,7 +247,7 @@ void DustGasDrag::GatherGravityAcceleration(Real time,
   const int npart=particles->nprtcl_thispack, gids=pmy_pack->gids;
   if (particle_acceleration.extent_int(0)!=3 ||
       particle_acceleration.extent_int(1)!=npart)
-    particle_acceleration=(record && !GatherAllocOld()) ? GravityAccelerationStorage(npart) :
+    particle_acceleration=record ? GravityAccelerationStorage(npart) :
         DvceArray2D<Real>("gravity_particle_acceleration",3,npart);
   auto result=particle_acceleration;
   auto pr=particles->prtcl_rdata;
@@ -297,7 +260,7 @@ void DustGasDrag::GatherGravityAcceleration(Real time,
   Kokkos::parallel_reduce(nord>0 ? "gravity_dust_gather" : "gravity_dust_gather_storage",
       CloudPolicy(0,nq),KOKKOS_LAMBDA(int q,int &invalid) {
     const int p=(q<nord) ? ord(q) : q;
-    if (p>=npart) return;   // (cloud_order_keep) an index slot past the end
+    if (p>=npart) return;   // an index slot past the end (the index is kept after migrations)
     for (int d=0;d<3;++d) result(d,p)=0;
     const Real mass=pr(IPM,p);
     if (!(mass>=0) || !Kokkos::isfinite(mass)) {++invalid;return;}
@@ -331,12 +294,8 @@ void DustGasDrag::RecordGravityGather(Real time) {
     // an eighth of headroom above the new high-water mark, as the particle send list: a rank
     // whose particle count keeps growing (a collapsing clump) no longer frees and allocates
     // the snapshot (several GB, a large cost per cycle) at every gather; only the first
-    // gravity_gather_nsnap_ columns are used.  ATHENA_DUST_GATHER_SNAP_OLD=1: the exact size.
-    static const bool exact = [] {
-      const char *e = std::getenv("ATHENA_DUST_GATHER_SNAP_OLD");
-      return e != nullptr && e[0] == '1';
-    }();
-    const int cap = exact ? npart : static_cast<int>(std::min<long long>(
+    // gravity_gather_nsnap_ columns are used.
+    const int cap = static_cast<int>(std::min<long long>(
         static_cast<long long>(npart) + npart/8, std::numeric_limits<int>::max()));
     gravity_gather_rsnap_=DvceArray2D<Real>();   // free first: no peak with both copies
     gravity_gather_isnap_=DvceArray2D<int>();
@@ -384,8 +343,7 @@ long long DustGasDrag::RegatherGravityAccelerationChanged(Real time,
   const int npart=particles->nprtcl_thispack, gids=pmy_pack->gids, nold=gravity_gather_nsnap_;
   auto old=particle_acceleration;
   auto result=old;
-  if (npart!=nold) result=GatherAllocOld() ?
-      DvceArray2D<Real>("gravity_particle_acceleration",3,npart) : GravityAccelerationStorage(npart);
+  if (npart!=nold) result=GravityAccelerationStorage(npart);
   const bool copy=npart!=nold;
   auto rs=gravity_gather_rsnap_;
   auto is=gravity_gather_isnap_;
@@ -397,7 +355,7 @@ long long DustGasDrag::RegatherGravityAccelerationChanged(Real time,
   Kokkos::parallel_reduce(nord>0 ? "gravity_dust_regather" : "gravity_dust_regather_storage",
       CloudPolicy(0,nq),KOKKOS_LAMBDA(int q,int &invalid,int &count) {
     const int p=(q<nord) ? ord(q) : q;
-    if (p>=npart) return;   // (cloud_order_keep) an index slot past the end
+    if (p>=npart) return;   // an index slot past the end (the index is kept after migrations)
     if (p<nold && rs(0,p)==pr(IPX,p) && rs(1,p)==pr(IPY,p) && rs(2,p)==pr(IPZ,p) &&
         rs(3,p)==pr(IPM,p) && is(0,p)==pi(PLEV,p) && is(1,p)==pi(PGID,p)) {
       if (copy) for (int d=0;d<3;++d) result(d,p)=old(d,p);
@@ -472,7 +430,7 @@ Real DustGasDrag::GravityAccelerationTimeStep(const DvceArray2D<Real> &accelerat
       }
       return;
     }
-    const int level=pi(PLEV,p)&SMRCompositeTransfer::kCloudLevelMask;
+    const int level=pi(PLEV,p)&CloudGeometry::kCloudLevelMask;
     const Real width[3]={lt.root_dx1/static_cast<Real>(1<<level),
         lt.root_dx2/static_cast<Real>(1<<level),lt.root_dx3/static_cast<Real>(1<<level)};
     for (int d=0;d<3;++d) {

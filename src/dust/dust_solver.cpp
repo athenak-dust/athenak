@@ -11,7 +11,12 @@
 //!   A = diag(rho_g) + G^T diag(m_p*c_p/V) G,
 //!   b = momentum_g + G^T diag(m_p*c_p/V) v_p,
 //!
-//! where c_p=a/(t_stop,p+a).  Matching PMWeights in G and G^T makes A SPD.  Ordinary
+//! where c_p=a/(t_stop,p+a).  Matching PMWeights in G and G^T makes A SPD on a periodic
+//! mesh.  In a 3-D shearing box or with physical x3 faces (dc1 / dc2 only) the operator is the
+//! kick's own: the gather reads the ghost cells of the stage's u* exchange (shear collection, x3
+//! values) and the deposit goes through the stage's deposit remap, which are not transposes of
+//! each other; the defect correction needs only that its operator is the one of the kick and the
+//! back-reaction (dust_imex3d_dc.cpp: the same check as for the clouds).  Ordinary
 //! operator applications are non-mutating.  Fixed defect-correction sweeps explicitly
 //! update the provisional gas-velocity field; particle velocities and gas momentum are
 //! changed only later by GatherKickPMBR and ApplyPMBR after that field has been accepted.
@@ -85,16 +90,116 @@ void DustGasDrag::CompleteCopyExchange(DvceArray5D<Real> &field) {
 //! Complete one reusable additive exchange of a particle-deposited field.
 
 void DustGasDrag::CompleteAddExchange(DvceArray5D<Real> &field) {
-  RequireComplete(pbval_solver_add->InitRecv(3), "add InitRecv");
+  // (the *Dep calls are the base class calls unless the exchange uses the general remap: 3-D
+  // with a shearing box or physical x3 faces, whose shear part the stage has updated to t^n)
+  RequireComplete(pbval_solver_add->InitRecvDep(3), "add InitRecv");
   RequireComplete(pbval_solver_add->PackAndSendDeposit(field), "add send");
   TaskStatus status;
   do {
     status = pbval_solver_add->RecvAndSumDeposit(field);
     RequireComplete(status, "add receive");
   } while (status == TaskStatus::incomplete);
-  RequireComplete(pbval_solver_add->ClearSend(), "add ClearSend");
-  RequireComplete(pbval_solver_add->ClearRecv(), "add ClearRecv");
+  RequireComplete(pbval_solver_add->ClearSendDep(), "add ClearSend");
+  RequireComplete(pbval_solver_add->ClearRecvDep(), "add ClearRecv");
   ++solver_halo_count;
+}
+
+//----------------------------------------------------------------------------------------
+//! The ghost cells of the operator's field as the stage fills those of u*: the plain copy
+//! exchange on a periodic mesh, else (3-D shearing box, physical x3 faces) the blocking version
+//! of the stage's u* exchange with the shear collection and the x3 values.
+
+void DustGasDrag::PointCopyExchange(DvceArray5D<Real> &field) {
+  if (point_dc_general) {
+    ExchangeUstarBlocking(field, dc_cfield);
+    ++solver_halo_count;
+  } else {
+    CompleteCopyExchange(field);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! The particle part of the operator: the TSC gather of field (ghost cells filled) at every
+//! particle and the deposit of m_p c_p times it with the same weights into result (ghost cells
+//! included, not exchanged).  gath (optional): every particle's gathered velocity.
+
+void DustGasDrag::PointOperatorParticles(DvceArray5D<Real> &field, DvceArray5D<Real> &result,
+                                         Real a_dt, DvceArray2D<Real> *gath) {
+  particles::Particles *ppar = pmy_pack->ppart;
+  auto &pr = ppar->prtcl_rdata;
+  auto &pi = ppar->prtcl_idata;
+  int npart = ppar->nprtcl_thispack;
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int is = indcs.is, js = indcs.js, ks = indcs.ks;
+  int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
+  bool three_d = pmy_pack->pmesh->three_d;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+  auto gids = pmy_pack->gids;
+  int scheme = static_cast<int>(deposit);
+  auto &field_ = field;
+  auto &result_ = result;
+  // the gas of the IMEX stage in its t^n frame: the y weights at y + sh x, as the deposit and the
+  // kick (ImplicitShearShift; 0 without a 3-D shearing box: y + 0 x = y exactly)
+  const Real sh = dc_point_sh_;
+  const bool keep = (gath != nullptr);
+  if (keep && (gath->extent_int(0) < npart || gath->extent_int(1) != 3)) {
+    Kokkos::realloc(*gath, std::max(1, npart), 3);
+  }
+  DvceArray2D<Real> gv;
+  if (keep) gv = *gath;
+
+  par_for("dust_applya_gtsg",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
+    int m = pi(PGID,p) - gids;
+    int ip, jp, kp;
+    Real wx[3], wy[3], wz[3];
+    PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
+              scheme, ip, wx);
+    PMWeights(pr(IPY,p) + sh*pr(IPX,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
+              scheme, jp, wy);
+    if (three_d) {
+      PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
+                scheme, kp, wz);
+    } else {
+      kp = ks;
+      wz[0] = 0.0; wz[1] = 1.0; wz[2] = 0.0;
+    }
+
+    Real gathered[3] = {0.0, 0.0, 0.0};
+    int clo = three_d ? 0 : 1, chi = three_d ? 2 : 1;
+    for (int c=clo; c<=chi; ++c) {
+      for (int b=0; b<3; ++b) {
+        Real wcb = wz[c]*wy[b];
+        if (wcb == 0.0) continue;
+        for (int a=0; a<3; ++a) {
+          Real w = wcb*wx[a];
+          int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
+          gathered[0] += w*field_(m,0,kk,jj,ii);
+          gathered[1] += w*field_(m,1,kk,jj,ii);
+          gathered[2] += w*field_(m,2,kk,jj,ii);
+        }
+      }
+    }
+
+    if (keep) {gv(p,0) = gathered[0]; gv(p,1) = gathered[1]; gv(p,2) = gathered[2];}
+    Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
+    if (three_d) vol *= mbsize.d_view(m).dx3;
+    Real cj = a_dt/(pr(IPTS,p) + a_dt);
+    Real fac = pr(IPM,p)*cj/vol;
+    for (int c=clo; c<=chi; ++c) {
+      for (int b=0; b<3; ++b) {
+        Real wcb = wz[c]*wy[b]*fac;
+        if (wcb == 0.0) continue;
+        for (int a=0; a<3; ++a) {
+          Real w = wcb*wx[a];
+          int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
+          DepositAdd(&result_(m,0,kk,jj,ii), w*gathered[0]);
+          DepositAdd(&result_(m,1,kk,jj,ii), w*gathered[1]);
+          DepositAdd(&result_(m,2,kk,jj,ii), w*gathered[2]);
+        }
+      }
+    }
+  });
+
 }
 
 //----------------------------------------------------------------------------------------
@@ -121,77 +226,16 @@ void DustGasDrag::ApplyDefectCorrection(DvceArray5D<Real> &field,
 void DustGasDrag::ApplyCoupledOperatorImpl(DvceArray5D<Real> &field,
                                            DvceArray5D<Real> &result, Real a_dt,
                                            bool correct_field) {
-  CompleteCopyExchange(field);
+  PointCopyExchange(field);
   Kokkos::deep_copy(DevExeSpace(), result, 0.0);
-
-  particles::Particles *ppar = pmy_pack->ppart;
-  auto &pr = ppar->prtcl_rdata;
-  auto &pi = ppar->prtcl_idata;
-  int npart = ppar->nprtcl_thispack;
-  auto &indcs = pmy_pack->pmesh->mb_indcs;
-  int is = indcs.is, js = indcs.js, ks = indcs.ks;
-  int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
-  bool three_d = pmy_pack->pmesh->three_d;
-  auto &mbsize = pmy_pack->pmb->mb_size;
-  auto gids = pmy_pack->gids;
-  int scheme = static_cast<int>(deposit);
-  auto &field_ = field;
-  auto &result_ = result;
-
-  par_for("dust_applya_gtsg",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
-    int m = pi(PGID,p) - gids;
-    int ip, jp, kp;
-    Real wx[3], wy[3], wz[3];
-    PMWeights(pr(IPX,p), mbsize.d_view(m).x1min, mbsize.d_view(m).x1max, nx1, is,
-              scheme, ip, wx);
-    PMWeights(pr(IPY,p), mbsize.d_view(m).x2min, mbsize.d_view(m).x2max, nx2, js,
-              scheme, jp, wy);
-    if (three_d) {
-      PMWeights(pr(IPZ,p), mbsize.d_view(m).x3min, mbsize.d_view(m).x3max, nx3, ks,
-                scheme, kp, wz);
-    } else {
-      kp = ks;
-      wz[0] = 0.0; wz[1] = 1.0; wz[2] = 0.0;
-    }
-
-    Real gathered[3] = {0.0, 0.0, 0.0};
-    int clo = three_d ? 0 : 1, chi = three_d ? 2 : 1;
-    for (int c=clo; c<=chi; ++c) {
-      for (int b=0; b<3; ++b) {
-        Real wcb = wz[c]*wy[b];
-        if (wcb == 0.0) continue;
-        for (int a=0; a<3; ++a) {
-          Real w = wcb*wx[a];
-          int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
-          gathered[0] += w*field_(m,0,kk,jj,ii);
-          gathered[1] += w*field_(m,1,kk,jj,ii);
-          gathered[2] += w*field_(m,2,kk,jj,ii);
-        }
-      }
-    }
-
-    Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
-    if (three_d) vol *= mbsize.d_view(m).dx3;
-    Real cj = a_dt/(pr(IPTS,p) + a_dt);
-    Real fac = pr(IPM,p)*cj/vol;
-    for (int c=clo; c<=chi; ++c) {
-      for (int b=0; b<3; ++b) {
-        Real wcb = wz[c]*wy[b]*fac;
-        if (wcb == 0.0) continue;
-        for (int a=0; a<3; ++a) {
-          Real w = wcb*wx[a];
-          int kk = kp+c-1, jj = jp+b-1, ii = ip+a-1;
-          DepositAdd(&result_(m,0,kk,jj,ii), w*gathered[0]);
-          DepositAdd(&result_(m,1,kk,jj,ii), w*gathered[1]);
-          DepositAdd(&result_(m,2,kk,jj,ii), w*gathered[2]);
-        }
-      }
-    }
-  });
-
+  PointOperatorParticles(field, result, a_dt, nullptr);
   CompleteAddExchange(result);
 
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int is = indcs.is, js = indcs.js, ks = indcs.ks;
   int ie = indcs.ie, je = indcs.je, ke = indcs.ke;
+  auto &field_ = field;
+  auto &result_ = result;
   int nmb1 = pmy_pack->nmb_thispack - 1;
   auto &u0 = pmy_pack->phydro->u0;
   if (correct_field) {
@@ -586,6 +630,7 @@ Real DustGasDrag::AdaptiveErrorBound(Real a_dt, Real residual_norm, Real &state_
 TaskStatus DustGasDrag::SolveCoupledStage(Driver *pdrive, int stage) {
   auto started=std::chrono::steady_clock::now();
   Real a_dt=DragStep(pdrive);
+  dc_point_sh_=ImplicitShearShift(pdrive,stage);   // the deposit's / kick's t^n frame
   auto &indcs=pmy_pack->pmesh->mb_indcs;
   int is=indcs.is,ie=indcs.ie,js=indcs.js,je=indcs.je,ks=indcs.ks,ke=indcs.ke;
   int nmb1=pmy_pack->nmb_thispack-1;
@@ -658,6 +703,7 @@ TaskStatus DustGasDrag::SolveCoupledStage(Driver *pdrive, int stage) {
     }
   }
 
+  if (point_dc_opcheck) CloudDcOpCheckPoison();   // (test_point_dc_opcheck)
   Kokkos::fence();
   solver_wall_seconds+=std::chrono::duration<double>(
       std::chrono::steady_clock::now()-started).count();

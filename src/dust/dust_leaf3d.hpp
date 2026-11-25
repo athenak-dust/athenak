@@ -10,7 +10,7 @@
 //! under a refinable cloud on a 3-D mesh.  The 2-D LeafTraversal (dust.hpp) stays untouched;
 //! this is its 3-D counterpart with the same rules: per direction the integral of the cloud
 //! shape over a leaf interval is a difference of the hat CDF (and of its first moment), from
-//! the one-dimensional helpers of LeafTraversal (MakeShape, FaceAt, Cell); the weight over a
+//! the one-dimensional helpers of CloudShape1D (MakeShape, FaceAt, Cell); the weight over a
 //! leaf cell is the product of the three, the first moments the products with one moment.
 //! Included by dust.hpp after LeafTraversal.
 //!
@@ -70,7 +70,8 @@ struct LeafTraversal3D {
   DvceArray1D<int> sreach;
 
   using LT = LeafTraversal;
-  using T = SMRCompositeTransfer;
+  using CS = CloudShape1D;   // the 1-D cloud shape (shared with the 2-D traversal)
+  using T = CloudGeometry;
 
   KOKKOS_INLINE_FUNCTION
   int Leaf(const int b, const int k, const int j, const int i) const {
@@ -375,9 +376,9 @@ struct LeafTraversal3D {
     const Real h1 = ldexp(root_dx1, -lev), ih1 = ldexp(iroot_dx1, lev);
     const Real h2 = ldexp(root_dx2, -lev), ih2 = ldexp(iroot_dx2, lev);
     const Real h3 = ldexp(root_dx3, -lev), ih3 = ldexp(iroot_dx3, lev);
-    LT::Shape s1 = LT::MakeShape(x1, h1, ih1, T::CloudLobe1(code), point);
-    LT::Shape s2 = LT::MakeShape(x2, h2, ih2, T::CloudLobe2(code), point);
-    LT::Shape s3 = LT::MakeShape(x3, h3, ih3, T::CloudLobe3(code), point);
+    CS::Shape s1 = CS::MakeShape(x1, h1, ih1, T::CloudLobe1(code), point);
+    CS::Shape s2 = CS::MakeShape(x2, h2, ih2, T::CloudLobe2(code), point);
+    CS::Shape s3 = CS::MakeShape(x3, h3, ih3, T::CloudLobe3(code), point);
     // the parts: across a shear-periodic x1 face the translated cloud, across a
     // physical x3 face the mirrored one, both: four
     int npx = 1, side = 0, npz = 1, zside = 0;
@@ -403,9 +404,9 @@ struct LeafTraversal3D {
           zp = 2.0*((zside == 1) ? x3max : x3min) - x3;
           l3 = MirrorLobe(l3);
         }
-        s1 = LT::MakeShape(xq, h1, ih1, T::CloudLobe1(code), point);
-        s2 = LT::MakeShape(yp, h2, ih2, T::CloudLobe2(code), point);
-        s3 = LT::MakeShape(zp, h3, ih3, l3, point);
+        s1 = CS::MakeShape(xq, h1, ih1, T::CloudLobe1(code), point);
+        s2 = CS::MakeShape(yp, h2, ih2, T::CloudLobe2(code), point);
+        s3 = CS::MakeShape(zp, h3, ih3, l3, point);
       }
       const bool ycorr = kMoments && shear && (pxp == 1 || nw != 0);
       const bool zcorr = kMoments && pzp == 1;
@@ -445,22 +446,22 @@ struct LeafTraversal3D {
           for (int ic=i0; ic<=i1; ic+=kRun) {
             const int nr = (i1 - ic + 1 < kRun) ? i1 - ic + 1 : kRun;
             Real w1[kRun], g1[kRun];
-            LT::Face f1 = LT::FaceAt<kMoments>(s1, bx0 + ic*dx);
+            CS::Face f1 = CS::FaceAt<kMoments>(s1, bx0 + ic*dx);
 #pragma unroll
             for (int a=0; a<kRun; ++a) {
               w1[a] = 0.0; g1[a] = 0.0;
               if (a < nr) {
-                const LT::Face fn = LT::FaceAt<kMoments>(s1, bx0 + (ic + a + 1)*dx);
-                LT::Cell<kMoments>(s1, f1, fn, w1[a], g1[a]);
+                const CS::Face fn = CS::FaceAt<kMoments>(s1, bx0 + (ic + a + 1)*dx);
+                CS::Cell<kMoments>(s1, f1, fn, w1[a], g1[a]);
                 f1 = fn;
               }
             }
-            LT::Face f3 = LT::FaceAt<kMoments>(s3, bz0 + k0*dz);
+            CS::Face f3 = CS::FaceAt<kMoments>(s3, bz0 + k0*dz);
 #pragma unroll 1
             for (int k=k0; k<=k1; ++k) {
-              const LT::Face fn3 = LT::FaceAt<kMoments>(s3, bz0 + (k + 1)*dz);
+              const CS::Face fn3 = CS::FaceAt<kMoments>(s3, bz0 + (k + 1)*dz);
               Real w3, g3;
-              LT::Cell<kMoments>(s3, f3, fn3, w3, g3);
+              CS::Cell<kMoments>(s3, f3, fn3, w3, g3);
               f3 = fn3;
               if (w3 == 0.0 && (!kMoments || g3 == 0.0)) continue;
               // the mirror of this part against the caller's position (see above)
@@ -469,12 +470,12 @@ struct LeafTraversal3D {
                 const Real zc = bz0 + (k + 0.5)*dz;
                 czk = (zp - zc) - T::MinImage(px3 - zc, lz);
               }
-              LT::Face f2 = LT::FaceAt<kMoments>(s2, by0 + j0*dy);
+              CS::Face f2 = CS::FaceAt<kMoments>(s2, by0 + j0*dy);
 #pragma unroll 1
               for (int j=j0; j<=j1; ++j) {
-                const LT::Face fn2 = LT::FaceAt<kMoments>(s2, by0 + (j + 1)*dy);
+                const CS::Face fn2 = CS::FaceAt<kMoments>(s2, by0 + (j + 1)*dy);
                 Real w2, g2;
-                LT::Cell<kMoments>(s2, f2, fn2, w2, g2);
+                CS::Cell<kMoments>(s2, f2, fn2, w2, g2);
                 f2 = fn2;
                 if (w2 == 0.0 && (!kMoments || g2 == 0.0)) continue;
                 const Real w23 = w2*w3;

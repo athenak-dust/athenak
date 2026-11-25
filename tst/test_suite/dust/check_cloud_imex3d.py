@@ -40,9 +40,8 @@ def run(args, name, input_name, overrides):
                'time/ndiag=100', 'dust/coupling=imex', 'dust/experimental_3d=true',
                'dust/experimental_static_smr=true', 'dust/experimental_mpi=true',
                'dust/experimental_smr_transfer=refinable_cloud',
-               'dust/cloud_gather_order=2', 'dust/cloud_transition=2',
-               'dust/cloud_split_device=true', 'dust/cloud_p1_split=true',
-               'dust/cloud_split_overlap=true', 'dust/cloud_merge=false',
+               'dust/cloud_p1_split=true',
+               'dust/cloud_merge=false',
                'dust/cloud_resample=false', *overrides]
     for option in options:
         path, value = option.split('=', 1)

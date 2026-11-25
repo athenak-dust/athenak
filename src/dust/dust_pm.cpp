@@ -4,9 +4,8 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file dust_pm.cpp
-//! \brief Particle-mesh kernels for IMEX drag stages and for the PC2/split-BE hybrid.
-//! The implicit chain is executed with a=a_impl*dt in each working IMEX stage, or once
-//! with a=dt in the split-BE branch:
+//! \brief Particle-mesh kernels for IMEX drag stages and for PC2.
+//! The implicit chain is executed with a=a_impl*dt in each working IMEX stage:
 //!
 //!  (1) DepositDrag (scatter): with c_j = a/(t_s,j + a) and mu_j = m_j*W_jk/V, atomically
 //!      accumulate Q_k = sum_j mu_j*c_j and P_k = sum_j mu_j*c_j*v_j.
@@ -104,14 +103,12 @@ void DustGasDrag::PackGatherField(const DvceArray5D<Real> &vel) {
 
 TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
-  // the stiffness deposit qdep[4] feeds the automatic switch's metric and the stiffness
-  // monitor / dt limit / predictor damping
-  const bool rate_dep = NeedsHybridMetric() || StiffnessActive();
+  // the stiffness deposit qdep[4] feeds the stiffness monitor / dt limit / predictor damping
+  const bool rate_dep = StiffnessActive();
 
-  if (coupling == DustCoupling::hybrid) {
-    // Split-BE deposits Q/P in its fused preparation traversal.  PC2 needs only the
-    // fresh old-state feedback predictor during stage 1.
-    if (hybrid_mode != HybridMode::pc2 || stage != 1) return TaskStatus::complete;
+  if (coupling == DustCoupling::pc2) {
+    // PC2 needs only the fresh old-state feedback predictor during stage 1.
+    if (stage != 1) return TaskStatus::complete;
     Kokkos::deep_copy(DevExeSpace(), qdep, 0.0);
 
     particles::Particles *ppar = pmy_pack->ppart;
@@ -129,122 +126,15 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
     auto &uold = pmy_pack->phydro->u1;
     auto &qdep_ = qdep;
 
-    if (UsesCompositeTransfer()) {
-      auto transfer = smr_transfer;
-      auto lt = leaf_traversal;   // cloud weights on the actual leaves
-      int ncells1 = qdep.extent_int(4);
-      int ncells2 = qdep.extent_int(3);
-      bool linear = (cloud_gather_order == 2);
-      int tmode = cloud_transition;
-      if (linear) {
-        // Production refinable-cloud predictor: the linear gather and the cloud-weight
-        // deposit.
-        // The gas velocity of every cell (ghosts included) is formed once; the gather then
-        // reads velocities, as the advance does with u*, instead of dividing five momenta
-        // by five densities in each of the cloud's cells.
-        if (clouds3d) {CloudPredictor3D(rate_dep); return TaskStatus::complete;}   // 3-D clouds
-        PackGasGather(uold);
-        auto gp = gpack;
-        // (a split into gather + deposit kernels and a shared-memory weight cache were
-        // tried and removed, see CloudParFor in dust.hpp)
-        auto pred_body = KOKKOS_LAMBDA(const int p) {
-          Real xp = pr(IPX,p), yp = pr(IPY,p);
-          const int am = lt.Anchor(pi(PGID,p));   // anchor block of the cloud
-          int lev = pi(PLEV,p);
-          Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-          // the gather's leaf weights are the deposit's: keep them
-          int nt = 0, tt[SMRCompositeTransfer::kCloudWeightCache];
-          Real tw[SMRCompositeTransfer::kCloudWeightCache];
-          const int gcode = SMRCompositeTransfer::GatherCode(lev, tmode);
-          // same shape for the gather and the deposit (the point flag changes moments only)
-          const bool same = (gcode & ~SMRCompositeTransfer::kCloudGatherPoint) == lev;
-          lt.ForEachCloudMoment(xp, yp, gcode, am,
-          [&](const int target, const Real w, const Real m1x, const Real m1y) {
-            int ti = target % ncells1;
-            int remainder = target/ncells1;
-            int tj = remainder % ncells2;
-            int tm = remainder/ncells2;
-            // the leaf's block slot may be a halo block: its box from lt
-            Real dx1 = lt.box(tm,2), dx2 = lt.box(tm,3);
-            Real xc = lt.box(tm,0) + (ti - is + 0.5)*dx1;
-            Real yc = lt.box(tm,1) + (tj - js + 0.5)*dx2;
-            Real cx = 0.5*(m1x + transfer.MinImage1(xp - xc)*w)/dx1;
-            Real cy = 0.5*(m1y + transfer.MinImage2(yp - yc)*w)/dx2;
-            ugx += w*gp(tm,ks,tj,ti,0) + cx*gp(tm,ks,tj,ti,3) + cy*gp(tm,ks,tj,ti,6);
-            ugy += w*gp(tm,ks,tj,ti,1) + cx*gp(tm,ks,tj,ti,4) + cy*gp(tm,ks,tj,ti,7);
-            ugz += w*gp(tm,ks,tj,ti,2) + cx*gp(tm,ks,tj,ti,5) + cy*gp(tm,ks,tj,ti,8);
-            if (nt < SMRCompositeTransfer::kCloudWeightCache) {tt[nt] = target; tw[nt] = w;}
-            ++nt;
-          });
-          Real mass_rate = pr(IPM,p)/pr(IPTS,p);
-          Real gx = -dt*mass_rate*(ugx - pr(IPVX,p));
-          Real gy = -dt*mass_rate*(ugy - pr(IPVY,p));
-          Real gz = -dt*mass_rate*(ugz - pr(IPVZ,p));
-          auto add = [&](const int target, const Real w) {
-            int ti = target % ncells1;
-            int remainder = target/ncells1;
-            int tj = remainder % ncells2;
-            int tm = remainder/ncells2;
-            Real inv_volume = 1.0/(lt.box(tm,2)*lt.box(tm,3));
-            DepositAdd(&qdep_(tm,1,ks,tj,ti), inv_volume*w*gx);
-            DepositAdd(&qdep_(tm,2,ks,tj,ti), inv_volume*w*gy);
-            DepositAdd(&qdep_(tm,3,ks,tj,ti), inv_volume*w*gz);
-            if (rate_dep) DepositAdd(&qdep_(tm,4,ks,tj,ti), inv_volume*w*mass_rate);
-          };
-          if (same && nt <= SMRCompositeTransfer::kCloudWeightCache) {
-            for (int q=0; q<nt; ++q) if (tw[q] != 0.0) add(tt[q], tw[q]);
-          } else {
-            lt.ForEachCloudWeight(xp, yp, lev, am, add);
-          }
-        };
-        CloudOrderCount(cloud_ord_n > 0);
-        if (cloud_ord_n > 0) {   // in the order of the cell-sorted index
-          CloudParForOrdered("dust_pc2_cloud_predictor_linear", npart, cloud_ord,
-                             cloud_ord_n, pred_body);
-        } else {
-          CloudParFor("dust_pc2_cloud_predictor_linear", npart, pred_body);
-        }
-        // deposits on halo blocks back to their owners; component 4 only when the stiffness
-        // rate is deposited (rate_dep)
-        HaloReverseAdd(qdep, 1, rate_dep ? 4 : 3);
-        return TaskStatus::complete;
-      }
-      par_for("dust_pc2_composite_predictor",DevExeSpace(),0,(npart-1),
-      KOKKOS_LAMBDA(const int p) {
-        Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-        ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p),
-                               SMRCompositeTransfer::GatherCode(pi(PLEV,p), tmode),
-                               lt.Anchor(pi(PGID,p)),
-        [&](const int target, const Real particle_weight) {
-          int ti = target % ncells1;
-          int remainder = target/ncells1;
-          int tj = remainder % ncells2;
-          int tm = remainder/ncells2;
-          Real invrho = 1.0/uold(tm,IDN,ks,tj,ti);
-          ugx += particle_weight*uold(tm,IM1,ks,tj,ti)*invrho;
-          ugy += particle_weight*uold(tm,IM2,ks,tj,ti)*invrho;
-          ugz += particle_weight*uold(tm,IM3,ks,tj,ti)*invrho;
-        });
-
-        Real mass_rate = pr(IPM,p)/pr(IPTS,p);
-        Real gx = -dt*mass_rate*(ugx-pr(IPVX,p));
-        Real gy = -dt*mass_rate*(ugy-pr(IPVY,p));
-        Real gz = -dt*mass_rate*(ugz-pr(IPVZ,p));
-        ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p),
-                               lt.Anchor(pi(PGID,p)),
-        [&](const int target, const Real particle_weight) {
-          int ti = target % ncells1;
-          int remainder = target/ncells1;
-          int tj = remainder % ncells2;
-          int tm = remainder/ncells2;
-          Real volume = mbsize.d_view(tm).dx1*mbsize.d_view(tm).dx2;
-          Real density_weight = particle_weight/volume;
-          DepositAdd(&qdep_(tm,1,ks,tj,ti), density_weight*gx);
-          DepositAdd(&qdep_(tm,2,ks,tj,ti), density_weight*gy);
-          DepositAdd(&qdep_(tm,3,ks,tj,ti), density_weight*gz);
-          if (rate_dep) DepositAdd(&qdep_(tm,4,ks,tj,ti), density_weight*mass_rate);
-        });
-      });
+    if (UsesRefinableClouds()) {
+      // Production refinable-cloud predictor: the linear gather and the cloud-weight
+      // deposit.
+      // The gas velocity of every cell (ghosts included) is formed once; the gather then
+      // reads velocities, as the advance does with u*, instead of dividing five momenta
+      // by five densities in each of the cloud's cells.
+      // (one kernel for both traversals, CloudPredictorT in dust_cloud3d.cpp)
+      if (cloud_dim == 3) {CloudPredictorT(leaf_traversal3d, rate_dep); return TaskStatus::complete;}   // 3-D clouds
+      CloudPredictorT(leaf_traversal, rate_dep);
       return TaskStatus::complete;
     }
 
@@ -321,48 +211,17 @@ TaskStatus DustGasDrag::DepositDrag(Driver *pdrive, int stage) {
   Real a_dt = DragStep(pdrive);
   auto &qdep_ = qdep;
 
-  if (clouds3d) {
-    CloudDepositImplicit3D(pdrive, stage);
+  if (cloud_dim == 3) {
+    CloudDepositImplicitT(leaf_traversal3d, pdrive, stage);
     return TaskStatus::complete;
   }
-  if (UsesCompositeTransfer()) {
-    auto transfer = smr_transfer;
-    auto lt = leaf_traversal;   // cloud weights on the actual leaves
-    int ncells1 = qdep.extent_int(4);
-    int ncells2 = qdep.extent_int(3);
-    auto scat_body = KOKKOS_LAMBDA(const int p) {
-      Real cj = a_dt/(pr(IPTS,p) + a_dt);
-      Real mass_c = pr(IPM,p)*cj;
-      Real vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
-      ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p),
-                             lt.Anchor(pi(PGID,p)),
-      [&](const int target, const Real particle_weight) {
-        int ti = target % ncells1;
-        int remainder = target/ncells1;
-        int tj = remainder % ncells2;
-        int tm = remainder/ncells2;
-        // the leaf's block slot may be a halo block: its box from lt
-        Real receiving_volume = lt.box(tm,2)*lt.box(tm,3);
-        Real density_weight = mass_c*particle_weight/receiving_volume;
-        DepositAdd(&qdep_(tm,0,ks,tj,ti), density_weight);
-        DepositAdd(&qdep_(tm,1,ks,tj,ti), density_weight*vx);
-        DepositAdd(&qdep_(tm,2,ks,tj,ti), density_weight*vy);
-        DepositAdd(&qdep_(tm,3,ks,tj,ti), density_weight*vz);
-      });
-    };
-    if (const int nord = CloudOrderLength(npart)) {
-      // in the order of the cell-sorted index (a permutation of its slots,
-      // which the migration of this stage may have refilled)
-      CloudParForOrdered("dust_composite_scatter", npart, cloud_ord,
-                         nord, scat_body);
-    } else {
-      par_for("dust_composite_scatter",DevExeSpace(),0,(npart-1), scat_body);
-    }
-    HaloReverseAdd(qdep, 0, 4);   // halo deposits back to their owners
+  if (UsesRefinableClouds()) {
+    // (the kernel of both traversals, CloudDepositImplicitT in dust_imex3d.cpp)
+    CloudDepositImplicitT(leaf_traversal, pdrive, stage);
     return TaskStatus::complete;
   }
 
-  const Real sh = ImplicitShearShift(pdrive, stage);   // t^n gas frame (0 for hybrid paths)
+  const Real sh = ImplicitShearShift(pdrive, stage);   // t^n gas frame
   par_for("dust_scatter",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     int ip, jp, kp;
@@ -500,60 +359,6 @@ void DustGasDrag::SyncStiffness() {
 }
 
 //----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::UpdateHybridMetric
-//! \brief Reduce the cell feedback stiffness deposited in qdep[4].  A PC2 cycle may
-//! still fall back before committing its predictor; a split-BE cycle records the metric
-//! for the next cycle's hysteretic choice.
-
-void DustGasDrag::UpdateHybridMetric(Driver *pdrive, int stage) {
-  // only the automatic switch reads the metric; with a fixed mode (coupling = pc2,
-  // hybrid_force_mode = pc2 / split_be) the full-mesh reduction and its host wait are skipped
-  // and the metric stays "not computed" (hybrid_have_metric = false)
-  if (!NeedsHybridMetric()) {InvalidateHybridMetric(); return;}
-  hybrid_last_zeta = pmy_pack->pmesh->dt/taus_min;
-  hybrid_last_chi = 0.0;
-  if (back_reaction) {
-    auto &indcs = pmy_pack->pmesh->mb_indcs;
-    int is = indcs.is, ie = indcs.ie;
-    int js = indcs.js, je = indcs.je;
-    int ks = indcs.ks, ke = indcs.ke;
-    int nx1 = ie-is+1, nx2 = je-js+1, nx3 = ke-ks+1;
-    int nmb = pmy_pack->nmb_thispack;
-    int ncells = nmb*nx3*nx2*nx1;
-    auto &rho_state = (hybrid_mode == HybridMode::pc2 && stage == 1) ?
-                      pmy_pack->phydro->u1 : pmy_pack->phydro->u0;
-    auto &qdep_ = qdep;
-    Real dt = pmy_pack->pmesh->dt;
-    Real local_chi = 0.0;
-    Kokkos::parallel_reduce("dust_hybrid_chi",
-    Kokkos::RangePolicy<>(DevExeSpace(), 0, ncells),
-    KOKKOS_LAMBDA(const int idx, Real &maximum) {
-      int q = idx;
-      int i = is + q % nx1; q /= nx1;
-      int j = js + q % nx2; q /= nx2;
-      int k = ks + q % nx3; q /= nx3;
-      int m = q;
-      Real value = dt*qdep_(m,4,k,j,i)/rho_state(m,IDN,k,j,i);
-      maximum = fmax(maximum, value);
-    }, Kokkos::Max<Real>(local_chi));
-#if MPI_PARALLEL_ENABLED
-    MPI_Allreduce(MPI_IN_PLACE, &local_chi, 1, MPI_ATHENA_REAL, MPI_MAX,
-                  MPI_COMM_WORLD);
-#endif
-    hybrid_last_chi = local_chi;
-    hybrid_feedback_rate_max = local_chi/dt;
-  } else {
-    hybrid_feedback_rate_max = 0.0;
-  }
-  hybrid_have_metric = true;
-  if (hybrid_force_mode == HybridForceMode::automatic &&
-      hybrid_mode == HybridMode::pc2 && stage == 1 &&
-      (hybrid_last_zeta > hybrid_enter_zeta || hybrid_last_chi > hybrid_enter_chi)) {
-    hybrid_mode = HybridMode::split_be;
-  }
-}
-
-//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::GasImplicitSolve
 //! \brief Closed-form per-cell drag solve for the provisional gas velocity u*. Uses
 //! conserved variables (primitives are stale mid-stage). Active cells only; ghost values
@@ -566,10 +371,9 @@ void DustGasDrag::UpdateHybridMetric(Driver *pdrive, int stage) {
 
 TaskStatus DustGasDrag::GasImplicitSolve(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
-  if (coupling == DustCoupling::hybrid) {
-    if (hybrid_mode == HybridMode::pc2 && stage == 1) {
-      UpdateHybridMetric(pdrive, stage);
-      if (hybrid_mode == HybridMode::pc2 && back_reaction) {
+  if (coupling == DustCoupling::pc2) {
+    if (stage == 1) {
+      if (back_reaction) {
         if (StiffnessActive()) UpdateStiffness(pmy_pack->pmesh->dt);
         auto &indcs = pmy_pack->pmesh->mb_indcs;
         int is = indcs.is, ie = indcs.ie;
@@ -597,15 +401,15 @@ TaskStatus DustGasDrag::GasImplicitSolve(Driver *pdrive, int stage) {
           u0(m,IM3,k,j,i) += qdep_(m,3,k,j,i);
         });
       }
-      return TaskStatus::complete;
     }
-    if (hybrid_mode == HybridMode::split_be && stage == 2) {
-      UpdateHybridMetric(pdrive, stage);
-    } else {
-      return TaskStatus::complete;
-    }
+    return TaskStatus::complete;
   }
-  if (back_reaction && drag_solver != DustDragSolver::local) {
+  // (hidden test_qrho_diag: the coupled dust-to-gas ratio of this stage, read-only)
+  if (qrho_diag_ > 0 && back_reaction && (pmy_pack->pmesh->ncycle % qrho_diag_) == 0) {
+    QrhoDiag(pdrive, stage);
+  }
+  // (refinable clouds, 2-D and 3-D: the lumped solve below and their own dc1 / dc2 correction)
+  if (back_reaction && drag_solver != DustDragSolver::local && !UsesRefinableClouds()) {
     return SolveCoupledStage(pdrive, stage);
   }
 
@@ -630,6 +434,9 @@ TaskStatus DustGasDrag::GasImplicitSolve(Driver *pdrive, int stage) {
     ustar_(m,1,k,j,i) = (u0(m,IM2,k,j,i) + qd2)*denom;
     ustar_(m,2,k,j,i) = (u0(m,IM3,k,j,i) + qd3)*denom;
   });
+  // refinable clouds (2-D and 3-D), drag_solver = dc1 / dc2: the defect correction of u* (every
+  // rank, every working stage)
+  if (cloud_dc1) CloudDefectCorrection(pdrive, stage);
 
   return TaskStatus::complete;
 }
@@ -642,10 +449,7 @@ TaskStatus DustGasDrag::GasImplicitSolve(Driver *pdrive, int stage) {
 
 TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
-  if (coupling == DustCoupling::hybrid &&
-      !(hybrid_mode == HybridMode::split_be && stage == 2)) {
-    return TaskStatus::complete;
-  }
+  if (coupling == DustCoupling::pc2) return TaskStatus::complete;   // (the kick is in ExplicitPush)
 
   bool br = back_reaction;
   if (br) {
@@ -665,125 +469,34 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
   auto gids = pmy_pack->gids;
   int scheme = static_cast<int>(deposit);
   Real a_dt = DragStep(pdrive);
-  Real dt = pmy_pack->pmesh->dt;
-  bool split_be = (coupling == DustCoupling::hybrid);
-  bool shear3d = is_shearing_box && three_d;
-  Real qo = qshear*omega0;
   auto &ustar_ = ustar;
   auto &dmom_ = dmom;
 
-  if (clouds3d) {
+  if (cloud_dim == 3) {
+    if (cloud_dc1_opcheck) CloudDcOpCheckBefore(pdrive, stage);
     CloudGatherImplicit3D(pdrive, stage);
+    if (cloud_dc1_opcheck) CloudDcOpCheckAfterKick(pdrive, stage);
     return TaskStatus::complete;
   }
-  if (UsesCompositeTransfer()) {
-    auto transfer = smr_transfer;
-    auto lt = leaf_traversal;   // cloud weights on the actual leaves
-    int ncells1 = ustar.extent_int(4);
-    int ncells2 = ustar.extent_int(3);
-    int tmode = cloud_transition;
+  if (UsesRefinableClouds()) {
     // Refinable clouds: the gather reads the packed u* field (velocity and its central
     // differences, with the owners' values on halo blocks).
-    // cloud_gather_order = 2 gathers the linear reconstruction of u* over the cloud, with
-    // the lobed weights and point values of transition mode 2, as the PC2 midpoint gather
-    // does with its midpoint velocity; order 1 the cell values (piecewise constant).  The
-    // impulse is deposited with the cloud's own weights.
-    const bool linear = (cloud_gather_order == 2);
+    // The gather is the linear reconstruction of u* over the cloud, with the lobed weights and
+    // point values of transition mode 2, as the PC2 midpoint gather does with its midpoint
+    // velocity.  The impulse is deposited with the cloud's own weights.
+    // (test_cloud_dc1_opcheck, 2-D clouds: the operator on u* before the kick; it packs its own
+    // fields, so it comes before the kick's pack)
+    if (cloud_dc1_opcheck) CloudDcOpCheckBefore(pdrive, stage);
     PackGatherField(ustar);
-    auto gp = gpack;
-    auto gk_body = KOKKOS_LAMBDA(const int p) {
-      // the gather's leaf weights are the deposit's when the shapes agree: keep them
-      int nt = 0, tt[SMRCompositeTransfer::kCloudWeightCache];
-      Real tw[SMRCompositeTransfer::kCloudWeightCache];
-      Real x0 = pr(IPX,p), y0 = pr(IPY,p);
-      const int am = lt.Anchor(pi(PGID,p));   // anchor block of the cloud
-      const int lev = pi(PLEV,p);
-      const int glev = SMRCompositeTransfer::GatherCode(lev, tmode);
-      // same shape for the gather and the deposit (the point flag changes moments only)
-      const bool same = (glev & ~SMRCompositeTransfer::kCloudGatherPoint) == lev;
-      Real ux = 0.0, uy = 0.0, uz = 0.0;
-      if (linear) {
-        lt.ForEachCloudMoment(x0, y0, glev, am,
-        [&](const int target, const Real w, const Real m1x, const Real m1y) {
-          int ti = target % ncells1;
-          int remainder = target/ncells1;
-          int tj = remainder % ncells2;
-          int tm = remainder/ncells2;
-          // the leaf's block slot may be a halo block: its box from lt
-          Real dx1 = lt.box(tm,2), dx2 = lt.box(tm,3);
-          Real xc = lt.box(tm,0) + (ti - is + 0.5)*dx1;
-          Real yc = lt.box(tm,1) + (tj - js + 0.5)*dx2;
-          Real cx = 0.5*(m1x + transfer.MinImage1(x0 - xc)*w)/dx1;
-          Real cy = 0.5*(m1y + transfer.MinImage2(y0 - yc)*w)/dx2;
-          ux += w*gp(tm,ks,tj,ti,0) + cx*gp(tm,ks,tj,ti,3) + cy*gp(tm,ks,tj,ti,6);
-          uy += w*gp(tm,ks,tj,ti,1) + cx*gp(tm,ks,tj,ti,4) + cy*gp(tm,ks,tj,ti,7);
-          uz += w*gp(tm,ks,tj,ti,2) + cx*gp(tm,ks,tj,ti,5) + cy*gp(tm,ks,tj,ti,8);
-          if (nt < SMRCompositeTransfer::kCloudWeightCache) {tt[nt] = target; tw[nt] = w;}
-          ++nt;
-        });
-      } else {
-        lt.ForEachCloudWeight(x0, y0, glev, am,
-        [&](const int target, const Real w) {
-          int ti = target % ncells1;
-          int remainder = target/ncells1;
-          int tj = remainder % ncells2;
-          int tm = remainder/ncells2;
-          ux += w*gp(tm,ks,tj,ti,0);
-          uy += w*gp(tm,ks,tj,ti,1);
-          uz += w*gp(tm,ks,tj,ti,2);
-          if (nt < SMRCompositeTransfer::kCloudWeightCache) {tt[nt] = target; tw[nt] = w;}
-          ++nt;
-        });
-      }
-
-      Real cj = a_dt/(pr(IPTS,p) + a_dt);
-      Real dvx = cj*(ux - pr(IPVX,p));
-      Real dvy = cj*(uy - pr(IPVY,p));
-      Real dvz = cj*(uz - pr(IPVZ,p));
-      pr(IPVX,p) += dvx;
-      pr(IPVY,p) += dvy;
-      pr(IPVZ,p) += dvz;
-      pr(IPRX,p) = dvx/a_dt;
-      pr(IPRY,p) = dvy/a_dt;
-      pr(IPRZ,p) = dvz/a_dt;
-
-      if (br) {
-        Real mass = -pr(IPM,p);
-        auto add = [&](const int target, const Real particle_weight) {
-          int ti = target % ncells1;
-          int remainder = target/ncells1;
-          int tj = remainder % ncells2;
-          int tm = remainder/ncells2;
-          Real receiving_volume = lt.box(tm,2)*lt.box(tm,3);
-          Real density_weight = mass*particle_weight/receiving_volume;
-          DepositAdd(&dmom_(tm,0,ks,tj,ti), density_weight*dvx);
-          DepositAdd(&dmom_(tm,1,ks,tj,ti), density_weight*dvy);
-          DepositAdd(&dmom_(tm,2,ks,tj,ti), density_weight*dvz);
-        };
-        if (same && nt <= SMRCompositeTransfer::kCloudWeightCache) {
-          for (int q=0; q<nt; ++q) if (tw[q] != 0.0) add(tt[q], tw[q]);
-        } else {
-          lt.ForEachCloudWeight(x0, y0, lev, am, add);
-        }
-      }
-      if (split_be) {
-        pr(IPX,p) += dt*pr(IPVX,p);
-        pr(IPY,p) += dt*(pr(IPVY,p) - (shear3d ? qo*x0 : 0.0));
-        if (three_d) pr(IPZ,p) += dt*pr(IPVZ,p);
-      }
-    };
-    if (const int nord = CloudOrderLength(npart)) {
-      // in the order of the cell-sorted index (a permutation of its slots)
-      CloudParForOrdered("dust_cloud_gather_kick", npart, cloud_ord,
-                         nord, gk_body);
-    } else {
-      CloudParFor("dust_cloud_gather_kick", npart, gk_body);
-    }
-    if (br) HaloReverseAdd(dmom, 0, 3);   // halo deposits back to their owners
+    // (the kernel of both traversals, CloudGatherKickT in dust_imex3d.cpp; it sums
+    // dmom to the owners)
+    CloudGatherKickT(leaf_traversal, gpack, a_dt, 0.0, "dust_cloud_gather_kick");
+    if (cloud_dc1_opcheck) CloudDcOpCheckAfterKick(pdrive, stage);
     return TaskStatus::complete;
   }
 
-  const Real sh = ImplicitShearShift(pdrive, stage);   // gas in its t^n frame (0 for split-BE)
+  const Real sh = ImplicitShearShift(pdrive, stage);   // gas in its t^n frame
+  if (point_dc_opcheck) CloudDcOpCheckBefore(pdrive, stage);   // (test_point_dc_opcheck)
   par_for("dust_gather",DevExeSpace(),0,(npart-1), KOKKOS_LAMBDA(const int p) {
     int m = pi(PGID,p) - gids;
     int ip, jp, kp;
@@ -829,15 +542,6 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
     pr(IPRY,p) = dvy/a_dt;
     pr(IPRZ,p) = dvz/a_dt;
 
-    // The split fallback holds positions fixed during the coupled solve, then uses the
-    // relaxed velocity for its deliberately first-order drift.
-    if (split_be) {
-      Real x0 = pr(IPX,p);
-      pr(IPX,p) += dt*pr(IPVX,p);
-      pr(IPY,p) += dt*(pr(IPVY,p) - (shear3d ? qo*x0 : 0.0));
-      if (three_d) pr(IPZ,p) += dt*pr(IPVZ,p);
-    }
-
     // momentum back-reaction deposit with the SAME weights and dv
     if (br) {
       Real vol = mbsize.d_view(m).dx1*mbsize.d_view(m).dx2;
@@ -858,6 +562,7 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
       }
     }
   });
+  if (point_dc_opcheck) CloudDcOpCheckAfterKick(pdrive, stage);
 
   return TaskStatus::complete;
 }
@@ -869,7 +574,7 @@ TaskStatus DustGasDrag::GatherKickPMBR(Driver *pdrive, int stage) {
 //! R_g = dmom/(a_impl*dt) consumed by AddDragHistoryGas at the next stage.
 
 TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
-  if (prescribed_gas && coupling == DustCoupling::hybrid && stage == 2 &&
+  if (prescribed_gas && coupling == DustCoupling::pc2 && stage == 2 &&
       ActiveStage(pdrive, stage)) {
     // diagnostic prescribed gas (back_reaction=false): reset the gas to the prescribed
     // end-of-step state before the boundary tail
@@ -877,7 +582,7 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
   }
   if (!ActiveStage(pdrive, stage) || !back_reaction) {return TaskStatus::complete;}
 
-  if (coupling == DustCoupling::hybrid) {
+  if (coupling == DustCoupling::pc2) {
     if (stage != 2) return TaskStatus::complete;
     auto &indcs = pmy_pack->pmesh->mb_indcs;
     int is = indcs.is, ie = indcs.ie;
@@ -887,13 +592,12 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
     auto &u0 = pmy_pack->phydro->u0;
     auto &dmom_ = dmom;
     auto &qdep_ = qdep;
-    bool pc2 = (hybrid_mode == HybridMode::pc2);
     Real wpred = pdrive->gam1[pdrive->nexp_stages-1];
-    par_for("dust_hybrid_commit",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
+    par_for("dust_pc2_commit",DevExeSpace(),0,nmb1,ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-      u0(m,IM1,k,j,i) += dmom_(m,0,k,j,i) - (pc2 ? wpred*qdep_(m,1,k,j,i) : 0.0);
-      u0(m,IM2,k,j,i) += dmom_(m,1,k,j,i) - (pc2 ? wpred*qdep_(m,2,k,j,i) : 0.0);
-      u0(m,IM3,k,j,i) += dmom_(m,2,k,j,i) - (pc2 ? wpred*qdep_(m,3,k,j,i) : 0.0);
+      u0(m,IM1,k,j,i) += dmom_(m,0,k,j,i) - wpred*qdep_(m,1,k,j,i);
+      u0(m,IM2,k,j,i) += dmom_(m,1,k,j,i) - wpred*qdep_(m,2,k,j,i);
+      u0(m,IM3,k,j,i) += dmom_(m,2,k,j,i) - wpred*qdep_(m,3,k,j,i);
     });
     return TaskStatus::complete;
   }
@@ -906,11 +610,18 @@ TaskStatus DustGasDrag::ApplyPMBR(Driver *pdrive, int stage) {
   auto &u0 = pmy_pack->phydro->u0;
   auto &dmom_ = dmom;
   Real inv_adt = 1.0/((pdrive->a_impl)*(pmy_pack->pmesh->dt));
-  if (clouds3d && imex_consistent_gas) {   // consistent gas / dust split of the residual
+  if (cloud_dc1_opcheck || point_dc_opcheck) CloudDcOpCheckDmom(pdrive, stage);   // (dc1 checks)
+  if (cloud_dim == 3 && imex_consistent_gas) {   // consistent gas / dust split of the residual
     CloudImplicitConsistency3D(pdrive, stage);
     return TaskStatus::complete;
   }
-  if (!clouds3d && !UsesCompositeTransfer() && imex_consistent_gas) {
+  // 2-D clouds (IMEX working stages; PC2 returned above): the same split with the
+  // overlap weights (dust_imex3d.cpp)
+  if (cloud_dim != 3 && UsesRefinableClouds() && imex_consistent_gas) {
+    CloudImplicitConsistencyOverlapT(leaf_traversal, pdrive, stage);   // (overlap weights)
+    return TaskStatus::complete;
+  }
+  if (cloud_dim != 3 && !UsesRefinableClouds() && imex_consistent_gas) {
     // Point particles (canonical TSC): as for the clouds, the gas takes the lumped
     // solve's change G_c = rho (u*_c - u_c) plus its mass share rho/(rho + Q_c) of the residual
     // D_c - G_c; the dust share r_c Q_c V of a cell goes to the particles whose TSC center cell it

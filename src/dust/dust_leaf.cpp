@@ -72,7 +72,7 @@ void DustGasDrag::BuildLeafTraversal() {
       }
     }
     if (global_variable::nranks > 1) {
-      const int nl = smr_transfer.cloud_nlev;
+      const int nl = cloud_geometry.cloud_nlev;
       // the widenings found by CheckHaloReach stay until the mesh changes
       if (halo_need_seq_ != pm->GetAMRLoadBalanceUpdateSeq() ||
           static_cast<int>(halo_need_.size()) != nmb) {
@@ -160,10 +160,10 @@ void DustGasDrag::BuildLeafTraversal() {
     for (const int g : h) {slot_of[g] = static_cast<int>(slot_gid.size()); slot_gid.push_back(g);}
   }
   const int nfld = static_cast<int>(slot_gid.size());
-  // the rectangle of every halo slot: the reachable cells with cloud_halo_strips, else (and for
-  // a block without one, which the reach always gives) the whole block
+  // the rectangle of every halo slot: the reachable cells (the whole block for a block without
+  // one, which the reach always gives)
   halo_.rect.assign(nfld - nmb, {0, indcs.nx1, 0, indcs.nx2, 0, 1});
-  if (cloud_halo_strips) {
+  {
     for (int b=nmb; b<nfld; ++b) {
       auto it = hrect.find(slot_gid[b]);
       if (it != hrect.end()) {
@@ -205,7 +205,7 @@ void DustGasDrag::BuildLeafTraversal() {
   lt.x2min = pm->mesh_size.x2min; lt.x2max = pm->mesh_size.x2max;
   lt.lx = lt.x1max - lt.x1min; lt.ly = lt.x2max - lt.x2min;
   lt.ilx = 1.0/lt.lx; lt.ily = 1.0/lt.ly;
-  lt.root_dx1 = smr_transfer.root_dx1; lt.root_dx2 = smr_transfer.root_dx2;
+  lt.root_dx1 = cloud_geometry.root_dx1; lt.root_dx2 = cloud_geometry.root_dx2;
   lt.iroot_dx1 = 1.0/lt.root_dx1; lt.iroot_dx2 = 1.0/lt.root_dx2;
   lt.box = DvceArray2D<Real>("dust_leaf_box", nall, 6);
   lt.nnb = DvceArray1D<int>("dust_leaf_nnb", nmb);
@@ -285,7 +285,7 @@ void DustGasDrag::BuildLeafTraversal() {
   }
   // finest-level integer boxes, levels, the dilation of the split buffer
   {
-    const auto &t = smr_transfer;
+    const auto &t = cloud_geometry;
     lt.nlev = t.cloud_nlev; lt.nfine1 = t.nfine1; lt.nfine2 = t.nfine2;
     lt.fine_dx1 = t.fine_dx1; lt.fine_dx2 = t.fine_dx2;
     lt.cloud_max_level = t.cloud_max_level;
@@ -427,7 +427,7 @@ void DustGasDrag::BuildLeafTraversal() {
 
 void DustGasDrag::HaloReach(const int lev, const std::int64_t need, std::int64_t &reach,
                             std::int64_t &allow) const {
-  const auto &t = smr_transfer;
+  const auto &t = cloud_geometry;
   const int nl = t.cloud_nlev;
   const int coarser = (cloud_halo_coarser >= 0) ? cloud_halo_coarser : (t.cloud_split_overlap ? 1 : 2);
   int lmin = std::min(std::max(0, lev - coarser), t.cloud_max_level);

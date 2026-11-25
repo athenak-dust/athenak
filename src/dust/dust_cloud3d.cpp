@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -44,7 +45,6 @@ namespace dust {
 
 namespace {
 
-constexpr int kCache3 = 27;   // leaf weights kept from the gather (3 x 3 x 3: a same-level cloud)
 
 struct DPiece3 {Real off; Real frac; int lobe;};
 
@@ -62,26 +62,135 @@ int P1Pieces3(const int lobe_old, const bool sep_lo, const bool sep_hi, DPiece3 
   return n;
 }
 
-// the block slot (local or halo) that holds a new cloud, searched from the block m of its
-// parent (-1: none found)
-KOKKOS_INLINE_FUNCTION
-int NewCloudSlot3(const LeafTraversal3D &lt, const Real x, const Real y, const Real z,
-                  const int m, const int ncell123) {
-  const int leaf = lt.LeafOwner(x, y, z, m);
-  return (leaf < 0) ? -1 : leaf/ncell123;
+std::uint64_t Mix64(std::uint64_t x) {
+  x += UINT64_C(0x9e3779b97f4a7c15);
+  x = (x ^ (x >> 30))*UINT64_C(0xbf58476d1ce4e5b9);
+  x = (x ^ (x >> 27))*UINT64_C(0x94d049bb133111eb);
+  return x ^ (x >> 31);
 }
-// the MeshBlock of a new cloud: its slot if that block is on this rank, else its parent's
-// block m (the particle exchange moves it on)
-KOKKOS_INLINE_FUNCTION
-int NewCloudBlock3(const LeafTraversal3D &lt, const int slot, const int m) {
-  return (slot >= 0 && slot < lt.nmb) ? slot : m;
+double Uniform01(const std::uint64_t key) {
+  return static_cast<double>(Mix64(key) >> 11)*(1.0/9007199254740992.0);
 }
 
-// is the particle split (or a lobe released) now?  The 2-D rule (P1Flag) per direction.
+
+// The PC2 cloud advance's dimension-dependent steps (CloudAdvanceT): the midpoint position xh and the
+// position xg at which the gas is gathered and the impulse deposited, the implicit-midpoint kick
+// (shearing-box Coriolis terms, vertical gravity, the azimuthal boost of the 2-D r-z box) and the
+// drift.  Each is the expression of the former kernel of its dimension (CPU bitwise).
+template <class LTT> struct CloudPC2Push;
+template <>
+struct CloudPC2Push<LeafTraversal> {   // 2-D r-z: azimuth = IPVZ, no y drift, no vertical gravity
+  KOKKOS_INLINE_FUNCTION
+  static void Midpoint(const Real x0[3], const Real v0[3], const Real dt, const bool,
+                       const Real, const Real, Real xh[3], Real xg[3]) {
+    xh[0] = x0[0] + 0.5*dt*v0[0];
+    xh[1] = x0[1] + 0.5*dt*v0[1];
+    xh[2] = x0[2];
+    xg[0] = xh[0]; xg[1] = xh[1]; xg[2] = xh[2];
+  }
+  KOKKOS_INLINE_FUNCTION
+  static void Kick(const Real h, const Real aa, Real r[3], const Real xh[3], const bool is_sbox,
+                   const bool, const Real qshear, const Real omega0, const Real aphi, Real vh[3]) {
+    (void)xh;
+    if (is_sbox) {
+      const Real cxz = 2.0*h*omega0;
+      const Real czx = h*(2.0-qshear)*omega0;
+      const Real det = aa*aa + cxz*czx;
+      if (aphi != 0.0) r[2] += h*aphi;
+      vh[0] = (aa*r[0] + cxz*r[2])/det;
+      vh[2] = (aa*r[2] - czx*r[0])/det;
+      vh[1] = r[1]/aa;
+    } else {
+      vh[0] = r[0]/aa;
+      vh[1] = r[1]/aa;
+      vh[2] = r[2]/aa;
+    }
+  }
+  template <class PR>
+  KOKKOS_INLINE_FUNCTION
+  static void Drift(const PR &pr, const int p, const Real x0[3], const Real xh[3], const Real vh[3],
+                    const Real dt, const bool, const Real, const Real) {
+    pr(IPX,p) = x0[0] + dt*vh[0];
+    pr(IPY,p) = x0[1] + dt*vh[1];
+    (void)xh;
+  }
+};
+template <>
+struct CloudPC2Push<LeafTraversal3D> {   // 3-D: shearing box x-y, vertical gravity (stratified)
+  KOKKOS_INLINE_FUNCTION
+  static void Midpoint(const Real x0[3], const Real v0[3], const Real dt, const bool is_sbox,
+                       const Real qshear_, const Real omega0_, Real xh[3], Real xg[3]) {
+    xh[0] = x0[0] + 0.5*dt*v0[0];
+    xh[1] = x0[1] + 0.5*dt*(v0[1] - (is_sbox ? qshear_*omega0_*x0[0] : 0.0));
+    xh[2] = x0[2] + 0.5*dt*v0[2];
+    // the gas met at the lab midpoint (xh, yh) sits at yh + q Omega xh dt/2 in the stored
+    // field (IPY1 keeps the lab midpoint)
+    xg[0] = xh[0];
+    xg[1] = xh[1] + (is_sbox ? qshear_*omega0_*xh[0]*0.5*dt : 0.0);
+    xg[2] = xh[2];
+  }
+  KOKKOS_INLINE_FUNCTION
+  static void Kick(const Real h, const Real aa, Real r[3], const Real xh[3], const bool is_sbox,
+                   const bool is_strat, const Real qshear_, const Real omega0_, const Real,
+                   Real vh[3]) {
+    if (is_sbox) {
+      const Real cxy = 2.0*h*omega0_;
+      const Real cyx = h*(2.0-qshear_)*omega0_;
+      const Real det = aa*aa + cxy*cyx;
+      vh[0] = (aa*r[0] + cxy*r[1])/det;
+      vh[1] = (aa*r[1] - cyx*r[0])/det;
+      if (is_strat) r[2] -= h*SQR(omega0_)*xh[2];
+      vh[2] = r[2]/aa;
+    } else {
+      vh[0] = r[0]/aa;
+      vh[1] = r[1]/aa;
+      vh[2] = r[2]/aa;
+    }
+  }
+  template <class PR>
+  KOKKOS_INLINE_FUNCTION
+  static void Drift(const PR &pr, const int p, const Real x0[3], const Real xh[3], const Real vh[3],
+                    const Real dt, const bool is_sbox, const Real qshear_, const Real omega0_) {
+    pr(IPX,p) = x0[0] + dt*vh[0];
+    pr(IPY,p) = x0[1] + dt*(vh[1] - (is_sbox ? qshear_*omega0_*xh[0] : 0.0));
+    pr(IPZ,p) = x0[2] + dt*vh[2];
+  }
+};
+
+
+// the P1 split's per-direction rules on either traversal (the 2-D P1Flag / P1Sep /
+// P1Build of dust_cloud_device.cpp and the 3-D ones above, written once; the same tests and
+// the same pieces along each of the kDim directions)
+// is the particle split (or a lobe released) now?  (P1Flag / P1Flag3: one specialization per
+// traversal with the former code, straight-line tests; a loop over the directions made the 3-D
+// count kernel slower on GPUs)
+template <class LTT>
 KOKKOS_INLINE_FUNCTION
-bool P1Flag3(const LeafTraversal3D &t, const int m, const int code, const Real x, const Real y,
-             const Real z, const Real slack) {
-  using T = SMRCompositeTransfer;
+bool P1FlagT(const LTT &t, const int m, const int code, const Real x[3], const Real slack);
+template <>
+KOKKOS_INLINE_FUNCTION
+bool P1FlagT<LeafTraversal>(const LeafTraversal &t, const int m, const int code, const Real xp[3],
+                            const Real slack) {
+  const Real x = xp[0], y = xp[1];
+  const int lev = CloudGeometry::CloudLevel(code);
+  const int l1 = CloudGeometry::CloudLobe1(code);
+  const int l2 = CloudGeometry::CloudLobe2(code);
+  if (l1 == 0 && l2 == 0) return t.CloudInsideFiner(x, y, lev, slack, m);
+  if (lev > 0 && t.CloudInsideFiner(x, y, lev - 1, slack, m)) {
+    const Real h1 = t.CloudHalfWidth1(lev - 1), h2 = t.CloudHalfWidth2(lev - 1);
+    return ((l1 & 1) && t.CloudInsideFiner(x - h1, y, lev - 1, slack, m)) ||
+           ((l1 & 2) && t.CloudInsideFiner(x + h1, y, lev - 1, slack, m)) ||
+           ((l2 & 1) && t.CloudInsideFiner(x, y - h2, lev - 1, slack, m)) ||
+           ((l2 & 2) && t.CloudInsideFiner(x, y + h2, lev - 1, slack, m));
+  }
+  return false;
+}
+template <>
+KOKKOS_INLINE_FUNCTION
+bool P1FlagT<LeafTraversal3D>(const LeafTraversal3D &t, const int m, const int code,
+                              const Real xp[3], const Real slack) {
+  using T = CloudGeometry;
+  const Real x = xp[0], y = xp[1], z = xp[2];
   const int lev = T::CloudLevel(code);
   const int l1 = T::CloudLobe1(code), l2 = T::CloudLobe2(code), l3 = T::CloudLobe3(code);
   if (l1 == 0 && l2 == 0 && l3 == 0) return t.CloudInsideFiner(x, y, z, lev, slack, m);
@@ -97,15 +206,32 @@ bool P1Flag3(const LeafTraversal3D &t, const int m, const int code, const Real x
   }
   return false;
 }
-
-// the separation flags of a flagged particle: bit 2j (2j + 1) set when the lower (upper) side
-// along direction j lies inside the finer region (the CloudInsideFiner tests of P1Event per
-// direction); P1Build3 forms the pieces from them.  With the piece bound the count pass keeps
-// them (split_sep) and the range kernel and the fill use those, so all three decide alike.
+// the separation flags: bit 2d (2d + 1) set when the lower (upper) side along direction d lies
+// inside the finer region (P1Sep / P1Sep3, the former code of each traversal)
+template <class LTT>
 KOKKOS_INLINE_FUNCTION
-int P1Sep3(const LeafTraversal3D &t, const int m, const int code, const Real x, const Real y,
-           const Real z, const Real slack) {
-  using T = SMRCompositeTransfer;
+int P1SepT(const LTT &t, const int m, const int code, const Real x[3], const Real slack);
+template <>
+KOKKOS_INLINE_FUNCTION
+int P1SepT<LeafTraversal>(const LeafTraversal &t, const int m, const int code, const Real xp[3],
+                          const Real slack) {
+  const Real x = xp[0], y = xp[1];
+  const int lev = CloudGeometry::CloudLevel(code);
+  const bool plain = CloudGeometry::CloudLobe1(code) == 0 &&
+                     CloudGeometry::CloudLobe2(code) == 0;
+  const int l = plain ? lev : lev - 1;
+  const Real h1 = t.CloudHalfWidth1(l), h2 = t.CloudHalfWidth2(l);
+  return (t.CloudInsideFiner(x - h1, y, l, slack, m) ? 1 : 0) |
+         (t.CloudInsideFiner(x + h1, y, l, slack, m) ? 2 : 0) |
+         (t.CloudInsideFiner(x, y - h2, l, slack, m) ? 4 : 0) |
+         (t.CloudInsideFiner(x, y + h2, l, slack, m) ? 8 : 0);
+}
+template <>
+KOKKOS_INLINE_FUNCTION
+int P1SepT<LeafTraversal3D>(const LeafTraversal3D &t, const int m, const int code,
+                            const Real xp[3], const Real slack) {
+  using T = CloudGeometry;
+  const Real x = xp[0], y = xp[1], z = xp[2];
   const int lev = T::CloudLevel(code);
   const bool plain = T::CloudLobe1(code) == 0 && T::CloudLobe2(code) == 0 &&
                      T::CloudLobe3(code) == 0;
@@ -118,30 +244,70 @@ int P1Sep3(const LeafTraversal3D &t, const int m, const int code, const Real x, 
          (t.CloudInsideFiner(x, y, z - h3, l, slack, m) ? 16 : 0) |
          (t.CloudInsideFiner(x, y, z + h3, l, slack, m) ? 32 : 0);
 }
-
-// pieces of a flagged particle along the three directions from its separation flags
+// the pieces of a flagged particle along each direction from its separation flags (P1Build /
+// P1Build3, the former code of each dimension); 2-D: pc[2] stays a single piece of fraction 1
+// (never multiplied in)
+template <int D>
 KOKKOS_INLINE_FUNCTION
-void P1Build3(const int code, const int sep, DPiece3 p1[3], DPiece3 p2[3], DPiece3 p3[3],
-              int &n1, int &n2, int &n3, int &clev, bool &parent) {
-  using T = SMRCompositeTransfer;
-  const int lev = T::CloudLevel(code);
-  const int l1 = T::CloudLobe1(code), l2 = T::CloudLobe2(code), l3 = T::CloudLobe3(code);
-  const bool plain = (l1 == 0 && l2 == 0 && l3 == 0);
-  n1 = P1Pieces3(plain ? 3 : l1, (sep & 1) != 0, (sep & 2) != 0, p1);
-  n2 = P1Pieces3(plain ? 3 : l2, (sep & 4) != 0, (sep & 8) != 0, p2);
-  n3 = P1Pieces3(plain ? 3 : l3, (sep & 16) != 0, (sep & 32) != 0, p3);
+void P1BuildT(const int code, const int sep, DPiece3 pc[3][3], int n[3], int &clev, bool &parent);
+template <>
+KOKKOS_INLINE_FUNCTION
+void P1BuildT<2>(const int code, const int sep, DPiece3 pc[3][3], int n[3], int &clev,
+                 bool &parent) {
+  const int lev = CloudGeometry::CloudLevel(code);
+  const int l1 = CloudGeometry::CloudLobe1(code);
+  const int l2 = CloudGeometry::CloudLobe2(code);
+  const bool plain = (l1 == 0 && l2 == 0);
+  n[0] = P1Pieces3(plain ? 3 : l1, (sep & 1) != 0, (sep & 2) != 0, pc[0]);
+  n[1] = P1Pieces3(plain ? 3 : l2, (sep & 4) != 0, (sep & 8) != 0, pc[1]);
+  n[2] = 1; pc[2][0].off = 0.0; pc[2][0].frac = 1.0; pc[2][0].lobe = 0;
   clev = plain ? lev + 1 : lev;
   parent = plain;
 }
-
-std::uint64_t Mix64(std::uint64_t x) {
-  x += UINT64_C(0x9e3779b97f4a7c15);
-  x = (x ^ (x >> 30))*UINT64_C(0xbf58476d1ce4e5b9);
-  x = (x ^ (x >> 27))*UINT64_C(0x94d049bb133111eb);
-  return x ^ (x >> 31);
+template <>
+KOKKOS_INLINE_FUNCTION
+void P1BuildT<3>(const int code, const int sep, DPiece3 pc[3][3], int n[3], int &clev,
+                 bool &parent) {
+  using T = CloudGeometry;
+  const int lev = T::CloudLevel(code);
+  const int l1 = T::CloudLobe1(code), l2 = T::CloudLobe2(code), l3 = T::CloudLobe3(code);
+  const bool plain = (l1 == 0 && l2 == 0 && l3 == 0);
+  n[0] = P1Pieces3(plain ? 3 : l1, (sep & 1) != 0, (sep & 2) != 0, pc[0]);
+  n[1] = P1Pieces3(plain ? 3 : l2, (sep & 4) != 0, (sep & 8) != 0, pc[1]);
+  n[2] = P1Pieces3(plain ? 3 : l3, (sep & 16) != 0, (sep & 32) != 0, pc[2]);
+  clev = plain ? lev + 1 : lev;
+  parent = plain;
 }
-double Uniform01(const std::uint64_t key) {
-  return static_cast<double>(Mix64(key) >> 11)*(1.0/9007199254740992.0);
+// a piece's position into the domain; returns 1 if a physical x3 face mirrored it (3-D only)
+template <class LTT>
+KOKKOS_INLINE_FUNCTION
+int WrapPieceT(const LTT &lt, Real c[3]);
+template <>
+KOKKOS_INLINE_FUNCTION
+int WrapPieceT<LeafTraversal>(const LeafTraversal &lt, Real c[3]) {
+  c[0] = CloudGeometry::WrapPosition(c[0], lt.x1min, lt.x1max);
+  c[1] = CloudGeometry::WrapPosition(c[1], lt.x2min, lt.x2max);
+  return 0;
+}
+template <>
+KOKKOS_INLINE_FUNCTION
+int WrapPieceT<LeafTraversal3D>(const LeafTraversal3D &lt, Real c[3]) {
+  return lt.WrapPos(c[0], c[1], c[2]);
+}
+// the block slot (local or halo) that holds a new cloud, searched from the block m of its parent
+// (-1: none found), and the MeshBlock it takes (NewCloudSlot3 / NewCloudBlock3, the rule of
+// NewCloudBlock in 2-D)
+template <class LTT>
+KOKKOS_INLINE_FUNCTION
+int NewCloudSlotT(const LTT &lt, const Real c[3], const int m) {
+  using A = LeafApi<LTT>;
+  const int leaf = A::Owner(lt, c, m);
+  return (leaf < 0) ? -1 : A::Slot(lt, leaf);
+}
+template <class LTT>
+KOKKOS_INLINE_FUNCTION
+int NewCloudBlockT(const LTT &lt, const int slot, const int m) {
+  return (slot >= 0 && slot < lt.nmb) ? slot : m;
 }
 
 }  // namespace
@@ -153,24 +319,14 @@ double Uniform01(const std::uint64_t key) {
 void DustGasDrag::CheckClouds3D() {
   if (!pmy_pack->pmesh->three_d || smr_transfer_mode != DustSMRTransfer::refinable_cloud) return;
   std::vector<std::string> bad;
-  if (!(coupling == DustCoupling::imex ||
-        (coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2))) {
-    bad.push_back("a coupling other than PC2 or IMEX (coupling = pc2 / imex)");
-  }
-  if (drag_solver != DustDragSolver::local) bad.push_back("drag_solver other than local");
-  if (cloud_gather_order != 2 || analytic_gather.on) {
-    bad.push_back("gather variants (cloud_gather_order != 2, analytic_gather)");
-  }
-  // G: the device quantum pass with the pass budget (MergeCloudsDevice3D)
-  if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device || cloud_merge_budget_x ||
-                      cloud_merge_xprotect)) {
-    bad.push_back("merging other than the device quantum G (no stage-X budget, no X protection)");
+  if (drag_solver != DustDragSolver::local && drag_solver != DustDragSolver::dc1 &&
+      drag_solver != DustDragSolver::dc2) {
+    bad.push_back("drag_solver other than local, dc1 or dc2");
   }
   // R: the device solve (ResampleClouds3D)
-  if (cloud_resample && (!cloud_resample_device || cloud_resample_pos_order)) {
-    bad.push_back("resampling other than the device solve (no host solve, no position order)");
+  if (cloud_resample && !cloud_resample_device) {
+    bad.push_back("resampling other than the device solve (no host solve)");
   }
-  if (!cloud_split_device) bad.push_back("the host split");
   // (physical x3 faces: the supports fold back at the faces; x3_ghost_deposit = drop
   // is refused by the constructor)
   if (pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
@@ -218,7 +374,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
               << "3-D leaf traversal: 3-D meshes only (56 neighbor slots)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  const auto &t = smr_transfer;
+  const auto &t = cloud_geometry;
   // physical x3 faces (no periodic image in x3)
   const bool zper = pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic;
   // block slots: the blocks of this rank (slot = gid - gids), then
@@ -387,7 +543,7 @@ void DustGasDrag::BuildLeafTraversal3D() {
   }
   const int nfld = static_cast<int>(slot_gid.size());
   halo_.rect.assign(nfld - nmb, {0, indcs.nx1, 0, indcs.nx2, 0, indcs.nx3});
-  if (cloud_halo_strips) {
+  {   // the reachable cells of each halo block
     const int nxb[3] = {indcs.nx1, indcs.nx2, indcs.nx3};
     for (int b=nmb; b<nfld; ++b) {
       auto it = hrect.find(slot_gid[b]);
@@ -736,12 +892,12 @@ void DustGasDrag::UpdateShear3D(const Real time) {
   if (shear3d_lists_ok_ && ysh == lt.ysh) return;
   ++shear3d_updates;
   const double yf = static_cast<double>(ysh)/static_cast<double>(lt.fine_dx2);
-  // (cloud_shear_list_cache) the lists of the unit interval [k, k + 1) of yf: block boxes and
+  // the lists of the unit interval [k, k + 1) of yf: block boxes and
   // reaches are whole finest cells, so the windows of all yf in it lie in the window of the
   // interval; the traversal still tests every candidate at the current ysh (Candidates, meets)
   const double kf = std::floor(yf);
   lt.ysh = ysh;
-  if (shear3d_list_cache && shear3d_lists_ok_ && kf == shear3d_key_) return;
+  if (shear3d_lists_ok_ && kf == shear3d_key_) return;
   ++shear3d_rebuilds;
   shear3d_key_ = kf;
   const int nmb = lt.nmb, nf1 = lt.nfine1, nf2 = lt.nfine2, nf3 = lt.nfine3;
@@ -754,8 +910,8 @@ void DustGasDrag::UpdateShear3D(const Real time) {
       const int sg = 2*side - 1;   // across the outer face (1): x - Lx, y + ysh
       const int x0 = std::max(fb[m][0] - sg*nf1 - R, 0), x1 = std::min(fb[m][1] - sg*nf1 + R, nf1);
       if (x0 >= x1) continue;
-      const double ylo = shear3d_list_cache ? std::min(sg*kf, sg*(kf + 1.0)) : sg*yf;
-      const double yhi = shear3d_list_cache ? std::max(sg*kf, sg*(kf + 1.0)) : sg*yf;
+      const double ylo = std::min(sg*kf, sg*(kf + 1.0));
+      const double yhi = std::max(sg*kf, sg*(kf + 1.0));
       const double y0 = fb[m][2] + ylo - R, y1 = fb[m][3] + yhi + R;
       const int z0 = fb[m][4] - R, z1 = fb[m][5] + R;
       auto &l = lst[2*static_cast<std::size_t>(m) + side];
@@ -814,263 +970,22 @@ void DustGasDrag::WrapParticles3D() {
   Kokkos::parallel_for("dust_wrap3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     if (sh) {
-      const Real x = pr(IPX,p), xw = SMRCompositeTransfer::WrapPosition(x, x1a, x1b);
+      const Real x = pr(IPX,p), xw = CloudGeometry::WrapPosition(x, x1a, x1b);
       if (xw != x) {
         const Real dy = round((x - xw)*ilx)*ysh;
         pr(IPX,p) = xw; pr(IPX1,p) += xw - x;
         pr(IPY,p) += dy; pr(IPY1,p) += dy;
       }
     }
-    SMRCompositeTransfer::WrapParticle(pr, p, x1a, x1b, x2a, x2b);
+    CloudGeometry::WrapParticle(pr, p, x1a, x1b, x2a, x2b);
     if (!zper) return;   // (physical x3 faces: the particle routing reflects or removes)
-    const Real z = pr(IPZ,p), zw = SMRCompositeTransfer::WrapPosition(z, x3a, x3b);
+    const Real z = pr(IPZ,p), zw = CloudGeometry::WrapPosition(z, x3a, x3b);
     if (zw != z) {pr(IPZ,p) = zw; pr(IPZ1,p) += zw - z;}
   });
 }
 
-int DustGasDrag::ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum) {
-  particles::Particles *ppar = pmy_pack->ppart;
-  const int npart = ppar->nprtcl_thispack;
-  dwmax = 0.0; msum = 0.0;
-  if (npart == 0) return 0;
-  WrapParticles3D();
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  const auto lt = leaf_traversal3d;
-  const int ncell123 = lt.ncells1*lt.ncells2*lt.ncells3;
-  const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
-  int nchanged = 0, nbad = 0;
-  Kokkos::parallel_reduce("dust_reset_blocks3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, int &changed, int &bad, Real &dw, double &ms) {
-    const Real x = pr(IPX,p), y = pr(IPY,p), z = pr(IPZ,p);
-    const int leaf = lt.LeafOwner(x, y, z, lt.Anchor(pi(PGID,p)));   // the old id: a guess
-    const int owner = (leaf < 0) ? -1 : leaf/ncell123;
-    if (owner < 0 || owner >= nmb) {++bad; return;}
-    if (pi(PGID,p) != gids + owner) {pi(PGID,p) = gids + owner; ++changed;}
-    ms += static_cast<double>(pr(IPM,p));
-    if (!check) return;
-    int out = 0;
-    const Real sw = lt.ForEach<false>(x, y, z, pi(PLEV,p), owner,
-                                      [&](const int t, const Real) {
-      if (t < 0 || t/ncell123 >= lt.nfld) ++out;
-    });
-    dw = Kokkos::fmax(dw, Kokkos::fabs(sw - 1.0));
-    bad += out;
-  }, Kokkos::Sum<int>(nchanged), Kokkos::Sum<int>(nbad), Kokkos::Max<Real>(dwmax),
-     Kokkos::Sum<double>(msum));
-  if (nbad > 0 || dwmax > 1.0e-10) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "3-D clouds (" << when << "): " << nbad << " particles without a block or with "
-              << "weights outside the blocks, largest |sum of weights - 1| = " << dwmax << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  return nchanged;
-}
-
 //----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::FrameToBlock3D, CheckHaloReach3D, RouteToOwnerBlocks3D
-//! \brief Several ranks: the 2-D functions FrameToBlock, CheckHaloReach and RouteToOwnerBlocks
-//! with a third direction.  FrameToBlock3D: a particle in the periodic image next to the block
-//! it keeps
-//! (positions and RK position registers), so that the particle exchange sees a step of one
-//! block.  CheckHaloReach3D: how far each cloud's support (two half-widths on a lobed side)
-//! extends beyond its block, against the block's allowance; where it exceeds it the block's reach
-//! is widened and every rank rebuilds the leaf traversal and the halo.  RouteToOwnerBlocks3D:
-//! every particle to the block (and rank) that holds its position.
-
-void DustGasDrag::FrameToBlock3D(const Real tpos) {
-  auto pr = pmy_pack->ppart->prtcl_rdata;
-  auto pi = pmy_pack->ppart->prtcl_idata;
-  const auto lt = leaf_traversal3d;
-  const int npart = pmy_pack->ppart->nprtcl_thispack;
-  if (npart == 0) return;
-  const bool frame = global_variable::nranks > 1;
-  // the particle routing (bvals_part.cpp) moves a particle across a shear-periodic x1
-  // face by ysh at pm->time; positions at tpos != pm->time (after the push) get the difference
-  // first, so that the move is the one of their time
-  Real dsh = 0.0, ysp = lt.ysh;   // ysp: the shear offset at the time of the positions
-  if (shear3d && shear3d_route_fix && tpos >= 0.0) {
-    const Real t0 = pmy_pack->pmesh->time;
-    ysp = std::fmod(qshear*omega0*lt.lx*tpos, lt.ly);
-    // the difference unfolded: the folded values jump by ly when q Omega lx t passes a
-    // multiple of ly, which moved the crossing particles by a whole box in y (routing abort)
-    dsh = qshear*omega0*lt.lx*(tpos - t0);
-  }
-  if (!frame && dsh == 0.0) return;
-  const bool sh = lt.shear;
-  Kokkos::parallel_for("dust_migrate_frame3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p) {
-    if (frame) {
-      const int m = lt.Anchor(pi(PGID,p));
-      const Real cx = lt.box(m,0) + 0.5*lt.nx1*lt.box(m,3);
-      const Real cy = lt.box(m,1) + 0.5*lt.nx2*lt.box(m,4);
-      const Real cz = lt.box(m,2) + 0.5*lt.nx3*lt.box(m,5);
-      const Real n1 = round((pr(IPX,p) - cx)*lt.ilx);
-      const Real sx = lt.lx*n1;
-      if (sx != 0.0) {
-        pr(IPX,p) -= sx; pr(IPX1,p) -= sx;
-        if (sh) {pr(IPY,p) += n1*ysp; pr(IPY1,p) += n1*ysp;}
-      }
-      const Real sy = lt.ly*round((pr(IPY,p) - cy)*lt.ily);
-      const Real sz = lt.x3per ? lt.lz*round((pr(IPZ,p) - cz)*lt.ilz) : 0.0;
-      if (sy != 0.0) {pr(IPY,p) -= sy; pr(IPY1,p) -= sy;}
-      if (sz != 0.0) {pr(IPZ,p) -= sz; pr(IPZ1,p) -= sz;}
-    }
-    if (dsh != 0.0) {
-      const Real x = pr(IPX,p);
-      const Real c = (x >= lt.x1max) ? 1.0 : ((x < lt.x1min) ? -1.0 : 0.0);
-      if (c != 0.0) {pr(IPY,p) += c*dsh; pr(IPY1,p) += c*dsh;}
-    }
-  });
-}
-
-bool DustGasDrag::CheckHaloReach3D(const char *when) {
-  particles::Particles *ppar = pmy_pack->ppart;
-  const int npart = ppar->nprtcl_thispack;
-  const int nmb = pmy_pack->nmb_thispack;
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  const auto lt = leaf_traversal3d;
-  auto allow = halo_allow_d_;
-  DvceArray1D<std::int64_t> need("dust_halo_need3d", std::max(nmb, 1));
-  int nover = 0;
-  if (npart > 0) {
-    Kokkos::parallel_reduce("dust_halo_reach3d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p, int &cnt) {
-      using T = SMRCompositeTransfer;
-      const int m = lt.Anchor(pi(PGID,p));
-      Real x = pr(IPX,p), y = pr(IPY,p), z = pr(IPZ,p);
-      lt.Frame(m, x, y, z);
-      const int code = pi(PLEV,p);
-      const int lev = T::CloudLevel(code);
-      const Real e1 = (T::CloudLobe1(code) ? 2.0 : 1.0)*lt.CloudHalfWidth1(lev);
-      const Real e2 = (T::CloudLobe2(code) ? 2.0 : 1.0)*lt.CloudHalfWidth2(lev);
-      const Real e3 = (T::CloudLobe3(code) ? 2.0 : 1.0)*lt.CloudHalfWidth3(lev);
-      const Real bx0 = lt.box(m,0), bx1 = bx0 + lt.nx1*lt.box(m,3);
-      const Real by0 = lt.box(m,1), by1 = by0 + lt.nx2*lt.box(m,4);
-      const Real bz0 = lt.box(m,2), bz1 = bz0 + lt.nx3*lt.box(m,5);
-      const Real o1 = Kokkos::fmax(0.0, Kokkos::fmax(bx0 - (x - e1), (x + e1) - bx1));
-      const Real o2 = Kokkos::fmax(0.0, Kokkos::fmax(by0 - (y - e2), (y + e2) - by1));
-      const Real o3 = Kokkos::fmax(0.0, Kokkos::fmax(bz0 - (z - e3), (z + e3) - bz1));
-      const std::int64_t d = static_cast<std::int64_t>(
-          Kokkos::fmax(Kokkos::ceil(o1/lt.fine_dx1),
-                       Kokkos::fmax(Kokkos::ceil(o2/lt.fine_dx2), Kokkos::ceil(o3/lt.fine_dx3))));
-      if (d > allow(m)) {
-        const std::int64_t margin = static_cast<std::int64_t>(1) << (lt.nlev - lt.blev(m));
-        Kokkos::atomic_max(&need(m), d + margin);
-        ++cnt;
-      }
-    }, Kokkos::Sum<int>(nover));
-  }
-  long long tot = nover;
-#if MPI_PARALLEL_ENABLED
-  MPI_Allreduce(MPI_IN_PLACE, &tot, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-#endif
-  if (tot == 0) return false;
-  auto nh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), need);
-  int nwide = 0;
-  for (int m=0; m<nmb; ++m) {
-    if (nh(m) > halo_need_[m]) {halo_need_[m] = nh(m); ++nwide;}
-  }
-  halo_widenings_ += static_cast<unsigned long long>(nwide);
-  const int nhalo_before = leaf_traversal3d.nfld - leaf_traversal3d.nmb;
-  BuildLeafTraversal3D();
-  if (global_variable::my_rank == 0) {
-    std::cout << "# dust halo (3-D): " << tot << " clouds reached beyond the halo ("
-              << when << ", cycle " << pmy_pack->pmesh->ncycle << "); rank 0 widened " << nwide
-              << " blocks, halo blocks " << nhalo_before << " -> "
-              << leaf_traversal3d.nfld - leaf_traversal3d.nmb << std::endl;
-  }
-  return true;
-}
-
-int DustGasDrag::RouteToOwnerBlocks3D(const char *when, const int first) {
-  particles::Particles *ppar = pmy_pack->ppart;
-  auto *pb = ppar->pbval_part;
-  int nchanged = 0, nbad = 0;
-#if MPI_PARALLEL_ENABLED
-  ProfLaps laps(false);   // this rank's phases (only with <dust>/amr_profile)
-  // (first > 0: the pieces of this cycle's split, already wrapped into the domain)
-  if (first == 0) WrapParticles3D();
-  laps.Lap("wrap");
-  const int npart = ppar->nprtcl_thispack;
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  const auto lt = leaf_traversal3d;
-  const int ncell123 = lt.ncells1*lt.ncells2*lt.ncells3;
-  const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
-  auto sgid = leaf_slot_gid_d;
-  auto srank = leaf_slot_rank_d;
-  pb->ReserveSendlist(npart);
-  Kokkos::deep_copy(pb->send_count.d_view, 0);
-  auto psendl = pb->sendlist.d_view;
-  int *pcounter = pb->send_count.d_view.data();
-  if (npart > first) {
-    Kokkos::parallel_reduce("dust_route_owner3d", Kokkos::RangePolicy<>(DevExeSpace(), first, npart),
-    KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
-      const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), pr(IPZ,p), lt.Anchor(pi(PGID,p)));
-      const int slot = (leaf < 0) ? -1 : leaf/ncell123;
-      if (slot < 0) {++bad; return;}
-      const int g = (slot < nmb) ? gids + slot : sgid(slot);
-      if (pi(PGID,p) != g) {pi(PGID,p) = g; ++changed;}
-      if (slot >= nmb) {
-        const int k = Kokkos::atomic_fetch_add(pcounter, 1);
-        psendl(k).prtcl_indx = p;
-        psendl(k).dest_gid = g;
-        psendl(k).dest_rank = srank(slot);
-      }
-    }, Kokkos::Sum<int>(nchanged), Kokkos::Sum<int>(nbad));
-  }
-  if (nbad > 0) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << nbad << " particles have no owning MeshBlock (" << (when ? when : "split")
-              << ", 3-D)" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  Kokkos::deep_copy(pb->send_count.h_view, pb->send_count.d_view);
-  pb->nprtcl_send = pb->send_count.h_view(0);
-  if (pb->nprtcl_send > 0) {
-    auto d = Kokkos::subview(pb->sendlist.d_view, std::make_pair(0, pb->nprtcl_send));
-    auto h = Kokkos::subview(pb->sendlist.h_view, std::make_pair(0, pb->nprtcl_send));
-    Kokkos::deep_copy(h, d);
-  }
-  const int nsent = pb->nprtcl_send;
-  laps.Lap("owner");
-  pb->CountSendsAndRecvs();
-  laps.Lap("count");
-  pb->InitPrtclRecv();
-  pb->PackAndSendPrtcls();
-  laps.Lap("post");
-  while (pb->RecvAndUnpackPrtcls() != TaskStatus::complete) {}
-  laps.Lap("recv");
-  pb->ClearPrtclSend();
-  pb->ClearPrtclRecv();
-  laps.Lap("clear");
-  Mesh *pm = pmy_pack->pmesh;
-  const long long tot = particles::TotalCount(pm->nprtcl_eachrank, global_variable::nranks);
-  pm->nprtcl_total = tot;
-  long long sums[2] = {nchanged, nsent};
-  MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-  laps.Lap("sums");
-  if (ProfOn() && when != nullptr) {
-    std::cout << "# regrid laps route rank=" << global_variable::my_rank << " sent=" << nsent
-              << laps.text << std::endl;
-  }
-  if (global_variable::my_rank == 0 && when != nullptr) {   // nullptr: quiet (SplitToLeaves)
-    std::cout << "# dust (3-D): MeshBlock ids set from the positions at the " << when
-              << ": " << sums[0] << " of " << tot << " changed, " << sums[1]
-              << " sent to other ranks" << std::endl;
-  }
-#else
-  (void)pb; (void)nbad; (void)when; (void)first;
-#endif
-  return nchanged;
-}
-
-
-//----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::SplitCloudsP1Device3D
-//! \brief The device P1 split in 3-D (SplitCloudsP1Device with a third direction): pieces per
+//! (the device P1 split, see SplitCloudsP1DeviceT below; formerly SplitCloudsP1Device3D): pieces per
 //! particle, exclusive scan for the slots and tags, one fill kernel; the center piece keeps its
 //! parent's slot and tag.  Returns the number of split / released particles.
 //! cloud_split_budget > 0: the events are taken in particle index order while fewer than the
@@ -1078,7 +993,19 @@ int DustGasDrag::RouteToOwnerBlocks3D(const char *when, const int first) {
 //! it, so the taken events are a prefix and keep their offsets); the others wait.  With
 //! cloud_split_resample the anchor blocks of the taken events are marked in split_blk.
 
-int DustGasDrag::SplitCloudsP1Device3D() {
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::SplitCloudsP1DeviceT
+//! \brief The moving P1 split on the device on either traversal (SplitCloudsP1Device
+//! and SplitCloudsP1Device3D written once: the same flags, pieces (P1FlagT, P1SepT, P1BuildT along
+//! each of the kDim directions), tags, blocks and split-velocity gradient; the mass and the cloud
+//! code in each dimension's own expression).  The split budget and the split blocks' marks
+//! (cloud_split_budget, cloud_split_resample) exist for 3-D clouds only (2-D refuses them).
+
+template <class LTT>
+int DustGasDrag::SplitCloudsP1DeviceT(const LTT &lt_in) {
+  using A = LeafApi<LTT>;
+  constexpr int kD = A::kDim;
+  constexpr bool k3 = (kD == 3);
   particles::Particles *ppar = pmy_pack->ppart;
   Mesh *pmesh = pmy_pack->pmesh;
   const int npart = ppar->nprtcl_thispack;
@@ -1087,7 +1014,7 @@ int DustGasDrag::SplitCloudsP1Device3D() {
   split_gid_mark.clear();
   if (split_blk_mark) {
     // every slot of the leaf traversal: a piece can land in a halo block (another rank's)
-    const int nslot = std::max(1, leaf_traversal3d.nall);
+    const int nslot = std::max(1, lt_in.nall);
     if (split_blk.extent_int(0) != nslot) {
       split_blk = DvceArray1D<int>("dust_split_blk", nslot);
     } else {
@@ -1098,13 +1025,14 @@ int DustGasDrag::SplitCloudsP1Device3D() {
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
   const int nrdata = ppar->nrdata, nidata = ppar->nidata;
-  const auto lt = leaf_traversal3d;
+  const LTT lt = lt_in;
   const Real slack = cloud_split_slack;
-  const int sh1 = SMRCompositeTransfer::kCloudLobeShift1;
-  const int sh2 = SMRCompositeTransfer::kCloudLobeShift2;
-  const int sh3 = SMRCompositeTransfer::kCloudLobeShift3;
+  const int sh1 = CloudGeometry::kCloudLobeShift1;
+  const int sh2 = CloudGeometry::kCloudLobeShift2;
+  const int sh3 = CloudGeometry::kCloudLobeShift3;
+  int x3bc = 0;   // (3-D: 1 at reflecting physical x3 faces)
+  if constexpr (k3) x3bc = lt_in.x3bc;
   const int gids = pmy_pack->gids;
-  const int ncell123 = qdep.extent_int(4)*qdep.extent_int(3)*qdep.extent_int(2);
   if (split_np.extent_int(0) < npart) {
     split_np = DvceArray1D<int>(Kokkos::view_alloc(Kokkos::WithoutInitializing,
                                                    "dust_split_np"), npart + npart/4);
@@ -1121,16 +1049,18 @@ int DustGasDrag::SplitCloudsP1Device3D() {
   }
   auto sepv = split_sep;
   int nflag = 0, nparent = 0;
-  Kokkos::parallel_reduce("dust_split3d_count", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  Kokkos::parallel_reduce(k3 ? "dust_split3d_count" : "dust_split_count",
+                          Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p, int &sf, int &sp) {
     const int code = pi(PLEV,p);
-    const Real x = pr(IPX,p), y = pr(IPY,p), z = pr(IPZ,p);
+    Real x[3];
+    A::Load(pr, p, x);
     const int m = lt.Anchor(pi(PGID,p));
-    if (!P1Flag3(lt, m, code, x, y, z, slack)) {np(p) = 0; return;}
-    DPiece3 p1[3], p2[3], p3[3]; int n1, n2, n3, clev; bool parent;
-    const int sep = P1Sep3(lt, m, code, x, y, z, slack);
-    P1Build3(code, sep, p1, p2, p3, n1, n2, n3, clev, parent);
-    np(p) = n1*n2*n3;
+    if (!P1FlagT(lt, m, code, x, slack)) {np(p) = 0; return;}
+    DPiece3 pc[3][3]; int n[3], clev; bool parent;
+    const int sep = P1SepT(lt, m, code, x, slack);
+    P1BuildT<kD>(code, sep, pc, n, clev, parent);
+    np(p) = n[0]*n[1]*n[2];
     if (gbsep) sepv(p) = sep;
     sf += 1;
     if (parent) sp += 1;
@@ -1148,12 +1078,32 @@ int DustGasDrag::SplitCloudsP1Device3D() {
       upd += (np(p) > 0) ? np(p) - 1 : 0;
     }, ntags64);
     if (ntags64 <= budget) ntags = static_cast<int>(ntags64);
-  } else {
-    Kokkos::parallel_scan("dust_split3d_scan", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  } else if (static_cast<long long>(nflag)*(kD == 3 ? 26 : 8) <= static_cast<long long>(INT_MAX) - npart) {
+    // (the int sum, as before: a flagged cloud adds at most 3^d - 1 pieces, so neither the new
+    // clouds nor the particle count can leave the int range; the 64-bit scan below costs more
+    // on GPUs)
+    Kokkos::parallel_scan(k3 ? "dust_split3d_scan" : "dust_split_scan",
+                          Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p, int &upd, const bool final) {
       if (final) tagoff(p) = upd;
       upd += (np(p) > 0) ? np(p) - 1 : 0;
     }, ntags);
+  } else {
+    // (a 64-bit sum: the new clouds and the particle count must stay within the int range)
+    Kokkos::parallel_scan(k3 ? "dust_split3d_scan64" : "dust_split_scan64",
+                          Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, long long &upd, const bool final) {
+      if (final) tagoff(p) = static_cast<int>(upd);
+      upd += (np(p) > 0) ? np(p) - 1 : 0;
+    }, ntags64);
+    if (ntags64 > static_cast<long long>(INT_MAX)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                << "the split (P1) on rank " << global_variable::my_rank << " asks for "
+                << ntags64 << " new clouds, beyond the int range of the particle arrays; set "
+                << "<dust>/cloud_split_budget" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    ntags = static_cast<int>(ntags64);
   }
   if (cloud_split_budget > 0 && ntags64 > cloud_split_budget) {
     // (the first event has offset 0 and is always taken; at most 26 clouds above the budget)
@@ -1164,9 +1114,10 @@ int DustGasDrag::SplitCloudsP1Device3D() {
       if (np(p) == 0) return;
       if (tagoff(p) >= budget) {np(p) = 0; sh += 1; return;}
       const int code = pi(PLEV,p);
-      using T = SMRCompositeTransfer;
+      using T = CloudGeometry;
       sf += 1;
       if (T::CloudLobe1(code) == 0 && T::CloudLobe2(code) == 0 && T::CloudLobe3(code) == 0) sp += 1;
+      // (2-D codes have no x3 lobe: the same test)
       st += np(p) - 1;
     }, Kokkos::Sum<int>(nf), Kokkos::Sum<int>(npar), Kokkos::Sum<int>(nt), Kokkos::Sum<int>(nh));
     nflag = nf; nparent = npar; ntags = nt;
@@ -1177,10 +1128,20 @@ int DustGasDrag::SplitCloudsP1Device3D() {
   // (cloud_split_velocity = mesh_gradient) the parents' mean-flow gradients, rows tagoff(p)
   const bool ai = SplitVelocityPrepare(ntags);
   auto vg = split_vgrad;
-  const int nnew = npart + ntags;
+  const long long nnew64 = static_cast<long long>(npart) + ntags;
+  if (nnew64 > static_cast<long long>(INT_MAX)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "the split (P1) on rank " << global_variable::my_rank << ": " << npart
+              << " clouds and " << ntags << " new ones exceed the int range of the particle "
+              << "arrays; set <dust>/cloud_split_budget" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const int nnew = static_cast<int>(nnew64);
   if (ppar->prtcl_rdata.extent_int(1) < nnew) {
-    Kokkos::resize(ppar->prtcl_rdata, nrdata, nnew + nnew/4);
-    Kokkos::resize(ppar->prtcl_idata, nidata, nnew + nnew/4);
+    // (25% headroom, at most the int range)
+    const int ncap = static_cast<int>(std::min(nnew64 + nnew64/4, static_cast<long long>(INT_MAX)));
+    Kokkos::resize(ppar->prtcl_rdata, nrdata, ncap);
+    Kokkos::resize(ppar->prtcl_idata, nidata, ncap);
   }
   auto prv = ppar->prtcl_rdata;
   auto piv = ppar->prtcl_idata;
@@ -1194,92 +1155,96 @@ int DustGasDrag::SplitCloudsP1Device3D() {
     // the count pass's separation flags (the fill uses the same flags), the range factor (range:
     // G of the row scaled), with the diagnostic the pieces' statistics
     const int gbmode = split_gb_mode;
-    const Real gbmargin = split_gb_margin, gbrsmp = split_gb_rsmp;
-    const int gbkind = split_gb_kind, gbucol = split_gb_ucol;
+    const Real gbrsmp = split_gb_rsmp;
+    const int gbucol = split_gb_ucol;
     const bool gbfull = split_gb_full;
     auto gbc = split_gb_cnt;
     auto gbm = split_gb_max;
     auto gbs = split_gb_smp;
-    Kokkos::parallel_for("dust_split3d_gbound", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    Kokkos::parallel_for(k3 ? "dust_split3d_gbound" : "dust_split_gbound",
+                         Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
     KOKKOS_LAMBDA(const int p) {
       if (np(p) < 2) return;
-      using T = SMRCompositeTransfer;
       const int code = piv(PLEV,p);
-      const Real x = prv(IPX,p), y = prv(IPY,p), z = prv(IPZ,p);
-      DPiece3 p1[3], p2[3], p3[3]; int n1, n2, n3, clev; bool parent;
-      P1Build3(code, sepv(p), p1, p2, p3, n1, n2, n3, clev, parent);   // the count pass's flags
-      if (n1*n2*n3 < 2) return;
-      const Real e1 = lt.CloudHalfWidth1(clev), e2 = lt.CloudHalfWidth2(clev);
-      const Real e3 = lt.CloudHalfWidth3(clev);
+      Real x[3];
+      A::Load(prv, p, x);
+      DPiece3 pc[3][3]; int n[3], clev; bool parent;
+      P1BuildT<kD>(code, sepv(p), pc, n, clev, parent);   // the count pass's flags
+      if (n[0]*n[1]*n[2] < 2) return;
       Real dk[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
-      const int nk[3] = {n1, n2, n3};
-      for (int a=0; a<n1; ++a) {
-        dk[0][a] = p1[a].off*e1 + SplitLobeShift(p1[a].lobe, e1) -
-                   (parent ? 0.0 : SplitLobeShift(T::CloudLobe1(code), e1));
+      for (int d=0; d<kD; ++d) {
+        const Real e = A::HalfWidth(lt, clev, d);
+        for (int a=0; a<n[d]; ++a) {
+          dk[d][a] = pc[d][a].off*e + SplitLobeShift(pc[d][a].lobe, e) -
+                     (parent ? 0.0 : SplitLobeShift(A::Lobe(code, d), e));
+        }
       }
-      for (int b=0; b<n2; ++b) {
-        dk[1][b] = p2[b].off*e2 + SplitLobeShift(p2[b].lobe, e2) -
-                   (parent ? 0.0 : SplitLobeShift(T::CloudLobe2(code), e2));
-      }
-      for (int c=0; c<n3; ++c) {
-        dk[2][c] = p3[c].off*e3 + SplitLobeShift(p3[c].lobe, e3) -
-                   (parent ? 0.0 : SplitLobeShift(T::CloudLobe3(code), e3));
-      }
-      SplitGradientBound(vg, tagoff(p), gbmode, gbmargin, gbkind, gbfull, gbucol, gbrsmp, dk, nk, x, y,
-                         z, gbc, gbm, gbs);
+      SplitGradientBound(vg, tagoff(p), gbmode, gbfull, gbucol, gbrsmp, dk, n, x[0],
+                         x[1], x[2], gbc, gbm, gbs);
     });
   }
-  Kokkos::parallel_for("dust_split3d_fill", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  Kokkos::parallel_for(k3 ? "dust_split3d_fill" : "dust_split_fill",
+                       Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
   KOKKOS_LAMBDA(const int p) {
     if (np(p) == 0) return;
     if (mark) Kokkos::atomic_fetch_or(&sblk(lt.Anchor(piv(PGID,p))), 1);
     const int code = piv(PLEV,p);
-    const Real x = prv(IPX,p), y = prv(IPY,p), z = prv(IPZ,p), mass = prv(IPM,p);
-    DPiece3 p1[3], p2[3], p3[3]; int n1, n2, n3, clev; bool parent;
+    Real x[3];
+    A::Load(prv, p, x);
+    const Real mass = prv(IPM,p);
+    DPiece3 pc[3][3]; int n[3], clev; bool parent;
     // (with the piece bound the count pass's separation flags, as the range kernel)
-    P1Build3(code, gbsep ? sepv(p) : P1Sep3(lt, lt.Anchor(piv(PGID,p)), code, x, y, z, slack),
-             p1, p2, p3, n1, n2, n3, clev, parent);
-    const Real e1 = lt.CloudHalfWidth1(clev), e2 = lt.CloudHalfWidth2(clev);
-    const Real e3 = lt.CloudHalfWidth3(clev);
-    const int n12 = n1*n2;
-    for (int k=n12*n3-1; k>=0; --k) {
-      const int a = k % n1, b = (k/n1) % n2, c = k/n12;
+    P1BuildT<kD>(code, gbsep ? sepv(p) : P1SepT(lt, lt.Anchor(piv(PGID,p)), code, x, slack), pc, n,
+                 clev, parent);
+    Real e[3] = {0.0, 0.0, 0.0};
+    for (int d=0; d<kD; ++d) e[d] = A::HalfWidth(lt, clev, d);
+    const int n12 = n[0]*n[1];
+    // the parent's slot is written last, after the appended pieces have copied it
+    for (int k=n12*n[2]-1; k>=0; --k) {
+      const int ia[3] = {k % n[0], (k/n[0]) % n[1], k/n12};
       const int s = (k == 0) ? p : npart + tagoff(p) + k - 1;
-      Real cx = x + p1[a].off*e1, cy = y + p2[b].off*e2, cz = z + p3[c].off*e3;
-      // (shear-periodic x1: y moves with an x wrap; a physical x3 face: a piece beyond it
+      Real c[3] = {x[0], x[1], x[2]};
+      for (int d=0; d<kD; ++d) c[d] = x[d] + pc[d][ia[d]].off*e[d];
+      // (3-D: shear-periodic x1, y moves with an x wrap; a physical x3 face: a piece beyond it
       // is mirrored back with its x3 lobe swapped)
-      const int zmir = lt.WrapPos(cx, cy, cz);
+      const int zmir = WrapPieceT(lt, c);
       if (k > 0) {
         for (int q=0; q<nrdata; ++q) prv(q,s) = prv(q,p);
         for (int q=0; q<nidata; ++q) piv(q,s) = piv(q,p);
+        // the center keeps the tag
         SetTag(piv, s, tag0 + static_cast<std::uint64_t>(tagoff(p) + k - 1)*tstride);
       }
-      prv(IPX,s) = cx; prv(IPX1,s) = cx;
-      prv(IPY,s) = cy; prv(IPY1,s) = cy;
-      prv(IPZ,s) = cz; prv(IPZ1,s) = cz;
-      prv(IPM,s) = mass*p1[a].frac*p2[b].frac*p3[c].frac;
-      piv(PLEV,s) = clev | (p1[a].lobe << sh1) | (p2[b].lobe << sh2) |
-                    ((zmir ? LeafTraversal3D::MirrorLobe(p3[c].lobe) : p3[c].lobe) << sh3);
-      if (zmir && lt.x3bc == 1) {   // a reflecting face: the velocity mirrored too
+      prv(IPX,s) = c[0]; prv(IPX1,s) = c[0];
+      prv(IPY,s) = c[1]; prv(IPY1,s) = c[1];
+      // (the mass of 2-D and 3-D in their own expressions: mass f1 f2, (mass f1 f2) f3)
+      Real mp = mass*pc[0][ia[0]].frac*pc[1][ia[1]].frac;
+      int code_s = clev | (pc[0][ia[0]].lobe << sh1) | (pc[1][ia[1]].lobe << sh2);
+      if (A::kDim == 3) {
+        prv(IPZ,s) = c[2]; prv(IPZ1,s) = c[2];
+        mp = mp*pc[2][ia[2]].frac;
+        code_s |= (zmir ? LeafTraversal3D::MirrorLobe(pc[2][ia[2]].lobe) : pc[2][ia[2]].lobe) << sh3;
+      }
+      prv(IPM,s) = mp;
+      piv(PLEV,s) = code_s;
+      if (zmir && x3bc == 1) {   // a reflecting face: the velocity mirrored too
         prv(IPVZ,s) = -prv(IPVZ,s); prv(IPVZ1,s) = -prv(IPVZ1,s);
       }
       // mesh_gradient: v += G (piece centroid - parent centroid); a piece mirrored at a reflecting
       // x3 face gets -(G d)_z, its v_z reversed with the rest (the wall impulse: the pieces'
       // normal momentum is then not the parent's, as with An)
-      if (ai && n12*n3 > 1) {
-        using T = SMRCompositeTransfer;
-        const Real d1 = p1[a].off*e1 + SplitLobeShift(p1[a].lobe, e1) -
-                        (parent ? 0.0 : SplitLobeShift(T::CloudLobe1(code), e1));
-        const Real d2 = p2[b].off*e2 + SplitLobeShift(p2[b].lobe, e2) -
-                        (parent ? 0.0 : SplitLobeShift(T::CloudLobe2(code), e2));
-        const Real d3 = p3[c].off*e3 + SplitLobeShift(p3[c].lobe, e3) -
-                        (parent ? 0.0 : SplitLobeShift(T::CloudLobe3(code), e3));
-        SplitAddGradient(prv, s, vg, tagoff(p), d1, d2, d3, (zmir && lt.x3bc == 1) ? -1.0 : 1.0);
+      if (ai && n12*n[2] > 1) {
+        Real dd[3] = {0.0, 0.0, 0.0};
+        for (int d=0; d<kD; ++d) {
+          dd[d] = pc[d][ia[d]].off*e[d] + SplitLobeShift(pc[d][ia[d]].lobe, e[d]) -
+                  (parent ? 0.0 : SplitLobeShift(A::Lobe(code, d), e[d]));
+        }
+        SplitAddGradient(prv, s, vg, tagoff(p), dd[0], dd[1], dd[2],
+                         (zmir && x3bc == 1) ? -1.0 : 1.0);
       }
       const int am = lt.Anchor(piv(PGID,s));
-      const int slot = NewCloudSlot3(lt, cx, cy, cz, am, ncell123);
+      const int slot = NewCloudSlotT(lt, c, am);
       if (mark && slot >= 0) Kokkos::atomic_fetch_or(&sblk(slot), 2);   // the block it landed in
-      piv(PGID,s) = gids + NewCloudBlock3(lt, slot, am);
+      piv(PGID,s) = gids + NewCloudBlockT(lt, slot, am);
     }
   });
   if (mark) {
@@ -1307,7 +1272,9 @@ int DustGasDrag::SplitCloudsP1Device3D() {
       const int am = lt.Anchor(piv(PGID,p));
       for (int k=1; k<np(p); ++k) {
         const int s = npart + tagoff(p) + k - 1;
-        const int slot = NewCloudSlot3(lt, prv(IPX,s), prv(IPY,s), prv(IPZ,s), am, ncell123);
+        Real cs[3];
+        A::Load(prv, s, cs);
+        const int slot = NewCloudSlotT(lt, cs, am);
         if (slot < 0 || slot == am) continue;
         const int g = (slot < nmb) ? gids + slot : sgid(slot);
         bool near = false;
@@ -1323,8 +1290,9 @@ int DustGasDrag::SplitCloudsP1Device3D() {
     int noff = 0;
     Kokkos::parallel_reduce("dust_split3d_offrank", Kokkos::RangePolicy<>(DevExeSpace(), npart, nnew),
     KOKKOS_LAMBDA(const int s, int &n) {
-      const int slot = NewCloudSlot3(lt, prv(IPX,s), prv(IPY,s), prv(IPZ,s),
-                                     lt.Anchor(piv(PGID,s)), ncell123);
+      Real cs[3];
+      A::Load(prv, s, cs);
+      const int slot = NewCloudSlotT(lt, cs, lt.Anchor(piv(PGID,s)));
       if (slot >= nmb) ++n;
     }, Kokkos::Sum<int>(noff));
     split_last_offrank = noff;
@@ -1339,6 +1307,8 @@ int DustGasDrag::SplitCloudsP1Device3D() {
   pmesh->nprtcl_total = nnew;
   return nflag;
 }
+template int DustGasDrag::SplitCloudsP1DeviceT<LeafTraversal>(const LeafTraversal &);
+template int DustGasDrag::SplitCloudsP1DeviceT<LeafTraversal3D>(const LeafTraversal3D &);
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::PackGatherField3D, PackGasGather3D
@@ -1389,12 +1359,17 @@ void DustGasDrag::PackGasGather3D(const DvceArray5D<Real> &u) {
 }
 
 //----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::CloudPredictor3D
-//! \brief The production refinable-cloud PC2 predictor (DepositDrag, linear gather) in 3-D:
-//! linear gather of the step-start gas velocity over the cloud, the drag impulse deposited with
-//! the cloud's own weights into qdep (components 1-3, and 4 with rate_dep).
+//! \fn DustGasDrag::CloudPredictorT
+//! \brief The production refinable-cloud PC2 predictor (DepositDrag, linear gather) on either
+//! traversal (the 2-D kernel of DepositDrag and the 3-D one written once, the
+//! per-dimension expressions in LeafApi::GatherLinear and Measure): the linear gather of the
+//! step-start gas velocity (u1) over the cloud, the drag impulse deposited with the cloud's own
+//! weights (the gather's when the shapes agree) into qdep 1-3 (and 4 with rate_dep).
 
-void DustGasDrag::CloudPredictor3D(const bool rate_dep) {
+template <class LTT>
+void DustGasDrag::CloudPredictorT(const LTT &lt, const bool rate_dep) {
+  using A = LeafApi<LTT>;
+  constexpr int kC = A::kCache;
   particles::Particles *ppar = pmy_pack->ppart;
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
@@ -1403,75 +1378,79 @@ void DustGasDrag::CloudPredictor3D(const bool rate_dep) {
   const int is = indcs.is, js = indcs.js, ks = indcs.ks;
   const Real dt = pmy_pack->pmesh->dt;
   auto &qdep_ = qdep;
-  UpdateShear3D(pmy_pack->pmesh->time);   // positions at the start of the step
-  const auto lt = leaf_traversal3d;
-  const int tmode = cloud_transition;
-  PackGasGather3D(pmy_pack->phydro->u1);
-  auto gp = gpack3;
+  if constexpr (A::kDim == 3) {
+    UpdateShear3D(pmy_pack->pmesh->time);   // positions at the start of the step
+    PackGasGather3D(pmy_pack->phydro->u1);
+  } else {
+    PackGasGather(pmy_pack->phydro->u1);
+  }
+  const LTT ltc = lt;   // (a copy for the kernel; the shear set above)
+  auto gp = (A::kDim == 3) ? gpack3 : gpack;
   auto body = KOKKOS_LAMBDA(const int p) {
-    using T = SMRCompositeTransfer;
-    const Real xp = pr(IPX,p), yp = pr(IPY,p), zp = pr(IPZ,p);
-    const int am = lt.Anchor(pi(PGID,p));
+    using T = CloudGeometry;
+    Real x[3];
+    A::Load(pr, p, x);
+    const int am = ltc.Anchor(pi(PGID,p));
     const int lev = pi(PLEV,p);
-    Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-    int nt = 0, tt[kCache3];
-    Real tw[kCache3];
-    const int gcode = T::GatherCode(lev, tmode);
+    Real ug[3] = {0.0, 0.0, 0.0};
+    // the gather's leaf weights are the deposit's: keep them
+    int nt = 0, tt[kC];
+    Real tw[kC];
+    const int gcode = T::GatherCode(lev);
+    // same shape for the gather and the deposit (the point flag changes moments only)
     const bool same = (gcode & ~T::kCloudGatherPoint) == lev;
-    lt.ForEachCloudMoment(xp, yp, zp, gcode, am,
+    A::ForEachMoment(ltc, x, gcode, am,
     [&](const int target, const Real w, const Real m1x, const Real m1y, const Real m1z) {
-      int tb, tk, tj, ti;
-      lt.Decode(target, tb, tk, tj, ti);
-      const Real dx1 = lt.box(tb,3), dx2 = lt.box(tb,4), dx3 = lt.box(tb,5);
-      const Real xc = lt.box(tb,0) + (ti - is + 0.5)*dx1;
-      const Real yc = lt.box(tb,1) + (tj - js + 0.5)*dx2;
-      const Real zc = lt.box(tb,2) + (tk - ks + 0.5)*dx3;
-      const Real cx = 0.5*(m1x + T::MinImage(xp - xc, lt.lx)*w)/dx1;
-      const Real cy = 0.5*(m1y + T::MinImage(yp - yc, lt.ly)*w)/dx2;
-      const Real cz = 0.5*(m1z + T::MinImage(zp - zc, lt.lz)*w)/dx3;
-      ugx += w*gp(tb,tk,tj,ti,0) + cx*gp(tb,tk,tj,ti,3) + cy*gp(tb,tk,tj,ti,6) + cz*gp(tb,tk,tj,ti,9);
-      ugy += w*gp(tb,tk,tj,ti,1) + cx*gp(tb,tk,tj,ti,4) + cy*gp(tb,tk,tj,ti,7) + cz*gp(tb,tk,tj,ti,10);
-      ugz += w*gp(tb,tk,tj,ti,2) + cx*gp(tb,tk,tj,ti,5) + cy*gp(tb,tk,tj,ti,8) + cz*gp(tb,tk,tj,ti,11);
-      if (nt < kCache3) {tt[nt] = target; tw[nt] = w;}
+      A::GatherLinear(ltc, gp, target, w, m1x, m1y, m1z, x, is, js, ks, ug);
+      if (nt < kC) {tt[nt] = target; tw[nt] = w;}
       ++nt;
     });
     const Real mass_rate = pr(IPM,p)/pr(IPTS,p);
-    const Real gx = -dt*mass_rate*(ugx - pr(IPVX,p));
-    const Real gy = -dt*mass_rate*(ugy - pr(IPVY,p));
-    const Real gz = -dt*mass_rate*(ugz - pr(IPVZ,p));
+    const Real gx = -dt*mass_rate*(ug[0] - pr(IPVX,p));
+    const Real gy = -dt*mass_rate*(ug[1] - pr(IPVY,p));
+    const Real gz = -dt*mass_rate*(ug[2] - pr(IPVZ,p));
     auto add = [&](const int target, const Real w) {
       int tb, tk, tj, ti;
-      lt.Decode(target, tb, tk, tj, ti);
-      const Real inv_volume = 1.0/(lt.box(tb,3)*lt.box(tb,4)*lt.box(tb,5));
+      A::Decode(ltc, target, tb, tk, tj, ti);
+      const Real inv_volume = 1.0/A::Measure(ltc, tb);
       DepositAdd(&qdep_(tb,1,tk,tj,ti), inv_volume*w*gx);
       DepositAdd(&qdep_(tb,2,tk,tj,ti), inv_volume*w*gy);
       DepositAdd(&qdep_(tb,3,tk,tj,ti), inv_volume*w*gz);
       if (rate_dep) DepositAdd(&qdep_(tb,4,tk,tj,ti), inv_volume*w*mass_rate);
     };
-    if (same && nt <= kCache3) {
+    if (same && nt <= kC) {
       for (int q=0; q<nt; ++q) if (tw[q] != 0.0) add(tt[q], tw[q]);
     } else {
-      lt.ForEachCloudWeight(xp, yp, zp, lev, am, add);
+      A::ForEachWeight(ltc, x, lev, am, add);
     }
   };
+  const char *label = (A::kDim == 3) ? "dust_pc2_cloud3d_predictor" : "dust_pc2_cloud_predictor_linear";
+  if (A::kDim == 2) CloudOrderCount(cloud_ord_n > 0);
   if (cloud_ord_n > 0) {   // (cloud_order_interval) in the cell-sorted index order
-    CloudParForOrdered("dust_pc2_cloud3d_predictor", npart, cloud_ord, cloud_ord_n, body);
+    CloudParForOrdered(label, npart, cloud_ord, cloud_ord_n, body);
   } else {
-    CloudParFor("dust_pc2_cloud3d_predictor", npart, body);
+    CloudParFor(label, npart, body);
   }
-  // deposits on halo blocks back to their owners; component 4 (stiffness) only when the automatic
-  // PC2 / split-BE switch reads it (rate_dep, the same on every rank)
+  // deposits on halo blocks back to their owners; component 4 (stiffness) only when the stiffness
+  // monitor, dt limit or predictor damping reads it (rate_dep, the same on every rank)
   HaloReverseAdd(qdep, 1, rate_dep ? 4 : 3);
 }
+template void DustGasDrag::CloudPredictorT<LeafTraversal>(const LeafTraversal &, const bool);
+template void DustGasDrag::CloudPredictorT<LeafTraversal3D>(const LeafTraversal3D &, const bool);
 
 //----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::CloudAdvance3D
-//! \brief The production refinable-cloud PC2 advance (ExplicitPush, linear gather) in 3-D:
-//! linear gather of the midpoint gas velocity u* at the midpoint position, implicit-midpoint
-//! kick and drift (the 3-D shearing-box terms as in the 2-D kernel), and the impulse deposited
-//! with the cloud's weights into dmom.
+//! \fn DustGasDrag::CloudAdvanceT
+//! \brief The production refinable-cloud PC2 advance (ExplicitPush, linear gather) on either
+//! traversal (the 2-D kernel of ExplicitPush and the 3-D one written once, the
+//! per-dimension steps in CloudPC2Push and LeafApi): the linear gather of the midpoint gas velocity
+//! u* at the midpoint, the implicit-midpoint kick and drift, the impulse deposited into dmom with
+//! the cloud's weights.  dmom is cleared by the caller (ExplicitPush).
 
-void DustGasDrag::CloudAdvance3D() {
+template <class LTT>
+void DustGasDrag::CloudAdvanceT(const LTT &lt) {
+  using A = LeafApi<LTT>;
+  using PU = CloudPC2Push<LTT>;
+  constexpr int kC = A::kCache;
   particles::Particles *ppar = pmy_pack->ppart;
   auto &pr = ppar->prtcl_rdata;
   auto &pi = ppar->prtcl_idata;
@@ -1481,78 +1460,52 @@ void DustGasDrag::CloudAdvance3D() {
   const Real dt = pmy_pack->pmesh->dt;
   const bool br = back_reaction;
   const bool is_sbox = is_shearing_box, is_strat = is_stratified;
-  const Real qshear_ = qshear, omega0_ = omega0;
+  const Real qshear_ = qshear, omega0_ = omega0, aphi = const_accel_phi;
   auto &dmom_ = dmom;
-  // the gas is sampled in its t^n orbital-advection frame (the remap runs after this
-  // gather and the impulse deposit), so the shear-periodic images are those of t^n
-  UpdateShear3D(pmy_pack->pmesh->time);
-  const auto lt = leaf_traversal3d;
-  const int tmode = cloud_transition;
-  PackGatherField3D(ustar);
-  auto gp = gpack3;
+  if constexpr (A::kDim == 3) {
+    // the gas is sampled in its t^n orbital-advection frame (the remap runs after this
+    // gather and the impulse deposit), so the shear-periodic images are those of t^n
+    UpdateShear3D(pmy_pack->pmesh->time);
+    PackGatherField3D(ustar);
+  } else {
+    PackGatherField(ustar);
+  }
+  const LTT ltc = lt;   // (a copy for the kernel; the shear set above)
+  auto gp = (A::kDim == 3) ? gpack3 : gpack;
   auto body = KOKKOS_LAMBDA(const int p) {
-    using T = SMRCompositeTransfer;
-    int nt = 0, tt[kCache3];
-    Real tw[kCache3];
-    const Real x0 = pr(IPX1,p), y0 = pr(IPY1,p), z0 = pr(IPZ1,p);
-    const int am = lt.Anchor(pi(PGID,p));
-    const Real vx0 = pr(IPVX1,p), vy0 = pr(IPVY1,p), vz0 = pr(IPVZ1,p);
-    const Real xh = x0 + 0.5*dt*vx0;
-    const Real yh = y0 + 0.5*dt*(vy0 - (is_sbox ? qshear_*omega0_*x0 : 0.0));
-    const Real zh = z0 + 0.5*dt*vz0;
-    // the gas met at the lab midpoint (xh, yh) sits at yh + q Omega xh dt/2 in the stored
-    // field (IPY1 keeps the lab midpoint)
-    const Real yg = yh + (is_sbox ? qshear_*omega0_*xh*0.5*dt : 0.0);
-    Real ugx = 0.0, ugy = 0.0, ugz = 0.0;
-    const int glev = T::GatherCode(pi(PLEV,p), tmode);
+    using T = CloudGeometry;
+    // the gather's leaf weights are the deposit's: keep them
+    int nt = 0, tt[kC];
+    Real tw[kC];
+    const Real x0[3] = {pr(IPX1,p), pr(IPY1,p), pr(IPZ1,p)};
+    const int am = ltc.Anchor(pi(PGID,p));
+    const Real v0[3] = {pr(IPVX1,p), pr(IPVY1,p), pr(IPVZ1,p)};
+    Real xh[3], xg[3];
+    PU::Midpoint(x0, v0, dt, is_sbox, qshear_, omega0_, xh, xg);
+    Real ug[3] = {0.0, 0.0, 0.0};
+    const int glev = T::GatherCode(pi(PLEV,p));
+    // same shape for the gather and the deposit (the point flag changes moments only)
     const bool same = (glev & ~T::kCloudGatherPoint) == pi(PLEV,p);
-    lt.ForEachCloudMoment(xh, yg, zh, glev, am,
+    A::ForEachMoment(ltc, xg, glev, am,
     [&](const int target, const Real w, const Real m1x, const Real m1y, const Real m1z) {
-      int tb, tk, tj, ti;
-      lt.Decode(target, tb, tk, tj, ti);
-      const Real dx1 = lt.box(tb,3), dx2 = lt.box(tb,4), dx3 = lt.box(tb,5);
-      const Real xc = lt.box(tb,0) + (ti - is + 0.5)*dx1;
-      const Real yc = lt.box(tb,1) + (tj - js + 0.5)*dx2;
-      const Real zc = lt.box(tb,2) + (tk - ks + 0.5)*dx3;
-      const Real cx = 0.5*(m1x + T::MinImage(xh - xc, lt.lx)*w)/dx1;
-      const Real cy = 0.5*(m1y + T::MinImage(yg - yc, lt.ly)*w)/dx2;
-      const Real cz = 0.5*(m1z + T::MinImage(zh - zc, lt.lz)*w)/dx3;
-      ugx += w*gp(tb,tk,tj,ti,0) + cx*gp(tb,tk,tj,ti,3) + cy*gp(tb,tk,tj,ti,6) + cz*gp(tb,tk,tj,ti,9);
-      ugy += w*gp(tb,tk,tj,ti,1) + cx*gp(tb,tk,tj,ti,4) + cy*gp(tb,tk,tj,ti,7) + cz*gp(tb,tk,tj,ti,10);
-      ugz += w*gp(tb,tk,tj,ti,2) + cx*gp(tb,tk,tj,ti,5) + cy*gp(tb,tk,tj,ti,8) + cz*gp(tb,tk,tj,ti,11);
-      if (nt < kCache3) {tt[nt] = target; tw[nt] = w;}
+      A::GatherLinear(ltc, gp, target, w, m1x, m1y, m1z, xg, is, js, ks, ug);
+      if (nt < kC) {tt[nt] = target; tw[nt] = w;}
       ++nt;
     });
     const Real h = 0.5*dt;
     const Real lambda = h/pr(IPTS,p);
     const Real aa = 1.0 + lambda;
-    const Real rx = vx0 + lambda*ugx;
-    const Real ry = vy0 + lambda*ugy;
-    Real rz = vz0 + lambda*ugz;
-    Real vxh, vyh, vzh;
-    if (is_sbox) {
-      const Real cxy = 2.0*h*omega0_;
-      const Real cyx = h*(2.0-qshear_)*omega0_;
-      const Real det = aa*aa + cxy*cyx;
-      vxh = (aa*rx + cxy*ry)/det;
-      vyh = (aa*ry - cyx*rx)/det;
-      if (is_strat) rz -= h*SQR(omega0_)*zh;
-      vzh = rz/aa;
-    } else {
-      vxh = rx/aa;
-      vyh = ry/aa;
-      vzh = rz/aa;
-    }
-    pr(IPVX,p) = 2.0*vxh - vx0;
-    pr(IPVY,p) = 2.0*vyh - vy0;
-    pr(IPVZ,p) = 2.0*vzh - vz0;
-    pr(IPX,p) = x0 + dt*vxh;
-    pr(IPY,p) = y0 + dt*(vyh - (is_sbox ? qshear_*omega0_*xh : 0.0));
-    pr(IPZ,p) = z0 + dt*vzh;
-    pr(IPX1,p) = xh; pr(IPY1,p) = yh; pr(IPZ1,p) = zh;
-    const Real dvx_drag = dt*(ugx-vxh)/pr(IPTS,p);
-    const Real dvy_drag = dt*(ugy-vyh)/pr(IPTS,p);
-    const Real dvz_drag = dt*(ugz-vzh)/pr(IPTS,p);
+    Real r[3] = {v0[0] + lambda*ug[0], v0[1] + lambda*ug[1], v0[2] + lambda*ug[2]};
+    Real vh[3];
+    PU::Kick(h, aa, r, xh, is_sbox, is_strat, qshear_, omega0_, aphi, vh);
+    pr(IPVX,p) = 2.0*vh[0] - v0[0];
+    pr(IPVY,p) = 2.0*vh[1] - v0[1];
+    pr(IPVZ,p) = 2.0*vh[2] - v0[2];
+    PU::Drift(pr, p, x0, xh, vh, dt, is_sbox, qshear_, omega0_);
+    pr(IPX1,p) = xh[0]; pr(IPY1,p) = xh[1]; pr(IPZ1,p) = xh[2];
+    const Real dvx_drag = dt*(ug[0]-vh[0])/pr(IPTS,p);
+    const Real dvy_drag = dt*(ug[1]-vh[1])/pr(IPTS,p);
+    const Real dvz_drag = dt*(ug[2]-vh[2])/pr(IPTS,p);
     pr(IPRX,p) = dvx_drag;
     pr(IPRY,p) = dvy_drag;
     pr(IPRZ,p) = dvz_drag;
@@ -1560,25 +1513,29 @@ void DustGasDrag::CloudAdvance3D() {
     const Real mass = -pr(IPM,p);
     auto add = [&](const int target, const Real w) {
       int tb, tk, tj, ti;
-      lt.Decode(target, tb, tk, tj, ti);
-      const Real dw = mass*w/(lt.box(tb,3)*lt.box(tb,4)*lt.box(tb,5));
+      A::Decode(ltc, target, tb, tk, tj, ti);
+      const Real dw = mass*w/A::Measure(ltc, tb);
       DepositAdd(&dmom_(tb,0,tk,tj,ti), dw*dvx_drag);
       DepositAdd(&dmom_(tb,1,tk,tj,ti), dw*dvy_drag);
       DepositAdd(&dmom_(tb,2,tk,tj,ti), dw*dvz_drag);
     };
-    if (same && nt <= kCache3) {
+    if (same && nt <= kC) {
       for (int q=0; q<nt; ++q) if (tw[q] != 0.0) add(tt[q], tw[q]);
     } else {
-      lt.ForEachCloudWeight(xh, yg, zh, pi(PLEV,p), am, add);
+      A::ForEachWeight(ltc, xg, pi(PLEV,p), am, add);
     }
   };
+  const char *label = (A::kDim == 3) ? "dust_pc2_cloud3d_advance" : "dust_pc2_advance_linear";
+  if (A::kDim == 2) CloudOrderCount(cloud_ord_n > 0);
   if (cloud_ord_n > 0) {   // (cloud_order_interval) in the cell-sorted index order
-    CloudParForOrdered("dust_pc2_cloud3d_advance", npart, cloud_ord, cloud_ord_n, body);
+    CloudParForOrdered(label, npart, cloud_ord, cloud_ord_n, body);
   } else {
-    CloudParFor("dust_pc2_cloud3d_advance", npart, body);
+    CloudParFor(label, npart, body);
   }
   if (br) HaloReverseAdd(dmom, 0, 3);   // deposits on halo blocks back to their owners
 }
+template void DustGasDrag::CloudAdvanceT<LeafTraversal>(const LeafTraversal &);
+template void DustGasDrag::CloudAdvanceT<LeafTraversal3D>(const LeafTraversal3D &);
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::DepositCloudDensity3D
@@ -1602,22 +1559,9 @@ void DustGasDrag::DepositCloudDensity3D(DvceArray5D<Real> &f, const int species,
   const int npart = ppar->nprtcl_thispack;
   const auto lt = leaf_traversal3d;
   auto ff = f;
-  Kokkos::parallel_for("dust_cloud3d_density", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p) {
-    if (species >= 0 && pi(PSP,p) != species) return;
-    const Real m = pr(IPM,p), vx = pr(IPVX,p), vy = pr(IPVY,p), vz = pr(IPVZ,p);
-    lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
-    [&](const int target, const Real w) {
-      int tb, tk, tj, ti;
-      lt.Decode(target, tb, tk, tj, ti);
-      const Real d = m*w/(lt.box(tb,3)*lt.box(tb,4)*lt.box(tb,5));
-      DepositAdd(&ff(tb,0,tk,tj,ti), d);
-      if (density_only) return;
-      DepositAdd(&ff(tb,1,tk,tj,ti), d*vx);
-      DepositAdd(&ff(tb,2,tk,tj,ti), d*vy);
-      DepositAdd(&ff(tb,3,tk,tj,ti), d*vz);
-    });
-  });
+  // (written once, CloudFieldDepositT)
+  CloudFieldDepositT<LeafTraversal3D, false>("dust_cloud3d_density", lt, pr, pi, npart, species,
+                                             false, density_only ? 1 : 4, ff, CloudCodeSame());
   // several ranks: the owners hold every rank's clouds
   HaloReverseAdd(f, 0, density_only ? 1 : 4);
 }

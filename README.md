@@ -1,13 +1,12 @@
-# AthenaK dust: AMR, multi-species input, science outputs and dust self-gravity
+# AthenaK dust: dust particles on uniform and refined meshes, multi-species input, science outputs and self-gravity
 
-This branch (`amrSG_dev`) extends the dust module of the uniform-mesh dust branch [`dust`](https://github.com/athenak-dust/athenak/tree/dust) with
+The `dust` branch holds the dust module of [AthenaK](https://github.com/IAS-Astrophysics/athenak):
 
-- dust on statically and adaptively refined meshes (refinable dust clouds, or point particles with owner-overlap deposition),
+- Lagrangian dust particles coupled to the gas by drag with back-reaction, through the couplings `imex` (implicit–explicit; default drag solver `dc1`) and `pc2` (predictor–corrector),
+- dust on uniform meshes and on statically and adaptively refined meshes (refinable dust clouds, or point particles with owner-overlap deposition),
 - a multi-species input API (stopping times, abundances and sampling per species, power-law size distributions, and continuous size distributions sampled by Monte Carlo),
 - science outputs for the particles (`pbin`, `phst`) and dust mesh fields in the standard binary output,
-- self-gravity of the dust (and, experimentally, of the gas) with a multigrid Poisson solver that works on refined meshes and in the (stratified) shearing box.
-
-The basics of the dust module (particles, `pusher = imex_dust`, the drag couplings `imex` / `pc2`, back-reaction) are as on the `dust` branch; see its [README](https://github.com/athenak-dust/athenak/blob/dust/README.md) and the companion repository [athenak-dust/athenak_dust_tests](https://github.com/athenak-dust/athenak_dust_tests). The upstream AthenaK README is kept in [doc/README_upstream.md](doc/README_upstream.md); build the code as described there (CMake, Kokkos submodule, `-D PROBLEM=built_in_pgens`, with `-D Athena_ENABLE_MPI=ON` for several ranks).
+- self-gravity of the dust and of the gas with a multigrid Poisson solver that works on refined meshes and in the (stratified) shearing box.
 
 Example inputs for everything below are in [`inputs/dust_amr/`](inputs/dust_amr); each starts with a comment that says what it tests and how long it runs. Every dust problem has its own problem generator (section 3, Problem generators).
 
@@ -59,7 +58,7 @@ nsh_quadrature      = 256          # optional: points per bin for the NSH integr
 
 | Output | Content |
 | --- | --- |
-| `file_type = pbin` | every active particle: position, velocity, mass, species, stopping time, cloud shape code (level and lobes), 64-bit tag; a per-block table (gid, rank, level, logical location, bounds); the full input in the header (species and stopping time become header constants with one species and fixed stopping times, and so does the mass when every particle has the same mass).  `precision = single` stores the particle positions, velocities, masses and stopping times as float32 (default double).  One file per output time, written with MPI-IO.  Reader: `vis/python/pbin.py` |
+| `file_type = pbin` | every active particle: position, velocity, mass, species, stopping time, cloud shape code (level and lobes), 64-bit tag; a per-block table (gid, rank, level, logical location, bounds); the full input in the header (species and stopping time become header constants with one species and fixed stopping times, and so does the mass when every particle has the same mass).  `precision = single` stores the particle positions, velocities, masses and stopping times as float32 (the default; `double` for float64).  One file per output time, written with MPI-IO.  Reader: `vis/python/pbin.py` |
 | `file_type = phst` | one text line per output time: number of particles, mass, momentum, kinetic energy, `z_rms`, maximum dust density with its position and level, PC2 stiffness; with G/R also the number of merge groups and removed particles.  Reader: `vis/python/phst.py` (or `athena_read.hst`) |
 | `file_type = bin`, `variable = hydro_w` (or `hydro_u`) | adds `dust_total_rho` and `dust_total_mom1..3` automatically when dust is present (`dust_total = false` switches this off) |
 | `variable = dust_total` | `dust_total_rho`, `dust_total_mom1..3` alone |
@@ -86,7 +85,7 @@ guess = extrapolate      # first guess from the last two potentials
 
 - The dust mass is deposited with the same clouds/TSC as the drag; the acceleration is gathered at the particles and applied as a kick-drift-kick around the step.
 - Works with refined meshes (static and adaptive), the shearing box (shear-periodic x1) and several MPI ranks. The settings above are the ones used for the stratified SI runs; the self-gravity can be switched on at a restart ([`si3d_strat_amr1280_selfgrav_restart.athinput`](inputs/dust_amr/si3d_strat_amr1280_selfgrav_restart.athinput)).
-- Gas as a source (`source = gas | both`) needs `experimental_gas_source = true` (still experimental).
+- Gas as a source (`source = gas | both`) needs no extra key (`experimental_gas_source` is ignored with a note); an ideal gas as a source runs only in the tested set-up (one level, periodic in every direction, rk1/rk2/rk3).
 - Validation inputs: [`dust_freefall_u128`](inputs/dust_amr/dust_freefall_u128.athinput), [`dust_freefall_amr`](inputs/dust_amr/dust_freefall_amr.athinput) (homologous collapse of a cold sphere; Lagrangian radii and energy in `freefall_history.jsonl`) and [`dust_jeans_u128`](inputs/dust_amr/dust_jeans_u128.athinput) (linear growth of a dusty Jeans mode).
 - Outputs `gravity_phi`, `gravity_g1..3` (or `gravity`) write the potential and acceleration.
 
@@ -128,7 +127,7 @@ Dust-density trigger (`<mesh_refinement>/refinement = adaptive`, `<amr_criterion
 ```ini
 <dust>
 amr_density_trigger = true
-amr_rho_units = code            # code: rho_d in code units; mean: rho_d / <rho_d> (default)
+amr_rho_units = code            # code: rho_d in code units (default); mean: rho_d / <rho_d>
 amr_rho_refine = 64             # refine a level-0 block where rho_d >= 64 ...
 amr_rho_level_factor = 4        # ... and a level-l block where rho_d >= 64 * 4^l
 amr_rho_derefine = 32           # a level-l block coarsens below this * 4^(l-1)
@@ -166,7 +165,7 @@ Every dust problem has its own problem generator (`<problem>/pgen_name`). The pi
 | `dust_freefall` | collapse of a cold dust sphere under its own gravity | `dust_freefall_u128`, `dust_freefall_amr` |
 | `dust_jeans` | linear dusty Jeans mode | `dust_jeans_u128` |
 
-`dust_nsh` is in `src/pgen/tests/`, the others in `src/pgen/dust_amr/`. A key that belongs to another of these problem generators (for example `stratified_dust` in `dust_nsh`) stops the run with the name of the right one. On a refined mesh the particles start as root parents: `<problem>/cloud_root_random = true` places `ppc` parents per root cell over the whole box (`root_placement = random`, `lattice` or `generic`), and each parent is split exactly to the leaves it overlaps. On a uniform mesh (or with `amr_pic = instant_switch`) the same keys give the same parents as point particles, so uniform and refined runs start from the same samples. Without `cloud_root_random` the particles are point particles on a lattice or at random positions (`particle_placement`). The `<problem>/ba_*` keys (2-D) add the field snapshots and the particle density distribution of [`dust_snapshots.cpp`](src/pgen/dust_amr/dust_snapshots.cpp).
+`dust_nsh` is in `src/pgen/tests/`, the others in `src/pgen/dust_amr/`. A key that belongs to another of these problem generators (for example `stratified_dust` in `dust_nsh`) stops the run with the name of the right one. On a refined mesh the particles start as root parents: `<problem>/cloud_root_random = true` (the default with refinable clouds) places `ppc` parents per root cell over the whole box (`root_placement = random`, `lattice` or `generic`), and each parent is split exactly to the leaves it overlaps. On a uniform mesh (or with `amr_pic = instant_switch`) the same keys give the same parents as point particles, so uniform and refined runs start from the same samples. With `cloud_root_random = false` the particles are point particles on a lattice or at random positions (`particle_placement`). The `<problem>/ba_*` keys (2-D) add the field snapshots and the particle density distribution of [`dust_snapshots.cpp`](src/pgen/dust_amr/dust_snapshots.cpp).
 
 ## 4. Tuning parameters
 
@@ -176,7 +175,6 @@ All in `<dust>` unless noted. The defaults are the validated production values; 
 | --- | --- | --- |
 | `cloud_merge` (P) | on (off in `split_only`) | stage G |
 | `cloud_merge_alpha` (P) | 0.05 (2-D), 0.2 (3-D) | G velocity tolerance: cells moved within one damping time |
-| `cloud_merge_alpha_leaf` (P) | true | 3-D: measure alpha in cells of the leaf that holds the merge cell |
 | `cloud_merge_budget` (P) | 0.3 | G pass budget beta on the change of the deposited density (-1: no budget) |
 | `cloud_merge_budget_kappa` (P) | 0 (1 in `careful_merge`) | structure-relative G budget |
 | `cloud_merge_schedule`, `cloud_merge_dt_omega` (P) | `time`, 0.25 | G every 0.25/Omega (shearing box) |
@@ -188,21 +186,17 @@ All in `<dust>` unless noted. The defaults are the validated production values; 
 | `cloud_resample_eta_levels` | (none) | `auto`: eta_L = `min(eta 2^(L/2), max(4, eta))` in 3-D and `min(eta 2^(L/4), max(2, eta))` in 2-D (with eta = 2 in 3-D: 2, 2.83, 4, 4, ...), a cap that grows with the level up to 4 in 3-D and 2 in 2-D (unless eta is larger), below 2^d, at which a level-L cloud would carry the nominal mass of level L-1. A list of numbers gives eta_L per level as given (also above 4; <= 0: no cap on that level), e.g. `2 2.83 4 4` for levels 0-3; the last value holds for deeper levels |
 | `cloud_resample_schedule`, `cloud_resample_dt_omega` (P) | `time`, 0.25 | R every 0.25/Omega (shearing box); `cloud_resample_dt` in code time instead |
 | `cloud_resample_interval` (P) | 625 | R every N cycles (`cloud_resample_schedule = cycle`) |
-| `cloud_resample_after_regrid` (P) | false | also resample right after each regrid |
 | `cloud_resample_cold_alpha` (P) | 0 (0.05 in `careful_merge`) | R leaves cold (single-velocity) patches alone |
-| `cloud_resample_patch_split` | 1024 | split R patches holding more clouds than this into quadrants |
-| `amr_rho_units` | `mean` | trigger thresholds in units of the mean dust density, `code`, or `roche` |
+| `amr_rho_units` | `code` | trigger thresholds in code units, in units of the mean dust density (`mean`), or `roche` |
 | `amr_rho_refine`, `amr_rho_derefine` | (required) | refine a level-l block at `refine * f^l`, coarsen it below `derefine * f^(l-1)` (`f = amr_rho_level_factor`) |
 | `amr_rho_level_factor` | 1 | thresholds multiplied by this per level |
 | `amr_rho_refine_levels` | (none) | explicit refinement thresholds per level (starts with `amr_rho_refine`) |
 | `amr_rho_buffer` | 2 | buffer cells around dense cells |
-| `amr_shear_face_limit` | on | 2:1 level rule across shear-periodic x1 faces |
 | `<mesh_refinement>/ncycle_check` | (AthenaK) | cycles between refinement checks (50 is enough with self-gravity) |
 | `load_balance_cloud_weight` | 4 | block cost = cells + weight x clouds for the load balance |
-| `pc2_feedback_damping` | true | PC2 damping of the feedback stiffness |
 | `particle_x3_bc` | outflow (reflect at a reflecting gas wall) | dust at non-periodic x3 faces |
-| `<gravity>/kdk_reuse` | false | reuse the closing field at the next opening solve when mesh, phase and dust mass are unchanged |
-| `<gravity>/guess` | `previous` | `extrapolate`: linear extrapolation of the last two potentials |
+| `<gravity>/kdk_reuse` | true | reuse the closing field at the next opening solve when mesh, phase and dust mass are unchanged |
+| `<gravity>/guess` | `extrapolate` | linear extrapolation of the last two potentials; `previous`: the last potential |
 | `<gravity>/rtol`, `max_iterations` | 1e-10, 150 | multigrid convergence |
 | `<gravity>/setup` | `distributed` | `distributed`: each rank builds its own rows, rediscretized coarse levels, shear-phase updates of the changed rows only (scales, GPU); `reference`: replicated global matrices for accuracy checks on small problems |
 | `<gravity>/solver` | `multigrid` | the only solver |

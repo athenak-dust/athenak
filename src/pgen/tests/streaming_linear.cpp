@@ -191,7 +191,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     dust::SetupScheduledRefinement(pin);
     user_ref_func = dust::ScheduledRefinement;
     // optional: refine on the dust density instead of the schedule
-    if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {
+    if (dust::GetAmrDensityTrigger(pin)) {
       dust::SetupDensityTrigger(pin);
       user_ref_func = dust::DensityRefinement;
     }
@@ -241,9 +241,9 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     if (pr->pdust != nullptr) {
       cloud_mode_ = (pr->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud);
       if (cloud_mode_) {
-        cloud_root_dx1_ = pr->pdust->smr_transfer.root_dx1;
+        cloud_root_dx1_ = pr->pdust->cloud_geometry.root_dx1;
         cloud_root_dx2_ = pmy_mesh_->three_d ? pr->pdust->leaf_traversal3d.root_dx3
-                                             : pr->pdust->smr_transfer.root_dx2;
+                                             : pr->pdust->cloud_geometry.root_dx2;
       }
     }
     return;
@@ -265,7 +265,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
       (lina3d && ((pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
                    !pmbp->pdust->Clouds3D()) ||
                   pin->GetOrAddBoolean("problem", "prescribed_gas", false) ||
-                  pin->GetOrAddBoolean("problem", "analytic_gather", false) ||
                   pin->GetOrAddBoolean("problem", "double_precision_snapshots", false) ||
                   pin->GetOrAddBoolean("problem", "kx0_filter", false) ||
                   pin->GetOrAddReal("problem", "boost_vx", 0.0) != 0.0))) {
@@ -332,7 +331,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
         fabs(dval - aphi) > 1.0e-12*fabs(aphi)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "boost_vx = " << boost << " requires <hydro_srcterms> "
-                << "const_accel2 with const_accel2_dir = 3 and <dust>/const_accel_phi, both "
+                << "const_accel2 with const_accel2_dir = 3 and <dust>/test_const_accel_phi, both "
                 << "equal to (2-q)*omega0*boost_vx = " << aphi << std::endl;
       std::exit(EXIT_FAILURE);
     }
@@ -348,8 +347,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   // refinable clouds on the root lattice (npar1d^2 per root cell in x1-x3, one per root cell in
   // x2), split to the leaves, the seed imprinted after the split with seed_after_split
   if (pmy_mesh_->three_d && pmbp->pdust->Clouds3D()) {
-    for (const char *key : {"prescribed_gas", "analytic_gather", "kx0_filter",
-                            "double_precision_snapshots"}) {
+    for (const char *key : {"prescribed_gas", "kx0_filter", "double_precision_snapshots"}) {
       if (pin->GetOrAddBoolean("problem", key, false)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                   << "<problem>/" << key << " is not available in 3-D" << std::endl;
@@ -562,8 +560,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   // the gas (back_reaction = false).  Requires coupling = pc2 and no boost.
   if (pin->GetOrAddBoolean("problem", "prescribed_gas", false)) {
     auto *pdust = pmbp->pdust;
-    if (pdust->back_reaction || pdust->coupling != DustCoupling::hybrid ||
-        pdust->hybrid_force_mode != HybridForceMode::pc2 || boost != 0.0) {
+    if (pdust->back_reaction || pdust->coupling != DustCoupling::pc2 || boost != 0.0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<problem>/prescribed_gas requires <dust>/back_reaction = "
                 << "false, <dust>/coupling = pc2 and boost_vx = 0" << std::endl;
@@ -599,34 +596,6 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
     if (global_variable::my_rank == 0) {
       std::cout << "# streaming_linear: prescribed analytic gas (s = " << srate
                 << ", wR = " << wrate << "), dust back-reaction off" << std::endl;
-    }
-  }
-
-  // Diagnostic analytic gather: the dust sees the analytic gas
-  // velocity at t+dt/2 and the predicted midpoint position with the cloud response of
-  // the cloud_transition = 2 gather, instead of the gather from the gas cells
-  // (DustGasDrag::AnalyticGather).  The prescribed gas is kept for everything else.
-  if (pin->GetOrAddBoolean("problem", "analytic_gather", false)) {
-    if (!pin->GetOrAddBoolean("problem", "prescribed_gas", false)) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "<problem>/analytic_gather requires prescribed_gas"
-                << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    auto &ag = pmbp->pdust->analytic_gather;
-    ag.on = true;
-    ag.point_all = pin->GetOrAddBoolean("problem", "analytic_gather_point", false);
-    ag.centroid_lobes = pin->GetOrAddBoolean("problem", "analytic_gather_centroid", false);
-    ag.kx = kx; ag.kz = kz;
-    ag.srate = pin->GetReal("problem", "growth_rate");
-    ag.wrate = pin->GetReal("problem", "omega_re");
-    ag.ux0 = ugx; ag.up0 = ugp;
-    ag.uxr = Uxr; ag.uxi = Uxi; ag.uzr = Uzr; ag.uzi = Uzi; ag.upr = Upr; ag.upi = Upi;
-    if (global_variable::my_rank == 0) {
-      std::cout << "# streaming_linear: analytic gather on"
-                << (ag.point_all ? " (point value for every cloud)" : "")
-                << (ag.centroid_lobes ? " (lobed directions at the lobe centroid)" : "")
-                << std::endl;
     }
   }
 
@@ -670,7 +639,7 @@ void ProblemGenerator::StreamingLinear(ParameterInput *pin, const bool restart) 
   // every particle then receives the seed at its own lattice site (diagnostic).
   cloud_mode_ = (pmbp->pdust->smr_transfer_mode == DustSMRTransfer::refinable_cloud);
   if (cloud_mode_) {
-    auto &transfer = pmbp->pdust->smr_transfer;
+    auto &transfer = pmbp->pdust->cloud_geometry;
     const bool seed_after = pin->GetOrAddBoolean("problem", "seed_after_split", false);
     // analytic LinA seed of the particle at lattice site (x0, z0)
     auto imprint = [&](auto &h, int p, Real x0, Real z0) {
@@ -899,12 +868,12 @@ void StreamingLinearHistory(HistoryData *pdata, Mesh *pm) {
       // hat cloud of half-width ell: Fourier transform sinc^2(k ell/2) per direction;
       // a transition cloud adds 1/3 of its hat displaced by -/+ ell
       int code = pi(PLEV,p);
-      Real scale = 1.0/static_cast<Real>(1 << SMRCompositeTransfer::CloudLevel(code));
+      Real scale = 1.0/static_cast<Real>(1 << CloudGeometry::CloudLevel(code));
       Real ax = 0.5*kx*hx*scale, az = 0.5*kz*hz*scale;
       Real sx = (ax == 0.0) ? 1.0 : sin(ax)/ax;
       Real sz = (az == 0.0) ? 1.0 : sin(az)/az;
-      int l1 = SMRCompositeTransfer::CloudLobe1(code);
-      int l2 = SMRCompositeTransfer::CloudLobe2(code);
+      int l1 = CloudGeometry::CloudLobe1(code);
+      int l2 = CloudGeometry::CloudLobe2(code);
       // (lobe 3, both edge children attached: 1/2 at the particle, 1/4 at -/+ ell)
       if (l2 == 3) {
         Real d = hz*scale, z = pr(IPY,p);
@@ -1006,7 +975,7 @@ void StreamingLinearHistory3D(HistoryData *pdata, Mesh *pm) {
   Real pre = 0.0, pim = 0.0;
   Kokkos::parallel_reduce("stream_hp3d",Kokkos::RangePolicy<>(DevExeSpace(),0,npart),
   KOKKOS_LAMBDA(const int &p, Real &re_, Real &im_) {
-    using T = SMRCompositeTransfer;
+    using T = CloudGeometry;
     const int code = pi(PLEV,p);
     const Real scale = 1.0/static_cast<Real>(1 << T::CloudLevel(code));
     const Real ax = 0.5*kx*hx*scale, az = 0.5*kz*hz*scale;
@@ -1088,7 +1057,7 @@ void StreamingKx0Filter(Mesh *pm, const Real bdt) {
   auto &indcs = pm->mb_indcs;
   const int is = indcs.is, ie = indcs.ie, js = indcs.js, je = indcs.je;
   const int nmb = pmbp->nmb_thispack;
-  const auto &t = pmbp->pdust->smr_transfer;
+  const auto &t = pmbp->pdust->cloud_geometry;
   const int nf2 = t.nfine2;
   const Real fd2 = t.fine_dx2, x2min = t.x2min;
   const Real len1 = pm->mesh_size.x1max - pm->mesh_size.x1min;

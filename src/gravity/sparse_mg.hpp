@@ -162,12 +162,12 @@ bool &SetupTimesOn();
 // (SelfGravity: its setup threads, during a hierarchy rebuild).
 int &OperatorSetupThreads();
 
-// ATHENA_SG_TEMPLATE_CHECK=1 (diagnostic; memory option 8): every build of an operator
-// with template rows compares its product with the full CSR product (collective). Read once;
-// SelfGravity checks at construction that every rank has the same value.
+// <gravity>/test_sg_report = template_check (diagnostic; memory option 8): every build of an
+// operator with template rows compares its product with the full CSR product (collective).
+// From the input (sg_test_keys.hpp), the same on every rank.
 bool SgTemplateCheck();
-// ATHENA_SG_LEAN (hidden override of the automatic memory options, for comparisons; see
-// self_gravity.cpp): the bit mask it gives, or -1 when it is unset or empty. Read once.
+// <gravity>/test_lean_bits (hidden override of the automatic memory options, for comparisons;
+// see self_gravity.cpp): the bit mask it gives, or -1 when it is not given.
 int SgLeanOverride();
 
 // Restarted flexible GMRES preconditioned by the supplied multigrid V-cycle. The
@@ -221,7 +221,7 @@ class SparseMultigrid {
   // already reduced over the ranks by the caller (nullptr: reduced here)
   void UpdateFinePhaseRowsKnown(const CsrRowUpdate &matrix, const PhaseRowPlan *plan,
                                 const int *known);
-  // the V-cycle fuses projections with the next product (ATHENA_SG_PROJECT_FUSE=1 and
+  // the V-cycle fuses projections with the next product (<gravity>/test_project_fuse and
   // the construction-time probe of MPI_Allreduce found bitwise equal sums on every rank)
   bool ProjectionFusion() const;
   // Complete current-phase V-cycle: independent compact A and P dependency
@@ -231,7 +231,7 @@ class SparseMultigrid {
                                   const std::vector<std::vector<int>> &p_rows);
   // further operators updated after the hierarchy, in the given order (the force and
   // boundary operators of the self-gravity); their validity and ghost-change flags join the
-  // hierarchy's one collective unless ATHENA_SG_PHASE_FORCE_OLD=1 or ATHENA_SG_PHASE_COLLECTIVES=1
+  // hierarchy's one collective
   struct PhaseExtra {
     DistributedOperator *op;
     const CsrRowUpdate *a;

@@ -463,14 +463,16 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
   // create unique communicator for particles
   MPI_Comm_dup(MPI_COMM_WORLD, &mpi_comm_part);
 
-  // the largest MPI message of the particle exchange (msg_chunk_bytes): the smallest value of
-  // ATHENA_PART_MSG_CHUNK (bytes) of all ranks if one sets it (sender and receiver must split
-  // a message alike), else 1 GiB
+  // the largest MPI message of the particle exchange (msg_chunk_bytes): 1 GiB, or the hidden
+  // test key <particles>/test_msg_chunk_bytes = <bytes> (a positive integer; only a value below
+  // 1 GiB takes effect).  Read only when given (not added when absent); the smallest value of
+  // all ranks is taken (sender and receiver must split a message alike; with one restart file per
+  // rank each rank reads its own header)
   {
     unsigned long long chunk = msg_chunk_bytes;
-    const char *e = std::getenv("ATHENA_PART_MSG_CHUNK");
-    if (e != nullptr && e[0] != '\0') {
-      const unsigned long long v = std::strtoull(e, nullptr, 10);
+    if (pin->DoesParameterExist("particles", "test_msg_chunk_bytes")) {
+      const std::string s = pin->GetString("particles", "test_msg_chunk_bytes");
+      const unsigned long long v = std::strtoull(s.c_str(), nullptr, 10);
       if (v > 0) chunk = std::min<unsigned long long>(chunk, v);
     }
     MPI_Allreduce(MPI_IN_PLACE, &chunk, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, MPI_COMM_WORLD);
@@ -478,7 +480,7 @@ particles::ParticlesBoundaryValues::ParticlesBoundaryValues(
     msg_chunk_bytes = static_cast<std::size_t>(chunk);
     if (msg_chunk_forced && global_variable::my_rank == 0) {
       std::cout << "# particles: MPI messages of the particle exchange split every "
-                << msg_chunk_bytes << " bytes (ATHENA_PART_MSG_CHUNK)" << std::endl;
+                << msg_chunk_bytes << " bytes (<particles>/test_msg_chunk_bytes)" << std::endl;
     }
   }
 #endif

@@ -21,6 +21,7 @@
 #include "shearing_box/orbital_advection.hpp"
 #include "bvals/bvals.hpp"
 #include "hydro/hydro.hpp"
+#include "dust/dust_input.hpp"
 
 namespace hydro {
 //----------------------------------------------------------------------------------------
@@ -331,7 +332,7 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
       Kokkos::realloc(uflx.x2f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
       Kokkos::realloc(uflx.x3f, nmb, (nhydro+nscalars), ncells3, ncells2, ncells1);
 #ifdef ATHENAK_HYDRO_FLUX_PROBE
-      probe_ncycle = pin->GetOrAddInteger("hydro", "probe_ncycle", 0);
+      probe_ncycle = dust::TestKeyInt(pin, "hydro", "test_probe_ncycle", 0);
       Kokkos::realloc(probe, 6, ncells1);
 #endif
 

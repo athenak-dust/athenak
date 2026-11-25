@@ -26,6 +26,7 @@
 #include "globals.hpp"
 #include "gravity/composite.hpp"
 #include "gravity/geometric_mg.hpp"
+#include "gravity/sg_test_keys.hpp"
 #include "gravity/slab_boundary.hpp"
 #include "gravity/vacuum_boundary.hpp"
 #include "hydro/hydro.hpp"
@@ -35,6 +36,7 @@
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
 #include "pgen/pgen.hpp"
+#include "dust/dust_input.hpp"
 
 namespace gravity {
 namespace {
@@ -72,28 +74,71 @@ Real Sum(Real value) {
 // (row filtering, template hashing) is paid at every rebuild, and only adaptive meshes rebuild
 // during a run (the topology changes only in MeshRefinement::AdaptiveMeshRefinement); a static
 // mesh builds the operators once per run segment (start or restart) and updates only the shear
-// phase rows afterwards. Hidden override for comparisons: the environment variable
-// ATHENA_SG_LEAN = the bit mask (0 = the former path), on every rank alike.
+// phase rows afterwards. Hidden override for comparisons: the test key
+// <gravity>/test_lean_bits = the bit mask (0 = the former path; sg_test_keys.hpp).
 int SgLeanBits(const bool adaptive) {
   const int forced = SgLeanOverride();
   return forced >= 0 ? forced : (2 | 4 | (adaptive ? 0 : 1 | 8));
 }
-// The memory options and ATHENA_SG_TEMPLATE_CHECK choose collectives: option 1 adds an
-// MPI_Allreduce before the multigrid construction (its MPI_Comm_dup), options 4 and 8 change
-// which operators are released and built when, the template check adds an MPI_Allreduce at
-// every force build. A rank with other values (e.g. ATHENA_SG_LEAN set on some ranks only)
-// would pair different collectives (a hang). Collective: called by every rank in the
-// SelfGravity constructor, before any of them is used.
-void CheckSgEnvSwitches(const int lean) {
+// The hidden test keys of <gravity> (sg_test_keys.hpp), read only when given (not stored in
+// restart files).  The memory options, test_sg_report = template_check, test_project_fuse,
+// test_halo_alltoallv and test_device_mpi choose collectives: they come from the input, the
+// same on every rank.  Called first in the SelfGravity constructor, before any solver exists.
+void ReadSgTestKeys(ParameterInput *pin) {
+  SgTestKeys &k = SgTest();
+  const char *b = "gravity";
+  auto words = [](std::string s) {
+    for (char &c : s) if (c == ',') c = ' ';
+    std::vector<std::string> w;
+    std::istringstream in(s);
+    for (std::string t; in >> t;) w.push_back(t);
+    return w;
+  };
+  if (pin->DoesParameterExist(b, "test_sg_report")) {
+    for (const auto &w : words(pin->GetString(b, "test_sg_report"))) {
+      if (w == "template_check") k.template_check = true;
+      if (w == "mem") k.mem_stats = true;
+      if (w == "level") k.level_stats = true;
+    }
+  }
+  if (pin->DoesParameterExist(b, "test_lean_bits"))
+    k.lean = std::max(-1, pin->GetInteger(b, "test_lean_bits"));   // (< 0: automatic)
+  if (pin->DoesParameterExist(b, "test_device_mpi"))
+    k.device_mpi = pin->GetBoolean(b, "test_device_mpi");
+  if (pin->DoesParameterExist(b, "test_spmv_rows"))
+    k.spmv_rows = std::max(-1, pin->GetInteger(b, "test_spmv_rows"));   // (< 0: default)
+  if (pin->DoesParameterExist(b, "test_project_fuse")) {
+    const std::string s = pin->GetString(b, "test_project_fuse");
+    k.project_fuse_probe_test = (s == "probe_test");
+    k.project_fuse = k.project_fuse_probe_test || pin->GetBoolean(b, "test_project_fuse");
+  }
+  if (pin->DoesParameterExist(b, "test_halo_alltoallv"))
+    k.halo_alltoallv = pin->GetBoolean(b, "test_halo_alltoallv");
+  if (pin->DoesParameterExist(b, "test_deposit_atomic")) {
+    const std::string s = pin->GetString(b, "test_deposit_atomic");
+    if (s == "plain") k.deposit_atomic = 0;
+    else if (s == "warp") k.deposit_atomic = 1;
+    else if (s == "cycle") k.deposit_atomic = 2;
+    else if (s == "compare") k.deposit_atomic = 3;
+    else Fail("<gravity>/test_deposit_atomic = " + s + " (warp, plain, cycle or compare)");
+  }
 #if MPI_PARALLEL_ENABLED
-  const int check = SgTemplateCheck() ? 1 : 0;
-  int v[4] = {lean, check, -lean, -check};   // max and -min
-  MPI_Allreduce(MPI_IN_PLACE,v,4,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
-  if (v[0] != -v[2] || v[1] != -v[3]) {
-    Fail("the memory options (values " + std::to_string(-v[2]) + " to " + std::to_string(v[0])
-         + "; ATHENA_SG_LEAN overrides them) and ATHENA_SG_TEMPLATE_CHECK ("
-         + std::to_string(-v[3]) + " to " + std::to_string(v[1])
-         + ") must be alike on every rank (mpirun -x)");
+  // the keys come from the input or each rank's restart header; several choose collectives:
+  // they must agree on every rank (this constructor is collective)
+  if (global_variable::nranks > 1) {
+    constexpr int n = 10;
+    int v[2*n] = {k.template_check, k.mem_stats, k.level_stats, k.lean, k.device_mpi,
+                  k.spmv_rows, k.project_fuse, k.project_fuse_probe_test, k.halo_alltoallv,
+                  k.deposit_atomic};
+    for (int i = 0; i < n; ++i) v[n + i] = -v[i];
+    MPI_Allreduce(MPI_IN_PLACE, v, 2*n, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    for (int i = 0; i < n; ++i) {
+      if (v[i] != -v[n + i]) {
+        Fail("the hidden <gravity> test keys (test_sg_report, test_lean_bits, test_device_mpi, "
+             "test_spmv_rows, test_project_fuse, test_halo_alltoallv, test_deposit_atomic) must "
+             "be alike on every rank");
+      }
+    }
   }
 #endif
 }
@@ -127,16 +172,10 @@ void KeepRows(CsrRowUpdate &a, const std::vector<char> &keep) {
   a.colidx.resize(out);
   a.values.resize(out);
 }
-// ATHENA_SG_MEMSTATS=1 (diagnostics only): at every hierarchy rebuild each rank prints, per
-// local CSR operator, its rows, nonzeros, the nonzeros of its first `physical` rows (the
-// physical source cells; the rest are vacuum cells) and row-length histograms
-bool SgMemStats() {
-  static const bool on = []() {
-    const char *e = std::getenv("ATHENA_SG_MEMSTATS");
-    return e != nullptr && std::atoi(e) != 0;
-  }();
-  return on;
-}
+// <gravity>/test_sg_report with mem (diagnostics only): at every hierarchy rebuild each rank
+// prints, per local CSR operator, its rows, nonzeros, the nonzeros of its first `physical` rows
+// (the physical source cells; the rest are vacuum cells) and row-length histograms
+bool SgMemStats() { return SgTest().mem_stats; }
 void PrintCsrStats(int rank, const char *name, int level, const LocalCsr &a, int physical) {
   const int rows = a.LocalRows();
   std::uint64_t phys_nnz = 0;
@@ -165,7 +204,7 @@ void PrintCsrStats(int rank, const char *name, int level, const LocalCsr &a, int
   s << '\n';
   std::cout << s.str() << std::flush;
 }
-// ATHENA_SG_MEMSTATS=1: how much of a square operator a "template row" storage could take:
+// test_sg_report with mem: how much of a square operator a "template row" storage could take:
 // rows (not in phase_rows) whose columns are all owned and whose (column - row, value bits)
 // sequence equals that of other rows; a template row needs no CSR entries of its own (one
 // template id per row). Reports distinct patterns and the rows / nonzeros covered by the
@@ -289,6 +328,7 @@ struct SelfGravity::HierarchyAssembly {
 
 SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack) {
   auto *pm = pack->pmesh;
+  ReadSgTestKeys(pin);
   if (pack->phydro == nullptr || pack->pmhd != nullptr ||
       (pack->ppart != nullptr && pack->pdust == nullptr) ||
       pack->prad != nullptr || pack->pcoord->is_special_relativistic ||
@@ -310,10 +350,13 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     const bool dust_imex = coupled_dust_ && integrator == "imex2+" &&
         (pack->pdust->Clouds3D() || pack->pdust->PointGravityTransferSupported()) &&
         pack->pdust->coupling == DustCoupling::imex &&
-        pack->pdust->drag_solver == DustDragSolver::local;
+        // (dc1 / dc2 correct only u* before the drag kick; the gravity half-kicks are unchanged)
+        (pack->pdust->drag_solver == DustDragSolver::local ||
+         pack->pdust->drag_solver == DustDragSolver::dc1 ||
+         pack->pdust->drag_solver == DustDragSolver::dc2);
     if (integrator != "rk1" && integrator != "rk2" && integrator != "rk3" && !dust_imex) {
       Fail("gravity half-kicks support rk1/rk2/rk3, or imex2+ with supported "
-           "3D cloud or TSC point local dust drag");
+           "3D cloud or TSC point dust drag (drag_solver = local, dc1 or dc2)");
     }
   }
   auto *orbital = pack->phydro->porb_u;
@@ -369,9 +412,19 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
       Fail("<gravity>/source or kick includes dust, but the run has no dust module");
     if (coupled_dust_ && (source_dust_ || kick_dust_) && !pack->pdust->GravityTransferSupported())
       Fail("dust gravity requires supported 3D refinable clouds, uniform TSC, or instant_switch TSC");
-    if (coupled_dust_ && (source_dust_ || kick_dust_) &&
-        pin->GetOrAddString("gravity","dust_x3_assignment","fold")!="fold")
-      Fail("dust gravity/dust_x3_assignment supports fold only; drag deposit policy is independent");
+    // retired-compat: <gravity>/dust_x3_assignment (only fold existed) retired:
+    // fold -> NOTE; another value stopped dust gravity as before, else had no effect
+    {
+      dust::RetiredKeys rk(pin, "gravity", "2026-11-25");   // retired-compat
+      const bool fold = rk.Has("dust_x3_assignment") &&   // retired-compat
+                        rk.Get("dust_x3_assignment") == "fold";   // retired-compat
+      if (rk.Has("dust_x3_assignment") && !fold && coupled_dust_ &&   // retired-compat
+          (source_dust_ || kick_dust_))   // retired-compat
+        Fail("dust gravity/dust_x3_assignment supports fold only (the key retired: "   // retired-compat
+             "the x3 assignment of the dust mass is fold; drop the key)");   // retired-compat
+      rk.Check("dust_x3_assignment", fold, false, "", "", "fold");   // retired-compat
+      rk.Finish();   // retired-compat
+    }
   }
   pin_ = pin;
   {
@@ -482,19 +535,19 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
     // the host assembly of the next hierarchy during the rest of a regrid (same defaults)
     hierarchy_prefetch_enabled_ = pin->GetOrAddBoolean("gravity", "rebuild_prefetch",
                                                        device_build) && !phase_serial_only_;
-    // KDK reuse of the closing field at the next opening solve (default off: the
-    // reused field differs from a re-solve by the deposit round-off of the exact
-    // representation changes); reuse_check adds the fresh deposit, the true residual of
+    // KDK reuse of the closing field at the next opening solve (default on,
+    // the production value; false re-solves: the reused field differs from a re-solve by the
+    // deposit round-off of the exact representation changes); test_reuse_check adds the fresh deposit, the true residual of
     // the reused potential and a full regather for comparison (diagnostic only)
-    kdk_reuse_ = pin->GetOrAddBoolean("gravity", "kdk_reuse", false);
-    // Initial guess of a solve at a new time: previous (default: the last accepted
-    // potential) or extrapolate (linear in time from the last two; the converged field then
-    // differs from the default within the solver tolerance)
-    const std::string guess = pin->GetOrAddString("gravity", "guess", "previous");
+    kdk_reuse_ = pin->GetOrAddBoolean("gravity", "kdk_reuse", true);
+    // Initial guess of a solve at a new time: extrapolate (default, the
+    // production value: linear in time from the last two) or previous (the last accepted
+    // potential; the converged fields differ within the solver tolerance)
+    const std::string guess = pin->GetOrAddString("gravity", "guess", "extrapolate");
     if (guess != "previous" && guess != "extrapolate")
       Fail("<gravity>/guess must be previous or extrapolate");
     guess_extrapolate_ = guess == "extrapolate";
-    reuse_check_ = pin->GetOrAddBoolean("gravity", "reuse_check", false);
+    reuse_check_ = dust::TestKeyBool(pin, "gravity", "test_reuse_check", false);
   }
   setup_ = pin->GetOrAddString("gravity", "setup", "distributed");
   if (setup_ != "reference" && setup_ != "distributed") {
@@ -545,7 +598,6 @@ SelfGravity::SelfGravity(MeshBlockPack *pack, ParameterInput *pin) : pack_(pack)
                                 std::to_string(d+1));
   }
   lean_ = SgLeanBits(pm->adaptive);
-  CheckSgEnvSwitches(lean_);
   dtnew = std::numeric_limits<Real>::max();
 }
 
@@ -1394,8 +1446,7 @@ void SelfGravity::UpdatePhase(Real shear_offset) {
     auto &p = job.p;
     const double assembled = ProfileTime(profile_);
     // the force and boundary operators after the hierarchy, in the former order; their
-    // validity and ghost-change flags join the hierarchy's collective (ATHENA_SG_PHASE_FORCE_OLD=1:
-    // their own two collectives each, see sparse_mg.cpp)
+    // validity and ghost-change flags join the hierarchy's collective (see sparse_mg.cpp)
     std::vector<SparseMultigrid::PhaseExtra> extra;
     for (int d = 0; d < solver_domain_.ndim; ++d) {
       extra.push_back({force_[d].get(),&update.acceleration[d],&job.force_plans[d]});

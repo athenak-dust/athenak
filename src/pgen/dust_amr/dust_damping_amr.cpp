@@ -78,7 +78,7 @@ struct SVTest {
 } svt_;
 
 void SVCentroid(const Real *x, const int code, Real X[3]) {
-  using T = SMRCompositeTransfer;
+  using T = CloudGeometry;
   const int lev = T::CloudLevel(code);
   const int lobe[3] = {T::CloudLobe1(code), T::CloudLobe2(code), T::CloudLobe3(code)};
   for (int d=0; d<3; ++d) {
@@ -111,7 +111,7 @@ void SVTestFinal(ParameterInput *, Mesh *pm) {
   for (int p=0; p<np; ++p) {
     const Real x[3] = {pr(IPX,p), pr(IPY,p), pr(IPZ,p)};
     const Real v[3] = {pr(IPVX,p), pr(IPVY,p), pr(IPVZ,p)};
-    const int code = pi(PLEV,p), lev = SMRCompositeTransfer::CloudLevel(code);
+    const int code = pi(PLEV,p), lev = CloudGeometry::CloudLevel(code);
     Real X[3];
     SVCentroid(x, code, X);
     Real err = 0.0;
@@ -305,7 +305,7 @@ void ProblemGenerator::DustDampingAMR(ParameterInput *pin, const bool restart) {
   const Real rho0 = pin->GetOrAddReal("problem","rho0",1.0);
   dust_setup::InitUniformGas(pmy_mesh_, rho0, 0.0, 0.0);
 
-  const bool cloud_root_random = pin->GetOrAddBoolean("problem", "cloud_root_random", false);
+  const bool cloud_root_random = dust::GetCloudRootRandom(pin, pmbp->pdust);
   if (pmy_mesh_->three_d && nspec == 1 && cloud_root_random) {   // the 3-D history errors
     dtest3d_.on = true;
     dtest3d_.rho0 = rho0; dtest3d_.eps = eps[0]; dtest3d_.ts = taus[0];

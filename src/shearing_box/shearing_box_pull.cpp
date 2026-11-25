@@ -91,7 +91,7 @@ void ShearingBox::PlanPull() {
       lmin = std::min(lmin, ll.level); lmax = std::max(lmax, ll.level);
     }
   }
-  const bool rounds = !pull_lagged_xslope && lmax > lmin;
+  const bool rounds = lmax > lmin;
   pull_nround_ = rounds ? (lmax - lmin + 1) : 1;
   pull_round_ = 0;
   pull_done_ = false;
@@ -135,6 +135,23 @@ void ShearingBox::PlanPull() {
     const long long y0 = r.j0 - ng - r.joff - 3, y1 = y0 + nyb;
     const long long z0 = r.k0 - ng, z1 = z0 + nzb;
     const int d = s.level - lr;
+    if (pm->three_d && d > 0 && ((nx2 % (1 << d)) != 0 || (nx3 % (1 << d)) != 0)) {
+      // (3-D) the sender is so much finer that it is not a whole number of the receiver's
+      // cells (its extent below would round to nothing): it cannot be exchanged.  The face
+      // rule keeps such a block away from every block that reads it; checked here in the
+      // sender's own cells.  (The candidates are all the opposite blocks in the x3 range, at
+      // any x2.)
+      const long long f = 1LL << d;
+      const long long ty0 = static_cast<long long>(s.lx2)*nx2;
+      const long long tz0 = static_cast<long long>(s.lx3)*nx3;
+      const long long ka = FloorDiv(y0*f - (ty0 + nx2), ny_l*f) + 1;
+      const long long kb = FloorDiv(y1*f - 1 - ty0, ny_l*f);
+      long long la = FloorDiv(z0*f - (tz0 + nx3), nz_l*f) + 1;
+      long long lb = FloorDiv(z1*f - 1 - tz0, nz_l*f);
+      if (!zper) {la = std::max(la, 0LL); lb = std::min(lb, 0LL);}
+      if (ka <= kb && la <= lb) bad = true;
+      return;
+    }
     long long sy0, sy1, sz0, sz1;
     if (d >= 0) {
       sy0 = static_cast<long long>(s.lx2)*(nx2 >> d); sy1 = sy0 + (nx2 >> d);
@@ -391,9 +408,7 @@ void ShearingBoxCC::PullPack(DvceArray5D<Real> &a, const int rnd) {
   auto sf = psendflat;
   const int nymax = npymax, nzmax = npzmax;
   // x slope at the face column: its x1 ghosts were filled in an earlier round of this
-  // exchange.  test_pull_lagged_xslope: they hold the values of the previous stage, and the
-  // slope is left out until they have been collected once (pull_ghost_valid).
-  const bool xslope = !pull_lagged_xslope || pull_ghost_valid;
+  // exchange (the one-round collection with the lagged x slope, test_pull_lagged_xslope, retired).
   // A coarser sender's y / z slopes read its transverse ghost rows.  Those of a same-level or
   // finer neighbor (RecvU) and of a physical x3 boundary (set before the pack) are of this
   // stage; those of a COARSER neighbor are prolongated only after this exchange (Prolongate,
@@ -465,12 +480,9 @@ void ShearingBoxCC::PullPack(DvceArray5D<Real> &a, const int rnd) {
         one = false;
       }
       const Real mz = one ? PullOneSidedSlope(dl, dr, u0, pos) : 4.0*PROLONG_CC_SLOPE(dl, dr);
-      // the face column (cd == 0) reads the x1 ghost beyond the face (see xslope above)
-      Real mx = 0.0;
-      if (cd > 0 || xslope) {
-        dl = u0 - a(m, v, kp, jp, ip-1); dr = a(m, v, kp, jp, ip+1) - u0;
-        mx = 4.0*PROLONG_CC_SLOPE(dl, dr);
-      }
+      // the face column (cd == 0) reads the x1 ghost beyond the face (see the x slope above)
+      dl = u0 - a(m, v, kp, jp, ip-1); dr = a(m, v, kp, jp, ip+1) - u0;
+      const Real mx = 4.0*PROLONG_CC_SLOPE(dl, dr);
       val = u0 + ox*mx + oy*my + oz*mz;
     }
     const int ridx = pp.d_view(n,kPRIdx);
@@ -573,7 +585,6 @@ TaskStatus ShearingBoxCC::PullRecv(DvceArray5D<Real> &a, const bool coarse) {
   }
 #endif
   pull_done_ = true;
-  pull_ghost_valid = true;   // after this the x1 ghosts hold collected values
   return TaskStatus::complete;
 }
 

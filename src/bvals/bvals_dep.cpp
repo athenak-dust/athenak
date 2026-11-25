@@ -41,6 +41,7 @@
 
 MeshBoundaryValuesDep::MeshBoundaryValuesDep(MeshBlockPack *pp, ParameterInput *pin) :
   MeshBoundaryValues(pp, pin, false) {
+  DepRemapPlan::ReadTestKeys(pin);   // (the general remap's hidden test keys, before any plan)
 #if MPI_PARALLEL_ENABLED
   MPI_Comm_dup(MPI_COMM_WORLD, &comm_dep_);   // the general path
 #endif

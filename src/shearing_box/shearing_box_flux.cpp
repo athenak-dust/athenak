@@ -466,13 +466,13 @@ void ShearingBoxCC::PlanFluxPair() {
   std::vector<std::array<int, kQNField>> pcs;
   std::vector<Real> fr;
   bool bad = false;
+  std::array<int, 4> badpair{};   // the first pair that does not fit: gid and level of y, x
   // the pieces of (receiving block y on face fy, authoritative block x), the same
   // function on both sides; ridx >= 0: y is local
   auto pieces = [&](const ShearCand &y, int fy, const ShearCand &x, int ridx) {
     const int d = x.level - y.level;
     if (d < 0 || (d == 0 && fy == 1)) return;   // y is authoritative there
     const long long f2 = 1LL << d;
-    if ((nx2 % f2) != 0 || (nx3 % f2) != 0) {bad = true; return;}
     const long long nyx = static_cast<long long>(pm->nmb_rootx2)*nx2 << (x.level - root);
     const long long nzx = static_cast<long long>(pm->nmb_rootx3)*nx3 << (x.level - root);
     // x3: x's k row kx sits at kx + bz in y's frame (x cells); y spans [0, nx3 f2)
@@ -505,6 +505,15 @@ void ShearingBoxCC::PlanFluxPair() {
         const int r0 = std::max(0, static_cast<int>(std::floor(lo/static_cast<Real>(f2))));
         const int r1 = std::min(nx2, static_cast<int>(std::ceil(hi/static_cast<Real>(f2))));
         if (r1 <= r0) continue;
+        // only a pair that really exchanges must fit (2^d divides the block's x2 and x3
+        // sizes).  The candidates are all the opposite blocks in the x3 range, at any x2;
+        // the face rule limits the level difference only between blocks that meet across
+        // the shear, so a deep level elsewhere on the opposite face is no error.
+        if ((nx2 % f2) != 0 || (nx3 % f2) != 0) {
+          if (!bad) badpair = {y.gid, y.level, x.gid, x.level};
+          bad = true;
+          continue;
+        }
         std::array<int, kQNField> p{};
         p[kQRGid] = y.gid; p[kQRIdx] = (ridx >= 0) ? 1 : -1; p[kQRFace] = fy;
         p[kQSGid] = x.gid; p[kQSLoc] = (x.rank == my_rank) ? 1 : 0; p[kQSFace] = 1 - fy;
@@ -541,7 +550,9 @@ void ShearingBoxCC::PlanFluxPair() {
   if (bad) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "shear flux matching (face levels): level difference too large for the "
-              << "block size" << std::endl;
+              << "block size (block " << badpair[0] << " at level " << badpair[1]
+              << " meets block " << badpair[2] << " at level " << badpair[3]
+              << " across the shear)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   // one message per peer rank and direction

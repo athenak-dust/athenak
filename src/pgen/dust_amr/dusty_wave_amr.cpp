@@ -173,7 +173,7 @@ void ProblemGenerator::DustyWaveAMR(ParameterInput *pin, const bool restart) {
     });
   }
 
-  const bool cloud_root_random = pin->GetOrAddBoolean("problem", "cloud_root_random", false);
+  const bool cloud_root_random = dust::GetCloudRootRandom(pin, pmbp->pdust);
   if (three_d && nspec == 1 && cloud_root_random) {   // the 3-D history errors
     dtest3d_.on = true;
     dtest3d_.rho0 = rho0; dtest3d_.eps = eps[0]; dtest3d_.ts = taus[0];

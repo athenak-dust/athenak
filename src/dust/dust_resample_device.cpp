@@ -24,12 +24,12 @@
 //! their pools differ (the atomic deposit makes the whole run non-reproducible), not because of
 //! this solver.
 //!
-//! Exception: with <dust>/cloud_resample_qr_rows = true (the default) the QR
+//! Exception: the QR
 //! update sums each column by row chunks over the team, in another order than the host.  The
 //! device and host solves then agree only to round-off, and the end-point reduction can turn a
 //! round-off difference into another end point of the null space: the kept clouds and their
-//! masses may differ from the host's (both satisfy every constraint to round-off).  Set
-//! cloud_resample_qr_rows = false to recover the host's order (only in a build with -DDUST_R_QR_COLUMNS=1, dust_resample.hpp).
+//! masses may differ from the host's (both satisfy every constraint to round-off).  The build
+//! with -DDUST_R_QR_COLUMNS=1 (dust_resample.hpp) recovers the host's order.
 //!
 //! Workspaces live in global memory, one per team slot, in two buckets of patch sizes (at
 //! most 64 clouds, more than 64) sized from the largest patch of the bucket; the number of
@@ -94,7 +94,7 @@ using PolicyWider = Kokkos::TeamPolicy<DevExeSpace, Kokkos::LaunchBounds<1024, 1
 // 2 x 8 x 32 threads of a 1024-thread team share the scan; the chunks are merged in
 // their order with strict comparisons, so the result does not depend on the number)
 constexpr int kChunk = 32;
-// cloud_resample_qr_rows: row chunks per column in the dot products of the
+// row chunks per column in the dot products of the
 // row-parallel QR update
 constexpr int kQRow = 16;
 
@@ -343,7 +343,7 @@ int PivotedQRTeam(const Member &tm, double *a, const int m, const int n, int *pe
     (void) rows;   // the row-parallel update only (DUST_R_QR_COLUMNS = 0)
     {
 #endif
-      // cloud_resample_qr_rows: the update with the rows shared as well.  The dot products of the
+      // the update with the rows shared as well.  The dot products of the
       // Householder vector with the columns k+1..n-1 by (column, row chunk) over all threads, the
       // chunk sums added in their order; the rank-one update by matrix element (consecutive
       // threads on consecutive columns of a row).  NOTE: the sums run in another order than the
@@ -814,32 +814,28 @@ void PatchTeam(const Member &tm, const DevicePatchProblem &pb, const int q, cons
   if (prof) Kokkos::atomic_add(&pb.stage(5), (unsigned long long)(Clk() - ccheck));
 }
 
-// the patch solves of one bucket (b: 0 at most 64 clouds, 1 middle, 2 large), body the team
+// the patch solves of one bucket (b: 0 at most 64 clouds, 1 large), body the team
 // functor of the mode of the cross-moment rows.
 // The large patches set the critical path of a resampling: the widest team the kernel
-// allows (at most 512 threads); the small ones keep the automatic size.
-// A 512-thread team of the wide kernel (at most 128 registers per thread) fills the
-// register file of an SM, so the middle bucket runs the same kernel with mid_team threads
-// (several patches per SM)
+// allows (at most 512 threads); the small ones keep the automatic size.  (The middle bucket,
+// cloud_resample_device_mid, retired.)
 template <class Body>
-void LaunchBucket(const Body &body, const int b, const int nslot, const int mid_team,
-                  const int wide_team) {
+void LaunchBucket(const Body &body, const int b, const int nslot, const int wide_team) {
   if (b == 0) {
     Kokkos::parallel_for("rs_dev_patches_small", Policy(nslot, Kokkos::AUTO), body);
     return;
   }
   const int tmax = PolicyWide(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
-  int ts = 1;   // the largest power of two the backend allows, at most 512 (or mid_team)
-  const int tcap = (b == 1) ? std::max(1, mid_team) : 512;
-  while (2*ts <= tmax && 2*ts <= tcap) ts *= 2;
-  static bool told[3] = {false, false, false};
-  if (!told[b] && global_variable::my_rank == 0 && !(b == 2 && wide_team > 512)) {
-    std::cout << "# device resampling: " << ((b == 1) ? "middle" : "large")
+  int ts = 1;   // the largest power of two the backend allows, at most 512
+  while (2*ts <= tmax && 2*ts <= 512) ts *= 2;
+  static bool told = false;
+  if (!told && global_variable::my_rank == 0 && !(wide_team > 512)) {
+    std::cout << "# device resampling: large"
               << " patches with teams of " << ts << " threads (largest allowed " << tmax << ")"
               << std::endl;
-    told[b] = true;
+    told = true;
   }
-  if (b == 2 && wide_team > 512) {
+  if (wide_team > 512) {
     // the large bucket with teams of up to 1024 threads (at most 64
     // registers per thread)
     const int tmax2 = PolicyWider(nslot, 1).team_size_max(body, Kokkos::ParallelForTag());
@@ -853,8 +849,7 @@ void LaunchBucket(const Body &body, const int b, const int nslot, const int mid_
     }
     Kokkos::parallel_for("rs_dev_patches_large1024", PolicyWider(nslot, ts2), body);
   } else {
-    Kokkos::parallel_for((b == 1) ? "rs_dev_patches_mid" : "rs_dev_patches_large",
-                         PolicyWide(nslot, ts), body);
+    Kokkos::parallel_for("rs_dev_patches_large", PolicyWide(nslot, ts), body);
   }
 }
 
@@ -863,11 +858,11 @@ void LaunchBucket(const Body &body, const int b, const int nslot, const int mid_
 //----------------------------------------------------------------------------------------
 //! \fn SolvePatchesDevice
 //! \brief See dust_resample.hpp.  timing: [0] sizes, [1] small bucket, [2] large bucket,
-//! [3] total, [4] middle bucket, seconds (fenced).
+//! [3] total, [4] 0 (the former middle bucket), seconds (fenced).
 
 void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
                         DvceArray2D<int> outi, DvceArray1D<double> outr, const int mem_mb,
-                        const int mid, const int mid_team, const int wide_team,
+                        const int wide_team,
                         double timing[5], long long *screened, const int xv,
                         const DvceArray1D<int> &xflag, const bool xv_rot, const double xv_q) {
   Kokkos::Timer t_all, t;
@@ -1000,11 +995,11 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     }, nsk[0], nsk[1]);
   }
   if (screened != nullptr) {screened[0] = nsk[0]; screened[1] = nsk[1];}
-  // buckets: 0 at most 64 clouds, 1 (when mid > 64) at most mid clouds, 2 more;
+  // buckets: 0 at most 64 clouds, 1 more;
   // patches of one or no cloud only get their counters.  Every bucket in two lists, sb = 2 b + f
   // (f: flagged for the cross-moment rows; always 0 with xv = 0).  Per list the number of
-  // patches and the largest clouds / entries / leaves.  mid <= 64: no bucket 1
-  constexpr int NB = 3, NSB = 2*NB;
+  // patches and the largest clouds / entries / leaves
+  constexpr int NB = 2, NSB = 2*NB;
   int nqb[NSB], nmx[NSB], emx[NSB], lmx[NSB];
   {
     DvceArray2D<int> bst("rs_dev_bstat", NSB, 4);
@@ -1012,7 +1007,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     KOKKOS_LAMBDA(const int q) {
       const int n = sz(q, 0);
       if (n < 2 || skp(q) != 0) return;
-      const int sb = 2*((n <= 64) ? 0 : ((n <= mid) ? 1 : 2)) + flagged(q);
+      const int sb = 2*((n <= 64) ? 0 : 1) + flagged(q);
       Kokkos::atomic_increment(&bst(sb, 0));
       Kokkos::atomic_max(&bst(sb, 1), n);
       Kokkos::atomic_max(&bst(sb, 2), sz(q, 1));
@@ -1035,7 +1030,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
     Kokkos::parallel_for("rs_dev_lists", Kokkos::RangePolicy<>(DevExeSpace(), 0, npatch),
     KOKKOS_LAMBDA(const int q) {
       const int n = sz(q, 0);
-      const int sb = 2*((n <= 64) ? 0 : ((n <= mid) ? 1 : 2)) + flagged(q);
+      const int sb = 2*((n <= 64) ? 0 : 1) + flagged(q);
       qkey(q) = (n < 2 || skp(q) != 0) ? std::numeric_limits<std::int64_t>::max()
                         : (sb*top + top - 1 - n)*np + q;
     });
@@ -1066,7 +1061,7 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
         const double budget = WorkspaceBudget(mem_mb, "solver");
         int nslot = static_cast<int>(std::min<double>(nq, std::max(1.0, budget/per)));
         nslot = std::min(nslot, 4096);
-        if (b == 2 && (nmx[sb] >= 16384 || per > budget)) {
+        if (b == 1 && (nmx[sb] >= 16384 || per > budget)) {
           std::cout << "# device resampling (rank " << global_variable::my_rank << "): " << nq
                     << " large patches; per patch at most " << nmx[sb] << " clouds, at most "
                     << emx[sb] << " entries, at most " << lmx[sb] << " leaves (separate maxima); " << per/1048576.0 << " MB per slot, "
@@ -1124,21 +1119,22 @@ void SolvePatchesDevice(const DevicePatchProblem &pb, DvceArray1D<double> mnew,
         xp.rot = xv_rot ? 1 : 0;
         if (kx == 1) {
           auto body = DUST_R_PATCH_BODYX(1);
-          LaunchBucket(body, b, nslot, mid_team, wide_team);
+          LaunchBucket(body, b, nslot, wide_team);
         } else if (kx == 2) {
           auto body = DUST_R_PATCH_BODYX(2);
-          LaunchBucket(body, b, nslot, mid_team, wide_team);
+          LaunchBucket(body, b, nslot, wide_team);
         } else {
           auto body = DUST_R_PATCH_BODY(0);
-          LaunchBucket(body, b, nslot, mid_team, wide_team);
+          LaunchBucket(body, b, nslot, wide_team);
         }
 #undef DUST_R_PATCH_BODY
 #undef DUST_R_PATCH_BODYX
       }
     }
     Kokkos::fence();
-    timing[(b == 0) ? 1 : ((b == 1) ? 4 : 2)] = t.seconds();
+    timing[(b == 0) ? 1 : 2] = t.seconds();
   }
+  timing[4] = 0.0;   // (the former middle bucket)
   timing[3] = t_all.seconds();
 }
 

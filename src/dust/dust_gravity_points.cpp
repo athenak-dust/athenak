@@ -161,7 +161,7 @@ struct GravityPointTransfer {
 
 bool DustGasDrag::PointGravityTransferSupported() const {
   const auto *pm=pmy_pack->pmesh;
-  return pm->three_d && !clouds3d && deposit==DustDeposit::tsc &&
+  return pm->three_d && cloud_dim != 3 && deposit==DustDeposit::tsc &&
       (smr_transfer_mode==DustSMRTransfer::instant_switch ||
        (smr_transfer_mode==DustSMRTransfer::none && !pm->multilevel));
 }
@@ -239,7 +239,7 @@ void DustGasDrag::DepositPointGravityDensity(Real time,DvceArray5D<Real> &owned)
 void DustGasDrag::DepositPointScienceFields(Real time,DvceArray5D<Real> &out,
                                             const bool mass_only,const int species) {
   auto *pm=pmy_pack->pmesh;
-  if (!pm->three_d || clouds3d || !std::isfinite(time) ||
+  if (!pm->three_d || cloud_dim == 3 || !std::isfinite(time) ||
       !(smr_transfer_mode==DustSMRTransfer::instant_switch ||
         (smr_transfer_mode==DustSMRTransfer::none && !pm->multilevel)))
     PointFail("science fields of point particles need a 3-D mesh with point particles "

@@ -39,8 +39,8 @@ void Mesh::SetLoadBalanceStrategy(ParameterInput *pin) {
   lb_minmax = false;
   if (pin->DoesBlockExist("dust") && pin->DoesBlockExist("hydro") &&
       pin->DoesBlockExist("particles")) {
-    lb_minmax = pin->DoesParameterExist("dust", "load_balance_minmax") ?
-                pin->GetBoolean("dust", "load_balance_minmax") : true;
+    lb_minmax = pin->DoesParameterExist("dust", "test_load_balance_minmax") ?
+                pin->GetBoolean("dust", "test_load_balance_minmax") : true;
   }
 }
 

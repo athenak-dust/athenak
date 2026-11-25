@@ -308,6 +308,9 @@ class DepRemapPlan {
   // a physical x3 face fold back onto their mirror cells, 2 they are dropped (and recorded)
   DepRemapPlan(MeshBlockPack *pp, bool shear_x1, Real qshear, Real omega0, int x3mode = 0);
   ~DepRemapPlan();                 // (joins a running prefetch thread)
+  // the hidden test keys of the remap (<dust>/test_host_reference = deposit, test_dep_verify,
+  // test_dep_profile; bvals_dep_general.cpp), for all plans: set before the first plan is built
+  static void ReadTestKeys(ParameterInput *pin);
   void BuildStatic();              // after construction and after every regrid
   void UpdateShear(Real time);     // the shear part for the offset at time (no-op without shear)
   bool Shear() const {return shear_x1_;}
@@ -336,11 +339,10 @@ class DepRemapPlan {
   Real qshear_, omega0_;
   std::vector<int> face_gids_[2];  // blocks at the inner / outer x1 face (all ranks)
   // the shear weights on the device from a device copy of the recipes
-  // (ATHENA_DEP_WEIGHTS_HOST=1: the host loop and upload as before), and the next one-cell
-  // offset's shear part built ahead on a host thread (ATHENA_DEP_PREFETCH_OLD=1: a full build
-  // at every one-cell shift as before); ATHENA_DEP_VERIFY=1 (diagnostic) compares both with the
-  // host path in the run
-  bool dev_weights_ = true, prefetch_on_ = true, verify_ = false;
+  // (<dust>/test_host_reference = deposit: the host loop and upload as before), and the next
+  // one-cell offset's shear part built ahead on a host thread; <dust>/test_dep_verify = true
+  // (diagnostic) compares both with the host path in the run
+  bool dev_weights_ = true, verify_ = false;
   DvceArray1D<double> shr_rc_d_;          // the recipes on the device (dev_weights_)
   std::unique_ptr<DepShearPrefetch> pf_;
   bool have_event_ = false;               // a full build or prefetch install happened
@@ -539,8 +541,8 @@ class ParticlesBoundaryValues {
   // MPI counts are int: the Reals (or ints) of one message longer than msg_chunk_bytes go as
   // consecutive MPI messages of at most that many bytes, all with the message's tag (MPI's
   // non-overtaking order matches them to the receives, posted in the same order).  1 GiB, as
-  // the pbin and rst writers; the environment variable ATHENA_PART_MSG_CHUNK (bytes, the
-  // smallest of all ranks) lowers it, to test the split path on small runs
+  // the pbin and rst writers; the hidden test key <particles>/test_msg_chunk_bytes (bytes)
+  // lowers it, to test the split path on small runs
   std::size_t msg_chunk_bytes = std::size_t(1) << 30;
   bool msg_chunk_forced = false;
   std::uint64_t nmsg_prtcl = 0, nmsg_mpi = 0;   // messages, and the MPI messages they took

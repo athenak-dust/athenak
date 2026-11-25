@@ -148,7 +148,7 @@ class SelfGravity {
   std::unique_ptr<HierarchyAssembly> hierarchy_prefetch_;
   bool hierarchy_prefetch_enabled_ = false;
   std::uint64_t hierarchy_prefetch_used_ = 0, hierarchy_prefetch_discarded_ = 0;
-  // <gravity>/kdk_reuse (default off): the opening solve of a step keeps the
+  // <gravity>/kdk_reuse (default on): the opening solve of a step keeps the
   // closing field of the previous step when nothing but exact representation changes
   // (split, lobe release, migration, reordering) happened in between; see KdkReuseAllowed.
   bool kdk_reuse_ = false, reuse_check_ = false, reuse_valid_ = false;
@@ -156,7 +156,7 @@ class SelfGravity {
   Real reuse_check_max_residual_ = 0, reuse_check_max_source_ = 0, reuse_check_max_gather_ = 0;
   DvceArray1D<Real> reuse_gas_;  // gas density of the source cells (gas sources only)
   Real last_physical_mass_ = 0;
-  // <gravity>/guess = extrapolate (default previous): linear extrapolation in time of
+  // <gravity>/guess = extrapolate (default; or previous): linear extrapolation in time of
   // the last two accepted potentials as the initial guess of a solve at a new time
   bool guess_extrapolate_ = false, guess_prev_valid_ = false, guess_cur_valid_ = false;
   DvceArray1D<Real> guess_prev_, guess_tmp_;

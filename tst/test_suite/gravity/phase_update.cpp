@@ -7,9 +7,10 @@
 //  2. a batch whose coarse matrix, or whose extra (force) operator, is invalid throws on every
 //     rank and leaves every operator as it was (bitwise); the solver is then updated validly and
 //     equals a fresh solver given the same updates (bitwise)
-//  3. ATHENA_SG_PROJECT_FUSE / the Allreduce probe: with EXPECT_FUSION=0|1 in the environment the
-//     solver's ProjectionFusion() must match (run once without ATHENA_SG_PROJECT_FUSE, once with
-//     it, once with it and ATHENA_SG_PROJECT_FUSE_PROBE_TEST=1, which must refuse); the V-cycle
+//  3. <gravity>/test_project_fuse / the Allreduce probe: this program sets the switch from
+//     PROJECT_FUSE=0|1|probe_test in its environment (as SelfGravity would from the input); with
+//     EXPECT_FUSION=0|1 the solver's ProjectionFusion() must match (run once with PROJECT_FUSE=0,
+//     once with 1, once with probe_test, which must refuse); the V-cycle
 //     result is printed as a checksum so that runs with and without fusion can be compared
 //  4. the completion of the queued uploads: every public update that
 //     returns normally ends with the fence "gravity_phase_uploads", which may throw (Kokkos throws
@@ -17,7 +18,7 @@
 //     fence "gravity_phase_uploads_unwind".  A Kokkos Tools fence callback counts both and, when
 //     armed, throws from them as a failed device synchronization would: the error of the normal
 //     fence must reach the caller, the error of the unwinding fence must not replace the update's
-//     own exception (with ATHENA_SG_PHASE_ALLOC_OLD=1, blocking copies: no fence, none counted)
+//     own exception
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -32,6 +33,7 @@
 #include <vector>
 
 #include "gravity/geometric_mg.hpp"
+#include "gravity/sg_test_keys.hpp"
 #include "gravity/vacuum_mesh.hpp"
 #include <Kokkos_Profiling_ScopedRegion.hpp>   // (Kokkos::Tools::Experimental fence callbacks)
 
@@ -199,13 +201,8 @@ void FailedBatch(Setup &s, int rank) {
     bool threw = false;
     try { used.Batch(bad); } catch (const std::runtime_error &) { threw = true; }
     Check(Min(threw ? 1 : 0) == 1,"an invalid batch did not throw on every rank");
-    // (with ATHENA_SG_PHASE_FORCE_OLD=1 the extra operator keeps its own collectives after the
-    // hierarchy update, as before the batching: only the throw and the reuse are checked then)
-    const char *force_old = std::getenv("ATHENA_SG_PHASE_FORCE_OLD");
-    if (which == 0 || force_old == nullptr || force_old[0] != '1') {
-      Same(before,used.State(),which == 0 ? "invalid coarse matrix modified the solver"
-                                           : "invalid extra operator modified the solver");
-    }
+    Same(before,used.State(),which == 0 ? "invalid coarse matrix modified the solver"
+                                         : "invalid extra operator modified the solver");
   }
   used.Batch(u1); fresh.Batch(u1);
   Same(fresh.State(),used.State(),"reuse after a failed batch");
@@ -239,8 +236,7 @@ struct FenceProbe {
   static void Reset() { normal = unwind = 0; }
 };
 void CompletionFence(Setup &s, int rank) {
-  const char *old = std::getenv("ATHENA_SG_PHASE_ALLOC_OLD");
-  const bool fences = !(old != nullptr && old[0] == '1');
+  const bool fences = true;   // (every public update completes with a fence)
   Solver solver(s);
   auto u0 = MakeUpdates(s,Real(0),rank), u1 = MakeUpdates(s,Real(-.3),rank);
   solver.Batch(u0);
@@ -269,8 +265,7 @@ void CompletionFence(Setup &s, int rank) {
     bool reported = false;
     try { e.call(); } catch (const FenceProbe::Error &) { reported = true; }
     Check(Min(reported == fences ? 1 : 0) == 1,
-          std::string(e.what)+(fences ? ": a failed completion fence was not reported"
-                                      : ": a fence ran with ATHENA_SG_PHASE_ALLOC_OLD=1"));
+          std::string(e.what)+": a failed completion fence was not reported");
   }
   // (c) armed: a batch that throws itself (one rank's coarse matrix invalid) reports its own
   // error; the unwinding fence ran and its (simulated) failure was swallowed
@@ -296,8 +291,7 @@ void CompletionFence(Setup &s, int rank) {
   Check(Min(fences ? (FenceProbe::unwind >= 1 && FenceProbe::normal == 0 ? 1 : 0)
                    : (FenceProbe::unwind == 0 && FenceProbe::normal == 0 ? 1 : 0)) == 1,
         "a throwing batch did not end with (only) the unwinding fence");
-  if (rank == 0) std::cout << "completion fences PASS (" << (fences ? "fenced" : "no fences: "
-                           "ATHENA_SG_PHASE_ALLOC_OLD") << ")\n";
+  if (rank == 0) std::cout << "completion fences PASS (fenced)\n";
 }
 }  // namespace
 
@@ -312,6 +306,12 @@ int main(int argc, char **argv) {
 #if MPI_PARALLEL_ENABLED
   MPI_Comm_rank(MPI_COMM_WORLD,&rank); MPI_Comm_size(MPI_COMM_WORLD,&ranks);
 #endif
+  if (const char *f = std::getenv("PROJECT_FUSE"); f != nullptr) {
+    // (<gravity>/test_project_fuse; the same on every rank, as from the input)
+    const std::string v = f;
+    gravity::SgTest().project_fuse = (v == "1" || v == "true" || v == "probe_test");
+    gravity::SgTest().project_fuse_probe_test = (v == "probe_test");
+  }
   try {
     auto setup = MakeSetup(rank,ranks);
     ConsecutiveUpdates(*setup,rank);

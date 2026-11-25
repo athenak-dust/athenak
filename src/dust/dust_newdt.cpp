@@ -106,13 +106,6 @@ void DustGasDrag::RefreshStoppingTimeMaximum() {
 //! CFL factor to ppart->dtnew.
 
 TaskStatus DustGasDrag::NewTimeStep(Driver *pdrive, int stage) {
-  if (coupling == DustCoupling::hybrid && hybrid_mode == HybridMode::split_be) {
-    return TaskStatus::complete;
-  }
-  return ComputeNewTimeStep(pdrive, stage);
-}
-
-TaskStatus DustGasDrag::ComputeNewTimeStep(Driver *pdrive, int stage) {
   if (stage != (pdrive->nexp_stages)) {
     return TaskStatus::complete;  // only execute on last stage
   }
@@ -123,7 +116,7 @@ TaskStatus DustGasDrag::ComputeNewTimeStep(Driver *pdrive, int stage) {
   // chi = dt*max_rate <= stiff_thresh, from the global max rate of this cycle's predictor (the same
   // on every rank, also on ranks without particles)
   const Real dt_stiff = (stiff_thresh > 0.0 && stiff_rate_max > 0.0 &&
-                         coupling == DustCoupling::hybrid && hybrid_mode == HybridMode::pc2) ?
+                         coupling == DustCoupling::pc2) ?
                         stiff_thresh/stiff_rate_max : std::numeric_limits<float>::max();
   if (npart == 0) {
     ppar->dtnew = dt_stiff;
@@ -156,19 +149,6 @@ TaskStatus DustGasDrag::ComputeNewTimeStep(Driver *pdrive, int stage) {
 }
 
 //----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::NewTimeStep2
-//! \brief Split-BE migrates after its relaxed kick, later than PC2/IMEX.  Keep a second
-//! conditional task after that migration so the legacy paths retain their original
-//! overlap between particle timestep reduction and the PMBR commit.
-
-TaskStatus DustGasDrag::NewTimeStep2(Driver *pdrive, int stage) {
-  if (coupling != DustCoupling::hybrid || hybrid_mode != HybridMode::split_be) {
-    return TaskStatus::complete;
-  }
-  return ComputeNewTimeStep(pdrive, stage);
-}
-
-//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::GammaSwitch
 //! \brief Once per cycle (before the time integrator), switches the imex2+ singly-
 //! diagonal coefficient between gamma = 1+1/sqrt(2) (monotone, most accurate for
@@ -182,26 +162,7 @@ TaskStatus DustGasDrag::GammaSwitch(Driver *pdrive, int stage) {
       stopping_time_mode == DustStoppingTimeMode::dynamic) {
     RefreshStoppingTimeMaximum();
   }
-  if (coupling == DustCoupling::hybrid) {
-    if (hybrid_force_mode == HybridForceMode::pc2) {
-      hybrid_mode = HybridMode::pc2;
-    } else if (hybrid_force_mode == HybridForceMode::split_be) {
-      hybrid_mode = HybridMode::split_be;
-    } else if (hybrid_have_metric) {
-      Real zeta = pmy_pack->pmesh->dt/taus_min;
-      Real chi = pmy_pack->pmesh->dt*hybrid_feedback_rate_max;
-      if (hybrid_mode == HybridMode::pc2) {
-        if (zeta > hybrid_enter_zeta || chi > hybrid_enter_chi) {
-          hybrid_mode = HybridMode::split_be;
-        }
-      } else if (zeta < hybrid_exit_zeta && chi < hybrid_exit_chi) {
-        hybrid_mode = HybridMode::pc2;
-      }
-      hybrid_last_zeta = zeta;
-      hybrid_last_chi = chi;
-    }
-    return TaskStatus::complete;
-  }
+  if (coupling == DustCoupling::pc2) return TaskStatus::complete;
   if (!gamma_switch) {return TaskStatus::complete;}
 
   Real gnew = (pmy_pack->pmesh->dt > taus_max) ? 0.5 : 1.0 + 1.0/sqrt(2.0);

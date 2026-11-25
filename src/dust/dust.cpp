@@ -91,36 +91,31 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
               << "<dust> block requires <particles>/particle_type = dust" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  CheckRetiredCoupling(pin);   // retired-compat (coupling = hybrid, dust_input.hpp)
   // Driver is constructed after physics modules, so read the coupling and integrator
   // directly from the input while validating the module configuration.
-  bool pc2_only = false;
   {
     std::string method = pin->GetOrAddString("dust", "coupling", "imex");
     if (method.compare("imex") == 0) {
       coupling = DustCoupling::imex;
-    } else if (method.compare("hybrid") == 0) {
-      coupling = DustCoupling::hybrid;
     } else if (method.compare("pc2") == 0) {
-      // PC2 uses the hybrid task path, but this direct spelling disables the
-      // automatic split-BE fallback and selects PC2 for every cycle.
-      coupling = DustCoupling::hybrid;
-      pc2_only = true;
+      coupling = DustCoupling::pc2;
     } else {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<dust>/coupling = '" << method
-                << "' not recognized (must be imex, pc2, or hybrid)" << std::endl;
+                << "' not recognized (must be imex or pc2)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
   std::string integrator = pin->GetOrAddString("time", "integrator", "rk2");
   bool bad_integrator = ((coupling == DustCoupling::imex &&
                           integrator.compare("imex2+") != 0) ||
-                         (coupling == DustCoupling::hybrid &&
+                         (coupling == DustCoupling::pc2 &&
                           integrator.compare("rk2") != 0));
   if (bad_integrator) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "Dust coupling=imex requires integrator=imex2+, while coupling=pc2 "
-              << "or hybrid requires integrator=rk2" << std::endl;
+              << "requires integrator=rk2" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   // keys of earlier versions that are no longer read (one NOTE each; the run goes on).
@@ -160,8 +155,34 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                 << std::endl;
     }
   }
-  // refinable clouds on a 3-D mesh (dust_cloud3d.cpp)
-  clouds3d = pmy_pack->pmesh->three_d && smr_transfer_mode == DustSMRTransfer::refinable_cloud;
+  // refinable clouds on a 3-D mesh (dust_cloud3d.cpp): 3; on a 2-D mesh: 2; none: 0
+  cloud_dim = (smr_transfer_mode != DustSMRTransfer::refinable_cloud) ? 0 :
+              (pmy_pack->pmesh->three_d ? 3 : 2);
+  // the prototype keys test_cloud_dc1 / test_cloud_dc_sweeps of the clouds' dc1 are replaced by
+  // drag_solver (below).  A restart file of the prototype carries them, and a restart can change a
+  // key but not remove it: test_cloud_dc1 = false is ignored (NOTE), true stops with the way to
+  // continue (the rst of the prototype holds drag_solver = local, so the solver must be given)
+  if (pin->DoesParameterExist("dust", "test_cloud_dc1") &&
+      pin->GetBoolean("dust", "test_cloud_dc1")) {
+    const bool two = pin->DoesParameterExist("dust", "test_cloud_dc_sweeps") &&
+                     pin->GetInteger("dust", "test_cloud_dc_sweeps") == 2;
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "<dust>/test_cloud_dc1 = true (prototype key) is replaced by <dust>/drag_solver. "
+              << "To continue a run of the prototype give both dust/test_cloud_dc1=false and "
+              << "dust/drag_solver=" << (two ? "dc2" : "dc1") << " (its scheme"
+              << (two ? ", test_cloud_dc_sweeps = 2" : "") << "; or dc1 / dc2 / local) on the "
+              << "command line, or in the -i file two lines in its <dust> block: "
+              << "test_cloud_dc1 = false and drag_solver = " << (two ? "dc2" : "dc1")
+              << " (keys with a block/ prefix are not read there, and the rst's true would stay)"
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (global_variable::my_rank == 0) {
+    NoteDroppedKey(pin, "dust", "test_cloud_dc1",
+                   "prototype key, replaced by <dust>/drag_solver");
+    NoteDroppedKey(pin, "dust", "test_cloud_dc_sweeps",
+                   "prototype key, replaced by <dust>/drag_solver = dc1 / dc2");
+  }
   // <dust>/point_sort_interval = N (default 50; 0: never): point particles (no refinable clouds)
   // are reordered in their arrays by (MeshBlock, k, j, i) of their cell every N cycles, at the
   // start of the cycle (RefineClouds -> SortParticles, the cloud path's sort).  The TSC
@@ -179,16 +200,16 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   }
   // shear-periodic x1 in the leaf traversal (the cloud supports across
   // the radial boundaries on the sheared image)
-  shear3d = clouds3d &&
+  shear3d = cloud_dim == 3 &&
       pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic;
   // (test) false: particles crossing an x1 face after the push take the shear offset of the start
   // of the step, as the routing of point particles does
   if (shear3d) shear3d_route_fix = pin->GetOrAddBoolean("dust", "cloud_shear_route_time", true);
-  // cache the shear-image lists (default on; bitwise the same results as without the cache)
-  if (shear3d) shear3d_list_cache = pin->GetOrAddBoolean("dust", "cloud_shear_list_cache", true);
+  // (the shear-image lists are cached, always: bitwise the same results as
+  // without the cache)
   // 3-D clouds at physical x3 faces fold their supports back (dropping the ghost deposits has no
   // cloud version)
-  if (clouds3d && pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
+  if (cloud_dim == 3 && pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic &&
       pin->GetOrAddString("dust", "x3_ghost_deposit", "fold") != "fold") {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "3-D refinable clouds at physical x3 faces: x3_ghost_deposit = fold only "
@@ -198,12 +219,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // default 4 (the best balance of clouds per rank, fastest of 1 / 2 / 4); 0 gives
   // every new block the cost 1 as AthenaK does; one rank never uses it
   lb_cloud_weight = pin->GetOrAddReal("dust", "load_balance_cloud_weight", 4.0);
-  lb_log_interval = pin->GetOrAddInteger("dust", "load_balance_log", 0);
-  lb_octant_count = pin->GetOrAddBoolean("dust", "load_balance_octant_count", true);
+  lb_log_interval = TestKeyInt(pin, "dust", "test_load_balance_log", 0);
   // the partition with the smallest largest rank cost (Mesh::LoadBalance); the mesh has read
   // the same key before its first partition (Mesh::SetLoadBalanceStrategy)
-  pmy_pack->pmesh->lb_minmax = pin->GetOrAddBoolean("dust", "load_balance_minmax", true);
-  if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {   // (block map: the only one)
+  pmy_pack->pmesh->lb_minmax = TestKeyBool(pin, "dust", "test_load_balance_minmax", true);
+  if (GetAmrDensityTrigger(pin)) {   // (block map: the only one)
     halo_trigger_cells = std::max(0, pin->GetOrAddInteger("dust", "amr_rho_buffer", 2));
     // the derefinement test of a block of level l >= 1 reaches 2 amr_rho_buffer cells of its level
     // (= amr_rho_buffer cells of the parent's level): the siblings together see the region of the
@@ -251,7 +271,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   if (pmy_pack->pmesh->multilevel) {
     // the fenced phase profile (DUST_AMR_PROFILE) only on request; its fences make the
     // host wait for the device several times per cycle
-    ProfOn() = pin->GetOrAddBoolean("dust", "amr_profile", false);
+    ProfOn() = TestKeyBool(pin, "dust", "test_amr_profile", false);
     // static or adaptive refinement (dust_amr.cpp: the dust state is rebuilt
     // after every regrid): a 2-D periodic mesh, or a 3-D mesh with periodic or shear-periodic x1
     // (instant_switch or refinable clouds), periodic x2 and periodic or physical x3
@@ -269,7 +289,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // physical x3 faces in 3-D (a stratified box): particles reflect or leave
   // (<dust>/particle_x3_bc), ghost deposits beyond the faces fold back (or are dropped,
   // <dust>/x3_ghost_deposit); the PC2 gather reads the gas ghost cells of the gas boundary
-  // conditions, imex and the automatic hybrid the u* ghost cells.
+  // conditions, imex the u* ghost cells.
   const bool x3_phys = pmy_pack->pmesh->three_d &&
       pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic;
   if (!(pmy_pack->pmesh->strictly_periodic)) {
@@ -284,7 +304,7 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                 << "directions (or shear-periodic x1 and / or physical x3 faces in 3D)" << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    // imex and the automatic hybrid read u*, which gets x3 boundary values
+    // imex reads u*, which gets x3 boundary values
     // (DustGasDrag::UstarX3BCs); every coupling is allowed
     // the ghost deposits across the shear-periodic faces are moved
     // to the opposite face with the shear offset (DepRemapPlan); the u* ghost fill is remapped
@@ -295,11 +315,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // diagonal modes, so a 3-D dust run above 1/3 blows up within a fraction of a sound crossing.
   if (pmy_pack->pmesh->three_d &&
       pin->GetReal("time", "cfl_number") > 1.0/3.0 + 1.0e-12 &&
-      !pin->GetOrAddBoolean("dust", "allow_cfl_above_third_3d", false)) {
+      !TestKeyBool(pin, "dust", "test_allow_cfl_above_third_3d", false)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "3-D dust: <time>/cfl_number = " << pin->GetReal("time", "cfl_number")
               << " exceeds 1/3, the stability limit of the 3-D RK2 + PLM gas update; "
-              << "use cfl_number <= 0.3 (or <dust>/allow_cfl_above_third_3d = true for an "
+              << "use cfl_number <= 0.3 (or <dust>/test_allow_cfl_above_third_3d = true for an "
               << "integrator that allows more)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -312,10 +332,10 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // (2) read parameters ----------------------------------------------------------------
   back_reaction = pin->GetOrAddBoolean("dust","back_reaction",true);
   gamma_switch  = pin->GetOrAddBoolean("dust","gamma_switch",false);
-  if (coupling == DustCoupling::hybrid && gamma_switch) {
+  if (coupling == DustCoupling::pc2 && gamma_switch) {
     if (global_variable::my_rank == 0) {
       std::cout << "# WARNING (dust): <dust>/gamma_switch=true has no effect for "
-                << "coupling=" << (pc2_only ? "pc2" : "hybrid")
+                << "coupling=pc2"
                 << "; gamma_switch only modifies the imex2+ tableau and will be ignored."
                 << std::endl;
     }
@@ -331,26 +351,22 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     dust_to_gas = st.new_init ? st.total : pin->GetOrAddReal("dust","dust_to_gas",0.01);
   }
 
-  hybrid_enter_zeta = pin->GetOrAddReal("dust", "hybrid_enter_zeta", 0.5);
-  hybrid_enter_chi  = pin->GetOrAddReal("dust", "hybrid_enter_chi", 0.5);
-  hybrid_exit_zeta  = pin->GetOrAddReal("dust", "hybrid_exit_zeta", 0.25);
-  hybrid_exit_chi   = pin->GetOrAddReal("dust", "hybrid_exit_chi", 0.25);
   // PC2 feedback stiffness monitor, optional dt limit and predictor damping: the damping (as
   // Athena-C) on by default, the dt limit left to the user (off)
   stiff_thresh = pin->GetOrAddReal("dust", "stiff_thresh", -1.0);
   // the IMEX gas gets the lumped solve's change plus its mass share of the residual (3-D
   // clouds; false = the gas takes the clouds' whole impulse)
-  imex_consistent_gas = pin->GetOrAddBoolean("dust", "imex_consistent_gas", true);
+  imex_consistent_gas = TestKeyBool(pin, "dust", "test_imex_consistent_gas", true);
   // hidden key, on by default: the clouds' share of the lumped IMEX solve's residual goes to the
   // clouds whose center lies in the cell, up to the kick of one nominal cloud, and the u* gather
   // blends to the deposit's adjoint where the dust dominates (dust_imex3d.cpp).  false = the split
   // by the overlap weights and the plain gather.  It applies to 3-D refinable clouds with
-  // coupling = imex, back-reaction, imex_consistent_gas and cloud_transition = 2 and is skipped
+  // coupling = imex, back-reaction and imex_consistent_gas and is skipped
   // silently elsewhere (a restart stores the default-added key, so "given in the input" cannot be
-  // told from the default); the switches are set below, once cloud_transition is known.
+  // told from the default); the switches are set below for refinable clouds.
   {
-    const bool on = pin->GetOrAddBoolean("dust", "test_imex_residual_to_center_upto_nominal", true);
-    imex_res_want = on && clouds3d && coupling == DustCoupling::imex && back_reaction &&
+    const bool on = TestKeyBool(pin, "dust", "test_imex_residual_to_center_upto_nominal", true);
+    imex_res_want = on && cloud_dim == 3 && coupling == DustCoupling::imex && back_reaction &&
                     imex_consistent_gas;
   }
   // hidden diagnostic key: the dt threshold below which every cycle reports what limits dt
@@ -360,38 +376,44 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     std::cout << "# NOTE (dust): test_dt_diag = " << dt_diag_thr << ": cycles with a smaller dt "
               << "print '# DT_DIAG' lines (the limiting cell / cloud of each rank)" << std::endl;
   }
-  pc2_feedback_damping = pin->GetOrAddBoolean("dust", "pc2_feedback_damping", true);
-  if (!(hybrid_enter_zeta > hybrid_exit_zeta && hybrid_exit_zeta >= 0.0 &&
-        hybrid_enter_chi > hybrid_exit_chi && hybrid_exit_chi >= 0.0)) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Hybrid enter thresholds must be positive and exceed exit thresholds"
-              << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  if (pc2_only) {
-    hybrid_force_mode = HybridForceMode::pc2;
-    hybrid_mode = HybridMode::pc2;
-  } else {
-    std::string forced = pin->GetOrAddString("dust", "hybrid_force_mode", "auto");
-    if (forced.compare("auto") == 0) {
-      hybrid_force_mode = HybridForceMode::automatic;
-      hybrid_mode = HybridMode::pc2;
-    } else if (forced.compare("pc2") == 0) {
-      hybrid_force_mode = HybridForceMode::pc2;
-      hybrid_mode = HybridMode::pc2;
-    } else if (forced.compare("split_be") == 0) {
-      hybrid_force_mode = HybridForceMode::split_be;
-      hybrid_mode = HybridMode::split_be;
-    } else {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "<dust>/hybrid_force_mode = '" << forced
-                << "' not recognized (must be auto, pc2, or split_be)" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-  }
-
+  pc2_feedback_damping = TestKeyBool(pin, "dust", "test_pc2_feedback_damping", true);
   {
-    std::string solver = pin->GetOrAddString("dust", "drag_solver", "local");
+    // default: dc1 for point particles on a uniform mesh with coupling = imex
+    // (every geometry the point path supports: periodic, and in 3-D shear-periodic x1 and/or
+    // physical x3 faces), local otherwise (PC2, refinable clouds, instant_switch on
+    // a refined mesh).  The value is written to the restart file (the default too, as every
+    // GetOrAdd key): a run started with drag_solver = local, or before this default, keeps local
+    // when it continues from its rst unless drag_solver is given again
+    // (also dc1 for 3-D refinable clouds with coupling = imex;
+    // it falls back to local only with the lagged x slope of the shear pull on a refined mesh, see
+    // the cloud set-up below; dust_imex3d_dc.cpp)
+    // (also dc1 for 2-D refinable clouds with coupling = imex, the same operator,
+    // dust_imex3d_dc.cpp)
+    const bool point_uniform = smr_transfer_mode == DustSMRTransfer::none &&
+                               !pmy_pack->pmesh->multilevel;
+    const std::string def_solver =
+        ((point_uniform || UsesRefinableClouds()) && coupling == DustCoupling::imex) ? "dc1" :
+                                                                                     "local";
+    solver_given_ = pin->DoesParameterExist("dust", "drag_solver");
+    // where a given value comes from (the NOTEs below): a restart file stores every key, a
+    // default with the comment "# Default value added at run time", which a change on the command
+    // line keeps and a value in an input file replaces
+    if (solver_given_) {
+      std::string comment;
+      for (auto &blk : pin->block) {
+        if (blk.block_name != "dust") continue;
+        const InputLine *pl = blk.GetPtrToLine("drag_solver");
+        if (pl != nullptr) comment = pl->param_comment;
+        break;
+      }
+      solver_src_ = (comment.find("Default value added at run time") != std::string::npos) ?
+          "from the restart file, the default of the run that wrote it (or the same value given "
+          "again on the command line, which keeps the file's comment)" :
+          "given in the input (or in the input of the run that wrote the restart file)";
+    }
+    // (point particles in a 2-D shearing box: the coupled solvers stop below, no dc1)
+    solver_default_dc1_ = (def_solver == "dc1") && !(shear_x1 && !pmy_pack->pmesh->three_d);
+    std::string solver = pin->GetOrAddString("dust", "drag_solver", def_solver);
     if (solver.compare("local") == 0) {
       drag_solver = DustDragSolver::local;
     } else if (solver.compare("applya") == 0) {
@@ -411,25 +433,41 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
+    // a coupling without an implicit drag solve, PC2 (coupling = pc2), does not use drag_solver: a value other than local (a restart
+    // file of an IMEX run stores dc1, its default) is ignored (NOTE) and the run takes local
+    // inside.  The parameter keeps its value, so that a later restart with coupling = imex
+    // continues with it.
+    if (coupling == DustCoupling::pc2 && drag_solver != DustDragSolver::local) {
+      if (global_variable::my_rank == 0) {
+        std::cout << "# NOTE (dust): drag_solver = " << solver << " (" << solver_src_
+                  << ") is not used with coupling = pc2 (no implicit drag solve): ignored, the run "
+                  << "uses local; the parameter keeps " << solver << " for a later restart with "
+                  << "coupling = imex" << std::endl;
+      }
+      drag_solver = DustDragSolver::local;
+      solver_default_dc1_ = false;
+    }
+    // coupling = imex with local where dc1 is the default (point particles here; refinable
+    // clouds once their conditions for dc1 are known, below): a NOTE with the value's origin, for
+    // a restart of a PC2 run keeps the stored local
+    if (drag_solver == DustDragSolver::local && solver_default_dc1_ && !UsesRefinableClouds()) {
+      NoteLocalNotDefault();
+    }
   }
-  if (coupling == DustCoupling::hybrid &&
-      drag_solver != DustDragSolver::local && drag_solver != DustDragSolver::dc1 &&
-      drag_solver != DustDragSolver::pcg) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "The first hybrid split-BE implementation supports only "
-              << "drag_solver=local, dc1, or pcg" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  if (pmy_pack->pmesh->multilevel && drag_solver != DustDragSolver::local) {
+  // (refinable clouds, 2-D and 3-D: local, dc1 or dc2, checked in their set-up below)
+  const bool cloud_dc_req = UsesRefinableClouds() &&
+      (drag_solver == DustDragSolver::dc1 || drag_solver == DustDragSolver::dc2);
+  if (pmy_pack->pmesh->multilevel && drag_solver != DustDragSolver::local && !cloud_dc_req) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "dust on a refined mesh supports only drag_solver = local "
-              << "(the coupled solvers have no composite transfer)" << std::endl;
+              << "(the coupled solvers have no composite transfer; drag_solver: " << solver_src_
+              << "): give dust/drag_solver=local" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   drag_rtol = pin->GetOrAddReal("dust", "drag_rtol", 1.0e-11);
   drag_atol = pin->GetOrAddReal("dust", "drag_atol", 1.0e-14);
   drag_iter_max = pin->GetOrAddInteger("dust", "drag_iter_max", 200);
-  drag_diagnostic_interval = pin->GetOrAddInteger("dust", "drag_diagnostic_interval", 0);
+  drag_diagnostic_interval = TestKeyInt(pin, "dust", "test_drag_diagnostic_interval", 0);
   adaptive_order_c = pin->GetOrAddReal("dust", "drag_adaptive_order_c", 0.25);
   adaptive_rtol_max = pin->GetOrAddReal("dust", "drag_adaptive_rtol_max", 1.0e-3);
   adaptive_tref = pin->GetOrAddReal("dust", "drag_adaptive_tref", 1.0);
@@ -586,11 +624,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       {
         static const char *const keys[] = {
             "cloud_merge", "cloud_merge_stencil", "cloud_merge_budget_kappa", "cloud_merge_alpha",
-            "cloud_merge_alpha_leaf", "cloud_merge_budget", "cloud_merge_schedule",
-            "cloud_merge_dt_omega", "cloud_merge_interval", "cloud_merge_mode", "cloud_resample",
+            "test_cloud_merge_alpha_leaf", "cloud_merge_budget", "cloud_merge_schedule",
+            "cloud_merge_dt_omega", "cloud_merge_interval", "cloud_resample",
             "cloud_resample_eta", "cloud_resample_cold_alpha", "cloud_resample_schedule",
             "cloud_resample_dt", "cloud_resample_dt_omega", "cloud_resample_interval",
-            "cloud_resample_after_regrid"};
+            "test_resample_after_regrid"};
         refinable_given.clear();
         for (const char *k : keys) {
           if (pin->DoesParameterExist("dust", k)) {
@@ -598,50 +636,103 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           }
         }
       }
-      const bool x3phys3d = clouds3d &&
+      const bool x3phys3d = cloud_dim == 3 &&
           pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x3] != BoundaryFlag::periodic;
-      if (!multilevel && !((pmy_pack->pmesh->two_d || clouds3d) &&
+      // (several ranks, 2-D and 3-D: the dust halo as on a refined mesh; the options it does
+      // not cover stop in CheckMultiRank.  2-D clouds on a uniform mesh were limited to one rank
+      // in earlier versions)
+      if (!multilevel && !((pmy_pack->pmesh->two_d || cloud_dim == 3) &&
                            (pmy_pack->pmesh->strictly_periodic || shear3d || x3phys3d) &&
-                           (global_variable::nranks == 1 || clouds3d) &&
-                           drag_solver == DustDragSolver::local)) {
+                           (drag_solver == DustDragSolver::local ||
+                            drag_solver == DustDragSolver::dc1 ||
+                            drag_solver == DustDragSolver::dc2))) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "refinable_cloud on a uniform mesh requires supported "
-                  << "2-D/3-D cloud geometry and drag_solver=local; several ranks require "
-                  << "3-D clouds"
+                  << "2-D/3-D cloud geometry and drag_solver = local, dc1 or dc2"
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      cloud_split_slack = pin->GetOrAddReal("dust", "cloud_split_slack", 0.02);
-      cloud_gather_order = pin->GetOrAddInteger("dust", "cloud_gather_order", 2);
-      cloud_transition = pin->GetOrAddInteger("dust", "cloud_transition",
-                                              cloud_gather_order == 2 ? 2 : 1);
-      if (cloud_transition < 0 || cloud_transition > 2 ||
-          (cloud_transition == 2 && cloud_gather_order != 2)) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_transition must be 0, 1 or 2, and 2 "
-                  << "requires cloud_gather_order=2" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
+      // (the clouds gather the linear reconstruction of the leaves; cloud_gather_order = 1 was
+      // retired)  // retired-compat
       // the cloud residual rule (test_imex_residual_to_center_upto_nominal): its gather blend
-      // needs a gather with the deposit's own weights, cloud_transition = 2
+      // needs a gather with the deposit's own weights (the transition clouds' mode 2, the only one)
       {
-        const bool on = imex_res_want && cloud_transition == 2;
+        const bool on = imex_res_want;
         imex_resid_center = imex_gather_blend = imex_resid_center_floor = on;
-        if (on && global_variable::my_rank == 0) {
-          std::cout << "# NOTE (dust): test_imex_residual_to_center_upto_nominal = true: the IMEX "
-                    << "residual's dust share of a leaf cell goes to the clouds whose center lies "
-                    << "in it (at most the kick of one nominal cloud; the rest, and that of a cell "
-                    << "without a centered cloud, by the overlap weights), and the slope part of "
-                    << "the clouds' u* gather fades with the dust share Q/(rho + Q)" << std::endl;
+        // (its NOTE follows the dc1 settings below, which turn the gather blend off)
+      }
+      // drag_solver = dc1 / dc2 (the default with coupling = imex; dust_imex3d_dc.cpp): one / two
+      // defect-correction sweeps of the lumped IMEX solve with the clouds' own gather and deposit.
+      // Needs coupling = imex (otherwise the default is local).
+      // The drag_solver of the rst (also the default, written at run time) is kept on a restart: a
+      // run started with local, or before dc1 was the default, continues with local unless
+      // drag_solver is given again.  The gather blend is off on this path (in A and in the kick:
+      // its dt dependence alone keeps the scheme first order; test_cloud_dc1_blend, which kept it,
+      // retired).
+      if (cloud_dc_req) {
+        const bool ok = coupling == DustCoupling::imex;
+        if (!ok && solver_given_) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                    << "<dust>/drag_solver = " << (drag_solver == DustDragSolver::dc2 ? "dc2" : "dc1")
+                    << " (" << solver_src_ << ") cannot run here: the clouds' dc1 / dc2 needs "
+                    << "coupling = imex; give dust/drag_solver=local" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        if (!ok) {
+          drag_solver = DustDragSolver::local;
+          pin->SetString("dust", "drag_solver", "local");
+        }
+        cloud_dc1 = ok && back_reaction;
+        cloud_dc_sweeps = (drag_solver == DustDragSolver::dc2) ? 2 : 1;
+      } else if (drag_solver == DustDragSolver::local && solver_default_dc1_) {
+        // (local where dc1 would be the default)
+        if (coupling == DustCoupling::imex) {
+          NoteLocalNotDefault();
         }
       }
-      // the Kokkos P1 split on every backend (it runs on CPUs
-      // too); the host split needs the finite fine-grid table (few levels, one rank) and stays a
-      // reference, selected explicitly
-      cloud_split_device = pin->GetOrAddBoolean("dust", "cloud_split_device", true);
+      if (cloud_dc1) {
+        cloud_dc1_opcheck = pin->DoesParameterExist("dust", "test_cloud_dc1_opcheck") &&
+                            pin->GetBoolean("dust", "test_cloud_dc1_opcheck");
+        // one blend value for the correction's operator, the kick and the operator check: off
+        imex_gather_blend = false;
+        if (global_variable::my_rank == 0) {
+          std::cout << "# NOTE (dust): " << (cloud_dim == 3 ? "3-D" : "2-D") << " clouds, drag_solver = dc"
+                    << cloud_dc_sweeps << ": "
+                    << cloud_dc_sweeps
+                    << " defect-correction sweep(s) of the lumped IMEX solve per working stage "
+                    << "(the clouds' gather and deposit), gather blend "
+                    << "off"
+                    << (cloud_dc1_opcheck ? ", operator check every stage" : "") << std::endl;
+        }
+      }
+      // 2-D clouds: the IMEX residual is split as for the points and the 3-D clouds
+      // (CloudImplicitConsistency2D, overlap weights) when imex_consistent_gas; earlier
+      // versions gave the 2-D clouds the mirror whatever the key (and the rst holds it true by
+      // default)
+      if (cloud_dim != 3 && coupling == DustCoupling::imex && back_reaction &&
+          global_variable::my_rank == 0) {
+        std::cout << "# NOTE (dust): 2-D clouds, IMEX residual "
+                  << (imex_consistent_gas ?
+                      "split between gas and clouds (overlap weights); "
+                      "the 2-D clouds took the mirror in earlier versions, so a run continued from "
+                      "an older restart file changes; test_imex_consistent_gas = false gives the "
+                      "mirror" :
+                      "to the gas as the impulse deposit (mirror, test_imex_consistent_gas = false)")
+                  << std::endl;
+      }
+      if (imex_resid_center && global_variable::my_rank == 0) {
+        std::cout << "# NOTE (dust): test_imex_residual_to_center_upto_nominal = true: the IMEX "
+                  << "residual's dust share of a leaf cell goes to the clouds whose center lies "
+                  << "in it (at most the kick of one nominal cloud; the rest, and that of a cell "
+                  << "without a centered cloud, by the overlap weights)"
+                  << (imex_gather_blend ? ", and the slope part of the clouds' u* gather fades "
+                                          "with the dust share Q/(rho + Q)" :
+                                          "; the gather blend is off (drag_solver = dc1 / dc2)")
+                  << std::endl;
+      }
       ReadSplitVelocityKeys(pin);   // <dust>/cloud_split_velocity (dust_split_velocity.cpp)
       // test switch; false keeps every cloud at its level whatever the mesh
-      cloud_split_enable = pin->GetOrAddBoolean("dust", "cloud_split_enable", true);
+      cloud_split_enable = TestKeyBool(pin, "dust", "test_cloud_split_enable", true);
       // G (quantum merge under the pass budget): on in default and careful_merge (a full AMR
       // needs a coarsening channel), off in split_only
       cloud_merge = preset_bool("cloud_merge", !split_only);
@@ -653,13 +744,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // the 3-D G velocity tolerance on the cell size of the leaf
       // that holds the merge cell (alpha 2^gap H / tau when the leaf is gap levels coarser);
       // on by default
-      cloud_merge_alpha_leaf = pin->GetOrAddBoolean("dust", "cloud_merge_alpha_leaf", true);
+      cloud_merge_alpha_leaf = TestKeyBool(pin, "dust", "test_cloud_merge_alpha_leaf", true);
       cloud_merge_interval = pin->GetOrAddInteger("dust", "cloud_merge_interval", 10);
-      cloud_merge_min_mass = pin->GetOrAddReal("dust", "cloud_merge_min_mass", 0.5);
-      cloud_merge_nc = pin->GetOrAddBoolean("dust", "cloud_merge_nc", true);
-      cloud_merge_lobe_wait = pin->GetOrAddInteger("dust", "cloud_merge_lobe_wait", 0);
-      // quantum G and several ranks exist only in the Kokkos merge
-      cloud_merge_device = pin->GetOrAddBoolean("dust", "cloud_merge_device", true);
       // merge schedule in physical time, burst after derefinement
       {
         Real om = 0.0;
@@ -680,29 +766,20 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           if (!(om > 0.0)) fatal("cloud_merge_schedule = time needs <shearing_box>/omega0 > 0");
           cloud_merge_dt = pin->GetOrAddReal("dust", "cloud_merge_dt_omega", 0.25)/om;
           if (!(cloud_merge_dt > 0.0)) fatal("cloud_merge_dt_omega must be > 0");
-          cloud_merge_t0 = pin->GetOrAddReal("dust", "cloud_merge_t0", 0.0);
         } else if (ms != "cycle") {
           fatal("cloud_merge_schedule must be cycle or time");
         }
-        const Real bdt = pin->GetOrAddReal("dust", "cloud_merge_burst_dt_omega", 0.0);
-        if (bdt > 0.0) {
-          if (!(om > 0.0)) fatal("cloud_merge_burst_dt_omega needs <shearing_box>/omega0 > 0");
-          cloud_merge_burst_dt = bdt/om;
+        // the merge bursts after a derefinement: <dust>/test_merge_after_derefine (hidden; off
+        // or "dt [interval]", MergeAfterDerefine in dust_input.hpp)
+        const MergeAfterDerefine mb = MergeAfterDerefine::Parse(
+            TestKeyString(pin, "dust", "test_merge_after_derefine", "off"));
+        if (mb.dt_omega > 0.0) {
+          if (!(om > 0.0)) fatal("test_merge_after_derefine needs <shearing_box>/omega0 > 0");
+          cloud_merge_burst_dt = mb.dt_omega/om;
         }
-        cloud_merge_burst_interval = pin->GetOrAddInteger("dust", "cloud_merge_burst_interval", 50);
-        if (cloud_merge_burst_interval < 1) fatal("cloud_merge_burst_interval must be >= 1");
+        cloud_merge_burst_interval = mb.interval;
       }
-      {
-        // quantum G by default; tent stays a research control
-        std::string mode = pin->GetOrAddString("dust", "cloud_merge_mode", "quantum");
-        if (mode == "tent") cloud_merge_mode = 0;
-        else if (mode == "quantum") cloud_merge_mode = 1;
-        else {
-          std::cout << "### FATAL ERROR: <dust>/cloud_merge_mode must be tent or quantum" << std::endl;
-          std::exit(EXIT_FAILURE);
-        }
-      }
-      // stage X (the exact stencil re-merge before G in quantum mode): careful_merge only
+      // stage X (the exact stencil re-merge before G): careful_merge only
       cloud_merge_stencil = preset_bool("cloud_merge_stencil", careful);
       // no X in a 3-D shearing box: the background shear pulls the
       // members of a P1 family apart in x2 (q Omega l per unit time), so no family is ever complete
@@ -722,22 +799,13 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         }
       }
       cloud_merge_stencil_tol = pin->GetOrAddReal("dust", "cloud_merge_stencil_tol", 0.02);
-      cloud_merge_smax = pin->GetOrAddReal("dust", "cloud_merge_smax", 1.0);
-      cloud_merge_K = pin->GetOrAddInteger("dust", "cloud_merge_K", 4);
-      // merged clouds keep their members' common ts (default); false mass-averages ts with the
-      // velocities (last-bit drift)
-      cloud_merge_exact_ts = pin->GetOrAddBoolean("dust", "cloud_merge_exact_ts", true);
+      // (cloud_merge_smax 1, cloud_merge_K 4: constants; merged clouds keep their members' common
+      // ts: always)
       cloud_merge_g_lag = pin->GetOrAddInteger("dust", "cloud_merge_g_lag", 2);
-      cloud_merge_xprotect = pin->GetOrAddBoolean("dust", "cloud_merge_xprotect", false);
-      // the mass floor of the pass budget (named after the absorption budget)
-      cloud_absorb_floor = pin->GetOrAddReal("dust", "cloud_absorb_floor", 0.1);
       // the production pass budget beta = 0.3; cloud_merge_budget = -1 switches it off
       cloud_merge_budget = pin->GetOrAddReal("dust", "cloud_merge_budget", 0.3);
       // the structure-relative budget (careful_merge: 1; 0 = off)
       cloud_merge_budget_kappa = preset_real("cloud_merge_budget_kappa", careful ? 1.0 : 0.0);
-      cloud_merge_budget_evals = pin->GetOrAddInteger("dust", "cloud_merge_budget_evals", 4);
-      cloud_merge_budget_thin = pin->GetOrAddBoolean("dust", "cloud_merge_budget_thin", false);
-      cloud_merge_budget_x = pin->GetOrAddBoolean("dust", "cloud_merge_budget_x", false);
       // R (resampling) on in default and careful_merge, with the production clock below; off in
       // split_only
       cloud_resample = preset_bool("cloud_resample", !split_only);
@@ -755,7 +823,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
         const bool g_int = pin->DoesParameterExist("dust", "cloud_resample_interval");
         const bool g_dt = pin->DoesParameterExist("dust", "cloud_resample_dt");
         bool g_dto = pin->DoesParameterExist("dust", "cloud_resample_dt_omega");
-        const bool g_t0 = pin->DoesParameterExist("dust", "cloud_resample_t0");
         const bool g_rst = pin->DoesParameterExist("dust", "cloud_resample_schedule_reset");
         if (pin->DoesBlockExist("shearing_box") &&
             pin->DoesParameterExist("shearing_box", "omega0")) {
@@ -793,12 +860,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
             cloud_resample_dt = pin->GetReal("dust", "cloud_resample_dt");
           }
           if (!(cloud_resample_dt > 0.0)) fatal("the resampling interval must be > 0");
-          cloud_resample_t0 = pin->GetOrAddReal("dust", "cloud_resample_t0", 0.0);
           cloud_resample_schedule_reset =
               pin->GetOrAddBoolean("dust", "cloud_resample_schedule_reset", false);
         } else if (sched == "cycle") {
-          if (g_dt || g_dto || g_t0 || g_rst) {
-            ignored("cloud_resample_dt, cloud_resample_dt_omega, cloud_resample_t0 and "
+          if (g_dt || g_dto || g_rst) {
+            ignored("cloud_resample_dt, cloud_resample_dt_omega and "
                     "cloud_resample_schedule_reset", "cycle");
           }
         } else {
@@ -850,10 +916,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       // resampling leaves cold patches alone (careful_merge: 0.05; 0 = off)
       cloud_resample_cold_alpha = preset_real("cloud_resample_cold_alpha", careful ? 0.05 : 0.0);
-      cloud_resample_patch = pin->GetOrAddInteger("dust", "cloud_resample_patch", 2);
       // patches inside one MeshBlock of min(cloud_resample_patch 2^level,
-      // cloud_resample_patch_cells)^2 of its cells
-      cloud_resample_patch_cells = pin->GetOrAddInteger("dust", "cloud_resample_patch_cells", 4);   // cap
+      // cloud_resample_patch_cells)^2 of its cells (constants 2 and 4)
       // a block patch, or a quadrant of one, holding more than this many pool clouds
       // (of one species) is split into its four quadrants, recursively down to single cells;
       // 0 = never.  Only for block patches whose widths min(cloud_resample_patch 2^level,
@@ -862,24 +926,23 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       auto pow2 = [](const int n) {return n >= 1 && (n & (n - 1)) == 0;};
       const bool split_ok = cloud_resample_patch_cells <= 16 &&
                             pow2(cloud_resample_patch) && pow2(cloud_resample_patch_cells);
-      cloud_resample_patch_split = pin->GetOrAddInteger("dust", "cloud_resample_patch_split",
+      cloud_resample_patch_split = TestKeyInt(pin, "dust", "test_cloud_resample_patch_split",
                                                         split_ok ? 1024 : 0);
       // (3-D) a patch with more pool clouds than this (one cell of a dense core can hold 1e5 to
       // 1e6) is solved as sub-patches of consecutive pool clouds, each keeping its own share of
-      // every row, so that the solves stay small and run in parallel; 0 = never
-      cloud_resample_patch_max = pin->GetOrAddInteger("dust", "cloud_resample_patch_max", 4096);
+      // every row, so that the solves stay small and run in parallel (constant 4096)
       // (3-D) the (cloud, leaf cell) pairs of the pool are held in tables with 32-bit offsets: the
       // block patches of a rank are resampled in consecutive batches of about this many pairs
       // (patches are independent, so the result is that of one pass).  A target: a base patch with
       // more pairs is a batch of its own; the hard limit is 2^31 - 1 pairs per batch
       cloud_resample_batch_pairs = static_cast<long long>(pin->GetOrAddReal("dust",
-          "cloud_resample_batch_pairs", 1073741824.0));
+          "cloud_resample_batch_pairs", 268435456.0));   // 2^28 (2^30 in earlier versions)
       cloud_resample_threads = pin->GetOrAddInteger("dust", "cloud_resample_threads", 1);
       // (3-D refinable clouds only; 2-D ignores it): the device solve leaves out the
       // patches of n clouds on nl leaves with n <= 7 nl + 9 (+ the cross-moment rows in a flagged
       // patch; the nominal rows: no null vector is certain there).  false: every patch is solved
       // (the reference path)
-      cloud_resample_rank_screen = pin->GetOrAddBoolean("dust", "cloud_resample_rank_screen", true);
+      cloud_resample_rank_screen = TestKeyBool(pin, "dust", "test_cloud_resample_rank_screen", true);
       // (3-D refinable clouds) rows of the position-velocity cross moments sum m (x - c)_a (v - u)_b
       // per patch (c the patch center, u the patch mean velocity before R), only in the flagged
       // patches (dust_resample.hpp: several cloud levels, a cloud finer than a footprint leaf, a
@@ -892,11 +955,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // key, read there only when present, must be none
       {
         std::string xv;
-        if (clouds3d) {
-          xv = pin->GetOrAddString("dust", "cloud_resample_xv_rows", "angmom");
+        if (cloud_dim == 3) {
+          xv = TestKeyString(pin, "dust", "test_cloud_resample_xv_rows", "angmom");
         } else {
-          xv = pin->DoesParameterExist("dust", "cloud_resample_xv_rows")
-             ? pin->GetString("dust", "cloud_resample_xv_rows") : "none";
+          xv = pin->DoesParameterExist("dust", "test_cloud_resample_xv_rows")
+             ? pin->GetString("dust", "test_cloud_resample_xv_rows") : "none";
         }
         if (xv == "none") {
           cloud_resample_xv_rows = 0;
@@ -906,19 +969,19 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
           cloud_resample_xv_rows = 2;
         } else {
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                    << "<dust>/cloud_resample_xv_rows must be none, angmom or full" << std::endl;
+                    << "<dust>/test_cloud_resample_xv_rows must be none, angmom or full" << std::endl;
           std::exit(EXIT_FAILURE);
         }
-        if (cloud_resample_xv_rows != 0 && !clouds3d) {
+        if (cloud_resample_xv_rows != 0 && cloud_dim != 3) {
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                    << "<dust>/cloud_resample_xv_rows = " << xv << " exists only for 3-D "
+                    << "<dust>/test_cloud_resample_xv_rows = " << xv << " exists only for 3-D "
                     << "refinable clouds (the 2-D resampling has no cross-moment rows)" << std::endl;
           std::exit(EXIT_FAILURE);
         }
         // diagnostic: per R pass the changes of J about the center of mass of all clouds, of the
         // per-patch moments and of the leaf masses and momenta (3-D, extra kernels only)
-        cloud_resample_xv_audit = pin->DoesParameterExist("dust", "cloud_resample_xv_audit") &&
-                                  pin->GetBoolean("dust", "cloud_resample_xv_audit");
+        cloud_resample_xv_audit = pin->DoesParameterExist("dust", "test_cloud_resample_xv_audit") &&
+                                  pin->GetBoolean("dust", "test_cloud_resample_xv_audit");
       }
       // the per-patch solves on the device (same patches and algorithm; false keeps the host
       // solves).  The default follows the build: the device solver when the
@@ -926,56 +989,23 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // otherwise (on a CPU build the host solver is much faster than the device code)
       // (3-D refinable clouds have only the device solver, which also runs on a CPU)
       cloud_resample_device = pin->GetOrAddBoolean("dust", "cloud_resample_device",
-          !std::is_same<DevExeSpace, Kokkos::DefaultHostExecutionSpace>::value || clouds3d);
+          !std::is_same<DevExeSpace, Kokkos::DefaultHostExecutionSpace>::value || cloud_dim == 3);
       cloud_resample_device_mem_mb = pin->GetOrAddInteger("dust", "cloud_resample_device_mem_mb", 2048);
-      // a middle bucket (65 .. cloud_resample_device_mid clouds; 0: off) of the
-      // device solves with narrower teams, several per SM
-      cloud_resample_device_mid = pin->GetOrAddInteger("dust", "cloud_resample_device_mid", 0);
-      cloud_resample_device_mid_team = pin->GetOrAddInteger("dust", "cloud_resample_device_mid_team", 128);
       // default 1024: with the patch split, the resampling was faster than with 512
       cloud_resample_device_wide_team = pin->GetOrAddInteger("dust", "cloud_resample_device_wide_team", 1024);
-      // the device QR update shares the rows among the threads as well.  Its sums run
-      // in another order than the host's, so the device solve agrees with the host solve only to
-      // round-off (the kept clouds can differ; both satisfy the constraints to round-off); false:
-      // one thread per column in the host's order (bitwise comparable).  Default true (faster on
-      // GPUs)
-      cloud_resample_qr_rows = pin->GetOrAddBoolean("dust", "cloud_resample_qr_rows", true);
-      // default <256, 2> (at most 128 registers): the two production cloud kernels are
-      // faster on GPUs than without a bound.
-      // a compile-time choice (DUST_CLOUD_LAUNCH_BOUNDS, dust.hpp);
-      // an input or restart may only ask for the compiled value
-      if (pin->GetOrAddInteger("dust", "cloud_launch_bounds", DUST_CLOUD_LAUNCH_BOUNDS) !=
-          DUST_CLOUD_LAUNCH_BOUNDS) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "<dust>/cloud_launch_bounds = " << pin->GetString("dust", "cloud_launch_bounds")
-                  << ", but this binary was built with DUST_CLOUD_LAUNCH_BOUNDS = "
-                  << DUST_CLOUD_LAUNCH_BOUNDS << " (the launch bound of the cloud kernels is a "
-                  << "compile-time choice: rebuild with "
-                  << "-DDUST_CLOUD_LAUNCH_BOUNDS=<n> in CMAKE_CXX_FLAGS, or drop the key)" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-      // the column-by-column device QR (qr_rows = false) exists only
-      // in the reference build (-DDUST_R_QR_COLUMNS=1, dust_resample.hpp); without it a run whose
-      // device R solver would take that path stops instead of silently running the row update
-      if (!cloud_resample_qr_rows && !DUST_R_QR_COLUMNS && cloud_resample &&
-          cloud_resample_device) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "<dust>/cloud_resample_qr_rows = false (the column-by-column QR of the device "
-                  << "resampling solve) is not compiled in this binary (DUST_R_QR_COLUMNS = 0): "
-                  << "rebuild with -DDUST_R_QR_COLUMNS=1 in CMAKE_CXX_FLAGS (the reference "
-                  << "build), or use the row-parallel update (true, the default)" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
+      // (the device QR update shares the rows among the threads as well: its sums run in another
+      // order than the host's, so the device solve agrees with the host solve only to round-off;
+      // the reference build -DDUST_R_QR_COLUMNS=1 takes one thread per column in the host's order,
+      // dust_resample.hpp.  The launch bound of the cloud kernels is the compile-time
+      // DUST_CLOUD_LAUNCH_BOUNDS, dust.hpp; cloud_resample_qr_rows and cloud_launch_bounds
+      // retired)
       // the order in which a patch takes its candidates: array (default)
       // or tag (PTAG order, independent of the storage order)
       {
-        const std::string ro = pin->GetOrAddString("dust", "cloud_resample_order", "array");
-        if (ro != "array" && ro != "tag" && ro != "position") {
-          std::cout << "### FATAL ERROR: <dust>/cloud_resample_order must be array, tag or position" << std::endl;
-          std::exit(EXIT_FAILURE);
-        }
-        cloud_resample_tag_order = (ro != "array");   // reordered pool
-        cloud_resample_pos_order = (ro == "position");
+        // (<dust>/test_canonical_order = resample_tag, hidden; cloud_resample_order = position,
+        // retired: CheckRetiredKeys stops where R runs, else it is ignored)  // retired-compat
+        cloud_resample_tag_order = CanonicalOrder::Parse(
+            TestKeyString(pin, "dust", "test_canonical_order", "off")).resample_tag;
       }
       cloud_resample_m0 = pin->GetOrAddReal("dust", "cloud_resample_m0", -1.0);
       if (cloud_resample_m0 > 0.0 && nspecies > 1 && global_variable::my_rank == 0) {
@@ -985,35 +1015,33 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // resampling after every regrid.  Default false: no G or R after the regrids, the scheduled
       // ones (G and R every 0.25 / omega0) cover them; with a regrid every ~40 cycles the
       // per-regrid R was latency-bound
-      cloud_resample_after_regrid = pin->GetOrAddBoolean("dust", "cloud_resample_after_regrid",
-                                                         false);
-      // the resampling after a regrid only on the blocks the regrid made and their
-      // neighbors (the scheduled resampling stays global)
-      // Default true (false resamples every block after a regrid).  The
-      // scheduled resampling (every cloud_resample_dt_omega) stays global, also when a regrid event
-      // falls on its cycle
-      cloud_resample_event_local = pin->GetOrAddBoolean("dust", "cloud_resample_event_local", true);
+      // <dust>/test_resample_after_regrid (hidden; ResampleAfterRegrid in dust_input.hpp):
+      // off (default), or local / global [derefine] [dt]: the resampling after the regrids, on the
+      // blocks the regrid made and their neighbors (local) or on every block (global; the
+      // scheduled resampling stays global, also when a regrid event falls on its cycle), also
+      // after a regrid that only deleted blocks (derefine; else such an event runs G but no R,
+      // unless the scheduled resampling falls on that cycle), with the regrid events of dt /
+      // omega0 after the first one handled together (0: every regrid at the next cycle).
       {
-        // regrid events handled together, cloud_event_dt_omega / omega0 after
-        // the first regrid (0: every regrid at the next cycle)
-        const Real edt = pin->GetOrAddReal("dust", "cloud_event_dt_omega", 0.0);
-        if (edt > 0.0) {
+        const ResampleAfterRegrid ra = ResampleAfterRegrid::Parse(
+            TestKeyString(pin, "dust", "test_resample_after_regrid", "off"));
+        cloud_resample_after_regrid = ra.on;
+        cloud_resample_event_local = ra.local;
+        cloud_resample_after_derefine = ra.derefine;
+        if (ra.on && ra.dt_omega > 0.0) {
           Real om = 0.0;
           if (pin->DoesBlockExist("shearing_box") && pin->DoesParameterExist("shearing_box", "omega0")) {
             om = pin->GetReal("shearing_box", "omega0");
           }
           if (!(om > 0.0)) {
             std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                      << "cloud_event_dt_omega needs <shearing_box>/omega0 > 0" << std::endl;
+                      << "test_resample_after_regrid with dt needs <shearing_box>/omega0 > 0"
+                      << std::endl;
             std::exit(EXIT_FAILURE);
           }
-          cloud_event_dt = edt/om;
+          cloud_event_dt = ra.dt_omega/om;
         }
       }
-      // a regrid event that only deleted blocks runs G but no R,
-      // unless the scheduled resampling falls on that cycle
-      cloud_resample_after_derefine = pin->GetOrAddBoolean("dust",
-                                         "cloud_resample_after_derefine", false);
       // the split budget (most clouds one rank's split pass creates per cycle, 0: no limit; off
       // by default) and the local R right after a split pass that held events back or in which
       // some rank with at least the mean clouds per rank (after the split) created at least
@@ -1023,14 +1051,14 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       // default is written to the parameters: a restart file written before this default carries
       // cloud_split_resample = false and keeps it
       cloud_split_budget = pin->GetOrAddInteger("dust", "cloud_split_budget", 0);
-      cloud_split_resample = pin->GetOrAddBoolean("dust", "cloud_split_resample",
-                                                  clouds3d && cloud_resample);
-      cloud_split_resample_frac = pin->GetOrAddReal("dust", "cloud_split_resample_frac", 0.05);
-      if (cloud_split_budget < 0 || cloud_split_resample_frac < 0.0 ||
-          ((cloud_split_budget > 0 || cloud_split_resample) && !clouds3d)) {
+      cloud_split_resample = TestKeyBool(pin, "dust", "test_cloud_split_resample",
+                                                  cloud_dim == 3 && cloud_resample);
+      // (cloud_split_resample_frac: the constant 0.05)
+      if (cloud_split_budget < 0 ||
+          ((cloud_split_budget > 0 || cloud_split_resample) && cloud_dim != 3)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "<dust>/cloud_split_budget (>= 0) and cloud_split_resample "
-                  << "(cloud_split_resample_frac >= 0) are for 3-D refinable clouds" << std::endl;
+                  << "<dust>/cloud_split_budget (>= 0) and test_cloud_split_resample "
+                  << "are for 3-D refinable clouds" << std::endl;
         std::exit(EXIT_FAILURE);
       }
       // without R there is no R after a split: off, also when the parameters say true (a restart
@@ -1039,36 +1067,23 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       if (cloud_split_resample && !cloud_resample) {
         cloud_split_resample = false;
         if (global_variable::my_rank == 0) {
-          std::cout << "# NOTE (dust): cloud_split_resample = true ignored: cloud_resample is off"
+          std::cout << "# NOTE (dust): test_cloud_split_resample = true ignored: cloud_resample is off"
                     << std::endl;
         }
       }
       split_blk_mark = cloud_split_resample;
       if (cloud_resample && ((!cloud_resample_by_time && cloud_resample_interval < 1) ||
-                             cloud_resample_patch < 1 || cloud_resample_patch_split < 0 ||
-                             cloud_resample_patch_max < 0 || cloud_resample_patch_max == 1 ||
+                             cloud_resample_patch_split < 0 ||
                              cloud_resample_batch_pairs < 1 ||
                              cloud_resample_batch_pairs > std::numeric_limits<int>::max() ||
-                             (cloud_resample_patch_split > 0 && !split_ok) ||
-                             cloud_gather_order != 2)) {
+                             (cloud_resample_patch_split > 0 && !split_ok))) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                  << "cloud_resample requires cloud_resample_interval >= 1, cloud_resample_patch >= 1,"
-                  << " cloud_resample_patch_split >= 0 (> 0 only with block patches whose"
-                  << " cloud_resample_patch and cloud_resample_patch_cells <= 16 are powers of two),"
-                  << " cloud_resample_patch_max = 0 or >= 2, 1 <= cloud_resample_batch_pairs < 2^31,"
-                  << " cloud_gather_order = 2" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-      // (quantum is the default mode, so its requirements apply only when G is on;
-      // cloud_merge = false with the default mode is a run without G, not an error)
-      if (cloud_merge && cloud_merge_mode == 1 &&
-          (!cloud_merge_device || cloud_merge_K < 1 || cloud_merge_K > 8 ||
-           cloud_merge_smax <= 0.0)) {
-        std::cout << "### FATAL ERROR: <dust>/cloud_merge_mode = quantum needs "
-                  << "cloud_merge_device, 1 <= cloud_merge_K <= 8 and cloud_merge_smax > 0"
+                  << "cloud_resample requires cloud_resample_interval >= 1,"
+                  << " test_cloud_resample_patch_split >= 0, 1 <= cloud_resample_batch_pairs < 2^31"
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
+      // (the requirements of G apply only when G is on)
       if (cloud_merge && (cloud_merge_buffer < 2 ||
                           cloud_merge_alpha <= 0.0 || cloud_merge_interval < 1)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -1078,20 +1093,9 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
                   << " and cloud_merge_interval >= 1" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      if (cloud_transition == 0) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "the P1 split requires cloud_transition=1 or 2 "
-                  << "(the gather used for transition clouds)" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-      if (cloud_gather_order != 1 && cloud_gather_order != 2) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "<dust>/cloud_gather_order must be 1 or 2" << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
       PrintRefinablePreset();
     }
-    if (UsesCompositeTransfer() && deposit != DustDeposit::tsc) {
+    if (UsesRefinableClouds() && deposit != DustDeposit::tsc) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "<dust>/amr_pic = refinable_cloud requires <dust>/deposit = tsc"
                 << std::endl;
@@ -1113,24 +1117,43 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   // point particles crossing a shear-periodic x1 face take the shear offset of the
   // time of their position (<dust>/shear_route_time, default true; 3-D, where the push advects y
   // with the background shear).  The 3-D clouds keep their own key (cloud_shear_route_time).
-  if (is_shearing_box && pmy_pack->pmesh->three_d && !clouds3d &&
+  if (is_shearing_box && pmy_pack->pmesh->three_d && cloud_dim != 3 &&
       pmy_pack->pmesh->mesh_bcs[BoundaryFace::inner_x1] == BoundaryFlag::shear_periodic) {
     shear_route_point = pin->GetOrAddBoolean("dust", "shear_route_time", true);
   }
   // constant azimuthal acceleration on the particles (with the gas's const_accel2 it keeps
   // a radially boosted 2-D r-z shearing-box equilibrium, see the streaming_linear pgen)
-  const_accel_phi = pin->GetOrAddReal("dust", "const_accel_phi", 0.0);
+  const_accel_phi = TestKeyReal(pin, "dust", "test_const_accel_phi", 0.0);
   if (const_accel_phi != 0.0 &&
-      !(is_shearing_box && !pmy_pack->pmesh->three_d && pc2_only)) {
+      !(is_shearing_box && !pmy_pack->pmesh->three_d && coupling == DustCoupling::pc2)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "<dust>/const_accel_phi requires a 2-D r-z shearing box and "
+              << std::endl << "<dust>/test_const_accel_phi requires a 2-D r-z shearing box and "
               << "coupling=pc2" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  if (drag_solver != DustDragSolver::local && shear_x1) {
+  // point particles in a 3-D shearing box: dc1 / dc2 only (coupling = imex), whose operator is the
+  // kick's own gather and impulse deposit (the stage's u* exchange and deposit remap); PCG and the
+  // adaptive solver need D = G^T, which the shear-collected ghost gather and the remapped ghost
+  // deposit do not give
+  point_dc_general = pmy_pack->pmesh->three_d && smr_transfer_mode == DustSMRTransfer::none &&
+                     !pmy_pack->pmesh->multilevel && coupling == DustCoupling::imex &&
+                     (drag_solver == DustDragSolver::dc1 || drag_solver == DustDragSolver::dc2) &&
+                     (shear_x1 || x3_phys);
+  // hidden <dust>/test_qrho_diag = N (default 0, off): the QRHO_DIAG line every N cycles
+  qrho_diag_ = pin->DoesParameterExist("dust", "test_qrho_diag") ?
+               pin->GetInteger("dust", "test_qrho_diag") : 0;
+  // hidden <dust>/test_point_dc_opcheck: the operator check of the dc1 / dc2 correction of point
+  // particles (coupling = imex) at every working stage (dust_imex3d_dc.cpp, CloudDcOpCheck*)
+  point_dc_opcheck = pin->DoesParameterExist("dust", "test_point_dc_opcheck") &&
+                     pin->GetBoolean("dust", "test_point_dc_opcheck") &&
+                     smr_transfer_mode == DustSMRTransfer::none && coupling == DustCoupling::imex &&
+                     back_reaction &&
+                     (drag_solver == DustDragSolver::dc1 || drag_solver == DustDragSolver::dc2);
+  if (drag_solver != DustDragSolver::local && shear_x1 && !point_dc_general && cloud_dim != 3) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "Coupled drag solvers require ordinary periodic boundaries; "
-              << "the exact-transpose shear deposit is not implemented" << std::endl;
+              << "the exact-transpose shear deposit is not implemented (drag_solver: "
+              << solver_src_ << "): give dust/drag_solver=local" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
@@ -1144,10 +1167,6 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   Kokkos::realloc(ustar, nmb, 3, ncells3, ncells2, ncells1);
   Kokkos::realloc(dmom,  nmb, 3, ncells3, ncells2, ncells1);
   Kokkos::deep_copy(dmom, 0.0);  // read as R_g=0 in stage 2 if back_reaction is off
-  if (drag_solver == DustDragSolver::pcg || drag_solver == DustDragSolver::adaptive) {
-    Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
-    Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
-  }
   // the instant_switch transfer also runs on a dynamic mesh (one rank), in 3-D also on several
   // ranks (the general deposit remap)
   if (pmy_pack->pmesh->adaptive && smr_transfer_mode != DustSMRTransfer::refinable_cloud &&
@@ -1163,9 +1182,8 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     // the linear gather of the implicit stages reads u* in the ghost cells (its central
     // differences): with several levels the u* exchange restricts and prolongates through a
     // coarse buffer (PC2 forms its midpoint velocity from gas states that include ghosts)
-    const bool implicit_stages = coupling == DustCoupling::imex ||
-        (coupling == DustCoupling::hybrid && hybrid_force_mode != HybridForceMode::pc2);
-    if (pmy_pack->pmesh->multilevel && implicit_stages && UstarGhosts()) {
+    const bool implicit_stages = coupling == DustCoupling::imex;
+    if (pmy_pack->pmesh->multilevel && implicit_stages) {
       int nccells1 = indcs.cnx1 + 2*(indcs.ng);
       int nccells2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*(indcs.ng)) : 1;
       int nccells3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*(indcs.ng)) : 1;
@@ -1185,8 +1203,50 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       Kokkos::realloc(cdummy, nmb, 3, nccells3, nccells2, nccells1);
     }
   }
-  if (drag_solver != DustDragSolver::local) {
+  // retired-compat: the keys of the retired options, judged now that the
+  // representation, G, R and the coupling are known (dust_input.hpp)
+  {
+    RetiredContext rc;
+    rc.clouds = UsesRefinableClouds();
+    rc.split = rc.clouds && cloud_split_enable;
+    rc.g_on = rc.clouds && cloud_merge;
+    rc.r_on = rc.clouds && cloud_resample;
+    rc.stencil = cloud_merge_stencil;
+    rc.budget = cloud_merge_budget > 0.0;
+    rc.dim = cloud_dim;
+    // the second round's context  // retired-compat
+    rc.merge_by_time = rc.g_on && cloud_merge_by_time;   // retired-compat
+    rc.resample_by_time = rc.r_on && cloud_resample_by_time;   // retired-compat
+    rc.r_device = rc.r_on && cloud_resample_device;   // retired-compat
+    rc.split_resample = rc.clouds && cloud_split_resample;   // retired-compat
+    rc.split_mg = rc.split && cloud_split_velocity == 1;   // retired-compat
+    rc.split_range = rc.split_mg && split_gb_mode == 1;   // retired-compat
+    rc.shear3d = rc.clouds && shear3d;   // retired-compat
+    rc.multirank = global_variable::nranks > 1;   // retired-compat
+    rc.lb_weight = lb_cloud_weight > 0.0;   // retired-compat
+    rc.dc1 = rc.clouds && cloud_dc1;   // retired-compat
+    rc.launch_bounds = DUST_CLOUD_LAUNCH_BOUNDS;   // retired-compat
+    rc.qr_columns = (DUST_R_QR_COLUMNS != 0);   // retired-compat
+    // the analytic gather was read only by streaming_linear (a built-in pgen)  // retired-compat
+#if !USER_PROBLEM_ENABLED
+    rc.streaming_linear = pin->DoesParameterExist("problem", "pgen_name") &&
+                          pin->GetString("problem", "pgen_name") == "streaming_linear";
+#endif
+    CheckRetiredKeys(pin, rc);
+  }
+  // the coupled solve of point particles (SolveCoupledStage) runs only with back-reaction and a
+  // coupling whose stages reach it (imex): only then its work fields
+  // (solver_ap; solver_r / solver_p for pcg / adaptive) and exchange objects (passive dust gets
+  // none, also with a given pcg / adaptive).  The clouds' dc1 needs none of these
+  // (dust_imex3d_dc.cpp: cloud_dc1, also only with back-reaction)
+  const bool point_solve = drag_solver != DustDragSolver::local && !UsesRefinableClouds() &&
+      back_reaction && coupling == DustCoupling::imex;
+  if (point_solve) {
     Kokkos::realloc(solver_ap, nmb, 3, ncells3, ncells2, ncells1);
+    if (drag_solver == DustDragSolver::pcg || drag_solver == DustDragSolver::adaptive) {
+      Kokkos::realloc(solver_r, nmb, 3, ncells3, ncells2, ncells1);
+      Kokkos::realloc(solver_p, nmb, 3, ncells3, ncells2, ncells1);
+    }
   }
 
   // (4) allocate boundary communication objects -----------------------------------------
@@ -1196,11 +1256,15 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   pbval_dm->InitializeBuffers(3);
   pbval_us = new MeshBoundaryValuesCC(pmy_pack, pin, false);
   pbval_us->InitializeBuffers(3);
-  if (drag_solver != DustDragSolver::local) {
+  if (point_solve) {
     // These objects own distinct communicators/requests and are reinitialized for every
-    // matrix-free matvec; they must not alias the one-shot stage exchanges above.
-    pbval_solver_copy = new MeshBoundaryValuesCC(pmy_pack, pin, false);
-    pbval_solver_copy->InitializeBuffers(3);
+    // matrix-free matvec; they must not alias the one-shot stage exchanges above.  The copy
+    // exchange: this plain one on a periodic mesh, the blocking u* exchange (pbval_dc below) in a
+    // 3-D shearing box or with physical x3 faces (PointCopyExchange); one of the two only
+    if (!point_dc_general) {
+      pbval_solver_copy = new MeshBoundaryValuesCC(pmy_pack, pin, false);
+      pbval_solver_copy->InitializeBuffers(3);
+    }
     pbval_solver_add = new MeshBoundaryValuesDep(pmy_pack, pin);
     pbval_solver_add->InitializeBuffers(3);
   }
@@ -1216,12 +1280,30 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
       psbox_us->AllocateBuffers();
     }
   }
+  // the clouds' dc1 (and the point solve in a shearing box / with physical x3 faces): the
+  // blocking u* exchange of the correction has its own objects (own communicators, requests and
+  // buffers; made in the same order on every rank) and coarse buffer, set up as those of u*
+  const bool dc_exchange = cloud_dc1 || (point_solve && point_dc_general);
+  if (dc_exchange) {
+    pbval_dc = new MeshBoundaryValuesCC(pmy_pack, pin, false);
+    pbval_dc->InitializeBuffers(3);
+    pbval_dc->skip_shear_x1_prol = pbval_us->skip_shear_x1_prol;
+    if (psbox_us != nullptr) {
+      psbox_dc = new ShearingBoxCC(pmy_pack, pin, 3);
+      if (psbox_us->coarse_on) {
+        psbox_dc->coarse_on = true;
+        psbox_dc->AllocateBuffers();
+      }
+    }
+    dc_cfield = DvceArray5D<Real>("dust_dc_cfield", cdummy.extent(0), cdummy.extent(1),
+                                  cdummy.extent(2), cdummy.extent(3), cdummy.extent(4));
+  }
   // in 3-D with refinement or with shear-periodic x1 faces the ghost
   // deposits go through the general remap (any levels, several ranks, the shear offset)
   // not for 3-D refinable clouds: they deposit into the leaves directly
-  if (pmy_pack->pmesh->three_d && !clouds3d &&
+  if (pmy_pack->pmesh->three_d && cloud_dim != 3 &&
       (pmy_pack->pmesh->multilevel || shear_x1 || x3_phys)) {
-    if (drag_solver != DustDragSolver::local ||
+    if ((drag_solver != DustDragSolver::local && !point_dc_general) ||
         !(smr_transfer_mode == DustSMRTransfer::instant_switch ||
           smr_transfer_mode == DustSMRTransfer::none)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -1252,6 +1334,11 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
     dep_plan = new DepRemapPlan(pmy_pack, shear_x1, qshear, omega0, x3mode);
     pbval_qp->SetGeneralPlan(dep_plan);
     pbval_dm->SetGeneralPlan(dep_plan);
+    // (point dc1 / dc2: the operator's additive exchange remaps as the deposits do)
+    if (pbval_solver_add != nullptr) {
+      pbval_solver_add->SetGeneralPlan(dep_plan);
+      if (x3mode == 2) pbval_solver_add->dropped_sum.assign(3, 0.0);
+    }
     if (x3mode == 2) pbval_dm->dropped_sum.assign(3, 0.0);   // the record from the start
   }
   // instant_switch on a dynamic mesh: the block boxes and the block table of the
@@ -1259,6 +1346,29 @@ DustGasDrag::DustGasDrag(MeshBlockPack *ppack, ParameterInput *pin) :
   if (pmy_pack->pmesh->adaptive && smr_transfer_mode == DustSMRTransfer::instant_switch &&
       !pmy_pack->pmesh->three_d) {
     BuildOwnerOverlapMesh(false);
+  }
+  // the storage of the coupled solve / the dc1 correction (rank 0's share), once at start-up
+  if (drag_solver != DustDragSolver::local && global_variable::my_rank == 0) {
+    const double mib = 1.0/(1024.0*1024.0);
+    std::ostringstream os;
+    os << std::setprecision(4) << "# NOTE (dust): drag_solver storage on rank 0: ";
+    if (!point_solve && !dc_exchange) {
+      os << "none (" << (back_reaction ? "the coupled solve does not run in this coupling" :
+                                         "back_reaction = false: no coupled solve") << ")";
+    } else {
+      // (solver_ap, and solver_r / solver_p of pcg / adaptive; 1-element placeholders otherwise)
+      const double work = point_solve ? (solver_ap.span() +
+          ((drag_solver == DustDragSolver::pcg || drag_solver == DustDragSolver::adaptive) ?
+           solver_r.span() + solver_p.span() : 0))*sizeof(Real)*mib : 0.0;
+      os << "work fields " << work << " MiB, copy exchange "
+         << (pbval_solver_copy != nullptr ? "plain" :
+             (pbval_dc != nullptr ? "blocking u*" : "none"))
+         << ", additive exchange " << (pbval_solver_add != nullptr ? "yes" : "no")
+         << ", blocking u* exchange " << (pbval_dc != nullptr ? "yes" : "no")
+         << (psbox_dc != nullptr ? " (+ shear)" : "") << " (coarse buffer "
+         << dc_cfield.span()*sizeof(Real)*mib << " MiB)";
+    }
+    std::cout << os.str() << std::endl;
   }
 }
 
@@ -1285,9 +1395,9 @@ void DustGasDrag::PrintRefinablePreset() const {
   std::ostringstream g, r;
   g << "G " << (cloud_merge ? "on" : "off");
   if (cloud_merge) {
-    g << " (" << (cloud_merge_mode == 1 ? "quantum" : "tent") << ", stage X "
+    g << " (quantum, stage X "  // retired-compat
       << (cloud_merge_stencil ? "on" : "off") << ", alpha " << cloud_merge_alpha;
-    if (clouds3d) g << ", alpha_leaf " << (cloud_merge_alpha_leaf ? "on" : "off");
+    if (cloud_dim == 3) g << ", alpha_leaf " << (cloud_merge_alpha_leaf ? "on" : "off");
     g << ", budget beta " << cloud_merge_budget << " kappa " << cloud_merge_budget_kappa << ", "
       << sched(cloud_merge_by_time, cloud_merge_dt, cloud_merge_interval) << ")";
   }
@@ -1305,7 +1415,7 @@ void DustGasDrag::PrintRefinablePreset() const {
   }
   std::cout << "# DUST_PIC amr_pic = refinable_cloud, refinable_mode = " << mode << std::endl
             << "#   split: moving P1 (" << (cloud_split_enable ? "on" : "off") << "), gather order "
-            << cloud_gather_order << ", transition " << cloud_transition << "; " << g.str()
+            << 2 << ", transition " << 2 << "; " << g.str()  // retired-compat (log format)
             << std::endl
             << "#   " << r.str() << std::endl;
   if (cloud_split_budget > 0 || cloud_split_resample) {
@@ -1324,6 +1434,20 @@ void DustGasDrag::PrintRefinablePreset() const {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::NoteLocalNotDefault
+//! \brief coupling = imex with drag_solver = local where dc1 is the default of the configuration:
+//! rank 0 says where local came from (a restart keeps the stored solver: a PC2 run, or one
+//! started before dc1 was the default, stored local) and how to switch.
+
+void DustGasDrag::NoteLocalNotDefault() const {
+  if (global_variable::my_rank != 0) return;
+  std::cout << "# NOTE (dust): coupling = imex with drag_solver = local (" << solver_src_
+            << "): the lumped IMEX drag without defect correction (first order with "
+            << "back-reaction), while this configuration's default is dc1; a restart keeps the "
+            << "stored solver, give dust/drag_solver=dc1 to switch" << std::endl;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::CheckMultiRank
 //! \brief With several MPI ranks, refinable clouds run only the production path
 //! that the dust halo covers (PC2 linear gather, quantum G with or without the pass budget,
@@ -1332,26 +1456,13 @@ void DustGasDrag::PrintRefinablePreset() const {
 void DustGasDrag::CheckMultiRank() {
   if (global_variable::nranks == 1) return;
   std::vector<std::string> bad;
-  // PC2, or imex2+ (its deposit and gather-kick kernels use the halo); not the
-  // automatic hybrid, whose split-BE preparation pass has no halo exchange yet
-  if (!(coupling == DustCoupling::imex ||
-        (coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::pc2))) {
-    bad.push_back("a coupling other than PC2 or IMEX (coupling = pc2 / imex, or "
-                  "hybrid_force_mode = pc2)");
-  }
-  if (drag_solver != DustDragSolver::local) bad.push_back("drag_solver other than local");
-  if (cloud_gather_order != 2 || analytic_gather.on) {
-    bad.push_back("gather variants (cloud_gather_order != 2, analytic_gather)");
+  if (drag_solver != DustDragSolver::local && drag_solver != DustDragSolver::dc1 &&
+      drag_solver != DustDragSolver::dc2) {
+    bad.push_back("drag_solver other than local, dc1 or dc2");
   }
   // stage X and the structure-relative budget run on several ranks (X merges
   // the families whose nine members are on this rank; the budget's neighbor leaves come from
-  // the halo); X under the pass budget (cloud_merge_budget_x) has no exchange yet
-  if (cloud_merge && (cloud_merge_mode != 1 || !cloud_merge_device)) {
-    bad.push_back("merging other than the device quantum G (tent)");
-  }
-  if (cloud_merge && cloud_merge_stencil && cloud_merge_budget_x) {
-    bad.push_back("stage X under the pass budget (cloud_merge_budget_x)");
-  }
+  // the halo)
   if (!bad.empty()) {
     if (global_variable::my_rank == 0) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -1367,22 +1478,6 @@ void DustGasDrag::CheckMultiRank() {
 // destructor
 
 DustGasDrag::~DustGasDrag() {
-  if (global_variable::my_rank == 0 && coupling == DustCoupling::hybrid) {
-    unsigned long long total = hybrid_pc2_cycles + hybrid_split_be_cycles;
-    double pc2_fraction = (total > 0) ?
-        static_cast<double>(hybrid_pc2_cycles)/static_cast<double>(total) : 0.0;
-    std::cout << std::setprecision(14)
-              << "# DUST_HYBRID_SUMMARY pc2_cycles=" << hybrid_pc2_cycles
-              << " split_be_cycles=" << hybrid_split_be_cycles
-              << " pc2_fraction=" << pc2_fraction;
-    // with a fixed mode the switching metric is not computed (not a zero)
-    if (NeedsHybridMetric()) {
-      std::cout << " last_zeta=" << hybrid_last_zeta << " last_chi=" << hybrid_last_chi;
-    } else {
-      std::cout << " metric=not_computed";
-    }
-    std::cout << std::endl;
-  }
   if (global_variable::my_rank == 0 && point_sort_interval > 0) {
     std::cout << std::setprecision(6) << "# DUST_POINT_SORT interval=" << point_sort_interval
               << " sorts=" << point_sort_count << " seconds=" << point_sort_seconds
@@ -1447,10 +1542,8 @@ DustGasDrag::~DustGasDrag() {
                                        : std::string())
               << (cloud_merge ? " coarsen_events=" + std::to_string(cloud_coarsen_events) +
                   " coarsen_in=" + std::to_string(cloud_coarsen_in) +
-                  " coarsen_reject=" + std::to_string(cloud_coarsen_reject) +
-                  " far_releases=" + std::to_string(cloud_far_release) +
-                  " dK_grad=" + std::to_string(cloud_coarsen_dk_grad) +
-                  " dK_res=" + std::to_string(cloud_coarsen_dk_res) : std::string())
+                  " coarsen_reject=" + std::to_string(cloud_coarsen_reject) +  // retired-compat
+                  " far_releases=" + std::to_string(cloud_far_release) : std::string())
               // several ranks: the counters are rank 0's, the particles all ranks'
               << " particles=" << ((global_variable::nranks > 1) ? pmy_pack->pmesh->nprtcl_total
                                                                   : pmy_pack->ppart->nprtcl_thispack)
@@ -1460,19 +1553,19 @@ DustGasDrag::~DustGasDrag() {
   if (smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
       (cloud_order_interval > 0 || cloud_sort_interval > 0)) {
     // every rank: launches of the cloud kernels in the index order and in storage order (the
-    // index longer than the particles after a migration, cloud_order_keep = false), index
-    // builds and sorts
+    // index longer than the particles after a migration: none, the index is
+    // kept; keep=1 printed for the log parsers), index builds and sorts
     std::ostringstream os;
     os << "# DUST_CLOUD_ORDER rank=" << global_variable::my_rank << " ordered=" << cloud_ord_used
        << " storage_order=" << cloud_ord_fallback << " index_builds=" << cloud_ord_builds
-       << " sorts=" << cloud_sort_count << " keep=" << (cloud_order_keep ? 1 : 0)
+       << " sorts=" << cloud_sort_count << " keep=" << 1
        << " mean_particles=" << ord_stat_npart/std::max(1LL, ord_stat_cycles)
        << " mean_blocks=" << ord_stat_nmb/std::max(1LL, ord_stat_cycles) << "\n";
     std::cout << os.str() << std::flush;
   }
   if (global_variable::my_rank == 0 && shear3d) {   // shear-image list counters
     std::cout << "# DUST_SHEAR_LISTS rank0 ysh_updates=" << shear3d_updates << " list_rebuilds="
-              << shear3d_rebuilds << " cache=" << (shear3d_list_cache ? "on" : "off") << std::endl;
+              << shear3d_rebuilds << " cache=on" << std::endl;
   }
   if (global_variable::my_rank == 0 && global_variable::nranks > 1 && ProfOn() &&
       smr_transfer_mode == DustSMRTransfer::refinable_cloud) {
@@ -1487,7 +1580,7 @@ DustGasDrag::~DustGasDrag() {
               << ", halo blocks " << halo_.hslot1 - halo_.hslot0 << ", cells sent "
               << (halo_.soff.empty() ? 0 : halo_.soff.back()) << " received "
               << (halo_.roff.empty() ? 0 : halo_.roff.back())
-              << (cloud_halo_strips ? " (strips)" : " (whole blocks)") << std::endl;
+              << " (strips)" << std::endl;
   }
   if (global_variable::my_rank == 0 && solver_stage_count > 0) {
     auto quantile = [&](double fraction) {
@@ -1530,6 +1623,15 @@ DustGasDrag::~DustGasDrag() {
   if (pbval_solver_copy != nullptr) delete pbval_solver_copy;
   if (pbval_solver_add != nullptr) delete pbval_solver_add;
   if (psbox_us != nullptr) {delete psbox_us;}
+  if (pbval_dc != nullptr) delete pbval_dc;
+  if (global_variable::my_rank == 0 && cloud_dc1 && dc_prof_n_[0] > 0) {
+    // (<dust>/amr_profile only: fenced phases of the dc1 correction on rank 0)
+    std::cout << "# DC1_PROFILE rank 0: exchange " << dc_prof_t_[0] << " s (" << dc_prof_n_[0]
+              << "), slope pack + forward " << dc_prof_t_[1] << " s, operator kernel "
+              << dc_prof_t_[2] << " s, reverse add " << dc_prof_t_[3] << " s, correction "
+              << dc_prof_t_[4] << " s" << std::endl;
+  }
+  if (psbox_dc != nullptr) delete psbox_dc;
   // the general deposit remap (after the exchanges that point to it); its destructor joins a
   // shear prefetch thread that may still run
   if (dep_plan != nullptr) {delete dep_plan; dep_plan = nullptr;}
@@ -1542,25 +1644,20 @@ DustGasDrag::~DustGasDrag() {
 //! solve is skipped since estage == nexp_stages), so every dust task no-ops there.
 
 bool DustGasDrag::ActiveStage(Driver *pdrive, int stage) const {
-  if (coupling == DustCoupling::hybrid) return true;
+  if (coupling == DustCoupling::pc2) return true;
   return !((pdrive->integrator.compare("imex2+") == 0) && (stage == pdrive->nexp_stages));
 }
 
-bool DustGasDrag::FirstMigrationActive(Driver *pdrive, int stage) const {
+bool DustGasDrag::MigrationActive(Driver *pdrive, int stage) const {
   if (coupling == DustCoupling::imex) return ActiveStage(pdrive, stage);
-  return (hybrid_mode == HybridMode::pc2 && stage == 2);
-}
-
-bool DustGasDrag::SecondMigrationActive(Driver *pdrive, int stage) const {
-  return (coupling == DustCoupling::hybrid &&
-          hybrid_mode == HybridMode::split_be && stage == 2);
+  return stage == 2;   // (PC2: once per cycle, after the advance)
 }
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::ShearRouteTime, ShiftShearCrossings
 //! \brief AthenaK's particle routing (SetNewPrtclGID) moves a particle across a
 //! shear-periodic x1 face by the shear offset of pm->time = t^n, but the push has already moved it
-//! on.  PC2 and hybrid migrate once, after the full push: the move needs the offset of t^n + dt.
+//! on.  PC2 migrates once, after the full push: the move needs the offset of t^n + dt.
 //! imex migrates after every moving stage; a particle wrapped at stage s keeps moving in the
 //! following stages with the wrapped x, whose shear advection -q Omega x adds q Omega Lx w dt to its
 //! y (w_k = gam0_k w_(k-1) + beta_k over those stages, gam0_k + gam1_k = 1, w_s = 0), so the wrap
@@ -1605,7 +1702,7 @@ void DustGasDrag::ShiftShearCrossings(const Real tau) {
 }
 
 Real DustGasDrag::DragStep(Driver *pdrive) const {
-  if (coupling == DustCoupling::hybrid) return pmy_pack->pmesh->dt;
+  if (coupling == DustCoupling::pc2) return pmy_pack->pmesh->dt;
   return (pdrive->a_impl)*(pmy_pack->pmesh->dt);
 }
 

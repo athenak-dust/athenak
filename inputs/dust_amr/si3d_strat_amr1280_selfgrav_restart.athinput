@@ -39,3 +39,5 @@ ncycle_check = 50
 
 <dust>
 amr_rho_refine_levels = 64 256 5120
+cloud_resample_dt_omega = 0.01        # global resampling every 0.01/Omega
+cloud_resample_schedule_reset = true  # the restart file plans 0.25/Omega

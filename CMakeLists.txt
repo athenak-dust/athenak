@@ -299,7 +299,7 @@ if (ENABLE_MPI)
 endif()
 
 # shear-phase update regressions: consecutive updates, a failed batch and reuse, the
-# ATHENA_SG_PROJECT_FUSE probe (tst/test_suite/gravity/phase_update.cpp)
+# test_project_fuse probe (tst/test_suite/gravity/phase_update.cpp)
 add_executable(gravity_phase_update_check EXCLUDE_FROM_ALL
   tst/test_suite/gravity/phase_update.cpp
   src/gravity/sparse_mg.cpp src/gravity/geometric_mg.cpp

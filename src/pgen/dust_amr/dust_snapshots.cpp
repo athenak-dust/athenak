@@ -362,7 +362,7 @@ void WriteBAFieldsGlobal(Mesh *pm) {
   auto &pr = pack->ppart->prtcl_rdata;
   const int npart = pack->ppart->nprtcl_thispack;
   auto &mbsize = pack->pmb->mb_size;
-  if (pm->multilevel || pdust->UsesCompositeTransfer() || pdust->deposit != DustDeposit::tsc) {
+  if (pm->multilevel || pdust->UsesRefinableClouds() || pdust->deposit != DustDeposit::tsc) {
     std::cerr << "BA fields on several ranks: only the canonical TSC deposit on a uniform mesh" << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -555,7 +555,7 @@ void GatherToRoot(std::vector<T> &v, MPI_Datatype type) {
 void WriteBAFields(Mesh *pm) {
   auto *pack = pm->pmb_pack;
   auto *pdust = pack->pdust;
-  const bool composite = pdust->UsesCompositeTransfer();
+  const bool composite = pdust->UsesRefinableClouds();
   const int nranks = global_variable::nranks;
   if (nranks > 1 && !composite) {WriteBAFieldsGlobal(pm); return;}
   if (nranks > 1 && pdust->smr_transfer_mode != DustSMRTransfer::refinable_cloud) {
@@ -573,7 +573,7 @@ void WriteBAFields(Mesh *pm) {
   auto &pi = pack->ppart->prtcl_idata;
   int npart = pack->ppart->nprtcl_thispack;
   auto &mbsize = pack->pmb->mb_size;
-  auto transfer = pdust->smr_transfer;
+  auto transfer = pdust->cloud_geometry;
   auto lt = pdust->leaf_traversal;   // the actual leaves
   // the leaf fields of every block slot with fields, flat ((slot*ncells2 + j)*ncells1 + i): the
   // local blocks, then (several ranks) the halo blocks; f0 mass and momentum, f1 the moments
@@ -647,7 +647,7 @@ void WriteBAFields(Mesh *pm) {
         }
       };
       if (composite) {
-        ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)), add);
+        lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)), add);
       } else {
         Real q1 = (pr(IPX,p) - gx1)/h1 - 0.5, q2 = (pr(IPY,p) - gx2)/h2 - 0.5;
         int c1 = static_cast<int>(floor(q1 + 0.5)), c2 = static_cast<int>(floor(q2 + 0.5));
@@ -877,7 +877,7 @@ void HistoryColumns(HistoryData *pdata, Mesh *pm) {
     std::exit(EXIT_FAILURE);
   }
   const char *labels[14] = {"msum", "mvx", "mvz", "mvp", "mvx2", "mvz2", "mvp2",
-      "nsplit", "nlobesplit", "ncoarse", "ncoarsein", "ncoarserej", "nfar_rel",
+      "nsplit", "nlobesplit", "ncoarse", "ncoarsein", "ncoarserej", "nfar_rel",  // retired-compat
       "pcapacity"};
   for (int c=0; c<14; ++c) pdata->label[h+c] = labels[c];
   Real s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0, s5 = 0.0, s6 = 0.0;
@@ -899,7 +899,7 @@ void HistoryColumns(HistoryData *pdata, Mesh *pm) {
   pdata->hdata[h+8] = static_cast<Real>(pd->cloud_lobe_split_count);
   pdata->hdata[h+9] = static_cast<Real>(pd->cloud_coarsen_events);
   pdata->hdata[h+10] = static_cast<Real>(pd->cloud_coarsen_in);
-  pdata->hdata[h+11] = static_cast<Real>(pd->cloud_coarsen_reject);
+  pdata->hdata[h+11] = static_cast<Real>(pd->cloud_coarsen_reject);  // retired-compat
   pdata->hdata[h+12] = static_cast<Real>(pd->cloud_far_release);
   pdata->hdata[h+13] = static_cast<Real>(npart);   // the arrays may hold headroom (in-place split)
   pdata->nhist = h + 14;

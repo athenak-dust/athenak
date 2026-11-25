@@ -309,9 +309,11 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
         pout_list.insert(pout_list.begin(),pnode);
       } else if (opar.file_type.compare("pbin") == 0) {
         // the particle real columns (positions, velocities, mass, stopping time) as float32
-        // on request; float64 stays the default (the block table is always float64)
-        if (pin->DoesParameterExist(opar.block_name, "precision")) {
-          const std::string prec = pin->GetString(opar.block_name, "precision");
+        // (default) or float64 (precision = double); the block table is
+        // always float64.  The value is added to the parameters, so that a restart keeps it (a
+        // restart file of an older code without it continues in double, ApplyRenamedKeys)
+        {
+          const std::string prec = pin->GetOrAddString(opar.block_name, "precision", "single");
           if (prec != "single" && prec != "double") {
             std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Output block '" << opar.block_name << "': precision must be "

@@ -204,7 +204,7 @@ void ProblemGenerator::DustNSH(ParameterInput *pin, const bool restart) {
   d.vx = vx;
   d.vp = vp;
   d.placement = "lattice";
-  const bool cloud_root_random = pin->GetOrAddBoolean("problem", "cloud_root_random", false);
+  const bool cloud_root_random = dust::GetCloudRootRandom(pin, pmbp->pdust);
   // the NSH equilibrium of 3-D refinable clouds in the shearing box, with the error
   // columns of the drag tests (gas against its equilibrium, dust density against eps rho0)
   if (three_d && nspec == 1 && cloud_root_random && pmbp->pdust->Clouds3D()) {

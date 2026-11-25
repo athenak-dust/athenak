@@ -91,17 +91,14 @@ class ShearingBox {
   bool report_timing = false;
   double t_plan_pull = 0.0, t_plan_flux = 0.0;
   long n_plan_pull = 0, n_plan_flux = 0;
-  bool pull_ghost_valid = false;   // x1 ghosts hold collected values (not after a regrid)
   // Rounds of the collection.  A coarser sender converts its cells with an x slope that
   // reads its own x1 ghosts at the face column, so those are collected first: round 0 sends
   // every piece that needs no slope (same level or finer sender) and fills the x1 ghosts of
   // the coarsest face blocks; round k sends the pieces for the face blocks k levels above the
   // coarsest (their senders' x1 ghosts are of this stage by then) and fills theirs.  One
   // round when all face blocks are on one level.  pull_pbeg_: first piece of each round.
-  // <shearing_box>/test_pull_lagged_xslope (default false) = true: one round, the x slope from
-  // the x1 ghosts of the previous stage and none right after a start or a regrid (the
-  // former behavior, which made the ghost zones depend on the run's history).
-  bool pull_lagged_xslope = false;
+  // (<shearing_box>/test_pull_lagged_xslope, one round with the x slope from the x1 ghosts of the
+  // previous stage, retired)
   int pull_nround_ = 1, pull_round_ = 0;
   bool pull_done_ = false;
   // Counts for the timing report: plans with several rounds, and plans in which a piece

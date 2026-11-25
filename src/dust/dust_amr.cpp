@@ -95,8 +95,8 @@ std::vector<SchedPatch> sched_;
 // the dust-density request (SetupDensityTrigger)
 struct DensityTrigger {
   Real rho_refine = 0.0, rho_derefine = 0.0;   // in units of the mean dust density (or code units)
-  // <dust>/amr_rho_units = mean (default, the 2-D trigger:
-  // rho_d over the box mean), code, or roche (thresholds in 9 Omega^2/(4 pi G)).
+  // <dust>/amr_rho_units = code (default), mean (the 2-D trigger:
+  // rho_d over the box mean), or roche (thresholds in 9 Omega^2/(4 pi G)).
   // Roche thresholds are converted once to code density; the traversal is shared.
   bool code_units = false;
   int buffer = 0;                               // cells of the block's level
@@ -232,7 +232,7 @@ void SetupDensityTrigger(ParameterInput *pin) {
   trig_.rho_derefine = pin->GetReal("dust", "amr_rho_derefine");
   trig_.buffer = pin->GetOrAddInteger("dust", "amr_rho_buffer", 2);
   {
-    const std::string un = pin->GetOrAddString("dust", "amr_rho_units", "mean");
+    const std::string un = pin->GetOrAddString("dust", "amr_rho_units", "code");
     if (un != "mean" && un != "code" && un != "roche")
       fatal("<dust>/amr_rho_units must be mean, code or roche");
     trig_.code_units = (un != "mean");
@@ -281,18 +281,9 @@ void SetupDensityTrigger(ParameterInput *pin) {
     }
   }
   trig_.device = pin->GetOrAddBoolean("dust", "amr_rho_device", true);
-  {
-    // default on (the shear-periodic x1 faces follow the 2:1 rule of all other
-    // neighbors, within what the face exchange can fill); auto = only the exchange's limit
-    // the rule is the mesh refinement's for every AMR shearing box
-    // (MeshRefinement::ShearFaceLevelLimit), always on; the key is still read (restart files hold it)
-    const std::string sfl = pin->GetOrAddString("dust", "amr_shear_face_limit", "on");
-    if (sfl != "on" && sfl != "off") fatal("<dust>/amr_shear_face_limit must be on or off");
-    if (sfl == "off" && global_variable::my_rank == 0) {
-      std::cout << "# NOTE (dust): amr_shear_face_limit = off is ignored: the mesh refinement keeps the "
-                << "shear-periodic x1 faces within one level whatever the criteria" << std::endl;
-    }
-  }
+  // (the shear-periodic x1 faces follow the 2:1 rule of all other neighbors: the mesh
+  // refinement's MeshRefinement::ShearFaceLevelLimit, always on; <dust>/amr_shear_face_limit
+  // retired, CheckRetiredKeys)
   if (!(trig_.rho_derefine >= 0.0 && trig_.rho_derefine < trig_.rho_refine) || trig_.buffer < 0) {
     fatal("amr_density_trigger needs 0 <= amr_rho_derefine < amr_rho_refine and amr_rho_buffer >= 0");
   }
@@ -442,21 +433,45 @@ void ParentBufferDiag(Mesh *pm, const int pmode, const std::vector<int> &code,
 }  // namespace
 
 //----------------------------------------------------------------------------------------
-//! \fn dust::DensityRefinement3D
-//! \brief The density trigger with 3-D refinable clouds.  The dust density on
-//! the leaves (DepositCloudDensity3D); per block the largest rho_d/mean over the leaf cells that
-//! overlap the block widened by amr_rho_buffer cells of its level (the slots with leaf fields,
-//! every periodic image; the widened box must be covered); the thresholds and the log line as
-//! in 2-D.  Several ranks: the halo slots, each with the cells it receives.
+//! \fn dust::DensityRefinementT
+//! \brief The density trigger of the refinable clouds on either traversal (the 2-D
+//! part of DensityRefinement and DensityRefinement3D written once): the reach of the halo, the
+//! dust density on the actual leaves, the clouds' total mass, the per-block value (the largest
+//! rho_d/mean over the leaf cells that overlap the block widened by amr_rho_buffer cells of its
+//! level: the slots with leaf fields, every periodic image; the widened box must be covered; a
+//! second value over 2 amr_rho_buffer cells for the derefinement test, test_derefine_parent_buffer)
+//! and the per-block decision.  The deposit and the block values stay in each dimension's own code
+//! and layout (TriggerDeposit2D / 3D, TriggerBlocks2D / 3D): 2-D the flat leaf field trig_f, the
+//! instant_switch deposit, the host or device block values and the profile of its sub-phases;
+//! 3-D the 5-D field trig_f3, the sheared x1 images and the cut at physical x3 faces.  Several
+//! ranks: the halo slots, each with the cells it receives.
 
+namespace {
 
-void DensityRefinement3D(MeshBlockPack *pmbp) {
-  Mesh *pm = pmbp->pmesh;
+// (2-D, <dust>/amr_profile) the fenced sub-phases of the trigger: no fence and no time unless on
+struct TrigLaps {
+  using PClock = std::chrono::steady_clock;
+  DustGasDrag *pd;
+  bool on;
+  PClock::time_point t;
+  TrigLaps(DustGasDrag *p, const bool enable) : pd(p), on(enable && ProfOn()) {
+    if (on) Kokkos::fence();
+    t = PClock::now();
+  }
+  void operator()(const int k) {
+    if (!on) return;
+    Kokkos::fence();
+    const auto now = PClock::now();
+    pd->prof_time[k] += std::chrono::duration<double>(now - t).count();
+    ++pd->prof_count[k];
+    t = now;
+  }
+};
+
+// 3-D: the dust density on the leaves into trig_f3 (component 0); with a buffer the owners' sums
+// on the halo slots
+void TriggerDeposit3D(MeshBlockPack *pmbp) {
   DustGasDrag *pd = pmbp->pdust;
-  // several ranks: the deposit traverses the supports, so the reach of the
-  // halo is checked first; the deposit adds the halo parts to their owners, and with a buffer the
-  // owners' sums go back to the halo slots
-  pd->CheckHaloReach("density trigger");
   if (pd->cloud_split_max_level < 0 || pd->trigger_leaf_kernel) {
     // (the trigger reads the density alone; with cloud_split_max_level, by default, every cloud
     // with its own kernel too)
@@ -467,26 +482,68 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     pd->DepositTriggerDensityCapped3D(pd->trig_f3);
   }
   if (trig_.buffer > 0) pd->HaloForward5D(pd->trig_f3, 0, 1);
-  auto f = pd->trig_f3;
+}
+
+// 2-D: the dust density on the current leaves into trig_f (flat leaf index), from the particles at
+// their new positions; several ranks: the leaves of the halo blocks too, added back to their
+// owners, and with a buffer the owners' sums on the halo slots.  oo: the old instant_switch
+// transfer's own deposit (one rank)
+void TriggerDeposit2D(MeshBlockPack *pmbp, const bool oo) {
+  DustGasDrag *pdust = pmbp->pdust;
+  auto &ind = pmbp->pmesh->mb_indcs;
+  const int nmb = pmbp->nmb_thispack;
+  const int ncells1 = ind.nx1 + 2*ind.ng, ncells2 = ind.nx2 + 2*ind.ng;
   particles::Particles *ppar = pmbp->ppart;
   const int npart = ppar->nprtcl_thispack;
   auto pr = ppar->prtcl_rdata;
   auto pi = ppar->prtcl_idata;
-  Real mtot = 0.0;
-  int nlev[3] = {0, 0, 0};
-  Kokkos::parallel_reduce("amr_rho3d_totals", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, Real &m, int &n0, int &n1, int &nl) {
-    m += pr(IPM,p);
-    const int code = pi(PLEV,p);
-    if (code > 15) ++nl; else if ((code & 15) == 0) ++n0; else ++n1;
-  }, mtot, nlev[0], nlev[1], nlev[2]);
-#if MPI_PARALLEL_ENABLED
-  if (global_variable::nranks > 1) {
-    // (nlev, the clouds of this rank by level, is not summed: nothing reads it since the
-    // trigger log was removed, and an int sum over the ranks could overflow)
-    MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+  auto lt = pdust->leaf_traversal;   // the actual leaves
+  {
+    const int nf = std::max(1, lt.nfld*ncells2*ncells1);
+    if (pdust->trig_f.extent_int(1) != nf) {
+      pdust->trig_f = DvceArray2D<Real>("amr_rho", 1, nf);   // zero on allocation
+    } else {
+      Kokkos::deep_copy(pdust->trig_f, 0.0);
+    }
   }
-#endif
+  auto f = pdust->trig_f;
+  if (oo) {   // one rank, no halo (nfld = nmb): the leaf densities in the same flat layout
+    pdust->OwnerOverlapDeposit(pdust->oo_rho, false);
+    auto rho = pdust->oo_rho;
+    const int ks = ind.ks;
+    par_for("amr_rho_oo_copy", DevExeSpace(), 0, nmb*ncells2*ncells1 - 1, KOKKOS_LAMBDA(const int k) {
+      const int m = k/(ncells2*ncells1), r = k % (ncells2*ncells1);
+      f(0,k) = rho(m,0,ks,r/ncells1,r % ncells1);
+    });
+    return;
+  }
+  // (with cloud_split_max_level, by default, every cloud with its own kernel too;
+  // written once, CloudFieldDepositT, zero weights skipped as before)
+  if (pdust->cloud_split_max_level < 0 || pdust->trigger_leaf_kernel) {
+    CloudFieldDepositT<LeafTraversal, true>("amr_rho_deposit", lt, pr, pi, npart, -1, false, 1, f,
+                                            CloudCodeSame());
+  } else {
+    // <dust>/cloud_split_max_level = L and amr_rho_kernel_above_split_max_level = split_max_level
+    // (the former default): a plain cloud above L is deposited with the kernel of its mass level L
+    // (TriggerCloudCode), so the refinement does not follow the sampling noise of the switched
+    // kernels (the dynamics keep the switched kernel)
+    CloudFieldDepositT<LeafTraversal, true>("amr_rho_deposit_cap", lt, pr, pi, npart, -1, false, 1,
+                                            f, CloudCodeCapped{pdust->cloud_split_max_level});
+  }
+  pdust->HaloReverseAddFlat(f, 1);
+  // map = block: the buffer cells of a block may lie on a halo block; the owners' sums there
+  // (the strips hold every cell within the reach of the local blocks, at least 3 cells of the
+  // root level and 6 of any finer level, checked below)
+  if (trig_.buffer > 0) pdust->HaloForwardFlat(f, 1);
+}
+
+// 3-D: the block values q (amr_rho_buffer cells) and q2 (2 amr_rho_buffer cells, npass = 2, blocks
+// above the root; else 0) on the device, the covered volumes checked block by block
+void TriggerBlocks3D(MeshBlockPack *pmbp, const Real mtot, const int npass, std::vector<Real> &qv,
+                     std::vector<Real> &q2v) {
+  Mesh *pm = pmbp->pmesh;
+  DustGasDrag *pd = pmbp->pdust;
+  auto f = pd->trig_f3;
   const auto &ms = pm->mesh_size;
   const Real lx = ms.x1max - ms.x1min, ly = ms.x2max - ms.x2min, lz = ms.x3max - ms.x3min;
   const Real vbox = lx*ly*lz;
@@ -515,8 +572,6 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
   // a second pass with 2 bb cells (default and diag; not with test_derefine_parent_buffer = false),
   // the region of the derefinement test (bb cells of the parent's level: the siblings together see
   // the parent's region)
-  const int pmode = pd->trigger_parent_buffer;
-  const int npass = (pmode > 0 && bb > 0) ? 2 : 1;
   DvceArray1D<Real> q2d, a2d;
   DvceArray1D<int> b2d;
   if (npass > 1) {
@@ -597,14 +652,10 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
   auto bh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bd);
   decltype(Kokkos::create_mirror_view(DvceArray1D<Real>())) q2h, a2h;
   decltype(Kokkos::create_mirror_view(DvceArray1D<int>())) b2h;
-  std::vector<int> dcode;    // 1: kept by the test over 2 bb cells, 2 derefined (ParentBufferDiag)
-  std::vector<Real> dq2;
   if (npass > 1) {
     q2h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), q2d);
     a2h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), a2d);
     b2h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), b2d);
-    dcode.assign(nmb, 0);
-    dq2.assign(nmb, 0.0);
   }
   // the largest value and the share of the dust mass and volume on finer blocks
   Real qmax = 0.0, mfine = 0.0, vfine = 0.0;
@@ -636,8 +687,6 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
     mfine = fv[0]; vfine = fv[1];
   }
 #endif
-  auto &refine_flag = pm->pmr->refine_flag;
-  int nref = 0, nder = 0;
   for (int m=0; m<nmb; ++m) {
     const auto &sz = mbsz.h_view(m);
     Real wz = (nx3 + 2*bb)*sz.dx3;   // (cut at physical x3 faces)
@@ -654,14 +703,11 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
                 << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    const int lev = pm->lloc_eachmb[m + mbs].level;
-    const int l = lev - pm->root_level;
-    int flag = 0;
-    if (qh(m) >= trig_.RefineAt(l) && lev < pm->max_level) flag = 1;
-    else if (lev > pm->root_level && qh(m) < trig_.DerefineAt(l)) flag = -1;
+    qv[m] = qh(m);
+    q2v[m] = 0.0;
     // the derefinement test over 2 bb cells (not for root blocks: they never derefine, and on
     // several ranks their halo holds only bb cells)
-    if (npass > 1 && lev > pm->root_level) {
+    if (npass > 1 && pm->lloc_eachmb[m + mbs].level > pm->root_level) {
       Real wz2 = (nx3 + 4*bb)*sz.dx3;
       if (!pd->leaf_traversal3d.x3per) {
         const Real lo = std::max(sz.x3min - 2*bb*sz.dx3, pm->mesh_size.x3min);
@@ -676,228 +722,25 @@ void DensityRefinement3D(MeshBlockPack *pmbp) {
                   << ", " << b2h(m) << " non-finite cells)" << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      dq2[m] = q2h(m);
-      if (flag < 0) {
-        dcode[m] = (q2h(m) < trig_.DerefineAt(l)) ? 2 : 1;
-        if (dcode[m] == 1 && pmode == 1) flag = 0;   // default: kept
-      }
+      q2v[m] = q2h(m);
     }
-    refine_flag.h_view(m + mbs) = flag;
-    if (flag > 0) ++nref;
-    if (flag < 0) ++nder;
   }
-  if (npass > 1 && pmode == 2) ParentBufferDiag(pm, pmode, dcode, dq2);
-  // (the levels across the shear-periodic x1 faces: MeshRefinement::ShearFaceLevelLimit after all
-  // criteria)
-  (void) nref; (void) nder;
-  refine_flag.template modify<HostMemSpace>();
-  refine_flag.template sync<DevExeSpace>();
 }
 
-//----------------------------------------------------------------------------------------
-//! \fn dust::DensityRefinement
-//! \brief Refinement request from the deposited dust density (see the file header).
-
-//----------------------------------------------------------------------------------------
-//! \fn dust::DensityRefinement3DPoint
-//! \brief The dust-density request in 3-D (point particles, instant_switch or a
-//! uniform root): the particle mass of every block on its own cells (NGP), the largest rho_d /
-//! mean of the block (mean over the whole mesh) against amr_rho_refine / amr_rho_derefine, times
-//! amr_rho_level_factor^level as in 2-D.  No buffer: the 2:1 rule and the shear-face columns of
-//! the mesh refinement do the rest.
-
-void DensityRefinement3DPoint(MeshBlockPack *pmbp) {
-  Mesh *pm = pmbp->pmesh;
-  particles::Particles *ppar = pmbp->ppart;
-  auto &refine_flag = pm->pmr->refine_flag;
-  auto &ind = pm->mb_indcs;
-  const int nmb = pmbp->nmb_thispack, mbs = pm->gids_eachrank[global_variable::my_rank];
-  const int nx1 = ind.nx1, nx2 = ind.nx2, nx3 = ind.nx3;
-  const int npart = ppar->nprtcl_thispack, gids = pmbp->gids;
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  auto &mbsize = pmbp->pmb->mb_size;
-  DvceArray4D<Real> rho("amr_rho3d", std::max(1, nmb), nx3, nx2, nx1);
-  Real mtot = 0.0;
-  if (npart > 0) {
-    Kokkos::parallel_reduce("amr_rho3d_dep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p, Real &ms) {
-      const int m = pi(PGID,p) - gids;
-      const auto &sz = mbsize.d_view(m);
-      int i = static_cast<int>(Kokkos::floor((pr(IPX,p) - sz.x1min)/sz.dx1));
-      int j = static_cast<int>(Kokkos::floor((pr(IPY,p) - sz.x2min)/sz.dx2));
-      int k = static_cast<int>(Kokkos::floor((pr(IPZ,p) - sz.x3min)/sz.dx3));
-      i = Kokkos::min(nx1 - 1, Kokkos::max(0, i));
-      j = Kokkos::min(nx2 - 1, Kokkos::max(0, j));
-      k = Kokkos::min(nx3 - 1, Kokkos::max(0, k));
-      Kokkos::atomic_add(&rho(m,k,j,i), pr(IPM,p)/(sz.dx1*sz.dx2*sz.dx3));
-      ms += pr(IPM,p);
-    }, Kokkos::Sum<Real>(mtot));
-  }
-  DvceArray1D<Real> bmax("amr_rho3d_bmax", std::max(1, nmb));
-  const int ncell = nx1*nx2*nx3;
-  Kokkos::parallel_for("amr_rho3d_max", Kokkos::TeamPolicy<>(DevExeSpace(), std::max(1, nmb),
-                                                            Kokkos::AUTO),
-  KOKKOS_LAMBDA(const TeamMember_t &tm) {
-    const int m = tm.league_rank();
-    if (m >= nmb) return;
-    Real mx = 0.0;
-    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, ncell), [&](const int c, Real &q) {
-      const int k = c/(nx2*nx1), r = c - k*nx2*nx1, j = r/nx1, i = r - j*nx1;
-      q = Kokkos::fmax(q, rho(m,k,j,i));
-    }, Kokkos::Max<Real>(mx));
-    Kokkos::single(Kokkos::PerTeam(tm), [&]() {bmax(m) = mx;});
-  });
-#if MPI_PARALLEL_ENABLED
-  MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
-#endif
-  const auto &ms = pm->mesh_size;
-  const Real mean = trig_.code_units ? 1.0   // (amr_rho_units)
-                  : mtot/((ms.x1max - ms.x1min)*(ms.x2max - ms.x2min)*(ms.x3max - ms.x3min));
-  auto bh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bmax);
-  int nflag[2] = {0, 0};   // (counts, for a log)
-  for (int m=0; m<nmb; ++m) {
-    const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
-    const Real q = (mean > 0.0) ? bh(m)/mean : 0.0;
-    const Real thr_r = trig_.RefineAt(l);
-    const Real thr_d = (l > 0) ? trig_.DerefineAt(l) : 0.0;
-    int flag = 0;
-    if (q >= thr_r) flag = 1;
-    else if (l > 0 && q < thr_d) flag = -1;
-    refine_flag.h_view(m + mbs) = flag;
-    if (flag > 0) ++nflag[0];
-    if (flag < 0) ++nflag[1];
-  }
-  refine_flag.template modify<HostMemSpace>();
-  refine_flag.template sync<DevExeSpace>();
-  (void) nflag;
-}
-
-void DensityRefinement(MeshBlockPack *pmbp) {
+// 2-D: the block values q (amr_rho_buffer cells) and q2 (2 amr_rho_buffer cells, npass = 2, blocks
+// above the root; else 0), on the device (default) or on the host (amr_rho_device = false, and
+// with instant_switch), the covered areas checked block by block
+void TriggerBlocks2D(MeshBlockPack *pmbp, const Real mtot, const int npass, TrigLaps &lap,
+                     std::vector<Real> &qv, std::vector<Real> &q2v) {
   Mesh *pm = pmbp->pmesh;
   DustGasDrag *pdust = pmbp->pdust;
-  // 3-D point particles; 3-D refinable clouds below
-  if (pm->three_d && !(pdust != nullptr && pdust->Clouds3D())) {
-    DensityRefinement3DPoint(pmbp);
-    return;
-  }
-  double dummy_t = 0.0; long long dummy_c = 0;   // profile timer
-  ProfTimer prof_timer(pdust ? pdust->prof_time[DustGasDrag::kProfTrigger] : dummy_t,
-                       pdust ? pdust->prof_count[DustGasDrag::kProfTrigger] : dummy_c);
-  // the old instant_switch transfer has its own deposit (TSC on the owner blocks, the
-  // ghost parts added to the leaves they overlap); the block values below are the same
-  const bool oo = (pdust != nullptr) &&
-                  pdust->smr_transfer_mode == DustSMRTransfer::instant_switch;
-  // 3-D refinable clouds have their own (exact leaf deposit, halo on several ranks)
-  if (pdust != nullptr && pdust->Clouds3D()) {
-    DensityRefinement3D(pmbp);
-    return;
-  }
-  if (pdust == nullptr || !(pdust->UsesCompositeTransfer() || oo) || pm->three_d) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "amr_density_trigger needs 2-D refinable-cloud or instant_switch dust" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-  // several ranks: the deposit below traverses the supports, so
-  // the reach of the halo is checked first, before the leaf traversal is copied: after the
-  // push (particles moved and may have changed owner) and after a restart whose pending mesh
-  // check runs before any cycle
-  pdust->CheckHaloReach("density trigger");
-  // fenced sub-phases (deposit with the halo sums and totals, copy to the host, the
-  // per-block decisions on the host)
-  using PClock = std::chrono::steady_clock;
-  if (ProfOn()) Kokkos::fence();
-  auto tlap = PClock::now();
-  auto lap = [&](const int k) {   // (no fence and no time unless amr_profile)
-    if (!ProfOn()) return;
-    Kokkos::fence();
-    const auto now = PClock::now();
-    pdust->prof_time[k] += std::chrono::duration<double>(now - tlap).count();
-    ++pdust->prof_count[k];
-    tlap = now;
-  };
-  particles::Particles *ppar = pmbp->ppart;
-  auto &refine_flag = pm->pmr->refine_flag;
   auto &ind = pm->mb_indcs;
   const int nmb = pmbp->nmb_thispack, mbs = pm->gids_eachrank[global_variable::my_rank];
   const int is = ind.is, js = ind.js, nx1 = ind.nx1, nx2 = ind.nx2;
   const int ncells1 = nx1 + 2*ind.ng, ncells2 = nx2 + 2*ind.ng;
   auto &mbsize = pmbp->pmb->mb_size;
-  const int npart = ppar->nprtcl_thispack;
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  auto transfer = pdust->smr_transfer;
-  auto lt = pdust->leaf_traversal;   // the actual leaves
-  // dust density on the current leaves from the particles at their new positions; several
-  // ranks: leaves of the halo blocks too, added back to their owners
-  {
-    const int nf = std::max(1, lt.nfld*ncells2*ncells1);
-    if (pdust->trig_f.extent_int(1) != nf) {
-      pdust->trig_f = DvceArray2D<Real>("amr_rho", 1, nf);   // zero on allocation
-    } else {
-      Kokkos::deep_copy(pdust->trig_f, 0.0);
-    }
-  }
+  auto lt = pdust->leaf_traversal;
   auto f = pdust->trig_f;
-  if (oo) {   // one rank, no halo (nfld = nmb): the leaf densities in the same flat layout
-    pdust->OwnerOverlapDeposit(pdust->oo_rho, false);
-    auto rho = pdust->oo_rho;
-    const int ks = ind.ks;
-    par_for("amr_rho_oo_copy", DevExeSpace(), 0, nmb*ncells2*ncells1 - 1, KOKKOS_LAMBDA(const int k) {
-      const int m = k/(ncells2*ncells1), r = k % (ncells2*ncells1);
-      f(0,k) = rho(m,0,ks,r/ncells1,r % ncells1);
-    });
-  } else {
-  // (with cloud_split_max_level, by default, every cloud with its own kernel too)
-  if (pdust->cloud_split_max_level < 0 || pdust->trigger_leaf_kernel) {
-  par_for("amr_rho_deposit", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
-    const Real mass = pr(IPM,p);
-    ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
-                           [&](const int target, const Real w) {
-      if (w == 0.0) return;
-      const int tm = target/(ncells1*ncells2);
-      DepositAdd(&f(0,target), mass*w/(lt.box(tm,2)*lt.box(tm,3)));
-    });
-  });
-  } else {
-  // <dust>/cloud_split_max_level = L and amr_rho_kernel_above_split_max_level = split_max_level
-  // (the former default): a plain cloud above L is deposited with the kernel of its
-  // mass level L
-  // (TriggerCloudCode), so the refinement does not follow the sampling noise of the switched
-  // kernels (the dynamics keep the switched kernel)
-  const int lcap = pdust->cloud_split_max_level;
-  par_for("amr_rho_deposit_cap", DevExeSpace(), 0, npart-1, KOKKOS_LAMBDA(const int p) {
-    const Real mass = pr(IPM,p);
-    ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), TriggerCloudCode(pi(PLEV,p), lcap),
-                           lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
-      if (w == 0.0) return;
-      const int tm = target/(ncells1*ncells2);
-      DepositAdd(&f(0,target), mass*w/(lt.box(tm,2)*lt.box(tm,3)));
-    });
-  });
-  }
-  pdust->HaloReverseAddFlat(f, 1);
-  // map = block: the buffer cells of a block may lie on a halo block; the owners' sums there
-  // (the strips hold every cell within the reach of the local blocks, at least 3 cells of the
-  // root level and 6 of any finer level, checked below)
-  if (trig_.buffer > 0) pdust->HaloForwardFlat(f, 1);
-  }
-  Real mtot = 0.0;
-  int nlev[3] = {0, 0, 0};   // clouds at the root level, finer plain, lobed
-  Kokkos::parallel_reduce("amr_rho_totals", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-  KOKKOS_LAMBDA(const int p, Real &m, int &n0, int &n1, int &nl) {
-    m += pr(IPM,p);
-    const int code = pi(PLEV,p);
-    if (code > 15) ++nl; else if ((code & 15) == 0) ++n0; else ++n1;
-  }, mtot, nlev[0], nlev[1], nlev[2]);
-#if MPI_PARALLEL_ENABLED
-  if (global_variable::nranks > 1) {
-    // (nlev, the clouds of this rank by level, is not summed: nothing reads it since the
-    // trigger log was removed, and an int sum over the ranks could overflow)
-    MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
-  }
-#endif
-  lap(DustGasDrag::kProfTrigDeposit);
   // on the device the field stays there (the host copy only for the host path and
   // the comparison)
   const bool dev_blocks = trig_.device;
@@ -1076,10 +919,6 @@ void DensityRefinement(MeshBlockPack *pmbp) {
   // the non-finite cells, then only these three numbers per block go to the host
   decltype(Kokkos::create_mirror_view(DvceArray1D<Real>())) qd_h, ad_h;
   decltype(Kokkos::create_mirror_view(DvceArray1D<int>())) bd_h;
-  // a second pass with 2 trig_.buffer cells (default and diag; not with test_derefine_parent_buffer
-  // = false), the region of the derefinement test (trig_.buffer cells of the parent's level)
-  const int pmode = pdust->trigger_parent_buffer;
-  const int npass = (pmode > 0 && trig_.buffer > 0) ? 2 : 1;
   decltype(Kokkos::create_mirror_view(DvceArray1D<Real>())) q2d_h, a2d_h;
   decltype(Kokkos::create_mirror_view(DvceArray1D<int>())) b2d_h;
   if (dev_blocks) {
@@ -1164,9 +1003,6 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     }
     }
   }
-  std::vector<int> dcode(npass > 1 ? nmb : 0, 0);   // (as in 3-D, ParentBufferDiag)
-  std::vector<Real> dq2(npass > 1 ? nmb : 0, 0.0);
-  int nref = 0, nder = 0;
   for (int m=0; m<nmb; ++m) {
     const auto &sz = mbsize.h_view(m);
     Real q = 0.0, q2 = 0.0;
@@ -1206,30 +1042,201 @@ void DensityRefinement(MeshBlockPack *pmbp) {
     } else {
       q = BlockValue(m, sz.x1min, sz.x1max, sz.x2min, sz.x2max, sz.dx1, sz.dx2, trig_.buffer);
     }
+    qv[m] = q;
+    q2v[m] = q2;
+  }
+}
+
+}  // namespace
+
+template <class LTT>
+void DensityRefinementT(MeshBlockPack *pmbp, const bool oo) {
+  constexpr bool k3 = (LeafApi<LTT>::kDim == 3);
+  Mesh *pm = pmbp->pmesh;
+  DustGasDrag *pd = pmbp->pdust;
+  // several ranks: the deposit traverses the supports, so the reach of the halo is checked first,
+  // before the leaf traversal is copied: after the push (particles moved and may have changed
+  // owner) and after a restart whose pending mesh check runs before any cycle
+  pd->CheckHaloReach("density trigger");
+  // (2-D, amr_profile: the fenced sub-phases, the deposit with the halo sums and totals, the copy
+  // to the host, the per-block decisions on the host)
+  TrigLaps lap(pd, !k3);
+  if constexpr (k3) {
+    TriggerDeposit3D(pmbp);
+  } else {
+    TriggerDeposit2D(pmbp, oo);
+  }
+  particles::Particles *ppar = pmbp->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  Real mtot = 0.0;
+  int nlev[3] = {0, 0, 0};   // clouds at the root level, finer plain, lobed
+  Kokkos::parallel_reduce(k3 ? "amr_rho3d_totals" : "amr_rho_totals",
+                          Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p, Real &m, int &n0, int &n1, int &nl) {
+    m += pr(IPM,p);
+    const int code = pi(PLEV,p);
+    if (code > 15) ++nl; else if ((code & 15) == 0) ++n0; else ++n1;
+  }, mtot, nlev[0], nlev[1], nlev[2]);
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    // (nlev, the clouds of this rank by level, is not summed: nothing reads it since the
+    // trigger log was removed, and an int sum over the ranks could overflow)
+    MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+  }
+#endif
+  lap(DustGasDrag::kProfTrigDeposit);
+  // a second pass with 2 amr_rho_buffer cells (default and diag; not with
+  // test_derefine_parent_buffer = false), the region of the derefinement test (amr_rho_buffer
+  // cells of the parent's level: the siblings together see the parent's region)
+  const int pmode = pd->trigger_parent_buffer;
+  const int npass = (pmode > 0 && trig_.buffer > 0) ? 2 : 1;
+  const int nmb = pmbp->nmb_thispack, mbs = pm->gids_eachrank[global_variable::my_rank];
+  std::vector<Real> qv(nmb, 0.0), q2v(nmb, 0.0);
+  if constexpr (k3) {
+    TriggerBlocks3D(pmbp, mtot, npass, qv, q2v);
+  } else {
+    TriggerBlocks2D(pmbp, mtot, npass, lap, qv, q2v);
+  }
+  // the decision of every block: refine at RefineAt(l) (below the finest level), derefine below
+  // DerefineAt(l), l the block's level above the root; with the second pass a block flagged for
+  // derefinement whose value over 2 amr_rho_buffer cells reaches DerefineAt(l) is kept (default)
+  std::vector<int> dcode(npass > 1 ? nmb : 0, 0);   // 1 kept by the second pass, 2 derefined
+  std::vector<Real> dq2(npass > 1 ? nmb : 0, 0.0);
+  auto &refine_flag = pm->pmr->refine_flag;
+  for (int m=0; m<nmb; ++m) {
     const int lev = pm->lloc_eachmb[m + mbs].level;
-    int flag = 0;
-    // the thresholds of this block's level (amr_rho_level_factor)
     const int l = lev - pm->root_level;
-    const Real thr_r = trig_.RefineAt(l);
-    const Real thr_d = (l > 0) ? trig_.DerefineAt(l) : 0.0;
-    if (q >= thr_r && lev < pm->max_level) flag = 1;
-    else if (lev > pm->root_level && q < thr_d) flag = -1;
-    if (npass > 1) {   // the derefinement test over 2 trig_.buffer cells
-      dq2[m] = q2;
+    const Real q = qv[m];
+    int flag = 0;
+    if (q >= trig_.RefineAt(l) && lev < pm->max_level) flag = 1;
+    else if (lev > pm->root_level && q < trig_.DerefineAt(l)) flag = -1;
+    if (npass > 1) {
+      dq2[m] = q2v[m];
       if (flag < 0) {
-        dcode[m] = (q2 < thr_d) ? 2 : 1;
+        dcode[m] = (q2v[m] < trig_.DerefineAt(l)) ? 2 : 1;
         if (dcode[m] == 1 && pmode == 1) flag = 0;   // default: kept
       }
     }
     refine_flag.h_view(m + mbs) = flag;
-    if (flag > 0) ++nref;
-    if (flag < 0) ++nder;
   }
   if (npass > 1 && pmode == 2) ParentBufferDiag(pm, pmode, dcode, dq2);
   lap(DustGasDrag::kProfTrigBlocks);
+  // (3-D: the levels across the shear-periodic x1 faces, MeshRefinement::ShearFaceLevelLimit after
+  // all criteria)
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
   lap(DustGasDrag::kProfTrigLog);
+}
+
+
+//----------------------------------------------------------------------------------------
+//! \fn dust::DensityRefinement
+//! \brief Refinement request from the deposited dust density (see the file header).
+
+//----------------------------------------------------------------------------------------
+//! \fn dust::DensityRefinement3DPoint
+//! \brief The dust-density request in 3-D (point particles, instant_switch or a
+//! uniform root): the particle mass of every block on its own cells (NGP), the largest rho_d /
+//! mean of the block (mean over the whole mesh) against amr_rho_refine / amr_rho_derefine, times
+//! amr_rho_level_factor^level as in 2-D.  No buffer: the 2:1 rule and the shear-face columns of
+//! the mesh refinement do the rest.
+
+void DensityRefinement3DPoint(MeshBlockPack *pmbp) {
+  Mesh *pm = pmbp->pmesh;
+  particles::Particles *ppar = pmbp->ppart;
+  auto &refine_flag = pm->pmr->refine_flag;
+  auto &ind = pm->mb_indcs;
+  const int nmb = pmbp->nmb_thispack, mbs = pm->gids_eachrank[global_variable::my_rank];
+  const int nx1 = ind.nx1, nx2 = ind.nx2, nx3 = ind.nx3;
+  const int npart = ppar->nprtcl_thispack, gids = pmbp->gids;
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  auto &mbsize = pmbp->pmb->mb_size;
+  DvceArray4D<Real> rho("amr_rho3d", std::max(1, nmb), nx3, nx2, nx1);
+  Real mtot = 0.0;
+  if (npart > 0) {
+    Kokkos::parallel_reduce("amr_rho3d_dep", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p, Real &ms) {
+      const int m = pi(PGID,p) - gids;
+      const auto &sz = mbsize.d_view(m);
+      int i = static_cast<int>(Kokkos::floor((pr(IPX,p) - sz.x1min)/sz.dx1));
+      int j = static_cast<int>(Kokkos::floor((pr(IPY,p) - sz.x2min)/sz.dx2));
+      int k = static_cast<int>(Kokkos::floor((pr(IPZ,p) - sz.x3min)/sz.dx3));
+      i = Kokkos::min(nx1 - 1, Kokkos::max(0, i));
+      j = Kokkos::min(nx2 - 1, Kokkos::max(0, j));
+      k = Kokkos::min(nx3 - 1, Kokkos::max(0, k));
+      Kokkos::atomic_add(&rho(m,k,j,i), pr(IPM,p)/(sz.dx1*sz.dx2*sz.dx3));
+      ms += pr(IPM,p);
+    }, Kokkos::Sum<Real>(mtot));
+  }
+  DvceArray1D<Real> bmax("amr_rho3d_bmax", std::max(1, nmb));
+  const int ncell = nx1*nx2*nx3;
+  Kokkos::parallel_for("amr_rho3d_max", Kokkos::TeamPolicy<>(DevExeSpace(), std::max(1, nmb),
+                                                            Kokkos::AUTO),
+  KOKKOS_LAMBDA(const TeamMember_t &tm) {
+    const int m = tm.league_rank();
+    if (m >= nmb) return;
+    Real mx = 0.0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tm, ncell), [&](const int c, Real &q) {
+      const int k = c/(nx2*nx1), r = c - k*nx2*nx1, j = r/nx1, i = r - j*nx1;
+      q = Kokkos::fmax(q, rho(m,k,j,i));
+    }, Kokkos::Max<Real>(mx));
+    Kokkos::single(Kokkos::PerTeam(tm), [&]() {bmax(m) = mx;});
+  });
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &mtot, 1, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  const auto &ms = pm->mesh_size;
+  const Real mean = trig_.code_units ? 1.0   // (amr_rho_units)
+                  : mtot/((ms.x1max - ms.x1min)*(ms.x2max - ms.x2min)*(ms.x3max - ms.x3min));
+  auto bh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), bmax);
+  int nflag[2] = {0, 0};   // (counts, for a log)
+  for (int m=0; m<nmb; ++m) {
+    const int l = pm->lloc_eachmb[m + mbs].level - pm->root_level;
+    const Real q = (mean > 0.0) ? bh(m)/mean : 0.0;
+    const Real thr_r = trig_.RefineAt(l);
+    const Real thr_d = (l > 0) ? trig_.DerefineAt(l) : 0.0;
+    int flag = 0;
+    if (q >= thr_r) flag = 1;
+    else if (l > 0 && q < thr_d) flag = -1;
+    refine_flag.h_view(m + mbs) = flag;
+    if (flag > 0) ++nflag[0];
+    if (flag < 0) ++nflag[1];
+  }
+  refine_flag.template modify<HostMemSpace>();
+  refine_flag.template sync<DevExeSpace>();
+  (void) nflag;
+}
+
+void DensityRefinement(MeshBlockPack *pmbp) {
+  Mesh *pm = pmbp->pmesh;
+  DustGasDrag *pdust = pmbp->pdust;
+  // 3-D point particles; 3-D refinable clouds below
+  if (pm->three_d && !(pdust != nullptr && pdust->Clouds3D())) {
+    DensityRefinement3DPoint(pmbp);
+    return;
+  }
+  double dummy_t = 0.0; long long dummy_c = 0;   // profile timer
+  ProfTimer prof_timer(pdust ? pdust->prof_time[DustGasDrag::kProfTrigger] : dummy_t,
+                       pdust ? pdust->prof_count[DustGasDrag::kProfTrigger] : dummy_c);
+  // the old instant_switch transfer has its own deposit (TSC on the owner blocks, the
+  // ghost parts added to the leaves they overlap); the block values below are the same
+  const bool oo = (pdust != nullptr) &&
+                  pdust->smr_transfer_mode == DustSMRTransfer::instant_switch;
+  // 3-D refinable clouds have their own (exact leaf deposit, halo on several ranks)
+  if (pdust != nullptr && pdust->Clouds3D()) {
+    DensityRefinementT<LeafTraversal3D>(pmbp, false);
+    return;
+  }
+  if (pdust == nullptr || !(pdust->UsesRefinableClouds() || oo) || pm->three_d) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "amr_density_trigger needs 2-D refinable-cloud or instant_switch dust" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  // 2-D refinable clouds (and the old instant_switch transfer): written once with 3-D
+  DensityRefinementT<LeafTraversal>(pmbp, oo);
 }
 
 //----------------------------------------------------------------------------------------
@@ -1276,85 +1283,165 @@ void DustGasDrag::ResumeAmrAfterRestart(Driver *pdrive, ParameterInput *pin) {
 
 int DustGasDrag::ResetPGIDFromPositions(const char *when) {
   if (global_variable::nranks > 1) return RouteToOwnerBlocks(when);   // several ranks
-  if (clouds3d) {   // the 3-D leaves
-    Real dw = 0.0;
-    double ms = 0.0;
-    const int n = ResetBlocks3D(when, false, dw, ms);
-    if (global_variable::my_rank == 0) {
-      std::cout << "# dust: MeshBlock ids set from the positions at the " << when << ": "
-                << n << " of " << pmy_pack->ppart->nprtcl_thispack << " changed" << std::endl;
-    }
-    return n;
-  }
-  particles::Particles *ppar = pmy_pack->ppart;
-  const int npart = ppar->nprtcl_thispack;
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  const auto lt = leaf_traversal;   // the actual leaves
-  auto &indcs = pmy_pack->pmesh->mb_indcs;
-  const int ncell12 = (indcs.nx1 + 2*indcs.ng)*(indcs.nx2 + 2*indcs.ng);
-  const int nmb = pmy_pack->nmb_thispack;
-  const int gids = pmy_pack->gids;
-  int nchanged = 0, nbad = 0;
-  if (npart > 0) {
-    Kokkos::parallel_reduce("dust_pgid_reset", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
-      SMRCompositeTransfer::WrapParticle(pr, p, lt.x1min, lt.x1max, lt.x2min, lt.x2max);
-      const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)));
-      const int owner = (leaf < 0) ? -1 : leaf/ncell12;
-      if (owner < 0 || owner >= nmb) {
-        ++bad;
-      } else if (pi(PGID,p) != gids + owner) {
-        pi(PGID,p) = gids + owner;
-        ++changed;
-      }
-    }, Kokkos::Sum<int>(nchanged), Kokkos::Sum<int>(nbad));
-  }
-  if (nbad > 0) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << nbad << " particles have no owning MeshBlock (" << when << ")" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
+  Real dw = 0.0;
+  double ms = 0.0;
+  const int n = cloud_dim == 3 ? ResetBlocksT(leaf_traversal3d, when, false, dw, ms)
+                         : ResetBlocksT(leaf_traversal, when, false, dw, ms);
   if (global_variable::my_rank == 0) {
     std::cout << "# dust: MeshBlock ids set from the positions at the " << when << ": "
-              << nchanged << " of " << npart << " changed" << std::endl;
+              << n << " of " << pmy_pack->ppart->nprtcl_thispack << " changed" << std::endl;
   }
-  return nchanged;
+  return n;
 }
 
 //----------------------------------------------------------------------------------------
-//! \fn DustGasDrag::RouteToOwnerBlocks
-//! \brief Several ranks: every particle to the block that holds its position
-//! (the leaf traversal of the current mesh, all blocks of the mesh): its MeshBlock id, and the
-//! particles of blocks of other ranks (after a regrid with load balancing: anywhere) through
-//! the AthenaK particle exchange, with a send list filled here.  Returns how many ids of this
-//! rank's particles changed.
+//! \fn DustGasDrag::WrapParticles
+//! \brief Every particle position (with its RK register) into the domain: 2-D the periodic x1, x2
+//! (CloudGeometry::WrapParticle), 3-D WrapParticles3D (shear-periodic x1, periodic or
+//! physical x3).
+
+void DustGasDrag::WrapParticles() {
+  if (cloud_dim == 3) {WrapParticles3D(); return;}
+  const int npart = pmy_pack->ppart->nprtcl_thispack;
+  if (npart == 0) return;
+  auto pr = pmy_pack->ppart->prtcl_rdata;
+  const auto &ms = pmy_pack->pmesh->mesh_size;
+  const Real x1a = ms.x1min, x1b = ms.x1max, x2a = ms.x2min, x2b = ms.x2max;
+  Kokkos::parallel_for("dust_wrap2d", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p) {
+    CloudGeometry::WrapParticle(pr, p, x1a, x1b, x2a, x2b);
+  });
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::ResetBlocksT
+//! \brief One rank: the positions into the domain, then PGID of every particle from the leaf that
+//! holds its position (the old id only as the search anchor).  check (after a regrid): every cloud's
+//! weights lie on blocks with leaf fields and sum to one; dwmax is the largest |sum - 1|, msum the
+//! particle mass.  A particle without a block of this pack, or a failed check, stops the run
+//! (with the first offenders listed).  Returns the ids that changed.  The 2-D path before
+//! (ResetPGIDFromPositions, the 2-D branch of RebuildAfterRegrid) and ResetBlocks3D, written once
+//! (same per-particle operations, no change in results).
+
+template <class LTT>
+int DustGasDrag::ResetBlocksT(const LTT &lt, const char *when, const bool check, Real &dwmax,
+                              double &msum) {
+  using A = LeafApi<LTT>;
+  particles::Particles *ppar = pmy_pack->ppart;
+  const int npart = ppar->nprtcl_thispack;
+  dwmax = 0.0; msum = 0.0;
+  if (npart == 0) return 0;
+  WrapParticles();
+  auto pr = ppar->prtcl_rdata;
+  auto pi = ppar->prtcl_idata;
+  const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
+  int nchanged = 0, nbad = 0;
+  Kokkos::parallel_reduce(A::kDim == 3 ? "dust_reset_blocks3d" : "dust_reset_blocks2d",
+                          Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  KOKKOS_LAMBDA(const int p, int &changed, int &bad, Real &dw, double &ms) {
+    Real x[3];
+    A::Load(pr, p, x);
+    const int leaf = A::Owner(lt, x, lt.Anchor(pi(PGID,p)));   // the old id: a guess
+    const int owner = (leaf < 0) ? -1 : A::Slot(lt, leaf);
+    if (owner < 0 || owner >= nmb) {++bad; return;}
+    if (pi(PGID,p) != gids + owner) {pi(PGID,p) = gids + owner; ++changed;}
+    ms += static_cast<double>(pr(IPM,p));
+    if (!check) return;
+    int out = 0;
+    const Real sw = A::WeightSum(lt, x, pi(PLEV,p), owner, [&](const int t, const Real) {
+      if (t < 0 || A::Slot(lt, t) >= lt.nfld) ++out;
+    });
+    dw = Kokkos::fmax(dw, Kokkos::fabs(sw - 1.0));
+    bad += out;
+  }, Kokkos::Sum<int>(nchanged), Kokkos::Sum<int>(nbad), Kokkos::Max<Real>(dwmax),
+     Kokkos::Sum<double>(msum));
+  if (nbad > 0 || dwmax > 1.0e-10) {
+    // the first particles without an owning block or with a weight outside the blocks
+    DvceArray2D<Real> ex("dust_reset_bad", 8, 7);
+    DvceArray1D<int> nex("dust_reset_nbad", 1);
+    Kokkos::parallel_for("dust_reset_bad", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+    KOKKOS_LAMBDA(const int p) {
+      Real x[3];
+      A::Load(pr, p, x);
+      const int leaf = A::Owner(lt, x, lt.Anchor(pi(PGID,p)));
+      const int owner = (leaf < 0) ? -1 : A::Slot(lt, leaf);
+      int nout = 0;
+      if (owner >= 0 && owner < nmb) {
+        A::WeightSum(lt, x, pi(PLEV,p), owner, [&](const int t, const Real) {
+          if (t < 0 || A::Slot(lt, t) >= lt.nfld) ++nout;
+        });
+      }
+      if (owner >= 0 && owner < nmb && nout == 0) return;
+      const int k = Kokkos::atomic_fetch_add(&nex(0), 1);
+      if (k >= 8) return;
+      ex(k, 0) = x[0]; ex(k, 1) = x[1]; ex(k, 2) = x[2]; ex(k, 3) = pi(PGID,p) - gids;
+      ex(k, 4) = leaf; ex(k, 5) = nout; ex(k, 6) = pi(PLEV,p);
+    });
+    auto exh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ex);
+    auto nexh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), nex);
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl;
+    if (A::kDim == 2) {   // (the text of the former 2-D path first)
+      std::cout << nbad << " particles have no owning MeshBlock (" << when << ")" << std::endl;
+    }
+    std::cout << A::kDim << "-D clouds (" << when << "): " << nbad << " particles without a block "
+              << "or with weights outside the blocks, largest |sum of weights - 1| = " << dwmax
+              << "; first of " << nexh(0) << " (x1, x2, x3, block, owner leaf, weights outside, "
+              << "code):" << std::endl;
+    for (int k=0; k<std::min(8, nexh(0)); ++k) {
+      std::cout << "  " << exh(k, 0) << " " << exh(k, 1) << " " << exh(k, 2) << " " << exh(k, 3)
+                << " " << exh(k, 4) << " " << exh(k, 5) << " " << exh(k, 6) << std::endl;
+    }
+    std::exit(EXIT_FAILURE);
+  }
+  return nchanged;
+}
+template int DustGasDrag::ResetBlocksT<LeafTraversal>(const LeafTraversal &, const char *,
+                                                      const bool, Real &, double &);
+template int DustGasDrag::ResetBlocksT<LeafTraversal3D>(const LeafTraversal3D &, const char *,
+                                                        const bool, Real &, double &);
+
+//----------------------------------------------------------------------------------------
+//! \fn DustGasDrag::RouteToOwnerBlocks, RouteToOwnerBlocksT
+//! \brief Several ranks: PGID of every particle from the leaf that holds its position (the
+//! positions first wrapped into the domain unless first > 0: then only the particles first.. are
+//! routed, the pieces of a split, already wrapped), and the particles whose leaf is on another
+//! rank sent there (the halo's slot table gives the block and the rank).  The 2-D and the 3-D
+//! routing (RouteToOwnerBlocks3D) written once (same per-particle operations).
 
 int DustGasDrag::RouteToOwnerBlocks(const char *when) {
-  if (clouds3d) return RouteToOwnerBlocks3D(when);   // 3-D refinable clouds
+  return cloud_dim == 3 ? RouteToOwnerBlocksT(leaf_traversal3d, when, 0)
+                  : RouteToOwnerBlocksT(leaf_traversal, when, 0);
+}
+
+template <class LTT>
+int DustGasDrag::RouteToOwnerBlocksT(const LTT &lt, const char *when, const int first) {
+  using A = LeafApi<LTT>;
   particles::Particles *ppar = pmy_pack->ppart;
   auto *pb = ppar->pbval_part;
+  int nchanged = 0, nbad = 0;
+#if MPI_PARALLEL_ENABLED
+  ProfLaps laps(false);   // this rank's phases (only with <dust>/amr_profile)
+  // (first > 0: the pieces of this cycle's split, already wrapped into the domain)
+  if (first == 0) WrapParticles();
+  laps.Lap("wrap");
   const int npart = ppar->nprtcl_thispack;
   auto pr = ppar->prtcl_rdata;
   auto pi = ppar->prtcl_idata;
-  const auto lt = leaf_traversal;
-  auto &indcs = pmy_pack->pmesh->mb_indcs;
-  const int ncell12 = (indcs.nx1 + 2*indcs.ng)*(indcs.nx2 + 2*indcs.ng);
   const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
   auto sgid = leaf_slot_gid_d;
   auto srank = leaf_slot_rank_d;
-  int nchanged = 0, nbad = 0;
-#if MPI_PARALLEL_ENABLED
   pb->ReserveSendlist(npart);
   Kokkos::deep_copy(pb->send_count.d_view, 0);
   auto psendl = pb->sendlist.d_view;
   int *pcounter = pb->send_count.d_view.data();
-  if (npart > 0) {
-    Kokkos::parallel_reduce("dust_route_owner", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
+  if (npart > first) {
+    Kokkos::parallel_reduce(A::kDim == 3 ? "dust_route_owner3d" : "dust_route_owner",
+                            Kokkos::RangePolicy<>(DevExeSpace(), first, npart),
     KOKKOS_LAMBDA(const int p, int &changed, int &bad) {
-      SMRCompositeTransfer::WrapParticle(pr, p, lt.x1min, lt.x1max, lt.x2min, lt.x2max);
-      const int leaf = lt.LeafOwner(pr(IPX,p), pr(IPY,p), lt.Anchor(pi(PGID,p)));
-      const int slot = (leaf < 0) ? -1 : leaf/ncell12;
+      Real x[3];
+      A::Load(pr, p, x);
+      const int leaf = A::Owner(lt, x, lt.Anchor(pi(PGID,p)));
+      const int slot = (leaf < 0) ? -1 : A::Slot(lt, leaf);
       if (slot < 0) {++bad; return;}
       const int g = (slot < nmb) ? gids + slot : sgid(slot);
       if (pi(PGID,p) != g) {pi(PGID,p) = g; ++changed;}
@@ -1368,8 +1455,8 @@ int DustGasDrag::RouteToOwnerBlocks(const char *when) {
   }
   if (nbad > 0) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << nbad << " particles have no owning MeshBlock (" << (when ? when : "split") << ")"
-              << std::endl;
+              << nbad << " particles have no owning MeshBlock (" << (when ? when : "split")
+              << (A::kDim == 3 ? ", 3-D)" : ")") << std::endl;
     std::exit(EXIT_FAILURE);
   }
   Kokkos::deep_copy(pb->send_count.h_view, pb->send_count.d_view);
@@ -1380,29 +1467,42 @@ int DustGasDrag::RouteToOwnerBlocks(const char *when) {
     Kokkos::deep_copy(h, d);
   }
   const int nsent = pb->nprtcl_send;
+  laps.Lap("owner");
   pb->CountSendsAndRecvs();
+  laps.Lap("count");
   pb->InitPrtclRecv();
   pb->PackAndSendPrtcls();
+  laps.Lap("post");
   while (pb->RecvAndUnpackPrtcls() != TaskStatus::complete) {}
+  laps.Lap("recv");
   pb->ClearPrtclSend();
   pb->ClearPrtclRecv();
+  laps.Lap("clear");
   Mesh *pm = pmy_pack->pmesh;
   const long long tot = particles::TotalCount(pm->nprtcl_eachrank, global_variable::nranks);
   pm->nprtcl_total = tot;
   long long sums[2] = {nchanged, nsent};
   MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  laps.Lap("sums");
+  if (ProfOn() && when != nullptr) {
+    std::cout << "# regrid laps route rank=" << global_variable::my_rank << " sent=" << nsent
+              << laps.text << std::endl;
+  }
   if (global_variable::my_rank == 0 && when != nullptr) {   // nullptr: quiet (SplitToLeaves)
-    std::cout << "# dust: MeshBlock ids set from the positions at the " << when << ": "
-              << sums[0] << " of " << tot << " changed, " << sums[1] << " sent to other ranks"
-              << std::endl;
+    std::cout << (A::kDim == 3 ? "# dust (3-D): " : "# dust: ")
+              << "MeshBlock ids set from the positions at the " << when
+              << ": " << sums[0] << " of " << tot << " changed, " << sums[1]
+              << " sent to other ranks" << std::endl;
   }
 #else
-  (void)pb; (void)npart; (void)pr; (void)pi; (void)ncell12; (void)nmb; (void)gids;
-  (void)sgid; (void)srank; (void)nbad; (void)when;
+  (void)pb; (void)nbad; (void)when; (void)first; (void)lt;
 #endif
   return nchanged;
 }
-
+template int DustGasDrag::RouteToOwnerBlocksT<LeafTraversal>(const LeafTraversal &, const char *,
+                                                             const int);
+template int DustGasDrag::RouteToOwnerBlocksT<LeafTraversal3D>(const LeafTraversal3D &,
+                                                               const char *, const int);
 
 //----------------------------------------------------------------------------------------
 //! \fn DustGasDrag::RouteOO3D
@@ -1493,34 +1593,22 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
   amr_regrid_ndel = ndel;
   // positions into the box before the checksum (the rebuild sets the blocks from
   // the wrapped positions and must find the same particles)
-  if (clouds3d) {   // the third direction too
-    WrapParticles3D();
-  } else if (smr_transfer_mode == DustSMRTransfer::refinable_cloud &&
-      pmy_pack->ppart->nprtcl_thispack > 0) {
-    auto pr = pmy_pack->ppart->prtcl_rdata;
-    const auto &ms = pmy_pack->pmesh->mesh_size;
-    const Real x1a = ms.x1min, x1b = ms.x1max, x2a = ms.x2min, x2b = ms.x2max;
-    Kokkos::parallel_for("dust_wrap_before_regrid",
-                         Kokkos::RangePolicy<>(DevExeSpace(), 0, pmy_pack->ppart->nprtcl_thispack),
-    KOKKOS_LAMBDA(const int p) {
-      SMRCompositeTransfer::WrapParticle(pr, p, x1a, x1b, x2a, x2b);
-    });
-  }
+  if (smr_transfer_mode == DustSMRTransfer::refinable_cloud) WrapParticles();
   amr_checksum = ParticleChecksum(pmy_pack->ppart);
   lb_old_counts.clear();
 #if MPI_PARALLEL_ENABLED
   // the clouds of every block of the old mesh for the cost-weighted load balance (RegridCosts):
-  // one count per block, or with <dust>/load_balance_octant_count 2 * 2^d counts per block (lb_ncount)
+  // 2 * 2^d counts per block (lb_ncount; the octant counts, always)
   if (lb_cloud_weight > 0.0 && global_variable::nranks > 1) {
     Mesh *pm = pmy_pack->pmesh;
     const int nmb = pmy_pack->nmb_thispack, gids = pmy_pack->gids;
     const int npart = pmy_pack->ppart->nprtcl_thispack;
     const int nleaf = pm->three_d ? 8 : (pm->two_d ? 4 : 2);
-    const int nc = lb_octant_count ? 2*nleaf : 1;
+    const int nc = 2*nleaf;
     lb_ncount = nc;
     DvceArray2D<int> cnt("dust_lb_counts", std::max(1, nmb), nc);
     auto pi = pmy_pack->ppart->prtcl_idata;
-    if (npart > 0 && lb_octant_count) {
+    if (npart > 0) {
       // per octant of the block (bit 0 x1, bit 1 x2, bit 2 x3 upper half, as the children of a
       // refinement) the clouds finer than the block, which keep their level in a child, and
       // (refinable clouds) those at the block level or coarser, which split into 3^d children
@@ -1537,14 +1625,9 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
         int b = (pr(IPX,p) >= 0.5*(msz(m).x1min + msz(m).x1max)) ? 1 : 0;
         if (d2 && pr(IPY,p) >= 0.5*(msz(m).x2min + msz(m).x2max)) b |= 2;
         if (d3 && pr(IPZ,p) >= 0.5*(msz(m).x3min + msz(m).x3max)) b |= 4;
-        const int cl = SMRCompositeTransfer::CloudLevel(pi(PLEV,p));
+        const int cl = CloudGeometry::CloudLevel(pi(PLEV,p));
         const bool sp = split && cl <= mlev(m) - root && (lcap < 0 || cl < lcap);
         Kokkos::atomic_add(&cnt(m, sp ? nleaf + b : b), 1);
-      });
-    } else if (npart > 0) {
-      par_for("dust_lb_count", DevExeSpace(), 0, npart - 1, KOKKOS_LAMBDA(const int p) {
-        const int m = pi(PGID,p) - gids;
-        if (m >= 0 && m < nmb) Kokkos::atomic_add(&cnt(m,0), 1);
       });
     }
     auto ch = Kokkos::create_mirror_view_and_copy(HostMemSpace(), cnt);
@@ -1569,7 +1652,7 @@ void DustGasDrag::BeforeRegrid(int nnew, int ndel) {
 //! 1 + w * clouds / mean, with the clouds of the old blocks (BeforeRegrid): an unchanged block
 //! keeps its count, a refined block gives each child 1/2^d of its clouds times the 3^d children
 //! of the split of refinable clouds (1/2^d for point particles), a derefined
-//! parent takes the sum of its children.  With <dust>/load_balance_octant_count a child gets the
+//! parent takes the sum of its children.  A child gets the
 //! clouds of its own octant of the parent, 3^d times those at the parent's level or coarser
 //! (they split) and once those already finer (they keep their level).  The old mesh (lloc_eachmb) is still in place when it is called.
 
@@ -1632,18 +1715,12 @@ void DustGasDrag::RegridCosts(const int *newtoold, const LogicalLocation *new_ll
     if (ln == lo) {
       c[n] = all(o);
     } else if (ln > lo) {
-      if (nc == 2*nleaf) {   // <dust>/load_balance_octant_count: the clouds of the child's octant
-        const LogicalLocation &l = new_lloc[n];
-        const int b = (pm->three_d ? ((l.lx3 & 1) << 2) : 0) | (pm->multi_d ? ((l.lx2 & 1) << 1) : 0) |
-                      (l.lx1 & 1);
-        c[n] = lb_old_counts[static_cast<size_t>(o)*nc + b] +
-               nsplit*lb_old_counts[static_cast<size_t>(o)*nc + nleaf + b];
-      } else {
-        // (cloud_split_max_level = L: a child above L gets its share of the clouds, which switch)
-        const bool above = cloud_split_max_level >= 0 &&
-                           ln - pm->root_level > cloud_split_max_level;
-        c[n] = all(o)*(above ? 1.0 : nsplit)/static_cast<double>(nleaf);
-      }
+      // the clouds of the child's octant (the octant counts)
+      const LogicalLocation &l = new_lloc[n];
+      const int b = (pm->three_d ? ((l.lx3 & 1) << 2) : 0) | (pm->multi_d ? ((l.lx2 & 1) << 1) : 0) |
+                    (l.lx1 & 1);
+      c[n] = lb_old_counts[static_cast<size_t>(o)*nc + b] +
+             nsplit*lb_old_counts[static_cast<size_t>(o)*nc + nleaf + b];
     } else {
       for (int k=0; k<nleaf && o + k < pm->nmb_total; ++k) c[n] += all(o + k);
     }
@@ -1751,6 +1828,10 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
       psbox_us->BuildBoundaryLists();
       psbox_us->AllocateBuffers();
     }
+    if (psbox_dc != nullptr) {   // (dc1: the same topology)
+      psbox_dc->BuildBoundaryLists();
+      psbox_dc->AllocateBuffers();
+    }
     auto pr = ppar->prtcl_rdata;
     if (npart > 0) {
       Kokkos::parallel_reduce("dust_oo_regrid_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
@@ -1777,6 +1858,10 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
   if (psbox_us != nullptr) {
     psbox_us->BuildBoundaryLists();
     psbox_us->AllocateBuffers();
+  }
+  if (psbox_dc != nullptr) {   // (dc1: the same topology)
+    psbox_dc->BuildBoundaryLists();
+    psbox_dc->AllocateBuffers();
   }
   // shear-periodic x1: the particle routing across the radial faces on the new mesh
   if (ppar->pbval_part->shear_periodic_x1) ppar->pbval_part->BuildShearMaps();
@@ -1807,67 +1892,13 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
     cloud_merge_burst_until = pmesh->time + cloud_merge_burst_dt;
   }
 
-  if (clouds3d) {   // the blocks and the weight check on the 3-D leaves
-    ResetBlocks3D("regrid", true, dwmax, msum);
-    laps.Lap("reset_blocks");
+  // the blocks and the weight check on the leaves (one path, ResetBlocksT)
+  if (cloud_dim == 3) {
+    ResetBlocksT(leaf_traversal3d, "regrid", true, dwmax, msum);
   } else {
-  const auto lt = leaf_traversal;   // the actual leaves
-  auto pr = ppar->prtcl_rdata;
-  auto pi = ppar->prtcl_idata;
-  auto &indcs = pmesh->mb_indcs;
-  const int ncell12 = (indcs.nx1 + 2*indcs.ng)*(indcs.nx2 + 2*indcs.ng);
-  const int gids = pmy_pack->gids;
-  int nbad = 0;
-  if (npart > 0) {
-    Kokkos::parallel_reduce("dust_amr_regrid", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p, Real &dw, int &bad, double &ms) {
-      SMRCompositeTransfer::WrapParticle(pr, p, lt.x1min, lt.x1max, lt.x2min, lt.x2max);
-      const Real xp = pr(IPX,p), yp = pr(IPY,p);
-      const int leaf = lt.LeafOwner(xp, yp, lt.Anchor(pi(PGID,p)));   // the old id: a guess only
-      const int owner = (leaf < 0) ? -1 : leaf/ncell12;
-      pi(PGID,p) = gids + owner;
-      Real sw = 0.0;
-      int b = (owner < 0 || owner >= nmb) ? 1 : 0;
-      lt.ForEachCloudWeight(xp, yp, pi(PLEV,p), lt.Anchor(pi(PGID,p)), [&](const int target, const Real w) {
-        sw += w;
-        if (target < 0 || target/ncell12 >= lt.nfld) ++b;   // halo blocks included
-      });
-      dw = Kokkos::fmax(dw, Kokkos::fabs(sw - 1.0));
-      bad += b;
-      ms += static_cast<double>(pr(IPM,p));
-    }, Kokkos::Max<Real>(dwmax), Kokkos::Sum<int>(nbad), Kokkos::Sum<double>(msum));
+    ResetBlocksT(leaf_traversal, "regrid", true, dwmax, msum);
   }
-  if (nbad > 0 || dwmax > 1.0e-10) {
-    // the first particles without an owning block or with a weight outside the blocks
-    DvceArray2D<Real> ex("dust_amr_bad", 8, 6);
-    DvceArray1D<int> nex("dust_amr_nbad", 1);
-    Kokkos::parallel_for("dust_amr_bad", Kokkos::RangePolicy<>(DevExeSpace(), 0, npart),
-    KOKKOS_LAMBDA(const int p) {
-      const Real xp = pr(IPX,p), yp = pr(IPY,p);
-      const int leaf = lt.LeafOwner(xp, yp, lt.Anchor(pi(PGID,p)));
-      int bad = (leaf < 0) ? 1 : 0, nout = 0;
-      lt.ForEachCloudWeight(xp, yp, pi(PLEV,p), lt.Anchor(pi(PGID,p)), [&](const int target, const Real) {
-        if (target < 0 || target/ncell12 >= lt.nfld) ++nout;
-      });
-      if (bad == 0 && nout == 0) return;
-      const int k = Kokkos::atomic_fetch_add(&nex(0), 1);
-      if (k >= 8) return;
-      ex(k, 0) = xp; ex(k, 1) = yp; ex(k, 2) = pi(PGID,p) - gids; ex(k, 3) = leaf;
-      ex(k, 4) = nout; ex(k, 5) = pi(PLEV,p);
-    });
-    auto exh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), ex);
-    auto nexh = Kokkos::create_mirror_view_and_copy(HostMemSpace(), nex);
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "dust after a regrid: " << nbad << " cloud weights outside the mesh blocks, "
-              << "largest |sum of weights - 1| = " << dwmax << "; first of " << nexh(0)
-              << " particles (x, y, block, owner leaf, weights outside, code):" << std::endl;
-    for (int k=0; k<std::min(8, nexh(0)); ++k) {
-      std::cout << "  " << exh(k, 0) << " " << exh(k, 1) << " " << exh(k, 2) << " " << exh(k, 3)
-                << " " << exh(k, 4) << " " << exh(k, 5) << std::endl;
-    }
-    std::exit(EXIT_FAILURE);
-  }
-  }   // 2-D
+  laps.Lap("reset_blocks");
   }   // refinable clouds
 
   // nothing but PGID may have changed since BeforeRegrid (several ranks: over all ranks; the
@@ -1892,7 +1923,7 @@ void DustGasDrag::RebuildAfterRegrid(Driver *pdrive, ParameterInput *pin) {
 
   laps.Lap("checksum");
   // the particle time step with the new cell sizes (the gas step is set by the caller)
-  (void) ComputeNewTimeStep(pdrive, pdrive->nexp_stages);
+  (void) NewTimeStep(pdrive, pdrive->nexp_stages);
   laps.Lap("dt");
 
   ++amr_regrids;

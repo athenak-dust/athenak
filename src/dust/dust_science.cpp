@@ -15,7 +15,7 @@
 //!        (DepositCloudDensity3D, the leaf traversal of the coupling; shear-periodic images,
 //!        physical x3 faces mirrored back);
 //!      refinable clouds, 2-D: the composite weights of the coupling on the
-//!        leaves (ForEachCompositeWeight), the halo parts added to their owners;
+//!        leaves (LeafTraversal::ForEachCloudWeight), the halo parts added to their owners;
 //!      point particles, 3-D: the coupling's stencil (<dust>/deposit) on the owner block, the
 //!        ghost parts remapped conservatively onto the leaves they overlap (DepRemapPlan:
 //!        uniform, instant_switch SMR / AMR, shear-periodic x1, physical x3 faces folded back);
@@ -91,7 +91,7 @@ void DustGasDrag::ScienceRepresentation(std::ostream &os) const {
        << "lobe 3: hat of half-width 2 ell\n";
     os << "cloud_support = lobe 0 [x_p - ell, x_p + ell], 1 [x_p - 2 ell, x_p + ell], "
        << "2 [x_p - ell, x_p + 2 ell], 3 [x_p - 2 ell, x_p + 2 ell]\n";
-    os << "cloud_max_level = " << smr_transfer.cloud_max_level << "\n";
+    os << "cloud_max_level = " << cloud_geometry.cloud_max_level << "\n";
     os << "cloud_dims = " << ndim << "  # directions with a cloud shape (a 2-D run has none "
        << "along x3)\n";
     os << "mesh_deposit = exact integral of the cloud shape over the active leaf cells "
@@ -163,17 +163,9 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
       UpdateShear3D(pm->time);
       const auto lt = leaf_traversal3d;
       auto ff = science_mass_;
-      Kokkos::parallel_for("dust_science_cloud3d_mass", Kokkos::RangePolicy<>(DevExeSpace(), 0, np),
-      KOKKOS_LAMBDA(const int p) {
-        if (species >= 0 && pi(PSP,p) != species) return;
-        const Real m = pr(IPM,p);
-        lt.ForEachCloudWeight(pr(IPX,p), pr(IPY,p), pr(IPZ,p), pi(PLEV,p), lt.Anchor(pi(PGID,p)),
-        [&](const int target, const Real w) {
-          int tb, tk, tj, ti;
-          lt.Decode(target, tb, tk, tj, ti);
-          DepositAdd(&ff(tb,0,tk,tj,ti), m*w/(lt.box(tb,3)*lt.box(tb,4)*lt.box(tb,5)));
-        });
-      });
+      // (written once, CloudFieldDepositT)
+      CloudFieldDepositT<LeafTraversal3D, false>("dust_science_cloud3d_mass", lt, pr, pi, np,
+                                                 species, false, 1, ff, CloudCodeSame());
       HaloReverseAdd(science_mass_, 0, 1);
     }
     auto f = mass_only ? science_mass_ : science_work_;
@@ -182,32 +174,16 @@ void DustGasDrag::DepositScienceFields(DvceArray5D<Real> &out, const bool audit,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
       for (int c=0; c<nc; ++c) o(m,c,k,j,i) = f(m,c,k,j,i);
     });
-  } else if (UsesCompositeTransfer()) {
+  } else if (UsesRefinableClouds()) {
     // ---- 2-D refinable clouds: composite weights on the leaves
-    const auto transfer = smr_transfer;
     const auto lt = leaf_traversal;
     const int ncb = nc1*nc2;
     const int nslot = (global_variable::nranks > 1) ? std::max(nmb, lt.nfld) : nmb;
     const int nc = mass_only ? 1 : 4;
     DvceArray2D<Real> f0("dust_science_leaf2d", nc, static_cast<std::size_t>(nslot)*ncb);
-    par_for("dust_science_composite2d", DevExeSpace(), 0, np-1, KOKKOS_LAMBDA(const int p) {
-      const Real mass = pr(IPM,p);
-      if (mass == 0.0) return;
-      if (species >= 0 && pi(PSP,p) != species) return;
-      const Real v1 = pr(IPVX,p), v2 = pr(IPVY,p), v3 = pr(IPVZ,p);
-      ForEachCompositeWeight(transfer, lt, pr(IPX,p), pr(IPY,p), pi(PLEV,p),
-                             lt.Anchor(pi(PGID,p)),
-      [&](const int target, const Real w) {
-        const int tm = target/ncb;
-        const Real area = lt.box(tm,2)*lt.box(tm,3);
-        const Real d = mass*w/area;
-        DepositAdd(&f0(0,target), d);
-        if (mass_only) return;
-        DepositAdd(&f0(1,target), d*v1);
-        DepositAdd(&f0(2,target), d*v2);
-        DepositAdd(&f0(3,target), d*v3);
-      });
-    });
+    // (written once, CloudFieldDepositT; massless slots skipped)
+    CloudFieldDepositT<LeafTraversal, false>("dust_science_composite2d", lt, pr, pi, np, species,
+                                             true, nc, f0, CloudCodeSame());
     HaloReverseAddFlat(f0, nc);   // several ranks: the halo parts to their owners
     par_for("dust_science_composite2d_copy", DevExeSpace(), 0, nmb-1, js, je, is, ie,
     KOKKOS_LAMBDA(int m, int j, int i) {

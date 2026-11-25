@@ -8,8 +8,8 @@
 //! \file dust.hpp
 //! \brief definitions for DustGasDrag class: Lagrangian dust particles coupled to a
 //! Hydro gas by stiff mutual drag.  The module supports the imex2+ IMEX(4,3,2) method
-//! (Krapp et al. 2024), plus an RK2 hybrid of resolved PC2 midpoint coupling and a stiff
-//! full-step split-BE fallback.  Both use the particle-mesh scatter/gather method of
+//! (Krapp et al. 2024) and the RK2 PC2 midpoint coupling (the hybrid with its split-BE
+//! fallback was retired).  Both use the particle-mesh scatter/gather method of  // retired-compat
 //! Yang & Johansen (2016) with exact momentum-conserving back-reaction (PMBR), and the
 //! O(N) closed-form per-cell drag solve of Benitez-Llambay, Krapp & Pessah (2019)
 //! generalized to per-particle stopping times.
@@ -69,12 +69,9 @@ enum class DustStoppingTimeMode {species_fixed=0, particle_static=1, dynamic=2};
 // `dc1` and `dc2` unconditionally accept one and two fixed defect corrections.
 enum class DustDragSolver {local=0, applya=1, dc1=2, dc2=3, pcg=4, adaptive=5};
 
-// Time coupling between the hydro RK update and particle drag. Input coupling=pc2 maps
-// to the hybrid task path with PC2 forced for every cycle. Input coupling=hybrid can use
-// PC2 while drag and feedback are resolved and split backward-Euler otherwise.
-enum class DustCoupling {imex=0, hybrid=1};
-enum class HybridMode {pc2=0, split_be=1};
-enum class HybridForceMode {automatic=0, pc2=1, split_be=2};
+// Time coupling between the hydro RK update and particle drag: imex (imex2+) or pc2 (rk2).  The
+// hybrid coupling with its automatic split backward-Euler was retired.  // retired-compat
+enum class DustCoupling {imex=0, pc2=1};
 
 // Experimental transfer choices on the narrowly supported static-SMR path. The
 // instant_switch choice is retained only as a negative control. refinable_cloud gives
@@ -96,18 +93,15 @@ enum class DustSMRTransfer {none=0, instant_switch=1, refinable_cloud=3};
 // A key given explicitly overrides its preset value (advanced use).
 enum class RefinableMode {standard, careful_merge, split_only};
 
-// Device-copyable description of the refinable-cloud transfer: the finest-level virtual grid
-// (and, with cloud_table, its map to the active leaves) and the 1-D cloud weights.
-struct SMRCompositeTransfer {
-  // Largest 1-D cloud stencil on the finest virtual grid: 2*2^(nlev-lev)+1 cells, so
-  // nine cells allow a root cloud to sit on leaves up to two levels finer.
-  static constexpr int kMaxCloudStencil = 9;
+// Device-copyable description of the refinable-cloud geometry: the finest-level virtual grid
+// (every MeshBlock aligns with it) and the 1-D cloud weights.
+struct CloudGeometry {
   static constexpr int kCloudWeightCache = 25;   // leaf weights a kernel keeps from its gather
 
   // Cloud code stored in PLEV: bits 0-3 the cloud level, bits 4-5 (x2) and 6-7 (x1) a
   // transition lobe (0 none, 1 lower, 2 upper, 3 both); bit 8 is set only on gather calls and
   // evaluates the leaf reconstructions at the particle along lobed directions.  A
-  // transition cloud (<dust>/cloud_transition) is the rigid union of a
+  // transition cloud (mode 2: lobed weights, point-valued reconstructions) is the rigid union of a
   // level-lev child and the unpaired edge child next to it: along a lobed direction
   // its shape is (2/3) S_ell(x - x_p) + (1/3) S_ell(x - x_p -/+ ell), the P1 (FEM)
   // transition hat with half-widths ell and 2 ell, peaked at the particle.
@@ -125,16 +119,11 @@ struct SMRCompositeTransfer {
   static int CloudLobe1(const int code) {return (code >> kCloudLobeShift1) & 3;}
   KOKKOS_INLINE_FUNCTION
   static int CloudLobe2(const int code) {return (code >> kCloudLobeShift2) & 3;}
-  // Code handed to gathers: transition=1 gathers with the plain child hat, transition=2
-  // with the lobed weights and the point value of each leaf's linear reconstruction.
+  // Code handed to gathers: the lobed weights and the point value of each leaf's linear
+  // reconstruction (the transition mode 2, the only one).
   KOKKOS_INLINE_FUNCTION
-  static int GatherCode(const int code, const int transition) {
-    if (transition == 1) return code & kCloudLevelMask;
-    if (transition == 2) return code | kCloudGatherPoint;
-    return code;
-  }
+  static int GatherCode(const int code) {return code | kCloudGatherPoint;}
 
-  bool cloud_table = false;            // cloud_target / cloud_level built
   int cloud_nlev = 0;                 // max_level - root_level
   int cloud_max_level = 0;            // clouds are never split beyond this level
   bool cloud_split_everywhere = false; // control: split regardless of the local mesh
@@ -142,8 +131,6 @@ struct SMRCompositeTransfer {
                                        // instead of once it lies entirely on them
   Real root_dx1 = 0.0, root_dx2 = 0.0;
   Real fine_dx1 = 0.0, fine_dx2 = 0.0;
-  DvceArray2D<int> cloud_target;      // finest virtual cell -> encoded active leaf
-  DvceArray2D<int> cloud_level;       // finest virtual cell -> owner level - root_level
   int ncoarse1 = 0, ncoarse2 = 0;     // root cells of the mesh
   int nfine1 = 0, nfine2 = 0;         // finest virtual cells
   Real x1min = 0.0, x1max = 0.0;
@@ -186,92 +173,12 @@ struct SMRCompositeTransfer {
     return (s <= 0.0) ? 0.5*SQR(1.0 + s) : 1.0 - 0.5*SQR(1.0 - s);
   }
 
-  // Exact 1-D integrals of a hat cloud of half-width ell centered at x over the
-  // consecutive virtual cells [i0, i0+count) of spacing dx.  Consecutive CDF
-  // differences telescope, so the weights sum to one for any cell partition.
-  // A nonzero lobe (1 lower, 2 upper) gives the transition shape
-  // (2/3) S_ell(x - x_p) + (1/3) S_ell(x - x_p -/+ ell) instead.
-  // Lobe 3 (both edge children attached, a parent left unsplit along this direction by
-  // the moving P1 split) is the hat of half-width 2 ell by the two-scale identity.
-  KOKKOS_INLINE_FUNCTION
-  static int CloudWeights1D(const Real x, const Real ell_in, const Real xmin, const Real dx,
-                            int &i0, Real w[kMaxCloudStencil], const int lobe_in = 0) {
-    const Real ell = (lobe_in == 3) ? 2.0*ell_in : ell_in;
-    const int lobe = (lobe_in == 3) ? 0 : lobe_in;
-    Real inv_ell = 1.0/ell;
-    Real sl = (lobe == 1) ? -ell : ell;
-    Real lo = (lobe == 1) ? x - 2.0*ell : x - ell;
-    Real hi = (lobe == 2) ? x + 2.0*ell : x + ell;
-    i0 = static_cast<int>(floor((lo - xmin)/dx));
-    int i1 = static_cast<int>(ceil((hi - xmin)/dx));
-    int count = i1 - i0;
-    if (count > kMaxCloudStencil) count = kMaxCloudStencil;
-    Real prev = HatCDF((xmin + i0*dx - x)*inv_ell);
-    Real prevl = lobe ? HatCDF((xmin + i0*dx - x - sl)*inv_ell) : 0.0;
-    for (int a=0; a<count; ++a) {
-      Real next = HatCDF((xmin + (i0 + a + 1)*dx - x)*inv_ell);
-      w[a] = next - prev;
-      prev = next;
-      if (lobe) {
-        Real nextl = HatCDF((xmin + (i0 + a + 1)*dx - x - sl)*inv_ell);
-        w[a] = (2.0/3.0)*w[a] + (1.0/3.0)*(nextl - prevl);
-        prevl = nextl;
-      }
-    }
-    return count;
-  }
-
   // Antiderivative of s*(1-|s|), the first moment of the unit hat, clamped outside
   // [-1,1] so that differences give the moment of the hat over any interval.
   KOKKOS_INLINE_FUNCTION
   static Real HatMoment(const Real s) {
     if (s <= -1.0 || s >= 1.0) return 1.0/6.0;
     return (s <= 0.0) ? 0.5*SQR(s) + SQR(s)*s/3.0 : 0.5*SQR(s) - SQR(s)*s/3.0;
-  }
-
-  // CloudWeights1D plus the first moment g[a] = int_cell S(x) (x - x_particle) dx of the
-  // unit-mass hat over each virtual cell (about the particle position, length units).
-  // With a lobe the moments are those of the transition shape about x_p; point=true
-  // (lobed directions of a cloud_transition=2 gather) returns zero moments, so that
-  // the gather takes the value of each leaf's reconstruction at the particle.
-  KOKKOS_INLINE_FUNCTION
-  static int CloudWeightsMoments1D(const Real x, const Real ell_in, const Real xmin,
-                                   const Real dx, int &i0, Real w[kMaxCloudStencil],
-                                   Real g[kMaxCloudStencil], const int lobe_in = 0,
-                                   const bool point = false) {
-    const bool both = (lobe_in == 3);
-    const Real ell = both ? 2.0*ell_in : ell_in;
-    const int lobe = both ? 0 : lobe_in;
-    Real inv_ell = 1.0/ell;
-    Real sl = (lobe == 1) ? -ell : ell;
-    Real lo = (lobe == 1) ? x - 2.0*ell : x - ell;
-    Real hi = (lobe == 2) ? x + 2.0*ell : x + ell;
-    i0 = static_cast<int>(floor((lo - xmin)/dx));
-    int i1 = static_cast<int>(ceil((hi - xmin)/dx));
-    int count = i1 - i0;
-    if (count > kMaxCloudStencil) count = kMaxCloudStencil;
-    Real s = (xmin + i0*dx - x)*inv_ell;
-    Real prev = HatCDF(s), gprev = HatMoment(s);
-    Real t = lobe ? (xmin + i0*dx - x - sl)*inv_ell : 0.0;
-    Real prevl = HatCDF(t), gprevl = HatMoment(t);
-    for (int a=0; a<count; ++a) {
-      s = (xmin + (i0 + a + 1)*dx - x)*inv_ell;
-      Real next = HatCDF(s), gnext = HatMoment(s);
-      w[a] = next - prev;
-      g[a] = (both && point) ? 0.0 : ell*(gnext - gprev);
-      prev = next;
-      gprev = gnext;
-      if (lobe) {
-        t = (xmin + (i0 + a + 1)*dx - x - sl)*inv_ell;
-        Real nextl = HatCDF(t), gnextl = HatMoment(t);
-        Real wl = nextl - prevl;
-        w[a] = (2.0/3.0)*w[a] + (1.0/3.0)*wl;
-        g[a] = point ? 0.0 : (2.0/3.0)*g[a] + (1.0/3.0)*(ell*(gnextl - gprevl) + sl*wl);
-        prevl = nextl;
-        gprevl = gnextl;
-      }
-    }
-    return count;
   }
 
   // Minimum-image displacement in a periodic direction.
@@ -292,135 +199,6 @@ struct SMRCompositeTransfer {
   Real CloudHalfWidth2(const int lev) const {
     return root_dx2/static_cast<Real>(1 << (lev & kCloudLevelMask));
   }
-
-  // Cloud-integrated weights on active leaves: the virtual finest cells overlapped by
-  // the support are integrated exactly and forwarded to their owning leaf, so a
-  // coarse leaf receives the sum of its sub-cell integrals (its own exact integral).
-  template <typename Function>
-  KOKKOS_INLINE_FUNCTION
-  void ForEachCloudWeight(const Real particle_x1, const Real particle_x2, const int lev,
-                          const Function &function) const {
-    Real x1 = WrapPosition(particle_x1, x1min, x1max);
-    Real x2 = WrapPosition(particle_x2, x2min, x2max);
-    int i0, j0;
-    Real w1[kMaxCloudStencil], w2[kMaxCloudStencil];
-    int n1 = CloudWeights1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1,
-                            CloudLobe1(lev));
-    int n2 = CloudWeights1D(x2, CloudHalfWidth2(lev), x2min, fine_dx2, j0, w2,
-                            CloudLobe2(lev));
-    for (int b=0; b<n2; ++b) {
-      if (w2[b] == 0.0) continue;
-      int fj = WrapIndex(j0 + b, nfine2);
-      for (int a=0; a<n1; ++a) {
-        Real w = w2[b]*w1[a];
-        if (w == 0.0) continue;
-        function(cloud_target(fj, WrapIndex(i0 + a, nfine1)), w);
-      }
-    }
-  }
-
-  // True when the support of a level-lev cloud, shrunk by slack*ell on each side, lies
-  // entirely on leaves finer than lev, i.e. the particle may be split.  With
-  // cloud_split_overlap it suffices that the shrunk support touches a finer leaf, so the
-  // finer leaves only ever see split clouds and the size transition sits on coarser cells.
-  KOKKOS_INLINE_FUNCTION
-  bool CloudInsideFiner(const Real particle_x1, const Real particle_x2, const int lev,
-                        const Real slack) const {
-    if (CloudLobe1(lev) || CloudLobe2(lev)) return false;   // transition clouds stay
-    if (lev >= cloud_nlev || lev >= cloud_max_level) return false;
-    if (cloud_split_everywhere) return true;
-    Real x1 = WrapPosition(particle_x1, x1min, x1max);
-    Real x2 = WrapPosition(particle_x2, x2min, x2max);
-    Real r1 = (1.0 - slack)*CloudHalfWidth1(lev);
-    Real r2 = (1.0 - slack)*CloudHalfWidth2(lev);
-    int ia = static_cast<int>(floor((x1 - r1 - x1min)/fine_dx1));
-    int ib = static_cast<int>(ceil((x1 + r1 - x1min)/fine_dx1)) - 1;
-    int ja = static_cast<int>(floor((x2 - r2 - x2min)/fine_dx2));
-    int jb = static_cast<int>(ceil((x2 + r2 - x2min)/fine_dx2)) - 1;
-    if (cloud_split_overlap) {
-      for (int fj=ja; fj<=jb; ++fj) {
-        int wj = WrapIndex(fj, nfine2);
-        for (int fi=ia; fi<=ib; ++fi) {
-          if (cloud_level(wj, WrapIndex(fi, nfine1)) > lev) return true;
-        }
-      }
-      return false;
-    }
-    for (int fj=ja; fj<=jb; ++fj) {
-      int wj = WrapIndex(fj, nfine2);
-      for (int fi=ia; fi<=ib; ++fi) {
-        if (cloud_level(wj, WrapIndex(fi, nfine1)) <= lev) return false;
-      }
-    }
-    return true;
-  }
-
-  // Cloud traversal that also hands the callback the first moments of the cloud over
-  // the virtual cell about the particle position: function(target, w, m1x, m1y).  A
-  // gather of a linearly reconstructed leaf field u_c + s.(x - x_c) is then
-  // sum(w*u_c + (m1x + (x_p - x_c)*w)*s_x + (m1y + (y_p - y_c)*w)*s_y), exact for a
-  // linear field and second-order accurate for any cloud/leaf size combination.
-  template <typename Function>
-  KOKKOS_INLINE_FUNCTION
-  void ForEachCloudMoment(const Real particle_x1, const Real particle_x2, const int lev,
-                          const Function &function) const {
-    Real x1 = WrapPosition(particle_x1, x1min, x1max);
-    Real x2 = WrapPosition(particle_x2, x2min, x2max);
-    int i0, j0;
-    Real w1[kMaxCloudStencil], w2[kMaxCloudStencil];
-    Real g1[kMaxCloudStencil], g2[kMaxCloudStencil];
-    bool point = (lev & kCloudGatherPoint) != 0;
-    bool point1 = point, point2 = point;
-    int n1 = CloudWeightsMoments1D(x1, CloudHalfWidth1(lev), x1min, fine_dx1, i0, w1, g1,
-                                   CloudLobe1(lev), point1);
-    int n2 = CloudWeightsMoments1D(x2, CloudHalfWidth2(lev), x2min, fine_dx2, j0, w2, g2,
-                                   CloudLobe2(lev), point2);
-    for (int b=0; b<n2; ++b) {
-      if (w2[b] == 0.0 && g2[b] == 0.0) continue;
-      int fj = WrapIndex(j0 + b, nfine2);
-      for (int a=0; a<n1; ++a) {
-        Real w = w2[b]*w1[a];
-        Real m1x = w2[b]*g1[a];
-        Real m1y = w1[a]*g2[b];
-        if (w == 0.0 && m1x == 0.0 && m1y == 0.0) continue;
-        function(cloud_target(fj, WrapIndex(i0 + a, nfine1)), w, m1x, m1y);
-      }
-    }
-  }
-
-  // True if any finest virtual cell under the support of a level-lev cloud belongs to
-  // a leaf finer than lev (the cloud overlaps a finer region, split or not).
-  KOKKOS_INLINE_FUNCTION
-  bool CloudOverlapsFiner(const Real particle_x1, const Real particle_x2,
-                          const int code) const {
-    const int lev = CloudLevel(code);
-    if (lev >= cloud_nlev) return false;
-    Real x1 = WrapPosition(particle_x1, x1min, x1max);
-    Real x2 = WrapPosition(particle_x2, x2min, x2max);
-    Real r1 = CloudHalfWidth1(lev), r2 = CloudHalfWidth2(lev);
-    int ia = static_cast<int>(floor((x1 - r1 - x1min)/fine_dx1));
-    int ib = static_cast<int>(ceil((x1 + r1 - x1min)/fine_dx1)) - 1;
-    int ja = static_cast<int>(floor((x2 - r2 - x2min)/fine_dx2));
-    int jb = static_cast<int>(ceil((x2 + r2 - x2min)/fine_dx2)) - 1;
-    for (int fj=ja; fj<=jb; ++fj) {
-      int wj = WrapIndex(fj, nfine2);
-      for (int fi=ia; fi<=ib; ++fi) {
-        if (cloud_level(wj, WrapIndex(fi, nfine1)) > lev) return true;
-      }
-    }
-    return false;
-  }
-
-  // Encoded active leaf that owns a (wrapped) position; used to assign PGID to
-  // particles created by a split or a merge.
-  KOKKOS_INLINE_FUNCTION
-  int LeafOwner(const Real particle_x1, const Real particle_x2) const {
-    Real x1 = WrapPosition(particle_x1, x1min, x1max);
-    Real x2 = WrapPosition(particle_x2, x2min, x2max);
-    int fi = WrapIndex(static_cast<int>(floor((x1 - x1min)/fine_dx1)), nfine1);
-    int fj = WrapIndex(static_cast<int>(floor((x2 - x2min)/fine_dx2)), nfine2);
-    return cloud_target(fj, fi);
-  }
 };
 
 //----------------------------------------------------------------------------------------
@@ -430,7 +208,7 @@ struct SMRCompositeTransfer {
 //! mass of level lcap) as a plain level-lcap cloud; every other code as it is.
 KOKKOS_INLINE_FUNCTION
 int TriggerCloudCode(const int code, const int lcap) {
-  return ((code & ~SMRCompositeTransfer::kCloudLevelMask) == 0 && code > lcap) ? lcap : code;
+  return ((code & ~CloudGeometry::kCloudLevelMask) == 0 && code > lcap) ? lcap : code;
 }
 
 //----------------------------------------------------------------------------------------
@@ -442,26 +220,94 @@ int TriggerCloudCode(const int code, const int lcap) {
 //! value in kernels.
 
 struct ResampleCapTable {
-  static constexpr int kLevels = SMRCompositeTransfer::kCloudLevelMask + 1;
+  static constexpr int kLevels = CloudGeometry::kCloudLevelMask + 1;
   Real f[kLevels];
   KOKKOS_INLINE_FUNCTION
   Real Cap(const Real m0, const int lev) const {
-    const Real g = f[lev & SMRCompositeTransfer::kCloudLevelMask];
+    const Real g = f[lev & CloudGeometry::kCloudLevelMask];
     return (g > 0.0) ? g*m0 : 1.0e300;
   }
 };
 
 //----------------------------------------------------------------------------------------
+//! \struct CloudShape1D
+//! The shape of a refinable cloud along one direction and its integrals over a cell between two
+//! faces (weight and first moment), the integrals of the hat CDF (CloudGeometry::HatCDF, HatMoment)
+//! evaluated at arbitrary faces.  Shared by the 2-D LeafTraversal and the 3-D LeafTraversal3D (both
+//! reach it as LeafTraversal::MakeShape / FaceAt / Cell, LeafTraversal derives from it); moved out
+//! of LeafTraversal unchanged.
+
+struct CloudShape1D {
+  // the cloud shape along one direction
+  struct Shape {
+    Real x = 0.0, ell = 1.0, inv = 1.0, sl = 0.0, lo = 0.0, hi = 0.0;
+    int lobe = 0;
+    bool both = false, point = false;
+  };
+  KOKKOS_INLINE_FUNCTION
+  static Shape MakeShape(const Real x, const Real ell_in, const Real inv_in, const int lobe_in,
+                         const bool point) {
+    Shape s;
+    s.both = (lobe_in == 3);
+    s.ell = s.both ? 2.0*ell_in : ell_in;
+    s.lobe = s.both ? 0 : lobe_in;
+    s.sl = (s.lobe == 1) ? -s.ell : s.ell;
+    s.lo = (s.lobe == 1) ? x - 2.0*s.ell : x - s.ell;
+    s.hi = (s.lobe == 2) ? x + 2.0*s.ell : x + s.ell;
+    s.x = x;
+    s.point = point;
+    s.inv = s.both ? 0.5*inv_in : inv_in;   // = 1/ell (powers of two: exact)
+    return s;
+  }
+  // the shape's cumulative values at a face z of one direction: the hat CDF of the plain part
+  // and of the lobe, and (kMoments) their first-moment antiderivatives.  A cell takes the
+  // differences of its two faces, so a run of cells evaluates each face once.
+  struct Face {Real c = 0.0, cl = 0.0, h = 0.0, hl = 0.0;};
+  template <bool kMoments>
+  KOKKOS_INLINE_FUNCTION
+  static Face FaceAt(const Shape &s, const Real z) {
+    using T = CloudGeometry;
+    Face f;
+    const Real sz = (z - s.x)*s.inv;
+    f.c = T::HatCDF(sz);
+    if constexpr (kMoments) f.h = T::HatMoment(sz);
+    if (s.lobe) {
+      const Real tz = (z - s.x - s.sl)*s.inv;
+      f.cl = T::HatCDF(tz);
+      if constexpr (kMoments) f.hl = T::HatMoment(tz);
+    }
+    return f;
+  }
+  // weight and (kMoments) first moment (about the particle, length units) over the cell
+  // between the faces a and b
+  template <bool kMoments>
+  KOKKOS_INLINE_FUNCTION
+  static void Cell(const Shape &s, const Face &a, const Face &b, Real &w, Real &g) {
+    w = b.c - a.c;
+    g = 0.0;
+    if constexpr (kMoments) g = (s.both && s.point) ? 0.0 : s.ell*(b.h - a.h);
+    if (s.lobe) {
+      const Real wl = b.cl - a.cl;
+      w = (2.0/3.0)*w + (1.0/3.0)*wl;
+      if constexpr (kMoments) {
+        g = s.point ? 0.0 : (2.0/3.0)*g + (1.0/3.0)*(s.ell*(b.hl - a.hl) + s.sl*wl);
+      }
+    }
+  }
+
+};
+
+//----------------------------------------------------------------------------------------
 //! \struct LeafTraversal
 //! Block-local traversal of the actual leaves under a
-//! refinable cloud, without the global virtual finest grid of SMRCompositeTransfer.
+//! refinable cloud, without the global virtual finest grid of CloudGeometry.
 //!
 //! Each MeshBlock knows its box, its level and its adjacent MeshBlocks (from the AthenaK
 //! neighbor table, every distinct neighbor once, with the periodic shift that puts it next
 //! to the block).  A cloud owned by block m is integrated exactly over every leaf cell of m
 //! and of its neighbors that its support overlaps: per direction the integral of the cloud
 //! shape over the leaf interval is a difference of the hat CDF (and of its first moment),
-//! the formulas of SMRCompositeTransfer::CloudWeightsMoments1D evaluated at the leaf faces
+//! the integrals of the hat CDF (CloudGeometry::HatCDF, HatMoment) evaluated at the leaf faces
 //! instead of the faces of the virtual finest cells.  The integral over a leaf is the sum of
 //! the integrals over its finest sub-cells, so the weights and first moments equal those of
 //! the table up to round-off; lobes, gather codes and the point rule are handled as there.
@@ -473,7 +319,7 @@ struct ResampleCapTable {
 //! DustHalo), [nfld, nall) every other block of the mesh (geometry only, for the eligibility
 //! queries that leave the neighborhood and for Locate).  One rank: nfld = nall = nmb.
 
-struct LeafTraversal {
+struct LeafTraversal : CloudShape1D {
   static constexpr int kMaxNb = 16;    // distinct neighbors of a 2-D block (12 at most)
   int nmb = 0, gids = 0;
   int nfld = 0, nall = 0;              // slots with leaf fields (local + halo), all slots
@@ -519,63 +365,6 @@ struct LeafTraversal {
     while (w < xmin) w += l;
     while (w >= xmax) w -= l;
     return w;
-  }
-
-  // the cloud shape along one direction (SMRCompositeTransfer::CloudWeightsMoments1D)
-  struct Shape {
-    Real x = 0.0, ell = 1.0, inv = 1.0, sl = 0.0, lo = 0.0, hi = 0.0;
-    int lobe = 0;
-    bool both = false, point = false;
-  };
-  KOKKOS_INLINE_FUNCTION
-  static Shape MakeShape(const Real x, const Real ell_in, const Real inv_in, const int lobe_in,
-                         const bool point) {
-    Shape s;
-    s.both = (lobe_in == 3);
-    s.ell = s.both ? 2.0*ell_in : ell_in;
-    s.lobe = s.both ? 0 : lobe_in;
-    s.sl = (s.lobe == 1) ? -s.ell : s.ell;
-    s.lo = (s.lobe == 1) ? x - 2.0*s.ell : x - s.ell;
-    s.hi = (s.lobe == 2) ? x + 2.0*s.ell : x + s.ell;
-    s.x = x;
-    s.point = point;
-    s.inv = s.both ? 0.5*inv_in : inv_in;   // = 1/ell (powers of two: exact)
-    return s;
-  }
-  // the shape's cumulative values at a face z of one direction: the hat CDF of the plain part
-  // and of the lobe, and (kMoments) their first-moment antiderivatives.  A cell takes the
-  // differences of its two faces, so a run of cells evaluates each face once.
-  struct Face {Real c = 0.0, cl = 0.0, h = 0.0, hl = 0.0;};
-  template <bool kMoments>
-  KOKKOS_INLINE_FUNCTION
-  static Face FaceAt(const Shape &s, const Real z) {
-    using T = SMRCompositeTransfer;
-    Face f;
-    const Real sz = (z - s.x)*s.inv;
-    f.c = T::HatCDF(sz);
-    if constexpr (kMoments) f.h = T::HatMoment(sz);
-    if (s.lobe) {
-      const Real tz = (z - s.x - s.sl)*s.inv;
-      f.cl = T::HatCDF(tz);
-      if constexpr (kMoments) f.hl = T::HatMoment(tz);
-    }
-    return f;
-  }
-  // weight and (kMoments) first moment (about the particle, length units) over the cell
-  // between the faces a and b
-  template <bool kMoments>
-  KOKKOS_INLINE_FUNCTION
-  static void Cell(const Shape &s, const Face &a, const Face &b, Real &w, Real &g) {
-    w = b.c - a.c;
-    g = 0.0;
-    if constexpr (kMoments) g = (s.both && s.point) ? 0.0 : s.ell*(b.h - a.h);
-    if (s.lobe) {
-      const Real wl = b.cl - a.cl;
-      w = (2.0/3.0)*w + (1.0/3.0)*wl;
-      if constexpr (kMoments) {
-        g = s.point ? 0.0 : (2.0/3.0)*g + (1.0/3.0)*(s.ell*(b.hl - a.hl) + s.sl*wl);
-      }
-    }
   }
 
   // ---- candidate blocks ----------------------------------------------------------------
@@ -764,7 +553,7 @@ struct LeafTraversal {
   KOKKOS_INLINE_FUNCTION
   Real ForEach(const Real px1, const Real px2, const int code, const int m,
                const Function &function, bool *reach = nullptr) const {
-    using T = SMRCompositeTransfer;
+    using T = CloudGeometry;
     Real x1 = px1, x2 = px2;
     Frame(m, x1, x2);
     const int lev = T::CloudLevel(code);
@@ -941,11 +730,13 @@ struct LeafTraversal {
     if (!g && m < nmb && lev + 1 > nbmax(m) && ia <= ib && ja <= jb) return false;
     return Covered(m, ia, ib, ja, jb, lev + 1, r, g);
   }
-  // SMRCompositeTransfer::CloudInsideFiner on the actual leaves (anchor block m)
+  // the split's test on the actual leaves (anchor block m): true when the support of a
+  // level-lev cloud, shrunk by slack*ell on each side, lies entirely on leaves finer than lev
+  // (split_overlap: touches a finer leaf), i.e. the particle may be split
   KOKKOS_INLINE_FUNCTION
   bool InsideFiner(const Real px1, const Real px2, const int code, const Real slack, const int m,
                    bool *reach = nullptr) const {
-    using T = SMRCompositeTransfer;
+    using T = CloudGeometry;
     if (reach != nullptr) *reach = true;
     if (T::CloudLobe1(code) || T::CloudLobe2(code)) return false;
     const int lev = code & T::kCloudLevelMask;
@@ -962,12 +753,12 @@ struct LeafTraversal {
     return split_overlap ? AnyAbove(m, ia, ib, ja, jb, lev, reach)
                          : AllAbove(m, ia, ib, ja, jb, lev, reach);
   }
-  // SMRCompositeTransfer::CloudOverlapsFiner on the actual leaves
+  // true if a leaf finer than the cloud's level lies under its support (split or not)
   KOKKOS_INLINE_FUNCTION
   bool OverlapsFiner(const Real px1, const Real px2, const int code, const int m,
                      bool *reach = nullptr) const {
     if (reach != nullptr) *reach = true;
-    const int lev = SMRCompositeTransfer::CloudLevel(code);
+    const int lev = CloudGeometry::CloudLevel(code);
     if (lev >= nlev) return false;
     Real x1 = px1, x2 = px2;
     Frame(m, x1, x2);
@@ -978,7 +769,7 @@ struct LeafTraversal {
     const int jb = static_cast<int>(ceil((x2 + r2 - x2min)/fine_dx2)) - 1;
     return AnyAbove(m, ia, ib, ja, jb, lev, reach);
   }
-  // the merge-cell mask of MergeCloudsDevice: the level-L cell holding (x1, x2) and the B
+  // the merge-cell mask of G (MergeQuantumT): the level-L cell holding (x1, x2) and the B
   // cells around it carry no dilated level above L
   KOKKOS_INLINE_FUNCTION
   bool MergeOK(const Real px1, const Real px2, const int L, const int B, const int m,
@@ -992,7 +783,7 @@ struct LeafTraversal {
     return !AnyAbove(m, (I - B)*r, (I + B + 1)*r - 1, (J - B)*r, (J + B + 1)*r - 1, L, reach);
   }
 
-  // ---- the cloud interface of SMRCompositeTransfer on the actual
+  // ---- the cloud interface of CloudGeometry on the actual
   // leaves, with the anchor block m of the cloud (its particle's MeshBlock; a new cloud of a
   // split or merge takes its parent's).  The results do not depend on the anchor; a good
   // anchor only keeps the queries local.
@@ -1000,11 +791,11 @@ struct LeafTraversal {
   // set again after a regrid) gives block 0, and the queries then fall back to all blocks
   KOKKOS_INLINE_FUNCTION
   Real CloudHalfWidth1(const int lev) const {
-    return root_dx1/static_cast<Real>(1 << (lev & SMRCompositeTransfer::kCloudLevelMask));
+    return root_dx1/static_cast<Real>(1 << (lev & CloudGeometry::kCloudLevelMask));
   }
   KOKKOS_INLINE_FUNCTION
   Real CloudHalfWidth2(const int lev) const {
-    return root_dx2/static_cast<Real>(1 << (lev & SMRCompositeTransfer::kCloudLevelMask));
+    return root_dx2/static_cast<Real>(1 << (lev & CloudGeometry::kCloudLevelMask));
   }
   KOKKOS_INLINE_FUNCTION
   int Anchor(const int pgid) const {
@@ -1077,8 +868,7 @@ inline bool LogEmpty(std::FILE *fp) {
 //! peer rank p (ascending), the cells of this rank's blocks sent to it, scell[soff[p] ..
 //! soff[p+1]), and the cells of the halo slots received from it, rcell[roff[p] .. roff[p+1]),
 //! as flat leaf indices (block slot, j, i); the blocks in ascending gid, each block's cells
-//! row by row over its rectangle (the whole block, or with <dust>/cloud_halo_strips the
-//! part that the clouds of the receiving rank can reach).  One rank: no peers.
+//! row by row over its rectangle (the part that the clouds of the receiving rank can reach).  One rank: no peers.
 struct DustHalo {
   int nx1 = 0, nx2 = 0, is = 0, js = 0, ncells1 = 0, ncells2 = 0;
   // 3-D clouds: flat leaf index ((slot ncells3 + k) ncells2 + j) ncells1 + i; 2-D:
@@ -1104,16 +894,6 @@ struct DustHalo {
   bool comm_set = false;
 #endif
 };
-
-// the weights of a particle on the composite transfer: refinable clouds
-// on the actual leaves (anchor block m)
-template <typename Function>
-KOKKOS_INLINE_FUNCTION
-void ForEachCompositeWeight(const SMRCompositeTransfer &t, const LeafTraversal &lt,
-                            const Real x1, const Real x2, const int code, const int m,
-                            const Function &function) {
-  lt.ForEachCloudWeight(x1, x2, code, m, function);
-}
 
 //----------------------------------------------------------------------------------------
 //! \struct DustGasDragTaskIDs
@@ -1185,9 +965,8 @@ struct DustGasDragTaskIDs {
   TaskID p_newgid, p_cnt, p_irecv, p_sendp, p_recvp;
   TaskID scat, sendd, recvd, solve, sendus, recvus, sendus_shr, recvus_shr;
   TaskID gkp, sendbr, recvbr, apply;
-  TaskID p2_newgid, p2_cnt, p2_irecv, p2_sendp, p2_recvp;
   TaskID h_sendu_oa, h_recvu_oa, h_restu, h_sendu, h_recvu, h_sendu_shr, h_recvu_shr;
-  TaskID h_bcs, h_prol, h_c2p, h_newdt, newdt, newdt2;
+  TaskID h_bcs, h_prol, h_c2p, h_newdt, newdt;
   // "after_stagen" tasks
   TaskID h_csend, h_crecv, p_csend, p_crecv, cleard;
 };
@@ -1254,6 +1033,10 @@ void DepositAddWarp(Real *dst, const std::size_t stride, const int key, Real (&v
   for (int c=0; c<N; ++c) DepositAdd(dst + c*stride, v[c]);
 }
 
+// one compile-time interface over the two traversals (LeafApi; after DepositAdd and
+// DepositAddWarp, which it calls)
+#include "dust_leaf_api.hpp"
+
 // Tried and not adopted: splitting each of the two production cloud kernels into a gather
 // kernel and a deposit kernel that forms the leaf weights again (fewer registers per kernel)
 // was slower on GPUs; keeping the 25-entry leaf-weight cache in team scratch
@@ -1263,8 +1046,8 @@ void DepositAddWarp(Real *dst, const std::size_t stride, const int key, Real (&v
 // The cloud kernels over particles 0..n-1 with a launch bound: 0 none, 1 <256, 2> (at most
 // 128 registers, default), 2 <128, 3> (at most 168), 3 <256, 3> (at most
 // 85); occupancy against spills.  A compile-time choice, -DDUST_CLOUD_LAUNCH_BOUNDS=n (a
-// run-time choice would compile all four variants of every cloud kernel); the key
-// <dust>/cloud_launch_bounds is accepted only with the compiled value (dust.cpp)
+// run-time choice would compile all four variants of every cloud kernel; the key
+// <dust>/cloud_launch_bounds retired)
 #ifndef DUST_CLOUD_LAUNCH_BOUNDS
 #define DUST_CLOUD_LAUNCH_BOUNDS 1
 #endif
@@ -1286,7 +1069,7 @@ void CloudParFor(const std::string &name, const int n, const Function &f) {
 
 // cloud_order_interval: the same kernels over the particles in the order of an
 // index (ord(k) for k < nidx, k itself for the particles appended since the index was built).
-// The index is a permutation of 0..nidx-1; with nidx > n (cloud_order_keep: the migration of
+// The index is a permutation of 0..nidx-1; with nidx > n (the index kept after a migration of
 // the stage left fewer particles than the index holds) its slots past the end are skipped, so
 // every particle 0..n-1 still runs once
 template <typename Function>
@@ -1353,14 +1136,6 @@ class DustGasDrag {
   DustStoppingTimeMode stopping_time_mode;
   DustDragSolver drag_solver;
   DustCoupling coupling;
-  HybridMode hybrid_mode;
-  HybridForceMode hybrid_force_mode;
-  Real hybrid_enter_zeta, hybrid_enter_chi;
-  Real hybrid_exit_zeta, hybrid_exit_chi;
-  Real hybrid_last_zeta = 0.0;
-  Real hybrid_last_chi = 0.0;
-  Real hybrid_feedback_rate_max = 0.0;
-  bool hybrid_have_metric = false;
   // the PC2 feedback stiffness (after Bai 2010 §2.4 and Athena-C)
   // chi = dt max_cells sum_p w m_p/(t_s,p V rho_g) (= Bai's chi when t_s >= dt), from the stage-1
   // predictor deposit qdep[4], computed when the damping, the dt limit or the particle history
@@ -1387,16 +1162,13 @@ class DustGasDrag {
   Kokkos::View<Real, DevMemSpace> stiff_rate_dev;
   DvceArray1D<Real> stiff_diag_dev;
   void SyncStiffness();
-  unsigned long long hybrid_pc2_cycles = 0;
-  unsigned long long hybrid_split_be_cycles = 0;
   DustSMRTransfer smr_transfer_mode = DustSMRTransfer::none;
-  SMRCompositeTransfer smr_transfer;
+  CloudGeometry cloud_geometry;
   // refinable-cloud controls and counters (SplitAndMergeClouds)
-  Real cloud_split_slack = 0.02;      // support test shrinks the cloud by this fraction
-  int cloud_gather_order = 1;         // 2: gather a linear reconstruction of the leaves
-  int cloud_transition = 0;           // P1 transition clouds at split edges:
-                                      // 1 gathers with the child hat, 2 with the lobed
-                                      // weights and point-valued reconstructions
+  // the constants of the retired keys: the support test shrinks the cloud by this
+  // fraction; the P1 transition clouds at split edges gather with the lobed weights and
+  // point-valued reconstructions (the former cloud_transition = 2, the only mode)
+  static constexpr Real cloud_split_slack = 0.02;
   // the particle identity: an unsigned 64-bit tag (words PTAG, PTAGH)
   std::uint64_t cloud_next_tag = 0;   // next tag this rank issues (stride: the number of ranks)
   bool cloud_next_tag_set = false;    // ... once set (EnsureNextTag, or a restart file)
@@ -1408,7 +1180,7 @@ class DustGasDrag {
   std::uint64_t IssuedTagBound() const;   // collective: above every tag issued so far
   // moving-particle P1 split: edge children
                                       // separate only where the neighbor parent splits,
-                                      // no merging (requires cloud_transition > 0); the
+                                      // no merging (with the transition clouds); the
                                       // only split scheme
   bool cloud_merge = false;           // coarsening: far from finer
                                       // leaves, release lobes and merge fine clouds that are
@@ -1419,14 +1191,15 @@ class DustGasDrag {
   Real cloud_merge_alpha = 0.2;       // residual velocity tolerance alpha*H/tau_c,
                                       // tau_c = min(t_s, 1/Omega)
   int cloud_merge_interval = 10;      // cycles between coarsening passes
-  Real cloud_merge_min_mass = 0.5;    // a merge commits only with >= this fraction of m_ref
-  bool cloud_merge_device = false;  // run MergeClouds on the device
+  static constexpr Real cloud_merge_min_mass = 0.5;   // a merge commits only with >= this
+                                                     // fraction of m_ref (constant)
   // merge passes on a physical-time schedule (cloud_merge_schedule = time,
   // cloud_merge_dt_omega) instead of every cloud_merge_interval cycles, and a burst of passes
   // every cloud_merge_burst_interval cycles for cloud_merge_burst_dt_omega / omega0 after each
   // regrid that deleted blocks
   bool cloud_merge_by_time = false;
-  Real cloud_merge_dt = 0.0, cloud_merge_t0 = 0.0;
+  Real cloud_merge_dt = 0.0;
+  static constexpr Real cloud_merge_t0 = 0.0;   // origin of the planned times (constant)
   long long cloud_merge_next = -1;
   Real cloud_merge_burst_dt = 0.0, cloud_merge_burst_until = -1.0;
   int cloud_merge_burst_interval = 50;
@@ -1451,20 +1224,15 @@ class DustGasDrag {
   long long amr_event_handled = 0, amr_event_merged = 0;
   int amr_regrid_nnew = 0, amr_regrid_ndel = 0;  // of the regrid in progress (BeforeRegrid)
   void HandleRegridEvent(const bool merge_due, const bool split_r = false);
-  bool cloud_merge_nc = true;         // merge-side node convention
-  int cloud_merge_lobe_wait = 0;      // a center waits while an unreleased lobed cloud is near
-                                      // 1: reach H + ell, 2: reach per lobe direction
   std::vector<Real> cloud_merge_mroot; // per species: root-level cloud mass (set on first pass)
-  // quantum mode: stage X exact P1-stencil re-merge, stage G mass-quantum grouping
+  // the quantum pass: stage X exact P1-stencil re-merge, stage G mass-quantum grouping
   // (cross-level)
-  int cloud_merge_mode = 0;           // 0 tent, 1 quantum
   bool cloud_merge_stencil = true;    // quantum: stage X on
   Real cloud_merge_stencil_tol = 0.02;  // stage X offset tolerance (units of the piece half-width)
-  Real cloud_merge_smax = 1.0;        // stage G group position extent (units of the target cell)
-  int cloud_merge_K = 4;              // open groups per cell walk (1..8)
-  bool cloud_merge_exact_ts = true;   // merged clouds keep the common ts of their members
-  bool cloud_merge_xprotect = false;   // stage X's waiting candidates are not
-                                       // walked by G in the same pass
+  // stage G group position extent (units of the target cell), open
+  // groups per cell walk; merged clouds keep the common ts of their members
+  static constexpr Real cloud_merge_smax = 1.0;
+  static constexpr int cloud_merge_K = 4;
   Real cloud_merge_budget = -1.0;      // > 0, one budget of leaf mass / momentum
   // > 0, the budget of a leaf is min(beta, kappa s), s the largest dust
   // density difference to its four neighbor leaves relative to its own (structure-relative); 0 = off
@@ -1474,16 +1242,12 @@ class DustGasDrag {
   RefinableMode refinable_mode = RefinableMode::standard;
   std::string refinable_given;
   void PrintRefinablePreset() const;
-                                       // change for the whole pass (stage G; X with budget_x)
-  Real cloud_absorb_floor = 0.1;       // ... with the leaf mass floored at this fraction of a
-                                       // root cloud mass per root-cell volume (the name is
-                                       // from the absorption budget)
-  int cloud_merge_budget_evals = 4;    // ... evaluations per stage before the rest is rejected
-  bool cloud_merge_budget_x = false;   // stage X is also decided by the pass budget
-  // test option: 3-D G budget by thinning instead of rejecting every group on a
-  // violating leaf: a group survives a violating leaf when its hash u in [0, 1) is below
-  // 0.9/(change/budget) of that leaf; the last evaluation round uses the strict rule
-  bool cloud_merge_budget_thin = false;
+                                       // change for the whole pass (stage G)
+  static constexpr Real cloud_absorb_floor = 0.1;  // ... with the leaf mass floored at this
+                                       // fraction of a root cloud mass per root-cell volume (the
+                                       // name is from the absorption budget; constant)
+  static constexpr int cloud_merge_budget_evals = 4;   // ... evaluations per stage before the
+                                                       //     rest is rejected (constant)
   bool cloud_resample = false;         // conservative same-level resampling
   int cloud_resample_interval = 625;   // ... cycles between resamplings
   Real cloud_resample_eta = 2.0;       // ... base eta of the mass cap (<= 0: no cap)
@@ -1497,14 +1261,16 @@ class DustGasDrag {
   // spans at most alpha H / tau over the patch (H its cell size, tau = min(ts, 1/omega)); 0 = off
   Real cloud_resample_cold_alpha = 0.0;
   unsigned long long cloud_resample_cold_skips = 0;   // clouds kept out as cold (cumulative)
-  int cloud_resample_patch = 2;        // ... patches inside one MeshBlock, of
+  static constexpr int cloud_resample_patch = 2;   // ... patches inside one MeshBlock, of
                                        //     this many root cells per side on the root level
-  int cloud_resample_patch_cells = 4;  // ... at most this many cells of the block per side
+  static constexpr int cloud_resample_patch_cells = 4;  // ... at most this many cells of the
+                                                        //     block per side
   int cloud_resample_patch_split = 1024;   // ... a patch (or quadrant) with more pool
                                       //     clouds is split into quadrants, down to cells (0: never)
-  int cloud_resample_patch_max = 4096;   // ... (3-D) a patch with more pool clouds (a crowded
-                                         //     cell) is solved as sub-patches of at most this many
-  long long cloud_resample_batch_pairs = 1LL << 30;   // ... (3-D) the patches of a rank in batches of
+  static constexpr int cloud_resample_patch_max = 4096;   // ... (3-D) a patch with more pool
+                                         //     clouds (a crowded cell) is solved as sub-patches of
+                                         //     at most this many (constant)
+  long long cloud_resample_batch_pairs = 1LL << 28;   // ... (3-D) the patches of a rank in batches of
                                          //     about this many (cloud, leaf) pairs (32-bit tables;
                                          //     a larger patch is a batch of its own)
   int cloud_resample_threads = 1;      // ... host threads of the patch loop
@@ -1517,21 +1283,19 @@ class DustGasDrag {
   bool cloud_resample_xv_audit = false;   // ... (3-D) one line per R pass: changes of J about the
                                       //     COM, per-patch moments and leaf mass / momentum
   bool cloud_resample_device = true;   // ... the patch solves on the device (default)
-  bool cloud_resample_qr_rows = true;  // ... row-parallel QR update on the device
-                                       //     (matches the host only to round-off)
+  // (the device QR update shares the rows: matches the host only to round-off; the column-by-
+  // column reference is the build with -DDUST_R_QR_COLUMNS=1, dust_resample.hpp)
   int cloud_resample_device_mem_mb = 2048;  // ... workspace limit of the device solves
-  int cloud_resample_device_mid = 0;   // ... patches of 65..mid clouds in a middle
-  int cloud_resample_device_mid_team = 128;   //     bucket with teams of this many threads (0: off)
   int cloud_resample_device_wide_team = 512;  // ... large-bucket team (1024: a 1024-thread kernel)
   bool cloud_resample_tag_order = false;   // ... pool in PTAG order (else array order)
-  bool cloud_resample_pos_order = false;   // ... pool in position order instead
   Real cloud_resample_m0 = -1.0;       // ... root cloud mass (<= 0: the merge pass's value)
   unsigned long long cloud_resample_pass = 0, cloud_resample_removed = 0;
   // resampling at planned physical times t0 + k dt instead of every N cycles
   bool cloud_resample_by_time = false;      // <dust>/cloud_resample_schedule = time
   Real cloud_resample_dt = 0.0;             // ... interval in code time (cloud_resample_dt, or
                                             //     cloud_resample_dt_omega / <shearing_box>/omega0)
-  Real cloud_resample_t0 = 0.0;             // ... time origin of the planned times
+  static constexpr Real cloud_resample_t0 = 0.0;   // ... time origin of the planned times
+                                                   //     (constant)
   Real cloud_resample_omega = 0.0;          // ... <shearing_box>/omega0 (0 without a shearing box)
   bool cloud_resample_schedule_reset = false;  // ... a restart may change the origin / interval
   long long cloud_resample_next = -1;       // ... number of the next event (-1: set at the first check)
@@ -1545,8 +1309,7 @@ class DustGasDrag {
                                       // left to stage X
   int cloud_merge_pass = 0;           // pass counter (walk rotation)
   unsigned long long cloud_coarsen_events = 0, cloud_coarsen_in = 0;
-  unsigned long long cloud_coarsen_reject = 0, cloud_far_release = 0;
-  Real cloud_coarsen_dk_grad = 0.0, cloud_coarsen_dk_res = 0.0;
+  unsigned long long cloud_coarsen_reject = 0, cloud_far_release = 0;  // retired-compat
   int cloud_split_buffer = 0;         // refined dust region reaches this many next-coarser
                                       // cells beyond the refined gas
   DvceArray1D<int> split_np, split_off;  // device split work arrays, kept between cycles
@@ -1564,7 +1327,6 @@ class DustGasDrag {
   // (BuildRefinableCloudTransfer)
   bool trigger_leaf_kernel = true;
   unsigned long long cloud_instant_switch_count = 0;   // level changes made by CloudInstantSwitch
-  bool cloud_split_device = false;    // P1 split on the device; false: the host split
   // The split budget (off by default) and the resampling right after a split (on by default
   // with R); 3-D refinable clouds only.  cloud_split_budget > 0: one rank's
   // split pass takes its events (parent splits and lobe releases) in particle index order while
@@ -1582,12 +1344,12 @@ class DustGasDrag {
   // ranks:
   // the blocks of the parents and the blocks the pieces landed in (also across a
   // shear-periodic x1 face, and several blocks away after a hold) (not when the scheduled global
-  // R falls on that cycle).  Default clouds3d && cloud_resample (written to the parameters; off
+  // R falls on that cycle).  Default cloud_dim == 3 && cloud_resample (written to the parameters; off
   // whenever R is off).  It fires on large splits only: a new level opening, a restart of a
   // file with capped cloud levels.
   int cloud_split_budget = 0;
   bool cloud_split_resample = false;
-  Real cloud_split_resample_frac = 0.05;
+  static constexpr Real cloud_split_resample_frac = 0.05;   // (constant)
   DvceArray1D<int> split_blk;         // block slots of this cycle's split events (local and
                                       // halo slots): bit 0 parent, bit 1 a piece landed there
   bool split_blk_mark = false;        // the split marks split_blk (cloud_split_resample)
@@ -1612,51 +1374,13 @@ class DustGasDrag {
   // stage-2 midpoint gas velocity seen by the dust is formed from the prescribed states
   // at t and t+dt, and the gas is reset to the prescribed state at the end of each step.
   std::function<void(Real, DvceArray5D<Real>&)> prescribed_gas;
-  // Diagnostic analytic gather (<problem>/analytic_gather of streaming_linear): the PC2
-  // midpoint gas velocity seen by each particle is replaced by the analytic eigenmode at
-  // t+dt/2 and the predicted midpoint position, with the response of the
-  // cloud_transition = 2 gather: the hat transform sinc^2(k ell/2) along plain
-  // directions (cloud integral), the point value along lobed ones; point_all
-  // (<problem>/analytic_gather_point) takes the point value for every cloud instead, so
-  // that all cloud shapes see the same field; centroid_lobes
-  // (<problem>/analytic_gather_centroid) samples a lobed direction at the mass centroid
-  // of the lobed shape (node -/+ ell/3) instead of the node.  Plain data so that the
-  // advance kernel can capture it.
-  struct AnalyticGather {
-    bool on = false;
-    bool point_all = false;
-    bool centroid_lobes = false;
-    Real kx = 0.0, kz = 0.0, srate = 0.0, wrate = 0.0;
-    Real ux0 = 0.0, up0 = 0.0;          // background velocity (x1 radial, x3 azimuthal)
-    Real uxr = 0.0, uxi = 0.0, uzr = 0.0, uzi = 0.0, upr = 0.0, upi = 0.0;
-  };
-  AnalyticGather analytic_gather;
   unsigned long long cloud_split_event = 0;
   // cloud_merge_count: coincident children merged by an older split scheme (removed);
   // stays 0, kept in the restart record and the summary line
   unsigned long long cloud_split_count = 0, cloud_merge_count = 0;
   unsigned long long cloud_lobe_split_count = 0;
-  // the switching metric (the cell feedback stiffness, its reduction and the
-  // stiffness deposit in qdep[4]) is read only by the automatic PC2 / split-BE switch
-  bool NeedsHybridMetric() const {
-    return coupling == DustCoupling::hybrid && hybrid_force_mode == HybridForceMode::automatic;
-  }
-  // with a fixed mode the cached metric (from a restart written by
-  // an automatic run, say) is marked invalid, so that a later automatic run never starts from it
-  void InvalidateHybridMetric() {
-    hybrid_have_metric = false;
-    hybrid_feedback_rate_max = 0.0;
-    hybrid_last_zeta = 0.0;
-    hybrid_last_chi = 0.0;
-  }
-  bool UsesCompositeTransfer() const {
+  bool UsesRefinableClouds() const {
     return smr_transfer_mode == DustSMRTransfer::refinable_cloud;
-  }
-  // u* is exchanged into the ghost cells for the TSC gather and for the linear cloud gather
-  // (central differences); the piecewise-constant composite gathers read leaf cells only
-  bool UstarGhosts() const {
-    return !UsesCompositeTransfer() ||
-           (smr_transfer_mode == DustSMRTransfer::refinable_cloud && cloud_gather_order == 2);
   }
   Real drag_rtol, drag_atol;
   int drag_iter_max, drag_diagnostic_interval;
@@ -1708,8 +1432,7 @@ class DustGasDrag {
   void AssembleDustGasDragTasks(std::map<std::string, std::shared_ptr<TaskList>> tl);
   // dust tasks are dormant on the trivial assembly stage of imex2+ (beta=0, gam0=1)
   bool ActiveStage(Driver *pdrive, int stage) const;
-  bool FirstMigrationActive(Driver *pdrive, int stage) const;
-  bool SecondMigrationActive(Driver *pdrive, int stage) const;
+  bool MigrationActive(Driver *pdrive, int stage) const;
   Real DragStep(Driver *pdrive) const;
   // default particle mass/species/stopping-time initialization (pgen may override)
   void SetDefaultMasses(ParameterInput *pin);
@@ -1725,13 +1448,12 @@ class DustGasDrag {
   // particles), a derefined parent takes the sum of its children).
   Real lb_cloud_weight = 4.0;   // default 4
   std::vector<float> lb_old_counts;   // lb_ncount values per old block
-  // <dust>/load_balance_octant_count (default true): count the clouds of every old block per octant,
+  // (always) count the clouds of every old block per octant,
   // separately those finer than the block (they keep their level in a child) and those that split
   // (refinable clouds at the block level or coarser), so a child of a refined block gets the clouds of
   // its own octant, 3^d times those that split, instead of 3^d/2^d of all its parent's clouds (most
   // clouds of a dense block that refines are already finer and do not split)
-  bool lb_octant_count = true;
-  int lb_ncount = 1;   // counts per old block in lb_old_counts: 1, or 2 * 2^d with octant counts
+  int lb_ncount = 1;   // counts per old block in lb_old_counts: 2 * 2^d (the octant counts)
   // <dust>/load_balance_log = K > 0 (diagnostic): after every regrid the blocks, cost and estimated
   // clouds of every rank (LogRegridBalance), and every K cycles the actual clouds and blocks of
   // every rank (LogRankClouds); rank 0 prints
@@ -1775,7 +1497,27 @@ class DustGasDrag {
   // native restart (dust_restart.cpp): the records of what changes during
   // a run and cannot be rebuilt from the particles
   void PackRestartState(std::vector<char> &b) const;
-  void UnpackRestartState(const char *p, std::size_t nbytes);
+  // own_section: the records of this rank's own section (same ranks and blocks); false (records
+  // of section 0 on another layout): the per-rank cell-order index is not decoded
+  void UnpackRestartState(const char *p, std::size_t nbytes, const bool own_section);
+  // the cell-order index of the cloud kernels (cloud_ord) in the restart file, optional
+  // records after the required ones (dust_restart.cpp, dust_restart_order.hpp): appended while
+  // the dust state stays within `limit` bytes, else left out (status omitted); collective,
+  // returns whether this rank left it out
+  bool PackRestartOrder(std::vector<char> &b, const std::size_t limit);
+  // what UnpackRestartState found (pointers into the section buffer, valid until
+  // ApplyRestartOrder, which UnpackParticleRestart calls while it holds that buffer)
+  bool rst_ord_info = false, rst_ord_info_bad = false;
+  int rst_ord_seen[3] = {0, 0, 0};   // times cloud_ord_n, cloud_ord, cloud_ord_tag occurred
+  std::int32_t rst_ord_status = 0, rst_ord_n = 0, rst_ord_sort_cycle = -1;
+  const char *rst_ord_p = nullptr, *rst_ord_tag_p = nullptr;
+  std::size_t rst_ord_bytes = 0, rst_ord_tag_bytes = 0;
+  void ApplyRestartOrder(const bool exact);   // collective
+  // hidden <dust>/test_cloud_ord_budget = bytes: a smaller limit of the dust state than
+  // kDustStateMaxBytes for the cell-order records (tests of the omitted path); read only when
+  // given (no entry in the parameter dump otherwise).  A given value is kept in the restart
+  // header like any key: a continuation removes it with dust/test_cloud_ord_budget=-1
+  std::int64_t test_cloud_ord_budget = -1;
   // the resolved species table of the input (record species_table); a restart
   // compares the file's record with it and stops on any difference
   std::string species_record;
@@ -1786,18 +1528,17 @@ class DustGasDrag {
   // kernel of level L (TriggerCloudCode); f as DepositCloudDensity3D, the density component
   void DepositTriggerDensityCapped3D(DvceArray5D<Real> &f);
   int SplitCloudsP1();         // moving-particle P1 split
-  int SplitCloudsP1Device();   // device P1 split without the diagnostics
   TaskStatus RefineClouds(Driver *pdrive, int stage);
   // remove the particles that left through an outflow x3 face (zero mass), log
   TaskStatus RemoveOutflowParticles(Driver *pdrive, int stage);
   // the end of the u* ghost fill: coarse x3 boundary values, prolongation, fine x3
   // boundary values (physical x3 faces)
   void FinishUstarGhosts();
+  void FinishUstarGhosts(DvceArray5D<Real> &f, DvceArray5D<Real> &cf, MeshBoundaryValuesCC *pb);
   void UstarX3BCs(DvceArray5D<Real> &a, const bool coarse);
   double x3_outflow_mass = 0.0;    // cumulative over the run (this rank)
   long long x3_outflow_count = 0;
   int MergeClouds();
-  int MergeCloudsDevice();    // device version of MergeClouds
   int ResampleClouds(const bool local = false);   // returns the number of clouds removed;
                               // local: only clouds anchored in blocks new since the
                               // regrid and their neighbors
@@ -1814,8 +1555,12 @@ class DustGasDrag {
   // (dust_cloud3d.cpp)
   LeafTraversal3D leaf_traversal3d;
   DvceArray5D<Real> gpack3;
-  bool clouds3d = false;               // refinable clouds on a 3-D mesh (set by the constructor)
-  bool Clouds3D() const {return clouds3d;}
+  // the dimension of the refinable clouds' traversal: 3 for refinable clouds on a 3-D mesh
+  // (LeafTraversal3D), 2 for refinable clouds on a 2-D mesh (LeafTraversal), 0 without refinable
+  // clouds (point particles; set by the constructor).  The code tests cloud_dim == 3 or != 3 only,
+  // so 0 and 2 take the same branches.
+  int cloud_dim = 0;
+  bool Clouds3D() const {return cloud_dim == 3;}
   // 3-D clouds in a shearing box with shear-periodic x1; the shear
   // neighbors of LeafTraversal3D for the shear
   // offset at a time (UpdateShear3D: rebuilt when the offset changes), from the finest-cell boxes
@@ -1825,23 +1570,23 @@ class DustGasDrag {
   // the same for point particles (instant_switch, uniform / static / AMR) in a 3-D shearing
   // box, <dust>/shear_route_time (default true; false = AthenaK's time).  ShearRouteTime: the time
   // whose shear offset a particle crossing an x1 face at this migration needs (the end of the step
-  // for PC2 / hybrid; for imex the stages still to come move it with the sheared x, see dust.cpp);
+  // for PC2; for imex the stages still to come move it with the sheared x, see dust.cpp);
   // ShiftShearCrossings adds the difference to the offset of pm->time used by the routing
   bool shear_route_point = false;
   Real ShearRouteTime(Driver *pdrive, int stage) const;
   void ShiftShearCrossings(const Real tau);
   bool shear3d_lists_ok_ = false;
-  // <dust>/cloud_shear_list_cache keeps the shear neighbor
+  // (always) the cache keeps the shear neighbor
   // lists while ysh / fine_dx2 stays in one unit interval [k, k + 1) (lists built for the whole
   // interval: a superset, the traversal filters by the current ysh); shear3d_key_ = k
-  bool shear3d_list_cache = false;
   double shear3d_key_ = 0.0;
   unsigned long long shear3d_rebuilds = 0, shear3d_updates = 0;
   std::vector<std::array<int, 6>> shear3d_fbox_;
   std::vector<int> shear3d_face_[2], shear3d_reach_;
   void UpdateShear3D(const Real time);
   void BuildLeafTraversal3D();
-  int SplitCloudsP1Device3D();
+  template <class LTT>
+  int SplitCloudsP1DeviceT(const LTT &lt);   // (dust_cloud3d.cpp)
   // <dust>/cloud_split_velocity (dust_split_velocity.cpp): the velocities of the pieces of a
   // device P1 split or lobe release.  parent (0, the default): every piece keeps the parent's
   // velocity.  mesh_gradient (1): v_parent + G d, G the mean-flow velocity gradient fitted to the
@@ -1849,7 +1594,7 @@ class DustGasDrag {
   // deposit is single-stream (residual dispersion <= cloud_split_dispersion_max times the
   // velocity change of G over the parent's half-width); the parent's velocity otherwise.
   int cloud_split_velocity = 0;
-  Real cloud_split_dispersion_max = 0.5;
+  static constexpr Real cloud_split_dispersion_max = 0.5;   // (constant)
   bool cloud_split_velocity_check = false;   // diagnostic: momentum of every event's pieces
   DvceArray5D<Real> split_mom;        // deposited moments (slot, nc*species, k, j, i)
   DvceArray2D<Real> split_vgrad;      // per event (row tagoff(p)): G (9), v_parent (3), mass
@@ -1867,28 +1612,25 @@ class DustGasDrag {
   void ReadSplitVelocityKeys(ParameterInput *pin);
   bool SplitVelocityPrepare(const int nrows);   // collective (several ranks); true: offsets
   bool CheckSplitVelocityReach();   // collective: CheckHaloReach incl. the fit's retry support
-  void DepositSplitMoments();
-  void DepositSplitMoments3D();
-  void SplitVelocityGradient(const int npart);
-  void SplitVelocityGradient3D(const int npart);
+  // (the moments, the fit and the piece bound's statistics written once)
+  template <class LTT>
+  void DepositSplitMomentsT(const LTT &lt);
+  template <class LTT>
+  void SplitVelocityGradientT(const LTT &lt, const int npart);
+  template <class LTT>
+  void SplitGradientBoundFitT(const LTT &lt, const int npart);
   void SplitVelocityCheck(const int npart, const int nnew);
   void SplitVelocitySummary();
   Kokkos::View<unsigned long long*, DevMemSpace> split_vel_cnt;   // device counters of the fit
   // the bound on the mesh_gradient pieces (dust_split_velocity.cpp / .hpp): 1 range (default with
   // mesh_gradient: no piece leaves the range of its support cells' mean velocities, widened by
-  // split_gb_margin = 0.5 times its span and extended to the parent's; G scaled uniformly), 0 none
-  // (hidden test_split_gradient_bound = none: as before the bound), 2 count (test: the parent's
-  // velocity unless test_split_gradient_nmin clouds per support cell or on the fit-weighted mean,
-  // test_split_gradient_count = cell | mean; refused with physical x3 faces);
-  // test_split_gradient_diag: per-call statistics
+  // kSplitGBMargin = 0.5 times its span and extended to the parent's; G scaled uniformly), 0 none
+  // (hidden test_split_gradient_bound = none: as before the bound; the count rule, mode 2, and the
+  // span form retired); test_split_gradient_diag: per-call statistics
   int split_gb_mode = 0;
-  int split_gb_nmin = 8;
-  int split_gb_count_mean = 0;
-  Real split_gb_margin = 0.5;    // test_split_gradient_range_margin (fraction of the range)
-  int split_gb_kind = 0;         // test_split_gradient_range_kind = box (0) | span (1)
   bool split_gb_diag = false;    // test_split_gradient_diag
   bool split_gb_full = false, split_gb_stats = false, split_gb_fill = false;   // (see the keys)
-  bool split_gb_counts = false;  // the per-cell cloud counts (count rule, diag; periodic x3 only)
+  bool split_gb_counts = false;  // the per-cell cloud counts (diag; periodic x3 only)
   int split_gb_ucol = 14, split_gb_acol = 20;   // row columns: the range, the fit's support
   DvceArray1D<int> split_sep;    // (the bound) the count pass's separation flags per particle
   Real split_gb_rsmp = 3.0;      // test_split_gradient_sample_r: samples of events with R above
@@ -1901,22 +1643,22 @@ class DustGasDrag {
   unsigned long long split_gb_tot[64] = {};   // the counters summed over the calls (kGCNum)
   double split_gb_totmax[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
   void SplitGradientBoundReport();
-  void SplitGradientBoundFit3D(const int npart);   // the statistics kernels after the fit
-  void SplitGradientBoundFit(const int npart);
   void PackGatherField3D(const DvceArray5D<Real> &vel);
   void PackGasGather3D(const DvceArray5D<Real> &u);
-  void CloudPredictor3D(const bool rate_dep);
-  void CloudAdvance3D();
+  template <class LTT>
+  void CloudPredictorT(const LTT &lt, const bool rate_dep);   // (dust_cloud3d.cpp)
+  template <class LTT>
+  void CloudAdvanceT(const LTT &lt);
   Real CloudImplicitTime3D(Driver *pdrive, int stage) const;
   // consistent gas / dust split of the lumped IMEX solve's residual (3-D clouds)
   void CloudImplicitConsistency3D(Driver *pdrive, int stage);
   bool imex_consistent_gas = true;
   DvceArray5D<Real> imex_resid;
   // hidden key <dust>/test_imex_residual_to_center_upto_nominal (default true): for 3-D
-  // refinable clouds with coupling = imex, back-reaction, imex_consistent_gas and
-  // cloud_transition = 2 the three parts below, always together (false, or any other set-up: none
+  // refinable clouds with coupling = imex, back-reaction and imex_consistent_gas
+  // the three parts below, always together (false, or any other set-up: none
   // of them).
-  bool imex_res_want = false;    // the key is on and the set-up fits (but for cloud_transition)
+  bool imex_res_want = false;    // the key is on and the set-up fits
   // (1) center rule: the dust share of a leaf cell's residual goes to the clouds whose center lies
   // in that cell, in proportion to m_p c_p (the rule of the point path), instead of to every cloud
   // that overlaps the cell with its weight
@@ -1953,13 +1695,77 @@ class DustGasDrag {
   void DtDiag(const Real dt, const Real dt_hydro, const Real dt_grav, const Real dt_part);
   // IMEX stages see the gas in its t^n orbital-advection frame (the remap runs at the end
   // of the last stage): a particle at the lab stage position (x, y) meets the gas stored at
-  // y + ImplicitShearShift*x (0 outside the 3-D shearing box and for the hybrid paths)
+  // y + ImplicitShearShift*x (0 outside the 3-D shearing box and for PC2)
   Real ImplicitShearShift(Driver *pdrive, int stage) const {
     if (!is_shearing_box || !pmy_pack->pmesh->three_d || coupling != DustCoupling::imex) return 0.0;
     return qshear*omega0*(CloudImplicitTime3D(pdrive, stage) - pmy_pack->pmesh->time);
   }
-  void CloudDepositImplicit3D(Driver *pdrive, int stage);
+  // (dust_imex3d.cpp) the IMEX deposit and the plain gather-kick on either traversal
+  template <class LTT>
+  void CloudDepositImplicitT(const LTT &lt, Driver *pdrive, int stage);
+  template <class LTT>
+  void CloudGatherKickT(const LTT &lt, const DvceArray5D<Real> &gpk, const Real a_dt, const Real sh,
+                        const char *label);
   void CloudGatherImplicit3D(Driver *pdrive, int stage);
+  // drag_solver = dc1 / dc2 for 3-D refinable clouds (the default with coupling = imex;
+  // dust_imex3d_dc.cpp): with back-reaction they correct the
+  // lumped solve's u* once / twice before its exchange and gather: x1 = x0 + (rho + Q)^-1
+  // (M + P - rho x0 - D M G x0), with G the clouds' u* gather of the kick and D the deposit
+  // of its impulse (the same operators).  The dt-dependent gather blend is off on this path,
+  // in A and in the kick; the center rule and its floor stay in the consistent gas split.
+  bool cloud_dc1 = false;
+  bool solver_given_ = false;   // drag_solver given (input or rst), not the default of this run
+  // the origin of a given drag_solver (input, or the default stored in the restart file) and
+  // whether dc1 is the default of this configuration (the NOTEs on the solver; dust.cpp)
+  std::string solver_src_ = "the default of this run";
+  bool solver_default_dc1_ = false;
+  void NoteLocalNotDefault() const;
+  int cloud_dc_sweeps = 1;       // 1: dc1, 2: dc2
+  bool cloud_dc1_opcheck = false;   // test_cloud_dc1_opcheck: the operator-consistency test
+  // (D M G x of the correction goes to dmom, free at that point of the stage)
+  // <dust>/amr_profile: exchange, pack, operator kernel, reverse add,
+  double dc_prof_t_[5] = {0.0};
+  long long dc_prof_n_[5] = {0};  // correction (fenced seconds and calls, this rank)
+  DvceArray5D<Real> dc_cfield;   // coarse buffer of the blocking u* exchange
+  MeshBoundaryValuesCC *pbval_dc = nullptr;   // blocking u* exchange (own communicator)
+  ShearingBoxCC *psbox_dc = nullptr;          // ... its shear-periodic x1 part
+  // the operator check: second field, its coarse buffer, gathers and results of both paths,
+  // the particle velocities and rates before the gather
+  DvceArray5D<Real> dc_tfield, dc_tcfield, dc_res_a, dc_res_b;
+  DvceArray2D<Real> dc_gath_a, dc_gath_b, dc_psave;
+  void EnsureCloudDcField(DvceArray5D<Real> &f, const int nslot_min);
+  void ExchangeUstarBlocking(DvceArray5D<Real> &field, DvceArray5D<Real> &cfield);
+  // the operator of the correction, D M G field, 2-D and 3-D clouds (dust_imex3d_dc.cpp;
+  // one function, CloudCoupledOperatorT; no gather blend; own_weights: 2-D, the
+  // deposit with ForEachCloudWeight of the cloud's level instead of the kept gather weights, for
+  // the operator check)
+  void CloudCoupledOperator(Driver *pdrive, int stage, DvceArray5D<Real> &field,
+                            DvceArray5D<Real> &result, DvceArray2D<Real> *gath,
+                            const bool own_weights);
+  template <class LTT>
+  void CloudCoupledOperatorT(Driver *pdrive, int stage, DvceArray5D<Real> &field,
+                             DvceArray5D<Real> &result, DvceArray2D<Real> *gath,
+                             const bool own_weights);
+  void CloudDefectCorrection(Driver *pdrive, int stage);   // 2-D and 3-D clouds
+  // the consistent gas / dust split of the IMEX residual by the overlap weights
+  // (imex_consistent_gas; 2-D clouds, and 3-D clouds without the center rule; dust_imex3d.cpp),
+  // and the 2-D part of the operator check (dust_cloud2d_dc.cpp)
+  template <class LTT>
+  void CloudImplicitConsistencyOverlapT(const LTT &lt, Driver *pdrive, int stage);
+  void CloudDcOpCheck2D(Driver *pdrive, int stage);
+  // (slot, 3, k, j, i): r of the overlap split, 2-D and 3-D (halo slots forwarded)
+  DvceArray5D<Real> cloud_res_ovl;
+  DvceArray5D<Real> dc_res_c;      // the operator check: result with the clouds' own weights
+  long long dc_cnt2d_[2] = {0, 0};  // the operator check: nt > cache (same shape), lobed
+  // hidden <dust>/test_qrho_diag = N: the Q/rho line every N cycles (dust_dtdiag.cpp)
+  int qrho_diag_ = 0;
+  void QrhoDiag(Driver *pdrive, int stage);
+  void CloudDcOpCheckPoison();
+  void CloudDcOpCheckBefore(Driver *pdrive, int stage);
+  void CloudDcOpCheckAfterKick(Driver *pdrive, int stage);
+  void CloudDcOpCheckDmom(Driver *pdrive, int stage);
+  void CloudDcSkipCheck(Driver *pdrive, int stage);   // the floor's overlap-skip, by a full gather
+  Real dc_check_[8] = {0.0};     // the operator check of the stage (max differences)
   // density_only: component 0 alone (the density trigger; components 1-3 stay zero)
   void DepositCloudDensity3D(DvceArray5D<Real> &f, const int species = -1,
                              const bool density_only = false);
@@ -2034,12 +1840,32 @@ class DustGasDrag {
   std::uint64_t gravity_mass_epoch = 0;
   void CheckClouds3D();   // checks the restrictions of the 3-D clouds
   void WrapParticles3D();
-  int ResetBlocks3D(const char *when, const bool check, Real &dwmax, double &msum);
-  void FrameToBlock3D(const Real tpos);         // tpos: the time of the positions
-  bool CheckHaloReach3D(const char *when);
-  int RouteToOwnerBlocks3D(const char *when, const int first = 0);   // particles first..
-  int MergeCloudsDevice3D();   // (dust_cloud_device.cpp)
+  // (dust_amr.cpp) the block bookkeeping written once on the traversal interface
+  // (LeafApi); WrapParticles: every position into the domain (2-D: x1, x2 periodic; 3-D:
+  // WrapParticles3D); ResetBlocksT: PGID from the positions on one rank (and, check, the weight
+  // sums of the regrid); RouteToOwnerBlocksT: PGID and the particle exchange on several ranks
+  void WrapParticles();
+  template <class LTT>
+  int ResetBlocksT(const LTT &lt, const char *when, const bool check, Real &dwmax, double &msum);
+  template <class LTT>
+  int RouteToOwnerBlocksT(const LTT &lt, const char *when, const int first);
+  template <class LTT>
+  void FrameToBlockT(const LTT &lt, const Real tpos);   // (dust_cloud.cpp)
+  template <class LTT>
+  bool CheckHaloReachT(const LTT &lt, const char *when);   // (dust_cloud.cpp)
+  // the merge pass's far-field release written once (dust_cloud_device.cpp; MMT the
+  // traversal's merge mask)
+  template <class LTT, class MMT>
+  int ReleaseFarLobesT(const LTT &lt, const MMT &mm, const int ncell);
+  // the quantum merge pass written once, both traversals (dust_cloud_device.cpp;
+  // MergeClouds calls it)
+  template <class LTT>
+  int MergeQuantumT(const LTT &lt);
   int ResampleClouds3D(const bool local);   // (dust_resample.cpp)
+  // one resampling pass written once, both traversals (dust_resample.cpp;
+  // ResampleClouds and ResampleClouds3D call it)
+  template <class LTT>
+  int ResampleCloudsT(const LTT &lt, const bool local);
   // timing diagnostic: storage order of the particles
   int cloud_sort_interval = 0;        // reorder every this many cycles (0: never)
   // <dust>/point_sort_interval: point particles (no refinable clouds) reordered by
@@ -2048,7 +1874,6 @@ class DustGasDrag {
   unsigned long long point_sort_count = 0;
   double point_sort_seconds = 0.0;
   bool cloud_sort_random = false;     // diagnostic: a random permutation instead
-  bool cloud_merge_position_order = false;   // diagnostic: G walk takes pieces by position
   DvceArray2D<Real> sort_spare_r;     // the arrays the reordered particles are written to
   DvceArray2D<int> sort_spare_i;
   void SortParticles();
@@ -2061,15 +1886,12 @@ class DustGasDrag {
   int cloud_ord_n = 0;
   unsigned long long cloud_ord_builds = 0;
   void UpdateCloudOrder();
-  // cloud_order_keep (default true): the kernels keep the index when the
-  // migration of the stage left fewer particles than it holds (they skip its slots past the end);
-  // false: they run in storage order then (the old rule; only the 3-D IMEX and the gravity cloud
-  // kernels check it, the 2-D PC2 kernels always use the index)
-  bool cloud_order_keep = false;
+  // the kernels keep the index when the migration of the stage left fewer particles than it
+  // holds (they skip its slots past the end; always, the former cloud_order_keep)
   // the index length the cloud kernels use for npart particles (0: storage order); counts
   // the launches in and out of the index order
   int CloudOrderLength(const int npart) {
-    const bool use = cloud_ord_n > 0 && (cloud_ord_n <= npart || cloud_order_keep);
+    const bool use = cloud_ord_n > 0;
     ++(use ? cloud_ord_used : cloud_ord_fallback);
     return use ? cloud_ord_n : 0;
   }
@@ -2123,7 +1945,7 @@ class DustGasDrag {
   // (HaloReach), the widenings found by CheckHaloReach (kept until the mesh changes), and the
   // furthest a support may extend beyond each block
   int cloud_halo_coarser = -1;         // test: levels a cloud may be coarser than its block (-1: auto)
-  bool cloud_halo_strips = true;       // exchange only the reachable cells of each block
+  // (always) the halo exchanges only the reachable cells of each block
   std::vector<std::int64_t> halo_need_, halo_reach_, halo_allow_;
   int halo_need_seq_ = -1;
   DvceArray1D<std::int64_t> halo_allow_d_;
@@ -2146,7 +1968,6 @@ class DustGasDrag {
   void HaloReverseAddFlat(DvceArray2D<Real> &f, const int nc);
   void HaloForwardFlags(DvceArray1D<int> &f);
   void HaloReverseAddFlags(DvceArray1D<int> &f);
-  void RequireCloudTable(const char *what) const;   // fatal without the table
   void EnsureRootCloudMass();          // cloud_merge_mroot once (merge pass, resampling caps)
 
   // ...in "before_timeintegrator" list
@@ -2164,17 +1985,11 @@ class DustGasDrag {
   TaskStatus InitParticleRecv(Driver *pdrive, int stage);
   TaskStatus SendParticles(Driver *pdrive, int stage);
   TaskStatus RecvParticles(Driver *pdrive, int stage);
-  TaskStatus UpdateParticleGIDs2(Driver *pdrive, int stage);
-  TaskStatus CountParticleSends2(Driver *pdrive, int stage);
-  TaskStatus InitParticleRecv2(Driver *pdrive, int stage);
-  TaskStatus SendParticles2(Driver *pdrive, int stage);
-  TaskStatus RecvParticles2(Driver *pdrive, int stage);
   TaskStatus AddDragHistoryGas(Driver *pdrive, int stage); // u0 += a_twid*dt*R_g
   TaskStatus DepositDrag(Driver *pdrive, int stage);       // scatter Q,P
   TaskStatus SendDepQP(Driver *pdrive, int stage);
   TaskStatus RecvDepQP(Driver *pdrive, int stage);
   TaskStatus GasImplicitSolve(Driver *pdrive, int stage);  // u* = (rho*u+P)/(rho+Q)
-  void UpdateHybridMetric(Driver *pdrive, int stage);
   TaskStatus SolveCoupledStage(Driver *pdrive, int stage);
   void ApplyCoupledOperator(DvceArray5D<Real> &field, DvceArray5D<Real> &result,
                             Real a_dt);
@@ -2186,6 +2001,15 @@ class DustGasDrag {
                                 Real a_dt, bool correct_field);
   void CompleteCopyExchange(DvceArray5D<Real> &field);
   void CompleteAddExchange(DvceArray5D<Real> &field);
+  // point particles (dc1 / dc2) in 3-D with a shearing box or physical x3 faces: the copy
+  // exchange of the operator is the stage's u* exchange (ExchangeUstarBlocking: shear collection,
+  // x3 values), the additive one the general deposit remap (DepRemapPlan, as the deposits)
+  bool point_dc_general = false;
+  bool point_dc_opcheck = false;   // hidden <dust>/test_point_dc_opcheck: the operator check
+  Real dc_point_sh_ = 0.0;         // the stage's ImplicitShearShift (the point gather / deposit)
+  void PointCopyExchange(DvceArray5D<Real> &field);
+  void PointOperatorParticles(DvceArray5D<Real> &field, DvceArray5D<Real> &result, Real a_dt,
+                              DvceArray2D<Real> *gath);
   void GlobalDot(DvceArray5D<Real> &left, DvceArray5D<Real> &right, Real value[3]);
   void GlobalPreconditionedNorm(DvceArray5D<Real> &residual, Real value[3]);
   int StrictPCG(Real a_dt, bool residual_is_current);
@@ -2200,8 +2024,6 @@ class DustGasDrag {
   TaskStatus RecvPMBR(Driver *pdrive, int stage);
   TaskStatus ApplyPMBR(Driver *pdrive, int stage);         // u0 += dmom; dmom -> R_g
   TaskStatus NewTimeStep(Driver *pdrive, int stage);
-  TaskStatus NewTimeStep2(Driver *pdrive, int stage);
-  TaskStatus ComputeNewTimeStep(Driver *pdrive, int stage);
   // ...in "after_stagen" list
   TaskStatus ClearParticleSend(Driver *pdrive, int stage);
   TaskStatus ClearParticleRecv(Driver *pdrive, int stage);
@@ -2217,7 +2039,7 @@ class DustGasDrag {
   // live in two persistent buffers used in turn (a selective regather reads the old values
   // while it writes the new ones): no device allocation and free (each a device
   // synchronization) whenever the cloud count of the rank changes.  Each new view is zeroed as
-  // the allocation it replaces.  ATHENA_DUST_GATHER_ALLOC=1: the former per-change allocation.
+  // the allocation it replaces.
   DvceArray1D<Real> gravity_acc_store_[2];
   int gravity_acc_turn_ = 0;
   DvceArray2D<Real> GravityAccelerationStorage(int npart);
@@ -2250,6 +2072,13 @@ void PackParticleRestart(MeshBlockPack *pmbp, std::vector<char> &buf);
 int ParticleRestartSections(const char *head);
 void UnpackParticleRestart(MeshBlockPack *pmbp, const int nsec,
                            const std::function<void(int, std::vector<char>&)> &read);
+
+// <problem>/cloud_root_random (read by the dust pgens): root parents placed over the whole box.
+// Default true with refinable clouds (the production value), else false.
+inline bool GetCloudRootRandom(ParameterInput *pin, const DustGasDrag *pd) {
+  return pin->GetOrAddBoolean("problem", "cloud_root_random",
+                              pd != nullptr && pd->UsesRefinableClouds());
+}
 
 } // namespace dust
 #endif // DUST_DUST_HPP_

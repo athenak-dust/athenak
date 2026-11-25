@@ -328,10 +328,17 @@ ParticleBinaryOutput::ParticleBinaryOutput(ParameterInput *pin, Mesh *pm,
               << "3-D mesh" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  // hidden: format version 3 with compressed particle columns (read only when set, so that
-  // the parameter dump of the default files is unchanged)
-  if (pin->DoesParameterExist(op.block_name, "test_pbin_compress")) {
-    const std::string mode = pin->GetString(op.block_name, "test_pbin_compress");
+  // hidden: format version 3 with compressed particle columns, the default
+  // where zlib is available (test_pbin_compress = none writes version 2).  The value is added to
+  // the parameters, so that a restart keeps it (a restart file of an older code without it
+  // continues uncompressed, ApplyRenamedKeys)
+  {
+#if ATHENA_HAVE_ZLIB
+    const char *cdef = "shuffle_deflate";
+#else
+    const char *cdef = "none";
+#endif
+    const std::string mode = pin->GetOrAddString(op.block_name, "test_pbin_compress", cdef);
     if (mode != "none" && mode != "shuffle_deflate") {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
                 << "Output block '" << op.block_name << "': test_pbin_compress must be none "
@@ -397,7 +404,7 @@ void ParticleBinaryOutput::PackParticleColumns(Mesh *pm,
       auto h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), d);
       sink(ic, h.data(), nbytes);
     } else if (name == "shape") {
-      using T = SMRCompositeTransfer;
+      using T = CloudGeometry;
       DvceArray1D<std::uint16_t> d("pbin_shape", nidx);
       Kokkos::parallel_for("pbin_pack_shape", Kokkos::RangePolicy<DevExeSpace>(0, nidx),
       KOKKOS_LAMBDA(const int q) {
@@ -498,7 +505,7 @@ void ParticleBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   auto pr = pp->prtcl_rdata;
   auto pi = pp->prtcl_idata;
   if (clouds) {
-    using T = SMRCompositeTransfer;
+    using T = CloudGeometry;
     const int known = T::kCloudLevelMask | (3 << T::kCloudLobeShift1) |
                       (3 << T::kCloudLobeShift2) | (3 << T::kCloudLobeShift3);
     long long nunknown = 0;

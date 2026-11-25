@@ -8,9 +8,8 @@
 //! Like IonNeutral, this module assembles the COMBINED gas+dust task graph: when a
 //! <dust> block is present, Hydro::AssembleHydroTasks and Particles::AssembleTasks are
 //! not called, and every Hydro/Particles task is inserted here instead. Particle
-//! IMEX particle migration runs inside each working stage.  Hybrid PC2 instead performs
-//! one midpoint update/migration per cycle, while split-BE performs one relaxed
-//! kick/drift/migration after the final hydro stage.  The common drag chain sits between
+//! IMEX particle migration runs inside each working stage.  PC2 instead performs
+//! one midpoint update/migration per cycle.  The common drag chain sits between
 //! the explicit gas update and the boundary communication tail.
 
 #include <chrono>
@@ -92,19 +91,9 @@ void DustGasDrag::AssembleDustGasDragTasks(
                                         id.sendus_shr);
   id.gkp       = tl["stagen"]->AddTask(&DustGasDrag::GatherKickPMBR, this,
                                        id.recvus_shr);
-  // Hybrid split-BE drifts only after the relaxed kick, so its sole migration belongs
-  // here.  These wrappers no-op for IMEX and PC2; the first chain above does the
-  // opposite.  Both branches therefore retain exactly one migration per active cycle.
-  id.p2_newgid = tl["stagen"]->AddTask(&DustGasDrag::UpdateParticleGIDs2, this, id.gkp);
-  id.p2_cnt    = tl["stagen"]->AddTask(&DustGasDrag::CountParticleSends2, this,
-                                       id.p2_newgid);
-  id.p2_irecv  = tl["stagen"]->AddTask(&DustGasDrag::InitParticleRecv2, this, id.p2_cnt);
-  id.p2_sendp  = tl["stagen"]->AddTask(&DustGasDrag::SendParticles2, this, id.p2_irecv);
-  id.p2_recvp  = tl["stagen"]->AddTask(&DustGasDrag::RecvParticles2, this, id.p2_sendp);
   id.sendbr    = tl["stagen"]->AddTask(&DustGasDrag::SendPMBR, this, id.gkp);
   id.recvbr    = tl["stagen"]->AddTask(&DustGasDrag::RecvPMBR, this, id.sendbr);
-  TaskID commit_ready = (id.recvbr | id.p2_recvp);
-  id.apply     = tl["stagen"]->AddTask(&DustGasDrag::ApplyPMBR, this, commit_ready);
+  id.apply     = tl["stagen"]->AddTask(&DustGasDrag::ApplyPMBR, this, id.recvbr);
   // standard hydro tail (boundary comms, BCs, cons-to-prim, timestep)
   id.h_sendu_oa  = tl["stagen"]->AddTask(&Hydro::SendU_OA, phyd, id.apply);
   id.h_recvu_oa  = tl["stagen"]->AddTask(&Hydro::RecvU_OA, phyd, id.h_sendu_oa);
@@ -118,7 +107,6 @@ void DustGasDrag::AssembleDustGasDragTasks(
   id.h_c2p       = tl["stagen"]->AddTask(&Hydro::ConToPrim, phyd, id.h_prol);
   id.h_newdt     = tl["stagen"]->AddTask(&Hydro::NewTimeStep, phyd, id.h_c2p);
   id.newdt       = tl["stagen"]->AddTask(&DustGasDrag::NewTimeStep, this, id.gkp);
-  id.newdt2      = tl["stagen"]->AddTask(&DustGasDrag::NewTimeStep2, this, id.apply);
 
   // assemble "after_stagen" task list
   id.h_csend = tl["after_stagen"]->AddTask(&Hydro::ClearSend, phyd, none);
@@ -159,7 +147,7 @@ struct MigTimer {
 //! third full GID scan and its MPI bookkeeping have no matching work to perform.
 
 TaskStatus DustGasDrag::UpdateParticleGIDs(Driver *pdrive, int stage) {
-  if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  if (!MigrationActive(pdrive, stage)) {return TaskStatus::complete;}
   MigTimer timer(mpi_time[1], mpi_time[2]);
   // several ranks: clouds made at the start of the cycle may keep a block across a periodic
   // boundary
@@ -174,68 +162,41 @@ TaskStatus DustGasDrag::UpdateParticleGIDs(Driver *pdrive, int stage) {
 }
 
 TaskStatus DustGasDrag::CountParticleSends(Driver *pdrive, int stage) {
-  if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  if (!MigrationActive(pdrive, stage)) {return TaskStatus::complete;}
   MigTimer timer(mpi_time[1], mpi_time[2]);
   ++mpi_count[1];
   return pmy_pack->ppart->SendCnt(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::InitParticleRecv(Driver *pdrive, int stage) {
-  if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  if (!MigrationActive(pdrive, stage)) {return TaskStatus::complete;}
   MigTimer timer(mpi_time[1], mpi_time[2]);
   return pmy_pack->ppart->InitRecv(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::SendParticles(Driver *pdrive, int stage) {
-  if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  if (!MigrationActive(pdrive, stage)) {return TaskStatus::complete;}
   MigTimer timer(mpi_time[1], mpi_time[2]);
   return pmy_pack->ppart->SendP(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::RecvParticles(Driver *pdrive, int stage) {
-  if (!FirstMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
+  if (!MigrationActive(pdrive, stage)) {return TaskStatus::complete;}
   MigTimer timer(mpi_time[1], mpi_time[2]);
   return pmy_pack->ppart->RecvP(pdrive, stage);
 }
 
-TaskStatus DustGasDrag::UpdateParticleGIDs2(Driver *pdrive, int stage) {
-  if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
-  if (shear_route_point) {ShiftShearCrossings(ShearRouteTime(pdrive, stage));}
-  return pmy_pack->ppart->NewGID(pdrive, stage);
-}
-
-TaskStatus DustGasDrag::CountParticleSends2(Driver *pdrive, int stage) {
-  if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
-  return pmy_pack->ppart->SendCnt(pdrive, stage);
-}
-
-TaskStatus DustGasDrag::InitParticleRecv2(Driver *pdrive, int stage) {
-  if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
-  return pmy_pack->ppart->InitRecv(pdrive, stage);
-}
-
-TaskStatus DustGasDrag::SendParticles2(Driver *pdrive, int stage) {
-  if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
-  return pmy_pack->ppart->SendP(pdrive, stage);
-}
-
-TaskStatus DustGasDrag::RecvParticles2(Driver *pdrive, int stage) {
-  if (!SecondMigrationActive(pdrive, stage)) {return TaskStatus::complete;}
-  return pmy_pack->ppart->RecvP(pdrive, stage);
-}
-
 TaskStatus DustGasDrag::ClearParticleSend(Driver *pdrive, int stage) {
-  // PC2 and split-BE deliberately skip particle migration in stage 1.  In an MPI
-  // build their request arrays therefore do not contain requests that may be waited
-  // on during that stage.
-  if (!FirstMigrationActive(pdrive, stage) && !SecondMigrationActive(pdrive, stage)) {
+  // PC2 deliberately skips particle migration in stage 1.  In an MPI build its request arrays
+  // therefore do not contain requests that may be waited on during that stage.
+  if (!MigrationActive(pdrive, stage)) {
     return TaskStatus::complete;
   }
   return pmy_pack->ppart->ClearSend(pdrive, stage);
 }
 
 TaskStatus DustGasDrag::ClearParticleRecv(Driver *pdrive, int stage) {
-  if (!FirstMigrationActive(pdrive, stage) && !SecondMigrationActive(pdrive, stage)) {
+  if (!MigrationActive(pdrive, stage)) {
     return TaskStatus::complete;
   }
   return pmy_pack->ppart->ClearRecv(pdrive, stage);
@@ -250,19 +211,13 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
   if (!ActiveStage(pdrive, stage)) {return TaskStatus::complete;}
 
   TaskStatus tstat = TaskStatus::complete;
-  bool use_qp = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid &&
-       ((hybrid_mode == HybridMode::pc2 && stage == 1) ||
-        (hybrid_mode == HybridMode::split_be && stage == 2)));
-  bool use_ustar = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid &&
-       hybrid_mode == HybridMode::split_be && stage == 2);
-  bool use_dmom = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid && stage == 2);
+  bool use_qp = (coupling == DustCoupling::imex) || stage == 1;     // (PC2: the predictor)
+  bool use_ustar = (coupling == DustCoupling::imex);
+  bool use_dmom = (coupling == DustCoupling::imex) || stage == 2;   // (PC2: the advance)
   // composite transfer on SMR / AMR deposits into the leaves directly and its additive
   // exchanges return at once (bvals_dep.cpp, local_smr_direct_): posting their receives would
   // leave them waiting for sends that never come on several ranks
-  const bool direct = UsesCompositeTransfer() && pmy_pack->pmesh->multilevel;
+  const bool direct = UsesRefinableClouds() && pmy_pack->pmesh->multilevel;
   // the shear part of the general deposit remap for this stage (the offset the
   // particles use when they cross the radial faces, bvals_part.cpp)
   if (dep_plan != nullptr && back_reaction && (use_qp || use_dmom)) {
@@ -272,7 +227,7 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
     tstat = pbval_qp->InitRecvDep(5);
     if (tstat != TaskStatus::complete) return tstat;
   }
-  if (use_ustar && UstarGhosts()) {
+  if (use_ustar) {   // (the TSC and the linear cloud gathers read u* in the ghost cells)
     tstat = pbval_us->InitRecv(3);
     if (tstat != TaskStatus::complete) return tstat;
   }
@@ -292,10 +247,7 @@ TaskStatus DustGasDrag::InitRecvDep(Driver *pdrive, int stage) {
 // Send/receive wrappers for the three exchanges of the implicit drag solve
 
 TaskStatus DustGasDrag::SendDepQP(Driver *pdrive, int stage) {
-  bool use = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid &&
-       ((hybrid_mode == HybridMode::pc2 && stage == 1) ||
-        (hybrid_mode == HybridMode::split_be && stage == 2)));
+  bool use = (coupling == DustCoupling::imex) || stage == 1;
   if (!ActiveStage(pdrive, stage) || !back_reaction || !use) {
     return TaskStatus::complete;
   }
@@ -303,10 +255,7 @@ TaskStatus DustGasDrag::SendDepQP(Driver *pdrive, int stage) {
 }
 
 TaskStatus DustGasDrag::RecvDepQP(Driver *pdrive, int stage) {
-  bool use = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid &&
-       ((hybrid_mode == HybridMode::pc2 && stage == 1) ||
-        (hybrid_mode == HybridMode::split_be && stage == 2)));
+  bool use = (coupling == DustCoupling::imex) || stage == 1;
   if (!ActiveStage(pdrive, stage) || !back_reaction || !use) {
     return TaskStatus::complete;
   }
@@ -314,13 +263,8 @@ TaskStatus DustGasDrag::RecvDepQP(Driver *pdrive, int stage) {
 }
 
 TaskStatus DustGasDrag::SendUstar(Driver *pdrive, int stage) {
-  bool use = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid &&
-       hybrid_mode == HybridMode::split_be && stage == 2);
+  bool use = (coupling == DustCoupling::imex);
   if (!ActiveStage(pdrive, stage) || !use) {return TaskStatus::complete;}
-  if (!UstarGhosts()) {   // the piecewise-constant composite gathers
-    return TaskStatus::complete;   // read leaf cells only
-  }
   if (pmy_pack->pmesh->multilevel) {
     pmy_pack->pmesh->pmr->RestrictCC(ustar, cdummy);
   }
@@ -328,13 +272,8 @@ TaskStatus DustGasDrag::SendUstar(Driver *pdrive, int stage) {
 }
 
 TaskStatus DustGasDrag::RecvUstar(Driver *pdrive, int stage) {
-  bool use = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid &&
-       hybrid_mode == HybridMode::split_be && stage == 2);
+  bool use = (coupling == DustCoupling::imex);
   if (!ActiveStage(pdrive, stage) || !use) {return TaskStatus::complete;}
-  if (!UstarGhosts()) {   // the piecewise-constant composite gathers
-    return TaskStatus::complete;   // read leaf cells only
-  }
   TaskStatus status = pbval_us->RecvAndUnpackCC(ustar, cdummy);
   // with a shearing box the prolongation comes after the shear of the coarse array
   // (RecvUstarShr), as for the gas (RecvU -> shear -> Prolongate)
@@ -343,9 +282,7 @@ TaskStatus DustGasDrag::RecvUstar(Driver *pdrive, int stage) {
 }
 
 TaskStatus DustGasDrag::SendUstarShr(Driver *pdrive, int stage) {
-  bool use = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid &&
-       hybrid_mode == HybridMode::split_be && stage == 2);
+  bool use = (coupling == DustCoupling::imex);
   if (!ActiveStage(pdrive, stage) || !use || psbox_us == nullptr) {
     return TaskStatus::complete;
   }
@@ -362,9 +299,7 @@ TaskStatus DustGasDrag::SendUstarShr(Driver *pdrive, int stage) {
 }
 
 TaskStatus DustGasDrag::RecvUstarShr(Driver *pdrive, int stage) {
-  bool use = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid &&
-       hybrid_mode == HybridMode::split_be && stage == 2);
+  bool use = (coupling == DustCoupling::imex);
   if (!ActiveStage(pdrive, stage) || !use || psbox_us == nullptr) {
     return TaskStatus::complete;
   }
@@ -377,8 +312,7 @@ TaskStatus DustGasDrag::RecvUstarShr(Driver *pdrive, int stage) {
 }
 
 TaskStatus DustGasDrag::SendPMBR(Driver *pdrive, int stage) {
-  bool use = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid && stage == 2);
+  bool use = (coupling == DustCoupling::imex) || stage == 2;
   if (!ActiveStage(pdrive, stage) || !back_reaction || !use) {
     return TaskStatus::complete;
   }
@@ -386,8 +320,7 @@ TaskStatus DustGasDrag::SendPMBR(Driver *pdrive, int stage) {
 }
 
 TaskStatus DustGasDrag::RecvPMBR(Driver *pdrive, int stage) {
-  bool use = (coupling == DustCoupling::imex) ||
-      (coupling == DustCoupling::hybrid && stage == 2);
+  bool use = (coupling == DustCoupling::imex) || stage == 2;
   if (!ActiveStage(pdrive, stage) || !back_reaction || !use) {
     return TaskStatus::complete;
   }
@@ -494,12 +427,19 @@ TaskStatus DustGasDrag::RemoveOutflowParticles(Driver *pdrive, int stage) {
 //! copy the boundary cell (zero gradient).  Nothing changes with periodic x3.
 
 void DustGasDrag::FinishUstarGhosts() {
+  FinishUstarGhosts(ustar, cdummy, pbval_us);
+}
+
+// (the same for any 3-component field f, its coarse buffer cf and exchange object pb: the
+// blocking exchange of the dc1 correction)
+void DustGasDrag::FinishUstarGhosts(DvceArray5D<Real> &f, DvceArray5D<Real> &cf,
+                                    MeshBoundaryValuesCC *pb) {
   if (pmy_pack->pmesh->multilevel) {
-    UstarX3BCs(cdummy, true);
-    pbval_us->FillCoarseInBndryCC(ustar, cdummy);
-    pbval_us->ProlongateCC(ustar, cdummy);
+    UstarX3BCs(cf, true);
+    pb->FillCoarseInBndryCC(f, cf);
+    pb->ProlongateCC(f, cf);
   }
-  UstarX3BCs(ustar, false);
+  UstarX3BCs(f, false);
 }
 
 void DustGasDrag::UstarX3BCs(DvceArray5D<Real> &a, const bool coarse) {

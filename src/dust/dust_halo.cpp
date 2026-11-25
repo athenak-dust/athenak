@@ -118,7 +118,7 @@ struct AccFlatInt {
 };
 
 // copy (forward: owner -> halo slots) or add back (reverse: halo slots -> owner) nc components
-// of the cells in the lists (whole blocks, or with <dust>/cloud_halo_strips their reachable strips)
+// of the cells in the lists (their reachable strips)
 template <typename Acc>
 void Exchange(DustHalo &h, const int nc, const bool reverse, const Acc &acc) {
 #if MPI_PARALLEL_ENABLED
@@ -221,7 +221,7 @@ void DustGasDrag::BuildHalo(const std::vector<int> &slot_gid) {
   auto &h = halo_;
   // the slot geometry: the 2-D leaf traversal or the 3-D one
   int nmb = 0, nfld = 0, gids = 0;
-  h.three = clouds3d;
+  h.three = cloud_dim == 3;
   if (h.three) {
     const auto &l3 = leaf_traversal3d;
     h.nx1 = l3.nx1; h.nx2 = l3.nx2; h.nx3 = l3.nx3; h.is = l3.is; h.js = l3.js; h.ks = l3.ks;

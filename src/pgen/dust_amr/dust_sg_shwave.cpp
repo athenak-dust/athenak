@@ -137,10 +137,10 @@ void MaxAll(double *a, int n) {
 // e^{-ik.x_c}: one for point particles; for a refinable cloud of half-width ell = root
 // dx/2^level the P1 hat sinc^2(k ell/2) per direction, times (2/3 + 1/3 e^{+-ik ell})
 // along a transition lobe (lower, upper) or the hat of half-width 2 ell (both lobes), cf.
-// SMRCompositeTransfer::CloudWeights1D.
+// CloudShape1D.
 Cplx CloudFactor(bool clouds, int code, Real kx, Real ky, Real rdx1, Real rdx2) {
   if (!clouds) return Cplx(1.0, 0.0);
-  using T = SMRCompositeTransfer;
+  using T = CloudGeometry;
   const int lev = T::CloudLevel(code);
   auto f1 = [](Real k, Real ell, int lobe) {
     auto sinc = [](Real a) {return std::abs(a) < 1.0e-12 ? 1.0 : std::sin(a)/a;};

@@ -22,6 +22,7 @@
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
 #include "shearing_box.hpp"
+#include "dust/dust_input.hpp"
 
 //----------------------------------------------------------------------------------------
 //! ShearingBox base class constructor
@@ -53,10 +54,23 @@ ShearingBox::ShearingBox(MeshBlockPack *ppack, ParameterInput *pin) :
               << "only (no SMR/AMR)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  report_timing = pin->GetOrAddBoolean("shearing_box", "report_timing", false);
-  // test switch (default false): true = the collected x1 ghost zones in one round, with the x
-  // slope of a coarser sender from its x1 ghosts of the previous stage (PullSend)
-  pull_lagged_xslope = pin->GetOrAddBoolean("shearing_box", "test_pull_lagged_xslope", false);
+  report_timing = dust::TestKeyBool(pin, "shearing_box", "test_report_timing", false);
+  // retired-compat: the one-round collection with the lagged x slope; it acted only
+  // on the collected ghosts (face_levels) of a coarser sender (a refined mesh).  Judged once per
+  // run (several shearing-box objects read the same parameters)
+  static bool sb_retired_checked = false;   // retired-compat
+  if (!sb_retired_checked) {   // retired-compat
+    sb_retired_checked = true;   // retired-compat
+    dust::RetiredKeys rk(pin, "shearing_box", "2026-11-25");   // retired-compat
+    rk.Check("test_pull_lagged_xslope", rk.Has("test_pull_lagged_xslope") &&   // retired-compat
+             !rk.Bool("test_pull_lagged_xslope"),   // retired-compat
+             face_levels && ppack->pmesh->multilevel,   // retired-compat
+             "the one-round collection of the shear-face ghosts with the lagged x slope "   // retired-compat
+             "(<shearing_box>/test_pull_lagged_xslope = true)",   // retired-compat
+             "The shear-face ghosts are collected in rounds with the centered x slope of the "   // retired-compat
+             "current ghosts: drop the key", "false");   // retired-compat
+    rk.Finish();   // retired-compat
+  }
   // with face_levels, non-periodic x3 needs the physical boundary values of the coarse
   // arrays for the corners the collected ghost zones leave to them; dust
   // (u* through the same collection, deposits through the general remap, particle routing by the
@@ -102,7 +116,6 @@ ShearingBox::~ShearingBox() {
 //! constructor and again after every regrid.
 
 void ShearingBox::BuildBoundaryLists() {
-  pull_ghost_valid = false;   // new or moved blocks: x1 ghosts not collected yet
   BuildCandidates();          // candidate partners of the block-local plans
   // Create vector with GID of every MBs on this rank at ix1/ox1 shearing-box boundaries
   std::vector<int> tmp_ix1bndry_gid, tmp_ox1bndry_gid;

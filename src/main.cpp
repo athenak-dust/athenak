@@ -40,6 +40,7 @@
 #include "outputs/outputs.hpp"
 #include "driver/driver.hpp"
 #include "utils/utils.hpp"
+#include "dust/dust_input.hpp"
 
 // MPI/OpenMP headers
 #if MPI_PARALLEL_ENABLED
@@ -267,6 +268,8 @@ int main(int argc, char *argv[]) {
     // read parameters from restart file
     restartfile.Open(restart_file.c_str(),IOWrapper::FileMode::read,single_file_per_rank);
     pinput->LoadFromFile(restartfile, single_file_per_rank);
+    // retired-compat: pbin blocks of an older restart file keep their format (recorded before -i)
+    dust::RecordRestartPbinGaps(pinput);
   }
 
   // read parameters from input file.  If both -r and -i are specified, this will
@@ -277,7 +280,11 @@ int main(int argc, char *argv[]) {
     infile.Close();
     pinput->CheckBlockNames();
   }
+  dust::CheckRetiredEnvironment();   // retired-compat (the ATHENA_* switches)
+  dust::RenameCommandLineKeys(pinput, argc, argv);   // retired-compat
   pinput->ModifyFromCmdline(argc, argv);
+  // retired-compat: keys renamed / merged read under their new names
+  dust::ApplyRenamedKeys(pinput);
 
   // Dump input parameters and quit if code was run with -n option.
   if (narg_flag) {

@@ -27,10 +27,10 @@
 //!
 //! The shear part changes its overlap structure only when the offset crosses a cell (UpdateShear);
 //! in between only its weights change.  The weights are computed on the device from recipes kept
-//! there (ATHENA_DEP_WEIGHTS_HOST=1: on the host and uploaded, as before), and the structure of the
-//! next one-cell offset is built ahead on a host thread from a snapshot of the blocks
-//! (ATHENA_DEP_PREFETCH_OLD=1: a full build at every crossing, as before).  Both give the lists
-//! and weights of a full build bit for bit (ATHENA_DEP_VERIFY=1 checks it in the run).
+//! there (hidden test key <dust>/test_host_reference with the word deposit: on the host and
+//! uploaded, as before), and the structure of the next one-cell offset is built ahead on a host
+//! thread from a snapshot of the blocks.  Both give the lists and weights of a full build bit for
+//! bit (<dust>/test_dep_verify = true checks it in the run).
 
 #include <algorithm>
 #include <chrono>
@@ -250,9 +250,20 @@ std::vector<int> Candidates(MeshBlockPack *pp, const BlkR &b, const int m, const
   return std::vector<int>(c.begin(), c.end());
 }
 
-// ATHENA_DEP_PROFILE=1 in the environment prints, on rank 0 every 400
+// the hidden test keys of the deposit remap, read only when given (not added when absent)
+// by DepRemapPlan::ReadTestKeys from the deposit exchange's constructor, before any plan is built;
+// the input is the same on every rank, so are these switches (collective: see UpdateShear)
+//   <dust>/test_host_reference = a list of words (spaces or commas); the word deposit computes
+//       the shear weights on the host and uploads them (the former path), default: on the device
+//   <dust>/test_dep_verify = true: (diagnostic) the device weights and every installed prefetch
+//       compared with a host build in the run, bitwise
+//   <dust>/test_dep_profile = true: (diagnostic) the timing lines of DepProfile below
+struct DepTestKeys {bool host_weights = false, verify = false, profile = false;};
+DepTestKeys &DepTest() {static DepTestKeys k; return k;}
+
+// <dust>/test_dep_profile = true prints, on rank 0 every 400
 // shear updates, the mean host time per build of its phases (diagnostic only); also the
-// prefetch installs and the ATHENA_DEP_VERIFY counts (main thread only)
+// prefetch installs and the test_dep_verify counts (main thread only)
 struct DepProfile {
   bool on = false;
   int nbuild = 0, ncall = 0, nupd = 0;
@@ -260,9 +271,9 @@ struct DepProfile {
   double t[7] = {0, 0, 0, 0, 0, 0, 0};   // recv pairs, send pairs, check, layout+Alltoall, sort, device, total
   int ninst = 0, ndisc = 0;              // prefetches installed, discarded
   double twait = 0.0, tinst = 0.0, tinst_a2a = 0.0, tinst_w = 0.0, tthread = 0.0;   // seconds
-  long nmis = 0;                         // ATHENA_DEP_VERIFY mismatches
+  long nmis = 0;                         // test_dep_verify mismatches
   int nver_w = 0, nver_i = 0;            // verified weight updates, installs
-  DepProfile() {const char *e = std::getenv("ATHENA_DEP_PROFILE"); on = (e != nullptr && e[0] == '1');}
+  DepProfile() : on(DepTest().profile) {}
 };
 DepProfile &DepProf() {static DepProfile p; return p;}
 
@@ -547,12 +558,32 @@ void BuildHostPart(const BuildIn &in, const int part, const double shR, DepHostP
   lap(4);
 }
 
-bool EnvOn(const char *name) {
-  const char *e = std::getenv(name);
-  return (e != nullptr && e[0] == '1');
-}
-
 }  // namespace
+
+//----------------------------------------------------------------------------------------
+//! \fn void DepRemapPlan::ReadTestKeys
+//! \brief The hidden test keys of the remap (DepTestKeys above); called by the constructor of
+//! the deposit exchange (MeshBoundaryValuesDep), which the dust module builds before any plan.
+
+void DepRemapPlan::ReadTestKeys(ParameterInput *pin) {
+  DepTestKeys &k = DepTest();
+  if (pin->DoesParameterExist("dust", "test_host_reference")) {
+    std::string s = pin->GetString("dust", "test_host_reference");
+    for (char &c : s) if (c == ',') c = ' ';
+    std::size_t b = 0;
+    k.host_weights = false;
+    while ((b = s.find_first_not_of(' ', b)) != std::string::npos) {
+      const std::size_t e = s.find(' ', b);
+      if (s.compare(b, (e == std::string::npos ? s.size() : e) - b, "deposit") == 0)
+        k.host_weights = true;
+      b = e;
+    }
+  }
+  if (pin->DoesParameterExist("dust", "test_dep_verify"))
+    k.verify = pin->GetBoolean("dust", "test_dep_verify");
+  if (pin->DoesParameterExist("dust", "test_dep_profile"))
+    k.profile = pin->GetBoolean("dust", "test_dep_profile");
+}
 
 //----------------------------------------------------------------------------------------
 // DepRemapPlan constructor
@@ -561,20 +592,19 @@ DepRemapPlan::DepRemapPlan(MeshBlockPack *pp, bool shear_x1, Real qshear, Real o
                            int x3mode) :
     pmy_pack(pp), shear_x1_(shear_x1), x3mode_(x3mode), qshear_(qshear), omega0_(omega0) {
   static_assert(kRecipe == 8, "BuildHostPart writes 8 recipe doubles per shear entry");
-  dev_weights_ = !EnvOn("ATHENA_DEP_WEIGHTS_HOST");
-  prefetch_on_ = !EnvOn("ATHENA_DEP_PREFETCH_OLD");
-  verify_ = EnvOn("ATHENA_DEP_VERIFY");
+  dev_weights_ = !DepTest().host_weights;
+  verify_ = DepTest().verify;
 #if MPI_PARALLEL_ENABLED
-  // The prefetch path adds one MPI_Allreduce per one-cell shift (UpdateShear): the switches
-  // must agree on every rank (collective: the construction is, BuildPart calls MPI_Alltoall)
+  // the test keys come from the input or each rank's restart header: they must agree on every
+  // rank (collective: the construction is, BuildPart calls MPI_Alltoall)
   if (global_variable::nranks > 1) {
-    const int a = prefetch_on_ ? 1 : 0, b = dev_weights_ ? 1 : 0, c = verify_ ? 1 : 0;
+    const int a = DepTest().profile ? 1 : 0, b = dev_weights_ ? 1 : 0, c = verify_ ? 1 : 0;
     int v[6] = {a, b, c, -a, -b, -c};
     MPI_Allreduce(MPI_IN_PLACE, v, 6, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     if (v[0] != -v[3] || v[1] != -v[4] || v[2] != -v[5]) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-                << "ATHENA_DEP_PREFETCH_OLD / ATHENA_DEP_WEIGHTS_HOST / ATHENA_DEP_VERIFY must "
-                << "be set alike on every rank" << std::endl;
+                << "<dust>/test_host_reference / test_dep_verify / test_dep_profile must be "
+                << "alike on every rank" << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
@@ -583,7 +613,7 @@ DepRemapPlan::DepRemapPlan(MeshBlockPack *pp, bool shear_x1, Real qshear, Real o
   if (shear_x1_ && !said && global_variable::my_rank == 0) {
     said = true;
     std::cout << "# DEP_REMAP shear_weights=" << (dev_weights_ ? "device" : "host")
-              << " shear_prefetch=" << (prefetch_on_ ? "on" : "off")
+              << " shear_prefetch=on"
               << (verify_ ? " verify=on" : "") << std::endl;
   }
   BuildStatic();
@@ -641,33 +671,31 @@ void DepRemapPlan::UpdateShear(Real time) {
     // the structure changed (normally a one-cell shift): the shear part prefetched for this
     // offset, or a full build.  Every rank comes here at the same calls (the offset is global).
     const std::int64_t f = static_cast<std::int64_t>(fl);
-    int took = -1;   // 1 prefetch installed, 0 installed but an overlap vanished, -1 not taken
-    if (prefetch_on_) took = TakePrefetch(shR, f);
+    // 1 prefetch installed, 0 installed but an overlap vanished, -1 not taken
+    const int took = TakePrefetch(shR, f);
     if (took < 0) {BuildPart(1, shR, shr); ++shr_builds;}
     bool redo = (took == 0);
 #if MPI_PARALLEL_ENABLED
-    if (prefetch_on_ && global_variable::nranks > 1) {   // (a rebuild calls MPI_Alltoall)
+    if (global_variable::nranks > 1) {   // (a rebuild calls MPI_Alltoall)
       int bad = redo ? 1 : 0;
       MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
       redo = (bad != 0);
     }
 #endif
     if (redo) {BuildPart(1, shR, shr); ++shr_builds;}
-    if (prefetch_on_) {
-      // build the next one-cell offset ahead while the plan is driven cell by cell (the drag
-      // and gravity plans: every cycle; not a science plan updated once per output)
-      const std::int64_t d = (qshear_*omega0_ >= 0.0) ? 1 : -1;   // (time increases)
-      auto next = [&](std::int64_t q) {
-        q += d;
-        if (q >= N2) q -= N2;
-        if (q < -N2) q += N2;
-        return q;
-      };
-      const bool driven = have_event_ && (event_floor_ == f || next(event_floor_) == f);
-      have_event_ = true;
-      event_floor_ = f;
-      if (driven) LaunchPrefetch(next(f));
-    }
+    // build the next one-cell offset ahead while the plan is driven cell by cell (the drag
+    // and gravity plans: every cycle; not a science plan updated once per output)
+    const std::int64_t d = (qshear_*omega0_ >= 0.0) ? 1 : -1;   // (time increases)
+    auto next = [&](std::int64_t q) {
+      q += d;
+      if (q >= N2) q -= N2;
+      if (q < -N2) q += N2;
+      return q;
+    };
+    const bool driven = have_event_ && (event_floor_ == f || next(event_floor_) == f);
+    have_event_ = true;
+    event_floor_ = f;
+    if (driven) LaunchPrefetch(next(f));
   }
   shear_time = time;
   if (P.on && ++P.ncall % 400 == 0 && global_variable::my_rank == 0) {
@@ -793,7 +821,7 @@ double DepRemapPlan::FinishPart(const int part, const double shR, DepHostPart &h
 //! of the last build (same overlap structure: same integer part of shR, and shR an integer or not
 //! as then).  The arithmetic is that of Overlaps and PairOverlap, so the weights are those of a
 //! full build bit for bit.  False (nothing changed) if an overlap would vanish.
-//! (The host path: ATHENA_DEP_WEIGHTS_HOST=1; HostShearWeights without the upload.)
+//! (The host path: <dust>/test_host_reference = deposit; HostShearWeights without the upload.)
 
 namespace {
 bool HostShearWeights(const std::vector<double> &recipe, const double shR, std::vector<Real> &hw) {
@@ -853,7 +881,7 @@ bool DepRemapPlan::UpdateShearWeightsDevice(const double shR) {
   return bad == 0;
 }
 
-// the weights of the shear part for offset shR, device or host as switched (ATHENA_DEP_VERIFY:
+// the weights of the shear part for offset shR, device or host as switched (test_dep_verify:
 // the device weights compared with the host loop, bitwise)
 bool DepRemapPlan::ShearWeights(const double shR) {
   if (!dev_weights_) return UpdateShearWeights(shR);
@@ -970,7 +998,7 @@ int DepRemapPlan::TakePrefetch(const double shR, const std::int64_t fl) {
 
 //----------------------------------------------------------------------------------------
 //! \fn void DepRemapPlan::VerifyInstall
-//! \brief (ATHENA_DEP_VERIFY=1, diagnostic) The installed shear part against a host build for
+//! \brief (<dust>/test_dep_verify = true, diagnostic) The installed shear part against a host build for
 //! shR from the live mesh: lists, layouts, recipes and weights, bitwise.  No MPI.
 
 void DepRemapPlan::VerifyInstall(const double shR) {

@@ -310,7 +310,7 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
   const StratDust &sd = d.strat;
   const Real rho0 = d.rho0;
   const int nspec = static_cast<int>(eps.size());
-  bool cloud_root_random = pin->GetOrAddBoolean("problem", "cloud_root_random", false);
+  bool cloud_root_random = dust::GetCloudRootRandom(pin, pmbp->pdust);
   // canonical_root: the same root parents with the standard deposit on a uniform mesh,
   // so a uniform control shares the parent positions of a refinable-cloud run
   // also the old instant_switch transfer on any mesh (point particles, each in the block
@@ -830,7 +830,7 @@ void PlaceParticles(ParameterInput *pin, Mesh *pm, const DustInit &d) {
   } else if (cloud_root_random) {
     // ppc particles per ROOT cell, placed over the whole box.  Refinement changes the
     // cloud shape through the exact P1 split, never the prescribed parent mass.
-    auto transfer = pmbp->pdust->smr_transfer;
+    auto transfer = pmbp->pdust->cloud_geometry;
     auto lt = pmbp->pdust->leaf_traversal;
     if (canonical_root) {   // only the root geometry is used below
       const auto &ms = pm->mesh_size;
@@ -1092,7 +1092,7 @@ void EnrollRefinement(ParameterInput *pin, Mesh *pm, ProblemGenerator *pgen) {
   if (pm->adaptive && pin->DoesBlockExist("dust")) {
     dust::SetupScheduledRefinement(pin);
     pgen->user_ref_func = dust::ScheduledRefinement;
-    if (pin->GetOrAddBoolean("dust", "amr_density_trigger", false)) {
+    if (dust::GetAmrDensityTrigger(pin)) {
       dust::SetupDensityTrigger(pin);
       pgen->user_ref_func = dust::DensityRefinement;
     }
